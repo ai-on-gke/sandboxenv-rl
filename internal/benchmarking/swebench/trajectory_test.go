@@ -183,3 +183,35 @@ func TestJSONTemplateFunc(t *testing.T) {
 		t.Fatalf("round trip: %+v", back)
 	}
 }
+
+func TestGrades(t *testing.T) {
+	def, err := LoadTrajectory("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !def.Grades() {
+		t.Fatal("the default trajectory grades")
+	}
+	for _, n := range []string{"workload-file-read", "workload-compile", "workload-read-all"} {
+		tr, err := LoadTrajectory(n)
+		if err != nil {
+			t.Fatalf("%s: %v", n, err)
+		}
+		if tr.Grades() {
+			t.Fatalf("%s must not need grading material", n)
+		}
+		if tr.Steps[0].Name != "probe" || tr.Steps[0].Run != "true" {
+			t.Fatalf("%s must start with the probe step so ttfi is the cold start alone", n)
+		}
+		if !tr.HasReward() {
+			t.Fatalf("%s needs a reward step so a failed workload is visible", n)
+		}
+	}
+	plain, err := ParseTrajectory([]byte("name: t\nsteps:\n  - {name: w, write: {path: /tmp/p, content: \"{{.Patch}}\"}}\n  - {name: r, run: \"true\"}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain.Grades() {
+		t.Fatal("a trajectory that uses only the patch does not grade")
+	}
+}

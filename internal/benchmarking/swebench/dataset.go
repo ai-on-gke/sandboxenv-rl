@@ -65,10 +65,23 @@ func (in Instance) Validate() error {
 		return fmt.Errorf("%s: image is required", in.InstanceID)
 	case !digestPinned.MatchString(in.Image):
 		return fmt.Errorf("%s: image %q is not digest-pinned", in.InstanceID, in.Image)
-	case in.EvalScript == "":
-		return fmt.Errorf("%s: eval_script is required", in.InstanceID)
-	case in.LogParser == "":
-		return fmt.Errorf("%s: log_parser is required", in.InstanceID)
+	}
+	return nil
+}
+
+// RequireGrading checks that every instance carries what a grading
+// trajectory needs, an eval script and a log parser, so a missing field is a
+// configuration error before the run and not a reward of zero after it. A
+// trajectory that only exercises the image (a pull or compile workload) does
+// not need them, so this is applied only when the trajectory grades.
+func RequireGrading(instances []Instance) error {
+	for _, in := range instances {
+		switch {
+		case in.EvalScript == "":
+			return fmt.Errorf("%s: eval_script is required by a grading trajectory", in.InstanceID)
+		case in.LogParser == "":
+			return fmt.Errorf("%s: log_parser is required by a grading trajectory", in.InstanceID)
+		}
 	}
 	return nil
 }

@@ -52,8 +52,6 @@ func TestParseDatasetRejects(t *testing.T) {
 		"no image":    `{"instance_id":"x"}` + "\n",
 		"tag not pin": `{"instance_id":"x","image":"reg/img:latest"}` + "\n",
 		"duplicate":   manifest("a", "a"),
-		"no eval":     `{"instance_id":"x","image":"reg/img@` + goodDigest + `","log_parser":"parse_log_pytest"}` + "\n",
-		"no parser":   `{"instance_id":"x","image":"reg/img@` + goodDigest + `","eval_script":"e"}` + "\n",
 	}
 	for name, in := range cases {
 		if _, err := ParseDataset(strings.NewReader(in)); err == nil {
@@ -145,5 +143,26 @@ func TestLoadDatasetRefusesARedirectToPlainHTTP(t *testing.T) {
 	got, err := LoadDataset(secure.URL + "/to-https")
 	if err != nil || len(got) != 1 {
 		t.Fatalf("redirect to https: %v, %v; want the manifest", got, err)
+	}
+}
+
+func TestRequireGrading(t *testing.T) {
+	full, err := ParseDataset(strings.NewReader(manifest("a")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RequireGrading(full); err != nil {
+		t.Fatalf("complete record: %v", err)
+	}
+	imageOnly, err := ParseDataset(strings.NewReader(`{"instance_id":"x","image":"reg/img@` + goodDigest + `"}` + "\n"))
+	if err != nil {
+		t.Fatalf("an image-only record must parse: %v", err)
+	}
+	if err := RequireGrading(imageOnly); err == nil || !strings.Contains(err.Error(), "eval_script") {
+		t.Fatalf("image-only record must fail grading requirement: %v", err)
+	}
+	noParser, _ := ParseDataset(strings.NewReader(`{"instance_id":"x","image":"reg/img@` + goodDigest + `","eval_script":"e"}` + "\n"))
+	if err := RequireGrading(noParser); err == nil || !strings.Contains(err.Error(), "log_parser") {
+		t.Fatalf("missing log_parser must fail grading requirement: %v", err)
 	}
 }

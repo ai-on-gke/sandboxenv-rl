@@ -44,6 +44,12 @@ SWE-bench images on Docker Hub are one repository per instance:
 
 Instances whose image cannot be resolved are reported and left out, so run
 mirror-images.sh first and re-run this until none are missing.
+
+For image-delivery workloads that grade nothing (workload-file-read,
+workload-compile, workload-read-all), build an image-only manifest from a
+list of references instead:
+
+    ./make-dataset.py --images-file images.txt --out images.jsonl
 """
 
 import argparse
@@ -124,17 +130,62 @@ def resolve_digest(ref: str) -> str | None:
     return f"{repo}@{proc.stdout.strip()}"
 
 
+def instance_id_from_ref(ref: str) -> str:
+    """A stable id for an image-only record: the last path segment plus the tag,
+    with characters outside [a-z0-9._-] replaced, so it survives EnvID."""
+    repo = ref.split("@", 1)[0]
+    last = repo.rsplit("/", 1)[-1]
+    tag = ""
+    if ":" in last:
+        last, tag = last.split(":", 1)
+    raw = f"{last}-{tag}" if tag and tag != "latest" else last
+    return "".join(c if c.isalnum() or c in "._-" else "-" for c in raw.lower())
+
+
+def write_image_only(images_file: str, out: str) -> int:
+    """Manifest for image-delivery workloads: one record per image reference,
+    no grading material. References may be tags (resolved to a digest with
+    crane) or already pinned by digest."""
+    written = missing = 0
+    with open(images_file) as src, open(out, "w") as dst:
+        for line in src:
+            ref = line.strip()
+            if not ref or ref.startswith("#"):
+                continue
+            pinned = ref if "@sha256:" in ref else resolve_digest(ref)
+            if pinned is None:
+                print(f"missing image: {ref}", file=sys.stderr)
+                missing += 1
+                continue
+            dst.write(json.dumps({"instance_id": instance_id_from_ref(ref), "repo": "", "image": pinned,
+                                  "patch": "", "test_patch": "", "eval_script": "",
+                                  "fail_to_pass": [], "pass_to_pass": [], "log_parser": "", "eval_type": ""}) + "\n")
+            written += 1
+    with open(out + ".meta.json", "w") as f:
+        json.dump({"source": images_file, "instances": written, "missing_images": missing, "grading": False,
+                   "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}, f, indent=2)
+        f.write("\n")
+    print(f"wrote {written} image-only instances to {out}; {missing} missing images", file=sys.stderr)
+    return 1 if missing else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dataset", default="SWE-bench/SWE-bench_Verified", help="Hugging Face dataset name or a local JSON/JSONL path. The rows must carry eval_script (the SWE-bench org copies do; the older princeton-nlp copies do not).")
     ap.add_argument("--split", default="test")
     ap.add_argument("--revision", default=None, help="Dataset revision (commit, tag or branch) to load; default the current head. The resolved commit is what is loaded and recorded in the meta file.")
-    ap.add_argument("--registry", required=True, help="Registry path that holds the task images, e.g. us-docker.pkg.dev/PROJECT/swebench-mirror/swebench-verified.")
+    ap.add_argument("--images-file", default=None, help="Build an image-only manifest (no grading material) from a file with one image reference per line, for the image-delivery workloads. --dataset and --registry are ignored.")
+    ap.add_argument("--registry", default=None, help="Registry path that holds the task images, e.g. us-docker.pkg.dev/PROJECT/swebench-mirror/swebench-verified. Required unless --images-file is given.")
     ap.add_argument("--image-ref", default="{registry}:sweb.eval.x86_64.{instance_id}", help="Image reference per instance; fields: {registry}, {instance_id}, {instance_id_1776}.")
     ap.add_argument("--limit", type=int, default=0, help="Stop after N instances (0 = all).")
     ap.add_argument("--instances", default="", help="Comma-separated instance ids to include; default all.")
     ap.add_argument("--out", required=True, help="JSONL manifest to write.")
     args = ap.parse_args()
+
+    if args.images_file:
+        return write_image_only(args.images_file, args.out)
+    if not args.registry:
+        ap.error("--registry is required unless --images-file is given")
 
     try:
         from datasets import load_dataset

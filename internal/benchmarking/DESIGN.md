@@ -94,13 +94,16 @@ accepts the previous version.
 
 - **SUT**: a sandbox backend accessed either through the sandbox SDK or
   directly against the backend API (to isolate and price the SDK layer).
-- **Scenario**: one benchmark run. SUT config plus a list of jobs. Its hash is
-  recorded in the system description.
+- **Scenario**: one benchmark run. SUT config, repeat count (independent
+  experiment repeats), and a list of jobs. Its hash is recorded in the system
+  description.
 - **Job**: one RL loop. Fields: id, kind (`simulated` | `real`), mode for real
-  jobs (`measure` | `trace`), start offset, concurrency, step pause (simulated
-  training and weight-transfer interval between steps), prefetch policy
-  (whether next-step pools are warmed ahead of the step boundary), park policy
-  (`suspend` | `pause` | `fork` | `delete` | `none`), dataset.
+  jobs (`measure` | `trace`), start offset, steps, tasks per step (batch size),
+  group size (rollouts/trajectories per task; `trajectories_per_step =
+  group_size * tasks_per_step`), concurrency (`max_concurrent`), step pause
+  (simulated training and weight-transfer interval between steps), prefetch
+  policy (whether next-step pools are warmed ahead of the step boundary), park
+  policy (`suspend` | `pause` | `fork` | `delete` | `none`), dataset.
 - **Workload**: dataset manifest, trajectories and a schedule.
 - **Dataset manifest**: instances with a digest-pinned image, prompt material,
   grader inputs and the image-specific setup and reset steps.
@@ -124,7 +127,9 @@ backend and access mode (via SDK or direct backend API), each wrapping a Helm
 chart or manifest set. Writes the system description: cluster, backend and SDK
 versions/commits, machine types, node counts, zone and network topology,
 sandbox runtime class, sandbox resource footprint (CPU, memory, disk), bucket
-region, scenario hash.
+region, scenario hash, and configured load parameters (tasks, group size, steps,
+tasks per step, trajectories per step, repeat count, `max_concurrent`, distinct
+sandbox images).
 
 ### 5.3 Job Runner
 Owns one loop. Interface: `Setup`, `Start`, `Wait`, `Collect`, `Teardown`.
@@ -152,39 +157,61 @@ and pre-warming are never the throughput bottleneck. Modes:
   pause. Each step matches tasks to parked environments by image, resets or
   forks the matched, creates the rest, and parks or deletes the surplus. When
   prefetch is enabled, uses the resolved schedule to pre-warm the next step's
-  pools and retire the previous step's surplus, recording churn, lead margin
-  (next step's pools ready minus step boundary) and release overlap. Replaces
-  today's fixed fleet.
+  pools and retire the previous step's surplus, recording standing warm pool
+  size, churn, lead margin (next step's pools ready minus step boundary),
+  release overlap, and operation errors/retries/timeouts. Replaces today's
+  fixed fleet.
 - **open-loop** (optional): Poisson arrivals regardless of completion, to find
   the throughput knee.
 
 ### 5.5 SDK instrumentation
 In `measure` mode, the SDK exports in-memory Prometheus metrics (counters and
-histograms for operation duration, `claim`-to-`Ready` vs. `Ready`-to-first-command
-sub-phases, acquisition source and node cache state) scraped by `Measurements`,
+histograms for lifecycle and command/grading execution duration, cumulative
+per-task sandbox execution time, `caller_wait_for_slot` [throttled by
+`max_concurrent`] vs. `wire_claim_to_ready` vs. `Ready`-to-first-command
+sub-phases, acquisition source [`warm_pool`, `cold_create`, `golden_restore`,
+`fork`, `resume`], node cache state [`warm` | `cold`], retries, errors, and
+readiness timeouts with their cumulative time cost) scraped by `Measurements`,
 avoiding per-call logging overhead. In `trace` mode, a verbose flag logs one
 JSONL record per call with payloads and timing detail (`Trace.jsonl`). A
 converter turns a trace into trajectories plus an explicit schedule.
 
 ### 5.6 Measurements
-Per SUT, config-driven. Scrapes server-side and cluster metrics for the run
-window and saves controller and API logs:
+Per SUT, config-driven. For every run (regardless of success or failure),
+scrapes server-side and cluster Prometheus metrics for the run window and
+always saves controller, API, and node/worker daemon logs:
 
-- **Sandbox and lifecycle internals**: image pull latency, template and
-  snapshot creation rates, per-node and per-pod readiness rates, active vs.
-  idle sandboxes.
-- **Cluster health**: node readiness transitions, network identity count and
-  creation rate, API server and object-store rate-limit responses (HTTP 429s),
-  database connection saturation, controller restarts and leader-election
-  losses, queue admission latency.
-- **Hardware utilization**: total and active sandboxes per node and per vCPU
-  over the run window.
+- **Sandbox and lifecycle internals**: template and snapshot creation rates,
+  per-node and per-pod readiness wall time and rates, per-pool and per-object
+  readiness latency, canonical startup/restore and checkpoint sub-phases parsed
+  from structured node/worker timing logs (Substrate `Restore`/`Checkpoint
+  timing breakdown`: `manifest_fetch`, `download`, `oci_unpack`,
+  `worker_restore`/`worker_checkpoint`, `persist`, split by `golden` vs.
+  `latest`; Kubernetes `PodStartupLatency`: `schedule`, `image_pull`,
+  `container_start`, `ready_to_serving`), data-plane router
+  CPU/connections/proxy latency, and peak/sustained claim rates.
+- **Cluster and node health (USE & K8s scalability)**: worker node and pod CPU,
+  memory, and disk I/O pressure (PSI `stall_pct`), node disk space used %,
+  image/snapshot cache eviction counts, container `OOMKill` and kubelet
+  eviction counts, node readiness transitions, network identity count and
+  creation rate, API server request latency (`p99`) and rate-limit responses
+  (HTTP 429s, plus object-store 429s/5xx), controller `workqueue` depth and
+  queue duration, database connection saturation, controller restarts and
+  leader-election losses, queue admission latency.
+- **Hardware and storage utilization**: active vs. total (active + parked/warm)
+  sandboxes per node, per vCPU, per GiB RAM, and per worker pod
+  (`p50`/`p90`/`p99`), worker pool bin-packing ratio (`cluster_packing`),
+  actual sandbox CPU and memory working-set (`WSS`) vs. requested footprint,
+  worker vs. system/control-plane/router node counts, and canonical snapshot
+  telemetry (`size_mb` percentiles, `checkpoints_in_window`, `checkpoint_mb_s`).
 
 ### 5.7 Orchestrator CLI
 Phases: provision or accept an endpoint; resolve schedules; prewarm configured
-initial images across jobs, recorded as events; set up every job runner before
-any start; start each job at its offset and wait; collect from runners and
-measurements; reap run resources (timed clear of claims, pools, templates,
+initial images across jobs (recording total prepare wall time, per-pool
+readiness time, and per-object readiness times as events); set up every job
+runner before any start; start each job at its offset and wait; collect from
+runners and measurements (always archiving metrics and logs regardless of pass
+or fail); reap run resources (timed clear of claims, pools, templates,
 sandboxes and pods to zero, recorded as events); tear down runners, then
 optionally the SUT; validate; report.
 
@@ -192,18 +219,49 @@ optionally the SUT; validate; report.
 Events carry run, job, step, environment, instance, acquisition source and
 node cache state. The report gives:
 
-- **Per-job percentile (`p50`/`p90`/`p95`/`max`) and per-step tables**: TTFI
-  (total and split by `claim`-to-`Ready` vs. `Ready`-to-first-command,
-  acquisition source, and warm vs. cold cache), lifecycle operations (`create`,
-  `fork`, `suspend`/`pause`, `wake`, `delete`), per-step barrier time, fleet
-  park and release times, prefetch lead margin, churn per step, task and
-  distinct-image counts, and reward rate.
-- **Trainer metrics** (for real jobs): step wall-clock breakdown (sampling
-  waits on sandbox acquire, command execution, and reward; training; weight
-  transfer), token and FLOP throughput per accelerator, and reward convergence.
-- **Cluster health, reap and hardware cost**: cluster health summary, reap
-  wall time to zero and deletion rate, sandboxes (total and active) per node
-  and per vCPU percentiles, and node-hours per completed task.
+- **Prepare stage**: total prepare wall time (`setup()` to warm pools/snapshots
+  ready), per-node and per-worker-pod readiness wall time and rates,
+  templates/snapshots created per second, time per pool to become ready, and
+  time per object in pool to become ready percentiles.
+- **Per-job percentile (`p50`/`p90`/`p95`/`max`) and per-step tables**:
+  - **TTFI & claim throughput**: client-boundary TTFI (total and split by
+    `caller_wait_for_slot` vs. `wire_claim_to_ready` vs.
+    `Ready`-to-first-command, acquisition source [`warm_pool`, `cold_create`,
+    `golden_restore`, `fork`, `resume`], and warm vs. cold node cache),
+    readiness timeout count and cumulative time cost, and peak/sustained claim
+    rate (claims/s).
+  - **Active lifecycle & per-step pool stages**: **in-sandbox execution times**
+    (per-command/step execution latency by name [e.g., tool calls, `run_tests`,
+    `grade`], **total per-task in-sandbox execution time** [cumulative command +
+    grading time after TTFI], and **total per-task wall time** [claim through
+    TTFI + all sandbox executions to completion], split by warm vs. cold and
+    acquisition source to surface lazy-restore I/O penalties), lifecycle
+    operations (`create`, `fork`, `suspend`/`pause`, `wake`/`resume`, `delete`,
+    split by warm vs. cold and canonical server sub-phases [`manifest_fetch`,
+    `download`/`image_pull`, `oci_unpack`, `worker_restore`/`worker_checkpoint`,
+    `persist`]), data-plane router proxy latency, error/retry/timeout counts,
+    warm-pool hit rate (%), standing warm pool size, fleet park and release
+    wall times, release overlap with the next step's create burst, prefetch
+    lead margin, churn per step, leaked/orphaned resources at step release,
+    task/group/step/distinct-image counts, and reward rate.
+- **RL step & rollout breakdown**: step wall-clock breakdown (`rollout`,
+  `weight_sync`, `train`), unified per-step rollout decomposition at `p50` and
+  `p100` (the step-barrier straggler) into `llm_think` + `env_wait`
+  (`sdk_slot_wait`, `ttfi`, `exec`, `grade`, `park`)—yielding per-step barrier
+  time, straggler skew (`p100 / p50`), **environment overhead fraction
+  (`env_wait / rollout_time`)**, and **accelerator bubble / sandbox-stalled
+  fraction (`accelerator-hours/task`)**—plus sampler and trainer token
+  throughput (`tokens/s/accelerator`), training model FLOP throughput
+  (`FLOPs/s/accelerator`), and reward convergence.
+- **Cluster health, reap and hardware/storage cost**: cluster and node health
+  summary (node/pod CPU/mem/IO PSI `stall_pct`, `OOMKill`/kubelet/cache
+  evictions, API server `p99` latency & 429s, controller `workqueue` depth &
+  lag), reap wall time to zero, deletion rate (objects/s), and remaining orphan
+  count, active vs. total sandbox counts and density (`sandboxes` per node, per
+  vCPU, per GiB RAM, per worker pod, and `cluster_packing`), actual vs.
+  requested sandbox CPU and memory `WSS`, **worker vs. system/control-plane
+  node-hours per completed task**, and **snapshot volume and throughput
+  (`size_mb` percentiles, `checkpoints_in_window`, `checkpoint_mb_s`)**.
 - **Multi-job interference**: a cross-job timeline with latency split by how
   many other jobs were active, plus run validity and the system description.
 
@@ -272,19 +330,19 @@ while breaking the system.
 
 | # | Item | Deliverable | Acceptance | Depends on |
 |---|---|---|---|---|
-| W1 | Artifact schemas | Go types with version fields for scenario, job, schedule, trace, events (extend with sub-phase, acquisition source, cache state, pool prefetch/retire, reap and trainer step events), report (extend with lifecycle, trainer, cluster health and hardware cost sections); JSON schema files; golden fixtures | round-trip tests with `DisallowUnknownFields`; schema validation helper usable from Go and Python; old events files still parse | none |
+| W1 | Artifact schemas | Go types with version fields for scenario (with repeat count), job (with steps, tasks per step, group size, concurrency), schedule, trace, events (extend with client queue wait, sub-phase, acquisition source, cache state, prepare/pool/object readiness, prefetch/retire, retry/timeout, reap and trainer step events), report (extend with prepare, straggler decomposition, lifecycle, trainer, cluster/node health and hardware/storage cost sections); JSON schema files; golden fixtures | round-trip tests with `DisallowUnknownFields`; schema validation helper usable from Go and Python; old events files still parse | none |
 | W2 | Schedule resolver | explicit, sampled (seeded) and fixed sources resolve to one explicit form; saved as resolved schedule JSON | same seed gives identical output; fixture covers each source; validates against W1 schema | W1 |
-| W3 | Steps-mode pool and prefetch | load generator matches tasks to parked environments by image, resets or forks, creates, parks or deletes surplus; supports configurable step pause, async next-step pool prefetch and previous-step retirement; emits churn, lead-margin and release-overlap events | in-memory backend test with changing images per step, step pause and async prefetch proving positive lead margin; `go test -bench` throughput test; existing steps tests pass | W1, W2 |
-| W4 | Job field in events and extended report | events carry job id and attribution fields; report groups per job, computes exact percentiles from raw events, splits TTFI and lifecycle metrics by source/cache state, computes hardware cost (including node-hours per task) and cross-job interference split | report test over a multi-job, multi-step raw events and measurements fixture verifying exact percentiles and interference buckets | W1 |
+| W3 | Steps-mode pool and prefetch | load generator matches tasks to parked environments by image, resets or forks, creates, parks or deletes surplus; supports configurable step pause, async next-step pool prefetch and previous-step retirement; emits standing warm pool size, churn, lead-margin, release-overlap and error/retry/timeout events | in-memory backend test with changing images per step, step pause and async prefetch proving positive lead margin; `go test -bench` throughput test; existing steps tests pass | W1, W2 |
+| W4 | Job field in events and extended report | events carry job id and attribution fields; report groups per job, computes exact percentiles from raw events, reports prepare stage, peak/sustained claim rates, client-boundary TTFI split by source/cache state, per-command and full per-task sandbox execution time (`task_exec` post-TTFI and total `task_wall` split by source/cache state), lifecycle metrics with canonical server sub-phases, unified per-step rollout decomposition (`p50`/`p100` straggler skew, barrier time, `env_overhead_pct`), readiness timeout cost, hardware/storage cost (active vs. total density per node/vCPU/GiB RAM/pod, `cluster_packing`, worker vs. system node-hours/task, actual vs. requested CPU/memory `WSS`, snapshot `size_mb`/`checkpoints_in_window`/`checkpoint_mb_s`) and cross-job interference split | report test over a multi-job, multi-step raw events and measurements fixture verifying exact percentiles and interference buckets | W1 |
 | W5 | Validity rules | validator over events, measurements and scenario (including zero-orphan reap check and missing-measurement check); report carries validity and reasons | one test per rule, pass and fail | W1, W4 |
 | W6 | Comparator | `swebench-loader compare A.json B.json -thresholds T.yaml`; nonzero exit on regression | fixture pair with a planted regression | W4 |
 | W7 | Simulated Job Runner | Go implementation of the runner interface staging manifest/schedule files and deploying the load generator in-cluster without client-side throughput bottlenecks; replaces run-in-cluster.sh | smoke scenario with one job runs end to end against a cluster | W1, W2 |
 | W8 | Provisioner, Reaper and Backend drivers | Helm/manifest provision, server-queried timed reap to zero and teardown; `Backend` drivers covering SDK and direct-API access across supported sandbox backends; system description written | hermetic fake-API unit tests plus cluster smoke run verifying server-side orphan count reaches zero | W1 |
-| W9 | Measurements | config-driven Prometheus/cluster queries (image pull, readiness rates, node/identity/429/DB/controller/queue health, sandboxes per node and vCPU) and log capture for a run window; distinguishes `0` from missing/failed scrape | test against fake Prometheus HTTP server covering both valid series and scrape failure; smoke run attaches measurements to report | W1, W8 |
-| W10 | Orchestrator CLI | `cmd/benchmarking/bench run SCENARIO.yaml` driving phases in 5.7 strictly via file artifacts, including timed reap | two simulated jobs with offsets run concurrently; reap converges to zero; report is valid | W2, W4, W5, W7, W8, W9 |
-| W11 | SDK instrumentation | in-memory Prometheus metrics in `measure` mode (sub-phase and acquisition source labels from existing responses, zero extra RPCs, zero per-call logs); verbose `trace` flag emitting `Trace.jsonl`; overhead benchmarked | emitted traces validate against W1 JSON schema; microbenchmark proves measure-mode metric overhead stays under bound; trace fixture produced | W1 |
+| W9 | Measurements | config-driven Prometheus/cluster queries (node/pod/pool/object readiness, router proxy latency, peak/sustained claims, node/pod CPU/mem/IO PSI, `OOMKill`/kubelet/cache evictions, node/identity/API `p99`/429/workqueue/DB/controller/queue health, active vs. total sandboxes per node/vCPU/GiB RAM/pod, `cluster_packing`, actual CPU/memory `WSS`, worker vs. system nodes, snapshot `size_mb`/`checkpoints_in_window`/`checkpoint_mb_s`), structured node timing log parser for canonical restore/checkpoint/pod-startup sub-phases, and unconditional controller/API/node log capture (regardless of run pass or fail); distinguishes `0` from missing/failed scrape | test against fake Prometheus HTTP server covering both valid series and scrape failure; smoke run attaches measurements and logs to report | W1, W8 |
+| W10 | Orchestrator CLI | `cmd/benchmarking/bench run SCENARIO.yaml` driving phases in 5.7 strictly via file artifacts, including timed prepare, unconditional metric/log collection, and timed reap | two simulated jobs with offsets run concurrently; reap converges to zero; report is valid | W2, W4, W5, W7, W8, W9 |
+| W11 | SDK instrumentation | in-memory Prometheus metrics in `measure` mode (lifecycle, per-command `exec`/grade, and total per-task sandbox execution histograms, client slot-wait vs. wire sub-phases, acquisition source and cache state labels from existing responses, retry/error/timeout counters, zero extra RPCs, zero per-call logs); verbose `trace` flag emitting `Trace.jsonl`; overhead benchmarked | emitted traces validate against W1 JSON schema; microbenchmark proves measure-mode metric overhead stays under bound; trace fixture produced | W1 |
 | W12 | Trace converter | trace JSONL to trajectories plus explicit schedule preserving concurrency profile, payload sizes and per-step inter-command think times | end-to-end chain test: W11 trace $\to$ W12 $\to$ W3 load generator reproduces step counts, concurrency histogram and think-time distribution | W1, W2, W3, W11 |
-| W13 | Real Job Runner | runner interface over one trainer, measure and trace modes; exports trainer step breakdown and accelerator throughput | one real job runs through the orchestrator; trace mode yields a trace W12 converts and replays | W10, W11, W12 |
+| W13 | Real Job Runner | runner interface over one trainer, measure and trace modes; exports trainer step breakdown (`rollout`, `weight_sync`, `train`), environment overhead fraction (`env_wait/rollout_time`), accelerator bubble/stalled fraction and accelerator-hours per task, sampler and trainer token/s/accelerator, FLOPs/s/accelerator, and rewards | one real job runs through the orchestrator; trace mode yields a trace W12 converts and replays | W10, W11, W12 |
 | W14 | Open-loop mode (optional) | Poisson arrival mode in the load generator | in-memory test shows arrivals independent of completion; report shows the knee | W3 |
 
 ## 9. Milestones (incremental delivery and verification)
@@ -299,7 +357,7 @@ defects surface before scaling up complexity or hardware cost.
 | **M1: Single-Job Step-Pool & Regression Gate (Core MVP)** | Deterministic multi-step simulated RL loops (with dynamic per-step image sets, environment reuse/churn, step pauses and async next-step pool prefetch) against an existing endpoint, with automated validity and regression diffing. | `W1`, `W2`, `W3`, `W4` (single-job & lifecycle tables), `W5` (event/schedule rules), `W6` | Resolve a seeded multi-step schedule with changing images per step $\to$ run `swebench-loader` in `steps` mode against a live endpoint $\to$ emit a valid `Report.json` with positive prefetch lead margin $\to$ pass `compare` against a baseline report. |
 | **M2: Automated SUT Lifecycle, Server Telemetry & Backend Drivers** | Self-contained single-job runs with automated SUT provisioning, server-side cluster health and hardware-cost telemetry, timed cluster reap to zero orphans, and A/B comparisons across backends and access layers (SDK vs. direct API). | `W7`, `W8`, `W9`, plus `W4`/`W5` extensions for measurements, hardware cost and zero-orphan reap | Provision a SUT from scratch $\to$ run an in-cluster simulated job through both the SDK driver and the direct-backend driver $\to$ attach scraped `Measurements` $\to$ verify `Reap` reaches zero server-side orphans $\to$ compare SDK vs. direct reports. |
 | **M3: Multi-Job Contention & Throughput Saturation** | Concurrent multi-loop RL workloads sharing one SUT (staggered or aligned step barriers, independent pool churn) to measure cross-job interference, plus open-loop arrival sweeps to find throughput knees. | `W10`, `W4` (cross-job timeline & interference split), `W14` | `bench run SCENARIO.yaml` executes multiple offset simulated jobs concurrently on a shared SUT, prewarms initial pools, produces a valid report with cross-job interference tables, and reaps the cluster to zero. |
-| **M4: SDK Telemetry & Trace-to-Simulation Replay** | Always-on low-overhead SDK event logging (`measure` mode) and offline conversion of verbose SDK call traces (`trace` mode) into deterministic schedules and trajectories replayable by the simulated loader without accelerators. | `W11`, `W12` | Capture a verbose `Trace.jsonl` from an SDK workload $\to$ convert via `W12` into `Trajectory` YAMLs and a `Resolved schedule` $\to$ replay through `M3` (`swebench-loader`) and verify step counts, concurrency histogram and think-time distribution match the trace. |
+| **M4: SDK Telemetry & Trace-to-Simulation Replay** | Always-on low-overhead SDK metrics (`measure` mode) and offline conversion of verbose SDK call traces (`trace` mode) into deterministic schedules and trajectories replayable by the simulated loader without accelerators. | `W11`, `W12` | Capture a verbose `Trace.jsonl` from an SDK workload $\to$ convert via `W12` into `Trajectory` YAMLs and a `Resolved schedule` $\to$ replay through `M3` (`swebench-loader`) and verify step counts, concurrency histogram and think-time distribution match the trace. |
 | **M5: Live Trainer Benchmarking** | End-to-end real RL training loops orchestrated against the SUT in both `measure` mode (unified sandbox + trainer step/throughput reporting) and `trace` mode (feeding new real workloads into `M4`). | `W13` | Orchestrate one real trainer job in `measure` mode (yielding a valid `Report.json` with trainer step breakdown and accelerator throughput) and one in `trace` mode (whose trace converts and replays cleanly through `M4`). |
 
 **Parallel execution & fail-fast ordering**:

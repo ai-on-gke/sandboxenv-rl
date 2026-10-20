@@ -74,8 +74,9 @@ requires one. Use an ate-env from before this bump with an older Substrate. Beca
 longer names a class, an actor booting without a snapshot can land on any pool whose labels its
 template's `workerSelector` matches, and on any pool at all without a selector. `ate-env` labels its
 WorkerPool `ate-env/workerpool: <pool>` and each template selects that label, thus actors stay on
-their pool and its sandbox class; `--workerpool` on `ate-env manifest template` must name the same
-pool as on `ate-env manifest` (both default to `<template>-workerpool`). The templates also use
+their pool and its sandbox class; `--workerpool` on `ate-env manifest template` names the pool to select:
+it defaults to `default-template-workerpool`, the pool `ate-env manifest` creates by default, whatever
+the template is named. Pass it when you deploy with another `--template` or `--workerpool`. The templates also use
 `snapshotConfig` and `wakeupProbe` and declare CPU and memory limits, and `--worker-image` must be the
 `ateworker-gvisor` image published by the same Substrate install.
 

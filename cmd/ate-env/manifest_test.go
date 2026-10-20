@@ -595,8 +595,11 @@ func TestManifestTemplateSelectsTheNamedPool(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "ate-env/workerpool: py-workerpool") {
-		t.Errorf("default pool is not <template>-workerpool:\n%s", out.String())
+	// A template named py still selects the pool ate-env manifest creates by
+	// default; py-workerpool does not exist, and its actors would never
+	// schedule.
+	if !strings.Contains(out.String(), "ate-env/workerpool: default-template-workerpool") {
+		t.Errorf("a template's default pool is not default-template-workerpool:\n%s", out.String())
 	}
 }
 
@@ -604,7 +607,7 @@ func TestWorkerPoolNameMustFitALabelValue(t *testing.T) {
 	long := strings.Repeat("t", 53) // 53 + len("-workerpool") = 64
 	for _, args := range [][]string{
 		{"--template", long, "--worker-image", "example.com/w@sha256:bbbb", "--api-image", "example.com/a@sha256:cccc"},
-		{"template", "--template", long, "--guest-image=example.com/guest@sha256:aaaa", "--snapshots-bucket=gs://b/p/"},
+		{"template", "--workerpool", long + "-workerpool", "--guest-image=example.com/guest@sha256:aaaa", "--snapshots-bucket=gs://b/p/"},
 	} {
 		cmd := newManifestCommand()
 		cmd.SetOut(&bytes.Buffer{})

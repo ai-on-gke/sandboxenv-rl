@@ -45,9 +45,15 @@ const apiName = "ate-env-api"
 // boots without a snapshot can land on any pool of any class in the cluster.
 const workerPoolLabel = "ate-env/workerpool"
 
-// defaultWorkerPool is the pool name both commands use unless --workerpool
-// says otherwise.
+// defaultWorkerPool is the pool name `ate-env manifest` gives its WorkerPool,
+// <template>-workerpool, unless --workerpool says otherwise.
 func defaultWorkerPool(template string) string { return template + "-workerpool" }
+
+// defaultTemplatePool is the pool a template selects unless --workerpool says
+// otherwise: the one `ate-env manifest` creates with its defaults. A cluster
+// usually runs one pool and registers many templates on it, thus the default
+// does not follow the template's own name.
+var defaultTemplatePool = defaultWorkerPool(apiservice.DefaultTemplate)
 
 // maxLabelValueLen is the Kubernetes limit on a label value. The pool name is
 // the value of workerPoolLabel, thus it must fit, while a WorkerPool name
@@ -341,7 +347,7 @@ It prints YAML to stdout without touching the cluster.`,
 				tCfg.template = apiservice.DefaultTemplate
 			}
 			if tCfg.workerPool == "" {
-				tCfg.workerPool = defaultWorkerPool(tCfg.template)
+				tCfg.workerPool = defaultTemplatePool
 			}
 			if err := checkWorkerPoolName(tCfg.workerPool); err != nil {
 				return err
@@ -367,7 +373,7 @@ It prints YAML to stdout without touching the cluster.`,
 	}
 
 	cmd.Flags().StringVar(&tCfg.template, "template", apiservice.DefaultTemplate, "ActorTemplate name")
-	cmd.Flags().StringVar(&tCfg.workerPool, "workerpool", "", "WorkerPool the actors run on, selected by its "+workerPoolLabel+" label (defaults to <template>-workerpool, as in ate-env manifest)")
+	cmd.Flags().StringVar(&tCfg.workerPool, "workerpool", "", "WorkerPool the actors run on, selected by its "+workerPoolLabel+" label (defaults to "+defaultTemplatePool+", the pool ate-env manifest creates by default)")
 	cmd.Flags().StringVar(&tCfg.atespace, "atespace", apiservice.DefaultAtespace, "Substrate atespace for the ActorTemplate")
 	cmd.Flags().StringVar(&tCfg.guestImage, "guest-image", defaultGuestImage, imageDefaultHelp("digest-pinned ate-env-guest image (repo@sha256:...)", defaultGuestImage))
 	cmd.Flags().StringSliceVar(&tCfg.guestCommand, "guest-command", []string{"/ko-app/ate-env-guest"}, "guest container entrypoint")
@@ -576,7 +582,7 @@ func buildActorTemplate(cfg templateConfig) *ateapipb.ActorTemplate {
 	}
 	pool := cfg.workerPool
 	if pool == "" {
-		pool = defaultWorkerPool(cfg.template)
+		pool = defaultTemplatePool
 	}
 	return &ateapipb.ActorTemplate{
 		Metadata: &ateapipb.ResourceMetadata{

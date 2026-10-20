@@ -142,6 +142,11 @@ func TestDelete(t *testing.T) {
 	if err := f.client.Delete(ctx, "", "sb-life"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
+	// The snapshot is deleted right away: the suspend before it must not wait
+	// for a durable upload.
+	if got := f.control.SuspendModes; len(got) != 1 || got[0] != ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS {
+		t.Fatalf("suspend modes = %v, want one ASYNCHRONOUS", got)
+	}
 }
 
 func TestCreateRequiresTemplate(t *testing.T) {

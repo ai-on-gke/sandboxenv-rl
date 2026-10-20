@@ -49,6 +49,19 @@ const workerPoolLabel = "ate-env/workerpool"
 // says otherwise.
 func defaultWorkerPool(template string) string { return template + "-workerpool" }
 
+// maxLabelValueLen is the Kubernetes limit on a label value. The pool name is
+// the value of workerPoolLabel, thus it must fit, while a WorkerPool name
+// itself can be longer.
+const maxLabelValueLen = 63
+
+func checkWorkerPoolName(pool string) error {
+	if len(pool) > maxLabelValueLen {
+		return fmt.Errorf("worker pool name %q has %d characters; it is the value of the %s label, "+
+			"which allows %d: pass a shorter --workerpool", pool, len(pool), workerPoolLabel, maxLabelValueLen)
+	}
+	return nil
+}
+
 // sandboxConfigName is the Substrate SandboxConfig the WorkerPool's gvisor
 // sandbox class refers to. `ate-setup deploy ate-system` installs exactly this
 // one, so a pool declared with it is schedulable on a stock install. Since
@@ -261,6 +274,9 @@ the "template" subcommand: ate-env manifest template`,
 			if mCfg.workerPool == "" {
 				mCfg.workerPool = defaultWorkerPool(mCfg.template)
 			}
+			if err := checkWorkerPoolName(mCfg.workerPool); err != nil {
+				return err
+			}
 			if err := mCfg.resolveImages(); err != nil {
 				return err
 			}
@@ -326,6 +342,9 @@ It prints YAML to stdout without touching the cluster.`,
 			}
 			if tCfg.workerPool == "" {
 				tCfg.workerPool = defaultWorkerPool(tCfg.template)
+			}
+			if err := checkWorkerPoolName(tCfg.workerPool); err != nil {
+				return err
 			}
 			if err := tCfg.resolveImages(); err != nil {
 				return err

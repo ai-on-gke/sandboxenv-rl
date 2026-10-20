@@ -303,9 +303,13 @@ func (c *Client) Get(ctx context.Context, atespace, id string) (*ateapipb.Actor,
 // stays on the node and uploads in the background); ate-env keeps the
 // durable behavior it always had.
 func (c *Client) Suspend(ctx context.Context, atespace, id string) error {
+	return c.suspend(ctx, atespace, id, ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS)
+}
+
+func (c *Client) suspend(ctx context.Context, atespace, id string, mode ateapipb.DurabilityMode) error {
 	req := &ateapipb.SuspendActorRequest{
 		Actor:   c.ref(atespace, id),
-		Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
+		Options: &ateapipb.SuspendOptions{Mode: mode},
 	}
 	if _, err := c.control.SuspendActor(ctx, req); err != nil {
 		return fmt.Errorf("ate: suspending %q: %w", id, wrapGRPCError(err))
@@ -317,7 +321,10 @@ func (c *Client) Suspend(ctx context.Context, atespace, id string) error {
 // actors, so Delete suspends the actor first.
 // If atespace is empty, DefaultAtespace is used.
 func (c *Client) Delete(ctx context.Context, atespace, id string) error {
-	if err := c.Suspend(ctx, atespace, id); err != nil {
+	// Substrate deletes only suspended actors. The snapshot is deleted right
+	// after, thus waiting for it to reach object storage is wasted time: the
+	// suspend before a delete is asynchronous.
+	if err := c.suspend(ctx, atespace, id, ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS); err != nil {
 		return err
 	}
 	_, err := c.control.DeleteActor(ctx, &ateapipb.DeleteActorRequest{Actor: c.ref(atespace, id)})

@@ -599,3 +599,25 @@ func TestManifestTemplateSelectsTheNamedPool(t *testing.T) {
 		t.Errorf("default pool is not <template>-workerpool:\n%s", out.String())
 	}
 }
+
+func TestWorkerPoolNameMustFitALabelValue(t *testing.T) {
+	long := strings.Repeat("t", 53) // 53 + len("-workerpool") = 64
+	for _, args := range [][]string{
+		{"--template", long, "--worker-image", "example.com/w@sha256:bbbb", "--api-image", "example.com/a@sha256:cccc"},
+		{"template", "--template", long, "--guest-image=example.com/guest@sha256:aaaa", "--snapshots-bucket=gs://b/p/"},
+	} {
+		cmd := newManifestCommand()
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "pass a shorter --workerpool") {
+			t.Errorf("%v: err = %v, want the label-length error", args[:2], err)
+		}
+		cmd = newManifestCommand()
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetArgs(append(args, "--workerpool", "short-pool"))
+		if err := cmd.Execute(); err != nil {
+			t.Errorf("%v with --workerpool: %v", args[:2], err)
+		}
+	}
+}

@@ -73,13 +73,11 @@ class Env:
         return self._atespace
 
     def _metadata(self) -> tuple[tuple[str, str], ...]:
-        md: tuple[tuple[str, str], ...] = (
+        return (
             ("x-env-id", self._id),
             ("x-env-atespace", self._atespace),
+            *self._client._auth_metadata(),
         )
-        if self._client._auth_token:
-            md = (*md, ("authorization", f"Bearer {self._client._auth_token}"))
-        return md
 
     async def info(self) -> EnvironmentInfo:
         """Retrieve the environment's current status and configuration."""

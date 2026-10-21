@@ -241,7 +241,8 @@ async def test_auth_interceptor_sends_bearer_on_all_call_shapes():
         await server.stop(None)
 
 
-async def test_auth_token_sent_once_across_unary_and_streaming_env_rpcs():
+@pytest.mark.parametrize("external_channel", [False, True], ids=["owned", "external"])
+async def test_auth_token_sent_once_across_unary_and_streaming_env_rpcs(external_channel):
     seen_auth: list[tuple[str, list[str]]] = []
 
     class RequireBearerInterceptor(grpc.aio.ServerInterceptor):
@@ -268,7 +269,10 @@ async def test_auth_token_sent_once_across_unary_and_streaming_env_rpcs():
     port = server.add_insecure_port("127.0.0.1:0")
     await server.start()
 
-    client = Client(f"127.0.0.1:{port}", auth_token="s3cr3t")
+    # A caller-owned channel has no auth interceptors: the client must still
+    # send the token on its own unary RPCs and on the Env RPCs.
+    channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}") if external_channel else None
+    client = Client(f"127.0.0.1:{port}", channel=channel, auth_token="s3cr3t")
     try:
         env = await client.create("dev1")
         await env.info()
@@ -280,13 +284,19 @@ async def test_auth_token_sent_once_across_unary_and_streaming_env_rpcs():
         res = await env.shell("cat", stdin=b"in")
         assert res.exit_code == 0
         assert res.stdout == "ok\nin"
+        await client.suspend("dev1")
+        await client.delete("dev1")
     finally:
         await client.close()
+        if channel is not None:
+            await channel.close()
         await server.stop(None)
 
     methods = {m for m, _ in seen_auth}
     assert "/ateenv.v1alpha.EnvironmentService/CreateEnvironment" in methods
     assert "/ateenv.v1alpha.EnvironmentService/GetEnvironment" in methods
+    assert "/ateenv.v1alpha.EnvironmentService/SuspendEnvironment" in methods
+    assert "/ateenv.v1alpha.EnvironmentService/DeleteEnvironment" in methods
     assert "/ateenv.v1alpha.FileSystemService/WriteFile" in methods
     assert "/ateenv.v1alpha.FileSystemService/ReadFile" in methods
     assert "/ateenv.v1alpha.ProcessService/StartProcess" in methods

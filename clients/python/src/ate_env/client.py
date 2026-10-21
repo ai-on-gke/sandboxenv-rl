@@ -144,6 +144,14 @@ class Client:
         self._processes = guest_pb2_grpc.ProcessServiceStub(self._channel)
         self._filesystem = guest_pb2_grpc.FileSystemServiceStub(self._channel)
 
+    def _auth_metadata(self) -> tuple[tuple[str, str], ...]:
+        # Sent on each call as well as by the interceptors: a caller-owned
+        # channel has no interceptors, and the interceptors skip a call that
+        # already carries authorization, so the header is never doubled.
+        if not self._auth_token:
+            return ()
+        return (("authorization", f"Bearer {self._auth_token}"),)
+
     async def close(self) -> None:
         """Release the client's resources (closes the channel if owned)."""
         if self._owns_channel:
@@ -175,7 +183,7 @@ class Client:
             req.template.name = template_name or ""
             req.template.atespace = template_atespace or ""
         try:
-            resp = await self._environments.CreateEnvironment(req)
+            resp = await self._environments.CreateEnvironment(req, metadata=self._auth_metadata())
         except grpc.RpcError as e:
             raise map_rpc_error(e) from e
         created = resp.environment
@@ -185,7 +193,7 @@ class Client:
         """Retrieve the status and configuration of an environment."""
         req = env_pb2.GetEnvironmentRequest(id=id, atespace=atespace)
         try:
-            resp = await self._environments.GetEnvironment(req)
+            resp = await self._environments.GetEnvironment(req, metadata=self._auth_metadata())
         except grpc.RpcError as e:
             raise map_rpc_error(e) from e
         return _environment_info_from_pb(resp.environment)
@@ -194,7 +202,7 @@ class Client:
         """Checkpoint and stop the environment."""
         req = env_pb2.SuspendEnvironmentRequest(id=id, atespace=atespace)
         try:
-            await self._environments.SuspendEnvironment(req)
+            await self._environments.SuspendEnvironment(req, metadata=self._auth_metadata())
         except grpc.RpcError as e:
             raise map_rpc_error(e) from e
 
@@ -202,7 +210,7 @@ class Client:
         """Remove the environment permanently."""
         req = env_pb2.DeleteEnvironmentRequest(id=id, atespace=atespace)
         try:
-            await self._environments.DeleteEnvironment(req)
+            await self._environments.DeleteEnvironment(req, metadata=self._auth_metadata())
         except grpc.RpcError as e:
             raise map_rpc_error(e) from e
 

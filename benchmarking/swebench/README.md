@@ -58,6 +58,41 @@ p50, p95 and max per event, a per-step table (tasks, barrier, park, wake
 p50/p95) and the most frequent errors. The JSON is the artifact to diff
 between runs.
 
+## How many actors, and on which clusters
+
+Every environment the loader creates is one Substrate actor. Three flags
+set how many:
+
+| Flag | Controls |
+|---|---|
+| `-width` | actors in flight at once; also the cap on parallel creates |
+| `-tasks-per-image` | eval: actors created per image, each a full create, replay, delete |
+| `-rollouts` | steps: actors per image kept alive across the training steps |
+
+So `-images 445` is many images with one actor each, `-images 1
+-tasks-per-image 2000 -width 500` is one image with 2,000 actors 500 at a
+time, and `-mode steps -rollouts 2 -steps 8` is both with a park between
+steps. Above a few hundred in flight, raise the API server's database
+connection pool: a burst of about 900 creates exhausted the default.
+
+The loader does not decide placement. Whether several actors share one
+worker pod is the WorkerPool's capacity on the cluster; configure it there
+and read the packing from Substrate's metrics, not from the report.
+
+The loader never talks to Kubernetes. `-endpoint` is an ate-env API address,
+so "which cluster" is "which API". To compare clusters (builds, node images,
+image delivery) run the same manifest, trajectory and flags once per
+cluster and diff the summaries; the in-cluster script uses the current
+`kubectl` context, so switch context between runs. Each cluster needs the
+full setup below: Substrate and the ate-env API installed, the images
+reachable from it, and the golden tags baked there (a golden tag is per
+cluster, so the first run on a fresh cluster pays the bake for every image).
+One run never spans clusters.
+
+Telemetry is the JSONL file only. There is no OpenTelemetry export yet; the
+events map one to one onto spans and that export is planned, with the file
+staying the source of truth so a run does not depend on a collector.
+
 ## Prepare once per project
 
 1. Put the task images in a registry the nodes can pull from. If the nodes

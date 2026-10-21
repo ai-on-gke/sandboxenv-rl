@@ -19,17 +19,24 @@
 # at /opt/oh; the guest starts it as a sidecar and holds the actor's readiness
 # until it answers /health. Callers outside the cluster reach it through
 # ate-env-api's port proxy with three routing headers plus the agent-server's
-# own X-Session-API-Key. The script registers a base template, creates one
-# environment per image, drives each agent-server from outside (health, a
-# command, a file download, a call without the key) and deletes the
-# environments, unless KEEP=1. It exits 1 if any agent-server did not answer.
+# own X-Session-API-Key. The script registers a base template when it does not
+# exist, creates one environment per image, drives each agent-server from
+# outside (health, a command, a file download, a call without the key) and
+# deletes the environments, unless KEEP=1. It exits 1 if any agent-server did
+# not answer.
 #
 # Templates are immutable and carry the session key, and the first create from
 # each image derives a template (<base>-<12 hex digits of the image digest>)
-# that copies the key. So before registering, the script deletes the base
-# template and every template derived from it, with their golden snapshots;
-# REUSE=1 keeps an existing base and its derived templates instead, for runs
-# with the same SESSION_KEY.
+# that copies the key. By default the script reuses an existing base template
+# and its derived templates; it then needs the SESSION_KEY they carry. It
+# deletes templates only with RECREATE=1: then it deletes the base template
+# and every template derived from it, with their golden snapshots, and
+# registers the base again. Use RECREATE=1 only for templates that nobody else
+# uses.
+#
+# The session key and the API token go to curl in a header file (mode 0600,
+# removed on exit), not on its command line. The template registration still
+# passes the key in an argument of `ate-env manifest template`.
 #
 # Required:
 #   GUEST_IMAGE       digest-pinned ate-env-guest image (with the -sidecar flags)
@@ -39,10 +46,14 @@
 #                     agent-server in; any image with /bin/sh and glibc 2.31
 #                     or newer
 # Optional:
-#   SESSION_KEY       agent-server API key on the template (default: random,
-#                     never printed; required with KEEP=1 or REUSE=1)
-#   REUSE             1 keeps an existing base template and its derived
-#                     templates (they must carry SESSION_KEY)
+#   SESSION_KEY       agent-server API key on the template. Required when the
+#                     template exists (it carries its own key) and with KEEP=1;
+#                     otherwise random and never printed
+#   RECREATE          1 deletes the base template and its derived templates,
+#                     with their golden snapshots, and registers the base again
+#   API_TOKEN         ate-env-api's bearer token, when it runs with
+#                     -auth-token-file: X-Env-Authorization for the port proxy,
+#                     SUBSTRATE_ENV_AUTH_TOKEN for the ate-env CLI
 #   PORT              agent-server port in the environment (default 8000)
 #   AGENT_SERVER_ENV  space-separated NAME=VALUE settings for the agent-server,
 #                     e.g. "LOG_JSON=true"; each becomes a template --env
@@ -59,18 +70,12 @@
 #                     (default 127.0.0.1:7777; port-forward it)
 #   ATE_ENV, KUBECTL_ATE  binaries (default: on PATH)
 set -euo pipefail
+umask 077
 
 : "${GUEST_IMAGE:?set GUEST_IMAGE to the digest-pinned ate-env-guest image}"
 : "${SNAPSHOTS_BUCKET:?set SNAPSHOTS_BUCKET to the snapshot object-storage URL}"
 : "${LAYER_IMAGE:?set LAYER_IMAGE to the digest-pinned agent-server layer image}"
 : "${IMAGES:?set IMAGES to one or more digest-pinned images}"
-if [ -z "${SESSION_KEY:-}" ]; then
-  if [ "${KEEP:-}" = 1 ] || [ "${REUSE:-}" = 1 ]; then
-    echo "set SESSION_KEY: with KEEP=1 or REUSE=1 you need the key later, and a random one is never printed" >&2
-    exit 2
-  fi
-  SESSION_KEY=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-fi
 PORT=${PORT:-8000}
 # shellcheck disable=SC2016 # expanded by the environment's shell, not here
 COMMAND=${COMMAND:-'head -1 /etc/os-release; echo "user: $(id -un)"; echo "cwd: $(pwd)"'}
@@ -79,25 +84,14 @@ ATESPACE=${ATESPACE:-ate-env}
 API=${API:-127.0.0.1:7777}
 ATE_ENV=${ATE_ENV:-ate-env}
 KUBECTL_ATE=${KUBECTL_ATE:-kubectl-ate}
+if [ -n "${API_TOKEN:-}" ]; then
+  export SUBSTRATE_ENV_AUTH_TOKEN="${API_TOKEN}"
+fi
+if [ -n "${REUSE:-}" ]; then
+  echo "note: REUSE is gone; reusing the templates is the default, RECREATE=1 registers them again" >&2
+fi
 
 step() { printf '\n== %s\n' "$*"; }
-
-# oh <env-id> <curl args...>: one request to the agent-server in <env-id>,
-# through ate-env-api.
-oh() {
-  local id=$1
-  shift
-  curl -sS --max-time 120 \
-    -H "X-Env-Id: ${id}" -H "X-Env-Atespace: ${ATESPACE}" -H "X-Env-Port: ${PORT}" \
-    -H "X-Session-API-Key: ${SESSION_KEY}" "$@"
-}
-
-read -r -a images <<<"${IMAGES}"
-read -r -a settings <<<"${AGENT_SERVER_ENV:-}"
-env_flags=(--env "OH_SESSION_API_KEYS_0=${SESSION_KEY}")
-for kv in ${settings[@]+"${settings[@]}"}; do
-  env_flags+=(--env "${kv}")
-done
 
 # templates: the names of the base template and the templates derived from it.
 templates() {
@@ -114,11 +108,63 @@ for t in d.get("actorTemplates", d.get("actor_templates", [])):
 }
 
 existing=$(templates)
-if [ "${REUSE:-}" = 1 ] && [ -n "${existing}" ]; then
-  step "reusing ${ATESPACE}/${TEMPLATE} and the templates derived from it (REUSE=1)"
+register=1
+if [ -n "${existing}" ] && [ "${RECREATE:-}" != 1 ]; then
+  if [ -z "${SESSION_KEY:-}" ]; then
+    echo "${ATESPACE}/${TEMPLATE} exists and carries its own session key: set SESSION_KEY to that key," >&2
+    echo "or set RECREATE=1 to delete it and the templates derived from it and register it again" >&2
+    exit 2
+  fi
+  register=0
+fi
+if [ -z "${SESSION_KEY:-}" ]; then
+  if [ "${KEEP:-}" = 1 ]; then
+    echo "set SESSION_KEY: with KEEP=1 you need the key later, and a random one is never printed" >&2
+    exit 2
+  fi
+  SESSION_KEY=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+fi
+
+# Header files for curl: the key and the token stay out of every argv.
+headers=$(mktemp -d)
+ids=()
+cleanup() {
+  rm -rf "${headers}"
+  [ "${KEEP:-}" = 1 ] && return
+  for id in "${ids[@]:-}"; do
+    [ -n "${id}" ] && "${ATE_ENV}" --api "${API}" delete "${id}" --atespace "${ATESPACE}" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup EXIT
+printf 'X-Session-API-Key: %s\n' "${SESSION_KEY}" >"${headers}/key"
+: >"${headers}/proxy"
+if [ -n "${API_TOKEN:-}" ]; then
+  printf 'X-Env-Authorization: Bearer %s\n' "${API_TOKEN}" >"${headers}/proxy"
+  cat "${headers}/proxy" >>"${headers}/key"
+fi
+
+# oh <env-id> <curl args...>: one request to the agent-server in <env-id>,
+# through ate-env-api.
+oh() {
+  local id=$1
+  shift
+  curl -sS --max-time 120 \
+    -H "X-Env-Id: ${id}" -H "X-Env-Atespace: ${ATESPACE}" -H "X-Env-Port: ${PORT}" \
+    -H "@${headers}/key" "$@"
+}
+
+read -r -a images <<<"${IMAGES}"
+read -r -a settings <<<"${AGENT_SERVER_ENV:-}"
+env_flags=(--env "OH_SESSION_API_KEYS_0=${SESSION_KEY}")
+for kv in ${settings[@]+"${settings[@]}"}; do
+  env_flags+=(--env "${kv}")
+done
+
+if [ "${register}" = 0 ]; then
+  step "reusing ${ATESPACE}/${TEMPLATE} and the templates derived from it (RECREATE=1 registers it again)"
 else
   for name in ${existing}; do
-    step "delete ${ATESPACE}/${name} (it carries an older session key)"
+    step "delete ${ATESPACE}/${name} (RECREATE=1)"
     "${KUBECTL_ATE}" delete actor-template --atespace "${ATESPACE}" "${name}" >/dev/null
   done
   step "register ${ATESPACE}/${TEMPLATE}: guest + agent-server layer on port ${PORT}"
@@ -129,15 +175,6 @@ else
     --sidecar-readyz "http://127.0.0.1:${PORT}/health" \
     "${env_flags[@]}" | "${KUBECTL_ATE}" create actor-template -f - >/dev/null
 fi
-
-ids=()
-cleanup() {
-  [ "${KEEP:-}" = 1 ] && return
-  for id in "${ids[@]:-}"; do
-    [ -n "${id}" ] && "${ATE_ENV}" --api "${API}" delete "${id}" --atespace "${ATESPACE}" >/dev/null 2>&1 || true
-  done
-}
-trap cleanup EXIT
 
 body=$(COMMAND="${COMMAND}" WORKDIR="${WORKDIR:-}" python3 -c 'import json,os; d={"command": os.environ["COMMAND"], "timeout": 60}; w=os.environ.get("WORKDIR"); d.update({"cwd": w} if w else {}); print(json.dumps(d))')
 
@@ -156,6 +193,12 @@ for image in "${images[@]}"; do
   for _ in $(seq 1 120); do
     code=$(oh "${id}" -o /dev/null -w '%{http_code}' "http://${API}/health" || true)
     [ "${code}" = 200 ] && break
+    case "${code}" in
+    400 | 401 | 403)
+      echo "the port proxy refused ${id} (HTTP ${code}); check API_TOKEN and PORT" >&2
+      break
+      ;;
+    esac
     sleep 5
   done
   if [ "${code}" != 200 ]; then
@@ -163,7 +206,7 @@ for image in "${images[@]}"; do
     failed=$((failed + 1))
     continue
   fi
-  echo "agent-server answering after $(( $(date +%s) - t0 ))s"
+  echo "agent-server answering after $(($(date +%s) - t0))s"
 
   echo "-- command, run with the image's own /bin/sh:"
   oh "${id}" -X POST -H 'Content-Type: application/json' "http://${API}/api/bash/execute_bash_command" -d "${body}" |
@@ -173,12 +216,13 @@ for image in "${images[@]}"; do
   echo "-- without the session key:"
   curl -sS -o /dev/null -w 'HTTP %{http_code}\n' -X POST -H 'Content-Type: application/json' \
     -H "X-Env-Id: ${id}" -H "X-Env-Atespace: ${ATESPACE}" -H "X-Env-Port: ${PORT}" \
-    -d '{"command": "true"}' "http://${API}/api/bash/execute_bash_command"
+    -H "@${headers}/proxy" -d '{"command": "true"}' "http://${API}/api/bash/execute_bash_command"
 done
 
 if [ "${KEEP:-}" = 1 ]; then
   step "kept: ${ids[*]}"
   echo "reach one with: -H 'X-Env-Id: <id>' -H 'X-Env-Port: ${PORT}' -H \"X-Session-API-Key: \$SESSION_KEY\" http://${API}/..."
+  [ -n "${API_TOKEN:-}" ] && echo "  and -H \"X-Env-Authorization: Bearer \$API_TOKEN\""
   echo "delete with: ${ATE_ENV} --api ${API} delete <id> --atespace ${ATESPACE}"
 else
   step "done; deleting the environments (the templates stay for reuse)"

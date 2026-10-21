@@ -12,7 +12,7 @@ base template; these scripts assume both.
 | [`scripted_llm.py`](scripted_llm.py) | a stand-in model that replays a fixed CodeAct trajectory, for runs without a model |
 | [`run_trajectory.py`](run_trajectory.py), [`oh_tool.py`](oh_tool.py), [`trajectories/`](trajectories) | executes a CodeAct trajectory from outside and records the observations |
 | [`demo.sh`](demo.sh) | registers the base template and drives the agent-server over plain HTTP, one environment per image |
-| [`_common.py`](_common.py) | `attach(env_id)`: an `AteEnvWorkspace` on an existing environment, from `API`, `ATESPACE`, `PORT`, `SESSION_KEY`, `WORKDIR` |
+| [`_common.py`](_common.py) | `attach(env_id)`: an `AteEnvWorkspace` on an existing environment, from `API`, `API_TOKEN`, `ATESPACE`, `PORT`, `SESSION_KEY`, `WORKDIR` |
 
 ```bash
 pip install ./clients/python './integrations/openhands[examples]'   # from the repository root
@@ -122,17 +122,27 @@ IMAGES="docker.io/library/ubuntu@sha256:<digest> docker.io/library/node@sha256:<
 examples/openhands/demo.sh
 ```
 
-It also takes `PORT`, `AGENT_SERVER_ENV` (extra `NAME=VALUE` settings), `COMMAND`, `WORKDIR` and
-`KEEP=1` (leave the environments up for the SDK scripts); see its header. It exits 1 if any
-agent-server did not answer.
+It also takes `PORT`, `AGENT_SERVER_ENV` (extra `NAME=VALUE` settings), `COMMAND`, `WORKDIR`,
+`API_TOKEN` (when ate-env-api runs with `-auth-token-file`) and `KEEP=1` (leave the environments up
+for the SDK scripts); see its header. It exits 1 if any agent-server did not answer.
 
-The session key is `SESSION_KEY`, else a random one that is never printed; set it with `KEEP=1`, so
-that you can reach the environments afterwards. Templates are immutable and the key is in them, also
-in the per-image templates that creates derive (`<base>-<12 hex digits of the image digest>`). So
-before registering, the demo deletes the base template and every template derived from it, with
-their golden snapshots; with `REUSE=1` (and the same `SESSION_KEY`) it keeps them instead.
+Templates are immutable and the session key is in them, also in the per-image templates that
+creates derive (`<base>-<12 hex digits of the image digest>`). The demo reuses an existing base
+template and its derived templates, and then needs the `SESSION_KEY` they carry; it stops with a
+message when the key is missing. It registers the base template only when it does not exist, with
+`SESSION_KEY` or a random key that is never printed (set one with `KEEP=1`, so that you can reach the
+environments afterwards). `RECREATE=1` deletes the base template and every template derived from
+it, with their golden snapshots, and registers it again; use it only for templates that nobody else
+uses. The demo hands the session key and the API token to curl in a header file (mode 0600, removed
+on exit), not on its command line; the template registration still passes the key in an argument of
+`ate-env manifest template`.
 
 ## Limits
+
+- With `API_TOKEN` (ate-env-api with `-auth-token-file`), a `RemoteConversation`'s event WebSocket
+  gets 401, because the SDK sends no extra headers on it. Commands, files and `run_trajectory.py`
+  work; `codeact_agent.py` and `convo_with_ate_env.py` need the follow-up in the integration's
+  [Limits](../../integrations/openhands/README.md#limits).
 
 - `codeact_agent.py` calls the model from inside the environment (see above); `run_trajectory.py`
   and a client-side agent built on it do not.

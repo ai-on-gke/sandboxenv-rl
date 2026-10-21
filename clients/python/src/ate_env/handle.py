@@ -99,9 +99,17 @@ class SandboxHandle:
             )
         return res
 
+    def write_file(self, path: str, content: bytes | str) -> None:
+        """Write file content directly into sandbox filesystem."""
+        self.runtime.write_file(path, content)
+
     async def write_file_async(self, path: str, content: bytes | str) -> None:
         """Asynchronously write file content directly into sandbox filesystem."""
         await self.runtime.write_file_async(path, content)
+
+    def read_file_bytes(self, path: str) -> bytes:
+        """Read binary file content from sandbox filesystem."""
+        return self.runtime.read_file_bytes(path)
 
     async def read_file_bytes_async(self, path: str) -> bytes:
         """Asynchronously read binary file content from sandbox filesystem."""

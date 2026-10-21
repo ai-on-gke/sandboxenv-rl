@@ -51,6 +51,8 @@ type ClientOptions struct {
 
 	// AuthToken, if non-empty, is sent as an "Authorization: Bearer <token>"
 	// metadata header on every RPC, matching the Python client's auth_token.
+	// On the client's own connection it is a per-RPC credential, thus each
+	// RPC carries it. With GRPCConn, each Client method attaches it instead.
 	AuthToken string
 }
 
@@ -58,6 +60,7 @@ type ClientOptions struct {
 type Client struct {
 	endpoint   string
 	opts       ClientOptions
+	connAuth   bool // the connection sends AuthToken itself
 	grpcConn   *grpc.ClientConn
 	grpc       ateenvv1alpha.EnvironmentServiceClient
 	process    ateenvv1alpha.ProcessServiceClient
@@ -83,7 +86,11 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	} else {
 		target := strings.TrimPrefix(endpoint, "http://")
 		target = strings.TrimPrefix(target, "https://")
-		grpcConn, err = grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+		if opts.AuthToken != "" {
+			dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(bearerCredentials{token: opts.AuthToken}))
+		}
+		grpcConn, err = grpc.NewClient(target, dialOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("env: connecting to gRPC %s: %w", target, err)
 		}
@@ -92,6 +99,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	return &Client{
 		endpoint:   endpoint,
 		opts:       opts,
+		connAuth:   opts.GRPCConn == nil && opts.AuthToken != "",
 		grpcConn:   grpcConn,
 		grpc:       ateenvv1alpha.NewEnvironmentServiceClient(grpcConn),
 		process:    ateenvv1alpha.NewProcessServiceClient(grpcConn),
@@ -107,8 +115,22 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// bearerCredentials sends the token on each RPC of the client's own
+// connection. That connection has no TLS (insecure credentials), thus it
+// cannot require transport security.
+type bearerCredentials struct{ token string }
+
+func (b bearerCredentials) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	return map[string]string{"authorization": "Bearer " + b.token}, nil
+}
+
+func (bearerCredentials) RequireTransportSecurity() bool { return false }
+
+// withAuth attaches the token for a caller-supplied GRPCConn. The client's
+// own connection sends it as a per-RPC credential, thus withAuth adds
+// nothing there, and the header is never sent twice.
 func (c *Client) withAuth(ctx context.Context) context.Context {
-	if c.opts.AuthToken == "" {
+	if c.opts.AuthToken == "" || c.connAuth {
 		return ctx
 	}
 	if md, ok := metadata.FromOutgoingContext(ctx); ok && len(md.Get("authorization")) > 0 {

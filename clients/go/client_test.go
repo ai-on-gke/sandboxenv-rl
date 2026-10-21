@@ -16,12 +16,14 @@ package env_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,6 +38,8 @@ import (
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -524,9 +528,27 @@ func TestClientAuthToken(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// headers records how many authorization values each RPC carried: the
+	// token must arrive exactly once, on unary and streaming RPCs alike.
+	var (
+		mu      sync.Mutex
+		headers = map[string][]int{}
+	)
+	record := func(ctx context.Context, method string) {
+		md, _ := metadata.FromIncomingContext(ctx)
+		mu.Lock()
+		headers[method] = append(headers[method], len(md.Get("authorization")))
+		mu.Unlock()
+	}
 	grpcServer := grpc.NewServer(
-		grpc.UnaryInterceptor(auth.UnaryInterceptor()),
-		grpc.StreamInterceptor(auth.StreamInterceptor()),
+		grpc.ChainUnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			record(ctx, info.FullMethod)
+			return handler(ctx, req)
+		}, auth.UnaryInterceptor()),
+		grpc.ChainStreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			record(ss.Context(), info.FullMethod)
+			return handler(srv, ss)
+		}, auth.StreamInterceptor()),
 	)
 	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, service)
 	ateenvv1alpha.RegisterProcessServiceServer(grpcServer, service)
@@ -551,52 +573,90 @@ func TestClientAuthToken(t *testing.T) {
 		t.Fatalf("unauthenticated Create: got %v, want Unauthenticated", err)
 	}
 
-	authClient, err := env.NewClient(env.ClientOptions{
-		Endpoint:  srv.URL,
-		AuthToken: "top-secret",
+	exercise := func(t *testing.T, client *env.Client, id string) {
+		mu.Lock()
+		clear(headers)
+		mu.Unlock()
+
+		grpcGuestServer, cleanup, err := guest.NewServer(guest.Config{
+			Workspace:        t.TempDir(),
+			EnableProcess:    true,
+			EnableFileSystem: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(cleanup)
+		router.Register(id, grpcGuestServer)
+
+		sb, err := client.Create(t.Context(), &ateenvv1alpha.CreateEnvironmentRequest{Id: id})
+		if err != nil {
+			t.Fatalf("authenticated Create: %v", err)
+		}
+		if err := sb.WriteFile(t.Context(), "note.txt", strings.NewReader("hello"), 0o644); err != nil {
+			t.Fatalf("authenticated WriteFile: %v", err)
+		}
+		rc, err := sb.ReadFile(t.Context(), "note.txt")
+		if err != nil {
+			t.Fatalf("authenticated ReadFile: %v", err)
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil || string(data) != "hello" {
+			t.Fatalf("ReadFile = %q, err = %v", data, err)
+		}
+		res, err := sb.Run(t.Context(), env.ShellRequest{Command: "cat", Stdin: []byte("pong")})
+		if err != nil || res.Stdout != "pong" {
+			t.Fatalf("authenticated Run = %+v, err = %v", res, err)
+		}
+		if err := sb.Suspend(t.Context()); err != nil {
+			t.Fatalf("authenticated Suspend: %v", err)
+		}
+		if err := sb.Delete(t.Context()); err != nil {
+			t.Fatalf("authenticated Delete: %v", err)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		for _, m := range []string{
+			"/ateenv.v1alpha.EnvironmentService/CreateEnvironment",
+			"/ateenv.v1alpha.FileSystemService/WriteFile",
+			"/ateenv.v1alpha.FileSystemService/ReadFile",
+			"/ateenv.v1alpha.ProcessService/StreamProcessOutput",
+			"/ateenv.v1alpha.EnvironmentService/DeleteEnvironment",
+		} {
+			if len(headers[m]) == 0 {
+				t.Errorf("no call to %s recorded", m)
+			}
+		}
+		for m, counts := range headers {
+			for _, n := range counts {
+				if n != 1 {
+					t.Errorf("%s carried %d authorization values, want 1", m, n)
+				}
+			}
+		}
+	}
+
+	t.Run("own connection", func(t *testing.T) {
+		client, err := env.NewClient(env.ClientOptions{Endpoint: srv.URL, AuthToken: "top-secret"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { client.Close() })
+		exercise(t, client, "sb-auth-own")
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { authClient.Close() })
 
-	workDir := t.TempDir()
-	grpcGuestServer, cleanup, err := guest.NewServer(guest.Config{
-		Workspace:        workDir,
-		EnableProcess:    true,
-		EnableFileSystem: true,
+	t.Run("caller connection", func(t *testing.T) {
+		conn, err := grpc.NewClient(strings.TrimPrefix(srv.URL, "http://"), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		client, err := env.NewClient(env.ClientOptions{GRPCConn: conn, AuthToken: "top-secret"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		exercise(t, client, "sb-auth-conn")
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(cleanup)
-
-	router.Register("sb-auth", grpcGuestServer)
-
-	sb, err := authClient.Create(t.Context(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "sb-auth"})
-	if err != nil {
-		t.Fatalf("authenticated Create: %v", err)
-	}
-	if err := sb.WriteFile(t.Context(), "note.txt", strings.NewReader("hello"), 0o644); err != nil {
-		t.Fatalf("authenticated WriteFile: %v", err)
-	}
-	rc, err := sb.ReadFile(t.Context(), "note.txt")
-	if err != nil {
-		t.Fatalf("authenticated ReadFile: %v", err)
-	}
-	data, err := io.ReadAll(rc)
-	rc.Close()
-	if err != nil || string(data) != "hello" {
-		t.Fatalf("ReadFile = %q, err = %v", data, err)
-	}
-	res, err := sb.Run(t.Context(), env.ShellRequest{Command: "cat", Stdin: []byte("pong")})
-	if err != nil || res.Stdout != "pong" {
-		t.Fatalf("authenticated Run = %+v, err = %v", res, err)
-	}
-	if err := sb.Suspend(t.Context()); err != nil {
-		t.Fatalf("authenticated Suspend: %v", err)
-	}
-	if err := sb.Delete(t.Context()); err != nil {
-		t.Fatalf("authenticated Delete: %v", err)
-	}
 }

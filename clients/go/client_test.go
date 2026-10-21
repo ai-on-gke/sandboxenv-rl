@@ -20,6 +20,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -430,6 +431,9 @@ func TestShellKilledByTimeout(t *testing.T) {
 }
 
 func TestProcessTTYAndResize(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("pty allocation is only supported on linux")
+	}
 	f := newFixture(t)
 	sb := f.create(t, "sb-tty")
 	ctx := t.Context()

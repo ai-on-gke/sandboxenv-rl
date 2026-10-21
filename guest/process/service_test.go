@@ -21,6 +21,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -531,7 +532,17 @@ func TestSignalRoundTrip(t *testing.T) {
 	}
 }
 
+// requirePTY skips a test that allocates a pseudo-terminal off Linux, where
+// openPTY is not implemented.
+func requirePTY(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("pty allocation is only supported on linux")
+	}
+}
+
 func TestTTYControllingTerminalAndMergedOutput(t *testing.T) {
+	requirePTY(t)
 	client := setupTestServer(t)
 	started := start(t, client, &ateenvv1alpha.StartProcessRequest{
 		Command: []string{"sh", "-c", "tty; stty size; echo out-msg; echo err-msg >&2"},
@@ -556,6 +567,7 @@ func TestTTYControllingTerminalAndMergedOutput(t *testing.T) {
 }
 
 func TestTTYResizeAndSIGWINCH(t *testing.T) {
+	requirePTY(t)
 	client := setupTestServer(t)
 	ctx := context.Background()
 	started := start(t, client, &ateenvv1alpha.StartProcessRequest{
@@ -635,6 +647,7 @@ func TestTTYResizeAndSIGWINCH(t *testing.T) {
 }
 
 func TestTTYInputAndCloseEOT(t *testing.T) {
+	requirePTY(t)
 	client := setupTestServer(t)
 	ctx := context.Background()
 	started := start(t, client, &ateenvv1alpha.StartProcessRequest{
@@ -670,7 +683,8 @@ func TestTTYInputAndCloseEOT(t *testing.T) {
 }
 
 func TestTTYExemptFromLogCap(t *testing.T) {
-	cfg := DefaultConfig("")
+	requirePTY(t)
+	cfg := DefaultConfig(t.TempDir()) // not the shared default: the cleanup removes LogDir
 	cfg.MaxLogBytes = 256
 	client := setupTestServerWithConfig(t, cfg)
 

@@ -16,11 +16,15 @@
 
 The OpenHands workspace API is synchronous and ``ate_env.Client`` is asyncio
 gRPC. A fleet of workspaces shares one loop thread and one channel per
-(endpoint, token) instead of a thread and a channel each.
+(endpoint, token) instead of a thread and a channel each. ``close_all``,
+registered with ``atexit``, closes the channels and stops the thread.
 """
 
 from __future__ import annotations
 
+import atexit
+import concurrent.futures
+import os
 import threading
 from collections.abc import Coroutine
 from typing import Any
@@ -41,9 +45,18 @@ def _get_runner() -> LoopRunner:
         return _runner
 
 
-def run[T](coro: Coroutine[Any, Any, T]) -> T:
-    """Run a coroutine on the shared loop and block for its result."""
-    return _get_runner().run(coro)
+def run[T](coro: Coroutine[Any, Any, T], timeout: float | None = None) -> T:
+    """Run a coroutine on the shared loop and block for its result.
+
+    With ``timeout``, raise ``TimeoutError`` and cancel the coroutine when it
+    does not finish in time.
+    """
+    future = _get_runner().submit(coro)
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise TimeoutError(f"ate-env call did not finish within {timeout}s") from None
 
 
 def client(endpoint: str, token: str | None) -> Client:
@@ -65,3 +78,38 @@ def client(endpoint: str, token: str | None) -> Client:
         # channel instead of leaking it.
         run(made.close())
     return kept
+
+
+def close_all(timeout: float = 5.0) -> None:
+    """Close the shared clients and stop the loop thread (idempotent).
+
+    Registered with ``atexit``. A later call to ``run`` or ``client`` starts a
+    new loop thread.
+    """
+    global _runner
+    with _lock:
+        runner, clients = _runner, list(_clients.values())
+        _runner = None
+        _clients.clear()
+    if runner is None:
+        return
+    for c in clients:
+        try:
+            runner.run(c.close(), timeout=timeout)
+        except Exception:
+            pass  # shutting down: a channel that does not close is dropped
+    runner.stop()
+
+
+def _forget_after_fork() -> None:
+    # A forked child has no loop thread: the parent's runner and the channels
+    # bound to it are unusable there. Start fresh on first use.
+    global _lock, _runner
+    _lock = threading.Lock()
+    _runner = None
+    _clients.clear()
+
+
+atexit.register(close_all)
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_after_fork)

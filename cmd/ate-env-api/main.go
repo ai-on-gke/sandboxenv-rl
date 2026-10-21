@@ -50,7 +50,7 @@ func isLoopbackAddr(addr string) bool {
 
 func main() {
 	var (
-		listen            = flag.String("listen", "127.0.0.1:7777", "address to serve the API on")
+		listen            = flag.String("listen", "0.0.0.0:7777", "address to serve the API on")
 		ateapi            = flag.String("ateapi", ate.DefaultControlAddr, "address of the ateapi gRPC control plane")
 		atenet            = flag.String("atenet", ate.DefaultRouterAddr, "address of the atenet HTTP router")
 		atenetConn        = flag.String("atenet-connect", ate.DefaultRouterConnectAddr, "address of the atenet router's plaintext CONNECT listener; HTTP requests carrying X-Env-Id and X-Env-Port, or to /v1alpha/envs/{id}/ports/{port}/..., are forwarded through it to that port in the environment. The forwarding does not authenticate callers and reaches any port of any actor the router serves. Empty disables it")

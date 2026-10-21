@@ -331,8 +331,9 @@ def image_ref_attr(ref: str | None) -> str | None:
     return f"{name}{at}{digest}"
 
 
-# A leading shell variable assignment (``NAME=value``), e.g. ``API_KEY=x cmd``.
-_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# A leading shell variable assignment (``NAME=value`` or bash's ``NAME+=value``),
+# e.g. ``API_KEY=x cmd``. The Go client's envAssignment is the same pattern.
+_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
 
 
 def executable_attr(command: str | list[str] | tuple[str, ...]) -> str | None:

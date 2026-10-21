@@ -426,6 +426,9 @@ def test_attribute_helpers_drop_tags_and_arguments():
         ("", None),
         ([], None),
         ("./a=b", "a=b"),  # a path, not an assignment
+        ("X+=s3cr3t cmd", "cmd"),  # bash appends with NAME+=value
+        ("PATH+=:/opt/bin A=1 make", "make"),
+        ("./a+=b", "a+=b"),  # a path, not an assignment
     ],
 )
 def test_executable_attr_skips_env_assignments(command, want):
@@ -904,6 +907,7 @@ def test_span_attributes_use_substrate_and_ate_env_keys(spans, threaded_fake_ser
             attrs = dict(s.attributes)
             assert attrs["ate_env.run_id"] == run_id, op
             assert attrs["ate.actor.name"], op
+            assert attrs["ate.atespace"] == "ate-env", op
     for acquire in names["ate_env_client.acquire"]:
         assert dict(acquire.attributes)["ate_env.run_id"] == run_id
 

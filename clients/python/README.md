@@ -540,7 +540,7 @@ traces and lifecycle records without a mapping. Client-only fields use the
 | Key | Value | On |
 | --- | --- | --- |
 | `ate.actor.name` | environment id (the Substrate actor name) | every span of one environment: `Client` spans, `acquire`, `release`, `exec`, `write_file`, `read_file` |
-| `ate.atespace` | atespace | `Client` spans |
+| `ate.atespace` | atespace | `Client` spans; `exec`, `write_file`, `read_file` when the runtime has one (Substrate) |
 | `ate.template.name` | template name | `create_environment`, `ensure_template`, `acquire`, `warm_pool` |
 | `ate.template.atespace` | template atespace, when given | `create_environment` |
 | `ate_env.run_id` | fleet run id | `exec`, `write_file`, `read_file`, `acquire`, `warm_pool`, `reap` |

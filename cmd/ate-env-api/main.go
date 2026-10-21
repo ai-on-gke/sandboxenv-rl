@@ -53,13 +53,13 @@ func main() {
 		listen            = flag.String("listen", "0.0.0.0:7777", "address to serve the API on")
 		ateapi            = flag.String("ateapi", ate.DefaultControlAddr, "address of the ateapi gRPC control plane")
 		atenet            = flag.String("atenet", ate.DefaultRouterAddr, "address of the atenet HTTP router")
-		atenetConn        = flag.String("atenet-connect", ate.DefaultRouterConnectAddr, "address of the atenet router's plaintext CONNECT listener; HTTP requests carrying X-Env-Id and X-Env-Port, or to /v1alpha/envs/{id}/ports/{port}/..., are forwarded through it to that port in the environment. The forwarding does not authenticate callers and reaches any port of any actor the router serves. Empty disables it")
+		atenetConn        = flag.String("atenet-connect", ate.DefaultRouterConnectAddr, "address of the atenet router's plaintext CONNECT listener; HTTP requests carrying X-Env-Id and X-Env-Port, or to /v1alpha/envs/{id}/ports/{port}/..., are forwarded through it to that port in the environment. Without -auth-token-file the forwarding does not authenticate callers, and it reaches any port of any actor the router serves. Empty disables it")
 		ppOrigins         = flag.String("port-proxy-trusted-origins", "", "comma-separated browser origins (scheme://host[:port]) whose pages may use the port proxy's path form, next to the listener's own origin")
 		ppHeaderTimeout   = flag.Duration("port-proxy-response-header-timeout", 0, "how long the port proxy waits for a daemon's response headers; 0 means no limit, and the caller's deadline applies")
 		hostSuffix        = flag.String("host-suffix", ate.DefaultHostSuffix, "atenet router host suffix for actor routing")
 		skipVerify        = flag.Bool("skip-verify", true, "skip TLS certificate verification on the control plane connection")
 		tokenFile         = flag.String("ateapi-token-file", "", "file with a bearer token for the control plane, e.g. a projected ServiceAccount token with the ateapi audience")
-		authTokenFile     = flag.String("auth-token-file", "", "file with a bearer token required from API and MCP callers; re-read on each request")
+		authTokenFile     = flag.String("auth-token-file", "", "file with a bearer token required from gRPC, MCP and port-proxy callers; re-read when the file changes")
 		wakeBudget        = flag.Duration("wake-budget", apiservice.DefaultWakeBudget, "how long a guest call or a port-proxy request waits for a suspended environment to wake before failing; cold image pulls and cross-region snapshot reads exceed the router's own parking budget")
 		wakeRunningBudget = flag.Duration("wake-running-budget", apiservice.DefaultWakeRunningBudget, "how long a guest call waits when the environment is already RUNNING but the router still answers Unavailable (guest not yet listening vs. path down)")
 	)
@@ -73,7 +73,7 @@ func main() {
 			log.Fatalf("loading --auth-token-file: %v", err)
 		}
 	} else if !isLoopbackAddr(*listen) {
-		log.Printf("WARNING: listening on %s without --auth-token-file; all gRPC and MCP callers are unauthenticated", *listen)
+		log.Printf("WARNING: listening on %s without --auth-token-file; all gRPC, MCP and port-proxy callers are unauthenticated", *listen)
 	}
 
 	client, err := ate.New(ate.Options{
@@ -138,14 +138,18 @@ func main() {
 				origins = append(origins, o)
 			}
 		}
-		pp, err := portproxy.New(portproxy.Options{
+		ppOpts := portproxy.Options{
 			ConnectAddr:           *atenetConn,
 			HostSuffix:            *hostSuffix,
 			DefaultAtespace:       ate.DefaultAtespace,
 			ResponseHeaderTimeout: *ppHeaderTimeout,
 			TrustedOrigins:        origins,
 			WakeBudget:            *wakeBudget,
-		})
+		}
+		if callerAuth != nil {
+			ppOpts.Authenticate = callerAuth.Check
+		}
+		pp, err := portproxy.New(ppOpts)
 		if err != nil {
 			log.Fatalf("--port-proxy-trusted-origins: %v", err)
 		}

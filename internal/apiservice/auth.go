@@ -93,6 +93,12 @@ func (a *BearerAuth) checkHeader(authHeader string) error {
 	return nil
 }
 
+// Check reports whether value, an Authorization header value, carries the
+// expected bearer token. The port proxy calls it for forwarded requests.
+func (a *BearerAuth) Check(value string) error {
+	return a.checkHeader(value)
+}
+
 func (a *BearerAuth) authorizeContext(ctx context.Context) error {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {

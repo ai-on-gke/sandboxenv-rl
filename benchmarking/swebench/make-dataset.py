@@ -56,6 +56,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import hashlib
 import subprocess
 import sys
 
@@ -117,47 +118,81 @@ def image_ref(registry: str, instance_id: str, fmt: str) -> str:
     )
 
 
+def split_ref(ref: str) -> tuple[str, str, str]:
+    """Split an image reference into (repository, tag, digest); tag and digest
+    are empty when absent. The tag is only in the last path segment, so a
+    registry port such as host:5000/img is left alone."""
+    repo, _, digest = ref.partition("@")
+    head, _, last = repo.rpartition("/")
+    tag = ""
+    if ":" in last:
+        last, tag = last.split(":", 1)
+    return (f"{head}/{last}" if head else last), tag, digest
+
+
 def resolve_digest(ref: str) -> str | None:
     """Return repo@sha256:... for ref, or None when crane cannot see it."""
     proc = subprocess.run(["crane", "digest", ref], capture_output=True, text=True)
     if proc.returncode != 0:
         return None
-    repo = ref.split("@", 1)[0]
-    if "@" not in ref:
-        head, _, last = repo.rpartition("/")
-        if ":" in last:
-            repo = f"{head}/{last.split(':', 1)[0]}" if head else last.split(":", 1)[0]
+    repo, _, _ = split_ref(ref)
     return f"{repo}@{proc.stdout.strip()}"
 
 
-def instance_id_from_ref(ref: str) -> str:
-    """A stable id for an image-only record: the last path segment plus the tag,
-    with characters outside [a-z0-9._-] replaced, so it survives EnvID."""
-    repo = ref.split("@", 1)[0]
+def pin_ref(ref: str) -> str | None:
+    """repo@sha256:... for ref: a reference that already carries a digest is
+    reduced to it (a tag next to the digest is dropped, ParseDataset accepts
+    only repo@digest); a tag is resolved with crane."""
+    repo, _, digest = split_ref(ref)
+    if digest.startswith("sha256:"):
+        return f"{repo}@{digest}"
+    return resolve_digest(ref)
+
+
+def instance_id_from_ref(ref: str, pinned: str) -> str:
+    """A stable id for an image-only record: the last path segment, the tag if
+    one was given, and the first 12 hex digits of the digest, so two digest-
+    pinned images of one repository get distinct ids. Characters outside
+    [a-z0-9._-] are replaced so the id survives EnvID."""
+    repo, tag, _ = split_ref(ref)
+    _, _, digest = split_ref(pinned)
     last = repo.rsplit("/", 1)[-1]
-    tag = ""
-    if ":" in last:
-        last, tag = last.split(":", 1)
-    raw = f"{last}-{tag}" if tag and tag != "latest" else last
+    short = digest.split(":", 1)[1][:12]
+    raw = f"{last}-{tag}-{short}" if tag and tag != "latest" else f"{last}-{short}"
     return "".join(c if c.isalnum() or c in "._-" else "-" for c in raw.lower())
 
 
-def write_image_only(images_file: str, out: str) -> int:
+def write_image_only(images_file: str, out: str, limit: int = 0) -> int:
     """Manifest for image-delivery workloads: one record per image reference,
     no grading material. References may be tags (resolved to a digest with
-    crane) or already pinned by digest."""
+    crane) or already pinned by digest. A reference that pins the same image
+    as an earlier line is skipped; two different references whose ids would
+    still collide get a hash of the full reference appended. limit > 0 stops
+    after that many records."""
     written = missing = 0
+    pinned_seen: set[str] = set()
+    ids: set[str] = set()
     with open(images_file) as src, open(out, "w") as dst:
         for line in src:
             ref = line.strip()
             if not ref or ref.startswith("#"):
                 continue
-            pinned = ref if "@sha256:" in ref else resolve_digest(ref)
+            if limit and written >= limit:
+                break
+            pinned = pin_ref(ref)
             if pinned is None:
                 print(f"missing image: {ref}", file=sys.stderr)
                 missing += 1
                 continue
-            dst.write(json.dumps({"instance_id": instance_id_from_ref(ref), "repo": "", "image": pinned,
+            if pinned in pinned_seen:
+                print(f"duplicate image: {ref} pins {pinned}, already written", file=sys.stderr)
+                continue
+            pinned_seen.add(pinned)
+            iid = instance_id_from_ref(ref, pinned)
+            if iid in ids:
+                iid = f"{iid}-{hashlib.sha256(pinned.encode()).hexdigest()[:8]}"
+            ids.add(iid)
+            dst.write(json.dumps({"instance_id": iid, "repo": "", "image": pinned,
                                   "patch": "", "test_patch": "", "eval_script": "",
                                   "fail_to_pass": [], "pass_to_pass": [], "log_parser": "", "eval_type": ""}) + "\n")
             written += 1
@@ -174,7 +209,7 @@ def main() -> int:
     ap.add_argument("--dataset", default="SWE-bench/SWE-bench_Verified", help="Hugging Face dataset name or a local JSON/JSONL path. The rows must carry eval_script (the SWE-bench org copies do; the older princeton-nlp copies do not).")
     ap.add_argument("--split", default="test")
     ap.add_argument("--revision", default=None, help="Dataset revision (commit, tag or branch) to load; default the current head. The resolved commit is what is loaded and recorded in the meta file.")
-    ap.add_argument("--images-file", default=None, help="Build an image-only manifest (no grading material) from a file with one image reference per line, for the image-delivery workloads. --dataset and --registry are ignored.")
+    ap.add_argument("--images-file", default=None, help="Build an image-only manifest (no grading material) from a file with one image reference per line, for the image-delivery workloads. --limit applies; --dataset, --registry and --instances are ignored.")
     ap.add_argument("--registry", default=None, help="Registry path that holds the task images, e.g. us-docker.pkg.dev/PROJECT/swebench-mirror/swebench-verified. Required unless --images-file is given.")
     ap.add_argument("--image-ref", default="{registry}:sweb.eval.x86_64.{instance_id}", help="Image reference per instance; fields: {registry}, {instance_id}, {instance_id_1776}.")
     ap.add_argument("--limit", type=int, default=0, help="Stop after N instances (0 = all).")
@@ -183,7 +218,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.images_file:
-        return write_image_only(args.images_file, args.out)
+        return write_image_only(args.images_file, args.out, args.limit)
     if not args.registry:
         ap.error("--registry is required unless --images-file is given")
 

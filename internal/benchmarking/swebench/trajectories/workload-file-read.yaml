@@ -21,6 +21,6 @@ steps:
   - name: probe
     run: "true"
   - name: file_read
-    run: find / -xdev -type f -name '*.py' 2>/dev/null | head -n 200 | xargs -r cat > /dev/null
+    run: find / -xdev -type f -name '*.py' 2>/dev/null | head -n 200 | tr '\n' '\0' | xargs -0 -r cat > /dev/null
     timeout: 10m
     reward: true

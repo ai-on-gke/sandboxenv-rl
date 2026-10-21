@@ -174,6 +174,12 @@ benchmarking/swebench/make-dataset.py --images-file images.txt --out images.json
 swebench-loader run -dataset images.jsonl -trajectory workload-read-all -images 200 -width 200 -run-id pull-baseline
 ```
 
+`images.txt` holds one reference per line, a tag or `repo@sha256:...`; tags
+are resolved with `crane`. The instance id is the image name, the tag if one
+was given, and the first 12 digits of the digest, so two pinned images of one
+repository stay distinct. A line that resolves to a reference already
+written is skipped. `--limit` applies; `--instances` does not.
+
 Run the same command against each delivery mechanism and diff the reports;
 the loader sees wall time per phase as a trainer would, and the split of a
 cold start into pull, unpack and restore comes from Substrate's own metrics

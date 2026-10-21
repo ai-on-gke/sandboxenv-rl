@@ -326,6 +326,69 @@ results = await asyncio.gather(
 )
 ```
 
+### Trace calls with OpenTelemetry (optional)
+
+The client can emit OpenTelemetry spans and send the W3C trace context to
+`ate-env-api`. This lets you see whether time goes to the client, the API
+server or Substrate. Tracing is off by default and needs the `tracing` extra:
+
+```bash
+pip install "./clients/python[tracing]"
+```
+
+Turn it on with `TracerConfig`, either on a `Client` or with
+`FleetConfig.tracing` for a fleet:
+
+```python
+from ate_env import Client, FleetConfig, SandboxFleet, TracerConfig
+
+client = Client("localhost:7777", tracer_config=TracerConfig(enable_tracing=True))
+
+fleet = SandboxFleet(FleetConfig(tracing=TracerConfig(enable_tracing=True)))
+# A plain dict also works: FleetConfig(tracing={"enable_tracing": True})
+```
+
+`TracerConfig` fields:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enable_tracing` | `False` | Emit spans and propagate the trace context. |
+| `trace_service_name` | `"ate-env-client"` | OTel resource `service.name` of the exporter the client installs (see below). Spans are always named `ate_env_client.<op>`. |
+
+When tracing is on:
+
+- **Spans.** `Client`, `SandboxHandle` and the Substrate backend emit
+  `ate_env_client.<op>` spans, for example `create_environment`, `acquire`,
+  `exec`, `write_file`, `read_file` and `release`. Their `env.*` attributes
+  hold ids, the executable name (leading `NAME=value` assignments are
+  skipped) and sizes. They never hold command arguments, file content or
+  image tags. A command that fails with `check=True` marks its `exec` span
+  as an error.
+- **Propagation.** Every gRPC call on a channel the client creates carries
+  `traceparent` / `tracestate`. Baggage is never sent. A channel you pass
+  with `Client(channel=...)` is left as is.
+- **Nesting.** Client spans nest under the caller's current span, including
+  across the fleet's worker threads and background event loop.
+
+**Global exporter.** If your application has already installed an
+OpenTelemetry SDK `TracerProvider`, the client uses it as is. Otherwise, the
+first time tracing is enabled the client installs a **process-global**
+`TracerProvider` with service name `trace_service_name`. That provider
+batches spans to an OTLP/gRPC exporter and is shut down (flushed) at exit.
+Configure the exporter with the standard OpenTelemetry environment
+variables, for example:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer <token>"
+# Also: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_EXPORTER_OTLP_INSECURE,
+# OTEL_EXPORTER_OTLP_CERTIFICATE, OTEL_EXPORTER_OTLP_TIMEOUT, ...
+```
+
+Without the extra, `import ate_env` never loads OpenTelemetry. Enabling
+tracing then logs one error naming the missing extra, and the client keeps
+working without spans.
+
 ### Develop against a local guest daemon (no cluster)
 
 The guest daemon example serves the process and filesystem services

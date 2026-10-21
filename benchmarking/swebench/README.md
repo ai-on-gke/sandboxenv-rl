@@ -192,6 +192,31 @@ the loader sees wall time per phase as a trainer would, and the split of a
 cold start into pull, unpack and restore comes from Substrate's own metrics
 over the run window, joined on the run id.
 
+To know whether those first pulls were cold, sample the node image caches
+before and after the run and hand both files to the report:
+
+```bash
+benchmarking/swebench/sample-node-cache.sh before.txt
+benchmarking/swebench/run-in-cluster.sh pull-baseline images.jsonl -trajectory workload-read-all -images 200 -width 200
+benchmarking/swebench/sample-node-cache.sh after.txt
+swebench-loader report pull-baseline.jsonl -cache-before before.txt -cache-after after.txt
+```
+
+The sample reads each atelet's `ate_imagecache_requests_total` counters and
+its process start time through the API server's pod proxy (atelet has no
+shell), so it needs kubectl with RBAC `get` on `pods/proxy` in `ate-system`.
+The report then adds a line with the run's misses, which are its cold pulls,
+the nodes they landed on, hits, errors, and misses per first command: 1.0
+means every environment pulled its image, 0 means every start was served
+from a node's cache. The count is cluster-wide for the window, so it also
+holds golden bakes and wakes that landed on a node without the image. A node
+whose atelet restarted between the samples, and a node the autoscaler added
+in between, count from zero; a node removed in between is left out; a node
+present only in the after sample with an atelet older than the before sample
+had a failed before scrape and is reported and left out. The report cannot
+label one environment cold or warm, because the ate-env API does not say
+which node an environment ran on.
+
 ## Network and the offline exclusion list
 
 Actors have no network until an egress policy is created for them, which the

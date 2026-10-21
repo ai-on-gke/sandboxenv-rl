@@ -19,6 +19,7 @@
 //	swebench-loader run    -dataset manifest.jsonl -mode steps -images 500 -rollouts 2 -steps 8 -park suspend -out run.jsonl
 //	swebench-loader report run.jsonl [-json summary.json]
 //	swebench-loader report a.jsonl b.jsonl   (one table, a column per run)
+//	swebench-loader report run.jsonl -cache-before before.txt -cache-after after.txt
 package main
 
 import (
@@ -218,6 +219,8 @@ func reportCmd(args []string) error {
 	jsonOut := fs.String("json", "", "Also write the summary as JSON to this path (an array when several files are given).")
 	unresolvedOut := fs.String("unresolved", "", "Write the unresolved instances to this path in -exclude-file format; one file only.")
 	unresolvedNote := fs.String("unresolved-note", "Instances graded unresolved", "First comment line of the -unresolved file.")
+	cacheBefore := fs.String("cache-before", "", "Node cache sample taken before the run (benchmarking/swebench/sample-node-cache.sh); with -cache-after, the report adds the run's cache misses. One file only.")
+	cacheAfter := fs.String("cache-after", "", "Node cache sample taken after the run.")
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
@@ -237,8 +240,8 @@ func reportCmd(args []string) error {
 	if len(reps) > 1 {
 		// Several runs: one table, a column per run, for the same workload on
 		// different clusters or builds.
-		if *unresolvedOut != "" {
-			return fmt.Errorf("-unresolved takes one events file")
+		if *unresolvedOut != "" || *cacheBefore != "" || *cacheAfter != "" {
+			return fmt.Errorf("-unresolved, -cache-before and -cache-after take one events file")
 		}
 		swebench.WriteComparison(os.Stdout, reps, files)
 		if *jsonOut != "" {
@@ -251,6 +254,21 @@ func reportCmd(args []string) error {
 		return nil
 	}
 	rep := reps[0]
+	if (*cacheBefore == "") != (*cacheAfter == "") {
+		return fmt.Errorf("-cache-before and -cache-after go together")
+	}
+	if *cacheBefore != "" {
+		before, err := loadCacheSample(*cacheBefore)
+		if err != nil {
+			return err
+		}
+		after, err := loadCacheSample(*cacheAfter)
+		if err != nil {
+			return err
+		}
+		d := before.Delta(after)
+		rep.Cache = &d
+	}
 	rep.WriteText(os.Stdout)
 	if *unresolvedOut != "" {
 		uf, err := os.Create(*unresolvedOut)
@@ -290,4 +308,17 @@ func summarizeFile(path string) (*swebench.Report, error) {
 	}
 	defer f.Close()
 	return swebench.Summarize(f)
+}
+
+func loadCacheSample(path string) (*swebench.NodeCacheSample, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	s, err := swebench.ParseNodeCacheSample(f)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return s, nil
 }

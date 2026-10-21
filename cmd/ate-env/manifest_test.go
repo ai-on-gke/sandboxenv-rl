@@ -625,6 +625,31 @@ func TestWorkerPoolNameMustFitALabelValue(t *testing.T) {
 	}
 }
 
+// Without --auth-token-secret, the deployment has no auth mount and no
+// -auth-token-file argument: the default install is unauthenticated.
+func TestBuildAPIDeploymentNoAuthTokenSecret(t *testing.T) {
+	cfg := testManifestConfig()
+	cfg.authTokenSecret = ""
+
+	dep := buildAPIDeployment(cfg)
+	c := dep.Spec.Template.Spec.Containers[0]
+	for _, a := range c.Args {
+		if strings.HasPrefix(a, "-auth-token-file") {
+			t.Errorf("container args = %v, want no -auth-token-file", c.Args)
+		}
+	}
+	for _, m := range c.VolumeMounts {
+		if m.Name == "ate-env-auth" {
+			t.Errorf("volume mounts = %+v, want no ate-env-auth mount", c.VolumeMounts)
+		}
+	}
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Name == "ate-env-auth" {
+			t.Errorf("volumes = %+v, want no ate-env-auth volume", dep.Spec.Template.Spec.Volumes)
+		}
+	}
+}
+
 func TestBuildAPIDeploymentAuthTokenSecret(t *testing.T) {
 	cfg := testManifestConfig()
 	cfg.authTokenSecret = "ate-env-caller-token"

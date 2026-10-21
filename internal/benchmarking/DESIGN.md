@@ -7,15 +7,20 @@ Status: draft. Owner: benchmarking. Scope: `internal/benchmarking/`,
 
 This system benchmarks sandbox backends under RL training and evaluation
 workloads. Components do not share code; they communicate strictly through
-versioned JSON/JSONL/YAML file artifacts so that simulated load generators,
-real RL trainers, and different sandbox backends (accessed via the sandbox SDK
-or directly against the backend API) are drop-in replaceable.
+versioned JSON/JSONL/YAML file artifacts in a standard run directory
+(`$ARTIFACT_DIR` or `--dest`, on local disk or object storage) so that
+simulated load generators, real RL trainers, and different sandbox backends
+(accessed via the sandbox SDK or directly against the backend API) are drop-in
+replaceable—and so that individual pieces can plug and play cleanly inside
+other benchmarking, CI, or ML orchestration frameworks.
 
 ```
 Scenario.yaml + Dataset.jsonl
       │
       ▼
-[ Orchestrator ] ──► [ Provisioner ] (setup SUT, prewarm, timed reap to zero)
+[ Orchestrator (`bench`) — or External Benchmark / CI Harness ]
+      │  (composable stages: resolve | render | prewarm | measure | reap | report)
+      ├──► [ Provisioner ] (setup SUT or `--render-only`, prewarm, timed reap to zero)
       │
       ├──► [ Simulated Job Runner(s) ] (swebench-loader: eval | steps | open-loop)
       │                                         ▲
@@ -23,20 +28,28 @@ Scenario.yaml + Dataset.jsonl
       │                                         │
       ├──► [ Real RL Job Runner(s) ] ──(trace mode)──► Trace.jsonl ──► [ Trace Converter ]
       │              │
-      │       (measure mode)
+      │       (measure mode: native trainer logs / MLLog / TensorBoard or Events.jsonl)
       ▼              ▼
- Events.jsonl + Measurements (Prometheus / cluster health / hardware cost)
+  $ARTIFACT_DIR: events/*.jsonl + Measurements (Prometheus / logs / server_summary.json)
       │
       ▼
-[ Report & Validator ] ──► Report.json ──► [ Comparator ] (regression gate)
+[ Report & Validator (`--report-only`) ] ──► Report.json + stats.jsonl ──► [ Comparator ]
 ```
 
-- **Orchestrator & Lifecycle**: Given a `Scenario` (one SUT + one or more
-  concurrent RL `Jobs`), the orchestrator provisions the SUT, resolves
-  deterministic per-step task schedules, pre-warms initial pools, launches all
-  jobs at their configured offsets, scrapes server/cluster telemetry, times a
-  full cluster `Reap` back to zero resources, checks validity gates, and builds
-  a `Report`.
+- **Composable Lifecycle & External Framework Plug-and-Play**: The CLI (`bench`)
+  exposes each lifecycle phase as an independent subcommand (`resolve`,
+  `render`, `prewarm`, `measure`, `reap`, `report`, plus `run` to chain them
+  end-to-end). When running standalone, `bench run` drives the full loop:
+  provisions the SUT, resolves deterministic per-step task schedules, pre-warms
+  initial pools, launches all jobs at their configured offsets, scrapes
+  server/cluster telemetry, times a full cluster `Reap` back to zero resources,
+  checks validity gates, and builds a `Report`. When plugged into an external
+  benchmark or CI harness that already owns cluster setup, recipe/manifest
+  deployment, or in-cluster Prometheus/log harvesting, the host framework can
+  invoke `bench resolve` / `--render-only` ahead of the run, execute
+  `swebench-loader` or a real trainer as a standard Kubernetes Job writing to
+  `$ARTIFACT_DIR` / `--dest`, and run `bench measure`, `bench reap`, and
+  `bench report --report-only` post-hoc.
 - **Simulated vs. Real RL**:
   - **Simulated jobs** drive scripted `Trajectories` and `Resolved schedules`
     through `swebench-loader`, scaling across threads or in-cluster workers to
@@ -46,10 +59,12 @@ Scenario.yaml + Dataset.jsonl
   - **Real jobs** run an actual RL trainer against the same SUT. In `measure`
     mode, sandbox and cluster performance data come from scraped metrics
     (server/SDK Prometheus counters and histograms) plus coarse per-step trainer
-    metrics, avoiding per-call logging overhead. In `trace` mode, a verbose SDK
-    flag logs individual calls and think times, which are converted offline into
-    `Trajectories` and a `Resolved schedule` that the simulated loader can
-    replay repeatedly without accelerators.
+    metrics (emitted directly as `Events.jsonl` or adapted from the trainer's
+    native MLPerf `:::MLLOG` lines, TensorBoard event files, or structured step
+    logs in `$ARTIFACT_DIR`), avoiding per-call logging overhead. In `trace`
+    mode, a verbose SDK flag logs individual calls and think times, which are
+    converted offline into `Trajectories` and a `Resolved schedule` that the
+    simulated loader can replay repeatedly without accelerators.
 
 ---
 
@@ -61,9 +76,14 @@ no shared dependency can run in parallel.
 
 ## 1. Principle
 
-Reuse happens through file contracts, not shared code. Every component reads
-or writes one of the artifacts in section 3 and nothing else. A component is
-replaceable if the artifacts it touches are unchanged.
+Reuse happens through file contracts and composable CLI stages, not shared code.
+Every component reads or writes the artifacts in section 3 within a standard run
+directory (`$ARTIFACT_DIR` or `--dest`, supporting both local paths and object
+storage) and nothing else. Because each stage (schedule resolution, manifest
+rendering, pool pre-warming, job execution, measurement collection, cluster
+reaping, and reporting) can be invoked independently, any component or stage is
+drop-in replaceable and can be plugged into external benchmarking, CI, or ML
+orchestration frameworks without fighting the host framework's lifecycle.
 
 ## 2. Two sibling benchmarks
 
@@ -77,15 +97,22 @@ rules. Each has its own setup and teardown.
 
 ## 3. Artifacts (the contracts)
 
+All run outputs live under a single run directory (`$ARTIFACT_DIR` or `--dest`,
+optionally organized in Hive-partitioned object-store paths such as
+`<dest>/runs/<name>/run_date=<YYYY-MM-DD>/run_ts=<epoch>/run_tag=<tag>/` for
+automated ingestion):
+
 | Artifact | Format | Written by | Read by |
 |---|---|---|---|
-| Scenario | YAML | operator | orchestrator |
+| Scenario | YAML | operator | orchestrator (`bench`) |
 | Dataset manifest | JSONL, one instance per line | dataset tooling | load generator, real runner, prewarm |
 | Trajectory | YAML | operator or trace converter | load generator |
-| Resolved schedule | JSON | orchestrator (simulated), trace converter (real) | load generator, report |
-| Trace | JSONL, one SDK call per line | SDK verbose flag (*trace* mode only) | trace converter |
-| Events | JSONL, one operation per line (simulated) or per training step (real) | load generator, prewarm, reaper, real trainer | report |
-| Report | JSON, includes system description, scraped measurements and validity | report | comparator, humans |
+| Resolved schedule | JSON (`schedule.json`) | `bench resolve` (simulated), trace converter (real) | load generator, report |
+| Run window & metadata | JSON (`run_window.json`: `run_id`, `test_name`, `tag`, `start_ts`, `end_ts`, `steady_start_ts`, `steady_end_ts`, `cluster`, `sut_endpoint`, and free-form `--metadata`) | job runner, `bench`, or external harness | `bench measure`, `bench reap`, `bench report` |
+| Trace | JSONL, one SDK call per line (`trace.jsonl`) | SDK verbose flag (*trace* mode only) | trace converter |
+| Events | JSONL (`events/*.jsonl`), one operation per line (simulated/SDK) or per training step (real, emitted directly or adapted from native trainer `:::MLLOG` / TensorBoard / step logs) | load generator, SDK, prewarm, reaper, real trainer or trainer telemetry adapter | report (glob-merges per-worker shards) |
+| Measurements | JSON (`measurements.json` / `server_summary.json`) + raw logs archive (`logs/`) | `bench measure` or host harness telemetry collector | report, validator |
+| Report & Stats feed | `report.json` (structured report with system description, measurements and validity) + `stats.jsonl` (flat `{timestamp, tag, test_name, metric, measurements}` rows for dashboards/tables) | `bench report` | comparator, external dashboards, humans |
 
 Schema changes to any artifact require a version field bump and a reader that
 accepts the previous version.
@@ -121,10 +148,13 @@ accepts the previous version.
 maintain exclusion lists.
 
 ### 5.2 Provisioner
-Owns the SUT shared by all jobs. Interface: `Provision(cluster, config) ->
-endpoint`, `Reap(runID) -> ReapStats`, `Teardown()`. One implementation per
-backend and access mode (via SDK or direct backend API), each wrapping a Helm
-chart or manifest set. Writes the system description: cluster, backend and SDK
+Owns the SUT shared by all jobs. Interface: `Render(config) -> ManifestDir`
+(`--render-only`, emitting Helm `values.yaml` and K8s manifests to
+`$ARTIFACT_DIR/manifests/` without applying them so external deployment
+harnesses can consume them directly), `Provision(cluster, config) -> endpoint`,
+`Reap(runID) -> ReapStats`, `Teardown()`. One implementation per backend and
+access mode (via SDK or direct backend API), each wrapping a Helm chart or
+manifest set. Writes the system description: cluster, backend and SDK
 versions/commits, machine types, node counts, zone and network topology,
 sandbox runtime class, sandbox resource footprint (CPU, memory, disk), bucket
 region, scenario hash, and configured load parameters (tasks, group size, steps,
@@ -132,25 +162,38 @@ tasks per step, trajectories per step, repeat count, `max_concurrent`, distinct
 sandbox images).
 
 ### 5.3 Job Runner
-Owns one loop. Interface: `Setup`, `Start`, `Wait`, `Collect`, `Teardown`.
+Owns one loop. Interface: `Render` (`--render-only`), `Setup`, `Start`, `Wait`,
+`Collect`, `Teardown`. Rendered Kubernetes `Job` / `JobSet` manifests follow
+standard benchmark runner conventions (`${JOB_NAME}`, `${IMAGE}`, `${TAG}`,
+`${NAME}`, `${DEST}`, benchmark service account, pod certificate/CA mounts, and
+benchmark node-pool tolerations) so external test-runner harnesses can template
+and submit them directly as a plugin test type.
 
 - **Simulated**: Setup stages the dataset manifest and resolved schedule and
-  deploys the load generator in-cluster. Collect copies events out. Teardown
-  deletes leftover environments and the runner resources. Generalizes
-  `benchmarking/swebench/run-in-cluster.sh`.
+  deploys the load generator in-cluster. Collect copies per-worker
+  `events/*.jsonl` shards and `run_window.json` out to `$ARTIFACT_DIR` /
+  `--dest`. Teardown deletes leftover environments and the runner resources.
+  Generalizes `benchmarking/swebench/run-in-cluster.sh`.
 - **Real**: Setup deploys the trainer (accelerators, weights, inference
-  server, SDK endpoint, trace flag only in trace mode). Collect pulls coarse
-  per-step trainer metrics and the trace if present (bulk sandbox and cluster
-  performance data come from `Measurements`). Teardown stops the trainer and
-  releases accelerators. Lives beside the trainer it wraps.
+  server, SDK endpoint, trace flag only in trace mode) or attaches to a trainer
+  job launched by an external ML benchmark harness with `$ARTIFACT_DIR` mounted.
+  Collect pulls coarse per-step trainer metrics—either emitted directly as
+  `Events.jsonl` or converted by a pluggable **Trainer Telemetry Adapter** from
+  native trainer step outputs (`:::MLLOG` lines, TensorBoard event files, or
+  structured step logs in `$ARTIFACT_DIR`)—plus the trace if present (bulk
+  sandbox and cluster performance data come from `Measurements`). Teardown stops
+  the trainer and releases accelerators. Lives beside the trainer it wraps.
 
 ### 5.4 Load generator
-`cmd/benchmarking/swebench-loader`. Seams: job spec in, `Backend` and
-`Sandbox` interfaces as the SUT driver (supporting SDK and direct-backend
-implementations, plus `create`, `fork`, `suspend`/`pause`, `wake`/`resume`,
-`delete`, and batch pool pre-warming and retirement), events out. Scales
-across threads or worker instances as needed so client-side load generation
-and pre-warming are never the throughput bottleneck. Modes:
+`cmd/benchmarking/swebench-loader`. Seams: job spec in (plus `--name`, `--tag`,
+`--dest` / `$ARTIFACT_DIR`, and free-form `--metadata` JSON when invoked
+directly by an in-cluster runner Job), `Backend` and `Sandbox` interfaces as the
+SUT driver (supporting SDK and direct-backend implementations, plus `create`,
+`fork`, `suspend`/`pause`, `wake`/`resume`, `delete`, and batch pool pre-warming
+and retirement), per-worker `events/<worker-id>.jsonl` shards and
+`run_window.json` out. Scales across threads or worker instances as needed so
+client-side load generation and pre-warming are never the throughput bottleneck.
+Modes:
 
 - **eval**: closed loop; create, replay, delete at fixed concurrency. Exists.
 - **steps**: a pool across training steps separated by a configurable step
@@ -172,14 +215,23 @@ per-task sandbox execution time, `caller_wait_for_slot` [throttled by
 sub-phases, acquisition source [`warm_pool`, `cold_create`, `golden_restore`,
 `fork`, `resume`], node cache state [`warm` | `cold`], retries, errors, and
 readiness timeouts with their cumulative time cost) scraped by `Measurements`,
-avoiding per-call logging overhead. In `trace` mode, a verbose flag logs one
+avoiding per-call logging overhead; optionally, when `ENV_BENCH_EVENTS_PATH`
+(defaulting to `$ARTIFACT_DIR/events`) is configured, workers flush coarse
+task/step summaries at step boundaries. In `trace` mode, a verbose flag logs one
 JSONL record per call with payloads and timing detail (`Trace.jsonl`). A
 converter turns a trace into trajectories plus an explicit schedule.
 
 ### 5.6 Measurements
-Per SUT, config-driven. For every run (regardless of success or failure),
-scrapes server-side and cluster Prometheus metrics for the run window and
-always saves controller, API, and node/worker daemon logs:
+Per SUT, config-driven. Can run during `bench run`, as a standalone post-run
+command (`bench measure --start-ts ... --end-ts ... --telemetry-lag 70s`,
+waiting `--telemetry-lag` so delayed OTel exports from node daemons land in
+Prometheus and auto-detecting the `[steady_start_ts, steady_end_ts]` window), or
+by ingesting pre-harvested `server_summary.json` / `trial_summary` /
+`phase_breakdown` artifacts when executed inside a harness that already queries
+Prometheus and pod logs in-cluster. For every run (regardless of success or
+failure), scrapes server-side and cluster Prometheus metrics for the run window
+and always saves controller, API, and node/worker daemon logs (including
+`previous` container logs when a worker or node daemon restarted mid-run):
 
 - **Sandbox and lifecycle internals**: template and snapshot creation rates,
   per-node and per-pod readiness wall time and rates, per-pool and per-object
@@ -187,13 +239,15 @@ always saves controller, API, and node/worker daemon logs:
   from structured node/worker timing logs (Substrate `Restore`/`Checkpoint
   timing breakdown`: `manifest_fetch`, `download`, `oci_unpack`,
   `worker_restore`/`worker_checkpoint`, `persist`, split by `golden` vs.
-  `latest`; Kubernetes `PodStartupLatency`: `schedule`, `image_pull`,
+  `latest`, cross-checked against client request counts to surface rotated or
+  unreadable pod logs; Kubernetes `PodStartupLatency`: `schedule`, `image_pull`,
   `container_start`, `ready_to_serving`), data-plane router
   CPU/connections/proxy latency, and peak/sustained claim rates.
 - **Cluster and node health (USE & K8s scalability)**: worker node and pod CPU,
   memory, and disk I/O pressure (PSI `stall_pct`), node disk space used %,
   image/snapshot cache eviction counts, container `OOMKill` and kubelet
-  eviction counts, node readiness transitions, network identity count and
+  eviction counts (diffing worker pod status before/after the run plus K8s
+  `Evicted` events), node readiness transitions, network identity count and
   creation rate, API server request latency (`p99`) and rate-limit responses
   (HTTP 429s, plus object-store 429s/5xx), controller `workqueue` depth and
   queue duration, database connection saturation, controller restarts and
@@ -206,18 +260,37 @@ always saves controller, API, and node/worker daemon logs:
   telemetry (`size_mb` percentiles, `checkpoints_in_window`, `checkpoint_mb_s`).
 
 ### 5.7 Orchestrator CLI
-Phases: provision or accept an endpoint; resolve schedules; prewarm configured
-initial images across jobs (recording total prepare wall time, per-pool
-readiness time, and per-object readiness times as events); set up every job
-runner before any start; start each job at its offset and wait; collect from
-runners and measurements (always archiving metrics and logs regardless of pass
-or fail); reap run resources (timed clear of claims, pools, templates,
-sandboxes and pods to zero, recorded as events); tear down runners, then
-optionally the SUT; validate; report.
+Exposed both as composable stage subcommands (for external benchmark/CI
+frameworks) and as a single `bench run SCENARIO.yaml` command:
+
+- `bench resolve`: resolves `Scenario` + `Dataset` into `$ARTIFACT_DIR/schedule.json`.
+- `bench render` (`--render-only`): outputs rendered SUT and Job Runner
+  manifests into `$ARTIFACT_DIR/manifests/` without applying them.
+- `bench prewarm`: prewarms configured initial images/templates across jobs
+  (recording total prepare wall time, per-pool readiness time, and per-object
+  readiness times as `$ARTIFACT_DIR/events/prewarm.jsonl`).
+- `bench measure`: harvests Prometheus metrics and controller/API/node logs over
+  `run_window.json` (or `--start-ts`/`--end-ts` with `--telemetry-lag`) into
+  `$ARTIFACT_DIR/measurements.json` and `$ARTIFACT_DIR/logs/`, always running
+  regardless of pass or fail.
+- `bench reap`: timed server-queried clear of claims, pools, templates,
+  sandboxes and pods to zero, recorded as `$ARTIFACT_DIR/events/reap.jsonl`.
+- `bench report` (`--report-only`): glob-merges `$ARTIFACT_DIR/events/*.jsonl`
+  (adapting native trainer step logs if present) +
+  `$ARTIFACT_DIR/measurements.json`, runs validity gates, and writes
+  `report.json` + `stats.jsonl` to `$ARTIFACT_DIR` / `--dest` (local disk or
+  object store).
+- `bench run`: chains provision (or existing endpoint) $\to$ resolve $\to$
+  prewarm $\to$ setup & start job runners at offsets $\to$ wait $\to$ measure
+  $\to$ reap $\to$ teardown $\to$ validate & report.
 
 ### 5.8 Report and comparator
 Events carry run, job, step, environment, instance, acquisition source and
-node cache state. The report gives:
+node cache state. In addition to `report.json`, the reporter emits flat
+`{timestamp, tag, test_name, metric, measurements}` rows in `stats.jsonl`
+(`trial_summary`, `server_summary`, `phase_breakdown_summary`, and per-operation
+latency/throughput rows) so existing benchmark dashboards and time-series tables
+can ingest runs without custom parsers. The report gives:
 
 - **Prepare stage**: total prepare wall time (`setup()` to warm pools/snapshots
   ready), per-node and per-worker-pod readiness wall time and rates,
@@ -330,19 +403,19 @@ while breaking the system.
 
 | # | Item | Deliverable | Acceptance | Depends on |
 |---|---|---|---|---|
-| W1 | Artifact schemas | Go types with version fields for scenario (with repeat count), job (with steps, tasks per step, group size, concurrency), schedule, trace, events (extend with client queue wait, sub-phase, acquisition source, cache state, prepare/pool/object readiness, prefetch/retire, retry/timeout, reap and trainer step events), report (extend with prepare, straggler decomposition, lifecycle, trainer, cluster/node health and hardware/storage cost sections); JSON schema files; golden fixtures | round-trip tests with `DisallowUnknownFields`; schema validation helper usable from Go and Python; old events files still parse | none |
-| W2 | Schedule resolver | explicit, sampled (seeded) and fixed sources resolve to one explicit form; saved as resolved schedule JSON | same seed gives identical output; fixture covers each source; validates against W1 schema | W1 |
-| W3 | Steps-mode pool and prefetch | load generator matches tasks to parked environments by image, resets or forks, creates, parks or deletes surplus; supports configurable step pause, async next-step pool prefetch and previous-step retirement; emits standing warm pool size, churn, lead-margin, release-overlap and error/retry/timeout events | in-memory backend test with changing images per step, step pause and async prefetch proving positive lead margin; `go test -bench` throughput test; existing steps tests pass | W1, W2 |
-| W4 | Job field in events and extended report | events carry job id and attribution fields; report groups per job, computes exact percentiles from raw events, reports prepare stage, peak/sustained claim rates, client-boundary TTFI split by source/cache state, per-command and full per-task sandbox execution time (`task_exec` post-TTFI and total `task_wall` split by source/cache state), lifecycle metrics with canonical server sub-phases, unified per-step rollout decomposition (`p50`/`p100` straggler skew, barrier time, `env_overhead_pct`), readiness timeout cost, hardware/storage cost (active vs. total density per node/vCPU/GiB RAM/pod, `cluster_packing`, worker vs. system node-hours/task, actual vs. requested CPU/memory `WSS`, snapshot `size_mb`/`checkpoints_in_window`/`checkpoint_mb_s`) and cross-job interference split | report test over a multi-job, multi-step raw events and measurements fixture verifying exact percentiles and interference buckets | W1 |
+| W1 | Artifact schemas | Go types with version fields for scenario (with repeat count), job (with steps, tasks per step, group size, concurrency), schedule, run window (`run_window.json` with `start_ts`/`end_ts`/`steady_start_ts`/`steady_end_ts` and `--metadata`), trace, events (extend with client queue wait, sub-phase, acquisition source, cache state, prepare/pool/object readiness, prefetch/retire, retry/timeout, reap and trainer step events), report (`report.json` plus flat `{timestamp, tag, test_name, metric, measurements}` `stats.jsonl` export rows); JSON schema files; golden fixtures | round-trip tests with `DisallowUnknownFields`; schema validation helper usable from Go and Python; old events files still parse | none |
+| W2 | Schedule resolver | explicit, sampled (seeded) and fixed sources resolve to one explicit form; saved as resolved schedule JSON (`schedule.json`) | same seed gives identical output; fixture covers each source; validates against W1 schema | W1 |
+| W3 | Steps-mode pool and prefetch | load generator matches tasks to parked environments by image, resets or forks, creates, parks or deletes surplus; supports configurable step pause, async next-step pool prefetch and previous-step retirement; emits per-worker `events/<worker-id>.jsonl` shards (standing warm pool size, churn, lead-margin, release-overlap and error/retry/timeout events) and `run_window.json` to `$ARTIFACT_DIR` / `--dest` | in-memory backend test with changing images per step, step pause and async prefetch proving positive lead margin; `go test -bench` throughput test; existing steps tests pass | W1, W2 |
+| W4 | Job field in events and extended report | glob-merges per-worker `events/*.jsonl` shards; events carry job id and attribution fields; report groups per job, computes exact percentiles from raw events, reports prepare stage, peak/sustained claim rates, client-boundary TTFI split by source/cache state, per-command and full per-task sandbox execution time (`task_exec` post-TTFI and total `task_wall` split by source/cache state), lifecycle metrics with canonical server sub-phases, unified per-step rollout decomposition (`p50`/`p100` straggler skew, barrier time, `env_overhead_pct`), readiness timeout cost, hardware/storage cost (active vs. total density per node/vCPU/GiB RAM/pod, `cluster_packing`, worker vs. system node-hours/task, actual vs. requested CPU/memory `WSS`, snapshot `size_mb`/`checkpoints_in_window`/`checkpoint_mb_s`) and cross-job interference split; emits both `report.json` and flat `stats.jsonl` rows to `$ARTIFACT_DIR` / `--dest` (local disk or object store) | report test over a multi-job, multi-step raw events and measurements fixture verifying exact percentiles, interference buckets, and `stats.jsonl` row emission | W1 |
 | W5 | Validity rules | validator over events, measurements and scenario (including zero-orphan reap check and missing-measurement check); report carries validity and reasons | one test per rule, pass and fail | W1, W4 |
 | W6 | Comparator | `swebench-loader compare A.json B.json -thresholds T.yaml`; nonzero exit on regression | fixture pair with a planted regression | W4 |
-| W7 | Simulated Job Runner | Go implementation of the runner interface staging manifest/schedule files and deploying the load generator in-cluster without client-side throughput bottlenecks; replaces run-in-cluster.sh | smoke scenario with one job runs end to end against a cluster | W1, W2 |
-| W8 | Provisioner, Reaper and Backend drivers | Helm/manifest provision, server-queried timed reap to zero and teardown; `Backend` drivers covering SDK and direct-API access across supported sandbox backends; system description written | hermetic fake-API unit tests plus cluster smoke run verifying server-side orphan count reaches zero | W1 |
-| W9 | Measurements | config-driven Prometheus/cluster queries (node/pod/pool/object readiness, router proxy latency, peak/sustained claims, node/pod CPU/mem/IO PSI, `OOMKill`/kubelet/cache evictions, node/identity/API `p99`/429/workqueue/DB/controller/queue health, active vs. total sandboxes per node/vCPU/GiB RAM/pod, `cluster_packing`, actual CPU/memory `WSS`, worker vs. system nodes, snapshot `size_mb`/`checkpoints_in_window`/`checkpoint_mb_s`), structured node timing log parser for canonical restore/checkpoint/pod-startup sub-phases, and unconditional controller/API/node log capture (regardless of run pass or fail); distinguishes `0` from missing/failed scrape | test against fake Prometheus HTTP server covering both valid series and scrape failure; smoke run attaches measurements and logs to report | W1, W8 |
-| W10 | Orchestrator CLI | `cmd/benchmarking/bench run SCENARIO.yaml` driving phases in 5.7 strictly via file artifacts, including timed prepare, unconditional metric/log collection, and timed reap | two simulated jobs with offsets run concurrently; reap converges to zero; report is valid | W2, W4, W5, W7, W8, W9 |
-| W11 | SDK instrumentation | in-memory Prometheus metrics in `measure` mode (lifecycle, per-command `exec`/grade, and total per-task sandbox execution histograms, client slot-wait vs. wire sub-phases, acquisition source and cache state labels from existing responses, retry/error/timeout counters, zero extra RPCs, zero per-call logs); verbose `trace` flag emitting `Trace.jsonl`; overhead benchmarked | emitted traces validate against W1 JSON schema; microbenchmark proves measure-mode metric overhead stays under bound; trace fixture produced | W1 |
+| W7 | Simulated Job Runner | Go implementation of the runner interface supporting `--render-only` (emitting standard runner Job manifests with `${JOB_NAME}`, `${IMAGE}`, `${TAG}`, `${NAME}`, `${DEST}`, service account, pod cert mounts and benchmark node-pool tolerations) and in-cluster deployment without client-side throughput bottlenecks; replaces run-in-cluster.sh | smoke scenario with one job runs end to end against a cluster; rendered manifest plugs into external Job-template harnesses | W1, W2 |
+| W8 | Provisioner, Reaper and Backend drivers | Helm/manifest provision (with `--render-only` manifest output), server-queried timed reap to zero and teardown; `Backend` drivers covering SDK and direct-API access across supported sandbox backends; system description written | hermetic fake-API unit tests plus cluster smoke run verifying server-side orphan count reaches zero | W1 |
+| W9 | Measurements | config-driven Prometheus/cluster queries (supporting standalone `bench measure --start-ts ... --end-ts ... --telemetry-lag 70s`, steady-state window detection, or ingestion of pre-harvested `server_summary.json` / `trial_summary` / `phase_breakdown` artifacts; node/pod/pool/object readiness, router proxy latency, peak/sustained claims, node/pod CPU/mem/IO PSI, `OOMKill`/kubelet/cache evictions, node/identity/API `p99`/429/workqueue/DB/controller/queue health, active vs. total sandboxes per node/vCPU/GiB RAM/pod, `cluster_packing`, actual CPU/memory `WSS`, worker vs. system nodes, snapshot `size_mb`/`checkpoints_in_window`/`checkpoint_mb_s`), structured node timing log parser for canonical restore/checkpoint/pod-startup sub-phases (cross-checked against client request counts), and unconditional controller/API/node log capture including `previous` restarted container logs (regardless of run pass or fail); distinguishes `0` from missing/failed scrape | test against fake Prometheus HTTP server covering both valid series, pre-harvested `server_summary.json` ingestion, and scrape failure; smoke run attaches measurements and logs to report | W1, W8 |
+| W10 | Orchestrator CLI | `cmd/benchmarking/bench` with composable subcommands (`resolve`, `render`, `prewarm`, `measure`, `reap`, `report --report-only`, and end-to-end `run SCENARIO.yaml`) driving phases in 5.7 strictly via `$ARTIFACT_DIR` / `--dest` file artifacts, including timed prepare, unconditional metric/log collection, and timed reap | two simulated jobs with offsets run concurrently via `bench run`; individual stage subcommands run standalone against an existing `$ARTIFACT_DIR`; reap converges to zero; report is valid | W2, W4, W5, W7, W8, W9 |
+| W11 | SDK instrumentation | in-memory Prometheus metrics in `measure` mode (lifecycle, per-command `exec`/grade, and total per-task sandbox execution histograms, client slot-wait vs. wire sub-phases, acquisition source and cache state labels from existing responses, retry/error/timeout counters, zero extra RPCs, zero per-call logs); optional coarse step-boundary flush to `ENV_BENCH_EVENTS_PATH`; verbose `trace` flag emitting `Trace.jsonl`; overhead benchmarked | emitted traces validate against W1 JSON schema; microbenchmark proves measure-mode metric overhead stays under bound; trace fixture produced | W1 |
 | W12 | Trace converter | trace JSONL to trajectories plus explicit schedule preserving concurrency profile, payload sizes and per-step inter-command think times | end-to-end chain test: W11 trace $\to$ W12 $\to$ W3 load generator reproduces step counts, concurrency histogram and think-time distribution | W1, W2, W3, W11 |
-| W13 | Real Job Runner | runner interface over one trainer, measure and trace modes; exports trainer step breakdown (`rollout`, `weight_sync`, `train`), environment overhead fraction (`env_wait/rollout_time`), accelerator bubble/stalled fraction and accelerator-hours per task, sampler and trainer token/s/accelerator, FLOPs/s/accelerator, and rewards | one real job runs through the orchestrator; trace mode yields a trace W12 converts and replays | W10, W11, W12 |
+| W13 | Real Job Runner & Trainer Telemetry Adapters | runner interface (including `--render-only` and attach/post-hoc collection) over one trainer in `measure` and `trace` modes, plus pluggable trainer step-telemetry adapters (converting native MLPerf `:::MLLOG` lines, TensorBoard event files, or structured step logs in `$ARTIFACT_DIR` into trainer step `Events.jsonl`); exports trainer step breakdown (`rollout`, `weight_sync`, `train`), environment overhead fraction (`env_wait/rollout_time`), accelerator bubble/stalled fraction and accelerator-hours per task, sampler and trainer token/s/accelerator, FLOPs/s/accelerator, and rewards | one real job runs through the orchestrator; trainer telemetry adapter parses native `:::MLLOG`/TensorBoard fixtures into valid step events; trace mode yields a trace W12 converts and replays | W10, W11, W12 |
 | W14 | Open-loop mode (optional) | Poisson arrival mode in the load generator | in-memory test shows arrivals independent of completion; report shows the knee | W3 |
 
 ## 9. Milestones (incremental delivery and verification)

@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -30,11 +31,16 @@ import (
 )
 
 // BearerAuth authenticates incoming gRPC and HTTP callers against an expected
-// bearer token, loaded either from a static string or re-read on each check
-// from a token file so rotated Secret mounts take effect without a restart.
+// bearer token, loaded either from a static string or from a token file. The
+// file is read again when it changes, so rotated Secret mounts take effect
+// without a restart.
 type BearerAuth struct {
 	token     string
 	tokenFile string
+
+	mu     sync.Mutex
+	cached string      // the token last read from tokenFile
+	stat   os.FileInfo // tokenFile's stat when cached was read
 }
 
 // NewBearerAuth creates a BearerAuth that requires the given static token.
@@ -59,9 +65,22 @@ func NewBearerAuthFromFile(path string) (*BearerAuth, error) {
 	return auth, nil
 }
 
+// expectedToken returns the static token, or the token file's content. Each
+// check stats the file, and reads it only when the stat changed: another file
+// in its place (a Kubernetes Secret update swaps a symlink), a new
+// modification time or a new size.
 func (a *BearerAuth) expectedToken() (string, error) {
 	if a.tokenFile == "" {
 		return a.token, nil
+	}
+	fi, err := os.Stat(a.tokenFile)
+	if err != nil {
+		return "", fmt.Errorf("apiservice: reading bearer token file %q: %w", a.tokenFile, err)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.stat != nil && os.SameFile(a.stat, fi) && a.stat.ModTime().Equal(fi.ModTime()) && a.stat.Size() == fi.Size() {
+		return a.cached, nil
 	}
 	b, err := os.ReadFile(a.tokenFile)
 	if err != nil {
@@ -71,6 +90,7 @@ func (a *BearerAuth) expectedToken() (string, error) {
 	if tok == "" {
 		return "", fmt.Errorf("apiservice: bearer token file %q is empty", a.tokenFile)
 	}
+	a.cached, a.stat = tok, fi
 	return tok, nil
 }
 

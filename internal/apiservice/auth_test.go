@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-substrate/env/internal/apiservice"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
@@ -118,9 +119,7 @@ func TestBearerAuthGRPCAndHTTP(t *testing.T) {
 	}
 
 	// 5. Token rotation on disk is picked up without recreating BearerAuth.
-	if err := os.WriteFile(tokFile, []byte("rotated-secret\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	replaceFile(t, tokFile, "rotated-secret\n")
 	if _, err := envClient.GetEnvironment(validCtx, &ateenvv1alpha.GetEnvironmentRequest{Id: "auth-env"}); status.Code(err) != codes.Unauthenticated {
 		t.Fatalf("old token after rotation: got %v, want Unauthenticated", err)
 	}
@@ -173,5 +172,74 @@ func TestBearerAuthGRPCAndHTTP(t *testing.T) {
 	res.Body.Close()
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("MCP with valid token: status = %d, want 200", res.StatusCode)
+	}
+}
+
+// replaceFile puts a new file with content at path, the way a Secret update
+// does: write a new file, then rename it over the old one.
+func replaceFile(t *testing.T, path, content string) {
+	t.Helper()
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The token file is read again only when its stat changes, not on each check.
+func TestBearerAuthTokenFileCache(t *testing.T) {
+	tokFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokFile, []byte("aaaa\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	auth, err := apiservice.NewBearerAuthFromFile(tokFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepts := func(tok string) bool { return auth.Check("Bearer "+tok) == nil }
+	fi, err := os.Stat(tokFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mtime := fi.ModTime()
+
+	// A rewrite in place that keeps the size and the modification time is
+	// not seen: the stat is what tells a change, and no read happens.
+	if err := os.WriteFile(tokFile, []byte("bbbb\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(tokFile, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	if !accepts("aaaa") || accepts("bbbb") {
+		t.Fatal("an unchanged stat must serve the cached token")
+	}
+
+	// A new modification time is a change.
+	later := mtime.Add(time.Second)
+	if err := os.Chtimes(tokFile, later, later); err != nil {
+		t.Fatal(err)
+	}
+	if accepts("aaaa") || !accepts("bbbb") {
+		t.Fatal("a new modification time must load the new token")
+	}
+
+	// Another file in its place is a change, with the same size and time.
+	replaceFile(t, tokFile, "cccc\n")
+	if err := os.Chtimes(tokFile, later, later); err != nil {
+		t.Fatal(err)
+	}
+	if accepts("bbbb") || !accepts("cccc") {
+		t.Fatal("a replaced file must load the new token")
+	}
+
+	// A missing file fails the check; the cached token does not hide it.
+	if err := os.Remove(tokFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := auth.Check("Bearer cccc"); status.Code(err) != codes.Internal {
+		t.Fatalf("missing token file: got %v, want Internal", err)
 	}
 }

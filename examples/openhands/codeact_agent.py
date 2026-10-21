@@ -38,7 +38,7 @@ its files when the script ends.
         python codeact_agent.py <env-id> ["task"]
     SESSION_KEY=<key> python codeact_agent.py --scripted <env-id>
 
-Environment as in _common.py (API, ATESPACE, PORT, SESSION_KEY, WORKDIR).
+Environment as in _common.py (API, API_TOKEN, ATESPACE, PORT, SESSION_KEY, WORKDIR).
 """
 
 from __future__ import annotations

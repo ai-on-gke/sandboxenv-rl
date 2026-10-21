@@ -30,6 +30,7 @@ pid to ``/tmp/scripted_llm_<port>.pid``, so the caller can stop it.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -106,8 +107,14 @@ def daemonize(log_path: str, pid_path: str) -> None:
 
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if a != "--daemon"]
-    port = int(args[0]) if args else 9999
-    if "--daemon" in sys.argv:
-        daemonize(f"/tmp/scripted_llm_{port}.log", f"/tmp/scripted_llm_{port}.pid")
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    parser = argparse.ArgumentParser(description="A scripted stand-in for a model: an "
+                                     "OpenAI-compatible endpoint with a fixed CodeAct trajectory.")
+    parser.add_argument("port", nargs="?", type=int, default=9999,
+                        help="port on 127.0.0.1 (default 9999)")
+    parser.add_argument("--daemon", action="store_true",
+                        help="detach; log to /tmp/scripted_llm_<port>.log, pid in "
+                        "/tmp/scripted_llm_<port>.pid")
+    args = parser.parse_args()
+    if args.daemon:
+        daemonize(f"/tmp/scripted_llm_{args.port}.log", f"/tmp/scripted_llm_{args.port}.pid")
+    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()

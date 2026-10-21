@@ -88,7 +88,8 @@ class ToolRunner:
     def request(self, path: str, payload: dict | None = None, timeout: float = 120) -> dict:
         data = None if payload is None else json.dumps(payload).encode()
         req = urllib.request.Request(self.url + path, data=data, headers={
-            "Content-Type": "application/json", "X-Session-API-Key": self.key})
+            "Content-Type": "application/json", "X-Session-API-Key": self.key,
+            **self.workspace.proxy_headers()})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
 

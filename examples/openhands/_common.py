@@ -15,8 +15,10 @@
 """Shared by the examples: a workspace attached to an existing environment.
 
 Environment: ``API`` (ate-env-api address, default 127.0.0.1:7777),
-``ATESPACE`` (default ate-env), ``PORT`` (agent-server port, default 8000),
-``SESSION_KEY`` (the template's ``OH_SESSION_API_KEYS_0``), ``WORKDIR`` (where
+``API_TOKEN`` (ate-env-api's bearer token, when it runs with
+``-auth-token-file``), ``ATESPACE`` (default ate-env), ``PORT`` (agent-server
+port, default 8000), ``SESSION_KEY`` (the template's
+``OH_SESSION_API_KEYS_0``), ``WORKDIR`` (where
 commands run and what relative paths resolve against; default ``/``). The
 image's WORKDIR does not apply: the agent-server runs in ``/``, where the
 guest starts it, and the SDK sends no directory unless given one, thus set
@@ -35,8 +37,13 @@ def attach(env_id: str, *, working_dir: str | None = None, api_key: str | None =
     return AteEnvWorkspace(
         env_id=env_id,
         api_url=os.environ.get("API", "127.0.0.1:7777"),
+        api_token=os.environ.get("API_TOKEN") or None,
         atespace=os.environ.get("ATESPACE", "ate-env"),
         server_port=int(os.environ.get("PORT", "8000")),
         api_key=api_key or os.environ["SESSION_KEY"],
+        # "/" and not AteEnvWorkspace's default "/workspace": these examples
+        # attach to environments that demo.sh or another tool created, and "/"
+        # is where the agent-server runs, thus a command without a cwd sees the
+        # same directory here as through the agent-server's own API.
         working_dir=working_dir or os.environ.get("WORKDIR") or "/",
     )

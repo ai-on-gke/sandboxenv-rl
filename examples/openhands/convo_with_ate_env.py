@@ -67,6 +67,7 @@ with AteEnvWorkspace(
     template=template,
     image=os.getenv("TASK_IMAGE"),
     api_url=os.getenv("API", "127.0.0.1:7777"),
+    api_token=os.getenv("API_TOKEN") or None,  # with ate-env-api -auth-token-file
     api_key=os.environ["SESSION_KEY"],
 ) as workspace:
     # 3) Create the agent

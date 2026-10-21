@@ -315,3 +315,83 @@ func (rep *Report) WriteText(w io.Writer) {
 		}
 	}
 }
+
+// WriteComparison prints several runs side by side, one column per run: the
+// header figures, then every event in the order it first appears, then the
+// per-step barrier, park and wake figures when a run has steps. It is the
+// table for the same workload on different clusters or builds.
+func WriteComparison(w io.Writer, reps []*Report) {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	row := func(label string, cell func(*Report) string) {
+		fmt.Fprint(tw, label)
+		for _, r := range reps {
+			fmt.Fprintf(tw, "\t%s", cell(r))
+		}
+		fmt.Fprintln(tw)
+	}
+	row("run", func(r *Report) string { return r.RunID })
+	row("mode", func(r *Report) string { return r.Mode })
+	row("tasks", func(r *Report) string { return fmt.Sprintf("%d", r.Tasks) })
+	row("failed", func(r *Report) string { return fmt.Sprintf("%d", r.Failed) })
+	row("reward_rate", func(r *Report) string { return fmt.Sprintf("%.3f", r.RewardRate) })
+	row("run_s", func(r *Report) string { return fmt.Sprintf("%.1f", r.RunMS/1000) })
+
+	type key struct{ event, name string }
+	var order []key
+	seen := map[key]bool{}
+	for _, r := range reps {
+		for _, s := range r.Stats {
+			k := key{s.Event, s.Name}
+			if !seen[k] {
+				seen[k] = true
+				order = append(order, k)
+			}
+		}
+	}
+	row("event", func(*Report) string { return "p50/p95 ms n=count [f=failed r=retried]" })
+	for _, k := range order {
+		label := k.event
+		if k.name != "" {
+			label += " " + k.name
+		}
+		row(label, func(r *Report) string {
+			for _, s := range r.Stats {
+				if s.Event != k.event || s.Name != k.name {
+					continue
+				}
+				cell := fmt.Sprintf("%.0f/%.0f n=%d", s.P50MS, s.P95MS, s.Count)
+				if s.Failed > 0 {
+					cell += fmt.Sprintf(" f=%d", s.Failed)
+				}
+				if s.Retried > 0 {
+					cell += fmt.Sprintf(" r=%d", s.Retried)
+				}
+				return cell
+			}
+			return "-"
+		})
+	}
+
+	last := 0
+	for _, r := range reps {
+		for _, s := range r.Steps {
+			if s.Step > last {
+				last = s.Step
+			}
+		}
+	}
+	if last > 0 {
+		row("step", func(*Report) string { return "barrier_s/park_s, wake p50 ms" })
+		for n := 1; n <= last; n++ {
+			row(fmt.Sprintf("step %d", n), func(r *Report) string {
+				for _, s := range r.Steps {
+					if s.Step == n {
+						return fmt.Sprintf("%.1f/%.1f, %.0f", s.BarrierMS/1000, s.ParkMS/1000, s.WakeP50MS)
+					}
+				}
+				return "-"
+			})
+		}
+	}
+	tw.Flush()
+}

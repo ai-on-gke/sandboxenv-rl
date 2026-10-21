@@ -137,3 +137,46 @@ func TestRecorderKeepsFirstWriteError(t *testing.T) {
 		t.Fatal("a discarding recorder has no error")
 	}
 }
+
+func TestWriteComparison(t *testing.T) {
+	a := Build([]Event{
+		{RunID: "a", Event: EventCreate, DurMS: 100, OK: true},
+		{RunID: "a", Event: EventTTFI, DurMS: 900, OK: true, Attempts: 2},
+		{RunID: "a", Event: EventTask, Step: 1, DurMS: 500, OK: true, Reward: intp(1)},
+		{RunID: "a", Event: EventBarrier, Step: 1, DurMS: 700, OK: true, Count: 1},
+		{RunID: "a", Event: EventPark, Name: "suspend", Step: 1, DurMS: 100, OK: true, Count: 1},
+		{RunID: "a", Event: EventRun, Name: "steps", DurMS: 2000, OK: true, Count: 1},
+	})
+	b := Build([]Event{
+		{RunID: "b", Event: EventCreate, DurMS: 50, OK: true},
+		{RunID: "b", Event: EventCreate, DurMS: 70, OK: false, Err: "boom"},
+		{RunID: "b", Event: EventTask, DurMS: 400, OK: true, Reward: intp(1)}, // eval mode: step 0
+		{RunID: "b", Event: EventRun, Name: "eval", DurMS: 1000, OK: true, Count: 1},
+	})
+	var out bytes.Buffer
+	WriteComparison(&out, []*Report{a, b})
+	text := out.String()
+	for _, want := range []string{"100/100 n=1", "50/50 n=2 f=1", "900/900 n=1 r=1", "0.7/0.1, 0"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("comparison lacks %q:\n%s", want, text)
+		}
+	}
+	// A run without the event, or without the step, shows a dash in its column.
+	for _, label := range []string{"ttfi", "step 1"} {
+		found := false
+		for _, line := range strings.Split(text, "\n") {
+			if strings.HasPrefix(line, label+" ") {
+				found = true
+				if !strings.HasSuffix(strings.TrimSpace(line), "-") {
+					t.Errorf("%s row should end with a dash for run b: %q", label, line)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("no %s row:\n%s", label, text)
+		}
+	}
+	if !strings.HasPrefix(text, "run ") || !strings.Contains(strings.SplitN(text, "\n", 2)[0], "b") {
+		t.Errorf("header row: %q", strings.SplitN(text, "\n", 2)[0])
+	}
+}

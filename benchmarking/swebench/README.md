@@ -56,7 +56,9 @@ API server included, which is what a trainer sees):
 `swebench-loader report RUN.jsonl -json summary.json` prints count, failed,
 p50, p95 and max per event, a per-step table (tasks, barrier, park, wake
 p50/p95) and the most frequent errors. The JSON is the artifact to diff
-between runs.
+between runs. Given several files, `report a.jsonl b.jsonl` prints one table
+with a column per run (p50/p95 per event, barrier, park and wake per step),
+and `-json` then writes the summaries as an array.
 
 ## How many actors, and on which clusters
 
@@ -82,8 +84,9 @@ and read the packing from Substrate's metrics, not from the report.
 The loader never talks to Kubernetes. `-endpoint` is an ate-env API address,
 so "which cluster" is "which API". To compare clusters (builds, node images,
 image delivery) run the same manifest, trajectory and flags once per
-cluster and diff the summaries; the in-cluster script uses the current
-`kubectl` context, so switch context between runs. Each cluster needs the
+cluster, with `CONTEXT=<kubectl context>` pointing the in-cluster script at
+each cluster and the cluster's name in the run id, then put the events files
+side by side with `swebench-loader report a.jsonl b.jsonl`. Each cluster needs the
 full setup below: Substrate and the ate-env API installed, the images
 reachable from it, and the golden tags baked there (a golden tag is per
 cluster, so the first run on a fresh cluster pays the bake for every image).
@@ -156,7 +159,9 @@ KO_DOCKER_REPO=gcr.io/PROJECT/repo benchmarking/swebench/run-in-cluster.sh swe-e
 The script bakes the dataset and the exclusion list into the loader image,
 runs a Job next to ate-env-api, follows the full loader log (step failures
 included), copies the events file back to the current directory, prints the
-report and deletes the Job.
+report and deletes the Job. `CONTEXT=<kubectl context>` selects the cluster;
+the same command with a different context and run id is how two clusters are
+compared.
 
 ## Image-delivery workloads
 

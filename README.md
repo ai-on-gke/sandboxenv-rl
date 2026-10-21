@@ -1,67 +1,135 @@
-# 📦 Agent Substrate Environment
+# sandboxenv-rl
 
 > [!WARNING]
 > This is an alpha API and is likely to change until v1.0 is released.
 
-An environment service on top of [Agent Substrate](https://github.com/agent-substrate/substrate): isolated, stateful execution environments
-driven remotely with **command execution**, **filesystem operations**, and **built-in MCP tools**.
+Sandboxed execution environments for reinforcement learning (RL) on
+[Agent Substrate](https://github.com/agent-substrate/substrate). Each rollout, eval task or agent
+episode gets its own isolated, stateful environment: a Substrate actor that runs in gVisor and is
+driven remotely through a gRPC API, a CLI, a Python fleet SDK or MCP.
 
-Each environment is a Substrate *actor* running in an isolated container.
-Substrate provides the heavy lifting — snapshotting, scheduling,
-multiplexing many idle environments onto a small worker pool, and routing —
-while this project adds the environment-shaped API on top.
+RL jobs create many environments per step and leave most of them idle while the model generates.
+Substrate fits that shape. An idle environment is suspended to a snapshot and holds no worker; the
+next command resumes it. Later environments on the same image restore a golden snapshot instead of
+booting. This repo adds the environment API, the fleet SDK, the framework integrations and the
+benchmarks on top.
 
-## Overview
+## What changed
+
+This repo started on 2026-10-20 as a copy of [agent-substrate/env](https://github.com/agent-substrate/env),
+with its history, its pull requests (recreated here with an `[env#N]` title prefix) and its open
+issues. agent-substrate/env is being repurposed, and the RL work continues here. The Go module path
+is still `github.com/agent-substrate/env`.
+
+The focus moves from a general environment service to RL training and evaluation:
+
+| Area | What it adds |
+|---|---|
+| Fleet SDK | `SandboxFleet` and `AsyncSandboxFleet` in [`clients/python`](clients/python/README.md): acquire sandboxes for tasks by image, run tasks with the `naive`, `sliding` or `pipelined` strategy, pre-warm images, release and recycle. |
+| Any task image | `rootfs_image` runs a digest-pinned image unmodified: `ate-env-api` derives an ActorTemplate per image and mounts the guest into it as an image volume. Runtime layers and sidecars add a second runtime to any image ([docs/rootfs-images](docs/rootfs-images/README.md)). |
+| Daemons inside an environment | A port proxy on `ate-env-api` reaches any port in an environment by header or by path, WebSockets included ([details](#reaching-a-service-inside-an-environment)). |
+| Framework integrations | A [NeMo Gym](integrations/nemo-gym/README.md) sandbox provider and a [GRPO](examples/grpo/README.md) training loop on TRL. |
+| Benchmarks | A [SWE-bench Verified loader](benchmarking/swebench/README.md) that drives real task images the way an RL job does, and the [design](internal/benchmarking/DESIGN.md) of the benchmark system. |
+| Platform | Built against Substrate `ddb46651`: the WorkerPool chooses the sandbox, each template selects its pool by label, suspends are durable, and `ate-env-api` runs as its own identity under Substrate authorization. The guest runs as a PID 1 init that reaps orphans, and it allocates PTYs. |
+
+## Architecture
 
 ```
  ╭──────────────╮    ╭──────────────╮ lifecycle  ╭────────────╮
  │    Clients   │    │              ├───────────▶│   ateapi   │ Substrate control plane
  │  ate-env CLI ├───▶│ ate-env-api  │            ╰────────────╯
- ╰──────────────╯    │ (API server) │ guest ops  ╭────────────╮     ╭──────────────────────╮
-                     │              ├───────────▶│   atenet   ├────▶│ actor                │
+ │  Python SDK  │    │ (API server) │ guest ops  ╭────────────╮     ╭──────────────────────╮
+ ╰──────────────╯    │              ├───────────▶│   atenet   ├────▶│ actor                │
                      ╰──────────────╯ (shell/mcp)│   router   │     │  └ ate-env-guest     │
-                                                 ╰────────────╯     │  /readyz, /v1alpha/* │
+                                      port proxy ╰────────────╯     │  /readyz, /v1alpha/* │
                                                                     ╰──────────────────────╯
 ```
 
-- **`cmd/ate-env`** — CLI for managing environments, executing remote commands, and performing file I/O.
-- **`cmd/ate-env-api`** — The API service that manages environments and proxies remote guest requests.
-- **`cmd/ate-env-guest`** — The daemon server running inside each actor serving command executions, file read/write, and built-in MCP tools.
-- **`clients/go`** — The Go client library to manage environments, run commands, and perform file operations.
-- **`clients/python`** — Python client for environment lifecycle management and batch sandbox orchestration ([README](clients/python/README.md)).
-- **`integrations/nemo-gym`** — A [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) sandbox provider that runs rollout sandboxes as environments, built on the Python client ([README](integrations/nemo-gym/README.md)).
+| Path | What it is |
+|---|---|
+| [`cmd/ate-env`](cmd/ate-env) | CLI: create, suspend and delete environments, run commands, move files, and print the Kubernetes and Substrate manifests. |
+| [`cmd/ate-env-api`](cmd/ate-env-api) | The API service: environment lifecycle, guest calls, MCP and the port proxy. |
+| [`cmd/ate-env-guest`](cmd/ate-env-guest) | The daemon inside each environment: processes, files and MCP tools. |
+| [`clients/python`](clients/python/README.md) | Python client, import name `ate_env`: `Client` and `Env` for single environments, and the fleet SDK. |
+| [`clients/go`](clients/go) | Go client. |
+| [`integrations/`](#integrations) | Framework integrations. |
+| [`examples/`](#examples) | Runnable examples. |
+| [`benchmarking/`](benchmarking/swebench/README.md), [`cmd/benchmarking`](cmd/benchmarking), [`internal/benchmarking`](internal/benchmarking/DESIGN.md) | The SWE-bench loader, its scripts and the benchmark design. |
+| [`docs/`](docs) | Rootfs images and runtime layers, and how releases are cut. |
 
-## Installation
+## Examples
 
-Download the `ate-env` binary for your platform from the
-[latest release](https://github.com/agent-substrate/env/releases/latest). Release
-binaries know the digests of the `ate-env-api` and `ate-env-guest` images
-published with that release, so the commands below need no image flags for
-this repo's images. Building from source works too, but then `--api-image` and
-`--guest-image` must be given:
+| Example | What it shows |
+|---|---|
+| [`examples/grpo`](examples/grpo/README.md) | A real RL loop: TRL's GRPOTrainer trains Qwen2.5-0.5B on MBPP, and each completion runs in an environment that computes the reward. Covers the park/wake pattern, with the fleet suspended after each step. CPU only. |
+| [`examples/runtime-layers`](examples/runtime-layers/README.md) | An unmodified rootfs image with a second runtime injected as a layer and supervised as a sidecar. |
+| [`examples/mcp`](examples/mcp/main.go) | Go: connect to an environment's MCP endpoint, list the tools and call them. |
+| [`examples/guest-daemon`](examples/guest-daemon/README.md) | Go: run the guest gRPC services standalone, without a cluster. |
+
+## Integrations
+
+| Integration | Framework | What it does |
+|---|---|---|
+| [`integrations/nemo-gym`](integrations/nemo-gym/README.md) | [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) | Sandbox provider `substrate`, registered through the `nemo_gym.sandbox_providers` entry point, with no change to NeMo Gym. `endpoint()` reaches a daemon inside the sandbox through the port proxy. |
+
+## Benchmarks
+
+[`swebench-loader`](benchmarking/swebench/README.md) drives SWE-bench Verified task images through
+the API the way a simulated RL job does: `eval` mode creates, replays, grades and deletes each task,
+and `steps` mode creates a fleet once and parks it between training steps. Image-delivery workloads
+compare image pull, image streaming and other loaders on the same images. The report breaks down
+what each phase cost.
+[`internal/benchmarking/DESIGN.md`](internal/benchmarking/DESIGN.md) specifies the benchmark system.
+
+## Get started
+
+You need a cluster with Agent Substrate at or after
+[`0443aec3`](https://github.com/agent-substrate/substrate/commit/0443aec3), a snapshots bucket,
+`kubectl` with `kubectl-ate`, Go and [ko](https://ko.build). This repo publishes no release binaries
+or images yet, thus build them:
 
 ```bash
-go install github.com/agent-substrate/env/cmd/ate-env@latest
+git clone https://github.com/ai-on-gke/sandboxenv-rl && cd sandboxenv-rl
+go install ./cmd/ate-env
+make images ATE_ENV_IMAGE_REPO=<registry>   # prints --guest-image and --api-image
 ```
 
-## Images
+Deploy, and register a template ([deployment guide](#deployment-guide) explains each step):
 
-Each release publishes two images to GitHub Container Registry, multi-platform,
-signed, and meant to be used by digest:
+```bash
+kubectl ate create atespace ate-env
+ate-env manifest access-policy | kubectl ate create access-policy -a ate-env -f -
+ate-env manifest --api-image <api-image> --worker-image <ateworker-gvisor-image> | kubectl apply -f -
+ate-env manifest template --guest-image <guest-image> --snapshots-bucket <object-storage-url> \
+  | kubectl-ate create actor-template -f -
+```
 
-| image | runs |
-|---|---|
-| `ghcr.io/agent-substrate/env/ate-env-api` | the API service, in the cluster |
-| `ghcr.io/agent-substrate/env/ate-env-guest` | inside every environment actor |
+Try an environment:
 
-The digests are in the release notes and in the `images_<tag>.txt` asset; the
-release's `ate-env` binary defaults to them. The worker image
-(`--worker-image`, `ateworker-gvisor`) comes from the
-[Substrate repo](https://github.com/agent-substrate/substrate) and must match the
-Substrate version on your cluster. See [docs/release.md](docs/release.md) for
-verification, pinning and how releases are cut.
+```bash
+kubectl port-forward -n ate-env svc/ate-env-api 7777:7777 &
+ate-env create dev1
+ate-env dev1 shell 'echo hello from $(hostname)'
+ate-env delete dev1
+```
 
-## Quickstart
+Drive environments from Python with the fleet SDK (`pip install ./clients/python`). Leaving the
+`with` block deletes everything the fleet created:
+
+```python
+from ate_env import FleetConfig, SandboxFleet, Task
+
+with SandboxFleet(FleetConfig(endpoint="127.0.0.1:7777")) as fleet:
+    handle = fleet.acquire(Task(id="t1", image="docker.io/library/python@sha256:<digest>"))
+    print(handle.exec(["python3", "-c", "print(6 * 7)"]).stdout)
+    handle.write_file("/tmp/answer.txt", "42\n")
+    print(handle.read_file_bytes("/tmp/answer.txt"))
+    handle.release()
+```
+
+Then pick an [example](#examples) or an [integration](#integrations).
+
+## Deployment guide
 
 Prerequisites: a cluster with [Agent Substrate](https://github.com/agent-substrate/substrate)
 installed and a snapshots bucket. ate-env is built against Substrate
@@ -121,14 +189,14 @@ environments in.
 Deploy the namespace, worker pool, ServiceAccount and API service:
 
 ```bash
-# With a release binary the API image defaults to the release's. The worker
+# --api-image is the ate-env-api image that `make images` printed. The worker
 # image is ateworker-gvisor from the Substrate repo at your cluster's version; in
 # that checkout, `go run ./cmd/ate-setup publish worker-images` pushes it and
 # prints the digest-pinned ref. Use the digest: a :latest tag is whatever was
 # built last, and a stale worker image registers workers with no capacity.
 ate-env manifest \
+  --api-image      <registry>/ate-env-api@sha256:<digest> \
   --worker-image   <registry>/ateworker-gvisor@sha256:<digest> | kubectl apply -f -
-# From a source build, add: --api-image ghcr.io/agent-substrate/env/ate-env-api@sha256:<digest>
 
 # Ensure that the pods are running:
 kubectl get pods -n ate-env
@@ -146,10 +214,10 @@ Substrate manages ActorTemplates directly in its control plane rather than Kuber
 Templates live in the `ate-env` atespace, which `ate-env-api` creates when it starts. Register templates after the `ate-env-api` pod is Running, or create the atespace yourself first with `kubectl-ate create atespace ate-env`.
 
 ```bash
-# With a release binary the guest image defaults to the release's.
+# --guest-image is the ate-env-guest image that `make images` printed.
 ate-env manifest template \
+  --guest-image    <registry>/ate-env-guest@sha256:<digest> \
   --snapshots-bucket <object-storage-url> | kubectl-ate create actor-template -f -
-# From a source build, add: --guest-image ghcr.io/agent-substrate/env/ate-env-guest@sha256:<digest>
 ```
 
 Each actor gets 2 CPUs and 4 GiB unless you pass `--cpu` and `--memory` (Kubernetes quantities such as
@@ -437,14 +505,6 @@ curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
        }
      }'
 ```
-
-## Examples
-
-For complete runnable Go programs:
-- **MCP**: See [mcp](examples/mcp/main.go) to connect to an environment's MCP endpoint, discover tools, and execute tool calls.
-- **Guest Daemon**: See [guest-daemon](examples/guest-daemon/main.go) to run a standalone in-actor gRPC service for asynchronous process execution and chunked file transfer.
-
-For using environments from a framework, see [integrations/nemo-gym](integrations/nemo-gym/README.md): a NeMo Gym sandbox provider registered through the `nemo_gym.sandbox_providers` entry point.
 
 ## Cleanup
 

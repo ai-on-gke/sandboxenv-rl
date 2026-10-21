@@ -39,15 +39,15 @@ func openPTY(rows, cols uint32) (*os.File, *os.File, error) {
 	}
 
 	var unlock int32
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCSPTLCK, uintptr(unsafe.Pointer(&unlock))); errno != 0 {
+	if err := ioctl(ptmx, syscall.TIOCSPTLCK, unsafe.Pointer(&unlock)); err != nil {
 		ptmx.Close()
-		return nil, nil, fmt.Errorf("unlocking pty slave (TIOCSPTLCK): %w", errno)
+		return nil, nil, fmt.Errorf("unlocking pty slave (TIOCSPTLCK): %w", err)
 	}
 
 	var ptyNum uint32
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCGPTN, uintptr(unsafe.Pointer(&ptyNum))); errno != 0 {
+	if err := ioctl(ptmx, syscall.TIOCGPTN, unsafe.Pointer(&ptyNum)); err != nil {
 		ptmx.Close()
-		return nil, nil, fmt.Errorf("querying pty number (TIOCGPTN): %w", errno)
+		return nil, nil, fmt.Errorf("querying pty number (TIOCGPTN): %w", err)
 	}
 
 	slavePath := fmt.Sprintf("/dev/pts/%d", ptyNum)
@@ -74,8 +74,29 @@ func setWinsize(ptmx *os.File, rows, cols uint32) error {
 		Row: uint16(rows),
 		Col: uint16(cols),
 	}
-	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCSWINSZ, uintptr(unsafe.Pointer(&ws))); errno != 0 {
-		return fmt.Errorf("setting window size (TIOCSWINSZ): %w", errno)
+	if err := ioctl(ptmx, syscall.TIOCSWINSZ, unsafe.Pointer(&ws)); err != nil {
+		return fmt.Errorf("setting window size (TIOCSWINSZ): %w", err)
+	}
+	return nil
+}
+
+// ioctl runs an ioctl on f through SyscallConn. Unlike f.Fd(), this leaves f
+// in non-blocking mode, so Close still interrupts a pending Read on the
+// master, and it keeps f open for the duration of the call. It returns
+// os.ErrClosed once f is closed.
+func ioctl(f *os.File, req uintptr, arg unsafe.Pointer) error {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var errno syscall.Errno
+	if err := rc.Control(func(fd uintptr) {
+		_, _, errno = syscall.Syscall(syscall.SYS_IOCTL, fd, req, uintptr(arg))
+	}); err != nil {
+		return err
+	}
+	if errno != 0 {
+		return errno
 	}
 	return nil
 }

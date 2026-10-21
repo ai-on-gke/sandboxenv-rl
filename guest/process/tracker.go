@@ -473,10 +473,17 @@ func (t *Tracker) reap(state *ProcessState, cmd *exec.Cmd, stdoutFile, stderrFil
 		select {
 		case <-state.ptyDone:
 		case <-time.After(100 * time.Millisecond):
-			_ = state.ptmx.Close()
-			<-state.ptyDone
+			// A descendant still holds the slave open. Closing the master
+			// ends copyPTY's read; output the descendant writes later is lost.
 		}
+		// ptmx is also stdin. Close it before taking stdinMu: Close interrupts
+		// a WriteInput blocked on a full terminal input queue, which holds
+		// stdinMu. WriteInput maps the closed file to ErrExited.
 		_ = state.ptmx.Close()
+		state.stdinMu.Lock()
+		state.stdinClosed = true
+		state.stdinMu.Unlock()
+		<-state.ptyDone
 	}
 
 	// Wait returned only after the stdout/stderr copiers finished, so the
@@ -586,7 +593,8 @@ func (t *Tracker) WriteInput(processID string, data []byte) (int, error) {
 	}
 	n, err := state.stdin.Write(data)
 	if err != nil {
-		if state.Exited() || errors.Is(err, syscall.EPIPE) {
+		// os.ErrClosed: reap closed the PTY master after the process exited.
+		if state.Exited() || errors.Is(err, syscall.EPIPE) || errors.Is(err, os.ErrClosed) {
 			return n, ErrExited
 		}
 		return n, fmt.Errorf("writing stdin: %w", err)
@@ -642,7 +650,7 @@ func (t *Tracker) Resize(processID string, rows, cols uint32) error {
 		return ErrNoTTY
 	}
 	if err := setWinsize(ptmx, rows, cols); err != nil {
-		if state.Exited() {
+		if state.Exited() || errors.Is(err, os.ErrClosed) {
 			return ErrExited
 		}
 		return err

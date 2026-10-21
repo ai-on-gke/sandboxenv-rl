@@ -21,8 +21,11 @@ import (
 	"math"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -704,5 +707,33 @@ func TestTTYExemptFromLogCap(t *testing.T) {
 	}
 	if exit == nil || exit.GetExitCode() != 0 {
 		t.Fatalf("expected exit_code 0, got %v", exit)
+	}
+}
+
+// A descendant that ignores SIGHUP keeps the slave open after the process
+// exits. The process must still be reported as exited, after the short drain
+// in reap, and not only when the descendant exits.
+func TestTTYExitWhileDescendantHoldsTerminal(t *testing.T) {
+	requirePTY(t)
+	client := setupTestServer(t)
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	started := time.Now()
+	proc := start(t, client, &ateenvv1alpha.StartProcessRequest{
+		Command: []string{"sh", "-c", `(trap '' HUP; exec sleep 30) & echo $! > ` + pidFile + `; echo started`},
+		Tty:     &ateenvv1alpha.TTY{Rows: 24, Cols: 80},
+	})
+	t.Cleanup(func() {
+		if b, err := os.ReadFile(pidFile); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	exit := wait(t, client, proc.GetProcessId())
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("exit reported after %v; want soon after the shell exits", elapsed)
+	}
+	if exit.GetExitCode() != 0 {
+		t.Fatalf("exit_code = %d, want 0", exit.GetExitCode())
 	}
 }

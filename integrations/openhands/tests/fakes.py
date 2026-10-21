@@ -17,11 +17,15 @@ and its port proxy over HTTP in front of a real agent-server on localhost.
 
 The fake proxy keeps the router's behaviour that the workspace relies on: an
 unknown environment is a 404, a suspended one is woken by the request, the
-routing prefix is stripped, and HTTP upgrades are relayed both ways.
+routing prefix is stripped, and HTTP upgrades are relayed both ways. It also
+keeps ate-env-api's own answers: 400 for port 80 (the guest) and a port out
+of range, and, with ``api_token``, 401 for a request without the bearer in
+X-Env-Authorization or Authorization, which it removes before it forwards.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import http.client
 import re
@@ -53,6 +57,9 @@ class FakeAteEnv:
     create_but_fail: bool = False  # record the env, then fail the call
     upstreams: dict[int, str] = field(default_factory=dict)  # port -> host:port
     unhealthy_polls: int = 0  # answer this many /health requests with 503 first
+    api_token: str | None = None  # the proxy requires this bearer when set
+    refuse: tuple[int, str] | None = None  # answer every proxy request with this
+    create_lands_after: float | None = None  # create succeeds this late, after the client gave up
     wakes: int = 0
     proxied: list[dict] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -82,17 +89,25 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
         })
         if s.create_code is not None:
             await context.abort(s.create_code, "create refused")
+        if s.create_lands_after is not None:
+            # The server goes on with the create after the caller's deadline.
+            asyncio.get_running_loop().call_later(
+                s.create_lands_after, self._register, request)
+            await asyncio.sleep(s.create_lands_after + 30)
         if request.id in s.envs:
             await context.abort(grpc.StatusCode.ALREADY_EXISTS, "exists")
-        s.envs[request.id] = {
+        self._register(request)
+        if s.create_but_fail:
+            await context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, "lost the answer")
+        return env_pb2.CreateEnvironmentResponse(environment=s.env_pb(request.id))
+
+    def _register(self, request) -> None:
+        self.state.envs[request.id] = {
             "atespace": request.atespace or DEFAULT_ATESPACE,
             "template": request.template.name or DEFAULT_TEMPLATE,
             "template_atespace": request.template.atespace or DEFAULT_ATESPACE,
             "status": int(EnvironmentStatus.RUNNING),
         }
-        if s.create_but_fail:
-            await context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, "lost the answer")
-        return env_pb2.CreateEnvironmentResponse(environment=s.env_pb(request.id))
 
     async def GetEnvironment(self, request, context):
         if request.id not in self.state.envs:
@@ -136,11 +151,33 @@ def _handler(state: FakeAteEnv):
             pass
 
         def _route(self):
+            """(upstream, rest, headers to drop) for a request, or None once answered."""
+            if state.refuse is not None:
+                self._reply(*state.refuse)
+                return None
             path, _, query = self.path.partition("?")
             m = _PATH.match(path)
             if not m:
                 self._reply(404, "not a port-proxy path")
                 return None
+            port = int(m["port"])
+            if port == 80:
+                self._reply(400, "port 80 is the ate-env guest, which ate-env-api serves itself")
+                return None
+            if port > 65535:
+                self._reply(400, f"port {m['port']!r} is not a TCP port (1-65535)")
+                return None
+            drop = {"x-env-authorization"}
+            if state.api_token is not None:
+                want = f"Bearer {state.api_token}"
+                given = self.headers.get("X-Env-Authorization")
+                if given is None:
+                    given = self.headers.get("Authorization")
+                    drop.add("authorization")
+                if given != want:
+                    self._reply(401, "missing or invalid bearer token; send it in "
+                                     "X-Env-Authorization or Authorization")
+                    return None
             env_id, atespace = m["id"], m["a"] or DEFAULT_ATESPACE
             with state.lock:
                 env = state.envs.get(env_id)
@@ -155,12 +192,14 @@ def _handler(state: FakeAteEnv):
                     state.unhealthy_polls -= 1
                     self._reply(503, f"actor {env_id} is not running")
                     return None
-                upstream = state.upstreams.get(int(m["port"]))
-                state.proxied.append({"method": self.command, "path": rest, "headers": dict(self.headers)})
+                upstream = state.upstreams.get(port)
+                # What the daemon sees: the headers after the proxy's removals.
+                forwarded = {k: v for k, v in self.headers.items() if k.lower() not in drop}
+                state.proxied.append({"method": self.command, "path": rest, "headers": forwarded})
             if upstream is None:
                 self._reply(502, "connection refused")
                 return None
-            return upstream, rest
+            return upstream, rest, drop
 
         def _reply(self, code: int, text: str) -> None:
             body = text.encode()
@@ -173,13 +212,13 @@ def _handler(state: FakeAteEnv):
             routed = self._route()
             if routed is None:
                 return
-            upstream, rest = routed
+            upstream, rest, drop = routed
             if self.headers.get("Upgrade"):
-                self._upgrade(upstream, rest)
+                self._upgrade(upstream, rest, drop)
                 return
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length) if length else None
-            headers = {k: v for k, v in self.headers.items() if k.lower() not in _HOP}
+            headers = {k: v for k, v in self.headers.items() if k.lower() not in _HOP | drop}
             conn = http.client.HTTPConnection(upstream, timeout=120)
             try:
                 conn.request(self.command, rest, body=body, headers=headers)
@@ -195,11 +234,11 @@ def _handler(state: FakeAteEnv):
             self.end_headers()
             self.wfile.write(data)
 
-        def _upgrade(self, upstream: str, rest: str) -> None:
+        def _upgrade(self, upstream: str, rest: str, drop: set[str]) -> None:
             host, port = upstream.rsplit(":", 1)
             up = socket.create_connection((host, int(port)), timeout=30)
             lines = [f"{self.command} {rest} HTTP/1.1", f"Host: {upstream}"]
-            lines += [f"{k}: {v}" for k, v in self.headers.items() if k.lower() != "host"]
+            lines += [f"{k}: {v}" for k, v in self.headers.items() if k.lower() not in {"host"} | drop]
             up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
             up.settimeout(None)
             self.connection.settimeout(None)

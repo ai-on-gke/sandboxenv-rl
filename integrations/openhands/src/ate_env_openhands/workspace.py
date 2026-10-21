@@ -20,7 +20,9 @@ agent-server next to itself (see this package's README and ``layer/``).
 ate-env-api's port proxy forwards ``/v1alpha/atespaces/<a>/envs/<id>/ports/<p>/...``
 to that port in the environment, so the proxy URL is the workspace host: the
 SDK appends its ``/api/...`` paths to it, and ``RemoteConversation`` builds
-its event WebSocket from it.
+its event WebSocket from it. With ``api_token``, each request carries it in
+``X-Env-Authorization``, which ate-env-api checks and removes before it
+forwards the request.
 
 Mirrors ``openhands.workspace.AgentSandboxWorkspace``: same lifecycle order
 (create, health wait, parent init; clean up on any failure after create),
@@ -34,11 +36,15 @@ from __future__ import annotations
 import asyncio
 import secrets
 import shlex
+import sys
 import time
+import weakref
+from collections.abc import Coroutine
 from typing import Any
 
+import grpc
 import httpx
-from ate_env import NotFoundError
+from ate_env import EnvError, NotFoundError, RpcError
 from openhands.sdk.logger import get_logger
 from openhands.sdk.workspace import RemoteWorkspace
 from pydantic import Field, PrivateAttr
@@ -48,6 +54,27 @@ from . import _runtime
 logger = get_logger(__name__)
 
 DEFAULT_ATESPACE = "ate-env"
+
+# The port proxy reads the caller's ate-env-api credential from this header
+# and does not forward it, so the agent-server's own credentials stay apart.
+ENV_AUTHORIZATION_HEADER = "X-Env-Authorization"
+
+# Deadline for get, suspend and delete, so that cleanup() cannot block forever.
+CALL_TIMEOUT = 30.0
+
+# After a create that failed on this side, how long a delete retries NotFound:
+# the server can still be creating the environment.
+ORPHAN_DELETE_WINDOW = 10.0
+
+# Create failures after which the environment can exist on the server.
+_AMBIGUOUS_CODES = {
+    grpc.StatusCode.DEADLINE_EXCEEDED,
+    grpc.StatusCode.UNAVAILABLE,
+    grpc.StatusCode.UNKNOWN,
+    grpc.StatusCode.INTERNAL,
+    grpc.StatusCode.CANCELLED,
+    grpc.StatusCode.ABORTED,
+}
 
 
 def _base_url(url: str) -> str:
@@ -64,6 +91,15 @@ def _new_env_id() -> str:
     return f"oh-{secrets.token_hex(6)}"
 
 
+def _may_exist_after(exc: BaseException) -> bool:
+    """Whether a failed create can still have made the environment."""
+    if isinstance(exc, RpcError):
+        return exc.code in _AMBIGUOUS_CODES
+    # NotFound, InvalidArgument, PermissionDenied and FailedPrecondition are
+    # definite refusals; a timeout, a cancel or a lost connection is not.
+    return not isinstance(exc, EnvError)
+
+
 class AteEnvWorkspace(RemoteWorkspace):
     """Remote workspace backed by an ate-env environment.
 
@@ -72,6 +108,13 @@ class AteEnvWorkspace(RemoteWorkspace):
     waits until the agent-server answers ``/health`` through ate-env-api, and
     deletes the environment on exit. With ``env_id`` it attaches to an
     existing environment instead and leaves it in place on exit.
+
+    Only the workspace that created or attached the environment deletes it.
+    A ``model_copy()`` of it shares the environment but never deletes it, and
+    gets its own HTTP client.
+
+    Use either the context manager or ``cleanup()``. ``__del__`` cleans up as
+    a last resort, but not during interpreter shutdown.
 
     Example:
         with AteEnvWorkspace(
@@ -89,7 +132,8 @@ class AteEnvWorkspace(RemoteWorkspace):
     )
     host: str = Field(
         default="",
-        description="Agent-server URL through the port proxy. Set by the workspace.",
+        description="Agent-server URL through the port proxy. Set by the workspace "
+        "from proxy_url (or api_url), atespace, env_id and server_port; do not pass it.",
     )
 
     # ate-env configuration
@@ -123,8 +167,10 @@ class AteEnvWorkspace(RemoteWorkspace):
     )
     api_token: str | None = Field(
         default=None,
-        description="Bearer token for ate-env-api's gRPC API. Not sent through the "
-        "port proxy, which would forward it to the agent-server.",
+        description="Bearer token for ate-env-api (its -auth-token-file). Sent on gRPC "
+        "calls, and on port-proxy requests in X-Env-Authorization, which ate-env-api "
+        "checks and removes before it forwards a request. The conversation event "
+        "WebSocket does not carry it (see the README's Limits).",
     )
     env_id: str | None = Field(
         default=None,
@@ -153,11 +199,17 @@ class AteEnvWorkspace(RemoteWorkspace):
         "this workspace created it, keep it when attached with env_id.",
     )
 
+    # Ownership, set only after the create or the attach succeeds.
+    _owner: Any = PrivateAttr(default=None)  # weakref to the owning workspace
     _created: bool = PrivateAttr(default=False)
+    _attached: bool = PrivateAttr(default=False)
     _deleted: bool = PrivateAttr(default=False)
 
     def model_post_init(self, context: Any) -> None:
         """Create or attach the environment, wait for the agent-server, initialize."""
+        if self.host:
+            raise ValueError("host is set by the workspace; pass proxy_url (or api_url) "
+                             "and server_port instead")
         if self.env_id is None and not self.template:
             raise ValueError("template is required to create an environment; "
                              "pass env_id to attach to an existing one")
@@ -172,7 +224,9 @@ class AteEnvWorkspace(RemoteWorkspace):
         if self.env_id is None:
             self._create()
         else:
-            _runtime.run(self._ate().get(self.env_id, atespace=self.atespace))
+            self._call(self._ate().get(self.env_id, atespace=self.atespace))
+            self._owner = weakref.ref(self)
+            self._attached = True
             logger.info("Attached to environment %s/%s", self.atespace, self.env_id)
 
         # Everything past the create must clean up on failure: the caller gets
@@ -189,8 +243,39 @@ class AteEnvWorkspace(RemoteWorkspace):
             self.cleanup()
             raise
 
+    def model_copy(self, *, update: dict[str, Any] | None = None, deep: bool = False):  # type: ignore[override]
+        """Copy the configuration. The copy never deletes the environment and
+        opens its own HTTP client."""
+        client, self._client = self._client, None
+        try:
+            return super().model_copy(update=update, deep=deep)
+        finally:
+            self._client = client
+
+    @property
+    def _headers(self) -> dict[str, str]:
+        headers = super()._headers
+        headers.update(self.proxy_headers())
+        return headers
+
+    def proxy_headers(self) -> dict[str, str]:
+        """Headers that authenticate a request to the port proxy itself.
+
+        Add them to a request that goes to ``port_url(...)`` outside the SDK.
+        Empty when ``api_token`` is unset.
+        """
+        if not self.api_token:
+            return {}
+        return {ENV_AUTHORIZATION_HEADER: f"Bearer {self.api_token}"}
+
     def _ate(self):
         return _runtime.client(self.api_url, self.api_token)
+
+    def _call[T](self, coro: Coroutine[Any, Any, T], timeout: float = CALL_TIMEOUT) -> T:
+        return _runtime.run(asyncio.wait_for(coro, timeout))
+
+    def _owns(self) -> bool:
+        return self._owner is not None and self._owner() is self
 
     def _create(self) -> None:
         env_id = _new_env_id()
@@ -199,7 +284,7 @@ class AteEnvWorkspace(RemoteWorkspace):
                     self.atespace, env_id, self.template,
                     f" with image {self.image}" if self.image else "")
         try:
-            _runtime.run(asyncio.wait_for(
+            self._call(
                 self._ate().create(
                     env_id,
                     atespace=self.atespace,
@@ -207,15 +292,43 @@ class AteEnvWorkspace(RemoteWorkspace):
                     template_atespace=self.template_atespace,
                     rootfs_image=self.image,
                 ),
-                self.create_timeout,
-            ))
-        except BaseException:
-            # The server can finish a create whose call failed or timed out on
-            # this side; delete by name so it cannot leak.
-            self._created = True
-            self.cleanup()
+                timeout=self.create_timeout,
+            )
+        except BaseException as exc:
+            self._deleted = True  # this workspace never holds the environment
+            if _may_exist_after(exc):
+                self._delete_orphan(env_id)
             raise
+        self._owner = weakref.ref(self)
         self._created = True
+
+    def _delete_orphan(self, env_id: str) -> None:
+        """Delete an environment whose create failed or timed out on this side.
+
+        The server can finish the create after this side gave up, thus a
+        NotFound is retried for a short time.
+        """
+        deadline = time.monotonic() + ORPHAN_DELETE_WINDOW
+        delay = 0.5
+        while True:
+            try:
+                self._call(self._ate().delete(env_id, atespace=self.atespace))
+                logger.info("Deleted environment %s/%s after the failed create",
+                            self.atespace, env_id)
+                return
+            except NotFoundError:
+                if time.monotonic() + delay > deadline:
+                    logger.warning(
+                        "Environment %s/%s was not found after the failed create; it can "
+                        "still appear on the server: delete it with `ate-env delete %s "
+                        "--atespace %s`", self.atespace, env_id, env_id, self.atespace)
+                    return
+                time.sleep(delay)
+                delay = min(delay * 2, 2.0)
+            except Exception as exc:
+                logger.warning("Error deleting environment %s/%s after the failed create: %s",
+                               self.atespace, env_id, exc)
+                return
 
     def port_url(self, port: int) -> str:
         """URL of another port in this environment, through the port proxy."""
@@ -226,13 +339,16 @@ class AteEnvWorkspace(RemoteWorkspace):
     def _wait_for_health(self, *, timeout: float) -> None:
         """Poll the agent-server's /health through the proxy until it answers.
 
-        The first request also wakes a suspended environment. A router 404 or
-        503 and a refused connection are retried; the last answer is in the
-        error when the deadline passes.
+        The first request also wakes a suspended environment. A 503 from the
+        router (not running yet), a 502 and a refused connection are retried.
+        Answers that waiting cannot change stop the wait at once: 401 and 403
+        (the proxy refused the caller), 400 (the proxy refused the port or the
+        id) and 404 when the environment no longer exists. Otherwise the last
+        answer is in the error when the deadline passes.
         """
         deadline = time.monotonic() + timeout
         url = f"{self.host}/health"
-        headers = {"X-Session-API-Key": self.api_key} if self.api_key else {}
+        headers = dict(self._headers)
         last = "no attempt"
         while True:
             remaining = deadline - time.monotonic()
@@ -240,21 +356,46 @@ class AteEnvWorkspace(RemoteWorkspace):
                 break
             try:
                 resp = httpx.get(url, headers=headers, timeout=min(30.0, max(remaining, 1.0)))
-                if 200 <= resp.status_code < 300:
-                    return
-                last = f"HTTP {resp.status_code}: {resp.text.strip()[:200]}"
             except httpx.HTTPError as exc:
                 last = f"{type(exc).__name__}: {exc}"
+            else:
+                code = resp.status_code
+                if 200 <= code < 300:
+                    return
+                text = resp.text.strip()[:200]
+                last = f"HTTP {code}: {text}"
+                if code in (401, 403):
+                    raise PermissionError(
+                        f"the port proxy refused the request for {self.atespace}/{self.env_id} "
+                        f"({last}); api_token must be ate-env-api's bearer token")
+                if code == 400:
+                    raise ValueError(f"the port proxy rejected {url} ({last})")
+                if code == 404 and not self._exists():
+                    raise RuntimeError(f"environment {self.atespace}/{self.env_id} no longer "
+                                       f"exists ({last})")
             time.sleep(min(1.0, max(deadline - time.monotonic(), 0)))
         raise RuntimeError(f"agent-server in {self.atespace}/{self.env_id} did not answer "
                            f"/health within {timeout}s; last: {last}")
+
+    def _exists(self) -> bool:
+        """Whether the environment still exists; True when that is unknown."""
+        try:
+            self._call(self._ate().get(self.env_id, atespace=self.atespace))
+        except NotFoundError:
+            return False
+        except Exception:
+            return True
+        return True
 
     def _check_session_key(self) -> None:
         """Fail at construction when the agent-server rejects api_key.
 
         /health answers without a key; the command API does not. The SDK turns
         a rejected command into a failed result, not an error, thus check once
-        here.
+        here. ``/api/bash/bash_events/search`` is not a public API: agent-server
+        1.55.0, the version pinned in pyproject.toml and layer/requirements.in,
+        serves it behind the session key. Check it again when the pin moves; a
+        404 skips the check with a warning instead of failing.
         """
         resp = self.client.get(f"{self.api_prefix}/bash/bash_events/search", params={"limit": 1})
         if resp.status_code in (401, 403):
@@ -262,6 +403,10 @@ class AteEnvWorkspace(RemoteWorkspace):
                 f"agent-server in {self.atespace}/{self.env_id} rejected the session key "
                 f"(HTTP {resp.status_code}); api_key must match the template's "
                 "OH_SESSION_API_KEYS_0")
+        if resp.status_code == 404:
+            logger.warning("session key not checked: the agent-server has no "
+                           "/api/bash/bash_events/search (version other than 1.55.0?)")
+            return
         resp.raise_for_status()
 
     def _ensure_working_dir(self) -> None:
@@ -271,27 +416,35 @@ class AteEnvWorkspace(RemoteWorkspace):
                            (result.stderr or result.stdout).strip()[:200])
 
     def _check_versions(self) -> None:
-        """Warn when the SDK and the agent-server in the layer differ in version."""
+        """Warn when the local openhands-sdk and the agent-server's differ in version."""
         try:
             from importlib.metadata import version
 
             local = version("openhands-sdk")
-            remote = str(self.get_server_info().get("version", ""))
+            info = self.get_server_info()
+            remote = str(info.get("sdk_version") or info.get("version") or "")
         except Exception as exc:  # informational only
             logger.debug("version check skipped: %s", exc)
             return
         if remote and remote != local:
-            logger.warning("openhands-sdk %s talks to agent-server %s; keep both at one "
-                           "version (see the layer's requirements.in)", local, remote)
+            logger.warning("openhands-sdk %s talks to an agent-server with openhands-sdk %s; "
+                           "keep both at one version (see the layer's requirements.in)",
+                           local, remote)
 
     def pause(self) -> None:
-        """Suspend the environment. Its filesystem is kept in the snapshot."""
+        """Suspend the environment. Its filesystem is kept in the snapshot.
+
+        Close any ``RemoteConversation`` on this workspace first. A live one
+        keeps its event WebSocket: the suspend breaks it, the SDK reconnects
+        after about a second, and the proxy wakes the environment for that
+        request, thus it does not stay suspended.
+        """
         if self.env_id is None or self._deleted:
             raise RuntimeError("Cannot pause: no active environment")
         logger.info("Suspending environment %s/%s", self.atespace, self.env_id)
         # Pooled connections tunnel to the actor that is going away.
         self.reset_client()
-        _runtime.run(self._ate().suspend(self.env_id, atespace=self.atespace))
+        self._call(self._ate().suspend(self.env_id, atespace=self.atespace))
 
     def resume(self) -> None:
         """Wake the environment and wait for the agent-server.
@@ -316,6 +469,10 @@ class AteEnvWorkspace(RemoteWorkspace):
             self.cleanup()
 
     def __del__(self) -> None:
+        # During interpreter shutdown the loop thread can be gone, and a call
+        # on it would hang; the atexit hook in _runtime has closed it.
+        if sys.is_finalizing():
+            return
         try:
             if getattr(self, "__pydantic_private__", None) is not None:
                 self.cleanup()
@@ -323,18 +480,25 @@ class AteEnvWorkspace(RemoteWorkspace):
             pass  # never raise from __del__
 
     def cleanup(self) -> None:
-        """Drop HTTP state and delete the environment when owned (idempotent)."""
+        """Drop HTTP state and delete the environment when owned (idempotent).
+
+        Only the workspace that created or attached the environment deletes
+        it: never a copy, and never a workspace whose constructor failed before
+        the create or the attach succeeded.
+        """
         try:
             self.reset_client()
         except Exception:
             pass
+        if not self._owns() or self._deleted or self.env_id is None:
+            return
         delete = self.delete_on_exit if self.delete_on_exit is not None else self._created
-        if not delete or self._deleted or self.env_id is None:
+        if not delete:
             return
         self._deleted = True
         try:
             logger.info("Deleting environment %s/%s", self.atespace, self.env_id)
-            _runtime.run(self._ate().delete(self.env_id, atespace=self.atespace))
+            self._call(self._ate().delete(self.env_id, atespace=self.atespace))
         except NotFoundError:
             pass
         except Exception as exc:

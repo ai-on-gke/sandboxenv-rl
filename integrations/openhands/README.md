@@ -28,7 +28,8 @@ How it fits together:
   `/health` answers.
 - The workspace reaches it through ate-env-api's port proxy, at
   `/v1alpha/atespaces/<atespace>/envs/<env>/ports/<port>/...`, with the agent-server's own session
-  key. The SDK uses that URL as its workspace host, so commands, files and `RemoteConversation`
+  key, and with `api_token` in `X-Env-Authorization` when ate-env-api requires its bearer token.
+  The SDK uses that URL as its workspace host, so commands, files and `RemoteConversation`
   (the agent loop and its event WebSocket) work unchanged. No `kubectl port-forward`.
 
 | path | what it is |
@@ -118,7 +119,7 @@ caller.
 | `atespace` | `ate-env` | atespace of the environment | `namespace` |
 | `api_url` | `127.0.0.1:7777` | ate-env-api, host:port or URL | `host` in `direct` mode |
 | `proxy_url` | `api_url` | port proxy base URL, when it differs | none |
-| `api_token` | none | bearer for ate-env-api's gRPC API; never sent through the proxy | none |
+| `api_token` | none | ate-env-api's bearer token: on gRPC calls, and in `X-Env-Authorization` on proxy requests, which ate-env-api removes before it forwards them | none |
 | `env_id` | generated | attach to this environment instead of creating one | none |
 | `server_port` | `8000` | agent-server port | `server_port` |
 | `working_dir` | `/workspace` (created) | where commands run; `/testbed` on SWE-bench images | `working_dir` |
@@ -130,9 +131,18 @@ caller.
 - `pause()` suspends the environment; its filesystem stays in Substrate's snapshot.
   `resume()` waits for `/health`, which also wakes it; any request wakes it as well. The host does
   not change, unlike a port-forward.
-- `port_url(port)` is the proxy URL of another port in the same environment.
+- `port_url(port)` is the proxy URL of another port in the same environment. A request to it from
+  outside the SDK adds `proxy_headers()` (empty without `api_token`).
 - A rejected session key fails the constructor with `PermissionError`; a version difference between
   `openhands-sdk` and the agent-server is logged as a warning.
+- The health wait stops at once on an answer that waiting cannot change: 401 or 403 from the proxy
+  (`PermissionError`: a missing or wrong `api_token`, or a refused origin), 400 (`ValueError`: the
+  proxy refused the port or the id), and 404 when the environment no longer exists.
+- Only the workspace that created or attached the environment deletes it. A failed constructor
+  deletes only what it created, a `model_copy()` never deletes and opens its own HTTP client, and
+  `__del__` does nothing during interpreter shutdown. A create that fails ambiguously (a timeout,
+  a lost answer) deletes the environment by name and retries for 10 s, because the server can still
+  be creating it. Get, suspend and delete have a 30 s deadline.
 
 From `AgentSandboxWorkspace`:
 
@@ -182,10 +192,14 @@ python -m pytest integrations/openhands/tests -q
 
 The tests run `AteEnvWorkspace` against an in-process fake of ate-env-api (environment lifecycle
 over gRPC) and of its port proxy (path form, wake on request, upgrade relay), in front of a real
-agent-server started on localhost, as the layer runs it. They cover the create arguments, the
-health wait, cleanup after each failure (lost create answer, health timeout, wrong session key),
-attach, pause and resume, exit ordering, files, and a `RemoteConversation` whose event WebSocket
-goes through the proxy.
+agent-server started on localhost, as the layer runs it. The fake proxy also answers as ate-env-api
+does: 400 for port 80, and with a bearer token 401 for a request without it, and it removes
+`X-Env-Authorization` before it forwards. The tests cover the create arguments, the health wait and
+the answers that stop it at once (400, 401, 403, 404), cleanup after each failure (lost create answer,
+a create that lands after its timeout, refused create, health timeout, wrong session key), ownership
+(a failed attach or validation error deletes nothing, a copy never deletes), the token at the proxy,
+attach, pause and resume, exit ordering, files, the shared loop (`close_all`, the call timeout, a
+fork), and a `RemoteConversation` whose event WebSocket goes through the proxy.
 
 ## Verified
 
@@ -223,9 +237,17 @@ GKE with gVisor workers, Substrate from 2026-10-12, ate-env-api with the port pr
 
 ## Limits
 
-- The port proxy has no caller authentication yet: whoever reaches ate-env-api reaches the
-  agent-server port and needs only the session key. `api_token` therefore goes to the gRPC API
-  only; the proxy would forward it to the sandbox.
+- `api_token` needs an ate-env-api whose port proxy checks `X-Env-Authorization` and removes it
+  (ate-env-api with `-auth-token-file`). An older ate-env-api forwards the header to the
+  agent-server: do not set `api_token` with it. Without `-auth-token-file`, whoever reaches
+  ate-env-api reaches the agent-server port and needs only the session key.
+- With `-auth-token-file`, the conversation event WebSocket gets 401: `RemoteConversation` opens it
+  with `websockets.connect(ws_url)` and sends no extra headers. Commands, files and the REST calls of
+  a conversation work. The fix is a follow-up: a query-parameter token in the port proxy, or a
+  header option in the SDK.
+- With a live `RemoteConversation`, `pause()` does not keep the environment suspended: the suspend
+  breaks the event WebSocket, the SDK reconnects after about a second, and the proxy wakes the
+  environment for that request. Close the conversation before `pause()`.
 
 - One API key per template: it is in the template's environment, readable by anyone who can read
   templates, and shared by the templates derived from it.

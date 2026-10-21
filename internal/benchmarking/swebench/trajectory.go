@@ -258,6 +258,27 @@ func (s Step) validate() error {
 	return nil
 }
 
+// Grades reports whether the trajectory uses the instance's grading
+// material: a step references the eval script or the log parser, or hands
+// the whole instance to a script. Such a trajectory needs RequireGrading on
+// its dataset.
+func (t *Trajectory) Grades() bool {
+	for _, steps := range [][]Step{t.Setup, t.Reset, t.Steps} {
+		for _, s := range steps {
+			texts := []string{s.Run}
+			if s.Write != nil {
+				texts = append(texts, s.Write.Content)
+			}
+			for _, text := range texts {
+				if strings.Contains(text, ".EvalScript") || strings.Contains(text, ".LogParser") || strings.Contains(text, "json .}}") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // HasReward reports whether a step decides the task reward.
 func (t *Trajectory) HasReward() bool {
 	for _, s := range t.Steps {

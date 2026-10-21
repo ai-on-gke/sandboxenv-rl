@@ -158,6 +158,33 @@ runs a Job next to ate-env-api, follows the full loader log (step failures
 included), copies the events file back to the current directory, prints the
 report and deletes the Job.
 
+## Image-delivery workloads
+
+Three built-in trajectories exercise image delivery rather than SWE-bench
+grading, for comparing conventional pull, image streaming and other loaders:
+`workload-file-read` (read a sample of files), `workload-compile`
+(byte-compile every Python file, which reads each one and writes next to it)
+and `workload-read-all` (read every file, the worst case for lazy loading).
+Each starts with a `probe` step that runs `true`, so `ttfi` is the cold start
+alone and the workload's own time is its own `step` row. They need no grading
+material, so the manifest can be image-only:
+
+```bash
+benchmarking/swebench/make-dataset.py --images-file images.txt --out images.jsonl
+swebench-loader run -dataset images.jsonl -trajectory workload-read-all -images 200 -width 200 -run-id pull-baseline
+```
+
+`images.txt` holds one reference per line, a tag or `repo@sha256:...`; tags
+are resolved with `crane`. The instance id is the image name, the tag if one
+was given, and the first 12 digits of the digest, so two pinned images of one
+repository stay distinct. A line that resolves to a reference already
+written is skipped. `--limit` applies; `--instances` does not.
+
+Run the same command against each delivery mechanism and diff the reports;
+the loader sees wall time per phase as a trainer would, and the split of a
+cold start into pull, unpack and restore comes from Substrate's own metrics
+over the run window, joined on the run id.
+
 ## Network and the offline exclusion list
 
 Actors have no network until an egress policy is created for them, which the

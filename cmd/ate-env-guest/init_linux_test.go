@@ -50,9 +50,11 @@ func TestSuperviseReapsOrphans(t *testing.T) {
 }
 
 func TestSuperviseForwardsSignals(t *testing.T) {
+	// The test sends SIGTERM to its own process until supervise forwards one.
+	// ignore keeps SIGTERM caught for the whole test, so a signal that
+	// supervise does not take cannot end the test binary.
 	ignore := make(chan os.Signal, 1)
 	signal.Notify(ignore, syscall.SIGTERM)
-	defer signal.Stop(ignore)
 
 	done := make(chan int, 1)
 	go func() {
@@ -60,19 +62,36 @@ func TestSuperviseForwardsSignals(t *testing.T) {
 	}()
 
 	tick := time.NewTicker(10 * time.Millisecond)
-	defer tick.Stop()
 	timeout := time.After(10 * time.Second)
+	got, finished := 0, false
+loop:
 	for {
 		select {
-		case got := <-done:
-			if got != 128+int(syscall.SIGTERM) {
-				t.Fatalf("supervise = %d, want %d", got, 128+int(syscall.SIGTERM))
-			}
-			return
+		case got = <-done:
+			finished = true
+			break loop
 		case <-tick.C:
 			_ = syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
 		case <-timeout:
-			t.Fatal("SIGTERM was not forwarded to the supervised child")
+			break loop
 		}
+	}
+	// Stop sending, then drain before signal.Stop restores the default
+	// action: a SIGTERM that arrives after it would end the test binary.
+	tick.Stop()
+	for drained := false; !drained; {
+		select {
+		case <-ignore:
+		case <-time.After(100 * time.Millisecond):
+			drained = true
+		}
+	}
+	signal.Stop(ignore)
+
+	if !finished {
+		t.Fatal("SIGTERM was not forwarded to the supervised child")
+	}
+	if got != 128+int(syscall.SIGTERM) {
+		t.Fatalf("supervise = %d, want %d", got, 128+int(syscall.SIGTERM))
 	}
 }

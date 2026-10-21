@@ -35,8 +35,10 @@ import (
 	"github.com/agent-substrate/env/internal/mcp"
 	"github.com/agent-substrate/env/internal/portproxy"
 	"github.com/agent-substrate/env/internal/routertls"
+	"github.com/agent-substrate/env/internal/telemetry"
 	"github.com/agent-substrate/env/internal/unknownfields"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 )
 
@@ -82,6 +84,9 @@ func serviceHostNames(service string, readFile func(string) ([]byte, error), get
 	return hostcheck.ServiceHosts(service, namespace, domain)
 }
 
+// otelServiceName is the OpenTelemetry service.name of the API server's spans.
+const otelServiceName = "ate-env-api"
+
 func main() {
 	var (
 		listen            = flag.String("listen", "0.0.0.0:7777", "address to serve the API on")
@@ -102,6 +107,8 @@ func main() {
 		allowedHosts      = flag.String("allowed-hosts", "", "comma-separated host names that HTTP callers may send in the Host header, next to IP addresses, localhost, names under .localhost and the names of --service-name, which are always allowed; a leading *. allows the names below it. Other names get 403, which blocks DNS rebinding against the listener, the MCP endpoint and the port proxy. gRPC requests are not checked")
 		serviceName       = flag.String("service-name", "ate-env-api", "name of the Kubernetes Service in front of ate-env-api; its in-cluster names are allowed hosts (<name>, <name>.<namespace>, <name>.<namespace>.svc and <name>.<namespace>.svc.<cluster domain>, with the namespace and cluster domain read from /etc/resolv.conf, else the namespace from POD_NAMESPACE). Empty allows none of them")
 		maxStreams        = flag.Int("max-concurrent-streams", DefaultMaxConcurrentStreams, "most concurrent HTTP/2 streams (gRPC calls) one client connection may have open; calls beyond it queue in the client. Go's default is 250, which a single trainer process reaches with a few hundred sandboxes, because every exec holds a stream for the whole command and its wake")
+		enableTracing     = flag.Bool("enable-tracing", false, "export OpenTelemetry traces over OTLP/gRPC, configured by OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_EXPORTER_OTLP_INSECURE; incoming W3C trace context is continued and passed on to ateapi and the guests")
+		metricsAddr       = flag.String("metrics-listen-addr", ":9090", "address to serve Prometheus metrics on, at /metrics, on a listener of its own; empty disables metrics")
 	)
 	flag.Parse()
 
@@ -122,6 +129,18 @@ func main() {
 		}
 	} else if !isLoopbackAddr(*listen) {
 		log.Printf("WARNING: listening on %s without --auth-token-file; all gRPC, MCP and port-proxy callers are unauthenticated", *listen)
+	}
+	if *enableTracing {
+		_, shutdown, err := telemetry.SetupOTel(context.Background(), otelServiceName)
+		if err != nil {
+			log.Fatalf("--enable-tracing: %v", err)
+		}
+		defer shutdown()
+		log.Printf("tracing enabled (OTLP endpoint %q)", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
+	}
+	var metrics *telemetry.Metrics
+	if *metricsAddr != "" {
+		metrics = telemetry.NewMetrics()
 	}
 
 	// With a client certificate the router is reached on its TLS listeners,
@@ -161,6 +180,7 @@ func main() {
 		SkipVerify:      *skipVerify,
 		BearerTokenFile: *tokenFile,
 		RouterTLS:       routerTLS,
+		EnableTracing:   *enableTracing,
 	})
 	if err != nil {
 		log.Fatalf("creating env client: %v", err)
@@ -187,9 +207,10 @@ func main() {
 	}
 	apisvc.RouterTLS = routerTLS
 	apisvc.RouterIdentity = routerIdentity
+	apisvc.Metrics = metrics
 	defer apisvc.Close()
 
-	grpcServer := grpc.NewServer(grpcServerOptions(callerAuth)...)
+	grpcServer := grpc.NewServer(grpcServerOptions(callerAuth, metrics, *enableTracing)...)
 	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, apisvc)
 	ateenvv1alpha.RegisterProcessServiceServer(grpcServer, apisvc)
 	ateenvv1alpha.RegisterFileSystemServiceServer(grpcServer, apisvc)
@@ -197,6 +218,22 @@ func main() {
 	mcpHandler := mcp.NewHandler(client)
 	if callerAuth != nil {
 		mcpHandler = callerAuth.WrapHTTP(mcpHandler)
+	}
+
+	var metricsSrv *http.Server
+	if metrics != nil {
+		metrics.InitMethods(grpcServer.GetServiceInfo())
+		metrics.InitAtespace(ate.DefaultAtespace)
+		metrics.SetEnvironmentSource(apisvc.EnvironmentCounts)
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("GET /metrics", metrics.Handler())
+		metricsSrv = &http.Server{Addr: *metricsAddr, Handler: metricsMux}
+		go func() {
+			log.Printf("metrics listening on %s", *metricsAddr)
+			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("metrics server error: %v", err)
+			}
+		}()
 	}
 
 	// The Host check wraps the HTTP routes (/healthz, MCP and the port
@@ -249,6 +286,9 @@ func main() {
 		<-ctx.Done()
 		grpcServer.GracefulStop()
 		_ = srv.Shutdown(context.Background())
+		if metricsSrv != nil {
+			_ = metricsSrv.Shutdown(context.Background())
+		}
 	}()
 
 	log.Printf("ate-env-api %s listening on %s (ateapi %s, atenet %s, atenet CONNECT %q, router TLS %v)", apisvc.Info.Version, *listen, *ateapi, *atenet, *atenetConn, routerTLS != nil)
@@ -260,16 +300,25 @@ func main() {
 // grpcServerOptions returns the interceptor chain of the API's gRPC server.
 // Authentication runs first, so an unauthenticated caller learns nothing from
 // the unknown-field check. callerAuth is nil when no token is required.
-func grpcServerOptions(callerAuth *apiservice.BearerAuth) []grpc.ServerOption {
+func grpcServerOptions(callerAuth *apiservice.BearerAuth, metrics *telemetry.Metrics, tracing bool) []grpc.ServerOption {
+	var opts []grpc.ServerOption
+	if tracing {
+		opts = append(opts, grpc.StatsHandler(otelgrpc.NewServerHandler()))
+	}
 	var unary []grpc.UnaryServerInterceptor
 	var stream []grpc.StreamServerInterceptor
+	// Metrics run before auth so rejected calls are counted too.
+	if metrics != nil {
+		unary = append(unary, metrics.UnaryServerInterceptor())
+		stream = append(stream, metrics.StreamServerInterceptor())
+	}
 	if callerAuth != nil {
 		unary = append(unary, callerAuth.UnaryInterceptor())
 		stream = append(stream, callerAuth.StreamInterceptor())
 	}
 	unary = append(unary, unknownfields.UnaryServerInterceptor())
 	stream = append(stream, unknownfields.StreamServerInterceptor())
-	return []grpc.ServerOption{grpc.ChainUnaryInterceptor(unary...), grpc.ChainStreamInterceptor(stream...)}
+	return append(opts, grpc.ChainUnaryInterceptor(unary...), grpc.ChainStreamInterceptor(stream...))
 }
 
 // DefaultMaxConcurrentStreams is the default -max-concurrent-streams. Each

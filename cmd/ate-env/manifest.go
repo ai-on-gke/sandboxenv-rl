@@ -112,7 +112,23 @@ type manifestConfig struct {
 	// the only ones Substrate serves since v0.6.0. Off only for the test
 	// fakes, which serve the plaintext listeners.
 	routerTLS bool
+
+	// Telemetry of ate-env-api. enableTracing renders --enable-tracing;
+	// otlpEndpoint and otlpInsecure set OTEL_EXPORTER_OTLP_ENDPOINT and
+	// OTEL_EXPORTER_OTLP_INSECURE for its exporter. metricsPort, when not
+	// zero, renders --metrics-listen-addr=:<port> and exposes the port as
+	// "metrics" on the container and the Service, with prometheus.io scrape
+	// annotations on the pod; zero leaves the server's default listener
+	// unexposed.
+	enableTracing bool
+	otlpEndpoint  string
+	otlpInsecure  bool
+	metricsPort   int32
 }
+
+// metricsPortName names the ate-env-api metrics port on the container and
+// the Service.
+const metricsPortName = "metrics"
 
 func (c *manifestConfig) resolveImages() error {
 	if c.workerImage == "" {
@@ -128,6 +144,17 @@ with no capacity`)
 		return errors.New(`--api-image is required when ate-env is built from source; release
 binaries default it to the ate-env-api image published with the release
 (see docs/release.md), or build and push your own with make images`)
+	}
+	return nil
+}
+
+// validateTelemetry checks the telemetry flags of the API deployment.
+func (c *manifestConfig) validateTelemetry() error {
+	if c.metricsPort < 0 || c.metricsPort > 65535 {
+		return fmt.Errorf("--metrics-port %d is not a port number", c.metricsPort)
+	}
+	if c.metricsPort != 0 && c.metricsPort == c.apiPort {
+		return fmt.Errorf("--metrics-port %d is the API port; metrics are served on a listener of their own", c.metricsPort)
 	}
 	return nil
 }
@@ -296,6 +323,9 @@ the "template" subcommand: ate-env manifest template`,
 			if mCfg.workerPool == "" {
 				mCfg.workerPool = defaultWorkerPool(mCfg.template)
 			}
+			if err := mCfg.validateTelemetry(); err != nil {
+				return err
+			}
 			if err := checkWorkerPoolName(mCfg.workerPool); err != nil {
 				return err
 			}
@@ -328,6 +358,10 @@ the "template" subcommand: ate-env manifest template`,
 	cmd.Flags().BoolVar(&mCfg.routerTLS, "api-router-tls", true, "mount the pod identity certificate and the servicedns trust bundle into ate-env-api and dial the atenet router's TLS listeners, the only ones Substrate serves since v0.6.0; the API's SPIFFE ID must then be in the router's --ingress-allowed-spiffe-ids. Off, the API dials the plaintext addresses, which only the test fakes serve")
 	cmd.Flags().StringVar(&mCfg.workerPool, "workerpool", "", "WorkerPool name (defaults to <template>-workerpool)")
 	cmd.Flags().Int32Var(&mCfg.replicas, "replicas", 5, "number of pre-warmed worker pods")
+	cmd.Flags().BoolVar(&mCfg.enableTracing, "enable-tracing", false, "run ate-env-api with --enable-tracing, exporting OpenTelemetry traces over OTLP/gRPC")
+	cmd.Flags().StringVar(&mCfg.otlpEndpoint, "otlp-endpoint", "", "OTLP/gRPC collector endpoint for ate-env-api's traces, set as OTEL_EXPORTER_OTLP_ENDPOINT, e.g. http://otel-collector.observability:4317")
+	cmd.Flags().BoolVar(&mCfg.otlpInsecure, "otlp-insecure", false, "set OTEL_EXPORTER_OTLP_INSECURE=true: talk to the collector in plaintext")
+	cmd.Flags().Int32Var(&mCfg.metricsPort, "metrics-port", 0, "port ate-env-api serves Prometheus metrics on (--metrics-listen-addr), exposed on the container and the Service as \"metrics\" with prometheus.io scrape annotations; 0 leaves metrics unexposed")
 
 	cmd.AddCommand(newManifestTemplateCommand())
 	cmd.AddCommand(newManifestAccessPolicyCommand())
@@ -785,6 +819,34 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 			},
 		})
 	}
+	ports := []corev1.ContainerPort{{ContainerPort: cfg.apiPort}}
+	var podAnnotations map[string]string
+	if cfg.enableTracing {
+		args = append(args, "-enable-tracing")
+	}
+	if cfg.metricsPort != 0 {
+		args = append(args, fmt.Sprintf("-metrics-listen-addr=:%d", cfg.metricsPort))
+		ports = append(ports, corev1.ContainerPort{Name: metricsPortName, ContainerPort: cfg.metricsPort})
+		podAnnotations = map[string]string{
+			"prometheus.io/scrape": "true",
+			"prometheus.io/port":   fmt.Sprint(cfg.metricsPort),
+			"prometheus.io/path":   "/metrics",
+		}
+	}
+	// POD_NAMESPACE lets ate-env-api name its own Service for the Host
+	// check when /etc/resolv.conf has no search list.
+	env := []corev1.EnvVar{{
+		Name: "POD_NAMESPACE",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+		},
+	}}
+	if cfg.otlpEndpoint != "" {
+		env = append(env, corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: cfg.otlpEndpoint})
+	}
+	if cfg.otlpInsecure {
+		env = append(env, corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_INSECURE", Value: "true"})
+	}
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -796,7 +858,7 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				ObjectMeta: metav1.ObjectMeta{Labels: labels, Annotations: podAnnotations},
 				Spec: corev1.PodSpec{
 					// The ServiceAccount is the principal the control plane
 					// authorizes (buildAccessPolicy); the projected ateapi token
@@ -808,14 +870,9 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 						Image: cfg.apiImage,
 						// ateapi/atenet default to the in-cluster
 						// Substrate service addresses.
-						Args: args,
-						Env: []corev1.EnvVar{{
-							Name: "POD_NAMESPACE",
-							ValueFrom: &corev1.EnvVarSource{
-								FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
-							},
-						}},
-						Ports:        []corev1.ContainerPort{{ContainerPort: cfg.apiPort}},
+						Args:         args,
+						Env:          env,
+						Ports:        ports,
 						VolumeMounts: mounts,
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
@@ -835,6 +892,19 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 
 func buildAPIService(cfg manifestConfig) *corev1.Service {
 	labels := map[string]string{"app": apiName}
+	ports := []corev1.ServicePort{{
+		Port:       cfg.apiPort,
+		TargetPort: intstr.FromInt32(cfg.apiPort),
+	}}
+	if cfg.metricsPort != 0 {
+		// A Service with several ports must name each.
+		ports[0].Name = "api"
+		ports = append(ports, corev1.ServicePort{
+			Name:       metricsPortName,
+			Port:       cfg.metricsPort,
+			TargetPort: intstr.FromString(metricsPortName),
+		})
+	}
 	return &corev1.Service{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -844,10 +914,7 @@ func buildAPIService(cfg manifestConfig) *corev1.Service {
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: labels,
-			Ports: []corev1.ServicePort{{
-				Port:       cfg.apiPort,
-				TargetPort: intstr.FromInt32(cfg.apiPort),
-			}},
+			Ports:    ports,
 		},
 	}
 }

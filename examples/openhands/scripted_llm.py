@@ -23,6 +23,9 @@ event stream all run for real; only the decisions are canned. Requests
 without tools (a title, a summary) get plain text.
 
     python scripted_llm.py [port] [--daemon]     # default port 9999
+
+With ``--daemon`` it logs to ``/tmp/scripted_llm_<port>.log`` and writes its
+pid to ``/tmp/scripted_llm_<port>.pid``, so the caller can stop it.
 """
 
 from __future__ import annotations
@@ -84,7 +87,7 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("scripted-llm: " + fmt % args + "\n")
 
 
-def daemonize(log_path: str) -> None:
+def daemonize(log_path: str, pid_path: str) -> None:
     """Detach from the caller's session, so a short-lived shell that starts
     this (the agent-server's command endpoint ends its process group when the
     command returns) does not take it down."""
@@ -93,6 +96,8 @@ def daemonize(log_path: str) -> None:
     os.setsid()
     if os.fork():
         os._exit(0)
+    with open(pid_path, "w") as f:
+        f.write(f"{os.getpid()}\n")
     log = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     null = os.open(os.devnull, os.O_RDONLY)
     os.dup2(null, 0)
@@ -104,5 +109,5 @@ if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if a != "--daemon"]
     port = int(args[0]) if args else 9999
     if "--daemon" in sys.argv:
-        daemonize(f"/tmp/scripted_llm_{port}.log")
+        daemonize(f"/tmp/scripted_llm_{port}.log", f"/tmp/scripted_llm_{port}.pid")
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()

@@ -30,7 +30,8 @@ one) can read that key: use a key scoped to this use, or ``--scripted``. The
 conversation is deleted on the agent-server when the script ends.
 ``--scripted`` needs no model: it starts ``scripted_llm.py`` inside the
 environment and points the agent at it, which replays a fixed CodeAct
-trajectory through the real agent loop and tools.
+trajectory through the real agent loop and tools, and stops it and removes
+its files when the script ends.
 
     pip install ./clients/python './integrations/openhands[examples]'
     SESSION_KEY=<key> LLM_MODEL=<litellm model> LLM_API_KEY=<key> [LLM_BASE_URL=<url>] \\
@@ -79,6 +80,19 @@ def start_scripted_llm(workspace) -> str:
     raise RuntimeError("scripted model did not start inside the environment")
 
 
+def stop_scripted_llm(workspace) -> None:
+    """Stop scripted_llm.py and remove its script, log and pid file. Best
+    effort: a failure here must not hide the run's own error."""
+    base = f"/tmp/scripted_llm_{SCRIPTED_PORT}"
+    try:
+        workspace.execute_command(
+            f'kill "$(cat {base}.pid 2>/dev/null)" 2>/dev/null; rm -f /tmp/scripted_llm.py {base}.log {base}.pid',
+            timeout=10,
+        )
+    except Exception as exc:  # noqa: BLE001 (cleanup must not hide the run's own error)
+        print(f"warning: could not stop the scripted model: {short(exc)}")
+
+
 _CONTROL = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
 
 
@@ -111,26 +125,30 @@ def main() -> None:
     args = parser.parse_args()
 
     workspace = attach(args.env_id)
-    if args.scripted:
-        llm = LLM(model="openai/scripted", base_url=start_scripted_llm(workspace), api_key="scripted",
-                  native_tool_calling=True, usage_id="agent")
-    else:
-        llm = LLM(model=os.environ["LLM_MODEL"], api_key=os.environ.get("LLM_API_KEY"),
-                  base_url=os.environ.get("LLM_BASE_URL"), usage_id="agent")
-
-    agent = get_default_agent(llm, cli_mode=True)
-    # delete_on_close: the agent-server drops the conversation (its events, the
-    # agent with the model settings) when this script closes it.
-    conversation = Conversation(agent=agent, workspace=workspace, callbacks=[on_event], visualizer=None,
-                                delete_on_close=True)
-    started = time.monotonic()
     try:
-        conversation.send_message(args.task)
-        conversation.run()
-        status = conversation.state.execution_status
-        print(f"status: {status.value} after {time.monotonic() - started:.1f}s")
+        if args.scripted:
+            llm = LLM(model="openai/scripted", base_url=start_scripted_llm(workspace), api_key="scripted",
+                      native_tool_calling=True, usage_id="agent")
+        else:
+            llm = LLM(model=os.environ["LLM_MODEL"], api_key=os.environ.get("LLM_API_KEY"),
+                      base_url=os.environ.get("LLM_BASE_URL"), usage_id="agent")
+
+        agent = get_default_agent(llm, cli_mode=True)
+        # delete_on_close: the agent-server drops the conversation (its events, the
+        # agent with the model settings) when this script closes it.
+        conversation = Conversation(agent=agent, workspace=workspace, callbacks=[on_event], visualizer=None,
+                                    delete_on_close=True)
+        started = time.monotonic()
+        try:
+            conversation.send_message(args.task)
+            conversation.run()
+            status = conversation.state.execution_status
+            print(f"status: {status.value} after {time.monotonic() - started:.1f}s")
+        finally:
+            conversation.close()
     finally:
-        conversation.close()
+        if args.scripted:
+            stop_scripted_llm(workspace)
 
 
 if __name__ == "__main__":

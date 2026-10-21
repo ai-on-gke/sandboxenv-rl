@@ -35,7 +35,8 @@ The agent-server calls the model from inside the environment, so the model endpo
 from the actor: allowed by Substrate's egress policy, or served inside the cluster. The model's API
 key goes into the sandbox with it (see [Limits](#limits)). `--scripted` needs
 no model at all. It starts `scripted_llm.py` inside the environment and points the agent at it; the
-agent loop, its tools and the event stream run for real, only the decisions are canned:
+agent loop, its tools and the event stream run for real, only the decisions are canned. The script
+stops the stand-in model and removes its files when it ends:
 
 ```
   task    Inspect this sandbox: report the operating system, the working directory and the top-level…

@@ -143,10 +143,14 @@ By default `ate-env manifest` deploys `ate-env-api` without caller authenticatio
 `kubectl port-forward`. Before exposing `ate-env-api` beyond loopback (e.g. through an internal
 LoadBalancer or to multi-tenant namespaces), create a Kubernetes Secret with a `token` key and pass
 `--auth-token-secret <secret-name>` to `ate-env manifest` (which mounts the secret and sets
-`-auth-token-file` on `ate-env-api`); callers then authenticate with `--auth-token` /
-`SUBSTRATE_ENV_AUTH_TOKEN` on the CLI, `ClientOptions.AuthToken` in the Go SDK, `Client(..., auth_token=...)`
+`-auth-token-file` on `ate-env-api`); callers then authenticate with `--auth-token-file`,
+`SUBSTRATE_ENV_AUTH_TOKEN` or `--auth-token` on the CLI (`--auth-token` shows the token in `ps`
+output and the shell history), `ClientOptions.AuthToken` in the Go SDK, `Client(..., auth_token=...)`
 in the Python SDK, or `Authorization: Bearer <token>` on MCP HTTP requests and port-proxy requests
 ([Reaching a service inside an environment](#reaching-a-service-inside-an-environment)).
+The clients connect without TLS, thus the token travels in clear text. Past the cluster boundary,
+for example through an internal LoadBalancer, put TLS termination or a mesh with mTLS in front of
+`ate-env-api`.
 
 ### 2. Register the ActorTemplate in Substrate
 

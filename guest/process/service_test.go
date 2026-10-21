@@ -710,6 +710,19 @@ func TestTTYExemptFromLogCap(t *testing.T) {
 	}
 }
 
+func TestTTYWindowSizeBounds(t *testing.T) {
+	client := setupTestServer(t)
+	ctx := context.Background()
+	for _, tty := range []*ateenvv1alpha.TTY{{Rows: math.MaxUint16 + 1, Cols: 80}, {Rows: 24, Cols: math.MaxUint16 + 1}} {
+		if _, err := client.StartProcess(ctx, &ateenvv1alpha.StartProcessRequest{Command: []string{"true"}, Tty: tty}); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("StartProcess with tty %v: got %v, want InvalidArgument", tty, err)
+		}
+		if _, err := client.ResizeProcess(ctx, &ateenvv1alpha.ResizeProcessRequest{ProcessId: "p", Rows: tty.GetRows(), Cols: tty.GetCols()}); status.Code(err) != codes.InvalidArgument {
+			t.Errorf("ResizeProcess to %dx%d: got %v, want InvalidArgument", tty.GetRows(), tty.GetCols(), err)
+		}
+	}
+}
+
 // A descendant that ignores SIGHUP keeps the slave open after the process
 // exits. The process must still be reported as exited, after the short drain
 // in reap, and not only when the descendant exits.

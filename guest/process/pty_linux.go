@@ -18,6 +18,7 @@ package process
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"syscall"
 	"unsafe"
@@ -70,6 +71,9 @@ func openPTY(rows, cols uint32) (*os.File, *os.File, error) {
 // setWinsize updates the terminal window size on ptmx via TIOCSWINSZ, which
 // also delivers SIGWINCH to the foreground process group.
 func setWinsize(ptmx *os.File, rows, cols uint32) error {
+	if rows > math.MaxUint16 || cols > math.MaxUint16 {
+		return fmt.Errorf("window size %dx%d exceeds %d", rows, cols, math.MaxUint16)
+	}
 	ws := winsize{
 		Row: uint16(rows),
 		Col: uint16(cols),

@@ -239,7 +239,36 @@ func TestBearerAuthTokenFileCache(t *testing.T) {
 	if err := os.Remove(tokFile); err != nil {
 		t.Fatal(err)
 	}
-	if err := auth.Check("Bearer cccc"); status.Code(err) != codes.Internal {
+	err = auth.Check("Bearer cccc")
+	if status.Code(err) != codes.Internal {
 		t.Fatalf("missing token file: got %v, want Internal", err)
+	}
+	// The caller does not learn where the token file is; the server logs it.
+	if msg := status.Convert(err).Message(); msg != "internal error" || strings.Contains(msg, tokFile) {
+		t.Fatalf("missing token file: message %q, want %q", msg, "internal error")
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1alpha/envs/e/mcp", nil)
+	req.Header.Set("Authorization", "Bearer cccc")
+	auth.WrapHTTP(http.NotFoundHandler()).ServeHTTP(rec, req)
+	if body := rec.Body.String(); rec.Code != http.StatusInternalServerError || strings.TrimSpace(body) != "internal error" || strings.Contains(body, tokFile) {
+		t.Fatalf("missing token file over HTTP: %d %q, want 500 %q", rec.Code, body, "internal error")
+	}
+}
+
+func TestBearerAuthHeaderParsing(t *testing.T) {
+	auth, err := apiservice.NewBearerAuth("tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []string{"Bearer tok", "bearer tok", "BEARER tok", "Bearer\ttok", "  Bearer   tok  "} {
+		if err := auth.Check(h); err != nil {
+			t.Errorf("Check(%q) = %v, want nil", h, err)
+		}
+	}
+	for _, h := range []string{"", "Bearer", "Bearer ", "Bearertok", "Basic tok", "Bearer other", "tok"} {
+		if err := auth.Check(h); status.Code(err) != codes.Unauthenticated {
+			t.Errorf("Check(%q) = %v, want Unauthenticated", h, err)
+		}
 	}
 }

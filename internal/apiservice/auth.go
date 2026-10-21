@@ -19,10 +19,12 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"unicode"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -68,7 +70,10 @@ func NewBearerAuthFromFile(path string) (*BearerAuth, error) {
 // expectedToken returns the static token, or the token file's content. Each
 // check stats the file, and reads it only when the stat changed: another file
 // in its place (a Kubernetes Secret update swaps a symlink), a new
-// modification time or a new size.
+// modification time or a new size. An in-place rewrite that keeps the size and
+// the modification time is missed, for example a token of the same length
+// written within one second on a filesystem with one-second timestamps. Secret
+// updates replace the file, which the cache detects.
 func (a *BearerAuth) expectedToken() (string, error) {
 	if a.tokenFile == "" {
 		return a.token, nil
@@ -94,23 +99,37 @@ func (a *BearerAuth) expectedToken() (string, error) {
 	return tok, nil
 }
 
+// errVerify is what a caller gets when the server cannot load its own token.
+// The details name the token file, thus they go to the server log only.
+var errVerify = status.Error(codes.Internal, "internal error")
+
 func (a *BearerAuth) checkHeader(authHeader string) error {
-	scheme, got, ok := strings.Cut(strings.TrimSpace(authHeader), " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") {
-		return status.Error(codes.Unauthenticated, "missing or invalid bearer token")
-	}
-	got = strings.TrimSpace(got)
-	if got == "" {
+	got, ok := bearerToken(authHeader)
+	if !ok {
 		return status.Error(codes.Unauthenticated, "missing or invalid bearer token")
 	}
 	want, err := a.expectedToken()
 	if err != nil {
-		return status.Errorf(codes.Internal, "verifying bearer token: %v", err)
+		log.Printf("apiservice: verifying bearer token: %v", err)
+		return errVerify
 	}
 	if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
 		return status.Error(codes.Unauthenticated, "missing or invalid bearer token")
 	}
 	return nil
+}
+
+// bearerToken returns the token of an Authorization value "Bearer <token>".
+// The scheme is case-insensitive (RFC 7235), and any whitespace can separate
+// it from the token.
+func bearerToken(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	i := strings.IndexFunc(value, unicode.IsSpace)
+	if i < 0 || !strings.EqualFold(value[:i], "Bearer") {
+		return "", false
+	}
+	tok := strings.TrimSpace(value[i:])
+	return tok, tok != ""
 }
 
 // Check reports whether value, an Authorization header value, carries the
@@ -158,7 +177,7 @@ func (a *BearerAuth) WrapHTTP(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := a.checkHeader(r.Header.Get("Authorization")); err != nil {
 			if status.Code(err) == codes.Internal {
-				http.Error(w, status.Convert(err).Message(), http.StatusInternalServerError)
+				http.Error(w, "internal error", http.StatusInternalServerError)
 				return
 			}
 			w.Header().Set("WWW-Authenticate", "Bearer")

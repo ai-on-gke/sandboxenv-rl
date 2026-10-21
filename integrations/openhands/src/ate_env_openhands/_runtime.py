@@ -59,4 +59,9 @@ def client(endpoint: str, token: str | None) -> Client:
 
     made = run(make())  # the channel binds to the shared loop
     with _lock:
-        return _clients.setdefault(key, made)
+        kept = _clients.setdefault(key, made)
+    if kept is not made:
+        # Another thread made a client for this key first: close the spare
+        # channel instead of leaking it.
+        run(made.close())
+    return kept

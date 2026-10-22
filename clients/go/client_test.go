@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -173,6 +174,25 @@ func TestDelete(t *testing.T) {
 
 	if err := sb.Delete(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestClientServerInfo(t *testing.T) {
+	f := newFixture(t)
+	info, err := f.client.ServerInfo(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.GetServer() != apiservice.ServerName {
+		t.Errorf("server = %q, want %q", info.GetServer(), apiservice.ServerName)
+	}
+	if info.GetVersion() != "dev" {
+		t.Errorf("version = %q, want \"dev\" for a server without a build version", info.GetVersion())
+	}
+	for _, want := range []string{apiservice.FeatureRootfsImage, apiservice.FeaturePTY} {
+		if !slices.Contains(info.GetFeatures(), want) {
+			t.Errorf("features = %v, want %q", info.GetFeatures(), want)
+		}
 	}
 }
 
@@ -571,6 +591,9 @@ func TestClientAuthToken(t *testing.T) {
 
 	if _, err := unauthClient.Create(t.Context(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "sb-auth"}); status.Code(err) != codes.Unauthenticated {
 		t.Fatalf("unauthenticated Create: got %v, want Unauthenticated", err)
+	}
+	if _, err := unauthClient.ServerInfo(t.Context()); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("unauthenticated ServerInfo: got %v, want Unauthenticated", err)
 	}
 
 	exercise := func(t *testing.T, client *env.Client, id string) {

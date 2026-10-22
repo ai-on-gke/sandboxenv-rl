@@ -334,6 +334,10 @@ $ ate-env suspend dev1
 $ ate-env delete dev1
 ```
 
+Subcommand names (`create`, `delete`, `suspend`, `manifest`, `server-info`, `help`, `completion`) are
+reserved: `ate-env create` rejects them as environment IDs, because `ate-env <id> ...` cannot reach
+such an environment.
+
 `ate-env` provides help text:
 
 ```bash
@@ -354,6 +358,7 @@ Available Commands:
   delete      Delete an environment
   help        Help about any command
   manifest    Generate Kubernetes manifests to deploy the system
+  server-info Show the ate-env-api server's version and features
   suspend     Suspend an environment
 
 Flags:
@@ -409,6 +414,7 @@ Manages the lifecycle of isolated execution environments (defined in [`proto/ate
 | `GetEnvironment` | Retrieves environment details and status |
 | `SuspendEnvironment` | Suspends and checkpoints the environment to snapshot storage |
 | `DeleteEnvironment` | Deletes the environment permanently |
+| `GetServerInfo` | Reports the server implementation (`sandboxenv-rl`), its version, the version of the `go.ate.dev/substrate` module it was built against, and its optional features (`rootfs_image`, `pty`, and `port_proxy` when enabled); answered by `ate-env-api` itself. The Substrate version is a build fact, not the version of the control plane the server talks to; Substrate has no RPC that reports that. `ate-env server-info --json` prints the four fields as one JSON object |
 
 ### ProcessService
 

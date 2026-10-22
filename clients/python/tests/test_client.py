@@ -23,6 +23,7 @@ from ate_env import (
     InvalidArgumentError,
     NotFoundError,
     RpcError,
+    ServerInfo,
 )
 from ate_env._gen.ateenv.v1alpha import env_pb2, env_pb2_grpc, guest_pb2_grpc
 from ate_env.client import _auth_interceptors, _normalize_target
@@ -136,6 +137,37 @@ async def test_get_missing_raises_not_found(fake_stack):
         await client.suspend("nope")
     with pytest.raises(NotFoundError):
         await client.delete("nope")
+
+
+async def test_server_info(fake_stack):
+    client, _ = fake_stack
+    info = await client.server_info()
+    assert info == ServerInfo(
+        server="sandboxenv-rl",
+        version="v0.0.0-fake",
+        substrate_version="unknown",
+        features=("rootfs_image", "pty"),
+    )
+    assert "pty" in info.features
+
+
+async def test_server_info_unimplemented_on_an_older_server():
+    # A server that predates GetServerInfo: the generated base servicer answers
+    # UNIMPLEMENTED for each RPC.
+    server = grpc.aio.server()
+    env_pb2_grpc.add_EnvironmentServiceServicer_to_server(
+        env_pb2_grpc.EnvironmentServiceServicer(), server
+    )
+    port = server.add_insecure_port("127.0.0.1:0")
+    await server.start()
+    client = Client(f"127.0.0.1:{port}")
+    try:
+        with pytest.raises(RpcError) as excinfo:
+            await client.server_info()
+        assert excinfo.value.code == grpc.StatusCode.UNIMPLEMENTED
+    finally:
+        await client.close()
+        await server.stop(None)
 
 
 async def test_env_factory_makes_no_rpc(fake_stack):

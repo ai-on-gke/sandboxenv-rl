@@ -125,6 +125,20 @@ class EnvironmentInfo:
 
 
 @dataclass(frozen=True)
+class ServerInfo:
+    """Identity, version and optional features of the ate-env-api server.
+
+    Check a feature with ``"pty" in info.features`` before depending on it;
+    names this client does not know can appear and are to be ignored.
+    """
+
+    server: str  # "sandboxenv-rl" for this repository's ate-env-api
+    version: str
+    substrate_version: str  # the go.ate.dev/substrate module version, or "unknown"
+    features: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ProcessInfo:
     """Identity, lifecycle state, and exit status of a process."""
 
@@ -175,6 +189,15 @@ def _environment_info_from_pb(pb: env_pb2.Environment) -> EnvironmentInfo:
         atespace=pb.atespace,
         template=template,
         status=EnvironmentStatus(pb.status),
+    )
+
+
+def _server_info_from_pb(pb: env_pb2.GetServerInfoResponse) -> ServerInfo:
+    return ServerInfo(
+        server=pb.server,
+        version=pb.version,
+        substrate_version=pb.substrate_version,
+        features=tuple(pb.features),
     )
 
 

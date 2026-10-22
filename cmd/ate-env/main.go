@@ -32,6 +32,7 @@ import (
 	"github.com/agent-substrate/env/internal/apiservice"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"github.com/spf13/cobra"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 func envOr(key, fallback string) string {
@@ -189,6 +190,9 @@ func newCreateCommand() *cobra.Command {
 		Short: "Create and start an environment",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := checkNotSubcommand(cmd, args[0]); err != nil {
+				return err
+			}
 			token, err := auth.resolve(cmd)
 			if err != nil {
 				return err
@@ -228,6 +232,18 @@ func newCreateCommand() *cobra.Command {
 	cmd.Flags().StringVar(&createTemplateAtespace, "template-atespace", "", "Substrate atespace of the ActorTemplate (defaults to environment atespace)")
 	cmd.Flags().StringVar(&rootfsImage, "rootfs-image", "", "digest-pinned rootfs image to run unmodified (repo@sha256:...); the template becomes the base the guest is taken from")
 	return cmd
+}
+
+// checkNotSubcommand rejects an environment id that equals an ate-env
+// subcommand name (create, delete, help, ...): `ate-env <id> read|write|shell`
+// cannot reach such an environment, because the subcommand takes the name.
+func checkNotSubcommand(cmd *cobra.Command, id string) error {
+	for _, c := range cmd.Root().Commands() {
+		if c.Name() == id || c.HasAlias(id) {
+			return fmt.Errorf("environment id %q is reserved: it is an ate-env subcommand, thus `ate-env %s read|write|shell` cannot reach the environment", id, id)
+		}
+	}
+	return nil
 }
 
 func newSuspendCommand() *cobra.Command {
@@ -300,6 +316,7 @@ func newServerInfoCommand() *cobra.Command {
 	var (
 		endpoint string
 		auth     authFlags
+		asJSON   bool
 	)
 	cmd := &cobra.Command{
 		Use:   "server-info",
@@ -324,6 +341,14 @@ func newServerInfoCommand() *cobra.Command {
 				return err
 			}
 			out := cmd.OutOrStdout()
+			if asJSON {
+				b, err := protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}.Marshal(info)
+				if err != nil {
+					return err
+				}
+				_, err = fmt.Fprintf(out, "%s\n", b)
+				return err
+			}
 			fmt.Fprintf(out, "server: %s\n", info.GetServer())
 			fmt.Fprintf(out, "version: %s\n", info.GetVersion())
 			fmt.Fprintf(out, "substrate_version: %s\n", info.GetSubstrateVersion())
@@ -332,6 +357,7 @@ func newServerInfoCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&endpoint, "api", envOr("SUBSTRATE_ENV_API", "127.0.0.1:7777"), "address of the ate-env-api service (e.g. localhost:7777)")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print one JSON object with the fields server, version, substrate_version and features")
 	auth.register(cmd, false)
 	return cmd
 }

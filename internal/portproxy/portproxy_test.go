@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/internaltest/fakerouter"
 	"github.com/agent-substrate/env/internal/portproxy"
@@ -647,5 +648,135 @@ func TestResponseHeaderTimeout(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusGatewayTimeout {
 		t.Errorf("silent daemon: got %d, want 504", resp.StatusCode)
+	}
+}
+
+// TestAuthenticate serves the proxy the way ate-env-api does with
+// -auth-token-file: both forms require the API's bearer token, the token does
+// not reach the daemon, and the API's own routes are left to their handlers.
+func TestAuthenticate(t *testing.T) {
+	s := newSetup(t)
+	var seen *http.Request
+	s.router.RegisterPort("env1", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r
+		io.WriteString(w, "daemon")
+	}))
+	auth, err := apiservice.NewBearerAuth("s3cret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := mustNew(t, portproxy.Options{ConnectAddr: s.routerAddr, DefaultAtespace: "ate-env", HandshakeTimeout: 5 * time.Second, Authenticate: auth.Check})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "api") })
+	srv := httptest.NewServer(portproxy.Dispatch(p, mux))
+	t.Cleanup(srv.Close)
+
+	get := func(path string, headers map[string]string) (*http.Response, string) {
+		t.Helper()
+		seen = nil
+		req, err := http.NewRequest(http.MethodGet, srv.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp, string(b)
+	}
+	with := func(h map[string]string, kv ...string) map[string]string {
+		out := map[string]string{}
+		for k, v := range h {
+			out[k] = v
+		}
+		for i := 0; i < len(kv); i += 2 {
+			out[kv[i]] = kv[i+1]
+		}
+		return out
+	}
+	header := target("env1", 8000)
+	const pathForm = "/v1alpha/envs/env1/ports/8000/health"
+
+	for _, tc := range []struct {
+		name    string
+		path    string
+		headers map[string]string
+	}{
+		{"header form without a token", "/health", header},
+		{"header form with a wrong token", "/health", with(header, "Authorization", "Bearer wrong")},
+		{"header form with a wrong token in " + portproxy.EnvAuthorizationHeader, "/health", with(header, portproxy.EnvAuthorizationHeader, "Bearer wrong", "Authorization", "Bearer s3cret")},
+		{"path form without a token", pathForm, nil},
+		{"path form with a wrong token", pathForm, map[string]string{"Authorization": "Bearer wrong"}},
+	} {
+		resp, body := get(tc.path, tc.headers)
+		if resp.StatusCode != http.StatusUnauthorized || resp.Header.Get("WWW-Authenticate") != "Bearer" {
+			t.Errorf("%s: got %d %q, want 401 with WWW-Authenticate: Bearer", tc.name, resp.StatusCode, body)
+		}
+		if seen != nil {
+			t.Errorf("%s: the request reached the daemon", tc.name)
+		}
+	}
+	if n := s.router.connectCount(); n != 0 {
+		t.Errorf("router saw %d CONNECTs for refused requests, want 0", n)
+	}
+
+	// The token in Authorization is the API's: the daemon does not get it.
+	for _, path := range []string{"/health", pathForm} {
+		h := map[string]string{"Authorization": "Bearer s3cret"}
+		if path == "/health" {
+			h = with(header, "Authorization", "Bearer s3cret")
+		}
+		resp, body := get(path, h)
+		if resp.StatusCode != http.StatusOK || body != "daemon" {
+			t.Fatalf("%s with the token in Authorization: got %d %q, want the daemon's answer", path, resp.StatusCode, body)
+		}
+		if v := seen.Header.Get("Authorization"); v != "" {
+			t.Errorf("%s: daemon saw Authorization %q; the API's token must not reach it", path, v)
+		}
+	}
+
+	// The token in X-Env-Authorization leaves Authorization to the daemon.
+	resp, body := get("/health", with(header, portproxy.EnvAuthorizationHeader, "Bearer s3cret", "Authorization", "Bearer daemon-key"))
+	if resp.StatusCode != http.StatusOK || body != "daemon" {
+		t.Fatalf("token in %s: got %d %q, want the daemon's answer", portproxy.EnvAuthorizationHeader, resp.StatusCode, body)
+	}
+	if v := seen.Header.Get("Authorization"); v != "Bearer daemon-key" {
+		t.Errorf("daemon saw Authorization %q, want the caller's daemon credential", v)
+	}
+	if v := seen.Header.Get(portproxy.EnvAuthorizationHeader); v != "" {
+		t.Errorf("daemon saw %s %q; the proxy must strip it", portproxy.EnvAuthorizationHeader, v)
+	}
+
+	// The API's own routes are not the proxy's to check.
+	if resp, body := get("/healthz", nil); resp.StatusCode != http.StatusOK || body != "api" {
+		t.Errorf("/healthz: got %d %q, want the API's answer", resp.StatusCode, body)
+	}
+}
+
+// Without Authenticate, the proxy still strips X-Env-Authorization and leaves
+// Authorization to the daemon.
+func TestStripsEnvAuthorizationWithoutAuthenticate(t *testing.T) {
+	s := newSetup(t)
+	var seen *http.Request
+	s.router.RegisterPort("env1", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r
+		io.WriteString(w, "daemon")
+	}))
+	h := target("env1", 8000)
+	h[portproxy.EnvAuthorizationHeader] = "Bearer api-token"
+	h["Authorization"] = "Bearer daemon-key"
+	if resp, body := s.do(t, http.MethodGet, "/", "", h); resp.StatusCode != http.StatusOK || body != "daemon" {
+		t.Fatalf("got %d %q", resp.StatusCode, body)
+	}
+	if v := seen.Header.Get(portproxy.EnvAuthorizationHeader); v != "" {
+		t.Errorf("daemon saw %s %q; the proxy must strip it", portproxy.EnvAuthorizationHeader, v)
+	}
+	if v := seen.Header.Get("Authorization"); v != "Bearer daemon-key" {
+		t.Errorf("daemon saw Authorization %q, want it untouched", v)
 	}
 }

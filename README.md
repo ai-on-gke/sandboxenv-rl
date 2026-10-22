@@ -139,6 +139,19 @@ kubectl get pods -n ate-env
 parking budget) and, once the control plane reports the environment RUNNING, up to
 `--wake-running-budget` (default 20s). Both are flags on the API deployment.
 
+By default `ate-env manifest` deploys `ate-env-api` without caller authentication for use over
+`kubectl port-forward`. Before exposing `ate-env-api` beyond loopback (e.g. through an internal
+LoadBalancer or to multi-tenant namespaces), create a Kubernetes Secret with a `token` key and pass
+`--auth-token-secret <secret-name>` to `ate-env manifest` (which mounts the secret and sets
+`-auth-token-file` on `ate-env-api`); callers then authenticate with `--auth-token-file`,
+`SUBSTRATE_ENV_AUTH_TOKEN` or `--auth-token` on the CLI (`--auth-token` shows the token in `ps`
+output and the shell history), `ClientOptions.AuthToken` in the Go SDK, `Client(..., auth_token=...)`
+in the Python SDK, or `Authorization: Bearer <token>` on MCP HTTP requests and port-proxy requests
+([Reaching a service inside an environment](#reaching-a-service-inside-an-environment)).
+The clients connect without TLS, thus the token travels in clear text. Past the cluster boundary,
+for example through an internal LoadBalancer, put TLS termination or a mesh with mTLS in front of
+`ate-env-api`.
+
 ### 2. Register the ActorTemplate in Substrate
 
 Substrate manages ActorTemplates directly in its control plane rather than Kubernetes CRDs. Use `ate-env manifest template` to generate the Substrate ActorTemplate manifest:
@@ -348,12 +361,20 @@ curl localhost:7777/v1alpha/envs/dev1/ports/6000/health
 The path form reaches the daemon exactly as sent: a path without the trailing slash is the daemon's
 root, and `//` or `..` after the prefix are not cleaned or redirected.
 
-**Who can use it.** The forwarding does not authenticate callers. Whoever can reach the API's
-listener can reach any TCP port of any actor the Substrate router serves, in any atespace,
-including actors that ate-env did not create. The guest API already reaches each actor that runs
+**Who can use it.** Without `--auth-token-file`, the forwarding does not authenticate callers.
+Whoever can reach the API's listener can reach any TCP port of any actor the Substrate router serves,
+in any atespace, including actors that ate-env did not create. The guest API already reaches each actor that runs
 the guest; the forwarding extends that reach to every port. Keep the listener inside the cluster
 (the manifest's Service is `ClusterIP`), restrict it with a NetworkPolicy where other workloads
 share the cluster, and make each daemon check its own credential.
+
+With `--auth-token-file`, each forwarded request, in either form, must carry the API's token, in
+`X-Env-Authorization: Bearer <token>` or in `Authorization: Bearer <token>`; the API answers 401
+otherwise. The token does not reach the daemon: the API strips `X-Env-Authorization`, and strips
+`Authorization` when it carried the token. Send the token in `X-Env-Authorization` when the daemon
+needs its own `Authorization`, such as an OpenAI-compatible server. A browser cannot add either
+header to a page load or a WebSocket handshake, thus with the token on, the path form serves
+scripted clients only.
 
 **Browsers.** The path form refuses a state-changing request or a WebSocket handshake that a browser
 sends from a page of another origin, so a web page cannot drive a daemon through a `kubectl

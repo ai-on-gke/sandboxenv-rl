@@ -28,7 +28,7 @@ func TestBuiltinTrajectoriesLoadAndRender(t *testing.T) {
 	if len(names) == 0 {
 		t.Fatal("no built-in trajectories")
 	}
-	in := Instance{InstanceID: "x", Image: "reg/img@" + goodDigest, Patch: "PATCH", EvalScript: "EVAL"}
+	in := makeInstance("x", "PATCH", "EVAL")
 	for _, n := range names {
 		tr, err := LoadTrajectory(n)
 		if err != nil {
@@ -50,12 +50,17 @@ func TestBuiltinTrajectoriesLoadAndRender(t *testing.T) {
 			t.Fatalf("%s: setup/reset not rendered", n)
 		}
 	}
-	def, err := LoadTrajectory("")
-	if err != nil || def.Name != DefaultTrajectory {
-		t.Fatalf("default: %v %v", def, err)
-	}
-	if !def.HasReward() {
-		t.Fatal("default trajectory has no reward step")
+	for _, n := range []string{"workload-file-read", "workload-compile", "workload-read-all"} {
+		tr, err := LoadTrajectory(n)
+		if err != nil {
+			t.Fatalf("%s: %v", n, err)
+		}
+		if tr.Steps[0].Name != "probe" || tr.Steps[0].Run != "true" {
+			t.Fatalf("%s must start with the probe step so ttfi is the cold start alone", n)
+		}
+		if !tr.HasReward() {
+			t.Fatalf("%s needs a reward step so a failed workload is visible", n)
+		}
 	}
 }
 
@@ -74,7 +79,7 @@ steps:
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := tr.Render(Instance{InstanceID: "id-1", Patch: "line1\nline2"})
+	r, err := tr.Render(makeInstance("id-1", "line1\nline2", ""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,48 +175,20 @@ func TestJSONTemplateFunc(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in := Instance{InstanceID: "x", Image: "reg/img@" + goodDigest, FailToPass: []string{"a::b[1]"}, LogParser: "parse_log_pytest"}
+	in := Instance{
+		InstanceID: "x",
+		Image:      "reg/img@" + goodDigest,
+		Material:   json.RawMessage(`{"fail_to_pass":["a::b[1]"],"log_parser":"parse_log_pytest"}`),
+	}
 	r, err := tr.Render(in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var back Instance
+	var back map[string]any
 	if err := json.Unmarshal([]byte(r.Steps[0].Write.Content), &back); err != nil {
 		t.Fatalf("not JSON: %v: %s", err, r.Steps[0].Write.Content)
 	}
-	if back.InstanceID != "x" || back.LogParser != "parse_log_pytest" || len(back.FailToPass) != 1 {
+	if back["instance_id"] != "x" || back["log_parser"] != "parse_log_pytest" {
 		t.Fatalf("round trip: %+v", back)
-	}
-}
-
-func TestGrades(t *testing.T) {
-	def, err := LoadTrajectory("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !def.Grades() {
-		t.Fatal("the default trajectory grades")
-	}
-	for _, n := range []string{"workload-file-read", "workload-compile", "workload-read-all"} {
-		tr, err := LoadTrajectory(n)
-		if err != nil {
-			t.Fatalf("%s: %v", n, err)
-		}
-		if tr.Grades() {
-			t.Fatalf("%s must not need grading material", n)
-		}
-		if tr.Steps[0].Name != "probe" || tr.Steps[0].Run != "true" {
-			t.Fatalf("%s must start with the probe step so ttfi is the cold start alone", n)
-		}
-		if !tr.HasReward() {
-			t.Fatalf("%s needs a reward step so a failed workload is visible", n)
-		}
-	}
-	plain, err := ParseTrajectory([]byte("name: t\nsteps:\n  - {name: w, write: {path: /tmp/p, content: \"{{.Patch}}\"}}\n  - {name: r, run: \"true\"}\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plain.Grades() {
-		t.Fatal("a trajectory that uses only the patch does not grade")
 	}
 }

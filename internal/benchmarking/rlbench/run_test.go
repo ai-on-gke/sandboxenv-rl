@@ -149,8 +149,7 @@ func (s *fakeSandbox) Delete(ctx context.Context) error {
 func instances(n int) []Instance {
 	out := make([]Instance, n)
 	for i := range out {
-		out[i] = Instance{InstanceID: "repo__repo-" + string(rune('a'+i)), Image: "reg/img@" + goodDigest,
-			Patch: "PATCH", EvalScript: "EVAL"}
+		out[i] = makeInstance("repo__repo-"+string(rune('a'+i)), "PATCH", "EVAL")
 	}
 	return out
 }
@@ -620,7 +619,7 @@ func TestStepsFailedDeleteParkDoesNotLeak(t *testing.T) {
 }
 
 func TestValidateChecksTheLongestName(t *testing.T) {
-	long := Instance{InstanceID: strings.Repeat("a", 40), Image: "reg/img@" + goodDigest, Patch: "P", EvalScript: "E"}
+	long := makeInstance(strings.Repeat("a", 40), "P", "E")
 	base := func() Config {
 		cfg := baseConfig(t, newFake(), nil)
 		cfg.RunID = strings.Repeat("r", maxRunIDLen)

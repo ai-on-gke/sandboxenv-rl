@@ -55,10 +55,10 @@ func TestSummarizeRoundTrip(t *testing.T) {
 	rec.Record(Event{RunID: "r", Event: EventTask, Step: 1, DurMS: 600, OK: false})
 	rec.Record(Event{RunID: "r", Event: EventWake, Step: 2, DurMS: 40, OK: true, Attempts: 3})
 	rec.Record(Event{RunID: "r", Event: EventStep, Name: "grade", Instance: "repo__x-1", DurMS: 9, OK: true, Reward: intp(0),
-		Tail: `{"valid": true, "resolved": false, "f2p": "1/1", "p2p": "3/4"}`})
+		Detail: "f2p 1/1 p2p 3/4"})
 	rec.Record(Event{RunID: "r", Event: EventStep, Name: "grade", Instance: "repo__x-2", DurMS: 9, OK: true, Reward: intp(0), Tail: "no json"})
 	rec.Record(Event{RunID: "r", Event: EventStep, Name: "grade", Instance: "repo__x-1", DurMS: 9, OK: true, Reward: intp(0),
-		Tail: `{"valid": false, "resolved": false}`})
+		Detail: "invalid run"})
 	rec.Record(Event{RunID: "r", Event: EventTask, Step: 2, DurMS: 700, OK: true, Reward: intp(0)})
 	rec.Record(Event{RunID: "r", Event: EventBarrier, Step: 1, DurMS: 650, OK: true, Count: 2})
 	rec.Record(Event{RunID: "r", Event: EventPark, Name: "suspend", Step: 1, DurMS: 90, OK: true, Count: 1})
@@ -109,9 +109,6 @@ func TestSummarizeRoundTrip(t *testing.T) {
 	rep.WriteExclusions(&excl, "test list")
 	if !strings.Contains(excl.String(), "# test list\n") || !strings.Contains(excl.String(), "repo__x-1  f2p 1/1 p2p 3/4\n") {
 		t.Fatalf("exclusions:\n%s", excl.String())
-	}
-	if v := verdict(`{"valid": false}`); v != "invalid run" {
-		t.Fatalf("verdict: %q", v)
 	}
 	var text bytes.Buffer
 	rep.WriteText(&text)

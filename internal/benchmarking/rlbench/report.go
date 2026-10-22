@@ -40,11 +40,8 @@ type Stat struct {
 	Retried int `json:"retried,omitempty"`
 }
 
-// OpRow aliases Stat for callers that refer to operation summary rows by name.
-type OpRow = Stat
-
 // Unresolved is an instance whose reward step scored 0, with the grader's
-// verdict when the step's output ended in one.
+// verdict when available.
 type Unresolved struct {
 	Instance string `json:"instance"`
 	Reason   string `json:"reason"`
@@ -65,9 +62,6 @@ type StepStat struct {
 	WakeP50MS float64 `json:"wake_p50_ms"`
 	WakeP95MS float64 `json:"wake_p95_ms"`
 }
-
-// StepRow aliases StepStat for callers that refer to step summary rows by name.
-type StepRow = StepStat
 
 // Report is the summary of one run's JSONL, stable enough to diff between
 // runs.
@@ -93,126 +87,132 @@ type ErrorCount struct {
 	Count int    `json:"count"`
 }
 
-// Failure aliases ErrorCount for callers that refer to error rows as Failure.
-type Failure = ErrorCount
+type statKey struct{ event, name string }
 
-// Summarize reads JSONL events and builds the report.
-func Summarize(r io.Reader) (*Report, error) {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 1<<20), 16<<20)
-	var events []Event
-	for sc.Scan() {
-		b := bytes.TrimSpace(sc.Bytes())
-		if len(b) == 0 {
-			continue
-		}
-		var e Event
-		if err := json.Unmarshal(b, &e); err != nil {
-			return nil, fmt.Errorf("parse event: %w", err)
-		}
-		events = append(events, e)
-	}
-	if err := sc.Err(); err != nil {
-		return nil, err
-	}
-	return Build(events), nil
+// Builder folds a stream of events into a Report without materializing the full
+// event slice in memory.
+type Builder struct {
+	rep        Report
+	durs       map[statKey][]float64
+	failed     map[statKey]int
+	retried    map[statKey]int
+	unresolved map[string]string
+	order      []statKey
+	steps      map[int]*StepStat
+	wakes      map[int][]float64
+	errs       map[string]int
 }
 
-// Build computes the report from events in memory.
-func Build(events []Event) *Report {
-	rep := &Report{}
-	type key struct{ event, name string }
-	durs := map[key][]float64{}
-	failed := map[key]int{}
-	retried := map[key]int{}
-	unresolved := map[string]string{}
-	var order []key
-	steps := map[int]*StepStat{}
-	wakes := map[int][]float64{}
-	errs := map[string]int{}
+// NewBuilder returns a streaming report Builder.
+func NewBuilder() *Builder {
+	return &Builder{
+		durs:       map[statKey][]float64{},
+		failed:     map[statKey]int{},
+		retried:    map[statKey]int{},
+		unresolved: map[string]string{},
+		steps:      map[int]*StepStat{},
+		wakes:      map[int][]float64{},
+		errs:       map[string]int{},
+	}
+}
 
-	for _, e := range events {
-		if rep.RunID == "" {
-			rep.RunID = e.RunID
-		}
-		k := key{e.Event, ""}
-		if e.Event == EventStep || e.Event == EventPark {
-			k.name = e.Name
-		}
-		if _, ok := durs[k]; !ok {
-			order = append(order, k)
-			durs[k] = nil
-		}
-		if e.Attempts > 1 {
-			retried[k]++
-		}
-		if e.Event == EventStep && e.Reward != nil && *e.Reward == 0 {
-			if _, seen := unresolved[e.Instance]; !seen {
-				unresolved[e.Instance] = verdict(e.Tail)
-			}
-		}
-		if e.OK {
-			durs[k] = append(durs[k], e.DurMS)
-		} else {
-			failed[k]++
-			if e.Err != "" {
-				errs[e.Err]++
-			}
-		}
-		switch e.Event {
-		case EventRun:
-			rep.Mode = e.Name
-			rep.RunMS = e.DurMS
-		case EventTask:
-			rep.Tasks++
-			if !e.OK {
-				rep.Failed++
-			}
-			if e.Reward != nil && *e.Reward == 1 {
-				rep.Rewarded++
-			}
-			if e.Step > 0 {
-				s := stepStat(steps, e.Step)
-				s.Tasks++
-				if !e.OK {
-					s.Failed++
-				}
-				if e.Reward != nil && *e.Reward == 1 {
-					s.Rewarded++
-				}
-			}
-		case EventBarrier:
-			stepStat(steps, e.Step).BarrierMS = e.DurMS
-			stepStat(steps, e.Step).Live = e.Count
-		case EventPark:
-			stepStat(steps, e.Step).ParkMS = e.DurMS
-		case EventWake:
-			if e.OK {
-				wakes[e.Step] = append(wakes[e.Step], e.DurMS)
-			}
+// Add folds one event into the Builder.
+func (b *Builder) Add(e Event) {
+	if b.rep.RunID == "" {
+		b.rep.RunID = e.RunID
+	}
+	k := statKey{e.Event, ""}
+	if e.Event == EventStep || e.Event == EventPark {
+		k.name = e.Name
+	}
+	if _, ok := b.durs[k]; !ok {
+		b.order = append(b.order, k)
+		b.durs[k] = nil
+	}
+	if e.Attempts > 1 {
+		b.retried[k]++
+	}
+	if e.Event == EventStep && e.Reward != nil && *e.Reward == 0 {
+		if _, seen := b.unresolved[e.Instance]; !seen {
+			b.unresolved[e.Instance] = resolveUnresolvedReason(e)
 		}
 	}
+	if e.OK {
+		b.durs[k] = append(b.durs[k], e.DurMS)
+	} else {
+		b.failed[k]++
+		if e.Err != "" {
+			b.errs[e.Err]++
+		}
+	}
+	switch e.Event {
+	case EventRun:
+		b.rep.Mode = e.Name
+		b.rep.RunMS = e.DurMS
+	case EventTask:
+		b.rep.Tasks++
+		if !e.OK {
+			b.rep.Failed++
+		}
+		if e.Reward != nil && *e.Reward == 1 {
+			b.rep.Rewarded++
+		}
+		if e.Step > 0 {
+			s := stepStat(b.steps, e.Step)
+			s.Tasks++
+			if !e.OK {
+				s.Failed++
+			}
+			if e.Reward != nil && *e.Reward == 1 {
+				s.Rewarded++
+			}
+		}
+	case EventBarrier:
+		stepStat(b.steps, e.Step).BarrierMS = e.DurMS
+		stepStat(b.steps, e.Step).Live = e.Count
+	case EventPark:
+		stepStat(b.steps, e.Step).ParkMS = e.DurMS
+	case EventWake:
+		if e.OK {
+			b.wakes[e.Step] = append(b.wakes[e.Step], e.DurMS)
+		}
+	}
+}
+
+// Finish computes exact percentiles over the accumulated durations and returns
+// the finalized Report.
+func (b *Builder) Finish() *Report {
+	rep := b.rep
 	if rep.Tasks > 0 {
 		rep.RewardRate = float64(rep.Rewarded) / float64(rep.Tasks)
 	}
-	for _, k := range order {
-		d := durs[k]
+	for _, k := range b.order {
+		d := b.durs[k]
 		sort.Float64s(d)
-		rep.Stats = append(rep.Stats, Stat{Event: k.event, Name: k.name, Count: len(d) + failed[k], Failed: failed[k],
-			P50MS: percentile(d, 0.50), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1), Retried: retried[k]})
+		rep.Stats = append(rep.Stats, Stat{
+			Event:   k.event,
+			Name:    k.name,
+			Count:   len(d) + b.failed[k],
+			Failed:  b.failed[k],
+			P50MS:   percentile(d, 0.50),
+			P95MS:   percentile(d, 0.95),
+			MaxMS:   percentile(d, 1),
+			Retried: b.retried[k],
+		})
 	}
-	for step, s := range steps {
-		w := wakes[step]
+	for step, s := range b.steps {
+		w := b.wakes[step]
 		sort.Float64s(w)
-		s.WakeP50MS = percentile(w, 0.5)
-		s.WakeP95MS = percentile(w, 0.95)
-		rep.Steps = append(rep.Steps, *s)
+		cp := *s
+		cp.WakeP50MS = percentile(w, 0.5)
+		cp.WakeP95MS = percentile(w, 0.95)
+		rep.Steps = append(rep.Steps, cp)
 	}
 	sort.Slice(rep.Steps, func(i, j int) bool { return rep.Steps[i].Step < rep.Steps[j].Step })
-	for msg, n := range errs {
+	for msg, n := range b.errs {
 		rep.Errors = append(rep.Errors, ErrorCount{Err: msg, Count: n})
 	}
-	for inst, why := range unresolved {
+	for inst, why := range b.unresolved {
 		rep.Unresolved = append(rep.Unresolved, Unresolved{Instance: inst, Reason: why})
 	}
 	sort.Slice(rep.Unresolved, func(i, j int) bool { return rep.Unresolved[i].Instance < rep.Unresolved[j].Instance })
@@ -222,34 +222,64 @@ func Build(events []Event) *Report {
 		}
 		return rep.Errors[i].Err < rep.Errors[j].Err
 	})
-	return rep
+	return &rep
 }
 
-// Verdict extracts the grader's verdict from the end of a reward step's output.
-func Verdict(tail string) string {
-	return verdict(tail)
+// resolveUnresolvedReason returns e.Detail when present, falls back to asking
+// registered dataset graders to parse e.Tail (for pre-existing JSONL files),
+// and otherwise returns "reward 0".
+func resolveUnresolvedReason(e Event) string {
+	if e.Detail != "" {
+		return e.Detail
+	}
+	if e.Tail != "" {
+		if a := AdapterFor(DefaultKind); a != nil && a.Grader() != nil {
+			if _, detail, err := a.Grader().Parse([]byte(e.Tail)); err == nil && detail != "" {
+				return detail
+			}
+		}
+		adaptersMu.RLock()
+		defer adaptersMu.RUnlock()
+		for _, a := range adapters {
+			if g := a.Grader(); g != nil {
+				if _, detail, err := g.Parse([]byte(e.Tail)); err == nil && detail != "" {
+					return detail
+				}
+			}
+		}
+	}
+	return "reward 0"
 }
 
-// verdict extracts the grader's verdict from the end of a reward step's
-// output: "invalid run", "f2p A/B p2p C/D", or "reward 0" when the output
-// does not end in the grader's JSON line.
-func verdict(tail string) string {
-	i := strings.LastIndex(tail, `{"valid"`)
-	if i < 0 {
-		return "reward 0"
+// Summarize streams JSONL events from r into a Builder and returns the Report.
+func Summarize(r io.Reader) (*Report, error) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 1<<20), 16<<20)
+	b := NewBuilder()
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var e Event
+		if err := json.Unmarshal(line, &e); err != nil {
+			return nil, fmt.Errorf("parse event: %w", err)
+		}
+		b.Add(e)
 	}
-	var g struct {
-		Valid bool   `json:"valid"`
-		F2P   string `json:"f2p"`
-		P2P   string `json:"p2p"`
+	if err := sc.Err(); err != nil {
+		return nil, err
 	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(tail[i:])), &g); err != nil {
-		return "reward 0"
+	return b.Finish(), nil
+}
+
+// Build computes the report from a slice of events in memory.
+func Build(events []Event) *Report {
+	b := NewBuilder()
+	for _, e := range events {
+		b.Add(e)
 	}
-	if !g.Valid {
-		return "invalid run"
-	}
-	return fmt.Sprintf("f2p %s p2p %s", g.F2P, g.P2P)
+	return b.Finish()
 }
 
 // WriteExclusions writes the unresolved instances in the exclude-file format:

@@ -140,11 +140,6 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// LongestName returns the longest environment name the run builds.
-func (c *Config) LongestName() string {
-	return c.longestName()
-}
-
 // longestName is the longest environment name the run builds: EnvID for the
 // largest replay index of each instance, plus the "-s<step>" suffix that a
 // delete park gives the environments of later steps.
@@ -198,9 +193,6 @@ var runIDPattern = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 const (
 	maxRunIDLen = 20
 	maxNameLen  = 63
-	// MaxRunIDLen and MaxNameLen expose the name length bounds for facades.
-	MaxRunIDLen = maxRunIDLen
-	MaxNameLen  = maxNameLen
 )
 
 // cleanupTimeout bounds the deletes that run after a cancelled or finished
@@ -271,6 +263,7 @@ func Run(ctx context.Context, cfg Config) (*Summary, error) {
 	s := &Summary{Tasks: r.tasks, Failed: r.failed, Rewarded: r.rewarded, Duration: dur}
 	r.rec.Record(Event{RunID: cfg.RunID, Event: EventRun, Name: string(cfg.Mode), DurMS: ms(dur),
 		OK: s.Failed == 0, Count: s.Tasks})
+	_ = r.rec.Flush()
 	return s, ctx.Err()
 }
 
@@ -543,10 +536,18 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 			if res.ExitCode == 0 {
 				*reward = 1
 			}
+			out := res.Stdout + res.Stderr
+			if a := AdapterFor(e.inst.Kind); a != nil && a.Grader() != nil {
+				if parsedReward, detail, gerr := a.Grader().Parse([]byte(out)); gerr == nil && detail != "" {
+					if parsedReward != nil && res.ExitCode != 0 {
+						reward = parsedReward
+					}
+					ev.Detail = detail
+				}
+			}
 			ev.Reward = reward
-			// The grader's verdict is the last line of a reward step's
-			// output; keep enough of it for the report to read it back.
-			ev.Tail = tail(res.Stdout+res.Stderr, 4000)
+			// Keep the trailing output so unresolved steps can be inspected.
+			ev.Tail = tail(out, 4000)
 		case s.ExpectExit != nil && res.ExitCode != *s.ExpectExit:
 			ok = false
 			ev.OK = false
@@ -614,11 +615,6 @@ func isNotFound(err error) bool {
 	}
 	st, ok := status.FromError(err)
 	return ok && st.Code() == codes.NotFound
-}
-
-// IsTransient reports whether a first-command error is worth another try.
-func IsTransient(err error) bool {
-	return isTransient(err)
 }
 
 // isTransient reports whether a first-command error is worth another try.

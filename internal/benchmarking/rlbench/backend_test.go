@@ -126,7 +126,7 @@ func (f *fakeAPI) SignalProcess(_ context.Context, req *ateenvv1alpha.SignalProc
 }
 
 // newFakeBackend serves fakeAPI over an in-memory connection and returns an
-// EnvBackend on it, the same path the binary uses with a real address.
+// EnvBackend configured with fast poll bounds via WithPollBounds.
 func newFakeBackend(t *testing.T, api *fakeAPI) *EnvBackend {
 	t.Helper()
 	api.polls = map[string]int{}
@@ -148,18 +148,12 @@ func newFakeBackend(t *testing.T, api *fakeAPI) *EnvBackend {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = c.Close(); _ = conn.Close(); srv.Stop() })
-	return &EnvBackend{clients: []*env.Client{c}, atespace: "ate-env", baseTemplate: "default-template"}
-}
-
-func fastPolls(t *testing.T) {
-	t.Helper()
-	oldMin, oldMax := pollMin, pollMax
-	pollMin, pollMax = time.Millisecond, 5*time.Millisecond
-	t.Cleanup(func() { pollMin, pollMax = oldMin, oldMax })
+	b := &EnvBackend{clients: []*env.Client{c}, atespace: "ate-env", baseTemplate: "default-template"}
+	WithPollBounds(time.Millisecond, 5*time.Millisecond)(b)
+	return b
 }
 
 func TestEnvBackendRunCollectsExitAndOutput(t *testing.T) {
-	fastPolls(t)
 	api := &fakeAPI{pollsUntilExit: 3, exitCode: 4, stdout: "out", stderr: "err"}
 	b := newFakeBackend(t, api)
 	sb, err := b.Create(context.Background(), "e1", "reg/img@"+goodDigest)
@@ -185,7 +179,6 @@ func TestEnvBackendRunCollectsExitAndOutput(t *testing.T) {
 }
 
 func TestEnvBackendRunToleratesTransientPolls(t *testing.T) {
-	fastPolls(t)
 	api := &fakeAPI{pollsUntilExit: 1, unavailablePolls: pollRetries}
 	b := newFakeBackend(t, api)
 	sb, _ := b.Create(context.Background(), "e1", "reg/img@"+goodDigest)
@@ -195,7 +188,6 @@ func TestEnvBackendRunToleratesTransientPolls(t *testing.T) {
 }
 
 func TestEnvBackendRunGivesUpAndKills(t *testing.T) {
-	fastPolls(t)
 	api := &fakeAPI{pollsUntilExit: 100, unavailablePolls: pollRetries + 1}
 	b := newFakeBackend(t, api)
 	sb, _ := b.Create(context.Background(), "e1", "reg/img@"+goodDigest)
@@ -209,7 +201,6 @@ func TestEnvBackendRunGivesUpAndKills(t *testing.T) {
 }
 
 func TestEnvBackendRunKillsOnCancel(t *testing.T) {
-	fastPolls(t)
 	api := &fakeAPI{pollsUntilExit: 1 << 30}
 	b := newFakeBackend(t, api)
 	sb, _ := b.Create(context.Background(), "e1", "reg/img@"+goodDigest)
@@ -237,13 +228,16 @@ func TestEnvBackendDeleteByName(t *testing.T) {
 func TestEnvBackendSpreadsConnections(t *testing.T) {
 	// grpc.NewClient does not dial until the first call, so a backend over
 	// an unreachable address is enough to check the pool and the rotation.
-	b, err := NewEnvBackend("127.0.0.1:1", "ate-env", "default-template", 3)
+	b, err := NewEnvBackend("127.0.0.1:1", "ate-env", "default-template", 3, WithPollBounds(time.Millisecond, 5*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer b.Close()
 	if len(b.clients) != 3 {
 		t.Fatalf("%d clients, want 3", len(b.clients))
+	}
+	if b.minPoll != time.Millisecond || b.maxPoll != 5*time.Millisecond {
+		t.Fatalf("poll bounds = (%v, %v)", b.minPoll, b.maxPoll)
 	}
 	seen := map[int]int{}
 	for i := 0; i < 9; i++ {

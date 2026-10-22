@@ -15,100 +15,34 @@
 package swebench
 
 import (
-	"encoding/json"
 	"io"
-	"sync"
-	"time"
+
+	"github.com/agent-substrate/env/internal/benchmarking/rlbench"
 )
 
 // Event names. Every timed operation of a run is one of these.
 const (
-	EventCreate  = "create"       // CreateEnvironment call
-	EventTTFI    = "ttfi"         // create start to the first command's return
-	EventWake    = "wake"         // first command after a park, including the wake it triggers
-	EventStep    = "step"         // one trajectory step (name is the step name)
-	EventTask    = "task"         // one trajectory replay end to end
-	EventSuspend = "suspend"      // SuspendEnvironment call
-	EventDelete  = "delete"       // DeleteEnvironment call
-	EventBarrier = "step_barrier" // steps mode: first task start to last task end in a training step
-	EventPark    = "park"         // steps mode: parking the whole fleet between steps
-	EventRun     = "run"          // whole run
+	EventCreate  = rlbench.EventCreate
+	EventTTFI    = rlbench.EventTTFI
+	EventWake    = rlbench.EventWake
+	EventStep    = rlbench.EventStep
+	EventTask    = rlbench.EventTask
+	EventSuspend = rlbench.EventSuspend
+	EventDelete  = rlbench.EventDelete
+	EventBarrier = rlbench.EventBarrier
+	EventPark    = rlbench.EventPark
+	EventRun     = rlbench.EventRun
 )
 
-// Event is one JSONL record. Dur is wall time as seen by the loader; it
-// includes the network and the API server, which is what a trainer sees.
-type Event struct {
-	Time  time.Time `json:"ts"`
-	RunID string    `json:"run"`
-	Event string    `json:"event"`
-	Name  string    `json:"name,omitempty"`
-	// Env is the environment's name. With a delete park, an environment is
-	// recreated under "<name>-s<step>" from step 2 on, thus group a replay's
-	// events by Instance and Task, not by Env.
-	Env      string `json:"env,omitempty"`
-	Instance string `json:"instance,omitempty"`
-	// Step is the training step in steps mode (1-based); 0 in eval mode.
-	Step int `json:"step,omitempty"`
-	// Task numbers the replays of one instance (eval: task index; steps:
-	// rollout index).
-	Task   int     `json:"task,omitempty"`
-	DurMS  float64 `json:"dur_ms"`
-	OK     bool    `json:"ok"`
-	Exit   *int    `json:"exit,omitempty"`
-	Reward *int    `json:"reward,omitempty"`
-	Err    string  `json:"err,omitempty"`
-	// Count is the number of tasks or environments an aggregate event covers.
-	Count int `json:"count,omitempty"`
-	// Tail is the last bytes of a failed or reward step's output.
-	Tail string `json:"tail,omitempty"`
-	// Attempts is how many tries a ttfi or wake took; above 1 means the
-	// environment was not serving when first asked.
-	Attempts int `json:"attempts,omitempty"`
-}
+// Event is one JSONL record.
+type Event = rlbench.Event
 
-// Recorder writes events as JSON lines. It is safe for concurrent use.
-type Recorder struct {
-	mu  sync.Mutex
-	w   io.Writer
-	enc *json.Encoder
-	n   int
-	err error
-}
+// Recorder writes events as JSON lines.
+type Recorder = rlbench.Recorder
 
 // NewRecorder writes to w; a nil w discards events.
 func NewRecorder(w io.Writer) *Recorder {
-	if w == nil {
-		w = io.Discard
-	}
-	return &Recorder{w: w, enc: json.NewEncoder(w)}
-}
-
-// Record writes one event, stamping the time if unset.
-func (r *Recorder) Record(e Event) {
-	if e.Time.IsZero() {
-		e.Time = time.Now()
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := r.enc.Encode(e); err != nil && r.err == nil {
-		r.err = err
-	}
-	r.n++
-}
-
-// Len is the number of events written so far.
-func (r *Recorder) Len() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.n
-}
-
-// Err is the first write error, if any; a run whose events were lost must
-// not report success.
-func (r *Recorder) Err() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.err
+	return rlbench.NewRecorder(w)
 }
 
 func intp(v int) *int { return &v }

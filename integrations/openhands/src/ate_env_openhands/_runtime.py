@@ -26,6 +26,7 @@ import atexit
 import concurrent.futures
 import os
 import threading
+from collections import OrderedDict
 from collections.abc import Coroutine
 from typing import Any
 
@@ -34,7 +35,11 @@ from ate_env.loop_runner import LoopRunner
 
 _lock = threading.Lock()
 _runner: LoopRunner | None = None
-_clients: dict[tuple[str, str | None], Client] = {}
+# Least recently used first. Each token rotation adds a client for the
+# endpoint; at most MAX_CLIENTS_PER_ENDPOINT stay open (the current token and
+# the previous one) and the least recently used one beyond that is closed.
+_clients: OrderedDict[tuple[str, str | None], Client] = OrderedDict()
+MAX_CLIENTS_PER_ENDPOINT = 2
 
 
 def _get_runner() -> LoopRunner:
@@ -64,6 +69,8 @@ def client(endpoint: str, token: str | None) -> Client:
     key = (endpoint, token)
     with _lock:
         existing = _clients.get(key)
+        if existing is not None:
+            _clients.move_to_end(key)
     if existing is not None:
         return existing
 
@@ -73,10 +80,18 @@ def client(endpoint: str, token: str | None) -> Client:
     made = run(make())  # the channel binds to the shared loop
     with _lock:
         kept = _clients.setdefault(key, made)
+        _clients.move_to_end(key)
+        same = [k for k in _clients if k[0] == endpoint]
+        evicted = [_clients.pop(k) for k in same[: max(len(same) - MAX_CLIENTS_PER_ENDPOINT, 0)]]
     if kept is not made:
         # Another thread made a client for this key first: close the spare
         # channel instead of leaking it.
-        run(made.close())
+        evicted.append(made)
+    for old in evicted:
+        try:
+            run(old.close())
+        except Exception:
+            pass  # a channel that does not close is dropped
     return kept
 
 

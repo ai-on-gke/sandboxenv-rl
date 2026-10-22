@@ -20,6 +20,6 @@ steps:
   - name: probe
     run: "true"
   - name: read_all
-    run: find / -xdev -type f -print0 2>/dev/null | xargs -0 -r cat > /dev/null
+    run: find '{{var "READ_ROOT" "/"}}' -xdev -type f -print0 2>/dev/null | xargs -0 -r cat -- 2>/dev/null | wc -c
     timeout: 30m
     reward: true

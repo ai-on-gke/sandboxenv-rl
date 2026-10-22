@@ -189,8 +189,9 @@ KO_DOCKER_REPO=gcr.io/PROJECT/repo benchmarking/swebench/run-in-cluster.sh swe-e
   -mode eval -images 500 -tasks-per-image 6 -width 500 -connections 8
 ```
 
-The script bakes the dataset and the exclusion list into the loader image,
-runs a Job next to ate-env-api, follows the full loader log (step failures
+The script bakes the dataset, the exclusion list and any `-trajectory` file
+you pass (with the files next to it, so a grader script travels with its
+trajectory) into the loader image, runs a Job next to ate-env-api, follows the full loader log (step failures
 included), copies the events file back to the current directory, prints the
 report and deletes the Job. `CONTEXT=<kubectl context>` selects the cluster;
 the same command with a different context and run id is how two clusters are
@@ -213,6 +214,25 @@ material, so the manifest can be image-only:
 benchmarking/swebench/make-dataset.py --images-file images.txt --out images.jsonl
 swebench-loader run -dataset images.jsonl -trajectory workload-read-all -images 200 -width 200 -run-id pull-baseline
 ```
+
+The workloads take their knobs from `run -set KEY=VALUE`, through the
+trajectories' `var` function, and each file states its defaults, which fit a
+SWE-bench image:
+
+| Workload | Knobs | Default | What it reads |
+|---|---|---|---|
+| `workload-file-read-one` | `READ_FILE` | `/testbed/lib/matplotlib/pyplot.py` | one file |
+| `workload-file-read` | `READ_ROOT`, `READ_FILES` | `/`, `200` | a sample of Python files |
+| `workload-compile` | `PYTHON`, `COMPILE_DIR` | `python3`, `/testbed` | every Python file under the directory, compiled with the image's own Python |
+| `workload-read-all` | `READ_ROOT` | `/` | every regular file, the worst case for lazy loading |
+
+The reading steps print the bytes read, which the reward step's output tail
+keeps in the events file. `-trajectory workload-file-read-one,workload-compile,workload-read-all`
+mixes them: each environment draws one, with `-seed` fixing the draw so every
+rep gives the same environment the same workload; the task event's `name` is
+the trajectory it replayed. In steps mode the first step's work runs after the
+create and every later step's after a wake, which is the boot-then-resume
+shape of the profiling scripts these workloads were ported from.
 
 `images.txt` holds one reference per line, a tag or `repo@sha256:...`; tags
 are resolved with `crane`. The instance id is the image name, the tag if one

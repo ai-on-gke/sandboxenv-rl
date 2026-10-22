@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Image-delivery workload: read a sample of files. The probe step comes first
+# Image-delivery workload: read a sample of files (READ_FILES of them, under
+# READ_ROOT; -set to change). The probe step comes first
 # so time to first instruction is the cold start alone (image pull, boot) and
 # the workload's own time lands on its own row. Needs no grading material in
 # the manifest: an image-only dataset is enough.
@@ -21,6 +22,6 @@ steps:
   - name: probe
     run: "true"
   - name: file_read
-    run: find / -xdev -type f -name '*.py' 2>/dev/null | head -n 200 | tr '\n' '\0' | xargs -0 -r cat > /dev/null
+    run: find '{{var "READ_ROOT" "/"}}' -xdev -type f -name '*.py' 2>/dev/null | head -n '{{var "READ_FILES" "200"}}' | tr '\n' '\0' | xargs -0 -r cat -- 2>/dev/null | wc -c
     timeout: 10m
     reward: true

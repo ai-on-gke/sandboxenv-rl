@@ -14,6 +14,10 @@ What this repository supports, and what that means.
 | [`integrations/`](../integrations) | Framework integrations: today [`integrations/nemo-gym`](../integrations/nemo-gym/README.md). |
 | [`proto/ateenv/v1alpha`](../proto/ateenv/v1alpha) | The `ateenv.v1alpha` API. |
 
+The packages under [`internal/`](../internal) that these binaries are built from are part of them:
+`internal/apiservice`, `internal/ate`, `internal/mcp`, `internal/portproxy` and `internal/tool` (the
+MCP tool adapter). Go does not let other modules import them, thus they are not an API of their own.
+
 For these paths, supported means:
 
 - Bug and security fixes land on `main`. There are no release branches.
@@ -33,9 +37,18 @@ incompatible ways until v1.0.
 the benchmark design. They are kept working with the rest of the repository and CI runs their
 tests, but their flags, file formats and reports can change at any time.
 
-## Not supported: `examples/`
+## Build, test and documentation files
 
-[`examples/`](../examples) is provided as is. Examples get no support, no compatibility promise and
-no security fixes, and they can break or be removed at any time. Do not depend on them; copy what
-you need. The Go examples are packages of the root module, thus CI compiles and tests them with
+[`hack/`](../hack) (license and format checks), [`internal/internaltest`](../internal/internaltest)
+(fakes of the Substrate control plane and router for tests), the [`Makefile`](../Makefile),
+[`buf.gen.yaml`](../buf.gen.yaml), [`.ko.yaml`](../.ko.yaml), `go.mod`, [`.github/`](../.github)
+(CI, Dependabot, code owners) and [`docs/`](.) are maintained with the code that they build, test or
+describe. They are not an API: they change whenever that code needs it.
+
+## Not supported: `examples/` and `internal/examples/`
+
+[`examples/`](../examples) and [`internal/examples/`](../internal/examples) (a program that walks
+through the `EnvironmentService` lifecycle) are provided as is. Examples get no support, no
+compatibility promise and no security fixes, and they can break or be removed at any time. Do not
+depend on them; copy what you need. The Go examples are packages of the root module, thus CI compiles and tests them with
 the rest of the module; that is not a support commitment.

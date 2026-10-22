@@ -10,6 +10,7 @@
 /internal/apiservice/           @tomergee
 /internal/portproxy/            @tomergee
 /internal/mcp/                  @tomergee
+/internal/tool/                 @tomergee
 /internal/ate/                  @tomergee
 /proto/                         @tomergee
 /cmd/ate-env/manifest.go        @tomergee
@@ -26,5 +27,16 @@
 /cmd/benchmarking/              @vicentefb @tomergee
 /internal/benchmarking/         @vicentefb @tomergee
 
+# Build, test and documentation files.
+/hack/                          @tomergee
+/internal/internaltest/         @tomergee
+/Makefile                       @tomergee
+/buf.gen.yaml                   @tomergee
+/.ko.yaml                       @tomergee
+/go.mod                         @tomergee
+/go.sum                         @tomergee
+/docs/                          @tomergee
+
 # Not supported: no owners.
 /examples/
+/internal/examples/

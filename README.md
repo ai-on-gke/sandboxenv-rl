@@ -86,7 +86,8 @@ what each phase cost.
 ## Support
 
 The components, the clients, the integrations and the `ateenv.v1alpha` API are supported;
-`examples/` is not. [docs/support.md](docs/support.md) says what supported means for each path.
+`examples/` and `internal/examples/` are not. [docs/support.md](docs/support.md) says what
+supported means for each path.
 
 ## Get started
 

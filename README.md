@@ -380,16 +380,18 @@ Available Commands:
   template      Generate Substrate ActorTemplate manifest
 
 Flags:
-      --api-image string      digest-pinned ate-env-api image for the API service (required: this ate-env was built from source; release binaries default to the image published with the release, see docs/release.md)
-      --api-port int32        port the ate-env-api service listens on (default 7777)
-      --api-replicas int32    number of API service replicas (default 1)
-      --ateom-image string    alias for --worker-image, kept from before Substrate renamed ateom to ateworker
-  -h, --help                  help for manifest
-      --namespace string      Kubernetes namespace to deploy into (default "ate-env")
-      --replicas int32        number of pre-warmed worker pods (default 5)
-      --template string       ActorTemplate name (default "default-template")
-      --worker-image string   digest-pinned worker image for the worker pool, e.g. ateworker-gvisor built from the Substrate repo
-      --workerpool string     WorkerPool name (defaults to <template>-workerpool)
+      --api-allowed-hosts strings   extra host names that HTTP clients may use to reach ate-env-api, e.g. an internal load balancer name (a leading *. allows the names below it); the Service's in-cluster names, in the cluster's own DNS domain, IP addresses and localhost are always allowed
+      --api-image string            digest-pinned ate-env-api image for the API service (required: this ate-env was built from source; release binaries default to the image published with the release, see docs/release.md)
+      --api-port int32              port the ate-env-api service listens on (default 7777)
+      --api-replicas int32          number of API service replicas (default 1)
+      --ateom-image string          alias for --worker-image, kept from before Substrate renamed ateom to ateworker
+      --auth-token-secret string    Kubernetes Secret name (with key 'token') to mount into ate-env-api and require as a caller bearer token
+  -h, --help                        help for manifest
+      --namespace string            Kubernetes namespace to deploy into (default "ate-env")
+      --replicas int32              number of pre-warmed worker pods (default 5)
+      --template string             ActorTemplate name (default "default-template")
+      --worker-image string         digest-pinned worker image for the worker pool, e.g. ateworker-gvisor built from the Substrate repo
+      --workerpool string           WorkerPool name (defaults to <template>-workerpool)
 
 Use "ate-env manifest [command] --help" for more information about a command.
 ```
@@ -483,12 +485,29 @@ port-forward`. A page served by the forwarded daemon itself is same-origin and p
 behind one listener share that origin, thus a page from one daemon can call another.
 `--port-proxy-trusted-origins` adds origins, such as a UI on its own host. The header form needs no
 check: a browser sends custom headers to another origin only after a CORS preflight, which the API
-never approves. DNS rebinding, where a page on an attacker's name resolves to the forwarded
-listener, is not blocked yet; it needs a check of the `Host` header across the whole listener, the
-MCP endpoint included.
+never approves.
+
+**DNS rebinding.** A page on an attacker's name can make that name resolve to the listener, for
+example to a `kubectl port-forward` on 127.0.0.1, and then read the answers as its own origin. The
+listener refuses that: a request whose `Host` is not an IP address, `localhost`, a name under
+`.localhost`, a name of the API Service or a name in `--allowed-hosts` gets 403. The check covers
+each HTTP route, the MCP endpoint and both forms of the port proxy, over HTTP/1.x and HTTP/2 alike,
+thus also behind a front proxy that speaks h2c to the listener. Only gRPC is not checked: HTTP/2
+requests with an `application/grpc` content type, which gRPC clients send to many different
+authorities. The check is a browser defense, not authentication: a client that sets its own `Host`
+passes, and the bearer token is the control for such callers, gRPC included.
+
+The API Service's names are `ate-env-api`, `ate-env-api.<namespace>`, `ate-env-api.<namespace>.svc`
+and `ate-env-api.<namespace>.svc.<cluster domain>`. `ate-env-api` derives them itself from
+`--service-name`, with the namespace and the cluster's own DNS domain from the pod's
+`/etc/resolv.conf` (else the namespace from `POD_NAMESPACE`), thus an upgrade that changes only the
+image keeps them. Add other names, such as an internal load balancer, with `--api-allowed-hosts` on
+`ate-env manifest`.
 
 | Flag | Default | Effect |
 |---|---|---|
+| `--allowed-hosts` | none | Comma-separated host names that HTTP callers may send in `Host`, next to IP addresses, `localhost`, names under `.localhost` and the names of `--service-name`, which are always allowed. A leading `*.` allows the names below it. Needed for a name such as an internal load balancer: `ate-env manifest --api-allowed-hosts` renders it. |
+| `--service-name` | `ate-env-api` | The Kubernetes Service in front of `ate-env-api`; its in-cluster names are allowed hosts. Empty allows none of them. |
 | `--atenet-connect` | `atenet-router.ate-system.svc.cluster.local:8081` | The router's CONNECT listener. An empty value turns the forwarding off. |
 | `--port-proxy-trusted-origins` | none | Comma-separated browser origins allowed to use the path form. |
 | `--port-proxy-response-header-timeout` | `0`, no limit | Bound on the wait for a daemon's response headers. Without it, the caller's deadline ends the wait. |

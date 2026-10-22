@@ -354,6 +354,7 @@ Available Commands:
   delete      Delete an environment
   help        Help about any command
   manifest    Generate Kubernetes manifests to deploy the system
+  server-info Show the ate-env-api server's version and features
   suspend     Suspend an environment
 
 Flags:
@@ -409,6 +410,7 @@ Manages the lifecycle of isolated execution environments (defined in [`proto/ate
 | `GetEnvironment` | Retrieves environment details and status |
 | `SuspendEnvironment` | Suspends and checkpoints the environment to snapshot storage |
 | `DeleteEnvironment` | Deletes the environment permanently |
+| `GetServerInfo` | Reports the server implementation (`sandboxenv-rl`), its version, the Substrate version it was built against, and its optional features (`rootfs_image`, `pty`, and `port_proxy` or `bearer_auth` when enabled); answered by `ate-env-api` itself |
 
 ### ProcessService
 

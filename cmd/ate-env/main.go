@@ -296,6 +296,46 @@ func newDeleteCommand() *cobra.Command {
 	return cmd
 }
 
+func newServerInfoCommand() *cobra.Command {
+	var (
+		endpoint string
+		auth     authFlags
+	)
+	cmd := &cobra.Command{
+		Use:   "server-info",
+		Short: "Show the ate-env-api server's version and features",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			token, err := auth.resolve(cmd)
+			if err != nil {
+				return err
+			}
+			client, err := env.NewClient(env.ClientOptions{
+				Endpoint:  endpoint,
+				AuthToken: token,
+			})
+			if err != nil {
+				return err
+			}
+			defer client.Close()
+
+			info, err := client.ServerInfo(cmd.Context())
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "server: %s\n", info.GetServer())
+			fmt.Fprintf(out, "version: %s\n", info.GetVersion())
+			fmt.Fprintf(out, "substrate_version: %s\n", info.GetSubstrateVersion())
+			fmt.Fprintf(out, "features: %s\n", strings.Join(info.GetFeatures(), ", "))
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&endpoint, "api", envOr("SUBSTRATE_ENV_API", "127.0.0.1:7777"), "address of the ate-env-api service (e.g. localhost:7777)")
+	auth.register(cmd, false)
+	return cmd
+}
+
 func newRootCommand(args []string) *cobra.Command {
 	root := &cobra.Command{
 		Use:   "ate-env",
@@ -315,6 +355,7 @@ Common environment commands:
 	root.AddCommand(newCreateCommand())
 	root.AddCommand(newSuspendCommand())
 	root.AddCommand(newDeleteCommand())
+	root.AddCommand(newServerInfoCommand())
 
 	if len(args) > 0 {
 		cmdName := args[0]

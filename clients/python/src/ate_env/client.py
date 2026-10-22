@@ -24,7 +24,12 @@ import grpc.aio
 from ._gen.ateenv.v1alpha import env_pb2, env_pb2_grpc, guest_pb2_grpc
 from .env import Env
 from .errors import map_rpc_error
-from .types import EnvironmentInfo, _environment_info_from_pb
+from .types import (
+    EnvironmentInfo,
+    ServerInfo,
+    _environment_info_from_pb,
+    _server_info_from_pb,
+)
 
 __all__ = ["Client", "DEFAULT_ATESPACE"]
 
@@ -213,6 +218,20 @@ class Client:
             await self._environments.DeleteEnvironment(req, metadata=self._auth_metadata())
         except grpc.RpcError as e:
             raise map_rpc_error(e) from e
+
+    async def server_info(self) -> ServerInfo:
+        """Return the server's implementation, version and optional features.
+
+        A server that predates GetServerInfo raises RpcError with code
+        UNIMPLEMENTED.
+        """
+        try:
+            resp = await self._environments.GetServerInfo(
+                env_pb2.GetServerInfoRequest(), metadata=self._auth_metadata()
+            )
+        except grpc.RpcError as e:
+            raise map_rpc_error(e) from e
+        return _server_info_from_pb(resp)
 
     def env(self, id: str, *, atespace: str = DEFAULT_ATESPACE) -> Env:
         """Return a handle to an environment without checking that it exists."""

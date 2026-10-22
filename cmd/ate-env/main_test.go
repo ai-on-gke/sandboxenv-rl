@@ -16,12 +16,16 @@ package main
 
 import (
 	"bytes"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/agent-substrate/env/internal/apiservice"
+	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
 )
 
 func TestCommandRouting(t *testing.T) {
@@ -176,7 +180,7 @@ func TestHelpOutput(t *testing.T) {
 			t.Fatalf("Execute failed: %v", err)
 		}
 		out := buf.String()
-		for _, want := range []string{"create", "manifest", "suspend", "delete", "Common environment commands", "ate-env <id> read <path>"} {
+		for _, want := range []string{"create", "manifest", "suspend", "delete", "server-info", "Common environment commands", "ate-env <id> read <path>"} {
 			if !bytes.Contains(buf.Bytes(), []byte(want)) {
 				t.Errorf("help output missing %q:\n%s", want, out)
 			}
@@ -292,5 +296,37 @@ func TestAuthFlagsResolve(t *testing.T) {
 	root.SetOut(&bytes.Buffer{})
 	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "cannot be used together") {
 		t.Fatalf("guest command with both flags: %v, want the exclusion error", err)
+	}
+}
+
+func TestServerInfoCommand(t *testing.T) {
+	svc := apiservice.New(nil, "", "")
+	svc.Info = apiservice.ServerInfo{Version: "v9.9.9", PortProxy: true}
+	grpcServer := grpc.NewServer()
+	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, svc)
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go grpcServer.Serve(lis)
+	t.Cleanup(grpcServer.Stop)
+
+	args := []string{"server-info", "--api", lis.Addr().String()}
+	root := newRootCommand(args)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetArgs(args)
+	if err := root.Execute(); err != nil {
+		t.Fatalf("server-info: %v", err)
+	}
+	for _, want := range []string{
+		"server: sandboxenv-rl\n",
+		"version: v9.9.9\n",
+		"substrate_version: ",
+		"features: rootfs_image, pty, port_proxy\n",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("server-info output missing %q:\n%s", want, out.String())
+		}
 	}
 }

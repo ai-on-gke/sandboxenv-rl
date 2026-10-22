@@ -83,6 +83,11 @@ compare image pull, image streaming and other loaders on the same images. The re
 what each phase cost.
 [`internal/benchmarking/DESIGN.md`](internal/benchmarking/DESIGN.md) specifies the benchmark system.
 
+## Support
+
+The components, the clients, the integrations and the `ateenv.v1alpha` API are supported;
+`examples/` is not. [docs/support.md](docs/support.md) says what supported means for each path.
+
 ## Get started
 
 You need a cluster with Agent Substrate at or after

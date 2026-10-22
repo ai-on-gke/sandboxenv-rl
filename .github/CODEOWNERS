@@ -1,0 +1,30 @@
+# Code owners, by support tier (docs/support.md). The last matching pattern wins.
+
+# Default.
+*                               @tomergee
+
+# Security-sensitive: the API listener, the port proxy, MCP, the Substrate
+# client, the wire API, the deployment manifest and the guest (PID 1 in each
+# actor).
+/cmd/ate-env-api/               @tomergee
+/internal/apiservice/           @tomergee
+/internal/portproxy/            @tomergee
+/internal/mcp/                  @tomergee
+/internal/ate/                  @tomergee
+/proto/                         @tomergee
+/cmd/ate-env/manifest.go        @tomergee
+/cmd/ate-env-guest/             @tomergee
+/guest/                         @tomergee
+/.github/                       @tomergee
+
+# Clients and integrations.
+/clients/python/                @sunnylovestiramisu @tomergee
+/integrations/nemo-gym/         @tomergee
+
+# Maintained tooling.
+/benchmarking/                  @vicentefb @tomergee
+/cmd/benchmarking/              @vicentefb @tomergee
+/internal/benchmarking/         @vicentefb @tomergee
+
+# Not supported: no owners.
+/examples/

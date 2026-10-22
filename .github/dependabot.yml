@@ -1,9 +1,12 @@
 # Dependabot: weekly, grouped, one PR per ecosystem. The Substrate module is
 # kept out of the Go group on purpose: its bumps change the API the manifests
 # and the client are generated from and go through the bump procedure, not
-# through an automated PR. integrations/nemo-gym is not listed: its
-# ate-env-client dependency is a path source Dependabot cannot resolve, and
-# nothing in it is pinned.
+# through an automated PR. The entries cover the supported components
+# (docs/support.md): the Go module, the Python client and the GitHub Actions.
+# integrations/nemo-gym is supported but not listed: its ate-env-client
+# dependency is a path source Dependabot cannot resolve, nothing in it is
+# pinned, and its only other dependency, grpcio, is also one of the Python
+# client's. examples/ is not supported and has no entry.
 version: 2
 updates:
   - package-ecosystem: gomod

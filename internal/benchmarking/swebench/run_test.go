@@ -198,6 +198,7 @@ func TestEvalCreatesReplaysDeletes(t *testing.T) {
 	cfg := baseConfig(t, f, &out)
 	cfg.Mode = ModeEval
 	cfg.TasksPerImage = 2
+	cfg.Labels = map[string]string{"cluster": "a", "mode": "custom"}
 
 	sum, err := Run(context.Background(), cfg)
 	if err != nil {
@@ -227,6 +228,15 @@ func TestEvalCreatesReplaysDeletes(t *testing.T) {
 	rep := Build(parseEvents(t, out.String()))
 	if rep.Tasks != 6 || rep.RewardRate != 1 {
 		t.Fatalf("report %+v", rep)
+	}
+	// The run event carries the loader's own labels under the operator's.
+	for k, want := range map[string]string{"cluster": "a", "mode": "custom", "width": "2", "images": "3", "tasks_per_image": "2"} {
+		if rep.Labels[k] != want {
+			t.Errorf("label %s = %q, want %q (labels %v)", k, rep.Labels[k], want, rep.Labels)
+		}
+	}
+	if rep.Labels["trajectory"] == "" {
+		t.Errorf("no trajectory label: %v", rep.Labels)
 	}
 	for _, ev := range []string{EventCreate, EventTTFI, EventTask, EventDelete, EventRun} {
 		if !hasStat(rep, ev) {

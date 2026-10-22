@@ -148,7 +148,7 @@ func TestWriteComparison(t *testing.T) {
 		{RunID: "a", Event: EventWake, Step: 1, DurMS: 40, OK: true},
 		{RunID: "a", Event: EventBarrier, Step: 1, DurMS: 700, OK: true, Count: 3},
 		{RunID: "a", Event: EventPark, Name: "suspend", Step: 1, DurMS: 100, OK: true, Count: 1},
-		{RunID: "a", Event: EventRun, Name: "steps", DurMS: 2000, OK: true, Count: 1},
+		{RunID: "a", Event: EventRun, Name: "steps", DurMS: 2000, OK: true, Count: 1, Labels: map[string]string{"cluster": "east"}},
 	})
 	b := Build([]Event{
 		{RunID: "b", Event: EventCreate, DurMS: 50, OK: true},
@@ -167,6 +167,9 @@ func TestWriteComparison(t *testing.T) {
 	}
 	if strings.Count(text, "cells:") != 1 || !strings.HasPrefix(text, "cells:") {
 		t.Errorf("the legend must appear once, above the table:\n%s", text)
+	}
+	if flat := strings.Join(strings.Fields(text), " "); !strings.Contains(flat, "cluster east -") {
+		t.Errorf("label row: want \"cluster east -\" in:\n%s", text)
 	}
 	// A run without the event, or without the step, shows a dash in its column.
 	for _, label := range []string{"ttfi", "step 1"} {
@@ -370,15 +373,71 @@ func TestJoinRestores(t *testing.T) {
 	if n < 2 || b.Wakes.Phases[n-1].Phase != "ateom_restore" || b.Wakes.Phases[n-2].Phase != "total" {
 		t.Fatalf("unknown phase must follow the known ones: %+v", b.Wakes.Phases)
 	}
+	// Cold is a restore that unpacked image layers: a's first start only.
+	if c := b.First.Cold; c == nil || c.Count != 1 || c.MaxMS != 10100 {
+		t.Fatalf("first cold: %+v", c)
+	}
+	if wm := b.First.Warm; wm == nil || wm.Count != 2 || wm.MaxMS != 46000 {
+		t.Fatalf("first warm: %+v", wm)
+	}
+	if b.Wakes.Cold != nil || b.Wakes.Warm == nil || b.Wakes.Warm.Count != 3 {
+		t.Fatalf("wake cold/warm: %+v / %+v", b.Wakes.Cold, b.Wakes.Warm)
+	}
 
 	rep := Build(events)
 	rep.Restores = b
 	var text bytes.Buffer
 	rep.WriteText(&text)
 	flat := strings.Join(strings.Fields(text.String()), " ")
-	for _, want := range []string{"1 records before or after this run", "1 records for actors not in this run", "1 records inside no ttfi or wake window", "first failed 1", "wake failed_events 1", "wake total 4"} {
+	for _, want := range []string{"1 records before or after this run", "1 records for actors not in this run", "1 records inside no ttfi or wake window", "first failed 1", "wake failed_events 1", "wake total 4", "first cold (image unpacked) 1 10100", "first warm (image cached) 2"} {
 		if !strings.Contains(flat, want) {
 			t.Errorf("text report lacks %q:\n%s", want, text.String())
 		}
+	}
+}
+
+func TestBuildPoolsStepsAcrossRuns(t *testing.T) {
+	// Two reps of one arm merged: per-step figures become medians, counts sum.
+	rep := Build([]Event{
+		{RunID: "r1", Event: EventTask, Step: 1, DurMS: 500, OK: true, Reward: intp(1)},
+		{RunID: "r1", Event: EventBarrier, Step: 1, DurMS: 600, OK: true, Count: 2},
+		{RunID: "r1", Event: EventPark, Name: "suspend", Step: 1, DurMS: 100, OK: true, Count: 2},
+		{RunID: "r1", Event: EventRun, Name: "steps", DurMS: 1000, OK: true, Count: 1, Labels: map[string]string{"arm": "pull"}},
+		{RunID: "r2", Event: EventTask, Step: 1, DurMS: 400, OK: true, Reward: intp(1)},
+		{RunID: "r2", Event: EventBarrier, Step: 1, DurMS: 800, OK: true, Count: 4},
+		{RunID: "r2", Event: EventPark, Name: "suspend", Step: 1, DurMS: 300, OK: true, Count: 4},
+		{RunID: "r2", Event: EventRun, Name: "steps", DurMS: 1200, OK: true, Count: 1, Labels: map[string]string{"arm": "other"}},
+	})
+	if len(rep.Steps) != 1 {
+		t.Fatalf("steps: %+v", rep.Steps)
+	}
+	s := rep.Steps[0]
+	if s.Tasks != 2 || s.BarrierMS != 600 || s.ParkMS != 100 || s.Live != 2 {
+		t.Fatalf("pooled step: %+v (want tasks 2, barrier 600, park 100, live 2)", s)
+	}
+	if rep.Labels["arm"] != "pull" {
+		t.Fatalf("labels come from the first run event: %v", rep.Labels)
+	}
+}
+
+func TestSlowest(t *testing.T) {
+	events := []Event{
+		{Event: EventTTFI, Env: "e1", Instance: "i1", DurMS: 10, OK: true},
+		{Event: EventTTFI, Env: "e2", Instance: "i2", DurMS: 30, OK: true, Attempts: 2},
+		{Event: EventTTFI, Env: "e3", Instance: "i3", DurMS: 20, OK: true},
+		{Event: EventTTFI, Env: "e4", Instance: "i4", DurMS: 99, OK: false},
+		{Event: EventWake, Env: "e1", Step: 2, DurMS: 5, OK: true},
+		{Event: EventWake, Env: "e2", Step: 2, DurMS: 7, OK: true},
+	}
+	got := Slowest(events, 2)
+	if len(got) != 4 || got[0].Env != "e2" || got[0].Attempts != 2 || got[1].Env != "e3" || got[2].Event != EventWake || got[2].Env != "e2" || got[3].Env != "e1" {
+		t.Fatalf("slowest: %+v", got)
+	}
+	rep := Build(events)
+	rep.Slowest = got
+	var text bytes.Buffer
+	rep.WriteText(&text)
+	if flat := strings.Join(strings.Fields(text.String()), " "); !strings.Contains(flat, "slowest first commands and wakes: event env instance step ms attempts ttfi e2 i2 0 30 2") {
+		t.Fatalf("slowest table:\n%s", text.String())
 	}
 }

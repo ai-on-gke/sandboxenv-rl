@@ -21,6 +21,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -84,6 +85,32 @@ type Config struct {
 	WakeBackoff time.Duration
 	// Keep leaves the environments in place when the run ends.
 	Keep bool
+	// Labels are recorded on the run event over the loader's own labels
+	// (mode, width, images, trajectory, the shape flags); a clash goes to
+	// Labels. The Substrate commit, the cluster and the arm belong here.
+	Labels map[string]string
+}
+
+// labels describes the run for its run event.
+func (c *Config) labels() map[string]string {
+	l := map[string]string{
+		"mode":       string(c.Mode),
+		"width":      strconv.Itoa(c.Width),
+		"images":     strconv.Itoa(len(c.Instances)),
+		"trajectory": c.Trajectory.Name,
+	}
+	switch c.Mode {
+	case ModeEval:
+		l["tasks_per_image"] = strconv.Itoa(c.TasksPerImage)
+	case ModeSteps:
+		l["rollouts"] = strconv.Itoa(c.Rollouts)
+		l["steps"] = strconv.Itoa(c.Steps)
+		l["park"] = string(c.Park)
+	}
+	for k, v := range c.Labels {
+		l[k] = v
+	}
+	return l
 }
 
 // Summary is what a run produced, for the exit status and the log.
@@ -257,7 +284,7 @@ func Run(ctx context.Context, cfg Config) (*Summary, error) {
 	dur := time.Since(start)
 	s := &Summary{Tasks: r.tasks, Failed: r.failed, Rewarded: r.rewarded, Duration: dur}
 	r.rec.Record(Event{RunID: cfg.RunID, Event: EventRun, Name: string(cfg.Mode), DurMS: ms(dur),
-		OK: s.Failed == 0, Count: s.Tasks})
+		OK: s.Failed == 0, Count: s.Tasks, Labels: cfg.labels()})
 	return s, ctx.Err()
 }
 

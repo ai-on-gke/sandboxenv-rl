@@ -61,6 +61,17 @@ with a column per run: p50/p95 per event, and per step the live environments,
 tasks, failures, barrier, park and wake p50/p95. `-json` then writes the
 summaries as an array. Files go before the flags.
 
+Every run event carries labels: the loader's own (mode, width, images,
+trajectory, dataset, the shape flags) plus any `run -label KEY=VALUE`, which
+is where the Substrate commit, the cluster and the arm go. The report prints
+them under its header, and the comparison shows one row per label key, so a
+column's provenance is in the table. `report -arm pull=p1.jsonl,p2.jsonl
+-arm stream=s1.jsonl,s2.jsonl` gives one column per arm with the percentiles
+computed over the merged raw events of its files, never over per-run
+percentiles; per-step barrier, park and live become the median across the
+reps. `report RUN.jsonl -top 10` lists the ten slowest first commands and the
+ten slowest wakes by environment, for finding the straggler.
+
 ## How many actors, and on which clusters
 
 Every environment the loader creates is one Substrate actor. Three flags
@@ -241,9 +252,12 @@ each record with the `ttfi` or `wake` event of that environment whose window
 time: a record inside a `ttfi` window is a cold start, one inside a `wake`
 window is a wake. The table gives p50/p95/max per phase plus an `outside`
 row, the event's span minus atelet's total, which is ateapi, the scheduler,
-the router and the command itself. Failed restores are counted and left out
-of the percentiles; restores whose event failed are counted and left out of
-`outside`. Records before the run's first event or after its last (a rerun
+the router and the command itself, and `cold` and `warm` rows that split the
+events' spans by whether atelet unpacked image layers for the restore: cold
+means the actor landed on a node without the image, warm means the node had
+it. For wakes that is the cross-node versus same-node resume. Failed restores
+are counted and left out of the percentiles; restores whose event failed are
+counted and left out of `outside`, `cold` and `warm`. Records before the run's first event or after its last (a rerun
 with the same run id), for actors the run never created, or inside no window
 (a restore after an eviction or a failed suspend) are counted, not paired.
 The records come from the kubelet's container logs, which rotate, so harvest
@@ -274,6 +288,8 @@ benchmark of its own.
 
 ## Record with every run
 
-Substrate and env commits, cluster shape (machine type, node count, sandbox
-class), bucket region, the dataset manifest's digest, and the loader flags.
-The report alone is not reproducible without them.
+Substrate and env commits, cluster shape (machine type, node count, disk,
+sandbox class), bucket region, the dataset manifest's digest, and the loader
+flags. Pass them as `run -label` values so they travel with the events file;
+the loader records its own flags itself. The report alone is not reproducible
+without them.

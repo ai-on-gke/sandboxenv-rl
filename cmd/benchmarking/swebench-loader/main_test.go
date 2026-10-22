@@ -90,3 +90,34 @@ func TestReportCmdRejectsFilesAfterFlags(t *testing.T) {
 		t.Fatalf("err = %v, want the files-before-flags error naming b.jsonl", err)
 	}
 }
+
+func TestLabelFlags(t *testing.T) {
+	l := labelFlags{}
+	for _, v := range []string{"cluster=east", "note=a=b", "empty="} {
+		if err := l.Set(v); err != nil {
+			t.Fatalf("Set(%q): %v", v, err)
+		}
+	}
+	if l["cluster"] != "east" || l["note"] != "a=b" || l["empty"] != "" {
+		t.Fatalf("labels = %v", l)
+	}
+	for _, bad := range []string{"cluster=west", "novalue", "=x"} {
+		if err := l.Set(bad); err == nil {
+			t.Errorf("Set(%q) must fail", bad)
+		}
+	}
+	if got := l.String(); got != "cluster=east,empty=,note=a=b" {
+		t.Fatalf("String() = %q", got)
+	}
+}
+
+func TestReportCmdArmsRejectPositionalFiles(t *testing.T) {
+	err := reportCmd([]string{"a.jsonl", "-arm", "pull=p.jsonl"})
+	if err == nil || !strings.Contains(err.Error(), "inside an -arm value") {
+		t.Fatalf("err = %v, want the arm-and-files error", err)
+	}
+	err = reportCmd([]string{"-arm", "pull=p.jsonl", "-top", "3"})
+	if err == nil || !strings.Contains(err.Error(), "not -arm") {
+		t.Fatalf("err = %v, want the one-file flags error", err)
+	}
+}

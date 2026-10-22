@@ -89,6 +89,40 @@ type Report struct {
 	// Restores is atelet's restore phase breakdown joined to the run's
 	// environments (report -restore-log); nil without it.
 	Restores *RestoreBreakdown `json:"restores,omitempty"`
+	// Labels are the run event's labels: the loader's own and the operator's.
+	Labels map[string]string `json:"labels,omitempty"`
+	// Slowest lists the slowest first commands and wakes (report -top N).
+	Slowest []SlowEvent `json:"slowest,omitempty"`
+}
+
+// SlowEvent is one of the slowest first commands or wakes of a run.
+type SlowEvent struct {
+	Event    string  `json:"event"`
+	Env      string  `json:"env"`
+	Instance string  `json:"instance,omitempty"`
+	Step     int     `json:"step,omitempty"`
+	DurMS    float64 `json:"dur_ms"`
+	Attempts int     `json:"attempts,omitempty"`
+}
+
+// Slowest returns the n slowest successful ttfi events, then the n slowest
+// successful wake events, longest first.
+func Slowest(events []Event, n int) []SlowEvent {
+	var out []SlowEvent
+	for _, kind := range []string{EventTTFI, EventWake} {
+		var picked []SlowEvent
+		for _, e := range events {
+			if e.Event == kind && e.OK {
+				picked = append(picked, SlowEvent{Event: e.Event, Env: e.Env, Instance: e.Instance, Step: e.Step, DurMS: e.DurMS, Attempts: e.Attempts})
+			}
+		}
+		sort.SliceStable(picked, func(i, j int) bool { return picked[i].DurMS > picked[j].DurMS })
+		if len(picked) > n {
+			picked = picked[:n]
+		}
+		out = append(out, picked...)
+	}
+	return out
 }
 
 // ErrorCount is one error string and how often it occurred.
@@ -139,6 +173,12 @@ func Build(events []Event) *Report {
 	var order []key
 	steps := map[int]*StepStat{}
 	wakes := map[int][]float64{}
+	// Per step, one value per run: a report built over the merged events of
+	// several runs (report -arm) takes the median, which is the value itself
+	// for one run.
+	barriers := map[int][]float64{}
+	parks := map[int][]float64{}
+	lives := map[int][]float64{}
 	errs := map[string]int{}
 
 	for _, e := range events {
@@ -173,6 +213,9 @@ func Build(events []Event) *Report {
 		case EventRun:
 			rep.Mode = e.Name
 			rep.RunMS = e.DurMS
+			if rep.Labels == nil && len(e.Labels) > 0 {
+				rep.Labels = e.Labels
+			}
 		case EventTask:
 			rep.Tasks++
 			if !e.OK {
@@ -192,10 +235,12 @@ func Build(events []Event) *Report {
 				}
 			}
 		case EventBarrier:
-			stepStat(steps, e.Step).BarrierMS = e.DurMS
-			stepStat(steps, e.Step).Live = e.Count
+			stepStat(steps, e.Step)
+			barriers[e.Step] = append(barriers[e.Step], e.DurMS)
+			lives[e.Step] = append(lives[e.Step], float64(e.Count))
 		case EventPark:
-			stepStat(steps, e.Step).ParkMS = e.DurMS
+			stepStat(steps, e.Step)
+			parks[e.Step] = append(parks[e.Step], e.DurMS)
 		case EventWake:
 			if e.OK {
 				wakes[e.Step] = append(wakes[e.Step], e.DurMS)
@@ -211,11 +256,18 @@ func Build(events []Event) *Report {
 		rep.Stats = append(rep.Stats, Stat{Event: k.event, Name: k.name, Count: len(d) + failed[k], Failed: failed[k],
 			P50MS: percentile(d, 0.50), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1), Retried: retried[k]})
 	}
+	median := func(d []float64) float64 {
+		sort.Float64s(d)
+		return percentile(d, 0.5)
+	}
 	for step, s := range steps {
 		w := wakes[step]
 		sort.Float64s(w)
 		s.WakeP50MS = percentile(w, 0.5)
 		s.WakeP95MS = percentile(w, 0.95)
+		s.BarrierMS = median(barriers[step])
+		s.ParkMS = median(parks[step])
+		s.Live = int(median(lives[step]))
 		rep.Steps = append(rep.Steps, *s)
 	}
 	sort.Slice(rep.Steps, func(i, j int) bool { return rep.Steps[i].Step < rep.Steps[j].Step })
@@ -297,8 +349,12 @@ func percentile(sorted []float64, p float64) float64 {
 
 // WriteText prints the report as tables.
 func (rep *Report) WriteText(w io.Writer) {
-	fmt.Fprintf(w, "run %s mode=%s tasks=%d failed=%d rewarded=%d reward_rate=%.3f run=%.1fs\n\n",
+	fmt.Fprintf(w, "run %s mode=%s tasks=%d failed=%d rewarded=%d reward_rate=%.3f run=%.1fs\n",
 		rep.RunID, rep.Mode, rep.Tasks, rep.Failed, rep.Rewarded, rep.RewardRate, rep.RunMS/1000)
+	if len(rep.Labels) > 0 {
+		fmt.Fprintf(w, "labels: %s\n", labelLine(rep.Labels))
+	}
+	fmt.Fprintln(w)
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "event\tname\tcount\tfailed\tretried\tp50_ms\tp95_ms\tmax_ms")
 	for _, s := range rep.Stats {
@@ -354,8 +410,10 @@ func (rep *Report) WriteText(w io.Writer) {
 			for _, p := range g.Phases {
 				fmt.Fprintf(tw, "%s\t%s\t%d\t%.0f\t%.0f\t%.0f\n", label, p.Phase, p.Count, p.P50MS, p.P95MS, p.MaxMS)
 			}
-			if p := g.Outside; p != nil {
-				fmt.Fprintf(tw, "%s\t%s\t%d\t%.0f\t%.0f\t%.0f\n", label, p.Phase, p.Count, p.P50MS, p.P95MS, p.MaxMS)
+			for _, p := range []*PhaseStat{g.Outside, g.Cold, g.Warm} {
+				if p != nil {
+					fmt.Fprintf(tw, "%s\t%s\t%d\t%.0f\t%.0f\t%.0f\n", label, p.Phase, p.Count, p.P50MS, p.P95MS, p.MaxMS)
+				}
 			}
 			if g.Failed > 0 {
 				fmt.Fprintf(tw, "%s\tfailed\t%d\t\t\t\n", label, g.Failed)
@@ -366,6 +424,16 @@ func (rep *Report) WriteText(w io.Writer) {
 		}
 		group("first", b.First)
 		group("wake", b.Wakes)
+		tw.Flush()
+	}
+	if len(rep.Slowest) > 0 {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "slowest first commands and wakes:")
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "event\tenv\tinstance\tstep\tms\tattempts")
+		for _, e := range rep.Slowest {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%.0f\t%d\n", e.Event, e.Env, e.Instance, e.Step, e.DurMS, e.Attempts)
+		}
 		tw.Flush()
 	}
 	if len(rep.Unresolved) > 0 {
@@ -415,6 +483,14 @@ func WriteComparison(w io.Writer, reps []*Report, names []string) {
 	row("failed", func(r *Report) string { return fmt.Sprintf("%d", r.Failed) })
 	row("reward_rate", func(r *Report) string { return fmt.Sprintf("%.3f", r.RewardRate) })
 	row("run_s", func(r *Report) string { return fmt.Sprintf("%.1f", r.RunMS/1000) })
+	for _, k := range labelKeys(reps) {
+		row(k, func(r *Report) string {
+			if v, ok := r.Labels[k]; ok {
+				return v
+			}
+			return "-"
+		})
+	}
 
 	type key struct{ event, name string }
 	var order []key
@@ -806,6 +882,11 @@ type RestoreGroup struct {
 	// Outside is the event's span minus atelet's total: ateapi, the
 	// scheduler, the router and the command itself. Nil when nothing paired.
 	Outside *PhaseStat `json:"outside,omitempty"`
+	// Cold and Warm split the paired events' spans by whether atelet unpacked
+	// image layers for the restore: cold means the node did not have the
+	// image, warm means it did. Nil when the kind did not occur.
+	Cold *PhaseStat `json:"cold,omitempty"`
+	Warm *PhaseStat `json:"warm,omitempty"`
 }
 
 // RestoreBreakdown is atelet's restore records joined to a run's events.
@@ -849,6 +930,7 @@ func JoinRestores(events []Event, timings map[string][]RestoreTiming) *RestoreBr
 	}
 	var firstRecs, wakeRecs []RestoreTiming
 	var firstOutside, wakeOutside []float64
+	var firstCold, firstWarm, wakeCold, wakeWarm []float64
 	for actor, recs := range timings {
 		for _, rt := range recs {
 			if spanStart.IsZero() || rt.Time.Before(spanStart.Add(-pairSlack)) || rt.Time.After(spanEnd.Add(pairSlack)) {
@@ -874,9 +956,9 @@ func JoinRestores(events []Event, timings map[string][]RestoreTiming) *RestoreBr
 				b.Unpaired++
 				continue
 			}
-			g, recsOut, outside := &b.Wakes, &wakeRecs, &wakeOutside
+			g, recsOut, outside, cold, warm := &b.Wakes, &wakeRecs, &wakeOutside, &wakeCold, &wakeWarm
 			if ev.Event == EventTTFI {
-				g, recsOut, outside = &b.First, &firstRecs, &firstOutside
+				g, recsOut, outside, cold, warm = &b.First, &firstRecs, &firstOutside, &firstCold, &firstWarm
 			}
 			if rt.Err != "" {
 				g.Failed++
@@ -888,10 +970,17 @@ func JoinRestores(events []Event, timings map[string][]RestoreTiming) *RestoreBr
 				continue
 			}
 			*outside = append(*outside, ev.DurMS-rt.Phases["total"]*1000)
+			if rt.Phases["oci_unpack"] > 0 {
+				*cold = append(*cold, ev.DurMS)
+			} else {
+				*warm = append(*warm, ev.DurMS)
+			}
 		}
 	}
-	b.First.Restores, b.First.Phases, b.First.Outside = len(firstRecs), phaseStats(firstRecs), outsideStat(firstOutside)
-	b.Wakes.Restores, b.Wakes.Phases, b.Wakes.Outside = len(wakeRecs), phaseStats(wakeRecs), outsideStat(wakeOutside)
+	b.First.Restores, b.First.Phases, b.First.Outside = len(firstRecs), phaseStats(firstRecs), spanStat("outside", firstOutside)
+	b.First.Cold, b.First.Warm = spanStat("cold (image unpacked)", firstCold), spanStat("warm (image cached)", firstWarm)
+	b.Wakes.Restores, b.Wakes.Phases, b.Wakes.Outside = len(wakeRecs), phaseStats(wakeRecs), spanStat("outside", wakeOutside)
+	b.Wakes.Cold, b.Wakes.Warm = spanStat("cold (image unpacked)", wakeCold), spanStat("warm (image cached)", wakeWarm)
 	return b
 }
 
@@ -931,10 +1020,36 @@ func phaseStats(recs []RestoreTiming) []PhaseStat {
 	return out
 }
 
-func outsideStat(d []float64) *PhaseStat {
+// spanStat summarizes event spans under name; nil when there are none.
+func spanStat(name string, d []float64) *PhaseStat {
 	if len(d) == 0 {
 		return nil
 	}
 	sort.Float64s(d)
-	return &PhaseStat{Phase: "outside", Count: len(d), P50MS: percentile(d, 0.50), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1)}
+	return &PhaseStat{Phase: name, Count: len(d), P50MS: percentile(d, 0.50), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1)}
+}
+
+// labelKeys is the sorted union of the reports' label keys.
+func labelKeys(reps []*Report) []string {
+	seen := map[string]bool{}
+	for _, r := range reps {
+		for k := range r.Labels {
+			seen[k] = true
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for k := range seen {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// labelLine renders labels as "k=v k=v", keys sorted.
+func labelLine(labels map[string]string) string {
+	parts := make([]string, 0, len(labels))
+	for _, k := range labelKeys([]*Report{{Labels: labels}}) {
+		parts = append(parts, k+"="+labels[k])
+	}
+	return strings.Join(parts, " ")
 }

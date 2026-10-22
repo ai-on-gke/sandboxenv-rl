@@ -313,6 +313,30 @@ def test_a_copy_never_deletes_the_environment_or_closes_the_client(stack, tmp_pa
     assert state.deletes == [ws.env_id]
 
 
+def test_a_workspace_in_a_reference_cycle_still_deletes_on_collection(stack, tmp_path):
+    api_url, state = stack
+    ws = make(api_url, state, tmp_path)
+    env_id = ws.env_id
+    # The cycle makes the workspace cyclic garbage: the collector, not the
+    # reference count, finalizes it, and it clears weakrefs before __del__.
+    holder: list = [ws]
+    holder.append(holder)
+    del ws, holder
+    gc.collect()
+    assert state.deletes == [env_id]
+
+
+def test_a_copy_in_a_reference_cycle_never_deletes(stack, tmp_path):
+    api_url, state = stack
+    with make(api_url, state, tmp_path) as ws:
+        holder: list = [ws.model_copy()]
+        holder.append(holder)
+        del holder
+        gc.collect()
+        assert state.deletes == []
+    assert state.deletes == [ws.env_id]
+
+
 def test_del_skips_cleanup_at_interpreter_shutdown(stack, tmp_path, monkeypatch):
     api_url, state = stack
     ws = make(api_url, state, tmp_path)

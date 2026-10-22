@@ -38,7 +38,6 @@ import secrets
 import shlex
 import sys
 import time
-import weakref
 from collections.abc import Coroutine
 from typing import Any
 
@@ -199,8 +198,10 @@ class AteEnvWorkspace(RemoteWorkspace):
         "this workspace created it, keep it when attached with env_id.",
     )
 
-    # Ownership, set only after the create or the attach succeeds.
-    _owner: Any = PrivateAttr(default=None)  # weakref to the owning workspace
+    # Ownership, set only after the create or the attach succeeds. A copy
+    # carries _is_copy and never deletes. A plain flag, not a weakref: the
+    # cyclic garbage collector clears weakrefs before it calls __del__.
+    _is_copy: bool = PrivateAttr(default=False)
     _created: bool = PrivateAttr(default=False)
     _attached: bool = PrivateAttr(default=False)
     _deleted: bool = PrivateAttr(default=False)
@@ -225,7 +226,6 @@ class AteEnvWorkspace(RemoteWorkspace):
             self._create()
         else:
             self._call(self._ate().get(self.env_id, atespace=self.atespace))
-            self._owner = weakref.ref(self)
             self._attached = True
             logger.info("Attached to environment %s/%s", self.atespace, self.env_id)
 
@@ -248,9 +248,11 @@ class AteEnvWorkspace(RemoteWorkspace):
         opens its own HTTP client."""
         client, self._client = self._client, None
         try:
-            return super().model_copy(update=update, deep=deep)
+            copy = super().model_copy(update=update, deep=deep)
         finally:
             self._client = client
+        copy._is_copy = True
+        return copy
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -275,7 +277,7 @@ class AteEnvWorkspace(RemoteWorkspace):
         return _runtime.run(asyncio.wait_for(coro, timeout))
 
     def _owns(self) -> bool:
-        return self._owner is not None and self._owner() is self
+        return (self._created or self._attached) and not self._is_copy
 
     def _create(self) -> None:
         env_id = _new_env_id()
@@ -299,7 +301,6 @@ class AteEnvWorkspace(RemoteWorkspace):
             if _may_exist_after(exc):
                 self._delete_orphan(env_id)
             raise
-        self._owner = weakref.ref(self)
         self._created = True
 
     def _delete_orphan(self, env_id: str) -> None:

@@ -16,6 +16,8 @@ package main
 
 import (
 	"bytes"
+	"io"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -688,5 +690,94 @@ func TestBuildAPIDeploymentAuthTokenSecret(t *testing.T) {
 	}
 	if !foundVol {
 		t.Errorf("volumes = %+v, want Secret volume for ate-env-caller-token", dep.Spec.Template.Spec.Volumes)
+	}
+}
+
+// runManifest runs "ate-env manifest" with the image flags plus extra and
+// returns the output and the error.
+func runManifest(t *testing.T, extra ...string) (string, error) {
+	t.Helper()
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs(append([]string{
+		"--api-image=example.com/api@sha256:cccc",
+		"--worker-image=example.com/worker@sha256:bbbb",
+	}, extra...))
+	err := cmd.Execute()
+	return buf.String(), err
+}
+
+func TestManifestRequiresTheCallerTokenByDefault(t *testing.T) {
+	out, err := runManifest(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"-auth-token-file=/var/run/secrets/ate-env-auth/token", "secretName: " + defaultAuthTokenSecret} {
+		if !strings.Contains(out, want) {
+			t.Errorf("default manifest lacks %q:\n%s", want, out)
+		}
+	}
+	out, err = runManifest(t, "--auth-token-secret=team-token")
+	if err != nil || !strings.Contains(out, "secretName: team-token") {
+		t.Errorf("--auth-token-secret=team-token: err %v, output:\n%s", err, out)
+	}
+}
+
+func TestManifestInsecureNoAuth(t *testing.T) {
+	out, err := runManifest(t, "--insecure-no-auth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "auth-token-file") || strings.Contains(out, "ate-env-auth") {
+		t.Errorf("--insecure-no-auth still mounts the caller token:\n%s", out)
+	}
+	if _, err := runManifest(t, "--insecure-no-auth", "--auth-token-secret=x"); err == nil || !strings.Contains(err.Error(), "cannot be used together") {
+		t.Errorf("--insecure-no-auth with --auth-token-secret: err %v, want a conflict", err)
+	}
+	if _, err := runManifest(t, "--auth-token-secret="); err == nil || !strings.Contains(err.Error(), "--insecure-no-auth") {
+		t.Errorf("empty --auth-token-secret: err %v, want a pointer to --insecure-no-auth", err)
+	}
+}
+
+func TestManifestAuthSecretCommand(t *testing.T) {
+	run := func(args ...string) map[string]any {
+		t.Helper()
+		cmd := newManifestCommand()
+		var buf bytes.Buffer
+		cmd.SetOut(&buf)
+		cmd.SetArgs(append([]string{"auth-secret"}, args...))
+		if err := cmd.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := yaml.Unmarshal(buf.Bytes(), &m); err != nil {
+			t.Fatalf("%q: %v", buf.String(), err)
+		}
+		return m
+	}
+	token := func(m map[string]any) string {
+		sd, _ := m["stringData"].(map[string]any)
+		s, _ := sd["token"].(string)
+		return s
+	}
+	a, b := run(), run("--namespace", "team-env", "--name", "team-token")
+	if a["kind"] != "Secret" || a["type"] != "Opaque" {
+		t.Errorf("kind %v type %v, want an Opaque Secret", a["kind"], a["type"])
+	}
+	md, _ := a["metadata"].(map[string]any)
+	if md["name"] != defaultAuthTokenSecret || md["namespace"] != "ate-env" {
+		t.Errorf("metadata %v, want %s in ate-env", md, defaultAuthTokenSecret)
+	}
+	if md, _ := b["metadata"].(map[string]any); md["name"] != "team-token" || md["namespace"] != "team-env" {
+		t.Errorf("metadata %v, want team-token in team-env", md)
+	}
+	hex64 := regexp.MustCompile(`^[0-9a-f]{64}$`)
+	if !hex64.MatchString(token(a)) || !hex64.MatchString(token(b)) {
+		t.Errorf("tokens %q, %q: want 64 hex characters each", token(a), token(b))
+	}
+	if token(a) == token(b) {
+		t.Error("two runs printed the same token")
 	}
 }

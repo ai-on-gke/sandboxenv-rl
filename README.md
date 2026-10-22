@@ -102,14 +102,16 @@ Deploy, and register a template ([deployment guide](#deployment-guide) explains 
 kubectl ate create atespace ate-env
 ate-env manifest access-policy | kubectl ate create access-policy -a ate-env -f -
 ate-env manifest --api-image <api-image> --worker-image <ateworker-gvisor-image> | kubectl apply -f -
+ate-env manifest auth-secret | kubectl create -f -   # the caller token; create it once
 ate-env manifest template --guest-image <guest-image> --snapshots-bucket <object-storage-url> \
   | kubectl-ate create actor-template -f -
 ```
 
-Try an environment:
+Try an environment. `ate-env-api` requires the token from the Secret:
 
 ```bash
 kubectl port-forward -n ate-env svc/ate-env-api 7777:7777 &
+export SUBSTRATE_ENV_AUTH_TOKEN="$(kubectl -n ate-env get secret ate-env-api-token -o jsonpath='{.data.token}' | base64 -d)"
 ate-env create dev1
 ate-env dev1 shell 'echo hello from $(hostname)'
 ate-env delete dev1
@@ -119,9 +121,12 @@ Drive environments from Python with the fleet SDK (`pip install ./clients/python
 `with` block deletes everything the fleet created:
 
 ```python
+import os
+
 from ate_env import FleetConfig, SandboxFleet, Task
 
-with SandboxFleet(FleetConfig(endpoint="127.0.0.1:7777")) as fleet:
+config = FleetConfig(endpoint="127.0.0.1:7777", auth_token=os.environ["SUBSTRATE_ENV_AUTH_TOKEN"])
+with SandboxFleet(config) as fleet:
     handle = fleet.acquire(Task(id="t1", image="docker.io/library/python@sha256:<digest>"))
     print(handle.exec(["python3", "-c", "print(6 * 7)"]).stdout)
     handle.write_file("/tmp/answer.txt", "42\n")
@@ -203,6 +208,10 @@ ate-env manifest \
   --api-image      <registry>/ate-env-api@sha256:<digest> \
   --worker-image   <registry>/ateworker-gvisor@sha256:<digest> | kubectl apply -f -
 
+# The bearer token ate-env-api requires from callers. Each run prints a new
+# token, thus create the Secret once; ate-env-api starts when it exists.
+ate-env manifest auth-secret | kubectl create -f -
+
 # Ensure that the pods are running:
 kubectl get pods -n ate-env
 ```
@@ -213,15 +222,18 @@ parking budget) and, once the control plane reports the environment RUNNING, up 
 `--wake-running-budget` (default 20s). Both are flags of the `ate-env-api` binary; `ate-env manifest`
 does not set them, thus add them to the Deployment's arguments to change them.
 
-By default `ate-env manifest` deploys `ate-env-api` without caller authentication for use over
-`kubectl port-forward`. Before exposing `ate-env-api` beyond loopback (e.g. through an internal
-LoadBalancer or to multi-tenant namespaces), create a Kubernetes Secret with a `token` key and pass
-`--auth-token-secret <secret-name>` to `ate-env manifest` (which mounts the secret and sets
-`-auth-token-file` on `ate-env-api`); callers then authenticate with `--auth-token-file`,
-`SUBSTRATE_ENV_AUTH_TOKEN` or `--auth-token` on the CLI (`--auth-token` shows the token in `ps`
-output and the shell history), `ClientOptions.AuthToken` in the Go SDK, `Client(..., auth_token=...)`
-in the Python SDK, or `Authorization: Bearer <token>` on MCP HTTP requests and port-proxy requests
-([Reaching a service inside an environment](#reaching-a-service-inside-an-environment)).
+`ate-env-api` requires a bearer token from each caller: `ate-env manifest` mounts the Secret that
+`--auth-token-secret` names (default `ate-env-api-token`, key `token`) and sets `-auth-token-file`.
+The pod does not start until the Secret exists. Read the token back for clients with
+`kubectl -n ate-env get secret ate-env-api-token -o jsonpath='{.data.token}' | base64 -d`; callers
+send it with `--auth-token-file`, `SUBSTRATE_ENV_AUTH_TOKEN` or `--auth-token` on the CLI
+(`--auth-token` shows the token in `ps` output and the shell history), `ClientOptions.AuthToken` in
+the Go SDK, `Client(..., auth_token=...)` or `FleetConfig(auth_token=...)` in the Python SDK, or
+`Authorization: Bearer <token>` on MCP HTTP requests and port-proxy requests
+([Reaching a service inside an environment](#reaching-a-service-inside-an-environment)). To
+rotate the token, replace the Secret's value; `ate-env-api` reads it again once the kubelet updates
+the mounted file. `--insecure-no-auth` deploys `ate-env-api` without the token, in which case
+anyone who can reach its Service can create environments and run commands in them.
 The clients connect without TLS, thus the token travels in clear text. Past the cluster boundary,
 for example through an internal LoadBalancer, put TLS termination or a mesh with mTLS in front of
 `ate-env-api`.
@@ -317,6 +329,7 @@ Alternatively, interact with the environment over MCP:
 
 ```bash
 curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
+     -H "Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" \
      -H "Content-Type: application/json" \
      -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"shell","arguments":{"command":"echo hi"}}}'
 ```
@@ -368,6 +381,12 @@ a cluster that already runs the Agent Substrate system: the target
 namespace, a WorkerPool of pre-warmed workers, and the ate-env-api service.
 It prints YAML to stdout without touching the cluster; apply it with kubectl.
 
+ate-env-api requires a bearer token from its callers, read from the Secret
+--auth-token-secret names (key token). Create that Secret once, in the
+namespace this manifest creates, with
+"ate-env manifest auth-secret | kubectl create -f -"; ate-env-api starts when
+the Secret exists. --insecure-no-auth deploys without the token.
+
 To generate the Substrate ActorTemplate manifest (for kubectl-ate), use
 the "template" subcommand: ate-env manifest template
 
@@ -377,19 +396,22 @@ Usage:
 
 Available Commands:
   access-policy Generate the Substrate access policy that lets ate-env-api manage environments
+  auth-secret   Generate the Secret with the bearer token ate-env-api requires from callers
   template      Generate Substrate ActorTemplate manifest
 
 Flags:
-      --api-image string      digest-pinned ate-env-api image for the API service (required: this ate-env was built from source; release binaries default to the image published with the release, see docs/release.md)
-      --api-port int32        port the ate-env-api service listens on (default 7777)
-      --api-replicas int32    number of API service replicas (default 1)
-      --ateom-image string    alias for --worker-image, kept from before Substrate renamed ateom to ateworker
-  -h, --help                  help for manifest
-      --namespace string      Kubernetes namespace to deploy into (default "ate-env")
-      --replicas int32        number of pre-warmed worker pods (default 5)
-      --template string       ActorTemplate name (default "default-template")
-      --worker-image string   digest-pinned worker image for the worker pool, e.g. ateworker-gvisor built from the Substrate repo
-      --workerpool string     WorkerPool name (defaults to <template>-workerpool)
+      --api-image string           digest-pinned ate-env-api image for the API service (required: this ate-env was built from source; release binaries default to the image published with the release, see docs/release.md)
+      --api-port int32             port the ate-env-api service listens on (default 7777)
+      --api-replicas int32         number of API service replicas (default 1)
+      --ateom-image string         alias for --worker-image, kept from before Substrate renamed ateom to ateworker
+      --auth-token-secret string   Kubernetes Secret (key 'token') mounted into ate-env-api; its value is the bearer token ate-env-api requires from callers. Create it with 'ate-env manifest auth-secret' (default "ate-env-api-token")
+  -h, --help                       help for manifest
+      --insecure-no-auth           deploy ate-env-api without a caller token: anyone who can reach its Service can create environments, run commands in them and reach their ports
+      --namespace string           Kubernetes namespace to deploy into (default "ate-env")
+      --replicas int32             number of pre-warmed worker pods (default 5)
+      --template string            ActorTemplate name (default "default-template")
+      --worker-image string        digest-pinned worker image for the worker pool, e.g. ateworker-gvisor built from the Substrate repo
+      --workerpool string          WorkerPool name (defaults to <template>-workerpool)
 
 Use "ate-env manifest [command] --help" for more information about a command.
 ```
@@ -446,7 +468,8 @@ and the proxy waits for the wake up to `--wake-budget` (the same wait as a guest
 answers 503.
 
 ```bash
-curl -H 'X-Env-Id: dev1' -H 'X-Env-Port: 6000' localhost:7777/health
+curl -H 'X-Env-Id: dev1' -H 'X-Env-Port: 6000' \
+     -H "X-Env-Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" localhost:7777/health
 ```
 
 Clients that cannot set headers, such as WebSocket clients and browsers, put the target in the path
@@ -456,18 +479,21 @@ outside `ate-env`. The API strips that prefix and forwards the rest, so a client
 through either form; gRPC to the daemon is not supported yet.
 
 ```bash
-curl localhost:7777/v1alpha/envs/dev1/ports/6000/health
+curl -H "Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" localhost:7777/v1alpha/envs/dev1/ports/6000/health
 ```
 
 The path form reaches the daemon exactly as sent: a path without the trailing slash is the daemon's
 root, and `//` or `..` after the prefix are not cleaned or redirected.
 
-**Who can use it.** Without `--auth-token-file`, the forwarding does not authenticate callers.
-Whoever can reach the API's listener can reach any TCP port of any actor the Substrate router serves,
-in any atespace, including actors that ate-env did not create. The guest API already reaches each actor that runs
-the guest; the forwarding extends that reach to every port. Keep the listener inside the cluster
-(the manifest's Service is `ClusterIP`), restrict it with a NetworkPolicy where other workloads
-share the cluster, and make each daemon check its own credential.
+**Who can use it.** The forwarding reaches environments only in the atespaces
+`--port-proxy-atespaces` names (default `ate-env`); a request for another atespace gets 403.
+Substrate actors carry no label that marks the ones ate-env created, thus inside those atespaces it
+reaches any TCP port of any actor, and a dedicated atespace for ate-env is the boundary. Without
+`--auth-token-file` (`ate-env manifest --insecure-no-auth`), it does not authenticate callers:
+whoever can reach the API's listener can reach those ports. The guest API already reaches each
+actor that runs the guest; the forwarding extends that reach to every port. Keep the listener inside
+the cluster (the manifest's Service is `ClusterIP`), restrict it with a NetworkPolicy where other
+workloads share the cluster, and make each daemon check its own credential.
 
 With `--auth-token-file`, each forwarded request, in either form, must carry the API's token, in
 `X-Env-Authorization: Bearer <token>` or in `Authorization: Bearer <token>`; the API answers 401
@@ -490,13 +516,16 @@ MCP endpoint included.
 | Flag | Default | Effect |
 |---|---|---|
 | `--atenet-connect` | `atenet-router.ate-system.svc.cluster.local:8081` | The router's CONNECT listener. An empty value turns the forwarding off. |
+| `--port-proxy-atespaces` | `ate-env` | Comma-separated atespaces whose environments the forwarding reaches; `*` means any atespace the router serves. An empty value is an error. |
 | `--port-proxy-trusted-origins` | none | Comma-separated browser origins allowed to use the path form. |
 | `--port-proxy-response-header-timeout` | `0`, no limit | Bound on the wait for a daemon's response headers. Without it, the caller's deadline ends the wait. |
 
 ## Built-in MCP Server
 
 The API exposes a streamable MCP endpoint at `POST /v1alpha/envs/{id}/mcp` serving built-in tools.
-Outside the `ate-env` atespace, add `?atespace=<name>` to the URL.
+Outside the `ate-env` atespace, add `?atespace=<name>` to the URL. Each request carries the caller
+token in `Authorization: Bearer <token>`; the examples read it from `SUBSTRATE_ENV_AUTH_TOKEN`. Leave
+the header out for an `ate-env-api` deployed with `--insecure-no-auth`.
 
 ### Available Tools
 
@@ -514,6 +543,7 @@ Clients communicate with the MCP server at `/v1alpha/envs/{id}/mcp` using JSON-R
 
 ```bash
 curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
+     -H "Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" \
      -H "Content-Type: application/json" \
      -H "Accept: application/json, text/event-stream" \
      -d '{
@@ -532,6 +562,7 @@ curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
 
 ```bash
 curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
+     -H "Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" \
      -H "Content-Type: application/json" \
      -H "Accept: application/json, text/event-stream" \
      -d '{
@@ -545,6 +576,7 @@ curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
 
 ```bash
 curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
+     -H "Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" \
      -H "Content-Type: application/json" \
      -H "Accept: application/json, text/event-stream" \
      -d '{

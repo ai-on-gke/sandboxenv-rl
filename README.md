@@ -558,6 +558,11 @@ curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
      }'
 ```
 
+## Security
+
+The trust boundaries and their known gaps are in [docs/security/threat-model.md](docs/security/threat-model.md).
+To report a vulnerability, follow [SECURITY.md](SECURITY.md).
+
 ## Cleanup
 
 ```bash

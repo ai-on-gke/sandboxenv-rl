@@ -84,7 +84,12 @@ func newFixture(t *testing.T) *fixture {
 	service := apiservice.New(directClient, routerAddr, "")
 	t.Cleanup(service.Close)
 
-	grpcServer := grpc.NewServer()
+	// The interceptors ate-env-api runs, so each call the SDK makes is checked
+	// for fields the server does not know.
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(apiservice.RejectUnknownFieldsUnaryInterceptor()),
+		grpc.ChainStreamInterceptor(apiservice.RejectUnknownFieldsStreamInterceptor()),
+	)
 	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, service)
 	ateenvv1alpha.RegisterProcessServiceServer(grpcServer, service)
 	ateenvv1alpha.RegisterFileSystemServiceServer(grpcServer, service)
@@ -544,11 +549,11 @@ func TestClientAuthToken(t *testing.T) {
 		grpc.ChainUnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 			record(ctx, info.FullMethod)
 			return handler(ctx, req)
-		}, auth.UnaryInterceptor()),
+		}, auth.UnaryInterceptor(), apiservice.RejectUnknownFieldsUnaryInterceptor()),
 		grpc.ChainStreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 			record(ss.Context(), info.FullMethod)
 			return handler(srv, ss)
-		}, auth.StreamInterceptor()),
+		}, auth.StreamInterceptor(), apiservice.RejectUnknownFieldsStreamInterceptor()),
 	)
 	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, service)
 	ateenvv1alpha.RegisterProcessServiceServer(grpcServer, service)

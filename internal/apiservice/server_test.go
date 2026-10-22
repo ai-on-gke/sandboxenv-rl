@@ -81,7 +81,10 @@ func newFullTestEnv(t *testing.T) *testEnv {
 	srv := apiservice.New(client, routerAddr, "")
 	t.Cleanup(srv.Close)
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(apiservice.RejectUnknownFieldsUnaryInterceptor()),
+		grpc.ChainStreamInterceptor(apiservice.RejectUnknownFieldsStreamInterceptor()),
+	)
 	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, srv)
 	ateenvv1alpha.RegisterProcessServiceServer(grpcServer, srv)
 	ateenvv1alpha.RegisterFileSystemServiceServer(grpcServer, srv)

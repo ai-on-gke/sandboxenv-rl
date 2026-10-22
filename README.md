@@ -396,8 +396,10 @@ Use "ate-env manifest [command] --help" for more information about a command.
 
 ## API
 
-The `ate-env-api` service exposes gRPC APIs for environment
-lifecycle and in-actor operations, as well as HTTP endpoints for MCP.
+The `ate-env-api` service exposes gRPC APIs for environment lifecycle and in-actor operations, as
+well as HTTP endpoints for MCP. It rejects a request that carries a field it does not know, at any
+depth, with `InvalidArgument`: a client built from another version or fork of this API fails
+instead of being served as if the field were absent.
 
 ### EnvironmentService
 

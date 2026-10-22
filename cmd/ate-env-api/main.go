@@ -104,14 +104,17 @@ func main() {
 	apisvc.WakeRunningBudget = *wakeRunningBudget
 	defer apisvc.Close()
 
-	var grpcOpts []grpc.ServerOption
+	// Authentication runs first, so an unauthenticated caller learns nothing
+	// from the unknown-field check.
+	var unary []grpc.UnaryServerInterceptor
+	var stream []grpc.StreamServerInterceptor
 	if callerAuth != nil {
-		grpcOpts = append(grpcOpts,
-			grpc.UnaryInterceptor(callerAuth.UnaryInterceptor()),
-			grpc.StreamInterceptor(callerAuth.StreamInterceptor()),
-		)
+		unary = append(unary, callerAuth.UnaryInterceptor())
+		stream = append(stream, callerAuth.StreamInterceptor())
 	}
-	grpcServer := grpc.NewServer(grpcOpts...)
+	unary = append(unary, apiservice.RejectUnknownFieldsUnaryInterceptor())
+	stream = append(stream, apiservice.RejectUnknownFieldsStreamInterceptor())
+	grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(unary...), grpc.ChainStreamInterceptor(stream...))
 	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, apisvc)
 	ateenvv1alpha.RegisterProcessServiceServer(grpcServer, apisvc)
 	ateenvv1alpha.RegisterFileSystemServiceServer(grpcServer, apisvc)

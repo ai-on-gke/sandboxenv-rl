@@ -75,10 +75,11 @@ def test_tracer_config_defaults_and_validation():
 
 async def test_disabled_tracing_is_a_noop():
     assert tracing.create_tracer_manager(TracerConfig()) == (None, None)
+    assert tracing.tracer_from_config(TracerConfig()) is None
     client = Client("127.0.0.1:1")
-    assert client.tracer is None and client.tracer_manager is None
+    assert client.tracer is None
     await client.close()
-    assert tracing.inject_metadata([("a", "b")]) == [("a", "b")] or tracing.tracing_active()
+    assert tracing.inject_metadata([("a", "b")]) == [("a", "b")]
     tracing.mark_error(None, "ignored")
 
 
@@ -137,9 +138,6 @@ def spans():
         trace.set_tracer_provider(provider)
         _PROVIDER = (provider, exporter)
     provider, exporter = _PROVIDER
-    # initialize_tracer adopts the application's SDK provider instead of
-    # installing an OTLP exporter.
-    tracing._TRACER_PROVIDER = None
     exporter.clear()
     yield exporter
     exporter.clear()
@@ -198,23 +196,179 @@ def format_span_tree(finished) -> str:
 # --- tracer manager and decorators --------------------------------------- #
 
 
-def test_initialize_tracer_warns_on_second_service_name(spans, caplog, monkeypatch):
-    caplog.set_level(logging.WARNING, logger="ate_env.telemetry.tracing")
-    # The application's own SDK provider is adopted silently, whatever its name.
-    tracing.initialize_tracer("another-service")
-    assert tracing._TRACER_PROVIDER is spans_provider()
-    assert not caplog.records
-    # A provider ate_env installed itself warns when asked for another name.
-    monkeypatch.setattr(tracing, "_OWNS_PROVIDER", True)
-    tracing.initialize_tracer("ate-env-client")
-    assert not caplog.records
-    tracing.initialize_tracer("another-service")
-    assert len(caplog.records) == 1
-    assert "another-service" in caplog.records[0].getMessage()
+def _run_otel_script(code: str, **env: str) -> subprocess.CompletedProcess:
+    """Run code in a fresh interpreter: the global TracerProvider is set once per process."""
+    pytest.importorskip("opentelemetry.sdk")
+    import os
+
+    full_env = {k: v for k, v in os.environ.items() if not k.startswith("OTEL_")}
+    full_env.update(env)
+    return subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(code)],
+        capture_output=True,
+        text=True,
+        env=full_env,
+        timeout=60,
+    )
 
 
-def spans_provider():
-    return _PROVIDER[0]
+_APP_PROVIDER_AFTER_CLIENT = """
+    import asyncio, logging, time
+    logging.basicConfig(level=logging.WARNING)
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from ate_env import Client, TracerConfig
+
+    async def main():
+        # Tracing starts before the application installs its provider.
+        client = Client("127.0.0.1:1", tracer_config=TracerConfig(enable_tracing=True))
+        installed = type(trace.get_tracer_provider()).__name__
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        trace.set_tracer_provider(provider)
+        try:
+            await client.get("e1", atespace="a")
+        except Exception:
+            pass
+        await client.close()
+        print(installed, [s.name for s in exporter.get_finished_spans()])
+
+    start = time.monotonic()
+    asyncio.run(main())
+"""
+
+
+def test_client_never_installs_a_provider_without_otlp_endpoint():
+    out = _run_otel_script(_APP_PROVIDER_AFTER_CLIENT)
+    assert out.returncode == 0, out.stderr
+    # Nothing was installed, and the application's later provider receives
+    # the client span.
+    assert out.stdout.strip() == "ProxyTracerProvider ['ate_env_client.get_environment']"
+    assert "Overriding of current TracerProvider is not allowed" not in out.stderr
+
+
+# Replaces the OTLP exporter with an in-memory one, so the client's own
+# provider can be inspected without a collector.
+_FAKE_OTLP_EXPORTER = """
+    import opentelemetry.exporter.otlp.proto.grpc.trace_exporter as otlp_mod
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    otlp_exporter = InMemorySpanExporter()
+    otlp_mod.OTLPSpanExporter = lambda *a, **k: otlp_exporter
+"""
+
+
+def test_client_exports_through_its_own_provider_when_endpoint_is_set():
+    code = _FAKE_OTLP_EXPORTER + """
+    import logging
+    logging.basicConfig(level=logging.WARNING)
+    from opentelemetry import trace
+    from ate_env.config import TracerConfig
+    from ate_env.telemetry import tracing
+
+    tracer = tracing.tracer_from_config(TracerConfig(enable_tracing=True))
+    with tracing.start_span(tracer, "ate_env_client.op"):
+        pass
+    # The client's provider is never made global.
+    assert type(trace.get_tracer_provider()).__name__ == "ProxyTracerProvider"
+    provider = tracing._PRIVATE_PROVIDER
+    assert provider.resource.attributes["service.name"] == "ate-env-client"
+    provider.force_flush()
+    assert [s.name for s in otlp_exporter.get_finished_spans()] == ["ate_env_client.op"]
+    # Another service name shares the provider, with one warning.
+    other = tracing.tracer_from_config(
+        TracerConfig(enable_tracing=True, trace_service_name="another-service")
+    )
+    for _ in range(2):
+        with tracing.start_span(other, "ate_env_client.op2"):
+            pass
+    assert tracing._PRIVATE_PROVIDER is provider
+    print("ok")
+    """
+    for var in tracing.OTLP_ENDPOINT_ENV_VARS:
+        out = _run_otel_script(code, **{var: "http://127.0.0.1:1"})
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.strip() == "ok"
+        warnings = [ln for ln in out.stderr.splitlines() if "already initialized" in ln]
+        assert len(warnings) == 1 and "another-service" in warnings[0], out.stderr
+
+
+def test_app_provider_after_client_wins_even_with_otlp_endpoint():
+    # The README case 1 trap: an endpoint variable is set (for example by the
+    # OTel Operator) and the application installs its provider after the
+    # client has started tracing. OpenTelemetry must not refuse it.
+    code = _FAKE_OTLP_EXPORTER + """
+    import logging
+    logging.basicConfig(level=logging.WARNING)
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from ate_env.config import TracerConfig
+    from ate_env.telemetry import tracing
+
+    tracer = tracing.tracer_from_config(TracerConfig(enable_tracing=True))
+    with tracing.start_span(tracer, "ate_env_client.before"):
+        pass
+    app_exporter = InMemorySpanExporter()
+    app = TracerProvider()
+    app.add_span_processor(SimpleSpanProcessor(app_exporter))
+    trace.set_tracer_provider(app)
+    assert trace.get_tracer_provider() is app
+    with tracing.start_span(tracer, "ate_env_client.after"):
+        pass
+    tracing._PRIVATE_PROVIDER.force_flush()
+    print([s.name for s in otlp_exporter.get_finished_spans()],
+          [s.name for s in app_exporter.get_finished_spans()])
+    """
+    out = _run_otel_script(code, OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:1")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "['ate_env_client.before'] ['ate_env_client.after']"
+    assert "Overriding of current TracerProvider is not allowed" not in out.stderr
+
+
+def test_client_keeps_an_application_provider_even_with_otlp_endpoint():
+    code = """
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+        from ate_env.config import TracerConfig
+        from ate_env.telemetry import tracing
+
+        exporter = InMemorySpanExporter()
+        app = TracerProvider()
+        app.add_span_processor(SimpleSpanProcessor(exporter))
+        trace.set_tracer_provider(app)
+        tracer = tracing.tracer_from_config(TracerConfig(enable_tracing=True))
+        with tracing.start_span(tracer, "ate_env_client.op"):
+            pass
+        assert trace.get_tracer_provider() is app
+        assert tracing._PRIVATE_PROVIDER is None
+        assert [s.name for s in exporter.get_finished_spans()] == ["ate_env_client.op"]
+        print("ok")
+    """
+    out = _run_otel_script(code, OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:1")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "ok"
+
+
+def test_no_otlp_endpoint_builds_no_provider():
+    code = """
+        from ate_env.config import TracerConfig
+        from ate_env.telemetry import tracing
+
+        tracer = tracing.tracer_from_config(TracerConfig(enable_tracing=True))
+        with tracing.start_span(tracer, "ate_env_client.op"):
+            pass
+        assert tracing._PRIVATE_PROVIDER is None
+        print("ok")
+    """
+    out = _run_otel_script(code)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "ok"
 
 
 def test_tracer_manager_service_name_never_renames_spans(spans):
@@ -486,7 +640,10 @@ def test_nests_client_spans_under_caller_across_loop_runner(spans, threaded_fake
         assert "echo hi" not in str(attrs)
     for rel in names["ate_env_client.release"]:
         assert _parent_name(rel, finished) == "caller"
-        assert [_parent_name(d, finished) for d in names["ate_env_client.delete_environment"]]
+    deletes = names["ate_env_client.delete_environment"]
+    assert len(deletes) == 3
+    for d in deletes:
+        assert _parent_name(d, finished) == "ate_env_client.release"
     assert {s.context.trace_id for s in finished} == {names["caller"][0].context.trace_id}
     create_attrs = dict(names["ate_env_client.create_environment"][0].attributes)
     assert create_attrs["env.rootfs_image"] == f"registry.example/swe/repo-a@{DIGEST}"
@@ -532,3 +689,73 @@ async def test_nests_client_spans_under_caller_in_async_fleet(spans):
     for create in names["ate_env_client.create_environment"]:
         assert _ancestors(create, finished)[:2] == ["ate_env_client.acquire", "caller"]
     assert {_parent_name(s, finished) for s in names["ate_env_client.exec"]} == {"caller"}
+
+
+# --- span kind and cancellation ------------------------------------------ #
+
+
+async def test_client_rpc_spans_are_client_kind_with_rpc_attributes(spans):
+    from opentelemetry.trace import SpanKind
+
+    server, port = await _start_fake_server()
+    try:
+        client = Client(f"http://127.0.0.1:{port}", tracer_config=TracerConfig(enable_tracing=True))
+        env = await client.create(id="e1", atespace="a", template_name="tmpl")
+        await client.get(env.id, atespace="a")
+        await client.suspend(env.id, atespace="a")
+        await client.delete(env.id, atespace="a")
+        await client.close()
+    finally:
+        await server.stop(None)
+    by_name = _by_name(spans.get_finished_spans())
+    for op, method in [
+        ("create_environment", "CreateEnvironment"),
+        ("get_environment", "GetEnvironment"),
+        ("suspend_environment", "SuspendEnvironment"),
+        ("delete_environment", "DeleteEnvironment"),
+    ]:
+        (span,) = by_name[f"ate_env_client.{op}"]
+        assert span.kind == SpanKind.CLIENT, op
+        attrs = dict(span.attributes)
+        assert attrs["rpc.system"] == "grpc", op
+        assert attrs["rpc.service"] == "ateenv.v1alpha.EnvironmentService", op
+        assert attrs["rpc.method"] == method, op
+        assert attrs["server.address"] == "127.0.0.1", op
+        assert attrs["server.port"] == port, op
+
+
+def test_rpc_attrs_parse_targets():
+    assert tracing.rpc_attrs("s", "M", "[::1]:7777")["server.address"] == "::1"
+    assert tracing.rpc_attrs("s", "M", "unix:///tmp/sock")["server.address"] == "unix:///tmp/sock"
+    attrs = tracing.rpc_attrs("s", "M", None)
+    assert "server.address" not in attrs and "server.port" not in attrs
+
+
+async def test_cancelled_exec_async_marks_span_as_error(spans):
+    import asyncio
+
+    from opentelemetry.trace import StatusCode
+
+    from ate_env.handle import SandboxHandle
+
+    class HangingRuntime:
+        async def exec_async(self, *args, **kwargs):
+            await asyncio.Event().wait()
+
+    handle = SandboxHandle(
+        sandbox_id="sb-1",
+        endpoint="",
+        task=Task(id="t", image="img"),
+        run_id="r",
+        backend=None,
+        runtime=HangingRuntime(),
+        tracer=tracing.tracer_from_config(TracerConfig(enable_tracing=True)),
+    )
+    call = asyncio.ensure_future(handle.exec_async("sleep 100"))
+    await asyncio.sleep(0.01)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    (span,) = _by_name(spans.get_finished_spans())["ate_env_client.exec"]
+    assert span.status.status_code == StatusCode.ERROR
+    assert span.status.description == "cancelled"

@@ -55,7 +55,7 @@ class SandboxFleet:
         self._plan: FleetPlan | None = None
         self._lock = threading.Lock()
         # Tracing (FleetConfig.tracing): spans on handles and the Substrate driver.
-        self._tracer_manager, self._tracer = tracer_from_config(self.config.tracing)
+        self._tracer = tracer_from_config(self.config.tracing)
 
         # Initialize Backend Driver
         if driver is not None:

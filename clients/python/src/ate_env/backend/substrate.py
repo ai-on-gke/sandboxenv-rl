@@ -119,7 +119,7 @@ class SubstrateBackendDriver(BackendDriver):
         self.acquire_timeout_s = acquire_timeout_s
         self.ready_timeout_s = ready_timeout_s
         self.tracer_config = tracer_config or TracerConfig()
-        self.tracer_manager, self.tracer = tracer_from_config(self.tracer_config)
+        self.tracer = tracer_from_config(self.tracer_config)
 
         self._loop_runner = loop_runner
         self._owns_loop_runner = loop_runner is None

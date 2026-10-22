@@ -25,7 +25,6 @@ from .tracing import (
     create_tracer_manager,
     initialize_tracer,
     inject_metadata,
-    run_with_context,
 )
 
 __all__ = [
@@ -35,5 +34,4 @@ __all__ = [
     "create_tracer_manager",
     "initialize_tracer",
     "inject_metadata",
-    "run_with_context",
 ]

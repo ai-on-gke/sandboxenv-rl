@@ -29,6 +29,7 @@ from .telemetry.tracing import (
     CLIENT_SPAN_PREFIX,
     _trace_interceptors,
     image_ref_attr,
+    rpc_attrs,
     start_span,
     tracer_from_config,
 )
@@ -45,6 +46,13 @@ def _normalize_target(endpoint: str) -> str:
         if target.startswith(prefix):
             target = target[len(prefix) :]
     return target
+
+
+_ENVIRONMENT_SERVICE = "ateenv.v1alpha.EnvironmentService"
+
+
+def _env_rpc_attrs(method: str, target: str | None) -> dict[str, object]:
+    return rpc_attrs(_ENVIRONMENT_SERVICE, method, target)
 
 
 class _ClientCallDetails(
@@ -144,7 +152,9 @@ class Client:
         self.endpoint = endpoint
         self._auth_token = auth_token or None
         self.tracer_config = tracer_config or TracerConfig()
-        self.tracer_manager, self.tracer = tracer_from_config(self.tracer_config)
+        self.tracer = tracer_from_config(self.tracer_config)
+        # host:port of a channel the client creates; None for a caller-owned one.
+        self._target = None if channel is not None else _normalize_target(endpoint or "")
         if channel is not None:
             self._channel = channel
             self._owns_channel = False
@@ -206,7 +216,8 @@ class Client:
             "env.atespace": atespace,
             "env.template": template_name,
             "env.rootfs_image": image_ref_attr(rootfs_image),
-        }):
+            **_env_rpc_attrs("CreateEnvironment", self._target),
+        }, client_kind=True):
             try:
                 resp = await self._environments.CreateEnvironment(req, metadata=self._auth_metadata())
             except grpc.RpcError as e:
@@ -217,8 +228,11 @@ class Client:
     async def get(self, id: str, *, atespace: str = DEFAULT_ATESPACE) -> EnvironmentInfo:
         """Retrieve the status and configuration of an environment."""
         req = env_pb2.GetEnvironmentRequest(id=id, atespace=atespace)
-        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.get_environment",
-                        {"env.id": id, "env.atespace": atespace}):
+        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.get_environment", {
+            "env.id": id,
+            "env.atespace": atespace,
+            **_env_rpc_attrs("GetEnvironment", self._target),
+        }, client_kind=True):
             try:
                 resp = await self._environments.GetEnvironment(req, metadata=self._auth_metadata())
             except grpc.RpcError as e:
@@ -228,8 +242,11 @@ class Client:
     async def suspend(self, id: str, *, atespace: str = DEFAULT_ATESPACE) -> None:
         """Checkpoint and stop the environment."""
         req = env_pb2.SuspendEnvironmentRequest(id=id, atespace=atespace)
-        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.suspend_environment",
-                        {"env.id": id, "env.atespace": atespace}):
+        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.suspend_environment", {
+            "env.id": id,
+            "env.atespace": atespace,
+            **_env_rpc_attrs("SuspendEnvironment", self._target),
+        }, client_kind=True):
             try:
                 await self._environments.SuspendEnvironment(req, metadata=self._auth_metadata())
             except grpc.RpcError as e:
@@ -238,8 +255,11 @@ class Client:
     async def delete(self, id: str, *, atespace: str = DEFAULT_ATESPACE) -> None:
         """Remove the environment permanently."""
         req = env_pb2.DeleteEnvironmentRequest(id=id, atespace=atespace)
-        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.delete_environment",
-                        {"env.id": id, "env.atespace": atespace}):
+        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.delete_environment", {
+            "env.id": id,
+            "env.atespace": atespace,
+            **_env_rpc_attrs("DeleteEnvironment", self._target),
+        }, client_kind=True):
             try:
                 await self._environments.DeleteEnvironment(req, metadata=self._auth_metadata())
             except grpc.RpcError as e:

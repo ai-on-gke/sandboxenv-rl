@@ -353,7 +353,7 @@ fleet = SandboxFleet(FleetConfig(tracing=TracerConfig(enable_tracing=True)))
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `enable_tracing` | `False` | Emit spans and propagate the trace context. |
-| `trace_service_name` | `"ate-env-client"` | OTel resource `service.name` of the exporter the client installs (see below). Spans are always named `ate_env_client.<op>`. |
+| `trace_service_name` | `"ate-env-client"` | OTel resource `service.name` of the client's own OTLP provider (case 2 below). Spans are always named `ate_env_client.<op>`. |
 
 When tracing is on:
 
@@ -370,20 +370,33 @@ When tracing is on:
 - **Nesting.** Client spans nest under the caller's current span, including
   across the fleet's worker threads and background event loop.
 
-**Global exporter.** If your application has already installed an
-OpenTelemetry SDK `TracerProvider`, the client uses it as is. Otherwise, the
-first time tracing is enabled the client installs a **process-global**
-`TracerProvider` with service name `trace_service_name`. That provider
-batches spans to an OTLP/gRPC exporter and is shut down (flushed) at exit.
-Configure the exporter with the standard OpenTelemetry environment
-variables, for example:
+**Where spans go.** The client never installs the process-global
+OpenTelemetry `TracerProvider`. Its tracers choose a provider each time a span
+starts, so there are two cases:
 
-```bash
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
-export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer <token>"
-# Also: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_EXPORTER_OTLP_INSECURE,
-# OTEL_EXPORTER_OTLP_CERTIFICATE, OTEL_EXPORTER_OTLP_TIMEOUT, ...
-```
+1. **Your application configures OpenTelemetry** (the usual case). Install
+   your SDK `TracerProvider` and exporters as you normally do, before or after
+   you create the client: the order does not matter, also when
+   `OTEL_EXPORTER_OTLP_ENDPOINT` is set. From the moment your provider is
+   installed, client spans go to it and nest under your spans.
+2. **Your application does not configure OpenTelemetry.** Set
+   `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`). On
+   the first client span, the client builds its own `TracerProvider` with
+   service name `trace_service_name`, which batches spans to an OTLP/gRPC
+   exporter and is shut down (flushed) at exit. It is never made the global
+   provider, so you can still install yours later (case 1). Configure the
+   exporter with the standard OpenTelemetry environment variables, for
+   example:
+
+   ```bash
+   export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+   export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer <token>"
+   # Also: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_EXPORTER_OTLP_INSECURE,
+   # OTEL_EXPORTER_OTLP_CERTIFICATE, OTEL_EXPORTER_OTLP_TIMEOUT, ...
+   ```
+
+If neither applies (no provider and no OTLP endpoint), spans are created but
+not exported, and nothing is sent over the network.
 
 Without the extra, `import ate_env` never loads OpenTelemetry. Enabling
 tracing then logs one error naming the missing extra, and the client keeps

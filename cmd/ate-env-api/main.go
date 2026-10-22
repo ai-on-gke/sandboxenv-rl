@@ -49,6 +49,36 @@ func isLoopbackAddr(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// Files that tell a pod its namespace and cluster domain.
+const (
+	resolvConfPath   = "/etc/resolv.conf"
+	podNamespacePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+)
+
+// serviceHostNames returns the in-cluster names of the Service service: the
+// namespace and cluster domain come from the resolv.conf search list, which
+// kubelet writes for each pod; else the namespace comes from POD_NAMESPACE or
+// the ServiceAccount namespace file, without the cluster-domain name. An
+// upgrade that keeps the old Deployment arguments thus keeps these names.
+func serviceHostNames(service string, readFile func(string) ([]byte, error), getenv func(string) string) []string {
+	if service == "" {
+		return nil
+	}
+	var namespace, domain string
+	if b, err := readFile(resolvConfPath); err == nil {
+		namespace, domain = hostcheck.ClusterDNS(string(b))
+	}
+	if namespace == "" {
+		namespace = strings.TrimSpace(getenv("POD_NAMESPACE"))
+	}
+	if namespace == "" {
+		if b, err := readFile(podNamespacePath); err == nil {
+			namespace = strings.TrimSpace(string(b))
+		}
+	}
+	return hostcheck.ServiceHosts(service, namespace, domain)
+}
+
 func main() {
 	var (
 		listen            = flag.String("listen", "0.0.0.0:7777", "address to serve the API on")
@@ -63,18 +93,22 @@ func main() {
 		authTokenFile     = flag.String("auth-token-file", "", "file with a bearer token required from gRPC, MCP and port-proxy callers; re-read when the file changes")
 		wakeBudget        = flag.Duration("wake-budget", apiservice.DefaultWakeBudget, "how long a guest call or a port-proxy request waits for a suspended environment to wake before failing; cold image pulls and cross-region snapshot reads exceed the router's own parking budget")
 		wakeRunningBudget = flag.Duration("wake-running-budget", apiservice.DefaultWakeRunningBudget, "how long a guest call waits when the environment is already RUNNING but the router still answers Unavailable (guest not yet listening vs. path down)")
-		allowedHosts      = flag.String("allowed-hosts", "", "comma-separated host names that HTTP/1.x callers may send in the Host header, next to IP addresses, localhost and names under .localhost, which are always allowed; a leading *. allows the names below it. Other names get 403, which blocks DNS rebinding against the listener, the MCP endpoint and the port proxy. gRPC (h2c) is not checked")
+		allowedHosts      = flag.String("allowed-hosts", "", "comma-separated host names that HTTP callers may send in the Host header, next to IP addresses, localhost, names under .localhost and the names of --service-name, which are always allowed; a leading *. allows the names below it. Other names get 403, which blocks DNS rebinding against the listener, the MCP endpoint and the port proxy. gRPC requests are not checked")
+		serviceName       = flag.String("service-name", "ate-env-api", "name of the Kubernetes Service in front of ate-env-api; its in-cluster names are allowed hosts (<name>, <name>.<namespace>, <name>.<namespace>.svc and <name>.<namespace>.svc.<cluster domain>, with the namespace and cluster domain read from /etc/resolv.conf, else the namespace from POD_NAMESPACE). Empty allows none of them")
 	)
 	flag.Parse()
 
-	hosts, err := hostcheck.New(hostcheck.ParseList(*allowedHosts))
+	serviceHosts := serviceHostNames(*serviceName, os.ReadFile, os.Getenv)
+	if len(serviceHosts) > 0 {
+		log.Printf("hostcheck: allowing the Service names %s", strings.Join(serviceHosts, ", "))
+	}
+	hosts, err := hostcheck.New(append(serviceHosts, hostcheck.ParseList(*allowedHosts)...))
 	if err != nil {
 		log.Fatalf("--allowed-hosts: %v", err)
 	}
 
 	var callerAuth *apiservice.BearerAuth
 	if *authTokenFile != "" {
-		var err error
 		callerAuth, err = apiservice.NewBearerAuthFromFile(*authTokenFile)
 		if err != nil {
 			log.Fatalf("loading --auth-token-file: %v", err)

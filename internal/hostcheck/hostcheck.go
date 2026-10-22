@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package hostcheck refuses HTTP/1.x requests whose Host header names a host
-// the listener does not serve.
+// Package hostcheck refuses requests whose Host header names a host the
+// listener does not serve.
 //
 // This blocks DNS rebinding. A web page on a name the attacker controls can
 // make that name resolve to the listener, for example to a kubectl
@@ -22,9 +22,18 @@
 // page read the answers. Refusing names the listener does not serve stops
 // that, for the MCP endpoint and the port proxy alike.
 //
-// Only HTTP/1.x is checked. Browsers speak HTTP/1.1 to http:// origins and
-// cannot open the prior-knowledge cleartext HTTP/2 (h2c) that gRPC clients
-// use, so h2c requests pass whatever their :authority is.
+// gRPC requests are not checked: HTTP/2 requests whose Content-Type is
+// application/grpc (or application/grpc+proto and the like). gRPC clients
+// send many different authorities, the dial target among them, and always
+// send that content type. A browser request that a front proxy relays over
+// HTTP/2, for example a Gateway or a mesh hop that speaks h2c to the
+// listener, carries another content type and gets the same check as an
+// HTTP/1.x request: Go fills r.Host from :authority on HTTP/2.
+//
+// The check is a browser defense, not an authentication layer. Browsers
+// always send a Host header, which the check reads; a client that sets its
+// own Host, such as curl -H 'Host: x', passes by design. The bearer token of
+// ate-env-api is the control for callers that are not browsers, gRPC included.
 //
 // IP addresses are always allowed: a browser sends an IP address as the Host
 // only when it connected to that address, so no other name is involved.
@@ -130,17 +139,29 @@ func (c *Checker) Allowed(hostport string) bool {
 	return false
 }
 
-// Wrap refuses an HTTP/1.x request whose Host is not allowed with 403 and
-// passes all other requests to next.
+// Wrap refuses a request whose Host is not allowed with 403, except a gRPC
+// request (isGRPC), and passes all other requests to next.
 func (c *Checker) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.ProtoMajor >= 2 || c.Allowed(r.Host) {
+		if isGRPC(r) || c.Allowed(r.Host) {
 			next.ServeHTTP(w, r)
 			return
 		}
 		c.logRefused(r.Host)
-		http.Error(w, fmt.Sprintf("host %q is not served here: ate-env-api answers HTTP/1.x requests only for IP addresses, localhost and the names in --allowed-hosts", r.Host), http.StatusForbidden)
+		http.Error(w, fmt.Sprintf("host %q is not served here: ate-env-api answers HTTP requests only for IP addresses, localhost, its Service names and the names in --allowed-hosts", r.Host), http.StatusForbidden)
 	})
+}
+
+// isGRPC reports whether r is a gRPC request: HTTP/2 with the Content-Type
+// application/grpc, optionally followed by "+" and a codec or by ";"
+// parameters. gRPC-Web (application/grpc-web) does not count: ate-env-api
+// does not serve it, and browsers can send it.
+func isGRPC(r *http.Request) bool {
+	if r.ProtoMajor < 2 {
+		return false
+	}
+	rest, ok := strings.CutPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/grpc")
+	return ok && (rest == "" || rest[0] == '+' || rest[0] == ';')
 }
 
 func (c *Checker) logRefused(host string) {
@@ -155,5 +176,44 @@ func (c *Checker) logRefused(host string) {
 		return
 	}
 	c.logged[host] = struct{}{}
-	log.Printf("hostcheck: refused an HTTP/1.x request for host %q; add it to --allowed-hosts if ate-env-api serves it", host)
+	log.Printf("hostcheck: refused a request for host %q; add it to --allowed-hosts if ate-env-api serves it", host)
+}
+
+// ServiceHosts returns the in-cluster names of the Kubernetes Service name in
+// namespace: name, name.namespace and name.namespace.svc, then
+// name.namespace.svc.clusterDomain when the cluster domain is known. Without
+// a namespace it returns name alone; without a name, nothing.
+func ServiceHosts(name, namespace, clusterDomain string) []string {
+	if name == "" {
+		return nil
+	}
+	if namespace == "" {
+		return []string{name}
+	}
+	svc := name + "." + namespace + ".svc"
+	hosts := []string{name, name + "." + namespace, svc}
+	if clusterDomain != "" {
+		hosts = append(hosts, svc+"."+clusterDomain)
+	}
+	return hosts
+}
+
+// ClusterDNS reads the pod's namespace and the cluster domain from the
+// search list of a resolv.conf. For a pod with the ClusterFirst DNS policy,
+// kubelet writes "<namespace>.svc.<domain>" first, whatever the cluster
+// domain is. It returns empty strings when no search entry has that form.
+func ClusterDNS(resolvConf string) (namespace, clusterDomain string) {
+	for line := range strings.SplitSeq(resolvConf, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != "search" {
+			continue
+		}
+		for _, d := range fields[1:] {
+			ns, domain, ok := strings.Cut(normalize(d), ".svc.")
+			if ok && ns != "" && !strings.Contains(ns, ".") && domain != "" {
+				return ns, domain
+			}
+		}
+	}
+	return "", ""
 }

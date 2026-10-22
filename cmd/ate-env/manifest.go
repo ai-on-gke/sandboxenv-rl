@@ -96,16 +96,8 @@ type manifestConfig struct {
 	apiPort         int32
 	authTokenSecret string
 	// allowedHosts are host names, next to the Service's in-cluster names,
-	// that HTTP/1.x callers may send to ate-env-api (its -allowed-hosts).
+	// that HTTP callers may send to ate-env-api (its -allowed-hosts).
 	allowedHosts []string
-}
-
-// apiAllowedHosts returns the -allowed-hosts value for ate-env-api: the
-// in-cluster names of its Service, then cfg.allowedHosts. Callers that use an
-// IP address or localhost (a port-forward) need no entry.
-func apiAllowedHosts(cfg manifestConfig) []string {
-	svc := apiName + "." + cfg.namespace
-	return append([]string{apiName, svc, svc + ".svc", svc + ".svc.cluster.local"}, cfg.allowedHosts...)
 }
 
 func (c *manifestConfig) resolveImages() error {
@@ -314,7 +306,7 @@ the "template" subcommand: ate-env manifest template`,
 	cmd.Flags().Int32Var(&mCfg.apiReplicas, "api-replicas", 1, "number of API service replicas")
 	cmd.Flags().Int32Var(&mCfg.apiPort, "api-port", 7777, "port the ate-env-api service listens on")
 	cmd.Flags().StringVar(&mCfg.authTokenSecret, "auth-token-secret", "", "Kubernetes Secret name (with key 'token') to mount into ate-env-api and require as a caller bearer token")
-	cmd.Flags().StringSliceVar(&mCfg.allowedHosts, "api-allowed-hosts", nil, "extra host names that HTTP clients may use to reach ate-env-api, e.g. an internal load balancer name (a leading *. allows the names below it); the Service's in-cluster names, IP addresses and localhost are always allowed")
+	cmd.Flags().StringSliceVar(&mCfg.allowedHosts, "api-allowed-hosts", nil, "extra host names that HTTP clients may use to reach ate-env-api, e.g. an internal load balancer name (a leading *. allows the names below it); the Service's in-cluster names, in the cluster's own DNS domain, IP addresses and localhost are always allowed")
 	cmd.Flags().StringVar(&mCfg.workerPool, "workerpool", "", "WorkerPool name (defaults to <template>-workerpool)")
 	cmd.Flags().Int32Var(&mCfg.replicas, "replicas", 5, "number of pre-warmed worker pods")
 
@@ -694,7 +686,13 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 	args := []string{
 		"-listen", fmt.Sprintf("0.0.0.0:%d", cfg.apiPort),
 		"-ateapi-token-file=/var/run/secrets/ateapi/token",
-		"-allowed-hosts=" + strings.Join(apiAllowedHosts(cfg), ","),
+		// ate-env-api allows the Service's in-cluster names itself: it reads
+		// the namespace and the cluster domain from the pod's resolv.conf,
+		// else the namespace from POD_NAMESPACE below.
+		"-service-name=" + apiName,
+	}
+	if len(cfg.allowedHosts) > 0 {
+		args = append(args, "-allowed-hosts="+strings.Join(cfg.allowedHosts, ","))
 	}
 	mounts := []corev1.VolumeMount{{
 		Name:      "ateapi-token",
@@ -754,7 +752,13 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 						Image: cfg.apiImage,
 						// ateapi/atenet default to the in-cluster
 						// Substrate service addresses.
-						Args:         args,
+						Args: args,
+						Env: []corev1.EnvVar{{
+							Name: "POD_NAMESPACE",
+							ValueFrom: &corev1.EnvVarSource{
+								FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+							},
+						}},
 						Ports:        []corev1.ContainerPort{{ContainerPort: cfg.apiPort}},
 						VolumeMounts: mounts,
 						ReadinessProbe: &corev1.Probe{

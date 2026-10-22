@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -112,12 +113,68 @@ func TestWrapRefusesAndLogsOncePerHost(t *testing.T) {
 		t.Errorf("logged %d hosts (max flag %v), want %d and the flag set", len(c.logged), c.loggedMax, maxLogged)
 	}
 
-	// HTTP/2 requests pass whatever their authority.
-	req := httptest.NewRequest("GET", "http://attacker.example:7777/", nil)
-	req.ProtoMajor, req.ProtoMinor = 2, 0
-	h.ServeHTTP(httptest.NewRecorder(), req)
-	if reached != 1 {
-		t.Errorf("HTTP/2 request not passed through")
+	// Only gRPC passes whatever its authority: HTTP/2 with an application/grpc
+	// content type. A browser request relayed over HTTP/2 is checked.
+	for _, tc := range []struct {
+		proto       int
+		contentType string
+		pass        bool
+	}{
+		{2, "application/grpc", true},
+		{2, "application/grpc+proto", true},
+		{2, "Application/GRPC; charset=utf-8", true},
+		{2, "", false},
+		{2, "text/html", false},
+		{2, "application/json", false},
+		{2, "application/grpc-web+proto", false},
+		{2, "application/grpcx", false},
+		{1, "application/grpc", false},
+	} {
+		reached = 0
+		req := httptest.NewRequest("POST", "http://attacker.example:7777/", nil)
+		req.ProtoMajor, req.ProtoMinor = tc.proto, 0
+		if tc.contentType != "" {
+			req.Header.Set("Content-Type", tc.contentType)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if pass := reached == 1; pass != tc.pass {
+			t.Errorf("HTTP/%d %q with a foreign host: passed %v (code %d), want %v", tc.proto, tc.contentType, pass, rec.Code, tc.pass)
+		}
+	}
+}
+
+func TestClusterDNS(t *testing.T) {
+	for _, tc := range []struct {
+		name, conf, ns, domain string
+	}{
+		{"kubelet", "search team-env.svc.cluster.local svc.cluster.local cluster.local us-central1-c.c.proj.internal\nnameserver 10.0.0.10\noptions ndots:5\n", "team-env", "cluster.local"},
+		{"custom domain", "nameserver 10.0.0.10\nsearch ate-env.svc.corp.k8s svc.corp.k8s corp.k8s\n", "ate-env", "corp.k8s"},
+		{"trailing dot and case", "search Team-Env.svc.Cluster.Local.\n", "team-env", "cluster.local"},
+		{"later entry", "search example.com ate-env.svc.cluster.local\n", "ate-env", "cluster.local"},
+		{"not a pod", "search example.com\nnameserver 1.1.1.1\n", "", ""},
+		{"svc without namespace", "search svc.cluster.local\n", "", ""},
+		{"empty", "", "", ""},
+	} {
+		ns, domain := ClusterDNS(tc.conf)
+		if ns != tc.ns || domain != tc.domain {
+			t.Errorf("%s: ClusterDNS = %q, %q; want %q, %q", tc.name, ns, domain, tc.ns, tc.domain)
+		}
+	}
+}
+
+func TestServiceHosts(t *testing.T) {
+	if got, want := ServiceHosts("ate-env-api", "team-env", "corp.k8s"), []string{"ate-env-api", "ate-env-api.team-env", "ate-env-api.team-env.svc", "ate-env-api.team-env.svc.corp.k8s"}; !slices.Equal(got, want) {
+		t.Errorf("with a domain: %q, want %q", got, want)
+	}
+	if got, want := ServiceHosts("ate-env-api", "team-env", ""), []string{"ate-env-api", "ate-env-api.team-env", "ate-env-api.team-env.svc"}; !slices.Equal(got, want) {
+		t.Errorf("without a domain: %q, want %q", got, want)
+	}
+	if got, want := ServiceHosts("ate-env-api", "", ""), []string{"ate-env-api"}; !slices.Equal(got, want) {
+		t.Errorf("without a namespace: %q, want %q", got, want)
+	}
+	if got := ServiceHosts("", "team-env", "cluster.local"); got != nil {
+		t.Errorf("without a name: %q, want none", got)
 	}
 }
 
@@ -193,6 +250,32 @@ func TestListenerStack(t *testing.T) {
 		if code, body := get(host, "/v1alpha/envs/dev1/ports/8000/"); refused(code, body) {
 			t.Errorf("host %s on the path-form proxy: refused by the host check", host)
 		}
+	}
+
+	// A browser request that a front proxy relays over h2c carries a foreign
+	// :authority and no gRPC content type: refused like HTTP/1.x.
+	var h2c http.Protocols
+	h2c.SetUnencryptedHTTP2(true)
+	h2Client := &http.Client{Transport: &http.Transport{Protocols: &h2c}}
+	for _, path := range []string{"/healthz", "/v1alpha/envs/dev1/mcp", "/v1alpha/envs/dev1/ports/8000/"} {
+		req, _ := http.NewRequest("GET", "http://"+addr+path, nil)
+		req.Host = "attacker.example:7777"
+		resp, err := h2Client.Do(req)
+		if err != nil {
+			t.Fatalf("h2c GET %s: %v", path, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.ProtoMajor != 2 || !refused(resp.StatusCode, string(b)) {
+			t.Errorf("h2c rebinding host on %s: got HTTP/%d %d %q, want the hostcheck 403 over HTTP/2", path, resp.ProtoMajor, resp.StatusCode, b)
+		}
+	}
+	req, _ := http.NewRequest("GET", "http://"+addr+"/healthz", nil)
+	req.Host = "ate-env-api.ate-env:7777"
+	if resp, err := h2Client.Do(req); err != nil || resp.StatusCode != http.StatusOK {
+		t.Errorf("h2c with an allowed host: %v, %v; want 200", resp, err)
+	} else {
+		resp.Body.Close()
 	}
 
 	// gRPC over h2c with a foreign :authority still works.

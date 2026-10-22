@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 	"testing"
 
@@ -705,26 +706,36 @@ func allowedHostsArg(dep *appsv1.Deployment) (string, bool) {
 
 func TestBuildAPIDeploymentAllowedHosts(t *testing.T) {
 	cfg := testManifestConfig()
-	got, ok := allowedHostsArg(buildAPIDeployment(cfg))
-	want := "ate-env-api,ate-env-api.ate-env,ate-env-api.ate-env.svc,ate-env-api.ate-env.svc.cluster.local"
-	if !ok || got != want {
-		t.Errorf("-allowed-hosts = %q (present %v), want %q", got, ok, want)
+	dep := buildAPIDeployment(cfg)
+	c := dep.Spec.Template.Spec.Containers[0]
+	// ate-env-api derives the Service names itself (in the cluster's own
+	// domain); the manifest names the Service and passes the namespace.
+	if !slices.Contains(c.Args, "-service-name="+apiName) {
+		t.Errorf("args = %v, want -service-name=%s", c.Args, apiName)
+	}
+	if got, ok := allowedHostsArg(dep); ok {
+		t.Errorf("-allowed-hosts=%q rendered without --api-allowed-hosts, want none", got)
+	}
+	ns := false
+	for _, e := range c.Env {
+		if e.Name == "POD_NAMESPACE" && e.ValueFrom != nil && e.ValueFrom.FieldRef != nil && e.ValueFrom.FieldRef.FieldPath == "metadata.namespace" {
+			ns = true
+		}
+	}
+	if !ns {
+		t.Errorf("env = %+v, want POD_NAMESPACE from metadata.namespace", c.Env)
 	}
 
-	cfg.namespace = "team-env"
 	cfg.allowedHosts = []string{"lb.internal.example", "*.corp.example"}
-	got, _ = allowedHostsArg(buildAPIDeployment(cfg))
+	got, _ := allowedHostsArg(buildAPIDeployment(cfg))
 	checker, err := hostcheck.New(hostcheck.ParseList(got))
 	if err != nil {
 		t.Fatalf("rendered -allowed-hosts=%q does not parse: %v", got, err)
 	}
-	for _, host := range []string{"ate-env-api:7777", "ate-env-api.team-env:7777", "ate-env-api.team-env.svc.cluster.local:7777", "lb.internal.example", "api.corp.example:7777"} {
+	for _, host := range []string{"lb.internal.example", "api.corp.example:7777"} {
 		if !checker.Allowed(host) {
 			t.Errorf("rendered -allowed-hosts=%q refuses %q", got, host)
 		}
-	}
-	if checker.Allowed("ate-env-api.ate-env:7777") {
-		t.Errorf("rendered -allowed-hosts=%q allows the default namespace's name in namespace team-env", got)
 	}
 }
 
@@ -740,7 +751,7 @@ func TestManifestCommandAPIAllowedHosts(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute manifest: %v", err)
 	}
-	if want := "-allowed-hosts=ate-env-api,ate-env-api.ate-env,ate-env-api.ate-env.svc,ate-env-api.ate-env.svc.cluster.local,lb.internal.example,*.corp.example"; !strings.Contains(buf.String(), want) {
+	if want := "-allowed-hosts=lb.internal.example,*.corp.example"; !strings.Contains(buf.String(), want) {
 		t.Errorf("manifest output lacks %q:\n%s", want, buf.String())
 	}
 

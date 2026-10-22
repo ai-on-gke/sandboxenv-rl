@@ -49,7 +49,7 @@ On the cluster:
    `server closed the stream without sending trailers`.
 2. **The `ate-env` system deployed** from this repo at or after the `ateenv.v1alpha` proto
    move: namespace, WorkerPool, ActorTemplate(s), and the `ate-env-api` service (see the
-   [root README](../../README.md#quickstart)).
+   [root README](../../README.md#deployment-guide)).
 
    ```bash
    ate-env manifest \

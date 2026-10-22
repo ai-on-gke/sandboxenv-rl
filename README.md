@@ -1,67 +1,137 @@
-# 📦 Agent Substrate Environment
+# sandboxenv-rl
 
 > [!WARNING]
 > This is an alpha API and is likely to change until v1.0 is released.
 
-An environment service on top of [Agent Substrate](https://github.com/agent-substrate/substrate): isolated, stateful execution environments
-driven remotely with **command execution**, **filesystem operations**, and **built-in MCP tools**.
+Sandboxed execution environments for reinforcement learning (RL) on
+[Agent Substrate](https://github.com/agent-substrate/substrate). Each rollout, eval task or agent
+episode gets its own isolated, stateful environment: a Substrate actor that runs in gVisor and is
+driven remotely through a gRPC API, a CLI, a Python fleet SDK or MCP.
 
-Each environment is a Substrate *actor* running in an isolated container.
-Substrate provides the heavy lifting — snapshotting, scheduling,
-multiplexing many idle environments onto a small worker pool, and routing —
-while this project adds the environment-shaped API on top.
+RL jobs create many environments per step and leave most of them idle while the model generates.
+Substrate fits that shape. A suspended environment lives as a snapshot and holds no worker, and the
+next command resumes it, thus a job can park its environments between steps. Later environments on
+the same image restore a golden snapshot instead of booting. This repo adds the environment API,
+the fleet SDK, the framework integrations and the benchmarks on top.
 
-## Overview
+## What changed
+
+This repo started in October 2026 as a copy of [agent-substrate/env](https://github.com/agent-substrate/env),
+with its history, its pull requests (recreated here with an `[env#N]` title prefix) and its open
+issues. agent-substrate/env is being repurposed, and the RL work continues here. The components keep
+their ate-env names: the `ate-env`, `ate-env-api` and `ate-env-guest` binaries and images, the
+`ate_env` Python package and the `ateenv.v1alpha` API. The Go module path is still
+`github.com/agent-substrate/env`.
+
+The focus moves from a general environment service to RL training and evaluation:
+
+| Area | What it adds |
+|---|---|
+| Fleet SDK | `SandboxFleet` and `AsyncSandboxFleet` in [`clients/python`](clients/python/README.md): acquire sandboxes for tasks by image, run tasks with the `naive`, `sliding` or `pipelined` strategy, pre-warm images, release and recycle. |
+| Any task image | `rootfs_image` runs a digest-pinned image unmodified: `ate-env-api` derives an ActorTemplate per image and mounts the guest into it as an image volume. Runtime layers and sidecars add a second runtime to any image ([docs/rootfs-images](docs/rootfs-images/README.md)). |
+| Daemons inside an environment | A port proxy on `ate-env-api` reaches any port in an environment by header or by path, WebSockets included ([details](#reaching-a-service-inside-an-environment)). |
+| Framework integrations | A [NeMo Gym](integrations/nemo-gym/README.md) sandbox provider and a [GRPO](examples/grpo/README.md) training loop on TRL. |
+| Benchmarks | A [SWE-bench Verified loader](benchmarking/swebench/README.md) that drives real task images the way an RL job does, and the [design](internal/benchmarking/DESIGN.md) of the benchmark system. |
+| Platform | Built against Substrate `ddb46651`: the WorkerPool chooses the sandbox, each template selects its pool by label, suspends are durable, and `ate-env-api` runs as its own identity under Substrate authorization. The guest runs as a PID 1 init that reaps orphans, and it allocates PTYs. |
+
+## Architecture
 
 ```
  ╭──────────────╮    ╭──────────────╮ lifecycle  ╭────────────╮
  │    Clients   │    │              ├───────────▶│   ateapi   │ Substrate control plane
  │  ate-env CLI ├───▶│ ate-env-api  │            ╰────────────╯
- ╰──────────────╯    │ (API server) │ guest ops  ╭────────────╮     ╭──────────────────────╮
-                     │              ├───────────▶│   atenet   ├────▶│ actor                │
+ │  Python SDK  │    │ (API server) │ guest ops  ╭────────────╮     ╭──────────────────────╮
+ ╰──────────────╯    │              ├───────────▶│   atenet   ├────▶│ actor                │
                      ╰──────────────╯ (shell/mcp)│   router   │     │  └ ate-env-guest     │
-                                                 ╰────────────╯     │  /readyz, /v1alpha/* │
+                                      port proxy ╰────────────╯     │  /readyz, /v1alpha/* │
                                                                     ╰──────────────────────╯
 ```
 
-- **`cmd/ate-env`** — CLI for managing environments, executing remote commands, and performing file I/O.
-- **`cmd/ate-env-api`** — The API service that manages environments and proxies remote guest requests.
-- **`cmd/ate-env-guest`** — The daemon server running inside each actor serving command executions, file read/write, and built-in MCP tools.
-- **`clients/go`** — The Go client library to manage environments, run commands, and perform file operations.
-- **`clients/python`** — Python client for environment lifecycle management and batch sandbox orchestration ([README](clients/python/README.md)).
-- **`integrations/nemo-gym`** — A [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) sandbox provider that runs rollout sandboxes as environments, built on the Python client ([README](integrations/nemo-gym/README.md)).
+| Path | What it is |
+|---|---|
+| [`cmd/ate-env`](cmd/ate-env) | CLI: create, suspend and delete environments, run commands, move files, and print the Kubernetes and Substrate manifests. |
+| [`cmd/ate-env-api`](cmd/ate-env-api) | The API service: environment lifecycle, guest calls, MCP and the port proxy. |
+| [`cmd/ate-env-guest`](cmd/ate-env-guest) | The daemon inside each environment: processes and files. |
+| [`clients/python`](clients/python/README.md) | Python client, import name `ate_env`: `Client` and `Env` for single environments, and the fleet SDK. |
+| [`clients/go`](clients/go) | Go client. |
+| [`integrations/`](#integrations) | Framework integrations. |
+| [`examples/`](#examples) | Runnable examples. |
+| [`benchmarking/`](benchmarking/swebench/README.md), [`cmd/benchmarking`](cmd/benchmarking), [`internal/benchmarking`](internal/benchmarking/DESIGN.md) | The SWE-bench loader, its scripts and the benchmark design. |
+| [`docs/`](docs) | Rootfs images and runtime layers, and how releases are cut. |
 
-## Installation
+## Examples
 
-Download the `ate-env` binary for your platform from the
-[latest release](https://github.com/agent-substrate/env/releases/latest). Release
-binaries know the digests of the `ate-env-api` and `ate-env-guest` images
-published with that release, so the commands below need no image flags for
-this repo's images. Building from source works too, but then `--api-image` and
-`--guest-image` must be given:
+| Example | What it shows |
+|---|---|
+| [`examples/grpo`](examples/grpo/README.md) | A real RL loop: TRL's GRPOTrainer trains Qwen2.5-0.5B on MBPP, and each completion runs in an environment that computes the reward. Covers the park/wake pattern, with the fleet suspended after each step. CPU only. |
+| [`examples/runtime-layers`](examples/runtime-layers/README.md) | An unmodified rootfs image with a second runtime injected as a layer and supervised as a sidecar. |
+| [`examples/mcp`](examples/mcp/main.go) | Go: connect to an environment's MCP endpoint, list the tools and call them. |
+| [`examples/guest-daemon`](examples/guest-daemon/README.md) | Go: run the guest gRPC services standalone, without a cluster. |
+
+## Integrations
+
+| Integration | Framework | What it does |
+|---|---|---|
+| [`integrations/nemo-gym`](integrations/nemo-gym/README.md) | [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) | Sandbox provider `substrate`, registered through the `nemo_gym.sandbox_providers` entry point, with no change to NeMo Gym. `endpoint()` reaches a daemon inside the sandbox through the port proxy. |
+
+## Benchmarks
+
+[`swebench-loader`](benchmarking/swebench/README.md) drives SWE-bench Verified task images through
+the API the way a simulated RL job does: `eval` mode creates, replays, grades and deletes each task,
+and `steps` mode creates a fleet once and parks it between training steps. Image-delivery workloads
+compare image pull, image streaming and other loaders on the same images. The report breaks down
+what each phase cost.
+[`internal/benchmarking/DESIGN.md`](internal/benchmarking/DESIGN.md) specifies the benchmark system.
+
+## Get started
+
+You need a cluster with Agent Substrate at or after
+[`0443aec3`](https://github.com/agent-substrate/substrate/commit/0443aec3), a snapshots bucket,
+`kubectl` with `kubectl-ate`, Go, [ko](https://ko.build), and Python 3.10 or later for the SDK. This
+repo publishes no release binaries or images yet, thus build them:
 
 ```bash
-go install github.com/agent-substrate/env/cmd/ate-env@latest
+git clone https://github.com/ai-on-gke/sandboxenv-rl && cd sandboxenv-rl
+go install ./cmd/ate-env
+make images ATE_ENV_IMAGE_REPO=<registry>   # prints --guest-image and --api-image
 ```
 
-## Images
+Deploy, and register a template ([deployment guide](#deployment-guide) explains each step):
 
-Each release publishes two images to GitHub Container Registry, multi-platform,
-signed, and meant to be used by digest:
+```bash
+kubectl ate create atespace ate-env
+ate-env manifest access-policy | kubectl ate create access-policy -a ate-env -f -
+ate-env manifest --api-image <api-image> --worker-image <ateworker-gvisor-image> | kubectl apply -f -
+ate-env manifest template --guest-image <guest-image> --snapshots-bucket <object-storage-url> \
+  | kubectl-ate create actor-template -f -
+```
 
-| image | runs |
-|---|---|
-| `ghcr.io/agent-substrate/env/ate-env-api` | the API service, in the cluster |
-| `ghcr.io/agent-substrate/env/ate-env-guest` | inside every environment actor |
+Try an environment:
 
-The digests are in the release notes and in the `images_<tag>.txt` asset; the
-release's `ate-env` binary defaults to them. The worker image
-(`--worker-image`, `ateworker-gvisor`) comes from the
-[Substrate repo](https://github.com/agent-substrate/substrate) and must match the
-Substrate version on your cluster. See [docs/release.md](docs/release.md) for
-verification, pinning and how releases are cut.
+```bash
+kubectl port-forward -n ate-env svc/ate-env-api 7777:7777 &
+ate-env create dev1
+ate-env dev1 shell 'echo hello from $(hostname)'
+ate-env delete dev1
+```
 
-## Quickstart
+Drive environments from Python with the fleet SDK (`pip install ./clients/python`). Leaving the
+`with` block deletes everything the fleet created:
+
+```python
+from ate_env import FleetConfig, SandboxFleet, Task
+
+with SandboxFleet(FleetConfig(endpoint="127.0.0.1:7777")) as fleet:
+    handle = fleet.acquire(Task(id="t1", image="docker.io/library/python@sha256:<digest>"))
+    print(handle.exec(["python3", "-c", "print(6 * 7)"]).stdout)
+    handle.write_file("/tmp/answer.txt", "42\n")
+    print(handle.read_file_bytes("/tmp/answer.txt"))
+    handle.release()
+```
+
+Then pick an [example](#examples) or an [integration](#integrations).
+
+## Deployment guide
 
 Prerequisites: a cluster with [Agent Substrate](https://github.com/agent-substrate/substrate)
 installed and a snapshots bucket. ate-env is built against Substrate
@@ -70,7 +140,8 @@ installed and a snapshots bucket. ate-env is built against Substrate
 [`0443aec3`](https://github.com/agent-substrate/substrate/commit/0443aec3) (2026-10-17): from that
 commit the WorkerPool alone chooses the sandbox (`spec.sandboxClasses`), the ActorTemplate names
 none, and Substrate rejects a template that still sends `sandboxConfig`, while an older Substrate
-requires one. Use an ate-env from before this bump with an older Substrate. Because the template no
+requires one. With an older Substrate, use ate-env from before the Substrate bump (merge commit
+`a21ead9`). Because the template no
 longer names a class, an actor booting without a snapshot can land on any pool whose labels its
 template's `workerSelector` matches, and on any pool at all without a selector. `ate-env` labels its
 WorkerPool `ate-env/workerpool: <pool>` and each template selects that label, thus actors stay on
@@ -78,7 +149,7 @@ their pool and its sandbox class; `--workerpool` on `ate-env manifest template` 
 it defaults to `default-template-workerpool`, the pool `ate-env manifest` creates by default, whatever
 the template is named. Pass it when you deploy with another `--template` or `--workerpool`. The templates also use
 `snapshotConfig` and `wakeupProbe` and declare CPU and memory limits, and `--worker-image` must be the
-`ateworker-gvisor` image published by the same Substrate install.
+`ateworker-gvisor` image built from the Substrate version on the cluster.
 
 `ate-env-api` suspends synchronously: a suspend returns once the snapshot is in object storage, thus a
 suspended environment survives the loss of its node. Substrate's own default became asynchronous in
@@ -92,11 +163,12 @@ When you upgrade an existing cluster across these changes:
 
 - Create the atespace and the access policy (step 1) before you apply the new manifest. Without them
   `ate-env-api` fails at startup with `PermissionDenied` while it checks the default atespace.
-- Base templates registered before keep working, because Substrate drops their old `sandboxConfig`
-  when it stores them, but they have no `workerSelector`. On a cluster with more than one
-  WorkerPool, register them again (delete the base and its `<base>-<12 hex digits>` derived
-  templates, then `ate-env manifest template`), or their actors can boot on another pool. Apply the
-  new manifest first, so the pool carries the label the templates select.
+- Base templates registered before keep working, because Substrate keeps their old `sandboxConfig`
+  as an unknown field and drops it when it reads them, but they have no `workerSelector`. On a
+  cluster with more than one WorkerPool, register them again (delete the base and its
+  `<base>-<12 hex digits>` derived templates, then `ate-env manifest template`), or their actors
+  can boot on another pool. Apply the new manifest first, so the pool carries the label the
+  templates select.
 - A base registered before the CPU and memory limits (Substrate before
   [`c58f374a`](https://github.com/agent-substrate/substrate/commit/c58f374a)) still needs registering
   again: Substrate cannot update an ActorTemplate in place, thus each template `ate-env-api` derives
@@ -105,8 +177,8 @@ When you upgrade an existing cluster across these changes:
 
 ### 1. Deploy the Kubernetes Resources
 
-Give `ate-env-api` access to its atespace, once, as an owner of the atespace (on a stock install the
-default `kubectl-ate` identity is a bootstrap owner):
+Give `ate-env-api` access to its atespace, once, as a global owner (on a stock install the default
+`kubectl-ate` identity is a bootstrap owner, which is a global owner):
 
 ```bash
 kubectl ate create atespace ate-env
@@ -121,14 +193,15 @@ environments in.
 Deploy the namespace, worker pool, ServiceAccount and API service:
 
 ```bash
-# With a release binary the API image defaults to the release's. The worker
+# --api-image is the ate-env-api image that `make images` printed. The worker
 # image is ateworker-gvisor from the Substrate repo at your cluster's version; in
-# that checkout, `go run ./cmd/ate-setup publish worker-images` pushes it and
-# prints the digest-pinned ref. Use the digest: a :latest tag is whatever was
-# built last, and a stale worker image registers workers with no capacity.
+# that checkout, `go run ./cmd/ate-setup publish worker-images` pushes the worker
+# images and prints their digest-pinned refs. Use the digest: a :latest tag is
+# whatever was built last, and a stale worker image registers workers with no
+# capacity.
 ate-env manifest \
+  --api-image      <registry>/ate-env-api@sha256:<digest> \
   --worker-image   <registry>/ateworker-gvisor@sha256:<digest> | kubectl apply -f -
-# From a source build, add: --api-image ghcr.io/agent-substrate/env/ate-env-api@sha256:<digest>
 
 # Ensure that the pods are running:
 kubectl get pods -n ate-env
@@ -137,7 +210,8 @@ kubectl get pods -n ate-env
 `ate-env-api` waits for a suspended environment to wake before forwarding a guest call, up to
 `--wake-budget` (default 2m; cold image pulls and cross-region snapshot reads exceed the router's own
 parking budget) and, once the control plane reports the environment RUNNING, up to
-`--wake-running-budget` (default 20s). Both are flags on the API deployment.
+`--wake-running-budget` (default 20s). Both are flags of the `ate-env-api` binary; `ate-env manifest`
+does not set them, thus add them to the Deployment's arguments to change them.
 
 By default `ate-env manifest` deploys `ate-env-api` without caller authentication for use over
 `kubectl port-forward`. Before exposing `ate-env-api` beyond loopback (e.g. through an internal
@@ -154,15 +228,15 @@ for example through an internal LoadBalancer, put TLS termination or a mesh with
 
 ### 2. Register the ActorTemplate in Substrate
 
-Substrate manages ActorTemplates directly in its control plane rather than Kubernetes CRDs. Use `ate-env manifest template` to generate the Substrate ActorTemplate manifest:
-
-Templates live in the `ate-env` atespace, which `ate-env-api` creates when it starts. Register templates after the `ate-env-api` pod is Running, or create the atespace yourself first with `kubectl-ate create atespace ate-env`.
+Substrate manages ActorTemplates directly in its control plane rather than Kubernetes CRDs, and the
+templates live in the `ate-env` atespace that step 1 creates. Use `ate-env manifest template` to
+generate the Substrate ActorTemplate manifest:
 
 ```bash
-# With a release binary the guest image defaults to the release's.
+# --guest-image is the ate-env-guest image that `make images` printed.
 ate-env manifest template \
+  --guest-image    <registry>/ate-env-guest@sha256:<digest> \
   --snapshots-bucket <object-storage-url> | kubectl-ate create actor-template -f -
-# From a source build, add: --guest-image ghcr.io/agent-substrate/env/ate-env-guest@sha256:<digest>
 ```
 
 Each actor gets 2 CPUs and 4 GiB unless you pass `--cpu` and `--memory` (Kubernetes quantities such as
@@ -283,7 +357,8 @@ Available Commands:
   suspend     Suspend an environment
 
 Flags:
-  -h, --help   help for ate-env
+  -h, --help      help for ate-env
+  -v, --version   version for ate-env
 
 Use "ate-env [command] --help" for more information about a command.
 
@@ -292,6 +367,31 @@ Manifest generates Kubernetes manifests for everything environments need on
 a cluster that already runs the Agent Substrate system: the target
 namespace, a WorkerPool of pre-warmed workers, and the ate-env-api service.
 It prints YAML to stdout without touching the cluster; apply it with kubectl.
+
+To generate the Substrate ActorTemplate manifest (for kubectl-ate), use
+the "template" subcommand: ate-env manifest template
+
+Usage:
+  ate-env manifest [flags]
+  ate-env manifest [command]
+
+Available Commands:
+  access-policy Generate the Substrate access policy that lets ate-env-api manage environments
+  template      Generate Substrate ActorTemplate manifest
+
+Flags:
+      --api-image string      digest-pinned ate-env-api image for the API service (required: this ate-env was built from source; release binaries default to the image published with the release, see docs/release.md)
+      --api-port int32        port the ate-env-api service listens on (default 7777)
+      --api-replicas int32    number of API service replicas (default 1)
+      --ateom-image string    alias for --worker-image, kept from before Substrate renamed ateom to ateworker
+  -h, --help                  help for manifest
+      --namespace string      Kubernetes namespace to deploy into (default "ate-env")
+      --replicas int32        number of pre-warmed worker pods (default 5)
+      --template string       ActorTemplate name (default "default-template")
+      --worker-image string   digest-pinned worker image for the worker pool, e.g. ateworker-gvisor built from the Substrate repo
+      --workerpool string     WorkerPool name (defaults to <template>-workerpool)
+
+Use "ate-env manifest [command] --help" for more information about a command.
 ```
 
 ## API
@@ -312,21 +412,22 @@ Manages the lifecycle of isolated execution environments (defined in [`proto/ate
 
 ### ProcessService
 
-Manages process execution, I/O streaming, and signals inside the environment container (defined in [`proto/ateenv/v1alpha/guest.proto`](proto/ateenv/v1alpha/guest.proto)). Requests are proxied by `ate-env-api` directly to the `ate-env-guest` daemon:
+Manages process execution, I/O streaming, and signals inside the environment container (defined in [`proto/ateenv/v1alpha/guest.proto`](proto/ateenv/v1alpha/guest.proto)). `ate-env-api` forwards requests through the Substrate router to the `ate-env-guest` daemon in the environment, and wakes a suspended environment first:
 
 | RPC | Description |
 | --- | ----------- |
-| `StartProcess` | Launches a process (optionally with a stdin pipe and a timeout) and returns the `Process` resource |
+| `StartProcess` | Launches a process (optionally with a stdin pipe, a PTY and a timeout) and returns the `Process` resource |
 | `GetProcess` | Retrieves the process state, exit code, and timestamps |
 | `StreamProcessOutput` | Streams stdout and stderr chunks; with `follow`, ends with an `exit` message carrying the final `Process` |
 | `WriteProcessInput` | Streams bytes to the process's stdin; a message with `close` sends EOF |
 | `SignalProcess` | Delivers a POSIX signal (`TERM`, `INT`, `KILL`, `USR1`, ...) to the process group |
+| `ResizeProcess` | Sets the terminal rows and columns of a process started with a PTY and delivers `SIGWINCH` to its foreground process group |
 
 `exit_code` follows the shell convention: the process's exit code, or 128 + signal number if it was killed by a signal. To wait for a process without receiving its output, follow the output stream with offsets past the end of the spool.
 
 ### FileSystemService
 
-Provides chunked streaming file reading and writing within the environment container without unbounded memory usage (defined in [`proto/ateenv/v1alpha/guest.proto`](proto/ateenv/v1alpha/guest.proto)). Requests are proxied by `ate-env-api` directly to the `ate-env-guest` daemon:
+Provides chunked streaming file reading and writing within the environment container without unbounded memory usage (defined in [`proto/ateenv/v1alpha/guest.proto`](proto/ateenv/v1alpha/guest.proto)). `ate-env-api` forwards requests through the Substrate router to the `ate-env-guest` daemon in the environment, and wakes a suspended environment first:
 
 | RPC | Description |
 | --- | ----------- |
@@ -395,16 +496,14 @@ MCP endpoint included.
 ## Built-in MCP Server
 
 The API exposes a streamable MCP endpoint at `POST /v1alpha/envs/{id}/mcp` serving built-in tools.
+Outside the `ate-env` atespace, add `?atespace=<name>` to the URL.
 
 ### Available Tools
 
 | Tool | Category | Description |
 | ---- | -------- | ----------- |
-| `read_file` | Filesystem | Read a text file with optional line numbers or line ranges |
+| `read_file` | Filesystem | Read a file |
 | `write_file` | Filesystem | Create or overwrite a file |
-| `edit_file` | Filesystem | Replace exact text matching target content in a file |
-| `glob` | Filesystem | Search for files matching glob patterns |
-| `grep` | Filesystem | Search for text or regular expressions across files |
 | `shell` | Shell | Run a shell command line inside the environment |
 
 ### JSON-RPC Over HTTP
@@ -459,18 +558,23 @@ curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
      }'
 ```
 
-## Examples
-
-For complete runnable Go programs:
-- **MCP**: See [mcp](examples/mcp/main.go) to connect to an environment's MCP endpoint, discover tools, and execute tool calls.
-- **Guest Daemon**: See [guest-daemon](examples/guest-daemon/main.go) to run a standalone in-actor gRPC service for asynchronous process execution and chunked file transfer.
-
-For using environments from a framework, see [integrations/nemo-gym](integrations/nemo-gym/README.md): a NeMo Gym sandbox provider registered through the `nemo_gym.sandbox_providers` entry point.
-
 ## Cleanup
 
 ```bash
-# Delete the ate-env namespace to remove all components:
+# Delete each environment while ate-env-api still runs (list them with
+# `kubectl ate get actor -a ate-env`):
+ate-env delete <id>
+
+# Remove the namespace: the WorkerPool, the ServiceAccount and ate-env-api.
 kubectl delete ns ate-env
-kubectl ate delete actor-template --atespace ate-env default-template
+
+# Delete each template, including the <base>-<12 hex digits> templates that
+# ate-env-api derived per rootfs image (list them with
+# `kubectl ate get actor-template -a ate-env`). Each delete also removes the
+# template's golden snapshot.
+kubectl ate delete actor-template -a ate-env default-template
+
+# Remove the access policy, then the atespace (this fails while any actor remains).
+kubectl ate delete access-policy -a ate-env
+kubectl ate delete atespace ate-env
 ```

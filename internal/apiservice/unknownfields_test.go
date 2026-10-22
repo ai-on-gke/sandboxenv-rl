@@ -17,8 +17,12 @@ package apiservice_test
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/agent-substrate/env/guest"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
@@ -86,8 +90,9 @@ func TestStreamsRejectUnknownFields(t *testing.T) {
 	if _, err := te.envClient.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "guest-unknown"}); err != nil {
 		t.Fatalf("CreateEnvironment: %v", err)
 	}
+	workspace := t.TempDir()
 	grpcGuestServer, cleanup, err := guest.NewServer(guest.Config{
-		Workspace:        t.TempDir(),
+		Workspace:        workspace,
 		EnableProcess:    true,
 		EnableFileSystem: true,
 	})
@@ -111,6 +116,12 @@ func TestStreamsRejectUnknownFields(t *testing.T) {
 	_ = ws.Send(withUnknown(&ateenvv1alpha.WriteFileRequest{Chunk: []byte("b")}, 42))
 	_, err = ws.CloseAndRecv()
 	wantUnknownFields(t, err, "/ateenv.v1alpha.FileSystemService/WriteFile", "WriteFileRequest carries field numbers 42")
+	// The rejection ends the call but does not undo the first chunk: the guest
+	// can already hold it (it truncates the file on the first chunk). The
+	// rejected chunk never reaches the guest.
+	if got, err := os.ReadFile(filepath.Join(workspace, "f.txt")); err == nil && strings.Contains(string(got), "b") {
+		t.Errorf("f.txt = %q: the rejected chunk reached the guest", got)
+	}
 
 	// Server streaming: the single request is checked too.
 	rs, err := te.fsClient.ReadFile(envCtx, withUnknown(&ateenvv1alpha.ReadFileRequest{Path: "f.txt"}, 9))
@@ -130,5 +141,45 @@ func TestStreamsRejectUnknownFields(t *testing.T) {
 	}
 	if resp, err := ws.CloseAndRecv(); err != nil || resp.GetBytesWritten() != 2 {
 		t.Fatalf("WriteFile without unknown fields: %v, %v", resp, err)
+	}
+}
+
+// A client stream whose first message the API rejects does not wake a
+// suspended environment: the API reads the first message before it calls the
+// guest, and the wake probe would go through the router.
+func TestRejectedFirstStreamMessageDoesNotWake(t *testing.T) {
+	te := newFullTestEnv(t)
+	envCtx := registerGuest(t, te, "asleep")
+	te.control.SetState("asleep", ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	var routed atomic.Int32
+	te.router.Running = func(id string) bool {
+		routed.Add(1)
+		return te.control.Status(id) == ateapipb.ActorState_ACTOR_STATE_RUNNING
+	}
+	te.srv.WakeBudget = 2 * time.Second // a wake attempt fails here with Unavailable
+	ctx, cancel := context.WithTimeout(envCtx, 10*time.Second)
+	defer cancel()
+
+	ws, err := te.fsClient.WriteFile(ctx)
+	if err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	_ = ws.Send(withUnknown(&ateenvv1alpha.WriteFileRequest{Path: "f.txt", Chunk: []byte("a")}, 42))
+	_, err = ws.CloseAndRecv()
+	wantUnknownFields(t, err, "WriteFileRequest carries field numbers 42")
+
+	in, err := te.procClient.WriteProcessInput(ctx)
+	if err != nil {
+		t.Fatalf("WriteProcessInput: %v", err)
+	}
+	_ = in.Send(withUnknown(&ateenvv1alpha.WriteProcessInputRequest{ProcessId: "p"}, 43))
+	_, err = in.CloseAndRecv()
+	wantUnknownFields(t, err, "WriteProcessInputRequest carries field numbers 43")
+
+	if n := routed.Load(); n != 0 {
+		t.Errorf("the router got %d requests for rejected streams, want 0: the API tried to wake the environment", n)
+	}
+	if got := te.control.Status("asleep"); got != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		t.Errorf("state = %v, want SUSPENDED", got)
 	}
 }

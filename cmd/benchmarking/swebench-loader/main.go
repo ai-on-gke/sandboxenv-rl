@@ -61,6 +61,29 @@ func main() {
 	}
 }
 
+// authTokenEnv names the environment variable that holds the bearer token,
+// the same one the ate-env CLI reads.
+const authTokenEnv = "SUBSTRATE_ENV_AUTH_TOKEN"
+
+// resolveAuthToken returns the token from file when file is set, otherwise
+// from authTokenEnv, otherwise "" (no token sent). A file that holds only
+// whitespace is an error, because it is a misconfiguration and not a request
+// to run without the token.
+func resolveAuthToken(file string, getenv func(string) string) (string, error) {
+	if file == "" {
+		return strings.TrimSpace(getenv(authTokenEnv)), nil
+	}
+	b, err := os.ReadFile(file)
+	if err != nil {
+		return "", fmt.Errorf("reading -auth-token-file: %w", err)
+	}
+	token := strings.TrimSpace(string(b))
+	if token == "" {
+		return "", fmt.Errorf("-auth-token-file %s is empty", file)
+	}
+	return token, nil
+}
+
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: swebench-loader run [flags] | swebench-loader report FILE... [-json OUT]")
 }
@@ -91,12 +114,17 @@ func runCmd(args []string) (retErr error) {
 		out           = fs.String("out", "", "JSONL events file; default <run-id>.jsonl in the working directory.")
 		keep          = fs.Bool("keep", false, "Leave the environments in place when the run ends.")
 		dryRun        = fs.Bool("dry-run", false, "Load and render everything, print the plan and exit without touching the API.")
+		authTokenFile = fs.String("auth-token-file", "", "File that holds the bearer token for ate-env-api; surrounding whitespace is ignored. Without it, SUBSTRATE_ENV_AUTH_TOKEN is used when set.")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *dataset == "" {
 		return fmt.Errorf("-dataset is required")
+	}
+	authToken, err := resolveAuthToken(*authTokenFile, os.Getenv)
+	if err != nil {
+		return err
 	}
 	if *runID == "" {
 		*runID = fmt.Sprintf("swe-%d", time.Now().Unix())
@@ -153,7 +181,7 @@ func runCmd(args []string) (retErr error) {
 		return nil
 	}
 
-	backend, err := swebench.NewEnvBackend(*endpoint, *atespace, *baseTemplate, *connections)
+	backend, err := swebench.NewEnvBackend(*endpoint, *atespace, *baseTemplate, *connections, authToken)
 	if err != nil {
 		return err
 	}

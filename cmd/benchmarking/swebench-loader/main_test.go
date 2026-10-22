@@ -15,10 +15,52 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestResolveAuthToken(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "token")
+	if err := os.WriteFile(file, []byte("  from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	empty := filepath.Join(dir, "empty")
+	if err := os.WriteFile(empty, []byte(" \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := func(v string) func(string) string {
+		return func(k string) string {
+			if k == authTokenEnv {
+				return v
+			}
+			return ""
+		}
+	}
+	for _, tc := range []struct {
+		name, file, env, want, err string
+	}{
+		{name: "none", want: ""},
+		{name: "env", env: " from-env ", want: "from-env"},
+		{name: "file wins over env", file: file, env: "from-env", want: "from-file"},
+		{name: "empty file", file: empty, err: "is empty"},
+		{name: "missing file", file: filepath.Join(dir, "nope"), err: "reading -auth-token-file"},
+	} {
+		got, err := resolveAuthToken(tc.file, env(tc.env))
+		if tc.err != "" {
+			if err == nil || !strings.Contains(err.Error(), tc.err) {
+				t.Errorf("%s: err = %v, want %q", tc.name, err, tc.err)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Errorf("%s: got %q, %v; want %q", tc.name, got, err, tc.want)
+		}
+	}
+}
 
 func TestLeadingFiles(t *testing.T) {
 	for _, tc := range []struct {

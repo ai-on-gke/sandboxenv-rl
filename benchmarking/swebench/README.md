@@ -150,6 +150,12 @@ go run ./cmd/benchmarking/swebench-loader report smoke.jsonl
 `-dry-run` loads and renders everything and prints the plan without touching
 the API. `-keep` leaves the fleet in place for inspection.
 
+When ate-env-api requires a bearer token (`-auth-token-file` on the API), give
+the loader the same token: `-auth-token-file PATH`, or the
+`SUBSTRATE_ENV_AUTH_TOKEN` environment variable that the `ate-env` CLI also
+reads. The file wins when both are set. Without either, the loader sends no
+token.
+
 For the 500-wide shapes run inside the cluster so the loader sits next to the
 API and spreads over its replicas (`-connections`, default 4):
 
@@ -163,7 +169,9 @@ runs a Job next to ate-env-api, follows the full loader log (step failures
 included), copies the events file back to the current directory, prints the
 report and deletes the Job. `CONTEXT=<kubectl context>` selects the cluster;
 the same command with a different context and run id is how two clusters are
-compared.
+compared. For an API with a token, set `AUTH_TOKEN_SECRET`
+to a Secret in the namespace whose key `token` holds it; the Job passes it to
+the loader as `SUBSTRATE_ENV_AUTH_TOKEN`.
 
 ## Image-delivery workloads
 

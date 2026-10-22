@@ -780,3 +780,67 @@ func TestStripsEnvAuthorizationWithoutAuthenticate(t *testing.T) {
 		t.Errorf("daemon saw Authorization %q, want it untouched", v)
 	}
 }
+
+func TestAtespacesLimitTheProxy(t *testing.T) {
+	s := newSetup(t)
+	s.router.RegisterPort("env1", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "daemon")
+	}))
+	auth, err := apiservice.NewBearerAuth("s3cret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := mustNew(t, portproxy.Options{
+		ConnectAddr: s.routerAddr, DefaultAtespace: "ate-env", HandshakeTimeout: 5 * time.Second,
+		Authenticate: auth.Check, Atespaces: []string{"ate-env", "team-b"},
+	})
+	srv := httptest.NewServer(portproxy.Dispatch(p, http.NotFoundHandler()))
+	t.Cleanup(srv.Close)
+	get := func(path string, headers map[string]string) (int, string) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+path, nil)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b)
+	}
+	token := map[string]string{portproxy.EnvAuthorizationHeader: "Bearer s3cret"}
+	foreign := target("env1", 8000)
+	foreign[portproxy.EnvAtespaceHeader] = "team-a"
+
+	// Authentication comes first: an unauthenticated caller learns nothing
+	// about the atespaces.
+	if code, _ := get("/", foreign); code != http.StatusUnauthorized {
+		t.Errorf("foreign atespace without a token: got %d, want 401", code)
+	}
+	foreign[portproxy.EnvAuthorizationHeader] = "Bearer s3cret"
+	if code, body := get("/", foreign); code != http.StatusForbidden || !strings.Contains(body, `"team-a"`) {
+		t.Errorf("header form, foreign atespace: got %d %q, want 403 naming the atespace", code, body)
+	}
+	if code, _ := get("/v1alpha/atespaces/team-a/envs/env1/ports/8000/", token); code != http.StatusForbidden {
+		t.Errorf("path form, foreign atespace: got %d, want 403", code)
+	}
+	if n := s.router.connectCount(); n != 0 {
+		t.Errorf("router saw %d CONNECTs for refused requests, want 0", n)
+	}
+
+	// The default atespace and the other listed one are forwarded.
+	inScope := target("env1", 8000)
+	inScope[portproxy.EnvAuthorizationHeader] = "Bearer s3cret"
+	if code, body := get("/", inScope); code != http.StatusOK || body != "daemon" {
+		t.Errorf("default atespace: got %d %q, want the daemon", code, body)
+	}
+	if code, body := get("/v1alpha/atespaces/team-b/envs/env1/ports/8000/", token); code != http.StatusOK || body != "daemon" {
+		t.Errorf("listed atespace: got %d %q, want the daemon", code, body)
+	}
+
+	if _, err := portproxy.New(portproxy.Options{ConnectAddr: s.routerAddr, Atespaces: []string{"Team_A"}}); err == nil {
+		t.Error("New accepted an atespace that is not a DNS label")
+	}
+}

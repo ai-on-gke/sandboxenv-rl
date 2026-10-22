@@ -766,3 +766,76 @@ func TestValidateDefaultsTrajectoryFromTheMix(t *testing.T) {
 		t.Fatalf("validate() with a nil entry = %v", err)
 	}
 }
+
+func TestImagesPerStepTakesTheNextWindowEachStep(t *testing.T) {
+	f := newFake()
+	var out bytes.Buffer
+	cfg := baseConfig(t, f, &out)
+	cfg.Instances = instances(5) // a..e
+	cfg.Mode = ModeSteps
+	cfg.Park = ParkDelete
+	cfg.Rollouts = 1
+	cfg.Steps = 3
+	cfg.ImagesPerStep = 2
+
+	sum, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 2 images x 1 rollout x 3 steps; the third step wraps around to "a".
+	if sum.Tasks != 6 || sum.Failed != 0 || sum.Rewarded != 6 {
+		t.Fatalf("summary %+v", sum)
+	}
+	want := map[string]bool{
+		"t-repo--repo-a-0": true, "t-repo--repo-b-0": true,
+		"t-repo--repo-c-0-s2": true, "t-repo--repo-d-0-s2": true,
+		"t-repo--repo-e-0-s3": true, "t-repo--repo-a-0-s3": true,
+	}
+	if len(f.created) != len(want) {
+		t.Fatalf("created %v, want %v", f.created, want)
+	}
+	for id := range want {
+		if f.created[id] != 1 || f.deleted[id] != 1 {
+			t.Fatalf("env %s created %d deleted %d; created %v deleted %v", id, f.created[id], f.deleted[id], f.created, f.deleted)
+		}
+	}
+	events := parseEvents(t, out.String())
+	ttfi, parks, barriers := 0, 0, 0
+	for _, e := range events {
+		switch e.Event {
+		case EventTTFI:
+			ttfi++
+		case EventPark:
+			parks++
+			if e.Name != string(ParkDelete) || e.Count != 2 {
+				t.Errorf("park event %+v", e)
+			}
+		case EventBarrier:
+			barriers++
+		case EventWake:
+			t.Errorf("a window run never wakes: %+v", e)
+		case EventRun:
+			if e.Labels["images_per_step"] != "2" || e.Labels["park"] != "delete" {
+				t.Errorf("run labels %v", e.Labels)
+			}
+		}
+	}
+	// Every environment is fresh, so every task starts with a ttfi; the last
+	// window's retirement is the cleanup, not a park.
+	if ttfi != 6 || barriers != 3 || parks != 2 {
+		t.Fatalf("ttfi %d barriers %d parks %d, want 6 3 2", ttfi, barriers, parks)
+	}
+	rep := Build(events)
+	if len(rep.Steps) != 3 || rep.Steps[0].Tasks != 2 || rep.Steps[2].Live != 2 {
+		t.Fatalf("steps %+v", rep.Steps)
+	}
+
+	cfg.ImagesPerStep = 9
+	if _, err := Run(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "more than the 5 instances") {
+		t.Fatalf("a window larger than the dataset must be rejected: %v", err)
+	}
+	cfg.ImagesPerStep, cfg.Park = 2, ParkSuspend
+	if _, err := Run(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "park mode delete") {
+		t.Fatalf("a window with a suspend park must be rejected: %v", err)
+	}
+}

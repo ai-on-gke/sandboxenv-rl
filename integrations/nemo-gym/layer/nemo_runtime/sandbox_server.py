@@ -56,7 +56,12 @@ def main(argv: list[str] | None = None) -> int:
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     app = load_app()
     # One process, many threads: each IPython session already runs in its own
-    # child process, and the guest restarts this server if it exits.
+    # child process, and the guest restarts this server if it exits. Upstream
+    # serves this app under uWSGI; here the Flask server is threaded, thus a
+    # new session forks (multiprocessing) a process that has other threads.
+    # Python 3.12 warns about this: a lock that another thread holds at fork
+    # time stays held in the child, and that child can hang. The vendored
+    # server's timeout then kills the child; only that session is lost.
     app.run(host=args.host, port=args.port, threaded=True, use_reloader=False)
     return 0
 

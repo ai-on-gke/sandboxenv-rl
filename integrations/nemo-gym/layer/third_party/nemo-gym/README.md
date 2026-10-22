@@ -3,8 +3,9 @@
 `exec_server.py` is the `EXEC_SERVER_SCRIPT` string from
 https://github.com/NVIDIA-NeMo/Gym, path
 `nemo_gym/sandbox/providers/ecs_fargate/engine.py`, at commit `d4fd5e8`
-(2026-10), written out as a file; the text is unchanged. Licensed by NVIDIA
-under Apache-2.0 (`LICENSE`). It is the zero-dependency HTTP exec server the ECS
+(2026-10), written out as a file; the script text is unchanged, and the NVIDIA
+copyright and license header of `engine.py` follows the shebang line. Licensed
+by NVIDIA under Apache-2.0 (`LICENSE`). It is the zero-dependency HTTP exec server the ECS
 Fargate provider injects into its sandboxes: `POST /exec` with `cmd` and
 `timeout`, `POST /upload` with `path`, base64 `content` and optional `mode`,
 `GET /download?path=`, `GET /health`. It reads `TB_EXEC_BIND` and

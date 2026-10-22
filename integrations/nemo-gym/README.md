@@ -238,10 +238,16 @@ image contributes nothing but its kernel and filesystem:
 | NeMo Gym exec server | `/opt/nemo/python/bin/python3 -m nemo_runtime.exec_server --host 0.0.0.0 --port 19542` | `POST /exec` (`cmd`, `timeout`), `POST /upload`, `GET /download?path=`, `GET /health` | the `EXEC_SERVER_SCRIPT` of `nemo_gym/sandbox/providers/ecs_fargate/engine.py`, vendored verbatim ([provenance](layer/third_party/nemo-gym/README.md)) |
 
 Both execute whatever they are sent, with the task image's user and filesystem, and neither
-authenticates its caller; see the trust note below. `ipython` and `python` code runs on the
-layer's interpreter and its packages (IPython, psutil, Flask and their dependencies, nothing
-else); `shell` runs the task image's `/bin/sh`; a task image's own Python is used only when the
-code calls it by path.
+authenticates its caller; see the trust note under Limits. What runs the code:
+
+- `ipython`: the layer's interpreter and its packages (IPython, psutil, Flask and their
+  dependencies, nothing else). Each session is a child process of the server.
+- `python`: the first `python` on `PATH`. The server appends the layer's `bin` to `PATH`, thus
+  a task image that has a `python` runs the code with its own interpreter and packages, and an
+  image without one (or with only `python3`) gets the layer's CPython 3.12.
+- `shell` on the sandbox server: `/bin/bash`, which the task image must contain (Debian and
+  Ubuntu based images do; busybox and distroless images do not).
+- `POST /exec` on the exec server: `bash` when it is on `PATH`, else `/bin/sh`.
 
 Build and push it once per registry (linux/amd64 and linux/arm64; `layer/lock.sh` refreshes the
 hash-pinned requirements):
@@ -298,8 +304,9 @@ crane digest <registry>/nemo-runtime-layer:<tag>   # templates take the digest, 
        r = await http.post("/execute", json={"generated_code": "print(1)", "language": "python"})
    ```
 
-   `ep.endpoint` is ate-env-api, and `ep.headers` (`X-Env-Id`, `X-Env-Atespace`, `X-Env-Port`)
-   route each request through the Substrate router to port 6000 in this sandbox. `endpoint()` does
+   `ep.endpoint` is ate-env-api, and `ep.headers` (`X-Env-Id`, `X-Env-Atespace`, `X-Env-Port`, and
+   `X-Env-Authorization` when the provider has a token) route each request through the Substrate
+   router to port 6000 in this sandbox. `endpoint()` does
    not touch the guest: the first request through the proxy resumes a parked sandbox, and the proxy
    waits for the wake (ate-env-api's `--wake-budget`, two minutes by default, the same wait as a
    guest call). It checks only that the sandbox exists, and raises `RuntimeError` at once for one

@@ -140,7 +140,8 @@ def test_runtime_layer_endpoint() -> None:
             )
             ep = await provider.endpoint(handle, RUNTIME_PORT)
             url = ep.endpoint.rstrip("/") + "/execute"
-            # The layer's own interpreter runs the code: the task image needs no python.
+            # The first `python` on PATH runs the code: the task image's own when it
+            # has one, else the layer's (appended to PATH), so no image needs python.
             out = _post_json(url, ep.headers, {"generated_code": "print(6 * 7)", "language": "python", "timeout": 30})
             assert out.get("process_status") == "completed", out
             assert out.get("stdout", "").strip() == "42", out

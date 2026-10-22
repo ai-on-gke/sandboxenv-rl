@@ -16,9 +16,8 @@
 # nothing else in it. Mounted read-only into an environment (ate-env manifest
 # template --layer nemo=<image>=/opt/nemo), the guest starts either server as
 # a sidecar; the task image contributes only the kernel and its filesystem.
-# Same recipe as the OpenHands agent-server layer in agent-substrate/env
-# (its PR #93): python-build-standalone plus hash-pinned wheels installed
-# with uv. linux/amd64 and linux/arm64.
+# Recipe: python-build-standalone plus hash-pinned wheels installed with uv,
+# wheels only. linux/amd64 and linux/arm64.
 FROM curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6 AS fetch
 ARG TARGETARCH
 ARG PBS_RELEASE=20261013
@@ -44,7 +43,7 @@ ARG TARGETARCH
 ENV UV_NO_CACHE=1 UV_PYTHON_DOWNLOADS=never
 COPY --from=uv /uv /usr/local/bin/uv
 COPY --from=fetch /tmp/nemo/ /opt/nemo/
-COPY requirements.txt build-constraints.txt /tmp/lock/
+COPY requirements.txt /tmp/lock/
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN case "${TARGETARCH}" in \
       amd64) platform=x86_64-manylinux_2_31 ;; \
@@ -54,7 +53,7 @@ RUN case "${TARGETARCH}" in \
  && uv pip install --index-url https://pypi.org/simple --require-hashes \
       --python /opt/nemo/python/bin/python3 --python-platform "${platform}" --python-version 3.12 \
       --target /opt/nemo/python/lib/python3.12/site-packages \
-      --build-constraints /tmp/lock/build-constraints.txt -r /tmp/lock/requirements.txt
+      --only-binary :all: -r /tmp/lock/requirements.txt
 # The entry points and the vendored servers live in site-packages, so
 # python3 -m nemo_runtime.<server> works wherever the layer is mounted.
 COPY nemo_runtime/ /opt/nemo/python/lib/python3.12/site-packages/nemo_runtime/

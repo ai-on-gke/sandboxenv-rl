@@ -18,12 +18,16 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 )
 
 // Stat summarizes one kind of event.
@@ -79,6 +83,9 @@ type Report struct {
 	Errors []ErrorCount `json:"errors,omitempty"`
 	// Unresolved lists the instances whose reward was 0, once each.
 	Unresolved []Unresolved `json:"unresolved,omitempty"`
+	// Cache is what the node image caches did between the samples given to
+	// report -cache-before and -cache-after; nil without them.
+	Cache *CacheDelta `json:"cache,omitempty"`
 }
 
 // ErrorCount is one error string and how often it occurred.
@@ -296,6 +303,28 @@ func (rep *Report) WriteText(w io.Writer) {
 		}
 		tw.Flush()
 	}
+	if c := rep.Cache; c != nil {
+		first := 0
+		for _, s := range rep.Stats {
+			if s.Event == EventTTFI {
+				first = s.Count
+			}
+		}
+		fmt.Fprintf(w, "\nimage cache during the run: %d nodes differenced", c.Nodes)
+		for _, x := range []struct {
+			n    int
+			what string
+		}{{c.Restarted, "restarted, counted from zero"}, {c.Added, "added, counted from zero"}, {c.Removed, "removed, left out"}, {c.Skipped, "with no before sample, left out"}} {
+			if x.n > 0 {
+				fmt.Fprintf(w, ", %d %s", x.n, x.what)
+			}
+		}
+		fmt.Fprintf(w, "; misses (cold pulls) %.0f on %d nodes, hits %.0f, errors %.0f", c.Misses, c.NodesWithMisses, c.Hits, c.Errors)
+		if first > 0 {
+			fmt.Fprintf(w, "; first commands %d, misses per first command %.2f", first, c.Misses/float64(first))
+		}
+		fmt.Fprintln(w)
+	}
 	if len(rep.Unresolved) > 0 {
 		fmt.Fprintf(w, "\nunresolved: %d instances (report -unresolved FILE writes them in exclude-file format)\n", len(rep.Unresolved))
 	}
@@ -314,4 +343,321 @@ func (rep *Report) WriteText(w io.Writer) {
 			fmt.Fprintf(w, "  %5d  %s\n", e.Count, msg)
 		}
 	}
+}
+
+// WriteComparison prints several runs side by side, one column per run: the
+// header figures, then every event in the order it first appears, then the
+// per-step figures when a run has steps. It is the table for the same
+// workload on different clusters or builds. names are the files the reports
+// came from; a column is headed by its run id unless that is empty or shared
+// with another column, in which case the file name is used.
+func WriteComparison(w io.Writer, reps []*Report, names []string) {
+	labels := columnLabels(reps, names)
+	fmt.Fprintln(w, "cells: p50/p95 ms n=count [f=failed r=retried]; steps: live tasks [f=failed] barrier_s/park_s wake p50/p95 ms")
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	row := func(label string, cell func(*Report) string) {
+		fmt.Fprint(tw, label)
+		for _, r := range reps {
+			fmt.Fprintf(tw, "\t%s", cell(r))
+		}
+		fmt.Fprintln(tw)
+	}
+	fmt.Fprint(tw, "run")
+	for _, l := range labels {
+		fmt.Fprintf(tw, "\t%s", l)
+	}
+	fmt.Fprintln(tw)
+	row("mode", func(r *Report) string { return r.Mode })
+	row("tasks", func(r *Report) string { return fmt.Sprintf("%d", r.Tasks) })
+	row("failed", func(r *Report) string { return fmt.Sprintf("%d", r.Failed) })
+	row("reward_rate", func(r *Report) string { return fmt.Sprintf("%.3f", r.RewardRate) })
+	row("run_s", func(r *Report) string { return fmt.Sprintf("%.1f", r.RunMS/1000) })
+
+	type key struct{ event, name string }
+	var order []key
+	seen := map[key]bool{}
+	for _, r := range reps {
+		for _, s := range r.Stats {
+			k := key{s.Event, s.Name}
+			if !seen[k] {
+				seen[k] = true
+				order = append(order, k)
+			}
+		}
+	}
+	for _, k := range order {
+		label := k.event
+		if k.name != "" {
+			label += " " + k.name
+		}
+		row(label, func(r *Report) string {
+			for _, s := range r.Stats {
+				if s.Event != k.event || s.Name != k.name {
+					continue
+				}
+				cell := fmt.Sprintf("%.0f/%.0f n=%d", s.P50MS, s.P95MS, s.Count)
+				if s.Count == s.Failed {
+					// No call succeeded: there is no latency to show.
+					cell = fmt.Sprintf("-/- n=%d", s.Count)
+				}
+				if s.Failed > 0 {
+					cell += fmt.Sprintf(" f=%d", s.Failed)
+				}
+				if s.Retried > 0 {
+					cell += fmt.Sprintf(" r=%d", s.Retried)
+				}
+				return cell
+			}
+			return "-"
+		})
+	}
+
+	last := 0
+	for _, r := range reps {
+		for _, s := range r.Steps {
+			if s.Step > last {
+				last = s.Step
+			}
+		}
+	}
+	for n := 1; n <= last; n++ {
+		row(fmt.Sprintf("step %d", n), func(r *Report) string {
+			for _, s := range r.Steps {
+				if s.Step != n {
+					continue
+				}
+				cell := fmt.Sprintf("live=%d tasks=%d", s.Live, s.Tasks)
+				if s.Failed > 0 {
+					cell += fmt.Sprintf(" f=%d", s.Failed)
+				}
+				wake := fmt.Sprintf("%.0f/%.0f", s.WakeP50MS, s.WakeP95MS)
+				if s.WakeP50MS == 0 && s.WakeP95MS == 0 {
+					wake = "-/-" // no wake in this step: the first one, or -park none
+				}
+				return cell + fmt.Sprintf(" %.1f/%.1f %s", s.BarrierMS/1000, s.ParkMS/1000, wake)
+			}
+			return "-"
+		})
+	}
+	tw.Flush()
+}
+
+// columnLabels heads each column with its run id, or with the file name when
+// the run id is empty or the same as another column's; when the file names
+// also repeat, with the full path.
+func columnLabels(reps []*Report, names []string) []string {
+	count := map[string]int{}
+	for _, r := range reps {
+		count[r.RunID]++
+	}
+	labels := make([]string, len(reps))
+	byFile := map[int]bool{}
+	for i, r := range reps {
+		labels[i] = r.RunID
+		if r.RunID != "" && count[r.RunID] == 1 {
+			continue
+		}
+		if i < len(names) && names[i] != "" {
+			labels[i] = strings.TrimSuffix(filepath.Base(names[i]), ".jsonl")
+			byFile[i] = true
+		} else {
+			labels[i] = fmt.Sprintf("run %d", i+1)
+		}
+	}
+	seen := map[string]int{}
+	for _, l := range labels {
+		seen[l]++
+	}
+	for i := range labels {
+		if byFile[i] && seen[labels[i]] > 1 {
+			labels[i] = names[i]
+		}
+	}
+	return labels
+}
+
+// NodeCacheSample is one reading of the image-cache counters of every node,
+// as sample-node-cache.sh writes it: a node name, a tab, then a Prometheus
+// text line, with one "# sampled <unix seconds>" line per node. Nodes maps
+// each node the sample covered to the start time of its atelet process (zero
+// when that series was absent); Requests holds ate_imagecache_requests_total
+// by node and outcome.
+type NodeCacheSample struct {
+	// Time is when the sample was taken: the latest "# sampled" stamp.
+	Time     time.Time
+	Nodes    map[string]time.Time
+	Requests map[string]map[string]float64
+}
+
+const (
+	cacheRequestsSeries = "ate_imagecache_requests_total{"
+	processStartSeries  = "process_start_time_seconds"
+)
+
+// ParseNodeCacheSample reads a sample file. Comment lines and other metric
+// families only register the node; a line without the node tab, a request
+// line without labels, or a value that is not a number is an error.
+func ParseNodeCacheSample(r io.Reader) (*NodeCacheSample, error) {
+	s := &NodeCacheSample{Nodes: map[string]time.Time{}, Requests: map[string]map[string]float64{}}
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	line := 0
+	for sc.Scan() {
+		line++
+		text := strings.TrimRight(sc.Text(), " \r")
+		if text == "" {
+			continue
+		}
+		node, rest, ok := strings.Cut(text, "\t")
+		if !ok || node == "" {
+			return nil, fmt.Errorf("sample line %d: no node name and tab", line)
+		}
+		if _, seen := s.Nodes[node]; !seen {
+			s.Nodes[node] = time.Time{}
+		}
+		switch {
+		case strings.HasPrefix(rest, "# sampled "):
+			v, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(rest, "# sampled ")), 64)
+			if err != nil {
+				return nil, fmt.Errorf("sample line %d: sample time %q: %w", line, rest, err)
+			}
+			if t := unixTime(v); t.After(s.Time) {
+				s.Time = t
+			}
+		case strings.HasPrefix(rest, "#"):
+		case strings.HasPrefix(rest, processStartSeries+" ") || strings.HasPrefix(rest, processStartSeries+"{"):
+			tail := rest[len(processStartSeries):]
+			if rb := strings.IndexByte(tail, '}'); strings.HasPrefix(tail, "{") && rb >= 0 {
+				tail = tail[rb+1:]
+			}
+			v, err := lastNumber(tail)
+			if err != nil {
+				return nil, fmt.Errorf("sample line %d: %w", line, err)
+			}
+			s.Nodes[node] = unixTime(v)
+		case strings.HasPrefix(rest, cacheRequestsSeries):
+			rb := strings.LastIndexByte(rest, '}')
+			if rb < 0 {
+				return nil, fmt.Errorf("sample line %d: no labels", line)
+			}
+			outcome := ""
+			for _, kv := range strings.Split(rest[len(cacheRequestsSeries):rb], ",") {
+				if k, v, ok := strings.Cut(strings.TrimSpace(kv), "="); ok && k == "ate_imagecache_outcome" {
+					outcome = strings.Trim(v, `"`)
+				}
+			}
+			if outcome == "" {
+				return nil, fmt.Errorf("sample line %d: no ate_imagecache_outcome label", line)
+			}
+			v, err := lastNumber(rest[rb+1:])
+			if err != nil {
+				return nil, fmt.Errorf("sample line %d: %w", line, err)
+			}
+			if s.Requests[node] == nil {
+				s.Requests[node] = map[string]float64{}
+			}
+			s.Requests[node][outcome] += v
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// lastNumber parses the sample value of a Prometheus text line: the first
+// field after the metric name and labels (a timestamp may follow it).
+func lastNumber(tail string) (float64, error) {
+	fields := strings.Fields(tail)
+	if len(fields) == 0 {
+		return 0, errors.New("no value")
+	}
+	v, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0, fmt.Errorf("value %q: %w", fields[0], err)
+	}
+	return v, nil
+}
+
+func unixTime(seconds float64) time.Time {
+	sec := math.Floor(seconds)
+	return time.Unix(int64(sec), int64((seconds-sec)*1e9))
+}
+
+// CacheDelta is what the node image caches did between two samples. The
+// misses are the cold pulls of the window: every image lookup that had to
+// pull and unpack, golden bakes and wakes on a node without the image
+// included.
+type CacheDelta struct {
+	// Nodes were in both samples with the same atelet process; their
+	// counters are differenced. Restarted nodes were in both samples but
+	// atelet started in between, and Added nodes were only in the after
+	// sample with an atelet younger than the before sample (a node the
+	// autoscaler brought in); both count from zero. Removed nodes were only in
+	// the before sample. Skipped nodes were only in the after sample with an
+	// atelet older than the before sample, so the before scrape failed; they
+	// are reported and left out.
+	Nodes     int     `json:"nodes"`
+	Restarted int     `json:"restarted,omitempty"`
+	Added     int     `json:"added,omitempty"`
+	Removed   int     `json:"removed,omitempty"`
+	Skipped   int     `json:"skipped,omitempty"`
+	Hits      float64 `json:"hits"`
+	Misses    float64 `json:"misses"`
+	// Errors sums the error, cancelled and timeout outcomes.
+	Errors          float64 `json:"errors"`
+	NodesWithMisses int     `json:"nodes_with_misses"`
+}
+
+// Delta compares s, taken before a run, with after.
+func (s *NodeCacheSample) Delta(after *NodeCacheSample) CacheDelta {
+	var d CacheDelta
+	add := func(counts map[string]float64) {
+		for o, v := range counts {
+			switch o {
+			case "hit":
+				d.Hits += v
+			case "miss":
+				d.Misses += v
+				if v > 0 {
+					d.NodesWithMisses++
+				}
+			default:
+				d.Errors += v
+			}
+		}
+	}
+	for node, startAfter := range after.Nodes {
+		startBefore, inBefore := s.Nodes[node]
+		switch {
+		case !inBefore:
+			if !startAfter.IsZero() && !s.Time.IsZero() && startAfter.After(s.Time) {
+				d.Added++
+				add(after.Requests[node])
+			} else {
+				d.Skipped++
+			}
+		case !startAfter.IsZero() && !startBefore.IsZero() && !startAfter.Equal(startBefore):
+			d.Restarted++
+			add(after.Requests[node])
+		default:
+			d.Nodes++
+			diff := map[string]float64{}
+			for o, v := range after.Requests[node] {
+				delta := v - s.Requests[node][o]
+				if delta < 0 {
+					// No start time to prove a restart, but the counter went down.
+					delta = v
+				}
+				diff[o] = delta
+			}
+			add(diff)
+		}
+	}
+	for node := range s.Nodes {
+		if _, inAfter := after.Nodes[node]; !inAfter {
+			d.Removed++
+		}
+	}
+	return d
 }

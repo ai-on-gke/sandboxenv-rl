@@ -18,6 +18,8 @@
 //	swebench-loader run    -dataset manifest.jsonl -mode eval  -images 500 -tasks-per-image 6 -width 500 -out run.jsonl
 //	swebench-loader run    -dataset manifest.jsonl -mode steps -images 500 -rollouts 2 -steps 8 -park suspend -out run.jsonl
 //	swebench-loader report run.jsonl [-json summary.json]
+//	swebench-loader report a.jsonl b.jsonl   (one table, a column per run)
+//	swebench-loader report run.jsonl -cache-before before.txt -cache-after after.txt
 package main
 
 import (
@@ -83,7 +85,7 @@ func resolveAuthToken(file string, getenv func(string) string) (string, error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: swebench-loader run [flags] | swebench-loader report FILE [-json OUT]")
+	fmt.Fprintln(os.Stderr, "usage: swebench-loader run [flags] | swebench-loader report FILE... [-json OUT]")
 }
 
 func runCmd(args []string) (retErr error) {
@@ -237,25 +239,63 @@ func runCmd(args []string) (retErr error) {
 }
 
 func reportCmd(args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("report needs the JSONL file")
+	files, rest := leadingFiles(args)
+	if len(files) == 0 {
+		return fmt.Errorf("report needs at least one JSONL file")
 	}
-	path := args[0]
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
-	jsonOut := fs.String("json", "", "Also write the summary as JSON to this path.")
-	unresolvedOut := fs.String("unresolved", "", "Write the unresolved instances to this path in -exclude-file format.")
+	jsonOut := fs.String("json", "", "Also write the summary as JSON to this path (an array when several files are given).")
+	unresolvedOut := fs.String("unresolved", "", "Write the unresolved instances to this path in -exclude-file format; one file only.")
 	unresolvedNote := fs.String("unresolved-note", "Instances graded unresolved", "First comment line of the -unresolved file.")
-	if err := fs.Parse(args[1:]); err != nil {
+	cacheBefore := fs.String("cache-before", "", "Node cache sample taken before the run (benchmarking/swebench/sample-node-cache.sh); with -cache-after, the report adds the run's cache misses. One file only.")
+	cacheAfter := fs.String("cache-after", "", "Node cache sample taken after the run.")
+	if err := fs.Parse(rest); err != nil {
 		return err
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return err
+	if fs.NArg() > 0 {
+		// flag stops at the first non-flag, so a file after a flag would be
+		// dropped without a word.
+		return fmt.Errorf("unexpected arguments after the flags: %s; put every events file before the flags", strings.Join(fs.Args(), " "))
 	}
-	defer f.Close()
-	rep, err := swebench.Summarize(f)
-	if err != nil {
-		return err
+	reps := make([]*swebench.Report, 0, len(files))
+	for _, path := range files {
+		rep, err := summarizeFile(path)
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		reps = append(reps, rep)
+	}
+	if len(reps) > 1 {
+		// Several runs: one table, a column per run, for the same workload on
+		// different clusters or builds.
+		if *unresolvedOut != "" || *cacheBefore != "" || *cacheAfter != "" {
+			return fmt.Errorf("-unresolved, -cache-before and -cache-after take one events file")
+		}
+		swebench.WriteComparison(os.Stdout, reps, files)
+		if *jsonOut != "" {
+			b, err := json.MarshalIndent(reps, "", "  ")
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(*jsonOut, b, 0o644)
+		}
+		return nil
+	}
+	rep := reps[0]
+	if (*cacheBefore == "") != (*cacheAfter == "") {
+		return fmt.Errorf("-cache-before and -cache-after go together")
+	}
+	if *cacheBefore != "" {
+		before, err := loadCacheSample(*cacheBefore)
+		if err != nil {
+			return err
+		}
+		after, err := loadCacheSample(*cacheAfter)
+		if err != nil {
+			return err
+		}
+		d := before.Delta(after)
+		rep.Cache = &d
 	}
 	rep.WriteText(os.Stdout)
 	if *unresolvedOut != "" {
@@ -276,4 +316,37 @@ func reportCmd(args []string) error {
 		return os.WriteFile(*jsonOut, b, 0o644)
 	}
 	return nil
+}
+
+// leadingFiles splits report's arguments into the events files, which come
+// first, and the flags that follow them.
+func leadingFiles(args []string) (files, rest []string) {
+	for i, a := range args {
+		if strings.HasPrefix(a, "-") {
+			return args[:i], args[i:]
+		}
+	}
+	return args, nil
+}
+
+func summarizeFile(path string) (*swebench.Report, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return swebench.Summarize(f)
+}
+
+func loadCacheSample(path string) (*swebench.NodeCacheSample, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	s, err := swebench.ParseNodeCacheSample(f)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return s, nil
 }

@@ -17,6 +17,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -58,5 +59,34 @@ func TestResolveAuthToken(t *testing.T) {
 		if err != nil || got != tc.want {
 			t.Errorf("%s: got %q, %v; want %q", tc.name, got, err, tc.want)
 		}
+	}
+}
+
+func TestLeadingFiles(t *testing.T) {
+	for _, tc := range []struct {
+		args, files, rest []string
+	}{
+		{nil, nil, nil},
+		{[]string{"a.jsonl"}, []string{"a.jsonl"}, nil},
+		{[]string{"a.jsonl", "b.jsonl", "-json", "o.json"}, []string{"a.jsonl", "b.jsonl"}, []string{"-json", "o.json"}},
+		{[]string{"-json", "o.json", "a.jsonl"}, nil, []string{"-json", "o.json", "a.jsonl"}},
+	} {
+		files, rest := leadingFiles(tc.args)
+		if len(files) == 0 {
+			files = nil
+		}
+		if len(rest) == 0 {
+			rest = nil
+		}
+		if !reflect.DeepEqual(files, tc.files) || !reflect.DeepEqual(rest, tc.rest) {
+			t.Errorf("leadingFiles(%q) = %q, %q; want %q, %q", tc.args, files, rest, tc.files, tc.rest)
+		}
+	}
+}
+
+func TestReportCmdRejectsFilesAfterFlags(t *testing.T) {
+	err := reportCmd([]string{"a.jsonl", "-json", "o.json", "b.jsonl"})
+	if err == nil || !strings.Contains(err.Error(), "before the flags") || !strings.Contains(err.Error(), "b.jsonl") {
+		t.Fatalf("err = %v, want the files-before-flags error naming b.jsonl", err)
 	}
 }

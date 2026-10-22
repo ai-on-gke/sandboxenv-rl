@@ -56,7 +56,10 @@ API server included, which is what a trainer sees):
 `swebench-loader report RUN.jsonl -json summary.json` prints count, failed,
 p50, p95 and max per event, a per-step table (tasks, barrier, park, wake
 p50/p95) and the most frequent errors. The JSON is the artifact to diff
-between runs.
+between runs. Given several files, `report a.jsonl b.jsonl` prints one table
+with a column per run: p50/p95 per event, and per step the live environments,
+tasks, failures, barrier, park and wake p50/p95. `-json` then writes the
+summaries as an array. Files go before the flags.
 
 ## How many actors, and on which clusters
 
@@ -82,11 +85,13 @@ and read the packing from Substrate's metrics, not from the report.
 The loader never talks to Kubernetes. `-endpoint` is an ate-env API address,
 so "which cluster" is "which API". To compare clusters (builds, node images,
 image delivery) run the same manifest, trajectory and flags once per
-cluster and diff the summaries; the in-cluster script uses the current
-`kubectl` context, so switch context between runs. Each cluster needs the
-full setup below: Substrate and the ate-env API installed, the images
-reachable from it, and the golden tags baked there (a golden tag is per
-cluster, so the first run on a fresh cluster pays the bake for every image).
+cluster, with `CONTEXT=<kubectl context>` pointing the in-cluster script at
+each cluster and the cluster's name in the run id, then put the events files
+side by side with `swebench-loader report a.jsonl b.jsonl`. Each cluster
+needs the full setup below: Substrate and the ate-env API installed, the
+images reachable from it, and the golden tags baked there (a golden tag is
+per cluster, so the first run on a fresh cluster pays the bake for every
+image).
 One run never spans clusters.
 
 Telemetry is the JSONL file only. There is no OpenTelemetry export yet; the
@@ -162,7 +167,9 @@ KO_DOCKER_REPO=gcr.io/PROJECT/repo benchmarking/swebench/run-in-cluster.sh swe-e
 The script bakes the dataset and the exclusion list into the loader image,
 runs a Job next to ate-env-api, follows the full loader log (step failures
 included), copies the events file back to the current directory, prints the
-report and deletes the Job. For an API with a token, set `AUTH_TOKEN_SECRET`
+report and deletes the Job. `CONTEXT=<kubectl context>` selects the cluster;
+the same command with a different context and run id is how two clusters are
+compared. For an API with a token, set `AUTH_TOKEN_SECRET`
 to a Secret in the namespace whose key `token` holds it; the Job passes it to
 the loader as `SUBSTRATE_ENV_AUTH_TOKEN`.
 
@@ -192,6 +199,31 @@ Run the same command against each delivery mechanism and diff the reports;
 the loader sees wall time per phase as a trainer would, and the split of a
 cold start into pull, unpack and restore comes from Substrate's own metrics
 over the run window, joined on the run id.
+
+To know whether those first pulls were cold, sample the node image caches
+before and after the run and hand both files to the report:
+
+```bash
+benchmarking/swebench/sample-node-cache.sh before.txt
+benchmarking/swebench/run-in-cluster.sh pull-baseline images.jsonl -trajectory workload-read-all -images 200 -width 200
+benchmarking/swebench/sample-node-cache.sh after.txt
+swebench-loader report pull-baseline.jsonl -cache-before before.txt -cache-after after.txt
+```
+
+The sample reads each atelet's `ate_imagecache_requests_total` counters and
+its process start time through the API server's pod proxy (atelet has no
+shell), so it needs kubectl with RBAC `get` on `pods/proxy` in `ate-system`.
+The report then adds a line with the run's misses, which are its cold pulls,
+the nodes they landed on, hits, errors, and misses per first command: 1.0
+means every environment pulled its image, 0 means every start was served
+from a node's cache. The count is cluster-wide for the window, so it also
+holds golden bakes and wakes that landed on a node without the image. A node
+whose atelet restarted between the samples, and a node the autoscaler added
+in between, count from zero; a node removed in between is left out; a node
+present only in the after sample with an atelet older than the before sample
+had a failed before scrape and is reported and left out. The report cannot
+label one environment cold or warm, because the ate-env API does not say
+which node an environment ran on.
 
 ## Network and the offline exclusion list
 

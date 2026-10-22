@@ -410,7 +410,7 @@ Manages the lifecycle of isolated execution environments (defined in [`proto/ate
 | `GetEnvironment` | Retrieves environment details and status |
 | `SuspendEnvironment` | Suspends and checkpoints the environment to snapshot storage |
 | `DeleteEnvironment` | Deletes the environment permanently |
-| `GetServerInfo` | Reports the server implementation (`sandboxenv-rl`), its version, the Substrate version it was built against, and its optional features (`rootfs_image`, `pty`, and `port_proxy` or `bearer_auth` when enabled); answered by `ate-env-api` itself |
+| `GetServerInfo` | Reports the server implementation (`sandboxenv-rl`), its version, the version of the `go.ate.dev/substrate` module it was built against, and its optional features (`rootfs_image`, `pty`, and `port_proxy` when enabled); answered by `ate-env-api` itself. The Substrate version is a build fact, not the version of the control plane the server talks to; Substrate has no RPC that reports that. |
 
 ### ProcessService
 

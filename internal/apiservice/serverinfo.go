@@ -27,7 +27,8 @@ import (
 const ServerName = "sandboxenv-rl"
 
 // Optional features GetServerInfo reports. A client checks for a name before
-// it depends on the feature and ignores names it does not know.
+// it depends on the feature and ignores names it does not know. A name keeps
+// its meaning once published, because clients and stored run records use it.
 const (
 	// FeatureRootfsImage: CreateEnvironment accepts rootfs_image.
 	FeatureRootfsImage = "rootfs_image"
@@ -35,8 +36,6 @@ const (
 	FeaturePTY = "pty"
 	// FeaturePortProxy: the listener forwards HTTP to ports in environments.
 	FeaturePortProxy = "port_proxy"
-	// FeatureBearerAuth: callers must send the API's bearer token.
-	FeatureBearerAuth = "bearer_auth"
 )
 
 const substrateModule = "go.ate.dev/substrate"
@@ -48,8 +47,6 @@ type ServerInfo struct {
 	Version string
 	// PortProxy is true when the listener serves the port proxy.
 	PortProxy bool
-	// BearerAuth is true when callers must send a bearer token.
-	BearerAuth bool
 }
 
 // GetServerInfo reports the server implementation, its version, the Substrate
@@ -73,14 +70,15 @@ func (s *Server) features() []string {
 	if s.Info.PortProxy {
 		f = append(f, FeaturePortProxy)
 	}
-	if s.Info.BearerAuth {
-		f = append(f, FeatureBearerAuth)
-	}
 	return f
 }
 
 // substrateVersion returns the version of the Substrate module in the binary's
-// build information (its replacement's, when replaced), or "unknown".
+// build information, or "unknown". This is the module the binary was built
+// against, not the version of the control plane it talks to. A replacement
+// with a version reports that version; a local replacement without one
+// reports the go.mod version with "+replaced", because the binary does not
+// contain that version.
 func substrateVersion(read func() (*debug.BuildInfo, bool)) string {
 	bi, ok := read()
 	if !ok {
@@ -90,8 +88,14 @@ func substrateVersion(read func() (*debug.BuildInfo, bool)) string {
 		if dep.Path != substrateModule {
 			continue
 		}
-		if dep.Replace != nil && dep.Replace.Version != "" {
-			return dep.Replace.Version
+		if dep.Replace != nil {
+			if dep.Replace.Version != "" {
+				return dep.Replace.Version
+			}
+			if dep.Version != "" {
+				return dep.Version + "+replaced"
+			}
+			return "unknown+replaced"
 		}
 		if dep.Version != "" {
 			return dep.Version

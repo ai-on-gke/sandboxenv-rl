@@ -194,9 +194,6 @@ func TestClientServerInfo(t *testing.T) {
 			t.Errorf("features = %v, want %q", info.GetFeatures(), want)
 		}
 	}
-	if slices.Contains(info.GetFeatures(), apiservice.FeatureBearerAuth) {
-		t.Errorf("features = %v, want no %q on a server without a token", info.GetFeatures(), apiservice.FeatureBearerAuth)
-	}
 }
 
 func TestCmdAndFilesystem(t *testing.T) {

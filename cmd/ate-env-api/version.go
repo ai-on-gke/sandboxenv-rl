@@ -21,10 +21,12 @@ import "runtime/debug"
 var version = "dev"
 
 // buildVersion returns the version GetServerInfo reports: the -ldflags value
-// when set; otherwise the module version (a `go install ...@vX` build);
-// otherwise "dev+<commit>" from the VCS stamp that `go build` and `ko build`
-// record in a git checkout, with "-dirty" for uncommitted changes; otherwise
-// "dev".
+// when set; otherwise the main module version that the Go toolchain records.
+// Since Go 1.24, `go build` and `ko build` in a git checkout record a
+// pseudo-version (vX.Y.Z-0.<UTC time>-<12 hex digits of the commit>, with
+// "+dirty" for uncommitted changes), and `go install ...@vX` records vX. A
+// build without version information (-buildvcs=false, or no git checkout)
+// records "(devel)", which reports "dev".
 func buildVersion() string {
 	return resolveVersion(version, debug.ReadBuildInfo)
 }
@@ -40,25 +42,5 @@ func resolveVersion(ldflags string, read func() (*debug.BuildInfo, bool)) string
 	if v := bi.Main.Version; v != "" && v != "(devel)" {
 		return v
 	}
-	var revision string
-	var dirty bool
-	for _, s := range bi.Settings {
-		switch s.Key {
-		case "vcs.revision":
-			revision = s.Value
-		case "vcs.modified":
-			dirty = s.Value == "true"
-		}
-	}
-	if revision == "" {
-		return "dev"
-	}
-	if len(revision) > 12 {
-		revision = revision[:12]
-	}
-	v := "dev+" + revision
-	if dirty {
-		v += "-dirty"
-	}
-	return v
+	return "dev"
 }

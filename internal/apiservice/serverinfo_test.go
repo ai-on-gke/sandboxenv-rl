@@ -31,8 +31,6 @@ func TestGetServerInfoFeaturesFollowConfig(t *testing.T) {
 	}{
 		{"defaults", ServerInfo{}, []string{FeatureRootfsImage, FeaturePTY}},
 		{"port proxy", ServerInfo{PortProxy: true}, []string{FeatureRootfsImage, FeaturePTY, FeaturePortProxy}},
-		{"bearer auth", ServerInfo{BearerAuth: true}, []string{FeatureRootfsImage, FeaturePTY, FeatureBearerAuth}},
-		{"both", ServerInfo{PortProxy: true, BearerAuth: true}, []string{FeatureRootfsImage, FeaturePTY, FeaturePortProxy, FeatureBearerAuth}},
 	}
 	for _, tc := range cases {
 		s := New(nil, "", "")
@@ -80,7 +78,7 @@ func TestSubstrateVersion(t *testing.T) {
 	}{
 		{"pinned", deps(&debug.Module{Path: "go.ate.dev/substrate", Version: "v0.5.1-0.20261018212731-ddb46651d605"}), "v0.5.1-0.20261018212731-ddb46651d605"},
 		{"replaced", deps(&debug.Module{Path: "go.ate.dev/substrate", Version: "v0.5.0", Replace: &debug.Module{Path: "../substrate", Version: "v0.6.0"}}), "v0.6.0"},
-		{"local replace without version", deps(&debug.Module{Path: "go.ate.dev/substrate", Version: "v0.5.0", Replace: &debug.Module{Path: "../substrate"}}), "v0.5.0"},
+		{"local replace without version", deps(&debug.Module{Path: "go.ate.dev/substrate", Version: "v0.5.0", Replace: &debug.Module{Path: "../substrate"}}), "v0.5.0+replaced"},
 		{"absent", deps(&debug.Module{Path: "google.golang.org/grpc", Version: "v1.84.0"}), "unknown"},
 		{"no build info", func() (*debug.BuildInfo, bool) { return nil, false }, "unknown"},
 	}

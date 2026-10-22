@@ -699,13 +699,20 @@ type GetServerInfoResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Server implementation, "sandboxenv-rl" for this repository's ate-env-api.
 	Server string `protobuf:"bytes,1,opt,name=server,proto3" json:"server,omitempty"`
-	// Build version of the server, e.g. a release tag or "dev+<commit>".
+	// Build version of the server: the release tag; for a build from a git
+	// checkout, the Go pseudo-version (vX.Y.Z-0.<UTC time>-<12 hex digits of
+	// the commit>, with "+dirty" for uncommitted changes); "dev" when the build
+	// has no version information.
 	Version string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
-	// Version of the go.ate.dev/substrate module the server was built against,
-	// or "unknown".
+	// Version of the go.ate.dev/substrate module the server binary was built
+	// against, or "unknown". This is not the version of the Substrate control
+	// plane the server talks to: the two can differ, and Substrate has no RPC
+	// that reports its version. "+replaced" marks a local replacement of the
+	// module, whose version the binary does not record.
 	SubstrateVersion string `protobuf:"bytes,3,opt,name=substrate_version,json=substrateVersion,proto3" json:"substrate_version,omitempty"`
 	// Optional features the server serves, e.g. "rootfs_image", "pty",
-	// "port_proxy", "bearer_auth". Clients must ignore names they do not know.
+	// "port_proxy". Clients must ignore names they do not know. A name keeps its
+	// meaning once published.
 	Features      []string `protobuf:"bytes,4,rep,name=features,proto3" json:"features,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

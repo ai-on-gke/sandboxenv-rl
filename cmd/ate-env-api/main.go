@@ -103,9 +103,8 @@ func main() {
 	apisvc.WakeBudget = *wakeBudget
 	apisvc.WakeRunningBudget = *wakeRunningBudget
 	apisvc.Info = apiservice.ServerInfo{
-		Version:    buildVersion(),
-		PortProxy:  *atenetConn != "",
-		BearerAuth: callerAuth != nil,
+		Version:   buildVersion(),
+		PortProxy: *atenetConn != "",
 	}
 	defer apisvc.Close()
 

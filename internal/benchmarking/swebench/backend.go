@@ -73,14 +73,15 @@ type EnvBackend struct {
 // NewEnvBackend dials the ate-env API over connections connections (at
 // least one). Environments are created in atespace from baseTemplate with
 // the task image as rootfs; the API derives and bakes one template per
-// distinct image on first use.
-func NewEnvBackend(endpoint, atespace, baseTemplate string, connections int) (*EnvBackend, error) {
+// distinct image on first use. A non-empty authToken is sent as the bearer
+// token on each call, for an ate-env-api that runs with -auth-token-file.
+func NewEnvBackend(endpoint, atespace, baseTemplate string, connections int, authToken string) (*EnvBackend, error) {
 	if connections < 1 {
 		connections = 1
 	}
 	b := &EnvBackend{atespace: atespace, baseTemplate: baseTemplate}
 	for i := 0; i < connections; i++ {
-		c, err := env.NewClient(env.ClientOptions{Endpoint: endpoint})
+		c, err := env.NewClient(env.ClientOptions{Endpoint: endpoint, AuthToken: authToken})
 		if err != nil {
 			b.Close()
 			return nil, err

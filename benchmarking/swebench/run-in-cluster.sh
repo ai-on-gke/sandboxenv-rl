@@ -33,7 +33,9 @@
 # ends the wait early. If the script is killed before its trap runs, the Job
 # ends by itself after 48 hours (activeDeadlineSeconds) and is removed an hour
 # after it finishes; Ctrl-C runs the trap and deletes the Job at once, results
-# included.
+# included. AUTH_TOKEN_SECRET names a Secret in NAMESPACE whose key `token`
+# holds ate-env-api's bearer token; the loader then reads it from
+# SUBSTRATE_ENV_AUTH_TOKEN. Leave it unset for an API without a token.
 
 set -o errexit -o nounset -o pipefail
 
@@ -49,6 +51,18 @@ START_TIMEOUT="${START_TIMEOUT:-600}"
 : "${KO_DOCKER_REPO:?set KO_DOCKER_REPO to the registry path the cluster can pull from}"
 [[ "${RUN_ID}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ && ${#RUN_ID} -le 20 ]] || { echo "RUN_ID must be a DNS label of at most 20 characters" >&2; exit 2; }
 [[ -f "${DATASET}" ]] || { echo "dataset ${DATASET} not found" >&2; exit 2; }
+AUTH_TOKEN_SECRET="${AUTH_TOKEN_SECRET:-}"
+# Checked as a DNS subdomain name, so the value cannot break the manifest.
+[[ -z "${AUTH_TOKEN_SECRET}" || ( "${AUTH_TOKEN_SECRET}" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ && ${#AUTH_TOKEN_SECRET} -le 253 ) ]] || { echo "AUTH_TOKEN_SECRET must be a Secret name" >&2; exit 2; }
+LOADER_ENV=""
+if [[ -n "${AUTH_TOKEN_SECRET}" ]]; then
+  LOADER_ENV="env:
+            - name: SUBSTRATE_ENV_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ${AUTH_TOKEN_SECRET}
+                  key: token"
+fi
 command -v python3 >/dev/null || { echo "python3 is needed to encode the loader arguments" >&2; exit 2; }
 OUT_DIR="$(pwd)"
 
@@ -112,6 +126,7 @@ spec:
         - name: loader
           image: ${IMAGE}
           args: ${ARGS_JSON}
+          ${LOADER_ENV}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

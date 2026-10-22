@@ -217,6 +217,31 @@ had a failed before scrape and is reported and left out. The report cannot
 label one environment cold or warm, because the ate-env API does not say
 which node an environment ran on.
 
+To split the first-command window itself, harvest atelet's restore records
+for the run and give them to the report:
+
+```bash
+benchmarking/swebench/harvest-restore-timings.sh pull-baseline restores.jsonl
+swebench-loader report pull-baseline.jsonl -restore-log restores.jsonl
+```
+
+atelet logs one record per actor restore with the seconds each phase took:
+manifest fetch, snapshot download, image unpack, the worker's restore, and
+the total. The actor's name is the environment's name, so the report pairs
+each record with the `ttfi` or `wake` event of that environment whose window
+(the event's end minus its duration, up to its end) contains the record's
+time: a record inside a `ttfi` window is a cold start, one inside a `wake`
+window is a wake. The table gives p50/p95/max per phase plus an `outside`
+row, the event's span minus atelet's total, which is ateapi, the scheduler,
+the router and the command itself. Failed restores are counted and left out
+of the percentiles; restores whose event failed are counted and left out of
+`outside`. Records before the run's first event or after its last (a rerun
+with the same run id), for actors the run never created, or inside no window
+(a restore after an eviction or a failed suspend) are counted, not paired.
+The records come from the kubelet's container logs, which rotate, so harvest
+right after the run; when atelet restarted, the previous container's log is
+read too, one restart back.
+
 ## Network and the offline exclusion list
 
 Actors have no network until an egress policy is created for them, which the

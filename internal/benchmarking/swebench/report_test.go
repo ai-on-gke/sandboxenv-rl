@@ -274,3 +274,111 @@ func TestNodeCacheDelta(t *testing.T) {
 		t.Fatalf("text report lacks %q:\n%s", want2, text.String())
 	}
 }
+
+func TestJoinRestores(t *testing.T) {
+	rec := func(ts, actor, errType string, phases string) string {
+		e := ""
+		if errType != "" {
+			e = `,"error.type":"` + errType + `"`
+		}
+		return `{"time":"2026-10-21T` + ts + `Z","level":"INFO","msg":"Restore timing breakdown","ate.atespace":"ate-env","ate.actor.name":"` + actor +
+			`","ate.actor.uid":"u","ate.template.name":"t","ate.snapshot.fidelity":"memory"` + e + phases + "}\n"
+	}
+	const total = `,"ate.actor.restore.duration.total":`
+	log := `{"time":"2026-10-21T10:00:00Z","level":"INFO","msg":"Something else","ate.actor.name":"r-a-0"}` + "\n" +
+		// The worker's own record: same message, other key prefix, skipped.
+		`{"time":"2026-10-21T10:00:03Z","msg":"Restore timing breakdown","ate.actor.name":"r-a-0","ateworker.actor.restore.duration.total":2}` + "\n" +
+		rec("09:00:00", "r-a-0", "", total+"1") + // an earlier run with the same names
+		rec("10:00:01", "r-a-0", "", `,"ate.actor.restore.duration.manifest_fetch":0.1,"ate.actor.restore.duration.download":2,"ate.actor.restore.duration.oci_unpack":5,"ate.actor.restore.duration.worker_restore":1`+total+"8.1") +
+		rec("10:03:00", "r-a-0", "", total+"1") + // inside the run, inside no window
+		rec("10:05:01", "r-a-0", "", `,"ate.actor.restore.duration.download":0.5,"ate.actor.restore.duration.worker_restore":0.5`+total+"1") +
+		rec("10:00:00.5", "r-b-0", "DeadlineExceeded", `,"ate.actor.restore.duration.download":30`+total+"30.5") +
+		rec("10:00:40", "r-b-0", "", `,"ate.actor.restore.duration.download":3`+total+"4") +
+		rec("10:00:18", "r-c-0", "", total+"2") +
+		rec("10:10:01", "r-c-0", "", total+"1") +
+		rec("10:20:01", "r-c-0", "", total+"1.5") + // its wake event failed
+		rec("10:30:01", "r-c-0", "", `,"ate.actor.restore.duration.ateom_restore":0.4`+total+"1") + // an older atelet's phase name
+		rec("10:00:02", "other-x-0", "", total+"1")
+	timings, err := ParseRestoreTimings(strings.NewReader(log))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(timings["r-a-0"]) != 4 || timings["r-a-0"][1].Phases["total"] != 8.1 || timings["r-b-0"][0].Err != "DeadlineExceeded" {
+		t.Fatalf("timings: %+v", timings)
+	}
+	for _, bad := range []string{
+		"not json\n",
+		`{"time":"2026-10-21T10:00:00Z","msg":"Restore timing breakdown"` + total + "1}\n",
+		`{"msg":"Restore timing breakdown","ate.actor.name":"x"` + total + "1}\n",
+		`{"time":"garbage","msg":"Restore timing breakdown","ate.actor.name":"x"` + total + "1}\n",
+	} {
+		if _, err := ParseRestoreTimings(strings.NewReader(bad)); err == nil {
+			t.Errorf("%q must be rejected", bad)
+		}
+	}
+
+	at := func(s string) time.Time {
+		v, _ := time.Parse(time.RFC3339, "2026-10-21T"+s+"Z")
+		return v
+	}
+	events := []Event{
+		{Time: at("10:00:10"), RunID: "r", Event: EventTTFI, Env: "r-a-0", DurMS: 10100, OK: true},
+		{Time: at("10:05:02"), RunID: "r", Event: EventWake, Env: "r-a-0", Step: 2, DurMS: 1500, OK: true},
+		{Time: at("10:00:45"), RunID: "r", Event: EventTTFI, Env: "r-b-0", DurMS: 46000, OK: true, Attempts: 2},
+		{Time: at("10:00:20"), RunID: "r", Event: EventTTFI, Env: "r-c-0", DurMS: 5000, OK: true},
+		{Time: at("10:10:02"), RunID: "r", Event: EventWake, Env: "r-c-0", Step: 2, DurMS: 2000, OK: true},
+		{Time: at("10:20:03"), RunID: "r", Event: EventWake, Env: "r-c-0", Step: 3, DurMS: 3000, OK: false, Err: "timeout"},
+		{Time: at("10:30:02"), RunID: "r", Event: EventWake, Env: "r-c-0", Step: 4, DurMS: 2000, OK: true},
+	}
+	b := JoinRestores(events, timings)
+	if b.OutsideRun != 1 || b.Unmatched != 1 || b.Unpaired != 1 {
+		t.Fatalf("counts: %+v", b)
+	}
+	if b.First.Restores != 3 || b.First.Failed != 1 || b.First.FailedEvents != 0 {
+		t.Fatalf("first: %+v", b.First)
+	}
+	if b.Wakes.Restores != 4 || b.Wakes.Failed != 0 || b.Wakes.FailedEvents != 1 {
+		t.Fatalf("wakes: %+v", b.Wakes)
+	}
+	find := func(g RestoreGroup, phase string) PhaseStat {
+		for _, p := range g.Phases {
+			if p.Phase == phase {
+				return p
+			}
+		}
+		t.Fatalf("no %s in %+v", phase, g.Phases)
+		return PhaseStat{}
+	}
+	if p := find(b.First, "download"); p.Count != 2 || p.MaxMS != 3000 {
+		t.Fatalf("first download: %+v", p)
+	}
+	if p := find(b.First, "total"); p.Count != 3 || p.MaxMS != 8100 {
+		t.Fatalf("first total: %+v", p)
+	}
+	if b.First.Phases[0].Phase != "manifest_fetch" || b.First.Phases[len(b.First.Phases)-1].Phase != "total" {
+		t.Fatalf("first phase order: %+v", b.First.Phases)
+	}
+	// outside = event span - total: a 10100-8100, b 46000-4000, c 5000-2000.
+	if o := b.First.Outside; o == nil || o.Count != 3 || o.P50MS != 3000 || o.MaxMS != 42000 {
+		t.Fatalf("first outside: %+v", o)
+	}
+	// Wakes: a 1500-1000, c 2000-1000, c 2000-1000; the failed wake's restore is left out.
+	if o := b.Wakes.Outside; o == nil || o.Count != 3 || o.P50MS != 1000 || o.MaxMS != 1000 {
+		t.Fatalf("wake outside: %+v", o)
+	}
+	n := len(b.Wakes.Phases)
+	if n < 2 || b.Wakes.Phases[n-1].Phase != "ateom_restore" || b.Wakes.Phases[n-2].Phase != "total" {
+		t.Fatalf("unknown phase must follow the known ones: %+v", b.Wakes.Phases)
+	}
+
+	rep := Build(events)
+	rep.Restores = b
+	var text bytes.Buffer
+	rep.WriteText(&text)
+	flat := strings.Join(strings.Fields(text.String()), " ")
+	for _, want := range []string{"1 records before or after this run", "1 records for actors not in this run", "1 records inside no ttfi or wake window", "first failed 1", "wake failed_events 1", "wake total 4"} {
+		if !strings.Contains(flat, want) {
+			t.Errorf("text report lacks %q:\n%s", want, text.String())
+		}
+	}
+}

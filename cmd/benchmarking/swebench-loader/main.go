@@ -19,7 +19,7 @@
 //	swebench-loader run    -dataset manifest.jsonl -mode steps -images 500 -rollouts 2 -steps 8 -park suspend -out run.jsonl
 //	swebench-loader report run.jsonl [-json summary.json]
 //	swebench-loader report a.jsonl b.jsonl   (one table, a column per run)
-//	swebench-loader report run.jsonl -cache-before before.txt -cache-after after.txt
+//	swebench-loader report run.jsonl -cache-before before.txt -cache-after after.txt -restore-log restores.jsonl
 package main
 
 import (
@@ -221,6 +221,7 @@ func reportCmd(args []string) error {
 	unresolvedNote := fs.String("unresolved-note", "Instances graded unresolved", "First comment line of the -unresolved file.")
 	cacheBefore := fs.String("cache-before", "", "Node cache sample taken before the run (benchmarking/swebench/sample-node-cache.sh); with -cache-after, the report adds the run's cache misses. One file only.")
 	cacheAfter := fs.String("cache-after", "", "Node cache sample taken after the run.")
+	restoreLog := fs.String("restore-log", "", "atelet restore records for the run (benchmarking/swebench/harvest-restore-timings.sh); the report adds the restore phases per environment. One file only.")
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
@@ -230,18 +231,20 @@ func reportCmd(args []string) error {
 		return fmt.Errorf("unexpected arguments after the flags: %s; put every events file before the flags", strings.Join(fs.Args(), " "))
 	}
 	reps := make([]*swebench.Report, 0, len(files))
+	var events []swebench.Event // of the single file, for the restore join
 	for _, path := range files {
-		rep, err := summarizeFile(path)
+		evs, err := readEventsFile(path)
 		if err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
-		reps = append(reps, rep)
+		events = evs
+		reps = append(reps, swebench.Build(evs))
 	}
 	if len(reps) > 1 {
 		// Several runs: one table, a column per run, for the same workload on
 		// different clusters or builds.
-		if *unresolvedOut != "" || *cacheBefore != "" || *cacheAfter != "" {
-			return fmt.Errorf("-unresolved, -cache-before and -cache-after take one events file")
+		if *unresolvedOut != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" {
+			return fmt.Errorf("-unresolved, -cache-before, -cache-after and -restore-log take one events file")
 		}
 		swebench.WriteComparison(os.Stdout, reps, files)
 		if *jsonOut != "" {
@@ -268,6 +271,18 @@ func reportCmd(args []string) error {
 		}
 		d := before.Delta(after)
 		rep.Cache = &d
+	}
+	if *restoreLog != "" {
+		f, err := os.Open(*restoreLog)
+		if err != nil {
+			return err
+		}
+		timings, err := swebench.ParseRestoreTimings(f)
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("%s: %w", *restoreLog, err)
+		}
+		rep.Restores = swebench.JoinRestores(events, timings)
 	}
 	rep.WriteText(os.Stdout)
 	if *unresolvedOut != "" {
@@ -301,13 +316,13 @@ func leadingFiles(args []string) (files, rest []string) {
 	return args, nil
 }
 
-func summarizeFile(path string) (*swebench.Report, error) {
+func readEventsFile(path string) ([]swebench.Event, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	return swebench.Summarize(f)
+	return swebench.ReadEvents(f)
 }
 
 func loadCacheSample(path string) (*swebench.NodeCacheSample, error) {

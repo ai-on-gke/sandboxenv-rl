@@ -86,14 +86,15 @@ const (
 
 // manifestConfig holds configuration for generating Kubernetes deployment manifests.
 type manifestConfig struct {
-	namespace   string
-	template    string
-	workerPool  string
-	workerImage string
-	replicas    int32
-	apiImage    string
-	apiReplicas int32
-	apiPort     int32
+	namespace       string
+	template        string
+	workerPool      string
+	workerImage     string
+	replicas        int32
+	apiImage        string
+	apiReplicas     int32
+	apiPort         int32
+	authTokenSecret string
 }
 
 func (c *manifestConfig) resolveImages() error {
@@ -308,6 +309,7 @@ the "template" subcommand: ate-env manifest template`,
 	cmd.Flags().StringVar(&mCfg.apiImage, "api-image", defaultAPIImage, imageDefaultHelp("digest-pinned ate-env-api image for the API service", defaultAPIImage))
 	cmd.Flags().Int32Var(&mCfg.apiReplicas, "api-replicas", 1, "number of API service replicas")
 	cmd.Flags().Int32Var(&mCfg.apiPort, "api-port", 7777, "port the ate-env-api service listens on")
+	cmd.Flags().StringVar(&mCfg.authTokenSecret, "auth-token-secret", "", "Kubernetes Secret name (with key 'token') to mount into ate-env-api and require as a caller bearer token")
 	cmd.Flags().StringVar(&mCfg.workerPool, "workerpool", "", "WorkerPool name (defaults to <template>-workerpool)")
 	cmd.Flags().Int32Var(&mCfg.replicas, "replicas", 5, "number of pre-warmed worker pods")
 
@@ -693,6 +695,45 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 	labels := map[string]string{"app": apiName}
 	replicas := cfg.apiReplicas
 	tokenExpiration := int64(7200)
+	args := []string{
+		"-listen", fmt.Sprintf("0.0.0.0:%d", cfg.apiPort),
+		"-ateapi-token-file=/var/run/secrets/ateapi/token",
+	}
+	mounts := []corev1.VolumeMount{{
+		Name:      "ateapi-token",
+		MountPath: "/var/run/secrets/ateapi",
+		ReadOnly:  true,
+	}}
+	volumes := []corev1.Volume{{
+		Name: "ateapi-token",
+		VolumeSource: corev1.VolumeSource{
+			Projected: &corev1.ProjectedVolumeSource{
+				Sources: []corev1.VolumeProjection{{
+					ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+						Audience:          "api.ate-system.svc",
+						ExpirationSeconds: &tokenExpiration,
+						Path:              "token",
+					},
+				}},
+			},
+		},
+	}}
+	if cfg.authTokenSecret != "" {
+		args = append(args, "-auth-token-file=/var/run/secrets/ate-env-auth/token")
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      "ate-env-auth",
+			MountPath: "/var/run/secrets/ate-env-auth",
+			ReadOnly:  true,
+		})
+		volumes = append(volumes, corev1.Volume{
+			Name: "ate-env-auth",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: cfg.authTokenSecret,
+				},
+			},
+		})
+	}
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -716,16 +757,9 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 						Image: cfg.apiImage,
 						// ateapi/atenet default to the in-cluster
 						// Substrate service addresses.
-						Args: []string{
-							"-listen", fmt.Sprintf("0.0.0.0:%d", cfg.apiPort),
-							"-ateapi-token-file=/var/run/secrets/ateapi/token",
-						},
-						Ports: []corev1.ContainerPort{{ContainerPort: cfg.apiPort}},
-						VolumeMounts: []corev1.VolumeMount{{
-							Name:      "ateapi-token",
-							MountPath: "/var/run/secrets/ateapi",
-							ReadOnly:  true,
-						}},
+						Args:         args,
+						Ports:        []corev1.ContainerPort{{ContainerPort: cfg.apiPort}},
+						VolumeMounts: mounts,
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								HTTPGet: &corev1.HTTPGetAction{
@@ -735,20 +769,7 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 							},
 						},
 					}},
-					Volumes: []corev1.Volume{{
-						Name: "ateapi-token",
-						VolumeSource: corev1.VolumeSource{
-							Projected: &corev1.ProjectedVolumeSource{
-								Sources: []corev1.VolumeProjection{{
-									ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-										Audience:          "api.ate-system.svc",
-										ExpirationSeconds: &tokenExpiration,
-										Path:              "token",
-									},
-								}},
-							},
-						},
-					}},
+					Volumes: volumes,
 				},
 			},
 		},

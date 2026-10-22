@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"google.golang.org/grpc"
@@ -45,11 +46,23 @@ func (s *Service) StartProcess(ctx context.Context, req *ateenvv1alpha.StartProc
 		return nil, status.Error(codes.InvalidArgument, "timeout is invalid")
 	}
 
+	var tty *TTYOptions
+	if req.GetTty() != nil {
+		if err := checkWindowSize(req.GetTty().GetRows(), req.GetTty().GetCols()); err != nil {
+			return nil, err
+		}
+		tty = &TTYOptions{
+			Rows: req.GetTty().GetRows(),
+			Cols: req.GetTty().GetCols(),
+		}
+	}
+
 	state, err := s.tracker.Start(StartOptions{
 		Command: req.GetCommand(),
 		Cwd:     req.GetCwd(),
 		Env:     req.GetEnv(),
 		Stdin:   req.GetStdin(),
+		TTY:     tty,
 		Timeout: req.GetTimeout().AsDuration(),
 	})
 	if err != nil {
@@ -210,6 +223,29 @@ func (s *Service) SignalProcess(ctx context.Context, req *ateenvv1alpha.SignalPr
 	return state.ToProto(), nil
 }
 
+// ResizeProcess updates the window dimensions of a process's pseudo-terminal.
+func (s *Service) ResizeProcess(ctx context.Context, req *ateenvv1alpha.ResizeProcessRequest) (*ateenvv1alpha.ResizeProcessResponse, error) {
+	if req.GetProcessId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "process_id cannot be empty")
+	}
+	if err := checkWindowSize(req.GetRows(), req.GetCols()); err != nil {
+		return nil, err
+	}
+	if err := s.tracker.Resize(req.GetProcessId(), req.GetRows(), req.GetCols()); err != nil {
+		return nil, rpcError(err, req.GetProcessId())
+	}
+	return &ateenvv1alpha.ResizeProcessResponse{}, nil
+}
+
+// checkWindowSize rejects terminal dimensions that do not fit the kernel's
+// 16-bit winsize fields.
+func checkWindowSize(rows, cols uint32) error {
+	if rows > math.MaxUint16 || cols > math.MaxUint16 {
+		return status.Errorf(codes.InvalidArgument, "rows and cols must be at most %d, got %dx%d", math.MaxUint16, rows, cols)
+	}
+	return nil
+}
+
 func (s *Service) lookup(processID string) (*ProcessState, error) {
 	if processID == "" {
 		return nil, status.Error(codes.InvalidArgument, "process_id cannot be empty")
@@ -234,6 +270,8 @@ func rpcError(err error, processID string) error {
 		return status.Errorf(codes.FailedPrecondition, "process %q was started without stdin", processID)
 	case errors.Is(err, ErrStdinClosed):
 		return status.Errorf(codes.FailedPrecondition, "stdin of process %q is closed", processID)
+	case errors.Is(err, ErrNoTTY):
+		return status.Errorf(codes.FailedPrecondition, "process %q was started without a tty", processID)
 	case errors.Is(err, ErrTooManyProcesses):
 		return status.Errorf(codes.ResourceExhausted, "%v; wait for running processes to exit or signal them", err)
 	default:

@@ -129,6 +129,11 @@ func runCmd(args []string) (retErr error) {
 	if err != nil {
 		return err
 	}
+	if traj.Grades() {
+		if err := swebench.RequireGrading(selected); err != nil {
+			return err
+		}
+	}
 	for _, in := range selected {
 		if _, err := traj.Render(in); err != nil {
 			return err

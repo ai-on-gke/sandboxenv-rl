@@ -99,6 +99,17 @@ def _may_exist_after(exc: BaseException) -> bool:
     return not isinstance(exc, EnvError)
 
 
+def _from_port_proxy(resp: httpx.Response) -> bool:
+    """Whether a 401 or 403 came from ate-env-api's port proxy, not the agent-server.
+
+    The proxy answers a missing or wrong bearer token with
+    ``WWW-Authenticate: Bearer`` and a body that names the bearer token.
+    """
+    if resp.headers.get("www-authenticate", "").lower().startswith("bearer"):
+        return True
+    return "bearer token" in resp.text
+
+
 class AteEnvWorkspace(RemoteWorkspace):
     """Remote workspace backed by an ate-env environment.
 
@@ -400,10 +411,15 @@ class AteEnvWorkspace(RemoteWorkspace):
         """
         resp = self.client.get(f"{self.api_prefix}/bash/bash_events/search", params={"limit": 1})
         if resp.status_code in (401, 403):
+            detail = f"HTTP {resp.status_code}: {resp.text.strip()[:200]}"
+            if _from_port_proxy(resp):
+                # The token can change after the health wait, e.g. a rotation.
+                raise PermissionError(
+                    f"the port proxy refused the request for {self.atespace}/{self.env_id} "
+                    f"({detail}); api_token must be ate-env-api's current bearer token")
             raise PermissionError(
                 f"agent-server in {self.atespace}/{self.env_id} rejected the session key "
-                f"(HTTP {resp.status_code}); api_key must match the template's "
-                "OH_SESSION_API_KEYS_0")
+                f"({detail}); api_key must match the template's OH_SESSION_API_KEYS_0")
         if resp.status_code == 404:
             logger.warning("session key not checked: the agent-server has no "
                            "/api/bash/bash_events/search (version other than 1.55.0?)")

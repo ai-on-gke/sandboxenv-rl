@@ -162,6 +162,24 @@ def test_a_wrong_session_key_fails_and_cleans_up(no_finalizer, stack, tmp_path):
     assert state.deletes == [state.creates[0]["id"]]
 
 
+def test_a_proxy_refusal_in_the_key_check_blames_the_token(no_finalizer, stack, tmp_path,
+                                                          monkeypatch):
+    api_url, state = stack
+    state.api_token = "tok"
+    wait = AteEnvWorkspace._wait_for_health
+
+    def wait_then_rotate(self, *, timeout):
+        wait(self, timeout=timeout)
+        state.api_token = "rotated"  # the token changes after the health wait
+
+    monkeypatch.setattr(AteEnvWorkspace, "_wait_for_health", wait_then_rotate)
+    with pytest.raises(PermissionError, match="port proxy refused") as ei:
+        make(api_url, state, tmp_path, api_token="tok")
+    assert "session key" not in str(ei.value)
+    assert "HTTP 401" in str(ei.value)
+    assert len(state.deletes) == 1, "the failed constructor deletes what it created"
+
+
 def test_attach_neither_creates_nor_deletes(stack, tmp_path):
     api_url, state = stack
     owner = make(api_url, state, tmp_path, delete_on_exit=False)

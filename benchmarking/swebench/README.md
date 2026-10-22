@@ -57,8 +57,9 @@ API server included, which is what a trainer sees):
 p50, p95 and max per event, a per-step table (tasks, barrier, park, wake
 p50/p95) and the most frequent errors. The JSON is the artifact to diff
 between runs. Given several files, `report a.jsonl b.jsonl` prints one table
-with a column per run (p50/p95 per event, barrier, park and wake per step),
-and `-json` then writes the summaries as an array.
+with a column per run: p50/p95 per event, and per step the live environments,
+tasks, failures, barrier, park and wake p50/p95. `-json` then writes the
+summaries as an array. Files go before the flags.
 
 ## How many actors, and on which clusters
 
@@ -86,10 +87,11 @@ so "which cluster" is "which API". To compare clusters (builds, node images,
 image delivery) run the same manifest, trajectory and flags once per
 cluster, with `CONTEXT=<kubectl context>` pointing the in-cluster script at
 each cluster and the cluster's name in the run id, then put the events files
-side by side with `swebench-loader report a.jsonl b.jsonl`. Each cluster needs the
-full setup below: Substrate and the ate-env API installed, the images
-reachable from it, and the golden tags baked there (a golden tag is per
-cluster, so the first run on a fresh cluster pays the bake for every image).
+side by side with `swebench-loader report a.jsonl b.jsonl`. Each cluster
+needs the full setup below: Substrate and the ate-env API installed, the
+images reachable from it, and the golden tags baked there (a golden tag is
+per cluster, so the first run on a fresh cluster pays the bake for every
+image).
 One run never spans clusters.
 
 Telemetry is the JSONL file only. There is no OpenTelemetry export yet; the

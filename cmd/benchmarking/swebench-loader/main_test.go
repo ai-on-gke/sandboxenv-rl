@@ -16,6 +16,7 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -38,5 +39,12 @@ func TestLeadingFiles(t *testing.T) {
 		if !reflect.DeepEqual(files, tc.files) || !reflect.DeepEqual(rest, tc.rest) {
 			t.Errorf("leadingFiles(%q) = %q, %q; want %q, %q", tc.args, files, rest, tc.files, tc.rest)
 		}
+	}
+}
+
+func TestReportCmdRejectsFilesAfterFlags(t *testing.T) {
+	err := reportCmd([]string{"a.jsonl", "-json", "o.json", "b.jsonl"})
+	if err == nil || !strings.Contains(err.Error(), "before the flags") || !strings.Contains(err.Error(), "b.jsonl") {
+		t.Fatalf("err = %v, want the files-before-flags error naming b.jsonl", err)
 	}
 }

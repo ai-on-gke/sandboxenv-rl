@@ -221,6 +221,11 @@ func reportCmd(args []string) error {
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		// flag stops at the first non-flag, so a file after a flag would be
+		// dropped without a word.
+		return fmt.Errorf("unexpected arguments after the flags: %s; put every events file before the flags", strings.Join(fs.Args(), " "))
+	}
 	reps := make([]*swebench.Report, 0, len(files))
 	for _, path := range files {
 		rep, err := summarizeFile(path)
@@ -235,7 +240,7 @@ func reportCmd(args []string) error {
 		if *unresolvedOut != "" {
 			return fmt.Errorf("-unresolved takes one events file")
 		}
-		swebench.WriteComparison(os.Stdout, reps)
+		swebench.WriteComparison(os.Stdout, reps, files)
 		if *jsonOut != "" {
 			b, err := json.MarshalIndent(reps, "", "  ")
 			if err != nil {

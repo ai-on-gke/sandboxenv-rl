@@ -31,12 +31,12 @@
 # the current one), so one shell can drive the same run on several clusters
 # in turn: put the cluster in RUN_ID and compare the events files with
 # `swebench-loader report a.jsonl b.jsonl`. START_TIMEOUT (seconds, default
-# 600) bounds the wait for the pod to start. A failed kubectl call while waiting for the
-# loader's exit code is retried; only a pod that is gone (NotFound) or Failed
-# ends the wait early. If the script is killed before its trap runs, the Job
-# ends by itself after 48 hours (activeDeadlineSeconds) and is removed an hour
-# after it finishes; Ctrl-C runs the trap and deletes the Job at once, results
-# included.
+# 600) bounds the wait for the pod to start. A failed kubectl call while
+# waiting for the loader's exit code is retried; only a pod that is gone
+# (NotFound) or Failed ends the wait early. If the script is killed before
+# its trap runs, the Job ends by itself after 48 hours (activeDeadlineSeconds)
+# and is removed an hour after it finishes; Ctrl-C runs the trap and deletes
+# the Job at once, results included.
 
 set -o errexit -o nounset -o pipefail
 
@@ -50,8 +50,10 @@ shift 2
 NS="${NAMESPACE:-ate-env}"
 CONTEXT="${CONTEXT:-}"
 START_TIMEOUT="${START_TIMEOUT:-600}"
-# Every kubectl call goes through kc so CONTEXT applies to all of them.
+# Every kubectl call goes through kc so CONTEXT applies to all of them. The
+# context in use is logged so each run's log names its cluster.
 kc() { kubectl ${CONTEXT:+--context "${CONTEXT}"} "$@"; }
+echo "kubectl context ${CONTEXT:-$(kubectl config current-context 2>/dev/null || echo unknown)}"
 : "${KO_DOCKER_REPO:?set KO_DOCKER_REPO to the registry path the cluster can pull from}"
 [[ "${RUN_ID}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ && ${#RUN_ID} -le 20 ]] || { echo "RUN_ID must be a DNS label of at most 20 characters" >&2; exit 2; }
 [[ -f "${DATASET}" ]] || { echo "dataset ${DATASET} not found" >&2; exit 2; }

@@ -143,23 +143,28 @@ func TestWriteComparison(t *testing.T) {
 		{RunID: "a", Event: EventCreate, DurMS: 100, OK: true},
 		{RunID: "a", Event: EventTTFI, DurMS: 900, OK: true, Attempts: 2},
 		{RunID: "a", Event: EventTask, Step: 1, DurMS: 500, OK: true, Reward: intp(1)},
-		{RunID: "a", Event: EventBarrier, Step: 1, DurMS: 700, OK: true, Count: 1},
+		{RunID: "a", Event: EventWake, Step: 1, DurMS: 40, OK: true},
+		{RunID: "a", Event: EventBarrier, Step: 1, DurMS: 700, OK: true, Count: 3},
 		{RunID: "a", Event: EventPark, Name: "suspend", Step: 1, DurMS: 100, OK: true, Count: 1},
 		{RunID: "a", Event: EventRun, Name: "steps", DurMS: 2000, OK: true, Count: 1},
 	})
 	b := Build([]Event{
 		{RunID: "b", Event: EventCreate, DurMS: 50, OK: true},
 		{RunID: "b", Event: EventCreate, DurMS: 70, OK: false, Err: "boom"},
+		{RunID: "b", Event: EventDelete, DurMS: 70, OK: false, Err: "boom"},
 		{RunID: "b", Event: EventTask, DurMS: 400, OK: true, Reward: intp(1)}, // eval mode: step 0
 		{RunID: "b", Event: EventRun, Name: "eval", DurMS: 1000, OK: true, Count: 1},
 	})
 	var out bytes.Buffer
-	WriteComparison(&out, []*Report{a, b})
+	WriteComparison(&out, []*Report{a, b}, []string{"runs/a.jsonl", "runs/b.jsonl"})
 	text := out.String()
-	for _, want := range []string{"100/100 n=1", "50/50 n=2 f=1", "900/900 n=1 r=1", "0.7/0.1, 0"} {
+	for _, want := range []string{"100/100 n=1", "50/50 n=2 f=1", "900/900 n=1 r=1", "-/- n=1 f=1", "live=3 tasks=1 0.7/0.1 40/40"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("comparison lacks %q:\n%s", want, text)
 		}
+	}
+	if strings.Count(text, "cells:") != 1 || !strings.HasPrefix(text, "cells:") {
+		t.Errorf("the legend must appear once, above the table:\n%s", text)
 	}
 	// A run without the event, or without the step, shows a dash in its column.
 	for _, label := range []string{"ttfi", "step 1"} {
@@ -176,7 +181,33 @@ func TestWriteComparison(t *testing.T) {
 			t.Errorf("no %s row:\n%s", label, text)
 		}
 	}
-	if !strings.HasPrefix(text, "run ") || !strings.Contains(strings.SplitN(text, "\n", 2)[0], "b") {
-		t.Errorf("header row: %q", strings.SplitN(text, "\n", 2)[0])
+	header := strings.Split(text, "\n")[1]
+	if fields := strings.Fields(header); len(fields) != 3 || fields[0] != "run" || fields[1] != "a" || fields[2] != "b" {
+		t.Errorf("header row: %q", header)
+	}
+
+	// Two files with the same run id, or none, are told apart by file name,
+	// and by the full path when the file names repeat too.
+	same := Build([]Event{{RunID: "a", Event: EventCreate, DurMS: 1, OK: true}, {RunID: "a", Event: EventRun, Name: "eval", DurMS: 1, OK: true}})
+	empty := Build(nil)
+	got := columnLabels([]*Report{a, same, empty}, []string{"x/first.jsonl", "x/second.jsonl", ""})
+	if want := []string{"first", "second", "run 3"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("labels = %q, want %q", got, want)
+	}
+	got = columnLabels([]*Report{a, same}, []string{"east/run.jsonl", "west/run.jsonl"})
+	if want := []string{"east/run.jsonl", "west/run.jsonl"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("labels = %q, want %q", got, want)
+	}
+
+	// A step with no wake, the first one or -park none, shows a dash for wake.
+	nowake := Build([]Event{
+		{RunID: "n", Event: EventTask, Step: 1, DurMS: 500, OK: true, Reward: intp(1)},
+		{RunID: "n", Event: EventBarrier, Step: 1, DurMS: 700, OK: true, Count: 1},
+		{RunID: "n", Event: EventRun, Name: "steps", DurMS: 1000, OK: true, Count: 1},
+	})
+	out.Reset()
+	WriteComparison(&out, []*Report{nowake}, []string{"n.jsonl"})
+	if !strings.Contains(out.String(), "live=1 tasks=1 0.7/0.0 -/-") {
+		t.Errorf("step without wakes:\n%s", out.String())
 	}
 }

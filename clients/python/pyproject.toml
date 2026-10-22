@@ -43,7 +43,7 @@ Homepage = "https://github.com/agent-substrate/env"
 where = ["src"]
 
 [tool.setuptools.package-data]
-ate_env = ["py.typed", "_gen/**/*.pyi"]
+ate_env = ["py.typed", "_gen/**/*.pyi", "schemas/v1/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

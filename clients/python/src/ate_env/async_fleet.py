@@ -18,6 +18,9 @@ Enables RL post-training frameworks (TorchRL, VeRL, SkyRL) to overlap LLM token
 generation with background sandbox pre-warming and non-blocking batch acquisition.
 """
 
+# pylint: disable=missing-function-docstring,line-too-long,broad-exception-caught
+# pylint: disable=unused-argument,protected-access,duplicate-code
+
 from __future__ import annotations
 
 import asyncio
@@ -52,8 +55,16 @@ class AsyncSandboxFleet:
 
     def close(self, *, wait: bool = True) -> None:
         """Close fleet resources."""
+        try:
+            self._fleet.telemetry.close()
+        except Exception:
+            pass
         if hasattr(self.backend, "close"):
             self.backend.close()
+
+    @property
+    def telemetry(self) -> Any:
+        return self._fleet.telemetry
 
     def __del__(self) -> None:
         try:

@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pylint: disable=missing-module-docstring,missing-function-docstring,line-too-long
+# pylint: disable=too-many-instance-attributes,broad-exception-caught
+# pylint: disable=import-outside-toplevel,duplicate-code
+
 from __future__ import annotations
 
 import collections
@@ -28,6 +32,7 @@ from .config import FleetConfig
 from .handle import SandboxHandle
 from .runtime.base import RuntimeGuestHook
 from .strategies import STRATEGIES
+from .telemetry import BenchTelemetry
 from .types import (
     DataPlaneEndpoint,
     FleetPlan,
@@ -46,9 +51,21 @@ class SandboxFleet:
     task acquisition, and execution strategies across any backend driver.
     """
 
-    def __init__(self, config: FleetConfig | None = None, driver: BackendDriver | None = None):
+    def __init__(
+        self,
+        config: FleetConfig | None = None,
+        driver: BackendDriver | None = None,
+        *,
+        telemetry: BenchTelemetry | None = None,
+    ):
         self.config = config or FleetConfig()
         self.run_id = uuid.uuid4().hex[:12]
+        if telemetry is not None:
+            self.telemetry = telemetry
+        elif isinstance(self.config.telemetry, BenchTelemetry):
+            self.telemetry = self.config.telemetry
+        else:
+            self.telemetry = BenchTelemetry(run_id=self.run_id)
         self._tasks: list[Task] = []
         self._image_to_template: dict[str, tuple[str, str | None]] = {}
         self._plan: FleetPlan | None = None
@@ -57,8 +74,14 @@ class SandboxFleet:
         # Initialize Backend Driver
         if driver is not None:
             self.backend = driver
+            if getattr(self.backend, "telemetry", None) is None:
+                try:
+                    setattr(self.backend, "telemetry", self.telemetry)
+                except Exception:
+                    pass
         elif self.config.backend == "mock":
             self.backend = MockBackendDriver()
+            setattr(self.backend, "telemetry", self.telemetry)
         elif self.config.backend == "substrate":
             token = self.config.auth_token
             self.backend = SubstrateBackendDriver(
@@ -71,6 +94,8 @@ class SandboxFleet:
                 labels=self.config.labels,
                 acquire_timeout_s=self.config.acquire_timeout_s,
                 ready_timeout_s=self.config.ready_timeout_s,
+                max_concurrent=self.config.max_concurrent,
+                telemetry=self.telemetry,
             )
         else:
             raise NotImplementedError(f"Backend '{self.config.backend}' is not yet supported or requires extras")
@@ -92,6 +117,10 @@ class SandboxFleet:
         except Exception as e:
             teardown_err = e
         finally:
+            try:
+                self.telemetry.close()
+            except Exception:
+                pass
             if hasattr(self.backend, "close"):
                 try:
                     self.backend.close()
@@ -265,6 +294,10 @@ class SandboxFleet:
             atespace=self.config.tenancy or "ate-env",
             client=client,
             loop_runner=loop_runner,
+            telemetry=self.telemetry,
+            source=str(raw_inst.metadata.get("source") or "direct"),
+            cache_state=str(raw_inst.metadata.get("cache_state") or "unknown"),
+            acquired_at_monotonic=raw_inst.metadata.get("acquired_at_monotonic"),
         ), ep
 
     def release(self, handle: SandboxHandle | Sequence[SandboxHandle]) -> None:

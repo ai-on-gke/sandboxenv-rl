@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pylint: disable=missing-module-docstring,too-many-instance-attributes
+# pylint: disable=too-many-arguments,too-many-positional-arguments
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -41,6 +44,28 @@ class SandboxHandle:
     runtime: RuntimeGuestHook = field(repr=False)
     data_plane: DataPlaneEndpoint | None = None
     default_timeout_s: float = 120.0
+    _task_exec_ms: float = field(default=0.0, init=False, repr=False)
+    _task_exec_count: int = field(default=0, init=False, repr=False)
+
+    def _record_task_exec_if_needed(self) -> None:
+        if self._task_exec_count <= 0:
+            return
+        total_ms = self._task_exec_ms
+        self._task_exec_ms = 0.0
+        self._task_exec_count = 0
+        tel = getattr(self.backend, "telemetry", None) or getattr(self.runtime, "_telemetry", None)
+        if tel is not None and getattr(tel, "mode", "off") != "off":
+            source = str(getattr(self.runtime, "_source", "direct") or "direct")
+            cache_state = str(getattr(self.runtime, "_cache_state", "unknown") or "unknown")
+            tel.record_op(
+                "task_exec",
+                total_ms,
+                ok=True,
+                env_id=self.sandbox_id,
+                step_name="task_exec",
+                source=source,
+                cache_state=cache_state,
+            )
 
     def exec(
         self,
@@ -49,6 +74,8 @@ class SandboxHandle:
         env: dict[str, str] | None = None,
         timeout_s: float | None = None,
         check: bool = True,
+        *,
+        name: str = "",
     ) -> ExecResult:
         """Execute command inside the sandbox.
 
@@ -59,7 +86,12 @@ class SandboxHandle:
         Returns ExecResult.
         """
         to_s = self.default_timeout_s if timeout_s is None else timeout_s
-        res = self.runtime.exec(command, cwd=cwd, env=env, timeout_s=to_s)
+        if name and hasattr(self.runtime, "_supports_exec_name"):
+            res = self.runtime.exec(command, cwd=cwd, env=env, timeout_s=to_s, name=name)
+        else:
+            res = self.runtime.exec(command, cwd=cwd, env=env, timeout_s=to_s)
+        self._task_exec_ms += max(0.0, float(res.duration_s) * 1000.0)
+        self._task_exec_count += 1
         if check and res.timed_out:
             raise CommandTimeoutError(
                 f"Command '{command}' timed out after {to_s:g}s:\n"
@@ -81,10 +113,19 @@ class SandboxHandle:
         env: dict[str, str] | None = None,
         timeout_s: float | None = None,
         check: bool = True,
+        *,
+        name: str = "",
     ) -> ExecResult:
         """Asynchronously execute command inside the sandbox."""
         to_s = self.default_timeout_s if timeout_s is None else timeout_s
-        res = await self.runtime.exec_async(command, cwd=cwd, env=env, timeout_s=to_s)
+        if name and hasattr(self.runtime, "_supports_exec_name"):
+            res = await self.runtime.exec_async(
+                command, cwd=cwd, env=env, timeout_s=to_s, name=name
+            )
+        else:
+            res = await self.runtime.exec_async(command, cwd=cwd, env=env, timeout_s=to_s)
+        self._task_exec_ms += max(0.0, float(res.duration_s) * 1000.0)
+        self._task_exec_count += 1
         if check and res.timed_out:
             raise CommandTimeoutError(
                 f"Command '{command}' timed out after {to_s:g}s:\n"
@@ -126,6 +167,7 @@ class SandboxHandle:
 
     def release(self) -> None:
         """Release this sandbox back to the backend or terminate it."""
+        self._record_task_exec_if_needed()
         try:
             self.backend.release(self.sandbox_id, recycle=False)
         finally:
@@ -133,6 +175,7 @@ class SandboxHandle:
 
     async def release_async(self) -> None:
         """Asynchronously release this sandbox back to the backend or terminate it."""
+        self._record_task_exec_if_needed()
         try:
             if hasattr(self.backend, "release_async"):
                 await self.backend.release_async(self.sandbox_id, recycle=False)
@@ -151,6 +194,7 @@ class SandboxHandle:
         resetting filesystem or process state. The next claim will receive
         the actor in the state left by the previous workload.
         """
+        self._record_task_exec_if_needed()
         try:
             self.backend.release(self.sandbox_id, recycle=True)
         finally:
@@ -163,6 +207,7 @@ class SandboxHandle:
         resetting filesystem or process state. The next claim will receive
         the actor in the state left by the previous workload.
         """
+        self._record_task_exec_if_needed()
         try:
             if hasattr(self.backend, "release_async"):
                 await self.backend.release_async(self.sandbox_id, recycle=True)

@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ai-on-gke/sandboxenv-rl/schemas/v1/event.schema.json",
+  "title": "Event",
+  "description": "W1 benchmark operation or step summary event emitted to events/*.jsonl.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ts",
+    "run",
+    "event",
+    "dur_ms",
+    "ok"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "v1"
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "minLength": 1
+    },
+    "run": {
+      "type": "string",
+      "minLength": 1
+    },
+    "job": {
+      "type": "string"
+    },
+    "worker": {
+      "type": "string"
+    },
+    "event": {
+      "type": "string",
+      "minLength": 1
+    },
+    "name": {
+      "type": "string"
+    },
+    "env": {
+      "type": "string"
+    },
+    "instance": {
+      "type": "string"
+    },
+    "image": {
+      "type": "string"
+    },
+    "task": {
+      "type": [
+        "integer",
+        "string"
+      ]
+    },
+    "rollout": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "step": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source": {
+      "type": "string",
+      "enum": [
+        "warm_pool",
+        "cold_create",
+        "golden_restore",
+        "fork",
+        "resume",
+        "direct"
+      ]
+    },
+    "phase": {
+      "type": "string"
+    },
+    "dur_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "slot_wait_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "timeout": {
+      "type": "boolean"
+    },
+    "exit": {
+      "type": "integer"
+    },
+    "reward": {
+      "type": [
+        "integer",
+        "number"
+      ]
+    },
+    "attempts": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "err": {
+      "type": "string"
+    },
+    "tail": {
+      "type": "string"
+    },
+    "snapshot": {
+      "type": "string"
+    },
+    "node": {
+      "type": "string"
+    },
+    "bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "cache_hit": {
+      "type": "boolean"
+    },
+    "tags": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "number"
+      }
+    }
+  }
+}

@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pylint: disable=missing-module-docstring,missing-function-docstring
+# pylint: disable=too-many-instance-attributes,line-too-long
+
 from __future__ import annotations
 
 import re
@@ -92,6 +95,7 @@ class FleetConfig:
     ready_timeout_s: float = 180.0
     step_timeout_s: float = 120.0
     auth_token: SecretStr | None = None
+    telemetry: Any | None = None
 
     def __init__(self, **kwargs: Any):
         valid_fields = {f.name: f for f in fields(self)}

@@ -1,0 +1,26 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Image-delivery workload: read one file, the smallest read a lazily loaded
+# rootfs can be asked for. The probe step comes first so time to first
+# instruction is the cold start alone. READ_FILE (-set READ_FILE=...) names
+# the file; the default is matplotlib's pyplot.py in a SWE-bench image. The
+# step prints the bytes read, which the reward step's output tail keeps.
+name: workload-file-read-one
+steps:
+  - name: probe
+    run: "true"
+  - name: file_read_one
+    run: cat -- '{{var "READ_FILE" "/testbed/lib/matplotlib/pyplot.py"}}' | wc -c
+    timeout: 10m
+    reward: true

@@ -215,3 +215,46 @@ func TestGrades(t *testing.T) {
 		t.Fatal("a trajectory that uses only the patch does not grade")
 	}
 }
+
+func TestVarTemplateFunc(t *testing.T) {
+	tr, err := ParseTrajectory([]byte(`
+name: vars
+steps:
+  - {name: a, run: "cat {{var \"READ_FILE\" \"/default.py\"}} && echo {{var \"COUNT\" \"200\"}}", reward: true}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := Instance{InstanceID: "x", Image: "reg/img@" + goodDigest}
+	got, err := tr.Render(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Steps[0].Run != "cat /default.py && echo 200" {
+		t.Fatalf("defaults: %q", got.Steps[0].Run)
+	}
+	tr.Vars = map[string]string{"READ_FILE": "/testbed/setup.py"}
+	got, err = tr.Render(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Steps[0].Run != "cat /testbed/setup.py && echo 200" {
+		t.Fatalf("set value: %q", got.Steps[0].Run)
+	}
+	noDefault, err := ParseTrajectory([]byte(`
+name: nodefault
+steps:
+  - {name: a, run: "cat {{var \"MUST\"}}", reward: true}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := noDefault.Render(in); err == nil || !strings.Contains(err.Error(), "MUST") {
+		t.Fatalf("a variable without a value or a default must fail to render: %v", err)
+	}
+	noDefault.Vars = map[string]string{"MUST": "/x"}
+	got, err = noDefault.Render(in)
+	if err != nil || got.Steps[0].Run != "cat /x" {
+		t.Fatalf("set without default: %v, %v", got, err)
+	}
+}

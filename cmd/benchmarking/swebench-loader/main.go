@@ -209,7 +209,8 @@ func runCmd(args []string) (retErr error) {
 		images        = fs.Int("images", 0, "Use the first N instances of the dataset; 0 means all.")
 		instances     = fs.String("instances", "", "Comma-separated instance ids to use instead of the first N.")
 		excludeFile   = fs.String("exclude-file", "", "File of instance ids to leave out, one per line; text after the id is a comment.")
-		trajectory    = fs.String("trajectory", swebench.DefaultTrajectory, fmt.Sprintf("Trajectory file or built-in name (%s).", strings.Join(swebench.Names(), ", ")))
+		trajectory    = fs.String("trajectory", swebench.DefaultTrajectory, fmt.Sprintf("Trajectory file or built-in name (%s); a comma-separated list mixes them, one per environment, drawn with -seed.", strings.Join(swebench.Names(), ", ")))
+		seed          = fs.Int64("seed", 1, "Seed for the trajectory mix, so reps assign the same trajectory to the same environment.")
 		mode          = fs.String("mode", string(swebench.ModeEval), "eval (images x tasks-per-image, each create/replay/delete) or steps (images x rollouts kept across steps).")
 		width         = fs.Int("width", 50, "Most tasks in flight at once.")
 		tasksPerImage = fs.Int("tasks-per-image", 1, "eval: replays per image.")
@@ -226,7 +227,9 @@ func runCmd(args []string) (retErr error) {
 		dryRun        = fs.Bool("dry-run", false, "Load and render everything, print the plan and exit without touching the API.")
 		authTokenFile = fs.String("auth-token-file", "", "File that holds the bearer token for ate-env-api; surrounding whitespace is ignored. Without it, SUBSTRATE_ENV_AUTH_TOKEN is used when set.")
 		labels        = labelFlags{}
+		vars          = labelFlags{}
 	)
+	fs.Var(vars, "set", "KEY=VALUE for the trajectories' var function, repeatable, e.g. READ_FILE=/testbed/setup.py or COMPILE_DIR=/testbed; a workload's defaults are in its file.")
 	fs.Var(labels, "label", "KEY=VALUE recorded on the run event, repeatable: the Substrate commit, the cluster, the arm. The loader records its own flags itself (mode, width, images, trajectory, dataset, the shape flags, connections, base-template, exclude-file, instances and the timeouts); a -label with the same key wins.")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -267,20 +270,32 @@ func runCmd(args []string) (retErr error) {
 	if *images > 0 && len(selected) < *images && len(ids) == 0 {
 		fmt.Fprintf(os.Stderr, "note: %d instances requested, %d available after the exclude list\n", *images, len(selected))
 	}
-	traj, err := swebench.LoadTrajectory(*trajectory)
-	if err != nil {
-		return err
-	}
-	if traj.Grades() {
-		if err := swebench.RequireGrading(selected); err != nil {
+	var trajs []*swebench.Trajectory
+	for _, source := range strings.Split(*trajectory, ",") {
+		if source = strings.TrimSpace(source); source == "" {
+			continue
+		}
+		t, err := swebench.LoadTrajectory(source)
+		if err != nil {
 			return err
 		}
-	}
-	for _, in := range selected {
-		if _, err := traj.Render(in); err != nil {
-			return err
+		t.Vars = vars
+		if t.Grades() {
+			if err := swebench.RequireGrading(selected); err != nil {
+				return err
+			}
 		}
+		for _, in := range selected {
+			if _, err := t.Render(in); err != nil {
+				return err
+			}
+		}
+		trajs = append(trajs, t)
 	}
+	if len(trajs) == 0 {
+		return fmt.Errorf("-trajectory names no trajectory")
+	}
+	traj := trajs[0]
 
 	fanout := *tasksPerImage
 	if swebench.Mode(*mode) == swebench.ModeSteps {
@@ -288,7 +303,7 @@ func runCmd(args []string) (retErr error) {
 	}
 	log.Info("plan", slog.String("run", *runID), slog.String("mode", *mode), slog.Int("images", len(selected)),
 		slog.Int("environments", len(selected)*fanout), slog.Int("width", *width), slog.Int("steps", *steps),
-		slog.String("park", *park), slog.String("trajectory", traj.Name), slog.String("out", *out))
+		slog.String("park", *park), slog.String("trajectory", *trajectory), slog.String("out", *out))
 	if *dryRun {
 		return nil
 	}
@@ -328,6 +343,8 @@ func runCmd(args []string) (retErr error) {
 		Backend:       backend,
 		Instances:     selected,
 		Trajectory:    traj,
+		Trajectories:  trajs,
+		Seed:          *seed,
 		Recorder:      rec,
 		Logger:        log,
 		Mode:          swebench.Mode(*mode),

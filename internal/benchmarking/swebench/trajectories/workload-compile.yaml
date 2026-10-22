@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Image-delivery workload: byte-compile every Python file in the image, which
-# reads each one and writes next to it. Probe first, see workload-file-read.
+# Image-delivery workload: byte-compile every Python file under COMPILE_DIR
+# with PYTHON (-set to change; the defaults fit a SWE-bench image), which
+# reads each one and writes next to it. compileall's own exit code is ignored
+# because test fixtures with syntax errors are common; the step passes when
+# at least one .pyc is newer than the sandbox. Probe first, see
+# workload-file-read.
 name: workload-compile
 steps:
   - name: probe
     run: "true"
   - name: compile
-    run: find / -xdev -type f -name '*.py' 2>/dev/null | python3 -m compileall -f -q -i - >/dev/null 2>&1; test -n "$(find / -xdev -name '*.pyc' -newer /proc/1 2>/dev/null | head -n 1)"
+    run: >-
+      '{{var "PYTHON" "python3"}}' -m compileall -f -q '{{var "COMPILE_DIR" "/testbed"}}' >/dev/null 2>&1;
+      test -n "$(find '{{var "COMPILE_DIR" "/testbed"}}' -xdev -name '*.pyc' -newer /proc/1 2>/dev/null | head -n 1)"
     timeout: 20m
     reward: true

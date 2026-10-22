@@ -202,7 +202,7 @@ class SubstrateBackendDriver(BackendDriver):
         """
         with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.ensure_template") as span:
             template = self._resolve_template(env)
-            set_attributes(span, {"env.template": template})
+            set_attributes(span, {"ate.template.name": template})
             return template
 
     def _resolve_template(self, env: EnvironmentSpec | str) -> str:
@@ -261,7 +261,7 @@ class SubstrateBackendDriver(BackendDriver):
         """Acquire a live sandbox instance within timeout_s."""
         to_s = timeout_s or self.acquire_timeout_s
         with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.acquire",
-                        {"env.template": template_id, "env.run_id": run_id}) as span:
+                        {"ate.template.name": template_id, "ate_env.run_id": run_id}) as span:
             try:
                 instance = await asyncio.wait_for(
                     self._acquire_internal(template_id, run_id, rootfs_image=rootfs_image), timeout=to_s
@@ -270,7 +270,7 @@ class SubstrateBackendDriver(BackendDriver):
                 raise SandboxStartError(
                     f"Timed out acquiring sandbox for template {template_id} after {to_s:g}s"
                 ) from e
-            set_attributes(span, {"env.id": instance.instance_id})
+            set_attributes(span, {"ate.actor.name": instance.instance_id})
             return instance
 
     async def _acquire_internal(
@@ -377,9 +377,9 @@ class SubstrateBackendDriver(BackendDriver):
     ) -> None:
         """Pre-warm a pool of actors by creating and suspending them."""
         with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.warm_pool", {
-            "env.template": template_id,
-            "env.replicas": replicas,
-            "env.run_id": run_id,
+            "ate.template.name": template_id,
+            "ate_env.replicas": replicas,
+            "ate_env.run_id": run_id,
         }):
             await self._warm_pool_internal(
                 template_id, replicas, wait=wait, run_id=run_id, rootfs_image=rootfs_image
@@ -509,7 +509,7 @@ class SubstrateBackendDriver(BackendDriver):
         Note: Recycling suspends the actor and returns it to the warm pool
         without resetting guest filesystem or processes.
         """
-        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.release", {"env.id": instance_id}):
+        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.release", {"ate.actor.name": instance_id}):
             await self._release_internal(instance_id, recycle)
 
     async def _release_internal(self, instance_id: str, recycle: bool) -> None:
@@ -539,7 +539,7 @@ class SubstrateBackendDriver(BackendDriver):
 
     async def reap_async(self, run_id: str) -> int:
         """Force delete all environments tagged with this run_id and all warm pool actors."""
-        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.reap", {"env.run_id": run_id}):
+        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.reap", {"ate_env.run_id": run_id}):
             return await self._reap_internal(run_id)
 
     async def _reap_internal(self, run_id: str) -> int:

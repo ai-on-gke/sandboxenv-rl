@@ -44,7 +44,11 @@ class SandboxHandle:
 
     ``tracer`` (set by the fleet when tracing is on) wraps exec and file
     operations in ``ate_env_client.exec`` / ``.write_file`` / ``.read_file``
-    spans.
+    spans. Each carries ``ate.actor.name`` and ``ate_env.run_id``, so one
+    run's step-level spans are selectable without walking parents. The first
+    exec on a handle also carries ``ate_env.first_command=true``: it holds the
+    wake and readiness wait, and ends the time-to-first-command window that
+    starts with ``ate_env_client.acquire``.
     """
     sandbox_id: str
     endpoint: str
@@ -55,27 +59,34 @@ class SandboxHandle:
     data_plane: DataPlaneEndpoint | None = None
     default_timeout_s: float = 120.0
     tracer: Any = field(default=None, repr=False, compare=False)
+    _first_command_started: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def _span_ids(self) -> dict[str, Any]:
+        return {"ate.actor.name": self.sandbox_id, "ate_env.run_id": self.run_id or None}
 
     def _exec_span(self, command: str | list[str]) -> Any:
         if not self.tracer:
             return nullcontext()
+        first = not self._first_command_started
+        self._first_command_started = True
         return start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.exec", {
-            "env.id": self.sandbox_id,
-            "env.command.executable": executable_attr(command),
+            **self._span_ids(),
+            "ate_env.command.executable": executable_attr(command),
+            "ate_env.first_command": True if first else None,
         })
 
     def _file_span(self, op: str, path: str, content: bytes | str | None = None) -> Any:
         if not self.tracer:
             return nullcontext()
         return start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.{op}", {
-            "env.id": self.sandbox_id,
-            "env.file.path": path,
-            "env.file.size": None if content is None else _size(content),
+            **self._span_ids(),
+            "ate_env.file.path": path,
+            "ate_env.file.size": None if content is None else _size(content),
         })
 
     @staticmethod
     def _exec_result_attrs(span: Any, res: ExecResult, check: bool) -> None:
-        set_attributes(span, {"env.exit_code": res.exit_code, "env.timed_out": res.timed_out})
+        set_attributes(span, {"ate_env.exit_code": res.exit_code, "ate_env.timed_out": res.timed_out})
         # check=True raises after the span closes; mark it failed here so the
         # trace agrees with the caller. Only the exit state is recorded.
         if check and res.timed_out:
@@ -158,14 +169,14 @@ class SandboxHandle:
         """Read binary file content from sandbox filesystem."""
         with self._file_span("read_file", path) as span:
             data = self.runtime.read_file_bytes(path)
-            set_attributes(span, {"env.file.size": len(data)})
+            set_attributes(span, {"ate_env.file.size": len(data)})
             return data
 
     async def read_file_bytes_async(self, path: str) -> bytes:
         """Asynchronously read binary file content from sandbox filesystem."""
         with self._file_span("read_file", path) as span:
             data = await self.runtime.read_file_bytes_async(path)
-            set_attributes(span, {"env.file.size": len(data)})
+            set_attributes(span, {"ate_env.file.size": len(data)})
             return data
 
     def initialize(

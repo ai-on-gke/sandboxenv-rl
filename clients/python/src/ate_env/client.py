@@ -17,6 +17,9 @@
 from __future__ import annotations
 
 import collections
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
+from typing import Any
 
 import grpc
 import grpc.aio
@@ -181,6 +184,23 @@ class Client:
             return ()
         return (("authorization", f"Bearer {self._auth_token}"),)
 
+    def _rpc_span(
+        self, op: str, method: str, attributes: Callable[[], dict[str, Any]]
+    ) -> AbstractContextManager[Any]:
+        """The ``ate_env_client.<op>`` CLIENT span of one EnvironmentService call.
+
+        attributes is called only when tracing is on, so with tracing off no
+        attribute dict, image reference or rpc.* value is built.
+        """
+        if not self.tracer:
+            return nullcontext()
+        return start_span(
+            self.tracer,
+            f"{CLIENT_SPAN_PREFIX}.{op}",
+            {**attributes(), **_env_rpc_attrs(method, self._target)},
+            client_kind=True,
+        )
+
     async def close(self) -> None:
         """Release the client's resources (closes the channel if owned)."""
         if self._owns_channel:
@@ -211,13 +231,13 @@ class Client:
         if template_name or template_atespace:
             req.template.name = template_name or ""
             req.template.atespace = template_atespace or ""
-        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.create_environment", {
-            "env.id": id,
-            "env.atespace": atespace,
-            "env.template": template_name,
-            "env.rootfs_image": image_ref_attr(rootfs_image),
-            **_env_rpc_attrs("CreateEnvironment", self._target),
-        }, client_kind=True):
+        with self._rpc_span("create_environment", "CreateEnvironment", lambda: {
+            "ate.actor.name": id,
+            "ate.atespace": atespace,
+            "ate.template.name": template_name,
+            "ate.template.atespace": template_atespace,
+            "ate_env.rootfs_image": image_ref_attr(rootfs_image),
+        }):
             try:
                 resp = await self._environments.CreateEnvironment(req, metadata=self._auth_metadata())
             except grpc.RpcError as e:
@@ -228,11 +248,7 @@ class Client:
     async def get(self, id: str, *, atespace: str = DEFAULT_ATESPACE) -> EnvironmentInfo:
         """Retrieve the status and configuration of an environment."""
         req = env_pb2.GetEnvironmentRequest(id=id, atespace=atespace)
-        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.get_environment", {
-            "env.id": id,
-            "env.atespace": atespace,
-            **_env_rpc_attrs("GetEnvironment", self._target),
-        }, client_kind=True):
+        with self._rpc_span("get_environment", "GetEnvironment", lambda: {"ate.actor.name": id, "ate.atespace": atespace}):
             try:
                 resp = await self._environments.GetEnvironment(req, metadata=self._auth_metadata())
             except grpc.RpcError as e:
@@ -242,11 +258,7 @@ class Client:
     async def suspend(self, id: str, *, atespace: str = DEFAULT_ATESPACE) -> None:
         """Checkpoint and stop the environment."""
         req = env_pb2.SuspendEnvironmentRequest(id=id, atespace=atespace)
-        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.suspend_environment", {
-            "env.id": id,
-            "env.atespace": atespace,
-            **_env_rpc_attrs("SuspendEnvironment", self._target),
-        }, client_kind=True):
+        with self._rpc_span("suspend_environment", "SuspendEnvironment", lambda: {"ate.actor.name": id, "ate.atespace": atespace}):
             try:
                 await self._environments.SuspendEnvironment(req, metadata=self._auth_metadata())
             except grpc.RpcError as e:
@@ -255,11 +267,7 @@ class Client:
     async def delete(self, id: str, *, atespace: str = DEFAULT_ATESPACE) -> None:
         """Remove the environment permanently."""
         req = env_pb2.DeleteEnvironmentRequest(id=id, atespace=atespace)
-        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.delete_environment", {
-            "env.id": id,
-            "env.atespace": atespace,
-            **_env_rpc_attrs("DeleteEnvironment", self._target),
-        }, client_kind=True):
+        with self._rpc_span("delete_environment", "DeleteEnvironment", lambda: {"ate.actor.name": id, "ate.atespace": atespace}):
             try:
                 await self._environments.DeleteEnvironment(req, metadata=self._auth_metadata())
             except grpc.RpcError as e:

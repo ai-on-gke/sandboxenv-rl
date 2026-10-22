@@ -635,8 +635,8 @@ def test_nests_client_spans_under_caller_across_loop_runner(spans, threaded_fake
     for ex in names["ate_env_client.exec"]:
         assert _parent_name(ex, finished) == "caller"
         attrs = dict(ex.attributes)
-        assert attrs["env.command.executable"] == "echo"
-        assert attrs["env.exit_code"] == 0
+        assert attrs["ate_env.command.executable"] == "echo"
+        assert attrs["ate_env.exit_code"] == 0
         assert "echo hi" not in str(attrs)
     for rel in names["ate_env_client.release"]:
         assert _parent_name(rel, finished) == "caller"
@@ -646,8 +646,8 @@ def test_nests_client_spans_under_caller_across_loop_runner(spans, threaded_fake
         assert _parent_name(d, finished) == "ate_env_client.release"
     assert {s.context.trace_id for s in finished} == {names["caller"][0].context.trace_id}
     create_attrs = dict(names["ate_env_client.create_environment"][0].attributes)
-    assert create_attrs["env.rootfs_image"] == f"registry.example/swe/repo-a@{DIGEST}"
-    assert create_attrs["env.atespace"] == "ate-env"
+    assert create_attrs["ate_env.rootfs_image"] == f"registry.example/swe/repo-a@{DIGEST}"
+    assert create_attrs["ate.atespace"] == "ate-env"
 
 
 def test_nests_handle_spans_on_mock_backend(spans):
@@ -663,7 +663,7 @@ def test_nests_handle_spans_on_mock_backend(spans):
     execs = _by_name(finished)["ate_env_client.exec"]
     assert len(execs) == 4
     assert {_parent_name(s, finished) for s in execs} == {"caller"}
-    assert dict(execs[0].attributes)["env.command.executable"] == "python3"
+    assert dict(execs[0].attributes)["ate_env.command.executable"] == "python3"
 
 
 async def test_nests_client_spans_under_caller_in_async_fleet(spans):
@@ -759,3 +759,103 @@ async def test_cancelled_exec_async_marks_span_as_error(spans):
     (span,) = _by_name(spans.get_finished_spans())["ate_env_client.exec"]
     assert span.status.status_code == StatusCode.ERROR
     assert span.status.description == "cancelled"
+
+
+# --- attribute keys, run id and first command ---------------------------- #
+
+# Every attribute key the client may set. Substrate identities use
+# Substrate's ateattr keys; client-only fields use the ate_env. prefix.
+_ALLOWED_ATTRIBUTE_KEYS = {
+    "ate.actor.name",
+    "ate.atespace",
+    "ate.template.name",
+    "ate.template.atespace",
+    "ate_env.run_id",
+    "ate_env.command.executable",
+    "ate_env.exit_code",
+    "ate_env.timed_out",
+    "ate_env.first_command",
+    "ate_env.file.path",
+    "ate_env.file.size",
+    "ate_env.replicas",
+    "ate_env.rootfs_image",
+    "rpc.system",
+    "rpc.service",
+    "rpc.method",
+    "server.address",
+    "server.port",
+}
+
+
+def _process_two_commands(task, handle):
+    handle.write_file("/workspace/a.txt", "hello")
+    handle.exec("echo first")
+    handle.read_file_bytes("/workspace/a.txt")
+    return handle.exec("echo second").exit_code
+
+
+def test_span_attributes_use_substrate_and_ate_env_keys(spans, threaded_fake_server):
+    tasks = [Task(id=f"t{i}", image=IMAGE) for i in range(2)]
+    with SandboxFleet(_substrate_cfg(threaded_fake_server, max_concurrent=2)) as fleet:
+        fleet.load_tasks(tasks)
+        assert fleet.run(_process_two_commands) == [0, 0]
+        run_id = fleet.run_id
+    finished = spans.get_finished_spans()
+    keys = {k for s in finished if s.name.startswith("ate_env_client.") for k in s.attributes}
+    assert keys <= _ALLOWED_ATTRIBUTE_KEYS, keys - _ALLOWED_ATTRIBUTE_KEYS
+    names = _by_name(finished)
+    for create in names["ate_env_client.create_environment"]:
+        attrs = dict(create.attributes)
+        assert attrs["ate.actor.name"] and attrs["ate.atespace"] == "ate-env"
+    # Every step-level span carries the environment id and the run id.
+    for op in ("exec", "write_file", "read_file"):
+        assert names[f"ate_env_client.{op}"], op
+        for s in names[f"ate_env_client.{op}"]:
+            attrs = dict(s.attributes)
+            assert attrs["ate_env.run_id"] == run_id, op
+            assert attrs["ate.actor.name"], op
+    for acquire in names["ate_env_client.acquire"]:
+        assert dict(acquire.attributes)["ate_env.run_id"] == run_id
+
+
+def test_first_command_marks_only_the_first_exec_per_sandbox(spans, threaded_fake_server):
+    tasks = [Task(id=f"t{i}", image=IMAGE) for i in range(2)]
+    with SandboxFleet(_substrate_cfg(threaded_fake_server, max_concurrent=2)) as fleet:
+        fleet.load_tasks(tasks)
+        assert fleet.run(_process_two_commands) == [0, 0]
+    finished = spans.get_finished_spans()
+    by_actor: dict[str, list] = {}
+    for s in _by_name(finished)["ate_env_client.exec"]:
+        by_actor.setdefault(dict(s.attributes)["ate.actor.name"], []).append(s)
+    assert len(by_actor) == 2
+    acquires = {
+        dict(s.attributes)["ate.actor.name"]: s
+        for s in _by_name(finished)["ate_env_client.acquire"]
+    }
+    for actor, execs in by_actor.items():
+        execs.sort(key=lambda s: s.start_time)
+        first, second = execs
+        assert dict(first.attributes)["ate_env.first_command"] is True
+        assert "ate_env.first_command" not in dict(second.attributes)
+        # TTFC as the README defines it: acquire start to first command end.
+        assert acquires[actor].start_time < first.end_time
+
+
+async def test_client_builds_no_attributes_with_tracing_off(monkeypatch):
+    import ate_env.client as client_mod
+
+    def fail(*args, **kwargs):
+        raise AssertionError("attribute work on the tracing-off path")
+
+    monkeypatch.setattr(client_mod, "image_ref_attr", fail)
+    monkeypatch.setattr(client_mod, "_env_rpc_attrs", fail)
+    server, port = await _start_fake_server()
+    try:
+        client = Client(f"127.0.0.1:{port}")
+        env = await client.create(id="e1", atespace="a", rootfs_image=IMAGE)
+        await client.get(env.id, atespace="a")
+        await client.suspend(env.id, atespace="a")
+        await client.delete(env.id, atespace="a")
+        await client.close()
+    finally:
+        await server.stop(None)

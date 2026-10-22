@@ -359,7 +359,7 @@ When tracing is on:
 
 - **Spans.** `Client`, `SandboxHandle` and the Substrate backend emit
   `ate_env_client.<op>` spans, for example `create_environment`, `acquire`,
-  `exec`, `write_file`, `read_file` and `release`. Their `env.*` attributes
+  `exec`, `write_file`, `read_file` and `release`. Their attributes (below)
   hold ids, the executable name (leading `NAME=value` assignments are
   skipped) and sizes. They never hold command arguments, file content or
   image tags. A command that fails with `check=True` marks its `exec` span
@@ -369,6 +369,37 @@ When tracing is on:
   with `Client(channel=...)` is left as is.
 - **Nesting.** Client spans nest under the caller's current span, including
   across the fleet's worker threads and background event loop.
+
+**Span attributes.** Substrate identities use Substrate's own keys (its
+`ateattr` keys), so a backend can join a client span to Substrate's logs,
+traces and lifecycle records without a mapping. Client-only fields use the
+`ate_env.` prefix.
+
+| Key | Value | On |
+| --- | --- | --- |
+| `ate.actor.name` | environment id (the Substrate actor name) | every span of one environment: `Client` spans, `acquire`, `release`, `exec`, `write_file`, `read_file` |
+| `ate.atespace` | atespace | `Client` spans |
+| `ate.template.name` | template name | `create_environment`, `ensure_template`, `acquire`, `warm_pool` |
+| `ate.template.atespace` | template atespace, when given | `create_environment` |
+| `ate_env.run_id` | fleet run id | `exec`, `write_file`, `read_file`, `acquire`, `warm_pool`, `reap` |
+| `ate_env.command.executable` | executable name only | `exec` |
+| `ate_env.exit_code`, `ate_env.timed_out` | exit state | `exec` |
+| `ate_env.first_command` | `true` on the first `exec` of each acquired sandbox | `exec` |
+| `ate_env.file.path`, `ate_env.file.size` | path and size in bytes | `write_file`, `read_file` |
+| `ate_env.replicas` | warm pool size | `warm_pool` |
+| `ate_env.rootfs_image` | image reference without its tag | `create_environment` |
+
+`Client` spans also carry `rpc.system`, `rpc.service`, `rpc.method`,
+`server.address` and `server.port`, and have kind `CLIENT`.
+
+**Time to first command (TTFC).** `acquire` ends when the create call
+returns. The wake and readiness wait happen inside the first command, so the
+first `exec` span of each sandbox holds wake time plus command time. Compute
+TTFC per sandbox as the start of `ate_env_client.acquire` to the end of the
+`ate_env_client.exec` span with `ate_env.first_command=true` and the same
+`ate.actor.name`. This equals the swebench loader's `ttfi` (create start to
+first command returning), so a real trainer and the loader report the same
+client-side number.
 
 **Where spans go.** The client never installs the process-global
 OpenTelemetry `TracerProvider`. Its tracers choose a provider each time a span
@@ -394,6 +425,23 @@ starts, so there are two cases:
    # Also: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_EXPORTER_OTLP_INSECURE,
    # OTEL_EXPORTER_OTLP_CERTIFICATE, OTEL_EXPORTER_OTLP_TIMEOUT, ...
    ```
+
+   **Size the batch processor for wide runs.** With the SDK defaults, the
+   processor queues at most 2048 spans and exports 512 every 5 s. When the
+   queue is full it drops spans. A 500-wide RL step emits a few thousand spans
+   in seconds, so raise the limits, for example:
+
+   ```bash
+   export OTEL_BSP_MAX_QUEUE_SIZE=16384        # default 2048
+   export OTEL_BSP_SCHEDULE_DELAY=1000         # ms between exports, default 5000
+   export OTEL_BSP_MAX_EXPORT_BATCH_SIZE=2048  # default 512; at most the queue size
+   ```
+
+   Each dropped span logs the SDK warning `Queue full, dropping Span.` (logger
+   `opentelemetry.sdk._shared_internal`). If you see it, the trace is
+   incomplete: raise the limits before you read latencies from it. In case 1,
+   the same variables apply to an SDK `BatchSpanProcessor` that you create
+   without arguments.
 
 If neither applies (no provider and no OTLP endpoint), spans are created but
 not exported, and nothing is sent over the network.

@@ -17,8 +17,10 @@ package swebench
 import (
 	"bytes"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPercentile(t *testing.T) {
@@ -209,5 +211,66 @@ func TestWriteComparison(t *testing.T) {
 	WriteComparison(&out, []*Report{nowake}, []string{"n.jsonl"})
 	if !strings.Contains(out.String(), "live=1 tasks=1 0.7/0.0 -/-") {
 		t.Errorf("step without wakes:\n%s", out.String())
+	}
+}
+
+func TestNodeCacheDelta(t *testing.T) {
+	const scope = `otel_scope_name="go.ate.dev/substrate/internal/imagecache",otel_scope_version=""`
+	req := func(node, outcome string, v int) string {
+		return node + "\tate_imagecache_requests_total{ate_imagecache_outcome=\"" + outcome + "\"," + scope + "} " + strconv.Itoa(v) + "\n"
+	}
+	start := func(node string, unix int) string {
+		return node + "\tprocess_start_time_seconds " + strconv.Itoa(unix) + "\n"
+	}
+	before := "n1\t# sampled 1000\n" + start("n1", 500) +
+		"n1\t# HELP ate_imagecache_requests_total Number of image lookups\n" +
+		req("n1", "hit", 10) + req("n1", "miss", 4) +
+		"n1\tate_imagecache_requests_created{ate_imagecache_outcome=\"miss\"} 1.7e+09\n" + // not the counter
+		"n2\t# sampled 1000\n" + start("n2", 500) + req("n2", "miss", 7) +
+		"n3\t# sampled 1000\n" + start("n3", 500) + req("n3", "hit", 1)
+	after := "n1\t# sampled 2000\n" + start("n1", 500) +
+		req("n1", "hit", 12) + req("n1", "miss", 9) +
+		"n1\tate_imagecache_requests_total{ate_imagecache_outcome=\"error\",error_type=\"429\"," + scope + "} 1\n" +
+		"n2\t# sampled 2000\n" + start("n2", 1500) + req("n2", "miss", 2) + // atelet restarted: count from zero
+		"n4\t# sampled 2000\n" + "n4\tprocess_start_time_seconds{otel_scope_name=\"x\"} 1.5e+03\n" + req("n4", "hit", 1) + req("n4", "miss", 3) + // node added after the before sample; labeled form
+		"n6\t# sampled 2000\n" + start("n6", 400) + req("n6", "miss", 100) // older than the before sample: its before scrape failed
+	b, err := ParseNodeCacheSample(strings.NewReader(before))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := ParseNodeCacheSample(strings.NewReader(after))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !b.Time.Equal(time.Unix(1000, 0)) || !b.Nodes["n1"].Equal(time.Unix(500, 0)) || b.Requests["n1"]["miss"] != 4 {
+		t.Fatalf("before sample: %+v", b)
+	}
+	d := b.Delta(a)
+	want := CacheDelta{Nodes: 1, Restarted: 1, Added: 1, Removed: 1, Skipped: 1, Hits: 3, Misses: 10, Errors: 1, NodesWithMisses: 3}
+	if d != want {
+		t.Fatalf("delta = %+v, want %+v", d, want)
+	}
+	for _, bad := range []string{
+		"n1 ate_imagecache_requests_total{ate_imagecache_outcome=\"hit\"} 1\n",
+		"n1\tate_imagecache_requests_total{otel_scope_name=\"x\"} 1\n",
+		"n1\tate_imagecache_requests_total{ate_imagecache_outcome=\"hit\"} many\n",
+		"n1\t# sampled soon\n",
+	} {
+		if _, err := ParseNodeCacheSample(strings.NewReader(bad)); err == nil {
+			t.Errorf("line %q must be rejected", bad)
+		}
+	}
+
+	rep := Build([]Event{
+		{RunID: "r", Event: EventTTFI, DurMS: 100, OK: true},
+		{RunID: "r", Event: EventTTFI, DurMS: 100, OK: true},
+		{RunID: "r", Event: EventRun, Name: "eval", DurMS: 1000, OK: true, Count: 2},
+	})
+	rep.Cache = &d
+	var text bytes.Buffer
+	rep.WriteText(&text)
+	want2 := "image cache during the run: 1 nodes differenced, 1 restarted, counted from zero, 1 added, counted from zero, 1 removed, left out, 1 with no before sample, left out; misses (cold pulls) 10 on 3 nodes, hits 3, errors 1; first commands 2, misses per first command 5.00"
+	if !strings.Contains(text.String(), want2) {
+		t.Fatalf("text report lacks %q:\n%s", want2, text.String())
 	}
 }

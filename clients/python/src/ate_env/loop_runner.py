@@ -46,11 +46,14 @@ class LoopRunner:
 
     def run(self, coro: Coroutine[Any, Any, T], timeout: float | None = None) -> T:
         """Run a coroutine on the background event loop and block for the result."""
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=timeout)
+        return self.submit(coro).result(timeout=timeout)
 
     def submit(self, coro: Coroutine[Any, Any, T]) -> concurrent.futures.Future[T]:
-        """Submit a coroutine to the background event loop without blocking."""
+        """Submit a coroutine to the background event loop without blocking.
+
+        The coroutine runs in a copy of the caller's context (contextvars), so
+        OpenTelemetry spans on the loop nest under the caller's current span.
+        """
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     def stop(self) -> None:

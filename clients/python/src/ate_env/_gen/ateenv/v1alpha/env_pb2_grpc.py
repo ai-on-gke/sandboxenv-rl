@@ -75,6 +75,11 @@ class EnvironmentServiceStub:
                 request_serializer=ateenv_dot_v1alpha_dot_env__pb2.DeleteEnvironmentRequest.SerializeToString,
                 response_deserializer=ateenv_dot_v1alpha_dot_env__pb2.DeleteEnvironmentResponse.FromString,
                 _registered_method=True)
+        self.GetServerInfo = channel.unary_unary(
+                '/ateenv.v1alpha.EnvironmentService/GetServerInfo',
+                request_serializer=ateenv_dot_v1alpha_dot_env__pb2.GetServerInfoRequest.SerializeToString,
+                response_deserializer=ateenv_dot_v1alpha_dot_env__pb2.GetServerInfoResponse.FromString,
+                _registered_method=True)
 
 
 class EnvironmentServiceServicer:
@@ -115,6 +120,15 @@ class EnvironmentServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetServerInfo(self, request, context):
+        """GetServerInfo reports which server implementation answers, its version, and
+        the optional features it serves, so a client can check them before it
+        depends on them.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_EnvironmentServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -137,6 +151,11 @@ def add_EnvironmentServiceServicer_to_server(servicer, server):
                     servicer.DeleteEnvironment,
                     request_deserializer=ateenv_dot_v1alpha_dot_env__pb2.DeleteEnvironmentRequest.FromString,
                     response_serializer=ateenv_dot_v1alpha_dot_env__pb2.DeleteEnvironmentResponse.SerializeToString,
+            ),
+            'GetServerInfo': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetServerInfo,
+                    request_deserializer=ateenv_dot_v1alpha_dot_env__pb2.GetServerInfoRequest.FromString,
+                    response_serializer=ateenv_dot_v1alpha_dot_env__pb2.GetServerInfoResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -254,6 +273,33 @@ class EnvironmentService:
             '/ateenv.v1alpha.EnvironmentService/DeleteEnvironment',
             ateenv_dot_v1alpha_dot_env__pb2.DeleteEnvironmentRequest.SerializeToString,
             ateenv_dot_v1alpha_dot_env__pb2.DeleteEnvironmentResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetServerInfo(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ateenv.v1alpha.EnvironmentService/GetServerInfo',
+            ateenv_dot_v1alpha_dot_env__pb2.GetServerInfoRequest.SerializeToString,
+            ateenv_dot_v1alpha_dot_env__pb2.GetServerInfoResponse.FromString,
             options,
             channel_credentials,
             insecure,

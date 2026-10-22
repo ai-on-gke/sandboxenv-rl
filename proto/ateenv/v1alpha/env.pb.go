@@ -657,6 +657,118 @@ func (*DeleteEnvironmentResponse) Descriptor() ([]byte, []int) {
 	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{9}
 }
 
+// Request for the server's identity and features.
+type GetServerInfoRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetServerInfoRequest) Reset() {
+	*x = GetServerInfoRequest{}
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetServerInfoRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetServerInfoRequest) ProtoMessage() {}
+
+func (x *GetServerInfoRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetServerInfoRequest.ProtoReflect.Descriptor instead.
+func (*GetServerInfoRequest) Descriptor() ([]byte, []int) {
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{10}
+}
+
+// Identity, version and optional features of the server.
+type GetServerInfoResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Server implementation, "sandboxenv-rl" for this repository's ate-env-api.
+	Server string `protobuf:"bytes,1,opt,name=server,proto3" json:"server,omitempty"`
+	// Build version of the server, e.g. a release tag or "dev+<commit>".
+	Version string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
+	// Version of the go.ate.dev/substrate module the server was built against,
+	// or "unknown".
+	SubstrateVersion string `protobuf:"bytes,3,opt,name=substrate_version,json=substrateVersion,proto3" json:"substrate_version,omitempty"`
+	// Optional features the server serves, e.g. "rootfs_image", "pty",
+	// "port_proxy", "bearer_auth". Clients must ignore names they do not know.
+	Features      []string `protobuf:"bytes,4,rep,name=features,proto3" json:"features,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetServerInfoResponse) Reset() {
+	*x = GetServerInfoResponse{}
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetServerInfoResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetServerInfoResponse) ProtoMessage() {}
+
+func (x *GetServerInfoResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetServerInfoResponse.ProtoReflect.Descriptor instead.
+func (*GetServerInfoResponse) Descriptor() ([]byte, []int) {
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *GetServerInfoResponse) GetServer() string {
+	if x != nil {
+		return x.Server
+	}
+	return ""
+}
+
+func (x *GetServerInfoResponse) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
+}
+
+func (x *GetServerInfoResponse) GetSubstrateVersion() string {
+	if x != nil {
+		return x.SubstrateVersion
+	}
+	return ""
+}
+
+func (x *GetServerInfoResponse) GetFeatures() []string {
+	if x != nil {
+		return x.Features
+	}
+	return nil
+}
+
 var File_proto_ateenv_v1alpha_env_proto protoreflect.FileDescriptor
 
 const file_proto_ateenv_v1alpha_env_proto_rawDesc = "" +
@@ -689,7 +801,13 @@ const file_proto_ateenv_v1alpha_env_proto_rawDesc = "" +
 	"\x18DeleteEnvironmentRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
 	"\batespace\x18\x02 \x01(\tR\batespace\"\x1b\n" +
-	"\x19DeleteEnvironmentResponse*\xbd\x02\n" +
+	"\x19DeleteEnvironmentResponse\"\x16\n" +
+	"\x14GetServerInfoRequest\"\x92\x01\n" +
+	"\x15GetServerInfoResponse\x12\x16\n" +
+	"\x06server\x18\x01 \x01(\tR\x06server\x12\x18\n" +
+	"\aversion\x18\x02 \x01(\tR\aversion\x12+\n" +
+	"\x11substrate_version\x18\x03 \x01(\tR\x10substrateVersion\x12\x1a\n" +
+	"\bfeatures\x18\x04 \x03(\tR\bfeatures*\xbd\x02\n" +
 	"\x11EnvironmentStatus\x12\"\n" +
 	"\x1eENVIRONMENT_STATUS_UNSPECIFIED\x10\x00\x12\x1f\n" +
 	"\x1bENVIRONMENT_STATUS_RESUMING\x10\x01\x12\x1e\n" +
@@ -699,12 +817,13 @@ const file_proto_ateenv_v1alpha_env_proto_rawDesc = "" +
 	"\x1aENVIRONMENT_STATUS_PAUSING\x10\x05\x12\x1d\n" +
 	"\x19ENVIRONMENT_STATUS_PAUSED\x10\x06\x12\x1e\n" +
 	"\x1aENVIRONMENT_STATUS_CRASHED\x10\a\x12\x1f\n" +
-	"\x1bENVIRONMENT_STATUS_DELETING\x10\b2\xb6\x03\n" +
+	"\x1bENVIRONMENT_STATUS_DELETING\x10\b2\x94\x04\n" +
 	"\x12EnvironmentService\x12h\n" +
 	"\x11CreateEnvironment\x12(.ateenv.v1alpha.CreateEnvironmentRequest\x1a).ateenv.v1alpha.CreateEnvironmentResponse\x12_\n" +
 	"\x0eGetEnvironment\x12%.ateenv.v1alpha.GetEnvironmentRequest\x1a&.ateenv.v1alpha.GetEnvironmentResponse\x12k\n" +
 	"\x12SuspendEnvironment\x12).ateenv.v1alpha.SuspendEnvironmentRequest\x1a*.ateenv.v1alpha.SuspendEnvironmentResponse\x12h\n" +
-	"\x11DeleteEnvironment\x12(.ateenv.v1alpha.DeleteEnvironmentRequest\x1a).ateenv.v1alpha.DeleteEnvironmentResponseBCZAgithub.com/agent-substrate/env/proto/ateenv/v1alpha;ateenvv1alphab\x06proto3"
+	"\x11DeleteEnvironment\x12(.ateenv.v1alpha.DeleteEnvironmentRequest\x1a).ateenv.v1alpha.DeleteEnvironmentResponse\x12\\\n" +
+	"\rGetServerInfo\x12$.ateenv.v1alpha.GetServerInfoRequest\x1a%.ateenv.v1alpha.GetServerInfoResponseBCZAgithub.com/agent-substrate/env/proto/ateenv/v1alpha;ateenvv1alphab\x06proto3"
 
 var (
 	file_proto_ateenv_v1alpha_env_proto_rawDescOnce sync.Once
@@ -719,7 +838,7 @@ func file_proto_ateenv_v1alpha_env_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_ateenv_v1alpha_env_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_ateenv_v1alpha_env_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_proto_ateenv_v1alpha_env_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_proto_ateenv_v1alpha_env_proto_goTypes = []any{
 	(EnvironmentStatus)(0),             // 0: ateenv.v1alpha.EnvironmentStatus
 	(*Template)(nil),                   // 1: ateenv.v1alpha.Template
@@ -732,6 +851,8 @@ var file_proto_ateenv_v1alpha_env_proto_goTypes = []any{
 	(*SuspendEnvironmentResponse)(nil), // 8: ateenv.v1alpha.SuspendEnvironmentResponse
 	(*DeleteEnvironmentRequest)(nil),   // 9: ateenv.v1alpha.DeleteEnvironmentRequest
 	(*DeleteEnvironmentResponse)(nil),  // 10: ateenv.v1alpha.DeleteEnvironmentResponse
+	(*GetServerInfoRequest)(nil),       // 11: ateenv.v1alpha.GetServerInfoRequest
+	(*GetServerInfoResponse)(nil),      // 12: ateenv.v1alpha.GetServerInfoResponse
 }
 var file_proto_ateenv_v1alpha_env_proto_depIdxs = []int32{
 	1,  // 0: ateenv.v1alpha.Environment.template:type_name -> ateenv.v1alpha.Template
@@ -743,12 +864,14 @@ var file_proto_ateenv_v1alpha_env_proto_depIdxs = []int32{
 	5,  // 6: ateenv.v1alpha.EnvironmentService.GetEnvironment:input_type -> ateenv.v1alpha.GetEnvironmentRequest
 	7,  // 7: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:input_type -> ateenv.v1alpha.SuspendEnvironmentRequest
 	9,  // 8: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:input_type -> ateenv.v1alpha.DeleteEnvironmentRequest
-	4,  // 9: ateenv.v1alpha.EnvironmentService.CreateEnvironment:output_type -> ateenv.v1alpha.CreateEnvironmentResponse
-	6,  // 10: ateenv.v1alpha.EnvironmentService.GetEnvironment:output_type -> ateenv.v1alpha.GetEnvironmentResponse
-	8,  // 11: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:output_type -> ateenv.v1alpha.SuspendEnvironmentResponse
-	10, // 12: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:output_type -> ateenv.v1alpha.DeleteEnvironmentResponse
-	9,  // [9:13] is the sub-list for method output_type
-	5,  // [5:9] is the sub-list for method input_type
+	11, // 9: ateenv.v1alpha.EnvironmentService.GetServerInfo:input_type -> ateenv.v1alpha.GetServerInfoRequest
+	4,  // 10: ateenv.v1alpha.EnvironmentService.CreateEnvironment:output_type -> ateenv.v1alpha.CreateEnvironmentResponse
+	6,  // 11: ateenv.v1alpha.EnvironmentService.GetEnvironment:output_type -> ateenv.v1alpha.GetEnvironmentResponse
+	8,  // 12: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:output_type -> ateenv.v1alpha.SuspendEnvironmentResponse
+	10, // 13: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:output_type -> ateenv.v1alpha.DeleteEnvironmentResponse
+	12, // 14: ateenv.v1alpha.EnvironmentService.GetServerInfo:output_type -> ateenv.v1alpha.GetServerInfoResponse
+	10, // [10:15] is the sub-list for method output_type
+	5,  // [5:10] is the sub-list for method input_type
 	5,  // [5:5] is the sub-list for extension type_name
 	5,  // [5:5] is the sub-list for extension extendee
 	0,  // [0:5] is the sub-list for field type_name
@@ -765,7 +888,7 @@ func file_proto_ateenv_v1alpha_env_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_ateenv_v1alpha_env_proto_rawDesc), len(file_proto_ateenv_v1alpha_env_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   10,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

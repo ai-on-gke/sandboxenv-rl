@@ -63,6 +63,8 @@ type Server struct {
 	// WakeRunningBudget bounds the wait once the control plane reports the
 	// environment RUNNING; see ensureAwake. Zero means DefaultWakeRunningBudget.
 	WakeRunningBudget time.Duration
+	// Info is the build and configuration GetServerInfo reports.
+	Info ServerInfo
 }
 
 // New creates a new Server.

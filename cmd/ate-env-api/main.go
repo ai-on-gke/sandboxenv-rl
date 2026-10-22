@@ -102,6 +102,11 @@ func main() {
 	apisvc := apiservice.New(client, *atenet, *hostSuffix)
 	apisvc.WakeBudget = *wakeBudget
 	apisvc.WakeRunningBudget = *wakeRunningBudget
+	apisvc.Info = apiservice.ServerInfo{
+		Version:    buildVersion(),
+		PortProxy:  *atenetConn != "",
+		BearerAuth: callerAuth != nil,
+	}
 	defer apisvc.Close()
 
 	var grpcOpts []grpc.ServerOption
@@ -178,7 +183,7 @@ func main() {
 		_ = srv.Shutdown(context.Background())
 	}()
 
-	log.Printf("ate-env-api listening on %s (ateapi %s, atenet %s, atenet CONNECT %q)", *listen, *ateapi, *atenet, *atenetConn)
+	log.Printf("ate-env-api %s listening on %s (ateapi %s, atenet %s, atenet CONNECT %q)", apisvc.Info.Version, *listen, *ateapi, *atenet, *atenetConn)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server error: %v", err)
 	}

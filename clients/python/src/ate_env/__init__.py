@@ -61,6 +61,13 @@ from .errors import (
 from .exceptions import SandboxError
 from .fleet import SandboxFleet
 from .handle import SandboxHandle
+from .telemetry import (
+    BenchTelemetry,
+    TraceEventRecord,
+    instrument_client,
+    validate_event_dict,
+    validate_trace_event_dict,
+)
 
 # Types
 from .types import (
@@ -131,4 +138,10 @@ __all__ = [
     "RawSandboxInstance",
     "PlanEntry",
     "FleetPlan",
+    # Benchmark Telemetry (W11)
+    "BenchTelemetry",
+    "TraceEventRecord",
+    "instrument_client",
+    "validate_trace_event_dict",
+    "validate_event_dict",
 ]

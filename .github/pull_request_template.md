@@ -18,7 +18,9 @@ Does this change add or widen any of these?
 - [ ] Privileges: of `ate-env-api`, of the guest, or in the access policy or the manifest
 - [ ] Wire or API fields: a protobuf field, an RPC, a header, a CLI flag that changes defaults
 - [ ] Dependencies: a new module, package, base image or GitHub Action
+- [ ] None of the above
 
-If you checked a box, link a short design note with the threat it adds and its mitigation, and
-update [`docs/security/threat-model.md`](../docs/security/threat-model.md) in this pull request.
-If you checked none, write "None".
+If you checked one of the first four boxes, link a short design note with the threat it adds and
+its mitigation, and update
+[`docs/security/threat-model.md`](https://github.com/ai-on-gke/sandboxenv-rl/blob/main/docs/security/threat-model.md)
+in this pull request.

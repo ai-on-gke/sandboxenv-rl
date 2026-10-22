@@ -217,6 +217,7 @@ func runCmd(args []string) (retErr error) {
 		rollouts      = fs.Int("rollouts", 2, "steps: environments per image.")
 		steps         = fs.Int("steps", 8, "steps: training steps.")
 		park          = fs.String("park", string(swebench.ParkSuspend), "steps: what happens between steps: suspend, delete or none.")
+		imagesPerStep = fs.Int("images-per-step", 0, "steps: each step takes the next N images (wrapping around the dataset) with fresh environments, retired after the step: the create-and-retire-pools-per-step shape; needs -park delete. 0 keeps one fleet across the steps.")
 		createTimeout = fs.Duration("create-timeout", 5*time.Minute, "Deadline for one create call.")
 		stepTimeout   = fs.Duration("step-timeout", 10*time.Minute, "Default deadline for a run step without its own timeout.")
 		wakeBudget    = fs.Duration("wake-budget", 3*time.Minute, "How long a task's first command is retried while the environment is still waking or its image is still being baked.")
@@ -301,8 +302,13 @@ func runCmd(args []string) (retErr error) {
 	if swebench.Mode(*mode) == swebench.ModeSteps {
 		fanout = *rollouts
 	}
+	environments := len(selected) * fanout
+	if *imagesPerStep > 0 {
+		environments = *imagesPerStep * fanout // per step
+	}
 	log.Info("plan", slog.String("run", *runID), slog.String("mode", *mode), slog.Int("images", len(selected)),
-		slog.Int("environments", len(selected)*fanout), slog.Int("width", *width), slog.Int("steps", *steps),
+		slog.Int("images_per_step", *imagesPerStep),
+		slog.Int("environments", environments), slog.Int("width", *width), slog.Int("steps", *steps),
 		slog.String("park", *park), slog.String("trajectory", *trajectory), slog.String("out", *out))
 	if *dryRun {
 		return nil
@@ -353,6 +359,7 @@ func runCmd(args []string) (retErr error) {
 		Rollouts:      *rollouts,
 		Steps:         *steps,
 		Park:          swebench.Park(*park),
+		ImagesPerStep: *imagesPerStep,
 		CreateTimeout: *createTimeout,
 		StepTimeout:   *stepTimeout,
 		WakeBudget:    *wakeBudget,

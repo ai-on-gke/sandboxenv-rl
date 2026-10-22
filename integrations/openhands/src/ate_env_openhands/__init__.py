@@ -21,6 +21,13 @@ ate-env-api's port proxy. It mirrors OpenHands' ``AgentSandboxWorkspace``
 that workspace moves over by changing the constructor.
 """
 
+from .fleet import FleetWorkspace, make_fleet_workspace, make_handle_workspace
 from .workspace import AteEnvWorkspace, port_url
 
-__all__ = ["AteEnvWorkspace", "port_url"]
+__all__ = [
+    "AteEnvWorkspace",
+    "FleetWorkspace",
+    "make_fleet_workspace",
+    "make_handle_workspace",
+    "port_url",
+]

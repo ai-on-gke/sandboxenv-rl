@@ -192,6 +192,74 @@ the repository's other examples:
 | [`codeact_agent.py`](../../examples/openhands/codeact_agent.py) | OpenHands' CodeAct agent in an environment, with a model or `--scripted` |
 | [`run_trajectory.py`](../../examples/openhands/run_trajectory.py) | executes a CodeAct trajectory from outside and records the observations |
 | [`demo.sh`](../../examples/openhands/demo.sh) | registers the base template and drives the agent-server over plain HTTP |
+| [`fleet_rollout.py`](../../examples/openhands/fleet_rollout.py) | an agent-sandbox-rl style rollout: `fleet.run` with `make_handle_workspace` |
+
+## 6. Fleet adapters: the Tunix shape
+
+`ate_env_openhands.fleet` has the two helpers of `agent_sandbox_rl.adapters.openhands`, with the
+same names and ownership: the **fleet** (`ate_env.SandboxFleet`) acquires and releases sandboxes;
+the workspace only binds one and never creates or deletes an environment.
+
+```python
+from ate_env import FleetConfig, SandboxFleet, Task
+from ate_env_openhands import make_handle_workspace
+
+fleet = SandboxFleet(FleetConfig(backend="substrate", endpoint="127.0.0.1:7777",
+                                 template="oh-agent-server"))
+fleet.load_tasks([Task(id="t1", image="docker.io/library/python@sha256:...")])
+fleet.set_pool_replicas("docker.io/library/python@sha256:...", 4)   # idle sandboxes per image
+
+def rollout(task, handle):
+    workspace = make_handle_workspace(handle, api_key=SESSION_KEY, api_url="127.0.0.1:7777")
+    try:
+        return workspace.execute_command("python3 -m pytest -q", timeout=600).exit_code
+    finally:
+        workspace.cleanup()          # HTTP state only; fleet.run releases the sandbox
+
+results = fleet.run(rollout)
+```
+
+- `make_handle_workspace(handle, **kw)`: an `AteEnvWorkspace` on `handle.sandbox_id`,
+  `delete_on_exit=False`. `api_url` and `atespace` default from the handle (its data plane and
+  its backend's atespace); `api_key`, `proxy_url`, `api_token` and the timeouts pass through.
+- `make_fleet_workspace(fleet, task, **kw)`: acquires on construction and calls
+  `fleet.release(handle)` from `cleanup()`, so `with make_fleet_workspace(...) as ws:` owns one
+  episode; a failed start (health, session key) releases the handle before the error is raised.
+- `template`, `template_atespace`, `image`, `env_id` and `delete_on_exit` are fleet-owned and
+  raise `ValueError`, as agent-sandbox-rl's `_FLEET_OWNED_KWARGS` do.
+- Pool sizing for a prewarm loop: `SandboxFleet.set_pool_replicas(image, n)` sizes one image's
+  warm pool up or down without dropping it (idle, suspended environments; claimed ones are never
+  touched), and `warm_image(image, replicas)` warms one image. Both exist on `AsyncSandboxFleet`
+  too.
+
+## 7. R2E-Gym adapter
+
+`ate_env_openhands.r2egym` is `agent_sandbox_rl.adapters.r2egym` for ate-env: R2E-Gym's `RepoEnv`
+on a sandbox the fleet acquired, so Tunix's `r2egym` and `sweagent` scaffolds change only their
+imports. No agent-server is involved: the runtime's exec and file copy go through the handle.
+
+```python
+from ate_env_openhands.r2egym import fresh_eval_env, make_fleet_repo_env, r2egym_command_files
+
+def rollout(task, handle):                        # task.metadata["ds"] is the dataset row
+    env = make_fleet_repo_env(handle, command_files=r2egym_command_files())
+    try:
+        obs, reward, done, info = env.step(action)
+        patch = env.runtime.get_patch()
+    finally:
+        env.close()                               # no-op on the sandbox; the fleet releases
+    with fresh_eval_env(fleet, handle) as (_eval_handle, grader):   # a clean second sandbox
+        grader.runtime.apply_patch(patch)
+        return grader.compute_reward()
+```
+
+`AteEnvRuntime(DockerRuntime)` overrides the four `kubernetes-sandbox` hooks: bind the handle,
+no-op teardown, `handle.exec` for `run` (with R2E-Gym's `(output, exit_code)` strings and
+timeouts) and `handle.write_file` plus `tar` for `copy_to_container`. Everything else in the
+runtime (setup, patches, reward grading) runs unchanged. R2E-Gym is not on PyPI: install it from
+its checkout (`pip install -e path/to/R2E-Gym`); the module imports without it and raises a clear
+`RuntimeError` on first use. R2E-Gym's runtime loads a kubeconfig for this backend; the adapter
+stubs that during construction, so no Kubernetes access is needed.
 
 ## Versions
 
@@ -282,3 +350,7 @@ GKE with gVisor workers, Substrate from 2026-10-12, ate-env-api with the port pr
   delivers to the actor's address, and a loopback-only listener answers `502 bad gateway`.
 - The examples have their own limits (model calls from inside the environment, the model key, the
   tool runner): see [`examples/openhands`](../../examples/openhands/README.md#limits).
+- `fresh_eval_env` costs one more acquire per graded episode: a Substrate actor has one container,
+  so the clean grading container of the MLPerf setup is a second environment from the warm pool.
+- The R2E-Gym adapter is tested against a stand-in for R2E-Gym (it is not on PyPI); a live
+  SWE-bench episode on a cluster is the acceptance step still open.

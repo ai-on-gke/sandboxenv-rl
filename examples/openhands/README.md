@@ -137,6 +137,21 @@ uses. The demo hands the session key and the API token to curl in a header file 
 on exit), not on its command line; the template registration still passes the key in an argument of
 `ate-env manifest template`.
 
+## A fleet rollout
+
+`fleet_rollout.py` is the agent-sandbox-rl shape: `ate_env.SandboxFleet` acquires a sandbox per
+task, each rollout binds a workspace to its handle with `make_handle_workspace`, and the fleet
+releases. Point it at a base template with the agent-server layer (`demo.sh` registers one):
+
+```bash
+SUBSTRATE_ENV_API=127.0.0.1:7777 OH_TEMPLATE=oh-agent-server OH_SESSION_KEY=<key> \
+  OH_IMAGE=docker.io/library/python@sha256:<digest>,docker.io/library/debian@sha256:<digest> \
+  OH_WARM=2 python examples/openhands/fleet_rollout.py
+```
+
+`OH_WARM` keeps that many idle sandboxes per image (`set_pool_replicas`); `OH_API_TOKEN` is the
+ate-env-api bearer when the API runs with `-auth-token-file`.
+
 ## Limits
 
 - With `API_TOKEN` (ate-env-api with `-auth-token-file`), a `RemoteConversation`'s event WebSocket

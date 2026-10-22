@@ -139,6 +139,38 @@ class AsyncSandboxFleet:
             template_id, rootfs_image = await self._ensure_template_for_image_async(img)
             await self._warm_pool_for_template(template_id, rep, wait=wait, rootfs_image=rootfs_image)
 
+    async def warm_image(
+        self, image: str, replicas: int | None = None, wait: bool = True
+    ) -> None:
+        """Warm one image's pool (agent-sandbox-rl's ``warm_image``)."""
+        await self.warm_images([image], replicas=replicas, wait=wait)
+
+    async def set_pool_replicas(self, image: str, replicas: int, wait: bool = True) -> None:
+        """Size one image's warm pool to exactly ``replicas``, up or down; see
+        ``SandboxFleet.set_pool_replicas``."""
+        replicas = max(0, int(replicas))
+        template_id, rootfs_image = await self._ensure_template_for_image_async(image)
+        try:
+            if hasattr(self.backend, "resize_pool_async"):
+                await self.backend.resize_pool_async(
+                    template_id, replicas, wait=wait, rootfs_image=rootfs_image
+                )
+            else:
+                await asyncio.to_thread(
+                    self.backend.resize_pool,
+                    template_id,
+                    replicas,
+                    wait=wait,
+                    rootfs_image=rootfs_image,
+                )
+        except NotImplementedError:
+            if replicas == 0:
+                await self.unwarm_image(image)
+            else:
+                await self._warm_pool_for_template(
+                    template_id, replicas, wait=wait, rootfs_image=rootfs_image
+                )
+
     async def unwarm_image(self, image: str) -> None:
         entry = self._fleet._image_to_template.get(image)
         if entry:

@@ -1,0 +1,268 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""The R2E-Gym adapter against a stand-in for R2E-Gym (installed into
+sys.modules, as agent-sandbox-rl's adapter tests do) and a scripted fleet
+handle. R2E-Gym itself is not on PyPI, so nothing here imports it."""
+
+from __future__ import annotations
+
+import io
+import os
+import sys
+import tarfile
+import threading
+import types
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+import ate_env_openhands.r2egym as adapter
+
+
+class _ExecResult:
+    def __init__(self, exit_code, stdout="", stderr="", timed_out=False):
+        self.exit_code, self.stdout, self.stderr, self.timed_out = exit_code, stdout, stderr, timed_out
+
+
+class _Handle:
+    """A fleet handle: exec is scripted by command substring, write_file records."""
+
+    def __init__(self, sandbox_id="sb-1", with_ds=True, image="example.com/task@sha256:" + "c" * 64):
+        meta = {"repo": "django/django"}
+        if with_ds:
+            meta["ds"] = {"instance_id": "x", "docker_image": image, "repo": "django/django"}
+        self.sandbox_id = sandbox_id
+        self.task = SimpleNamespace(id="x", image=image, metadata=meta)
+        self.execs: list[tuple[str, str, float | None]] = []
+        self.files: dict[str, bytes] = {}
+        self.replies: dict[str, _ExecResult] = {}
+
+    def exec(self, command, cwd="", env=None, timeout_s=None):
+        self.execs.append((command, cwd, timeout_s))
+        for needle, reply in self.replies.items():
+            if needle in command:
+                return reply
+        return _ExecResult(0, stdout=f"ran: {command}\n")
+
+    def write_file(self, path, content):
+        self.files[path] = content if isinstance(content, bytes) else content.encode()
+
+
+class _FakeBaseRuntime:
+    """What R2E-Gym's DockerRuntime does around the four hooks, and nothing else.
+    config and client stand for the kubernetes imports the real base loads."""
+
+    def __init__(self, ds, docker_image=None, command="/bin/bash", logger=None, backend="docker", **kw):
+        assert ds
+        docker_mod.config.load_kube_config()  # the real base loads a kubeconfig here
+        self.client = docker_mod.client.CoreV1Api()
+        self.ds, self.docker_image, self.command = ds, docker_image, command
+        self.logger = logger or MagicMock()
+        self.backend, self.repo_name, self.docker_kwargs = backend, "repo", kw
+        self.container = None
+        self.container_name = None
+        self.start_container(docker_image, command, None)
+        self.setup_env()
+
+    def start_container(self, image, command, name, **kw):
+        if self.backend == "kubernetes-sandbox":
+            try:
+                self._start_kubernetes_sandbox()
+            except Exception:  # the real base swallows and stops
+                self.stop_container()
+
+    def stop_container(self):
+        if self.backend == "kubernetes-sandbox":
+            self._stop_kubernetes_sandbox()
+
+    def close(self):
+        self.stop_container()
+
+    def setup_env(self):
+        self.run("echo setup")
+
+    def run(self, code, timeout=90, args="", workdir=None):
+        return self._run_kubernetes(code, timeout, args, workdir=workdir or "/testbed")
+
+    def copy_to_container(self, src, dest):
+        return self._copy_to_container_kubernetes(src, dest)
+
+    def add_commands(self, files):
+        for f in files:
+            self.copy_to_container(f, "/usr/local/bin/" + os.path.basename(f))
+
+    def get_task_instruction(self):
+        return "instruction"
+
+
+class _FakeBaseRepoEnv:
+    def add_commands(self, files):
+        self.runtime.add_commands(files)
+
+    def close(self):
+        self.runtime.close()
+
+
+class _Boom:
+    """kubeconfig loading and CoreV1Api must not be reached through ate-env."""
+
+    def load_kube_config(self):
+        raise AssertionError("load_kube_config was called")
+
+    def load_incluster_config(self):
+        raise AssertionError("load_incluster_config was called")
+
+    def CoreV1Api(self, *a, **k):
+        raise AssertionError("CoreV1Api was built")
+
+
+docker_mod = None
+
+
+@pytest.fixture
+def fake_r2egym(monkeypatch):
+    global docker_mod
+    adapter._CLASSES = None
+
+    def mod(name):
+        m = types.ModuleType(name)
+        monkeypatch.setitem(sys.modules, name, m)
+        return m
+
+    mod("r2egym")
+    mod("r2egym.agenthub")
+    mod("r2egym.agenthub.environment")
+    env_mod = mod("r2egym.agenthub.environment.env")
+    env_mod.EnvArgs = lambda ds=None, repo_path=None, docker_image=None: SimpleNamespace(ds=ds)
+    env_mod.RepoEnv = _FakeBaseRepoEnv
+    mod("r2egym.agenthub.runtime")
+    docker_mod = mod("r2egym.agenthub.runtime.docker")
+    docker_mod.DockerRuntime = _FakeBaseRuntime
+    docker_mod.CMD_TIMEOUT = 900
+    docker_mod.config = _Boom()
+    docker_mod.client = _Boom()
+    mod("r2egym.agenthub.utils")
+    mod("r2egym.agenthub.utils.log").get_logger = lambda *a, **k: MagicMock()
+    mod("r2egym.agenthub.agent")
+    mod("r2egym.agenthub.agent.commands").ParseCommandBash = lambda: None
+    yield docker_mod
+    adapter._CLASSES = None
+
+
+def test_guard_without_r2egym(monkeypatch):
+    adapter._CLASSES = None
+    monkeypatch.setitem(sys.modules, "r2egym", None)
+    with pytest.raises(RuntimeError, match="not on PyPI"):
+        adapter.make_fleet_repo_env(_Handle())
+    with pytest.raises(RuntimeError, match="not on PyPI"):
+        adapter.r2egym_command_files()
+
+
+def test_bind_without_kubernetes_and_no_op_teardown(fake_r2egym):
+    handle = _Handle()
+    env = adapter.make_fleet_repo_env(handle)
+    rt = env.runtime
+    assert rt.container is handle and rt.container_name == "sb-1"
+    assert rt.client is None  # built from the stub, never from kubernetes
+    assert handle.execs[0][0].startswith("timeout 90 echo setup")  # setup_env ran through the handle
+    env.close()  # no release, no delete: the fleet owns the environment
+    assert rt.container is handle
+    # Module attributes are back after construction.
+    assert isinstance(fake_r2egym.config, _Boom) and isinstance(fake_r2egym.client, _Boom)
+
+
+def test_run_maps_exit_codes_timeouts_and_errors(fake_r2egym):
+    handle = _Handle()
+    handle.replies["ok"] = _ExecResult(0, stdout="\x1b[32mgreen\x1b[0m\r\n")
+    handle.replies["fail"] = _ExecResult(2, stdout="out", stderr="err")
+    handle.replies["slow"] = _ExecResult(None, timed_out=True)
+    handle.replies["t124"] = _ExecResult(124)
+    env = adapter.make_fleet_repo_env(handle)
+    rt = env.runtime
+    assert rt.run("ok") == ("green\n", "0")
+    assert rt.run("fail") == ("outerr", "Error: Exit code 2")
+    assert rt.run("slow", timeout=7) == ("The command took too long to execute (>7s)", "-1")
+    assert rt.run("t124") == ("The command took too long to execute (>90s)", "-1")
+    command, cwd, timeout_s = handle.execs[-1]
+    assert command == "timeout 90 t124 " and cwd == "/testbed" and timeout_s == 95
+
+    def broken(*a, **k):
+        raise ConnectionError("gone")
+
+    handle.exec = broken
+    assert rt.run("x") == ("Error executing command in environment: ConnectionError('gone')", "-1")
+
+
+def test_copy_stages_a_tar_and_extracts_into_the_destination(fake_r2egym, tmp_path):
+    handle = _Handle()
+    env = adapter.make_fleet_repo_env(handle)
+    src = tmp_path / "tool.py"
+    src.write_text("print(1)\n")
+    env.runtime.copy_to_container(str(src), "/usr/local/bin/renamed.py")
+    (staged, data), = handle.files.items()
+    assert staged.startswith("/tmp/ate-env-copy-") and staged.endswith(".tar")
+    with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        assert tar.getnames() == ["renamed.py"]
+    command = handle.execs[-1][0]
+    assert f"tar xmf {staged} -C /usr/local/bin" in command and f"rm -f {staged}" in command
+    handle.replies["tar xmf"] = _ExecResult(1, stderr="tar: no space")
+    with pytest.raises(RuntimeError, match="no space"):
+        env.runtime.copy_to_container(str(src), "/usr/local/bin/again.py")
+
+
+def test_bind_failure_raises(fake_r2egym):
+    handle = _Handle(sandbox_id="")  # an empty id cannot be what the hook bound
+    handle.sandbox_id = None
+    with pytest.raises(RuntimeError, match="failed to bind"):
+        adapter.make_fleet_repo_env(handle)
+
+
+def test_requires_the_dataset_row(fake_r2egym):
+    with pytest.raises(RuntimeError, match="metadata\\['ds'\\]"):
+        adapter.make_fleet_repo_env(_Handle(with_ds=False))
+
+
+def test_command_files_are_copied_in(fake_r2egym, tmp_path):
+    files = []
+    for name in ("a.py", "b.py"):
+        p = tmp_path / name
+        p.write_text("x")
+        files.append(str(p))
+    handle = _Handle()
+    adapter.make_fleet_repo_env(handle, command_files=files)
+    assert len(handle.files) == 2
+
+
+def test_fresh_eval_env_acquires_a_second_environment_and_releases_it(fake_r2egym):
+    first = _Handle(sandbox_id="sb-agent")
+    second = _Handle(sandbox_id="sb-eval")
+    fleet = SimpleNamespace(acquire=MagicMock(return_value=second), release=MagicMock())
+    with adapter.fresh_eval_env(fleet, first) as (eval_handle, env):
+        assert eval_handle is second and env.runtime.container_name == "sb-eval"
+        fleet.acquire.assert_called_once_with(first.task)
+        fleet.release.assert_not_called()
+    fleet.release.assert_called_once_with(second)
+
+
+def test_classes_are_built_once_under_concurrency(fake_r2egym):
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(adapter._build_classes())) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len({id(r[0]) for r in results}) == 1
+    assert adapter.AteEnvRuntime is results[0][0] and adapter.AteEnvRepoEnv is results[0][1]

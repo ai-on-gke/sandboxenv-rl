@@ -185,25 +185,23 @@ func TestBuildActorTemplate(t *testing.T) {
 	if probe.GetHttpGet() == nil || probe.GetHttpGet().GetPath() != "/readyz" || probe.GetHttpGet().GetPort() != 80 {
 		t.Errorf("wakeupProbe = %+v, want HTTP GET /readyz on port 80", probe)
 	}
-	// Substrate rejects an ActorTemplate without both limits (substrate#2285).
-	if got := limits(template); got["cpu"] != defaultActorCPU || got["memory"] != defaultActorMemory || len(got) != 2 {
-		t.Errorf("resources.limits = %v, want cpu=%s memory=%s", got, defaultActorCPU, defaultActorMemory)
+	// Substrate rejects an ActorTemplate without both limits (substrate#2285);
+	// since v0.6.0 they are integers: millicores and bytes.
+	if cpu, mem := limits(template); cpu != 2000 || mem != 4<<30 {
+		t.Errorf("resources.limits = %d millicores, %d bytes; want 2000 and %d (the %s / %s defaults)", cpu, mem, 4<<30, defaultActorCPU, defaultActorMemory)
 	}
 }
 
-func limits(tmpl *ateapipb.ActorTemplate) map[string]string {
-	m := map[string]string{}
-	for _, l := range tmpl.GetResources().GetLimits() {
-		m[l.GetName()] = l.GetQuantity()
-	}
-	return m
+func limits(tmpl *ateapipb.ActorTemplate) (cpuMillicores, memoryBytes int64) {
+	l := tmpl.GetResources().GetLimits()
+	return l.GetCpuMillicores(), l.GetMemoryBytes()
 }
 
 func TestBuildActorTemplateResources(t *testing.T) {
 	cfg := testTemplateConfig()
 	cfg.cpu, cfg.memory = "500m", "1Gi"
-	if got := limits(buildActorTemplate(cfg)); got["cpu"] != "500m" || got["memory"] != "1Gi" {
-		t.Errorf("resources.limits = %v, want cpu=500m memory=1Gi", got)
+	if cpu, mem := limits(buildActorTemplate(cfg)); cpu != 500 || mem != 1<<30 {
+		t.Errorf("resources.limits = %d millicores, %d bytes; want 500 and %d", cpu, mem, 1<<30)
 	}
 }
 
@@ -377,7 +375,8 @@ func TestManifestTemplateCommandExecution(t *testing.T) {
 	if !strings.Contains(out, "image: example.com/guest@sha256:aaaa") || !strings.Contains(out, "storageLocation: gs://bucket/prefix/") {
 		t.Errorf("expected guest image and storage location in output:\n%s", out)
 	}
-	for _, want := range []string{"name: cpu\n    quantity: \"4\"", "name: memory\n    quantity: 8Gi"} {
+	// --cpu 4 --memory 8Gi render as Substrate's integer limits.
+	for _, want := range []string{"cpuMillicores: \"4000\"", "memoryBytes: \"8589934592\""} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
 		}

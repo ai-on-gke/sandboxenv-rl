@@ -616,11 +616,20 @@ func buildActorTemplate(cfg templateConfig) *ateapipb.ActorTemplate {
 			// schema marks the field required, so say it explicitly.
 			PreferredFidelity: ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
 		},
-		Resources: &ateapipb.Resources{Limits: []*ateapipb.Limits{
-			{Name: "cpu", Quantity: orDefault(cfg.cpu, defaultActorCPU)},
-			{Name: "memory", Quantity: orDefault(cfg.memory, defaultActorMemory)},
-		}},
+		Resources: resourceLimits(orDefault(cfg.cpu, defaultActorCPU), orDefault(cfg.memory, defaultActorMemory)),
 	}
+}
+
+// resourceLimits renders the cpu and memory quantities as the integer limits
+// Substrate carries since v0.6.0: millicores and bytes. The flags were
+// checked by validateResources, and the defaults are constants, so the parse
+// cannot fail here.
+func resourceLimits(cpu, memory string) *ateapipb.ResourceRequirements {
+	c, m := resource.MustParse(cpu), resource.MustParse(memory)
+	return &ateapipb.ResourceRequirements{Limits: &ateapipb.Resources{
+		CpuMillicores: c.MilliValue(),
+		MemoryBytes:   m.Value(),
+	}}
 }
 
 func orDefault(v, def string) string {

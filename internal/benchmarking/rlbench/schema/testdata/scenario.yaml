@@ -1,0 +1,46 @@
+schema_version: v1
+name: swebench-multi-step
+repeat: 2
+sut:
+  backend: substrate
+  access: ate-env-api
+  endpoint: ate-env-api.default.svc.cluster.local:8080
+  substrate:
+    atespace: default
+    base_template: swebench-base
+  node_pool: worker-pool
+  runtime_class: gvisor
+  replicas: 2
+  extra_args:
+    log_level: info
+jobs:
+  - name: sim-loop-1
+    kind: simulated
+    loader_mode: steps
+    start_offset_ms: 500
+    dataset: benchmark/swebench.jsonl
+    trajectory: benchmark/traj.yaml
+    park: suspend-async
+    images: 4
+    tasks_per_step: 4
+    group_size: 2
+    steps: 5
+    max_concurrent: 8
+    step_pause_ms: 2000
+    prefetch: true
+    seed: 42
+    schedule_mode: sampled
+window_policy:
+  steady_state_start_step: 2
+  steady_state_end_step: 5
+  warmup_steps: 1
+  max_duration_s: 900
+variants:
+  - name: async-park-prefetch
+    description: Enable async suspend and next-step prefetch
+    park: suspend-async
+    prefetch: true
+    env_vars:
+      ATE_PREFETCH: "1"
+    flags:
+      --enable-fast-restore: "true"

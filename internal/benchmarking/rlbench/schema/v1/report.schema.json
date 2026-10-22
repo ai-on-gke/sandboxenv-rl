@@ -1,0 +1,253 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-on-gke.github.io/sandboxenv-rl/schema/v1/report.schema.json",
+  "title": "Report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "scenario_name", "generated_at", "validity"],
+  "properties": {
+    "schema_version": { "type": "string", "enum": ["v1"] },
+    "run_id": { "type": "string", "minLength": 1 },
+    "scenario_name": { "type": "string", "minLength": 1 },
+    "tag": { "type": "string" },
+    "generated_at": { "type": "string", "minLength": 1 },
+    "system_description": { "$ref": "#/$defs/SystemDescription" },
+    "measurements_ref": { "type": "string" },
+    "measurements": { "$ref": "#/$defs/Measurements" },
+    "validity": { "$ref": "#/$defs/ReportValidity" },
+    "jobs": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/JobReportSummary" }
+    },
+    "custom_metrics": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/MetricSummary" }
+    }
+  },
+  "$defs": {
+    "ReportValidity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valid"],
+      "properties": {
+        "valid": { "type": "boolean" },
+        "reasons": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "JobReportSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tasks", "failed", "rewarded", "reward_rate"],
+      "properties": {
+        "tasks": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "rewarded": { "type": "integer", "minimum": 0 },
+        "reward_rate": { "type": "number", "minimum": 0 },
+        "steps": { "type": "integer", "minimum": 0 },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/MetricSummary" }
+        }
+      }
+    },
+    "MetricSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "sum": { "type": "number" },
+        "min": { "type": "number" },
+        "max": { "type": "number" },
+        "p50": { "type": "number" },
+        "p90": { "type": "number" },
+        "p95": { "type": "number" },
+        "p99": { "type": "number" },
+        "unit": { "type": "string" }
+      }
+    },
+    "SystemDescription": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "cluster"],
+      "properties": {
+        "schema_version": { "type": "string", "enum": ["v1"] },
+        "cluster": { "type": "string", "minLength": 1 },
+        "backend": { "type": "string", "enum": ["substrate", "agent-sandbox"] },
+        "access": { "type": "string", "enum": ["sdk", "ate-env-api", "direct"] },
+        "kubernetes_version": { "type": "string" },
+        "sdk_version": { "type": "string" },
+        "substrate_version": { "type": "string" },
+        "grader_version": { "type": "string" },
+        "dataset_revision": { "type": "string" },
+        "swebench_harness_version": { "type": "string" },
+        "exclusion_list_revision": { "type": "string" },
+        "node_pools": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "machine_types": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/NodePoolInfo" }
+        },
+        "zone_topology": { "type": "string" },
+        "bucket_region": { "type": "string" },
+        "runtime_class": { "type": "string" },
+        "sandbox_footprint": { "$ref": "#/$defs/SandboxFootprint" },
+        "api_image": { "type": "string" },
+        "guest_image": { "type": "string" },
+        "git_sha": { "type": "string" },
+        "dataset_digest": { "type": "string" },
+        "scenario_hash": { "type": "string" },
+        "overlays": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/OverlayRef" }
+        },
+        "load": { "$ref": "#/$defs/LoadParams" }
+      }
+    },
+    "NodePoolInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["machine_type", "count"],
+      "properties": {
+        "machine_type": { "type": "string", "minLength": 1 },
+        "count": { "type": "integer", "minimum": 0 },
+        "zone": { "type": "string" }
+      }
+    },
+    "SandboxFootprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu", "memory_gib"],
+      "properties": {
+        "cpu": { "type": "number", "minimum": 0 },
+        "memory_gib": { "type": "number", "minimum": 0 },
+        "disk_gib": { "type": "number", "minimum": 0 }
+      }
+    },
+    "OverlayRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "hash": { "type": "string" },
+        "sut_overrides": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "LoadParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tasks": { "type": "integer", "minimum": 0 },
+        "group_size": { "type": "integer", "minimum": 0 },
+        "steps": { "type": "integer", "minimum": 0 },
+        "tasks_per_step": { "type": "integer", "minimum": 0 },
+        "trajectories_per_step": { "type": "integer", "minimum": 0 },
+        "repeat": { "type": "integer", "minimum": 0 },
+        "max_concurrent": { "type": "integer", "minimum": 0 },
+        "distinct_images": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "Measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "run_id", "collected_at"],
+      "properties": {
+        "schema_version": { "type": "string", "enum": ["v1"] },
+        "run_id": { "type": "string", "minLength": 1 },
+        "collected_at": { "type": "string", "minLength": 1 },
+        "start_ts": { "type": "string", "minLength": 1 },
+        "end_ts": { "type": "string", "minLength": 1 },
+        "cache_before_ref": { "type": "string" },
+        "cache_after_ref": { "type": "string" },
+        "restore_timings_ref": { "type": "string" },
+        "logs_archive": { "type": "string" },
+        "node_cache_before": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/NodeCacheSample" }
+        },
+        "node_cache_after": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/NodeCacheSample" }
+        },
+        "restores": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/RestoreSample" }
+        },
+        "prom_metrics": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/PrometheusSeries" }
+        },
+        "server_summary": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/MetricSummary" }
+        },
+        "custom_metrics": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/MetricSummary" }
+        }
+      }
+    },
+    "NodeCacheSample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node", "hits", "misses"],
+      "properties": {
+        "node": { "type": "string", "minLength": 1 },
+        "ts": { "type": "string" },
+        "hits": { "type": "integer", "minimum": 0 },
+        "misses": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 },
+        "evictions": { "type": "integer", "minimum": 0 },
+        "bytes_used": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "RestoreSample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["env", "total_ms"],
+      "properties": {
+        "schema_version": { "type": "string", "enum": ["v1"] },
+        "node": { "type": "string" },
+        "env": { "type": "string", "minLength": 1 },
+        "snapshot": { "type": "string" },
+        "kind": { "type": "string" },
+        "ts": { "type": "string" },
+        "total_ms": { "type": "number", "minimum": 0 },
+        "manifest_fetch_ms": { "type": "number", "minimum": 0 },
+        "download_ms": { "type": "number", "minimum": 0 },
+        "oci_unpack_ms": { "type": "number", "minimum": 0 },
+        "worker_restore_ms": { "type": "number", "minimum": 0 },
+        "persist_ms": { "type": "number", "minimum": 0 },
+        "cache_hit": { "type": "boolean" }
+      }
+    },
+    "PrometheusSeries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "labels": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "status": { "type": "string", "enum": ["ok", "error"] },
+        "err": { "type": "string" },
+        "value": { "type": "number" },
+        "values": {
+          "type": "array",
+          "items": { "type": "number" }
+        }
+      }
+    }
+  }
+}

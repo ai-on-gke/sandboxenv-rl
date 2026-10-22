@@ -1,0 +1,3 @@
+{"schema_version":"v1","ts":"2026-10-22T01:23:23.905Z","run":"swe-trace-1","job":"real-1","env":"env-0","instance":"astropy__astropy-12907","image":"gcr.io/test/astropy:latest","step":1,"op":"create","dur_ms":254.2,"ok":true}
+{"schema_version":"v1","ts":"2026-10-22T01:23:27.602Z","run":"swe-trace-1","job":"real-1","env":"env-0","instance":"astropy__astropy-12907","step":1,"op":"exec","command":["pytest","-q"],"bytes":128,"dur_ms":3696.4,"exit":0,"ok":true}
+{"schema_version":"v1","ts":"2026-10-22T01:23:36.092Z","run":"swe-trace-1","job":"real-1","env":"env-0","instance":"astropy__astropy-12907","step":1,"op":"suspend","dur_ms":114.6,"ok":true}

@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-on-gke.github.io/sandboxenv-rl/schema/v1/measurements.schema.json",
+  "title": "Measurements",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "collected_at"],
+  "properties": {
+    "schema_version": { "type": "string", "enum": ["v1"] },
+    "run_id": { "type": "string", "minLength": 1 },
+    "collected_at": { "type": "string", "minLength": 1 },
+    "start_ts": { "type": "string", "minLength": 1 },
+    "end_ts": { "type": "string", "minLength": 1 },
+    "cache_before_ref": { "type": "string" },
+    "cache_after_ref": { "type": "string" },
+    "restore_timings_ref": { "type": "string" },
+    "logs_archive": { "type": "string" },
+    "node_cache_before": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/NodeCacheSample" }
+    },
+    "node_cache_after": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/NodeCacheSample" }
+    },
+    "restores": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/RestoreSample" }
+    },
+    "prom_metrics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/PrometheusSeries" }
+    },
+    "server_summary": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/MetricSummary" }
+    },
+    "custom_metrics": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/MetricSummary" }
+    }
+  },
+  "$defs": {
+    "NodeCacheSample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node", "hits", "misses"],
+      "properties": {
+        "node": { "type": "string", "minLength": 1 },
+        "ts": { "type": "string" },
+        "hits": { "type": "integer", "minimum": 0 },
+        "misses": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 },
+        "evictions": { "type": "integer", "minimum": 0 },
+        "bytes_used": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "RestoreSample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["env", "total_ms"],
+      "properties": {
+        "schema_version": { "type": "string", "enum": ["v1"] },
+        "node": { "type": "string" },
+        "env": { "type": "string", "minLength": 1 },
+        "snapshot": { "type": "string" },
+        "kind": { "type": "string" },
+        "ts": { "type": "string" },
+        "total_ms": { "type": "number", "minimum": 0 },
+        "manifest_fetch_ms": { "type": "number", "minimum": 0 },
+        "download_ms": { "type": "number", "minimum": 0 },
+        "oci_unpack_ms": { "type": "number", "minimum": 0 },
+        "worker_restore_ms": { "type": "number", "minimum": 0 },
+        "persist_ms": { "type": "number", "minimum": 0 },
+        "cache_hit": { "type": "boolean" }
+      }
+    },
+    "PrometheusSeries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "labels": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "status": { "type": "string", "enum": ["ok", "error"] },
+        "err": { "type": "string" },
+        "value": { "type": "number" },
+        "values": {
+          "type": "array",
+          "items": { "type": "number" }
+        }
+      }
+    },
+    "MetricSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "sum": { "type": "number" },
+        "min": { "type": "number" },
+        "max": { "type": "number" },
+        "p50": { "type": "number" },
+        "p90": { "type": "number" },
+        "p95": { "type": "number" },
+        "p99": { "type": "number" },
+        "unit": { "type": "string" }
+      }
+    }
+  }
+}

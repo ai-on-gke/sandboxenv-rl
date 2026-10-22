@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-on-gke.github.io/sandboxenv-rl/schema/v1/stats_row.schema.json",
+  "title": "StatsRow",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "timestamp", "test_name", "metric", "measurements"],
+  "properties": {
+    "schema_version": { "type": "string", "enum": ["v1"] },
+    "timestamp": { "type": "string", "minLength": 1 },
+    "tag": { "type": "string" },
+    "test_name": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string" },
+    "job": { "type": "string" },
+    "metric": { "type": "string", "minLength": 1 },
+    "measurements": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "number" }
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  }
+}

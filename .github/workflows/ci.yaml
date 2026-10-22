@@ -64,6 +64,11 @@ jobs:
       - run: python -m pytest benchmarking/swebench -q
       - run: ruff check clients/python
       - run: python -m pytest integrations/nemo-gym/tests -q
+      # Again with the tracing extra: the whole client suite, so the span and
+      # traceparent tests run instead of skipping, and the instrumented code
+      # paths are tested with OpenTelemetry installed.
+      - run: python -m pip install -e 'clients/python[dev,tracing]'
+      - run: python -m pytest clients/python/tests -q
 
   openhands:
     # A job of its own: openhands-sdk and the agent-server the tests start pull

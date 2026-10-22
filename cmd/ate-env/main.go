@@ -21,6 +21,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -40,10 +41,48 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+// authFlags are the caller-token flags of the commands that call
+// ate-env-api.
+type authFlags struct {
+	token string
+	file  string
+}
+
+func (a *authFlags) register(cmd *cobra.Command, persistent bool) {
+	fs := cmd.Flags()
+	if persistent {
+		fs = cmd.PersistentFlags()
+	}
+	fs.StringVar(&a.token, "auth-token", envOr("SUBSTRATE_ENV_AUTH_TOKEN", ""), "bearer token for ate-env-api; the value shows in ps output and shell history, thus prefer SUBSTRATE_ENV_AUTH_TOKEN or --auth-token-file")
+	fs.StringVar(&a.file, "auth-token-file", "", "file that holds the bearer token for ate-env-api; surrounding whitespace is ignored")
+}
+
+// resolve returns the token from --auth-token-file when it is set, otherwise
+// from --auth-token or SUBSTRATE_ENV_AUTH_TOKEN. The two flags exclude each
+// other; the file flag takes precedence over the environment variable.
+func (a *authFlags) resolve(cmd *cobra.Command) (string, error) {
+	if a.file == "" {
+		return a.token, nil
+	}
+	if cmd.Flags().Changed("auth-token") {
+		return "", errors.New("--auth-token and --auth-token-file cannot be used together")
+	}
+	b, err := os.ReadFile(a.file)
+	if err != nil {
+		return "", fmt.Errorf("reading --auth-token-file: %w", err)
+	}
+	token := strings.TrimSpace(string(b))
+	if token == "" {
+		return "", fmt.Errorf("--auth-token-file %s is empty", a.file)
+	}
+	return token, nil
+}
+
 func newGuestCommand(id string) *cobra.Command {
 	var (
 		endpoint string
 		atespace string
+		auth     authFlags
 		client   *env.Client
 	)
 
@@ -51,9 +90,13 @@ func newGuestCommand(id string) *cobra.Command {
 		Use:   id,
 		Short: fmt.Sprintf("Manage environment %s", id),
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			var err error
+			token, err := auth.resolve(cmd)
+			if err != nil {
+				return err
+			}
 			client, err = env.NewClient(env.ClientOptions{
-				Endpoint: endpoint,
+				Endpoint:  endpoint,
+				AuthToken: token,
 			})
 			return err
 		},
@@ -65,6 +108,7 @@ func newGuestCommand(id string) *cobra.Command {
 	}
 	guestCmd.PersistentFlags().StringVar(&endpoint, "api", envOr("SUBSTRATE_ENV_API", "127.0.0.1:7777"), "address of the ate-env-api service (e.g. localhost:7777)")
 	guestCmd.PersistentFlags().StringVar(&atespace, "atespace", apiservice.DefaultAtespace, "Substrate atespace")
+	auth.register(guestCmd, true)
 
 	guestCmd.AddCommand(&cobra.Command{
 		Use:   "read <path>",
@@ -135,6 +179,7 @@ func newCreateCommand() *cobra.Command {
 	var (
 		endpoint               string
 		atespace               string
+		auth                   authFlags
 		createTemplate         string
 		createTemplateAtespace string
 		rootfsImage            string
@@ -144,8 +189,13 @@ func newCreateCommand() *cobra.Command {
 		Short: "Create and start an environment",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			token, err := auth.resolve(cmd)
+			if err != nil {
+				return err
+			}
 			client, err := env.NewClient(env.ClientOptions{
-				Endpoint: endpoint,
+				Endpoint:  endpoint,
+				AuthToken: token,
 			})
 			if err != nil {
 				return err
@@ -173,6 +223,7 @@ func newCreateCommand() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&endpoint, "api", envOr("SUBSTRATE_ENV_API", "127.0.0.1:7777"), "address of the ate-env-api service (e.g. localhost:7777)")
 	cmd.Flags().StringVar(&atespace, "atespace", apiservice.DefaultAtespace, "Substrate atespace")
+	auth.register(cmd, false)
 	cmd.Flags().StringVar(&createTemplate, "template", "", "ActorTemplate name (defaults to server default)")
 	cmd.Flags().StringVar(&createTemplateAtespace, "template-atespace", "", "Substrate atespace of the ActorTemplate (defaults to environment atespace)")
 	cmd.Flags().StringVar(&rootfsImage, "rootfs-image", "", "digest-pinned rootfs image to run unmodified (repo@sha256:...); the template becomes the base the guest is taken from")
@@ -183,14 +234,20 @@ func newSuspendCommand() *cobra.Command {
 	var (
 		endpoint string
 		atespace string
+		auth     authFlags
 	)
 	cmd := &cobra.Command{
 		Use:   "suspend <id>",
 		Short: "Suspend an environment",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			token, err := auth.resolve(cmd)
+			if err != nil {
+				return err
+			}
 			client, err := env.NewClient(env.ClientOptions{
-				Endpoint: endpoint,
+				Endpoint:  endpoint,
+				AuthToken: token,
 			})
 			if err != nil {
 				return err
@@ -202,6 +259,7 @@ func newSuspendCommand() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&endpoint, "api", envOr("SUBSTRATE_ENV_API", "127.0.0.1:7777"), "address of the ate-env-api service (e.g. localhost:7777)")
 	cmd.Flags().StringVar(&atespace, "atespace", apiservice.DefaultAtespace, "Substrate atespace")
+	auth.register(cmd, false)
 	return cmd
 }
 
@@ -209,14 +267,20 @@ func newDeleteCommand() *cobra.Command {
 	var (
 		endpoint string
 		atespace string
+		auth     authFlags
 	)
 	cmd := &cobra.Command{
 		Use:   "delete <id>",
 		Short: "Delete an environment",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			token, err := auth.resolve(cmd)
+			if err != nil {
+				return err
+			}
 			client, err := env.NewClient(env.ClientOptions{
-				Endpoint: endpoint,
+				Endpoint:  endpoint,
+				AuthToken: token,
 			})
 			if err != nil {
 				return err
@@ -228,6 +292,7 @@ func newDeleteCommand() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&endpoint, "api", envOr("SUBSTRATE_ENV_API", "127.0.0.1:7777"), "address of the ate-env-api service (e.g. localhost:7777)")
 	cmd.Flags().StringVar(&atespace, "atespace", apiservice.DefaultAtespace, "Substrate atespace")
+	auth.register(cmd, false)
 	return cmd
 }
 

@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -75,6 +76,12 @@ _SIGKILL_EXIT = 137
 _ENV_ID_HEADER = "X-Env-Id"
 _ENV_ATESPACE_HEADER = "X-Env-Atespace"
 _ENV_PORT_HEADER = "X-Env-Port"
+# The caller's bearer token for ate-env-api itself on a port-proxy request.
+# The proxy checks it and removes it, so the daemon never sees it and keeps
+# Authorization for its own credential.
+_ENV_AUTHORIZATION_HEADER = "X-Env-Authorization"
+# Environment variable with the bearer token, the one the ate-env CLI reads.
+_AUTH_TOKEN_ENV = "SUBSTRATE_ENV_AUTH_TOKEN"
 # The ate-env guest's own port in every environment: not a daemon port, and
 # the port proxy refuses it too.
 _GUEST_PORT = 80
@@ -151,18 +158,44 @@ class ConnectionConfig:
     # same listener. Set it when the code that calls the service reaches
     # ate-env-api at another address than the provider does.
     endpoint_url: str | None = None
+    # File with ate-env-api's bearer token (-auth-token-file on the API). Unset
+    # means SUBSTRATE_ENV_AUTH_TOKEN when it is set, else no token. The config
+    # names a file, not the token, so the token stays out of config files and
+    # of this object's repr.
+    auth_token_file: str | None = None
 
-    _ALLOWED = frozenset({"api_url", "request_timeout_s", "endpoint_url"})
+    _ALLOWED = frozenset({"api_url", "request_timeout_s", "endpoint_url", "auth_token_file"})
 
     @classmethod
     def from_mapping(cls, options: Mapping[str, Any]) -> "ConnectionConfig":
         _require_keys(options, cls._ALLOWED, "sandbox.substrate.connection")
         endpoint_url = options.get("endpoint_url")
+        auth_token_file = options.get("auth_token_file")
         return cls(
             api_url=str(options.get("api_url", cls.api_url)).rstrip("/"),
             request_timeout_s=float(options.get("request_timeout_s", cls.request_timeout_s)),
             endpoint_url=None if endpoint_url is None else str(endpoint_url).rstrip("/"),
+            auth_token_file=None if auth_token_file is None else str(auth_token_file),
         )
+
+    def resolve_auth_token(self) -> str | None:
+        """The bearer token: from ``auth_token_file`` when set, else from
+        ``SUBSTRATE_ENV_AUTH_TOKEN``, else None. Surrounding whitespace is
+        ignored; a file with no token is an error, not a request to run
+        without one."""
+        if self.auth_token_file is None:
+            return os.environ.get(_AUTH_TOKEN_ENV, "").strip() or None
+        try:
+            token = Path(self.auth_token_file).read_text().strip()
+        except OSError as exc:
+            raise ValueError(
+                f"sandbox.substrate.connection.auth_token_file {self.auth_token_file!r}: {exc}"
+            ) from exc
+        if not token:
+            raise ValueError(
+                f"sandbox.substrate.connection.auth_token_file {self.auth_token_file!r} is empty"
+            )
+        return token
 
     def endpoint_base(self) -> str:
         """The absolute URL of ate-env-api's port proxy: ``endpoint_url`` when
@@ -249,6 +282,9 @@ class SubstrateSandboxProvider:
         _require_keys(config, frozenset({"connection", "create"}), "sandbox.substrate")
         self._connection = ConnectionConfig.from_mapping(config.get("connection") or {})
         self._create = CreateConfig.from_mapping(config.get("create") or {})
+        # Sent on the gRPC calls of a client the provider opens and on each
+        # endpoint() request; a caller-owned client keeps its own token.
+        self._auth_token = self._connection.resolve_auth_token()
         # The channel is opened lazily so constructing a provider never dials.
         self._client: Client | None = client
         self._owns_client = client is None
@@ -436,14 +472,14 @@ class SubstrateSandboxProvider:
             ) from exc
         if info.status == EnvironmentStatus.CRASHED:
             raise RuntimeError(f"substrate env {handle.sandbox_id!r} crashed")
-        return SandboxEndpoint(
-            endpoint=self._connection.endpoint_base(),
-            headers={
-                _ENV_ID_HEADER: handle.sandbox_id,
-                _ENV_ATESPACE_HEADER: atespace,
-                _ENV_PORT_HEADER: str(port),
-            },
-        )
+        headers = {
+            _ENV_ID_HEADER: handle.sandbox_id,
+            _ENV_ATESPACE_HEADER: atespace,
+            _ENV_PORT_HEADER: str(port),
+        }
+        if self._auth_token:
+            headers[_ENV_AUTHORIZATION_HEADER] = f"Bearer {self._auth_token}"
+        return SandboxEndpoint(endpoint=self._connection.endpoint_base(), headers=headers)
 
     async def close(self, handle: SandboxHandle) -> None:
         await self._best_effort_delete(handle.sandbox_id, self._atespace_of(handle.raw or {}))
@@ -469,8 +505,8 @@ class SubstrateSandboxProvider:
             # ate_env.Client only dials h2c itself; hand it a TLS channel.
             target = f"{url.hostname}:{url.port or 443}"
             self._channel = grpc.aio.secure_channel(target, grpc.ssl_channel_credentials())
-            return Client(channel=self._channel)
-        return Client(api_url)
+            return Client(channel=self._channel, auth_token=self._auth_token)
+        return Client(api_url, auth_token=self._auth_token)
 
     def _atespace_of(self, raw: Mapping[str, Any]) -> str:
         return str(raw.get("atespace") or self._create.atespace)

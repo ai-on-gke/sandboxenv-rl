@@ -27,10 +27,13 @@
 // to that port. The proxy speaks HTTP/1.1 to the daemon through the tunnel and
 // keeps idle tunnels for reuse, one pool for each environment and port.
 //
-// Trust model: the proxy does not authenticate callers. Whoever can reach the
-// listener it is served on can reach any TCP port of any actor the router
-// serves, in any atespace, including actors that ate-env did not create. A
-// daemon behind it must authenticate its own clients. The path form refuses
+// Trust model: without Options.Authenticate, the proxy does not authenticate
+// callers. Whoever can reach the listener it is served on can reach any TCP
+// port of any actor the router serves, in any atespace, including actors that
+// ate-env did not create. With it, a caller must present the API's bearer
+// token in EnvAuthorizationHeader or Authorization, and the token does not
+// reach the daemon. Either way, a daemon behind it must authenticate its own
+// clients. The path form refuses
 // requests that a browser sends from another origin (see Options.TrustedOrigins),
 // so a web page cannot drive a daemon through a port-forwarded listener.
 package portproxy
@@ -61,6 +64,12 @@ const (
 	EnvAtespaceHeader = "X-Env-Atespace"
 	EnvPortHeader     = "X-Env-Port"
 )
+
+// EnvAuthorizationHeader carries the caller's credential for the API itself,
+// "Bearer <token>", on a forwarded request. It leaves the request's own
+// Authorization header free for the daemon's credential. The proxy never
+// forwards it.
+const EnvAuthorizationHeader = "X-Env-Authorization"
 
 // DefaultHandshakeTimeout bounds dialing the router and waiting for its
 // answer to CONNECT, which includes resuming a suspended actor.
@@ -117,6 +126,13 @@ type Options struct {
 	// 503 for an environment that is suspended or still waking. Zero means
 	// DefaultWakeBudget.
 	WakeBudget time.Duration
+	// Authenticate, when set, checks the caller before a request is
+	// forwarded. It gets the value of EnvAuthorizationHeader, or of
+	// Authorization when the request has no EnvAuthorizationHeader. An error
+	// refuses the request with 401. The credential does not reach the
+	// daemon: the proxy drops EnvAuthorizationHeader, and drops Authorization
+	// when it carried the credential.
+	Authenticate func(credential string) error
 }
 
 // Proxy is an http.Handler that forwards each request to the environment port
@@ -202,6 +218,9 @@ type target struct {
 	// path and rawPath, when set, replace the request's path upstream (the
 	// path form strips its routing prefix).
 	path, rawPath string
+	// dropAuthorization removes the Authorization header upstream: it
+	// carried the caller's credential for the API, not the daemon's.
+	dropAuthorization bool
 }
 
 type targetKey struct{}
@@ -314,6 +333,9 @@ func (p *Proxy) ServePath(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if !p.authenticate(w, r, &t) {
+		return
+	}
 	check := r
 	if r.Header.Get("Upgrade") != "" {
 		// CrossOriginProtection lets safe methods through; judge a handshake
@@ -336,7 +358,31 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if !p.authenticate(w, r, &t) {
+		return
+	}
 	p.rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), targetKey{}, t)))
+}
+
+// authenticate checks the caller with Options.Authenticate and records in t
+// which header to drop upstream. It answers 401 and returns false when the
+// check fails.
+func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request, t *target) bool {
+	if p.opts.Authenticate == nil {
+		return true
+	}
+	credential := r.Header.Get(EnvAuthorizationHeader)
+	if credential == "" {
+		credential = r.Header.Get("Authorization")
+		t.dropAuthorization = true
+	}
+	if err := p.opts.Authenticate(credential); err != nil {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		http.Error(w, "missing or invalid bearer token; send it in "+EnvAuthorizationHeader+
+			" or Authorization", http.StatusUnauthorized)
+		return false
+	}
+	return true
 }
 
 func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
@@ -351,8 +397,11 @@ func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 	if t.path != "" {
 		pr.Out.URL.Path, pr.Out.URL.RawPath = t.path, t.rawPath
 	}
-	for _, h := range []string{EnvIDHeader, EnvAtespaceHeader, EnvPortHeader} {
+	for _, h := range []string{EnvIDHeader, EnvAtespaceHeader, EnvPortHeader, EnvAuthorizationHeader} {
 		pr.Out.Header.Del(h)
+	}
+	if t.dropAuthorization {
+		pr.Out.Header.Del("Authorization")
 	}
 }
 

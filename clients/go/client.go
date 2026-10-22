@@ -29,6 +29,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -47,12 +48,19 @@ type ClientOptions struct {
 
 	// GRPCConn overrides the grpc.ClientConn used for ate-env-api RPCs.
 	GRPCConn *grpc.ClientConn
+
+	// AuthToken, if non-empty, is sent as an "Authorization: Bearer <token>"
+	// metadata header on every RPC, matching the Python client's auth_token.
+	// On the client's own connection it is a per-RPC credential, thus each
+	// RPC carries it. With GRPCConn, each Client method attaches it instead.
+	AuthToken string
 }
 
 // Client manages environments against an ate-env-api endpoint over gRPC.
 type Client struct {
 	endpoint   string
 	opts       ClientOptions
+	connAuth   bool // the connection sends AuthToken itself
 	grpcConn   *grpc.ClientConn
 	grpc       ateenvv1alpha.EnvironmentServiceClient
 	process    ateenvv1alpha.ProcessServiceClient
@@ -78,7 +86,11 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	} else {
 		target := strings.TrimPrefix(endpoint, "http://")
 		target = strings.TrimPrefix(target, "https://")
-		grpcConn, err = grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+		if opts.AuthToken != "" {
+			dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(bearerCredentials{token: opts.AuthToken}))
+		}
+		grpcConn, err = grpc.NewClient(target, dialOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("env: connecting to gRPC %s: %w", target, err)
 		}
@@ -87,6 +99,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	return &Client{
 		endpoint:   endpoint,
 		opts:       opts,
+		connAuth:   opts.GRPCConn == nil && opts.AuthToken != "",
 		grpcConn:   grpcConn,
 		grpc:       ateenvv1alpha.NewEnvironmentServiceClient(grpcConn),
 		process:    ateenvv1alpha.NewProcessServiceClient(grpcConn),
@@ -102,10 +115,34 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// bearerCredentials sends the token on each RPC of the client's own
+// connection. That connection has no TLS (insecure credentials), thus it
+// cannot require transport security.
+type bearerCredentials struct{ token string }
+
+func (b bearerCredentials) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	return map[string]string{"authorization": "Bearer " + b.token}, nil
+}
+
+func (bearerCredentials) RequireTransportSecurity() bool { return false }
+
+// withAuth attaches the token for a caller-supplied GRPCConn. The client's
+// own connection sends it as a per-RPC credential, thus withAuth adds
+// nothing there, and the header is never sent twice.
+func (c *Client) withAuth(ctx context.Context) context.Context {
+	if c.opts.AuthToken == "" || c.connAuth {
+		return ctx
+	}
+	if md, ok := metadata.FromOutgoingContext(ctx); ok && len(md.Get("authorization")) > 0 {
+		return ctx
+	}
+	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+c.opts.AuthToken)
+}
+
 // Create registers a new env with the parameters given in req and
 // starts it using the gRPC EnvironmentService.
 func (c *Client) Create(ctx context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (*Env, error) {
-	resp, err := c.grpc.CreateEnvironment(ctx, req)
+	resp, err := c.grpc.CreateEnvironment(c.withAuth(ctx), req)
 	if err != nil {
 		return nil, fromGRPCError(err)
 	}
@@ -119,7 +156,7 @@ func (c *Client) Suspend(ctx context.Context, atespace, id string) error {
 		Id:       id,
 		Atespace: atespace,
 	}
-	_, err := c.grpc.SuspendEnvironment(ctx, req)
+	_, err := c.grpc.SuspendEnvironment(c.withAuth(ctx), req)
 	if err != nil {
 		return fromGRPCError(err)
 	}
@@ -132,7 +169,7 @@ func (c *Client) Delete(ctx context.Context, atespace, id string) error {
 		Id:       id,
 		Atespace: atespace,
 	}
-	_, err := c.grpc.DeleteEnvironment(ctx, req)
+	_, err := c.grpc.DeleteEnvironment(c.withAuth(ctx), req)
 	if err != nil {
 		return fromGRPCError(err)
 	}

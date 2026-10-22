@@ -108,14 +108,21 @@ for t in d.get("actorTemplates", d.get("actor_templates", [])):
 }
 
 existing=$(templates)
+base_exists=0
+for name in ${existing}; do
+  [ "${name}" = "${TEMPLATE}" ] && base_exists=1
+done
+# Register the base when it is missing, also when only templates derived from
+# it remain, or with RECREATE=1.
 register=1
 if [ -n "${existing}" ] && [ "${RECREATE:-}" != 1 ]; then
   if [ -z "${SESSION_KEY:-}" ]; then
-    echo "${ATESPACE}/${TEMPLATE} exists and carries its own session key: set SESSION_KEY to that key," >&2
-    echo "or set RECREATE=1 to delete it and the templates derived from it and register it again" >&2
+    # Derived templates reuse the key of the base they came from.
+    echo "${ATESPACE}/${TEMPLATE} or a template derived from it exists and carries its own session key:" >&2
+    echo "set SESSION_KEY to that key, or set RECREATE=1 to delete them and register the base again" >&2
     exit 2
   fi
-  register=0
+  [ "${base_exists}" = 1 ] && register=0
 fi
 if [ -z "${SESSION_KEY:-}" ]; then
   if [ "${KEEP:-}" = 1 ]; then
@@ -163,10 +170,12 @@ done
 if [ "${register}" = 0 ]; then
   step "reusing ${ATESPACE}/${TEMPLATE} and the templates derived from it (RECREATE=1 registers it again)"
 else
-  for name in ${existing}; do
-    step "delete ${ATESPACE}/${name} (RECREATE=1)"
-    "${KUBECTL_ATE}" delete actor-template --atespace "${ATESPACE}" "${name}" >/dev/null
-  done
+  if [ "${RECREATE:-}" = 1 ]; then
+    for name in ${existing}; do
+      step "delete ${ATESPACE}/${name} (RECREATE=1)"
+      "${KUBECTL_ATE}" delete actor-template --atespace "${ATESPACE}" "${name}" >/dev/null
+    done
+  fi
   step "register ${ATESPACE}/${TEMPLATE}: guest + agent-server layer on port ${PORT}"
   "${ATE_ENV}" manifest template --template "${TEMPLATE}" --atespace "${ATESPACE}" \
     --guest-image "${GUEST_IMAGE}" --snapshots-bucket "${SNAPSHOTS_BUCKET}" \

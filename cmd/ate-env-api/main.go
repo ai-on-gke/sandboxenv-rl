@@ -32,6 +32,7 @@ import (
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/mcp"
 	"github.com/agent-substrate/env/internal/portproxy"
+	"github.com/agent-substrate/env/internal/unknownfields"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"google.golang.org/grpc"
 )
@@ -104,17 +105,7 @@ func main() {
 	apisvc.WakeRunningBudget = *wakeRunningBudget
 	defer apisvc.Close()
 
-	// Authentication runs first, so an unauthenticated caller learns nothing
-	// from the unknown-field check.
-	var unary []grpc.UnaryServerInterceptor
-	var stream []grpc.StreamServerInterceptor
-	if callerAuth != nil {
-		unary = append(unary, callerAuth.UnaryInterceptor())
-		stream = append(stream, callerAuth.StreamInterceptor())
-	}
-	unary = append(unary, apiservice.RejectUnknownFieldsUnaryInterceptor())
-	stream = append(stream, apiservice.RejectUnknownFieldsStreamInterceptor())
-	grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(unary...), grpc.ChainStreamInterceptor(stream...))
+	grpcServer := grpc.NewServer(grpcServerOptions(callerAuth)...)
 	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, apisvc)
 	ateenvv1alpha.RegisterProcessServiceServer(grpcServer, apisvc)
 	ateenvv1alpha.RegisterFileSystemServiceServer(grpcServer, apisvc)
@@ -185,4 +176,19 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server error: %v", err)
 	}
+}
+
+// grpcServerOptions returns the interceptor chain of the API's gRPC server.
+// Authentication runs first, so an unauthenticated caller learns nothing from
+// the unknown-field check. callerAuth is nil when no token is required.
+func grpcServerOptions(callerAuth *apiservice.BearerAuth) []grpc.ServerOption {
+	var unary []grpc.UnaryServerInterceptor
+	var stream []grpc.StreamServerInterceptor
+	if callerAuth != nil {
+		unary = append(unary, callerAuth.UnaryInterceptor())
+		stream = append(stream, callerAuth.StreamInterceptor())
+	}
+	unary = append(unary, unknownfields.UnaryServerInterceptor())
+	stream = append(stream, unknownfields.StreamServerInterceptor())
+	return []grpc.ServerOption{grpc.ChainUnaryInterceptor(unary...), grpc.ChainStreamInterceptor(stream...)}
 }

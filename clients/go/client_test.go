@@ -34,6 +34,7 @@ import (
 	"github.com/agent-substrate/env/internal/internaltest/fakecontrol"
 	"github.com/agent-substrate/env/internal/internaltest/fakerouter"
 	"github.com/agent-substrate/env/internal/mcp"
+	"github.com/agent-substrate/env/internal/unknownfields"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
@@ -87,8 +88,8 @@ func newFixture(t *testing.T) *fixture {
 	// The interceptors ate-env-api runs, so each call the SDK makes is checked
 	// for fields the server does not know.
 	grpcServer := grpc.NewServer(
-		grpc.ChainUnaryInterceptor(apiservice.RejectUnknownFieldsUnaryInterceptor()),
-		grpc.ChainStreamInterceptor(apiservice.RejectUnknownFieldsStreamInterceptor()),
+		grpc.ChainUnaryInterceptor(unknownfields.UnaryServerInterceptor()),
+		grpc.ChainStreamInterceptor(unknownfields.StreamServerInterceptor()),
 	)
 	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, service)
 	ateenvv1alpha.RegisterProcessServiceServer(grpcServer, service)
@@ -549,11 +550,11 @@ func TestClientAuthToken(t *testing.T) {
 		grpc.ChainUnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 			record(ctx, info.FullMethod)
 			return handler(ctx, req)
-		}, auth.UnaryInterceptor(), apiservice.RejectUnknownFieldsUnaryInterceptor()),
+		}, auth.UnaryInterceptor(), unknownfields.UnaryServerInterceptor()),
 		grpc.ChainStreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 			record(ss.Context(), info.FullMethod)
 			return handler(srv, ss)
-		}, auth.StreamInterceptor(), apiservice.RejectUnknownFieldsStreamInterceptor()),
+		}, auth.StreamInterceptor(), unknownfields.StreamServerInterceptor()),
 	)
 	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, service)
 	ateenvv1alpha.RegisterProcessServiceServer(grpcServer, service)

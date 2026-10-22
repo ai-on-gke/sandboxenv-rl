@@ -77,6 +77,11 @@ must be glibc 2.31 or newer: Debian 11, Ubuntu 20.04, RHEL 9 and later work; Alp
 answers `/health` in about 3.5 s instead of 6.5 s (arm64, local Docker). The layer is about 250 MB
 compressed and 900 MB on disk.
 
+For benchmarks: the layer goes through atelet's image cache like any image. A node pulls it once and
+shares it among all task images on the base. The cache evicts images that no live actor mounts, thus on
+a run that churns many task images the layer can be evicted and pulled again on the same node. A slow
+first command then comes from the layer pull, not from the task image.
+
 The dependency set is hash-locked: [`layer/requirements.txt`](layer/requirements.txt) (the agent-server and
 everything it pulls in, the same for linux/amd64 and linux/arm64) and
 [`layer/build-constraints.txt`](layer/build-constraints.txt) (setuptools, to build the one source-only
@@ -125,19 +130,33 @@ caller.
 | `working_dir` | `/workspace` (created) | where commands run; `/testbed` on SWE-bench images | `working_dir` |
 | `api_key` | none | the agent-server's session key | `api_key` |
 | `create_timeout` | `600` | seconds for the create (a new image pulls and snapshots) | `sandbox_ready_timeout` |
-| `health_check_timeout` | `120` | seconds for `/health` | `health_check_timeout` |
+| `health_check_timeout` | `600` | seconds for `/health`; the first use of a task image on a cluster bakes its golden snapshot and pulls the image (minutes for a large image), later uses take seconds | `health_check_timeout` |
 | `delete_on_exit` | created: yes, attached: no | delete in `cleanup()` | always deletes the claim |
 
 - `pause()` suspends the environment; its filesystem stays in Substrate's snapshot.
   `resume()` waits for `/health`, which also wakes it; any request wakes it as well. The host does
-  not change, unlike a port-forward.
+  not change, unlike a port-forward. To park an environment between agent turns, close the
+  conversation first and reattach it after `resume()`; the agent-server keeps the conversation:
+
+  ```python
+  conversation_id = conversation.state.id
+  conversation.close()  # stops the event WebSocket
+  ws.pause()
+  ...
+  ws.resume()
+  conversation = Conversation(agent=agent, workspace=ws, conversation_id=conversation_id)
+  ```
 - `port_url(port)` is the proxy URL of another port in the same environment. A request to it from
   outside the SDK adds `proxy_headers()` (empty without `api_token`).
 - A rejected session key fails the constructor with `PermissionError`; a version difference between
   `openhands-sdk` and the agent-server is logged as a warning.
 - The health wait stops at once on an answer that waiting cannot change: 401 or 403 from the proxy
   (`PermissionError`: a missing or wrong `api_token`, or a refused origin), 400 (`ValueError`: the
-  proxy refused the port or the id), and 404 when the environment no longer exists.
+  proxy refused the port or the id), and 404 when the environment no longer exists. One attempt can
+  wait for the rest of `health_check_timeout`, because the proxy holds a request while the
+  environment wakes (ate-env-api's `--wake-budget`).
+- A 401 or 403 from the port proxy in the session-key check names `api_token`, not the session key,
+  for example when the token changes after the health wait.
 - Only the workspace that created or attached the environment deletes it. A failed constructor
   deletes only what it created, a `model_copy()` never deletes and opens its own HTTP client, and
   `__del__` does nothing during interpreter shutdown. A create that fails ambiguously (a timeout,
@@ -247,10 +266,16 @@ GKE with gVisor workers, Substrate from 2026-10-12, ate-env-api with the port pr
   header option in the SDK.
 - With a live `RemoteConversation`, `pause()` does not keep the environment suspended: the suspend
   breaks the event WebSocket, the SDK reconnects after about a second, and the proxy wakes the
-  environment for that request. Close the conversation before `pause()`.
+  environment for that request. Thus a paused environment with a live conversation is a running
+  actor, and it costs a worker. Close the conversation before `pause()` (see `pause()` above). The
+  follow-up is in the OpenHands SDK: hold or close the event stream across a pause.
 
-- One API key per template: it is in the template's environment, readable by anyone who can read
-  templates, and shared by the templates derived from it.
+- One API key per template, and in practice one per atespace: the key is in the template's container
+  environment. Each viewer of the atespace can read it with `GetActorTemplate`, and each template
+  derived per task image copies it. Substrate's `EnvVar` has a name and a value only: logs redact
+  the value, reads do not, and a template cannot refer to a secret. Use a dedicated atespace for
+  these environments. The follow-up is a request to Substrate: a template field that uses its
+  credential-provider path to inject the key out of band.
 - The agent-server runs as the image's user and keeps its state under that user's home. The first
   environment on a node pulls the layer.
 - A daemon reached through ate-env-api must listen on all interfaces, not 127.0.0.1: the router

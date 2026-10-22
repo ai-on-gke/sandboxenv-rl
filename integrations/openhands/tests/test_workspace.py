@@ -443,3 +443,30 @@ def test_a_conversation_runs_through_the_port_proxy(stack, tmp_path):
             conversation.close()
     assert any(p["headers"].get("Upgrade", "").lower() == "websocket" for p in state.proxied), (
         "the event stream went through the proxy as a WebSocket")
+
+
+def test_a_closed_conversation_lets_the_environment_stay_parked(stack, tmp_path):
+    """The park pattern: close the conversation, pause, resume, reattach by id."""
+    pytest.importorskip("openhands.tools")
+    from openhands.sdk import LLM, Conversation
+    from openhands.tools.preset.default import get_default_agent
+    from pydantic import SecretStr
+
+    api_url, state = stack
+    llm = LLM(usage_id="agent", model="openai/unused", api_key=SecretStr("x"),
+              base_url="http://127.0.0.1:9")  # never called: the conversation is not run
+    agent = get_default_agent(llm=llm, cli_mode=True)
+    with make(api_url, state, tmp_path) as ws:
+        conversation = Conversation(agent=agent, workspace=ws)
+        conversation_id = conversation.state.id
+        conversation.close()  # stops the event WebSocket; the agent-server keeps the conversation
+        ws.pause()
+        wakes = state.wakes
+        time.sleep(2.5)  # longer than the SDK's WebSocket reconnect delay
+        assert state.wakes == wakes, "nothing woke the parked environment"
+        ws.resume()
+        again = Conversation(agent=agent, workspace=ws, conversation_id=conversation_id)
+        try:
+            assert again.state.id == conversation_id
+        finally:
+            again.close()

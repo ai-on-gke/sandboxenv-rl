@@ -463,7 +463,11 @@ class AteEnvWorkspace(RemoteWorkspace):
         Close any ``RemoteConversation`` on this workspace first. A live one
         keeps its event WebSocket: the suspend breaks it, the SDK reconnects
         after about a second, and the proxy wakes the environment for that
-        request, thus it does not stay suspended.
+        request, thus it does not stay suspended and keeps a worker. To park
+        between agent turns, close the conversation, call pause(), and after
+        resume() reattach it with
+        ``Conversation(agent=..., workspace=self, conversation_id=...)``; the
+        agent-server keeps the conversation.
         """
         if self.env_id is None or self._deleted:
             raise RuntimeError("Cannot pause: no active environment")

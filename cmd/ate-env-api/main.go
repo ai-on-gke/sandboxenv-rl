@@ -30,6 +30,7 @@ import (
 
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/ate"
+	"github.com/agent-substrate/env/internal/hostcheck"
 	"github.com/agent-substrate/env/internal/mcp"
 	"github.com/agent-substrate/env/internal/portproxy"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
@@ -62,8 +63,14 @@ func main() {
 		authTokenFile     = flag.String("auth-token-file", "", "file with a bearer token required from gRPC, MCP and port-proxy callers; re-read when the file changes")
 		wakeBudget        = flag.Duration("wake-budget", apiservice.DefaultWakeBudget, "how long a guest call or a port-proxy request waits for a suspended environment to wake before failing; cold image pulls and cross-region snapshot reads exceed the router's own parking budget")
 		wakeRunningBudget = flag.Duration("wake-running-budget", apiservice.DefaultWakeRunningBudget, "how long a guest call waits when the environment is already RUNNING but the router still answers Unavailable (guest not yet listening vs. path down)")
+		allowedHosts      = flag.String("allowed-hosts", "", "comma-separated host names that HTTP/1.x callers may send in the Host header, next to IP addresses, localhost and names under .localhost, which are always allowed; a leading *. allows the names below it. Other names get 403, which blocks DNS rebinding against the listener, the MCP endpoint and the port proxy. gRPC (h2c) is not checked")
 	)
 	flag.Parse()
+
+	hosts, err := hostcheck.New(hostcheck.ParseList(*allowedHosts))
+	if err != nil {
+		log.Fatalf("--allowed-hosts: %v", err)
+	}
 
 	var callerAuth *apiservice.BearerAuth
 	if *authTokenFile != "" {
@@ -163,9 +170,11 @@ func main() {
 	protocols.SetHTTP1(true)
 	protocols.SetUnencryptedHTTP2(true)
 
+	// The Host check covers every HTTP/1.x route: /healthz, MCP and both port
+	// proxy forms.
 	srv := &http.Server{
 		Addr:      *listen,
-		Handler:   handler,
+		Handler:   hosts.Wrap(handler),
 		Protocols: &protocols,
 	}
 

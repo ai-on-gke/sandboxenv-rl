@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/agent-substrate/env/internal/apiservice"
+	"github.com/agent-substrate/env/internal/hostcheck"
 	"github.com/spf13/cobra"
 	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
@@ -94,6 +95,17 @@ type manifestConfig struct {
 	apiReplicas     int32
 	apiPort         int32
 	authTokenSecret string
+	// allowedHosts are host names, next to the Service's in-cluster names,
+	// that HTTP/1.x callers may send to ate-env-api (its -allowed-hosts).
+	allowedHosts []string
+}
+
+// apiAllowedHosts returns the -allowed-hosts value for ate-env-api: the
+// in-cluster names of its Service, then cfg.allowedHosts. Callers that use an
+// IP address or localhost (a port-forward) need no entry.
+func apiAllowedHosts(cfg manifestConfig) []string {
+	svc := apiName + "." + cfg.namespace
+	return append([]string{apiName, svc, svc + ".svc", svc + ".svc.cluster.local"}, cfg.allowedHosts...)
 }
 
 func (c *manifestConfig) resolveImages() error {
@@ -287,6 +299,9 @@ the "template" subcommand: ate-env manifest template`,
 			if err := mCfg.resolveImages(); err != nil {
 				return err
 			}
+			if _, err := hostcheck.New(mCfg.allowedHosts); err != nil {
+				return fmt.Errorf("--api-allowed-hosts: %w", err)
+			}
 			return writeManifests(cmd.OutOrStdout(), buildManifests(mCfg))
 		},
 	}
@@ -299,6 +314,7 @@ the "template" subcommand: ate-env manifest template`,
 	cmd.Flags().Int32Var(&mCfg.apiReplicas, "api-replicas", 1, "number of API service replicas")
 	cmd.Flags().Int32Var(&mCfg.apiPort, "api-port", 7777, "port the ate-env-api service listens on")
 	cmd.Flags().StringVar(&mCfg.authTokenSecret, "auth-token-secret", "", "Kubernetes Secret name (with key 'token') to mount into ate-env-api and require as a caller bearer token")
+	cmd.Flags().StringSliceVar(&mCfg.allowedHosts, "api-allowed-hosts", nil, "extra host names that HTTP clients may use to reach ate-env-api, e.g. an internal load balancer name (a leading *. allows the names below it); the Service's in-cluster names, IP addresses and localhost are always allowed")
 	cmd.Flags().StringVar(&mCfg.workerPool, "workerpool", "", "WorkerPool name (defaults to <template>-workerpool)")
 	cmd.Flags().Int32Var(&mCfg.replicas, "replicas", 5, "number of pre-warmed worker pods")
 
@@ -678,6 +694,7 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 	args := []string{
 		"-listen", fmt.Sprintf("0.0.0.0:%d", cfg.apiPort),
 		"-ateapi-token-file=/var/run/secrets/ateapi/token",
+		"-allowed-hosts=" + strings.Join(apiAllowedHosts(cfg), ","),
 	}
 	mounts := []corev1.VolumeMount{{
 		Name:      "ateapi-token",

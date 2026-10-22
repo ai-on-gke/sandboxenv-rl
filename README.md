@@ -11,15 +11,17 @@ driven remotely through a gRPC API, a CLI, a Python fleet SDK or MCP.
 RL jobs create many environments per step and leave most of them idle while the model generates.
 Substrate fits that shape. A suspended environment lives as a snapshot and holds no worker, and the
 next command resumes it, thus a job can park its environments between steps. Later environments on
-the same image restore a golden snapshot instead of booting. This repo adds the environment API, the fleet SDK, the framework integrations and the
-benchmarks on top.
+the same image restore a golden snapshot instead of booting. This repo adds the environment API,
+the fleet SDK, the framework integrations and the benchmarks on top.
 
 ## What changed
 
 This repo started in October 2026 as a copy of [agent-substrate/env](https://github.com/agent-substrate/env),
 with its history, its pull requests (recreated here with an `[env#N]` title prefix) and its open
-issues. agent-substrate/env is being repurposed, and the RL work continues here. The Go module path
-is still `github.com/agent-substrate/env`.
+issues. agent-substrate/env is being repurposed, and the RL work continues here. The components keep
+their ate-env names: the `ate-env`, `ate-env-api` and `ate-env-guest` binaries and images, the
+`ate_env` Python package and the `ateenv.v1alpha` API. The Go module path is still
+`github.com/agent-substrate/env`.
 
 The focus moves from a general environment service to RL training and evaluation:
 
@@ -85,8 +87,8 @@ what each phase cost.
 
 You need a cluster with Agent Substrate at or after
 [`0443aec3`](https://github.com/agent-substrate/substrate/commit/0443aec3), a snapshots bucket,
-`kubectl` with `kubectl-ate`, Go and [ko](https://ko.build). This repo publishes no release binaries
-or images yet, thus build them:
+`kubectl` with `kubectl-ate`, Go, [ko](https://ko.build), and Python 3.10 or later for the SDK. This
+repo publishes no release binaries or images yet, thus build them:
 
 ```bash
 git clone https://github.com/ai-on-gke/sandboxenv-rl && cd sandboxenv-rl
@@ -138,7 +140,8 @@ installed and a snapshots bucket. ate-env is built against Substrate
 [`0443aec3`](https://github.com/agent-substrate/substrate/commit/0443aec3) (2026-10-17): from that
 commit the WorkerPool alone chooses the sandbox (`spec.sandboxClasses`), the ActorTemplate names
 none, and Substrate rejects a template that still sends `sandboxConfig`, while an older Substrate
-requires one. Use an ate-env from before this bump with an older Substrate. Because the template no
+requires one. With an older Substrate, use ate-env from before the Substrate bump (merge commit
+`a21ead9`). Because the template no
 longer names a class, an actor booting without a snapshot can land on any pool whose labels its
 template's `workerSelector` matches, and on any pool at all without a selector. `ate-env` labels its
 WorkerPool `ate-env/workerpool: <pool>` and each template selects that label, thus actors stay on
@@ -161,10 +164,11 @@ When you upgrade an existing cluster across these changes:
 - Create the atespace and the access policy (step 1) before you apply the new manifest. Without them
   `ate-env-api` fails at startup with `PermissionDenied` while it checks the default atespace.
 - Base templates registered before keep working, because Substrate keeps their old `sandboxConfig`
-  as an unknown field and drops it when it reads them, but they have no `workerSelector`. On a cluster with more than one
-  WorkerPool, register them again (delete the base and its `<base>-<12 hex digits>` derived
-  templates, then `ate-env manifest template`), or their actors can boot on another pool. Apply the
-  new manifest first, so the pool carries the label the templates select.
+  as an unknown field and drops it when it reads them, but they have no `workerSelector`. On a
+  cluster with more than one WorkerPool, register them again (delete the base and its
+  `<base>-<12 hex digits>` derived templates, then `ate-env manifest template`), or their actors
+  can boot on another pool. Apply the new manifest first, so the pool carries the label the
+  templates select.
 - A base registered before the CPU and memory limits (Substrate before
   [`c58f374a`](https://github.com/agent-substrate/substrate/commit/c58f374a)) still needs registering
   again: Substrate cannot update an ActorTemplate in place, thus each template `ate-env-api` derives
@@ -192,8 +196,9 @@ Deploy the namespace, worker pool, ServiceAccount and API service:
 # --api-image is the ate-env-api image that `make images` printed. The worker
 # image is ateworker-gvisor from the Substrate repo at your cluster's version; in
 # that checkout, `go run ./cmd/ate-setup publish worker-images` pushes the worker
-# images and prints their digest-pinned refs. Use the digest: a :latest tag is whatever was
-# built last, and a stale worker image registers workers with no capacity.
+# images and prints their digest-pinned refs. Use the digest: a :latest tag is
+# whatever was built last, and a stale worker image registers workers with no
+# capacity.
 ate-env manifest \
   --api-image      <registry>/ate-env-api@sha256:<digest> \
   --worker-image   <registry>/ateworker-gvisor@sha256:<digest> | kubectl apply -f -
@@ -210,9 +215,9 @@ does not set them, thus add them to the Deployment's arguments to change them.
 
 ### 2. Register the ActorTemplate in Substrate
 
-Substrate manages ActorTemplates directly in its control plane rather than Kubernetes CRDs. Use `ate-env manifest template` to generate the Substrate ActorTemplate manifest:
-
-Templates live in the `ate-env` atespace that step 1 creates.
+Substrate manages ActorTemplates directly in its control plane rather than Kubernetes CRDs, and the
+templates live in the `ate-env` atespace that step 1 creates. Use `ate-env manifest template` to
+generate the Substrate ActorTemplate manifest:
 
 ```bash
 # --guest-image is the ate-env-guest image that `make images` printed.

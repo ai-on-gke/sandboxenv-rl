@@ -41,6 +41,7 @@ package portproxy
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -104,8 +105,14 @@ const guestPort = 80
 
 // Options configures a Proxy.
 type Options struct {
-	// ConnectAddr is the router's plaintext CONNECT listener, host:port.
+	// ConnectAddr is the router's CONNECT listener, host:port: the TLS one
+	// (8444) with TLS set, else the plaintext one that only a Substrate
+	// before v0.6.0 serves.
 	ConnectAddr string
+	// TLS, when set, wraps each connection to ConnectAddr in TLS with it: the
+	// pod identity certificate and the router's trust bundle (see
+	// internal/routertls). The CONNECT and the tunnel are unchanged inside.
+	TLS *tls.Config
 	// HostSuffix is the router's actor host suffix; the CONNECT authority is
 	// <id>.<suffix>:<port>. The router reads only the port from it.
 	HostSuffix string
@@ -463,6 +470,14 @@ func (p *Proxy) connect(ctx context.Context, id, atespace, portStr string) (net.
 	conn, err := d.DialContext(ctx, "tcp", p.opts.ConnectAddr)
 	if err != nil {
 		return nil, fmt.Errorf("dialing the router's CONNECT listener %s: %w", p.opts.ConnectAddr, err)
+	}
+	if p.opts.TLS != nil {
+		tc := tls.Client(conn, p.opts.TLS.Clone())
+		if err := tc.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("TLS handshake with the router's CONNECT listener %s: %w", p.opts.ConnectAddr, err)
+		}
+		conn = tc
 	}
 	// A context that ends mid-handshake unblocks the write or read below.
 	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })

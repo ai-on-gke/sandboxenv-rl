@@ -16,14 +16,22 @@ package ate_test
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/internaltest/fakecontrol"
 	"github.com/agent-substrate/env/internal/internaltest/fakerouter"
+	"github.com/agent-substrate/env/internal/internaltest/testcerts"
+	"github.com/agent-substrate/env/internal/routertls"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 type fixture struct {
@@ -165,5 +173,63 @@ func TestCreateRequiresTemplate(t *testing.T) {
 
 	if err := client.Create(context.Background(), ate.CreateOptions{ID: "sb-x"}); err == nil {
 		t.Fatal("Create without template succeeded, want error")
+	}
+}
+
+// The guest's gRPC goes to the router's HTTPS listener since Substrate
+// v0.6.0: the client presents the pod identity certificate over h2.
+func TestDialGuestOverTLS(t *testing.T) {
+	control := fakecontrol.New()
+	controlAddr, stopControl, err := control.Serve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(stopControl)
+	ca := testcerts.NewAuthority(t, "test podcert")
+	router := fakerouter.New()
+	router.Register("env1", grpc.NewServer()) // no services: any RPC answers Unimplemented
+	addr, stop := router.ServeTLS(&tls.Config{
+		Certificates: []tls.Certificate{ca.Server(t, "atenet-router.ate-system.svc")},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    ca.Pool(),
+	})
+	t.Cleanup(stop)
+	dir := t.TempDir()
+	cfg, err := routertls.Options{
+		CredentialBundleFile: testcerts.WriteFile(t, dir, "bundle.pem", ca.ClientBundle(t, routertls.SPIFFEID("ate-env", "ate-env-api"))),
+		TrustBundleFile:      testcerts.WriteFile(t, dir, "trust.pem", ca.PEM),
+		ServerName:           "atenet-router.ate-system.svc",
+	}.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := ate.New(ate.Options{ControlAddr: controlAddr, RouterAddr: addr, SkipVerify: true, RouterTLS: cfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	conn, err := client.DialGuest("ate-env", "env1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = conn.Invoke(ctx, "/ateenv.test.Nothing/Ping", &emptypb.Empty{}, &emptypb.Empty{})
+	if status.Code(err) != codes.Unimplemented {
+		t.Fatalf("RPC through the TLS router: %v, want Unimplemented from the guest's gRPC server", err)
+	}
+
+	// Without the certificate the handshake is refused.
+	plain, err := ate.New(ate.Options{ControlAddr: controlAddr, RouterAddr: addr, SkipVerify: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { plain.Close() })
+	conn2, err := plain.DialGuest("ate-env", "env1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn2.Invoke(ctx, "/ateenv.test.Nothing/Ping", &emptypb.Empty{}, &emptypb.Empty{}); err == nil || status.Code(err) == codes.Unimplemented {
+		t.Fatalf("plaintext to a TLS router: %v, want a transport error", err)
 	}
 }

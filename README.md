@@ -32,7 +32,7 @@ The focus moves from a general environment service to RL training and evaluation
 | Daemons inside an environment | A port proxy on `ate-env-api` reaches any port in an environment by header or by path, WebSockets included ([details](#reaching-a-service-inside-an-environment)). |
 | Framework integrations | A [NeMo Gym](integrations/nemo-gym/README.md) sandbox provider and a [GRPO](examples/grpo/README.md) training loop on TRL. |
 | Benchmarks | A [SWE-bench Verified loader](benchmarking/swebench/README.md) that drives real task images the way an RL job does, and the [design](internal/benchmarking/DESIGN.md) of the benchmark system. |
-| Platform | Built against Substrate `v0.6.0` (actor limits are integer millicores and bytes): the WorkerPool chooses the sandbox, each template selects its pool by label, suspends are durable, and `ate-env-api` runs as its own identity under Substrate authorization. The guest runs as a PID 1 init that reaps orphans, and it allocates PTYs. The control plane must run v0.6.0 or later: the release renumbered proto fields env reads and writes, so an older control plane cannot serve this build. v0.6.0 also serves the router only over TLS; the stacked change makes `ate-env-api` present its pod identity certificate, and the two merge together. |
+| Platform | Built against Substrate `v0.6.0` (actor limits are integer millicores and bytes): the WorkerPool chooses the sandbox, each template selects its pool by label, suspends are durable, and `ate-env-api` runs as its own identity under Substrate authorization. The guest runs as a PID 1 init that reaps orphans, and it allocates PTYs. The control plane must run v0.6.0 or later: the release renumbered proto fields env reads and writes, so an older control plane cannot serve this build. `ate-env-api` reaches actors through the router's TLS listeners with its pod identity certificate (`ate-env manifest --api-router-tls`, on by default), so the install must list `spiffe://cluster.local/ns/ate-env/sa/ate-env-api` in the router's ingress allow-list. |
 
 ## Architecture
 
@@ -188,6 +188,18 @@ An atespace has one access policy. If `ate-env` already has one, add the binding
 `ate-env manifest access-policy` prints to it with `kubectl ate get access-policy` and
 `kubectl ate update access-policy`. Repeat both commands for each other atespace you create
 environments in.
+
+Since Substrate v0.6.0 the atenet router serves only TLS listeners and admits
+only clients whose SPIFFE ID is on its allow-list. The manifest mounts the pod
+identity certificate and the servicedns trust bundle into `ate-env-api` for
+that (`--api-router-tls`, on by default; it needs the PodCertificate
+projected volume, Kubernetes 1.34 or newer, which Substrate's installer
+already requires). The API's identity is
+`spiffe://cluster.local/ns/<namespace>/sa/ate-env-api`; give it to the
+Substrate install (`ATE_INGRESS_ALLOWED_SPIFFE_IDS` for cmd/ate-setup) or the
+router refuses every tunnel with a TLS error. `ate-env manifest` prints the
+exact ID. For a control plane that still serves the plaintext listeners, pass
+`--api-router-tls=false`.
 
 Deploy the namespace, worker pool, ServiceAccount and API service:
 
@@ -488,7 +500,10 @@ MCP endpoint included.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--atenet-connect` | `atenet-router.ate-system.svc.cluster.local:8081` | The router's CONNECT listener. An empty value turns the forwarding off. |
+| `--atenet-connect` | `atenet-router.ate-system.svc.cluster.local:8081`, or `:8444` with `--atenet-client-cert` | The router's CONNECT listener. An empty value turns the forwarding off. |
+| `--atenet-client-cert` | none | PEM credential bundle presented to the router's TLS listeners: the pod identity bundle the kubelet projects. With it, `--atenet` and `--atenet-connect` default to the TLS ports (443 and 8444), which are the only ones Substrate v0.6.0 serves. Re-read at every handshake. |
+| `--atenet-ca-file` | none | PEM trust bundle that signs the router's serving certificate, the servicedns bundle. Required with `--atenet-client-cert`; re-read at every handshake. |
+| `--atenet-server-name` | `atenet-router.ate-system.svc` | Name the router's serving certificate must carry. |
 | `--port-proxy-trusted-origins` | none | Comma-separated browser origins allowed to use the path form. |
 | `--port-proxy-response-header-timeout` | `0`, no limit | Bound on the wait for a daemon's response headers. Without it, the caller's deadline ends the wait. |
 

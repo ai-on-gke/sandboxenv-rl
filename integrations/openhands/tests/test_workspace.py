@@ -137,6 +137,30 @@ def test_health_waits_through_a_booting_environment(stack, tmp_path):
     assert state.unhealthy_polls == 0, "the three 503s were waited out"
 
 
+def test_a_health_attempt_can_wait_for_the_whole_remaining_budget(stack, tmp_path,
+                                                                  monkeypatch):
+    api_url, state = stack
+    import ate_env_openhands.workspace as wsmod
+
+    seen: list = []
+    real_get = httpx.get
+
+    def recording_get(url, **kw):
+        seen.append(kw["timeout"])
+        return real_get(url, **kw)
+
+    monkeypatch.setattr(wsmod.httpx, "get", recording_get)
+    with make(api_url, state, tmp_path, health_check_timeout=100):
+        pass
+    assert seen, "the health wait made a request"
+    # Not capped at 30 s: the proxy holds a request while the actor wakes.
+    assert seen[0].read > 90 and seen[0].connect <= 10
+
+
+def test_health_check_timeout_defaults_to_a_first_use_budget():
+    assert AteEnvWorkspace.model_fields["health_check_timeout"].default >= 300
+
+
 def test_health_timeout_deletes_the_environment(no_finalizer, tmp_path):
     with serve(FakeAteEnv()) as (api_url, state):  # nothing listens on the port
         with pytest.raises(RuntimeError, match="did not answer /health.*502"):

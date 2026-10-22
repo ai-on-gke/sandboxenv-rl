@@ -199,9 +199,13 @@ class AteEnvWorkspace(RemoteWorkspace):
         "snapshots first).",
     )
     health_check_timeout: float = Field(
-        default=120.0,
+        default=600.0,
         gt=0.0,
-        description="Seconds to wait for the agent-server's /health through the proxy.",
+        description="Seconds to wait for the agent-server's /health through the proxy. "
+        "The first use of a task image on a cluster bakes its golden snapshot and then "
+        "pulls the image onto the node, minutes for a large image; later uses take "
+        "seconds. Answers that waiting cannot change (400, 401, 403, and 404 for a "
+        "deleted environment) stop the wait at once.",
     )
     delete_on_exit: bool | None = Field(
         default=None,
@@ -366,8 +370,13 @@ class AteEnvWorkspace(RemoteWorkspace):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
+            # One attempt can wait for the rest of the budget: the proxy holds
+            # a request while the environment wakes (its --wake-budget), and a
+            # shorter client timeout would cut a cold start and restart it.
+            budget = max(remaining, 1.0)
             try:
-                resp = httpx.get(url, headers=headers, timeout=min(30.0, max(remaining, 1.0)))
+                resp = httpx.get(url, headers=headers,
+                                 timeout=httpx.Timeout(budget, connect=min(10.0, budget)))
             except httpx.HTTPError as exc:
                 last = f"{type(exc).__name__}: {exc}"
             else:

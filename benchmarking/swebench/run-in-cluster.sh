@@ -27,13 +27,16 @@
 # RUN_ID must be a DNS label (lowercase letters, digits, '-', at most 20
 # characters). Results land in ./RUN_ID.jsonl and ./RUN_ID.json in the
 # directory the script is run from, which can be outside the repository.
-# NAMESPACE defaults to ate-env; START_TIMEOUT (seconds, default 600) bounds
-# the wait for the pod to start. A failed kubectl call while waiting for the
-# loader's exit code is retried; only a pod that is gone (NotFound) or Failed
-# ends the wait early. If the script is killed before its trap runs, the Job
-# ends by itself after 48 hours (activeDeadlineSeconds) and is removed an hour
-# after it finishes; Ctrl-C runs the trap and deletes the Job at once, results
-# included.
+# NAMESPACE defaults to ate-env; CONTEXT selects the kubectl context (default
+# the current one), so one shell can drive the same run on several clusters
+# in turn: put the cluster in RUN_ID and compare the events files with
+# `swebench-loader report a.jsonl b.jsonl`. START_TIMEOUT (seconds, default
+# 600) bounds the wait for the pod to start. A failed kubectl call while
+# waiting for the loader's exit code is retried; only a pod that is gone
+# (NotFound) or Failed ends the wait early. If the script is killed before
+# its trap runs, the Job ends by itself after 48 hours (activeDeadlineSeconds)
+# and is removed an hour after it finishes; Ctrl-C runs the trap and deletes
+# the Job at once, results included.
 
 set -o errexit -o nounset -o pipefail
 
@@ -45,7 +48,12 @@ RUN_ID="$1"
 DATASET="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
 shift 2
 NS="${NAMESPACE:-ate-env}"
+CONTEXT="${CONTEXT:-}"
 START_TIMEOUT="${START_TIMEOUT:-600}"
+# Every kubectl call goes through kc so CONTEXT applies to all of them. The
+# context in use is logged so each run's log names its cluster.
+kc() { kubectl ${CONTEXT:+--context "${CONTEXT}"} "$@"; }
+echo "kubectl context ${CONTEXT:-$(kubectl config current-context 2>/dev/null || echo unknown)}"
 : "${KO_DOCKER_REPO:?set KO_DOCKER_REPO to the registry path the cluster can pull from}"
 [[ "${RUN_ID}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ && ${#RUN_ID} -le 20 ]] || { echo "RUN_ID must be a DNS label of at most 20 characters" >&2; exit 2; }
 [[ -f "${DATASET}" ]] || { echo "dataset ${DATASET} not found" >&2; exit 2; }
@@ -74,14 +82,14 @@ ARGS_JSON="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' \
 KUBECTL_ERR="$(mktemp)"
 # shellcheck disable=SC2329 # invoked by the EXIT trap
 cleanup() {
-  kubectl -n "${NS}" delete job "${JOB}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  kc -n "${NS}" delete job "${JOB}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   rm -f "${KUBECTL_ERR}"
 }
 trap cleanup EXIT
 
-kubectl -n "${NS}" delete job "${JOB}" --ignore-not-found --wait=true >/dev/null
+kc -n "${NS}" delete job "${JOB}" --ignore-not-found --wait=true >/dev/null
 # busybox 1.36, pinned by digest; Docker Hub rate-limits unauthenticated pulls.
-cat <<EOF_JOB | kubectl apply -f -
+cat <<EOF_JOB | kc apply -f -
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -147,24 +155,24 @@ echo "waiting up to ${START_TIMEOUT}s for the pod"
 POD=""
 deadline=$((SECONDS + START_TIMEOUT))
 while (( SECONDS < deadline )); do
-  POD="$(kubectl -n "${NS}" get pod -l "job-name=${JOB}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-  if [[ -n "${POD}" ]] && kubectl -n "${NS}" get pod "${POD}" -o jsonpath='{.status.containerStatuses[?(@.name=="loader")].state}' 2>/dev/null | grep -q 'running\|terminated'; then
+  POD="$(kc -n "${NS}" get pod -l "job-name=${JOB}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  if [[ -n "${POD}" ]] && kc -n "${NS}" get pod "${POD}" -o jsonpath='{.status.containerStatuses[?(@.name=="loader")].state}' 2>/dev/null | grep -q 'running\|terminated'; then
     break
   fi
   sleep 5
 done
-if [[ -z "${POD}" ]] || ! kubectl -n "${NS}" get pod "${POD}" -o jsonpath='{.status.containerStatuses[?(@.name=="loader")].state}' 2>/dev/null | grep -q 'running\|terminated'; then
+if [[ -z "${POD}" ]] || ! kc -n "${NS}" get pod "${POD}" -o jsonpath='{.status.containerStatuses[?(@.name=="loader")].state}' 2>/dev/null | grep -q 'running\|terminated'; then
   echo "loader did not start within ${START_TIMEOUT}s" >&2
   if [[ -n "${POD}" ]]; then
-    kubectl -n "${NS}" describe pod "${POD}" | tail -15 >&2 || true
+    kc -n "${NS}" describe pod "${POD}" | tail -15 >&2 || true
   else
     echo "no pod was created for job ${JOB}; its events:" >&2
-    kubectl -n "${NS}" describe job "${JOB}" | tail -15 >&2 || true
+    kc -n "${NS}" describe job "${JOB}" | tail -15 >&2 || true
   fi
   exit 1
 fi
 echo "pod ${POD}; following the loader log"
-kubectl -n "${NS}" logs -f "${POD}" -c loader || true
+kc -n "${NS}" logs -f "${POD}" -c loader || true
 
 # The log stream can end before the container does (or drop with the
 # connection); wait for the exit code, with the pod's own state as the
@@ -172,8 +180,8 @@ kubectl -n "${NS}" logs -f "${POD}" -c loader || true
 # means gone, and other errors are retried, MAX_API_ERRORS times in a row.
 MAX_API_ERRORS="${MAX_API_ERRORS:-30}"
 api_errors=0
-until EXIT="$(kubectl -n "${NS}" get pod "${POD}" -o jsonpath='{.status.containerStatuses[?(@.name=="loader")].state.terminated.exitCode}' 2>/dev/null)" && [[ -n "${EXIT}" ]]; do
-  if PHASE="$(kubectl -n "${NS}" get pod "${POD}" -o jsonpath='{.status.phase}' 2>"${KUBECTL_ERR}")"; then
+until EXIT="$(kc -n "${NS}" get pod "${POD}" -o jsonpath='{.status.containerStatuses[?(@.name=="loader")].state.terminated.exitCode}' 2>/dev/null)" && [[ -n "${EXIT}" ]]; do
+  if PHASE="$(kc -n "${NS}" get pod "${POD}" -o jsonpath='{.status.phase}' 2>"${KUBECTL_ERR}")"; then
     api_errors=0
   elif grep -q 'NotFound' "${KUBECTL_ERR}"; then
     PHASE=gone
@@ -193,7 +201,7 @@ until EXIT="$(kubectl -n "${NS}" get pod "${POD}" -o jsonpath='{.status.containe
   sleep 10
 done
 echo "loader exit code ${EXIT}"
-if ! kubectl -n "${NS}" cp -c keep "${POD}:/work/${RUN_ID}.jsonl" "${OUT_DIR}/${RUN_ID}.jsonl"; then
+if ! kc -n "${NS}" cp -c keep "${POD}:/work/${RUN_ID}.jsonl" "${OUT_DIR}/${RUN_ID}.jsonl"; then
   echo "no events file to copy; the loader exited before writing it" >&2
   exit "$(( EXIT == 0 ? 1 : EXIT ))"
 fi

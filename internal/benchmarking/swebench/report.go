@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"path/filepath"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -314,4 +315,135 @@ func (rep *Report) WriteText(w io.Writer) {
 			fmt.Fprintf(w, "  %5d  %s\n", e.Count, msg)
 		}
 	}
+}
+
+// WriteComparison prints several runs side by side, one column per run: the
+// header figures, then every event in the order it first appears, then the
+// per-step figures when a run has steps. It is the table for the same
+// workload on different clusters or builds. names are the files the reports
+// came from; a column is headed by its run id unless that is empty or shared
+// with another column, in which case the file name is used.
+func WriteComparison(w io.Writer, reps []*Report, names []string) {
+	labels := columnLabels(reps, names)
+	fmt.Fprintln(w, "cells: p50/p95 ms n=count [f=failed r=retried]; steps: live tasks [f=failed] barrier_s/park_s wake p50/p95 ms")
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	row := func(label string, cell func(*Report) string) {
+		fmt.Fprint(tw, label)
+		for _, r := range reps {
+			fmt.Fprintf(tw, "\t%s", cell(r))
+		}
+		fmt.Fprintln(tw)
+	}
+	fmt.Fprint(tw, "run")
+	for _, l := range labels {
+		fmt.Fprintf(tw, "\t%s", l)
+	}
+	fmt.Fprintln(tw)
+	row("mode", func(r *Report) string { return r.Mode })
+	row("tasks", func(r *Report) string { return fmt.Sprintf("%d", r.Tasks) })
+	row("failed", func(r *Report) string { return fmt.Sprintf("%d", r.Failed) })
+	row("reward_rate", func(r *Report) string { return fmt.Sprintf("%.3f", r.RewardRate) })
+	row("run_s", func(r *Report) string { return fmt.Sprintf("%.1f", r.RunMS/1000) })
+
+	type key struct{ event, name string }
+	var order []key
+	seen := map[key]bool{}
+	for _, r := range reps {
+		for _, s := range r.Stats {
+			k := key{s.Event, s.Name}
+			if !seen[k] {
+				seen[k] = true
+				order = append(order, k)
+			}
+		}
+	}
+	for _, k := range order {
+		label := k.event
+		if k.name != "" {
+			label += " " + k.name
+		}
+		row(label, func(r *Report) string {
+			for _, s := range r.Stats {
+				if s.Event != k.event || s.Name != k.name {
+					continue
+				}
+				cell := fmt.Sprintf("%.0f/%.0f n=%d", s.P50MS, s.P95MS, s.Count)
+				if s.Count == s.Failed {
+					// No call succeeded: there is no latency to show.
+					cell = fmt.Sprintf("-/- n=%d", s.Count)
+				}
+				if s.Failed > 0 {
+					cell += fmt.Sprintf(" f=%d", s.Failed)
+				}
+				if s.Retried > 0 {
+					cell += fmt.Sprintf(" r=%d", s.Retried)
+				}
+				return cell
+			}
+			return "-"
+		})
+	}
+
+	last := 0
+	for _, r := range reps {
+		for _, s := range r.Steps {
+			if s.Step > last {
+				last = s.Step
+			}
+		}
+	}
+	for n := 1; n <= last; n++ {
+		row(fmt.Sprintf("step %d", n), func(r *Report) string {
+			for _, s := range r.Steps {
+				if s.Step != n {
+					continue
+				}
+				cell := fmt.Sprintf("live=%d tasks=%d", s.Live, s.Tasks)
+				if s.Failed > 0 {
+					cell += fmt.Sprintf(" f=%d", s.Failed)
+				}
+				wake := fmt.Sprintf("%.0f/%.0f", s.WakeP50MS, s.WakeP95MS)
+				if s.WakeP50MS == 0 && s.WakeP95MS == 0 {
+					wake = "-/-" // no wake in this step: the first one, or -park none
+				}
+				return cell + fmt.Sprintf(" %.1f/%.1f %s", s.BarrierMS/1000, s.ParkMS/1000, wake)
+			}
+			return "-"
+		})
+	}
+	tw.Flush()
+}
+
+// columnLabels heads each column with its run id, or with the file name when
+// the run id is empty or the same as another column's; when the file names
+// also repeat, with the full path.
+func columnLabels(reps []*Report, names []string) []string {
+	count := map[string]int{}
+	for _, r := range reps {
+		count[r.RunID]++
+	}
+	labels := make([]string, len(reps))
+	byFile := map[int]bool{}
+	for i, r := range reps {
+		labels[i] = r.RunID
+		if r.RunID != "" && count[r.RunID] == 1 {
+			continue
+		}
+		if i < len(names) && names[i] != "" {
+			labels[i] = strings.TrimSuffix(filepath.Base(names[i]), ".jsonl")
+			byFile[i] = true
+		} else {
+			labels[i] = fmt.Sprintf("run %d", i+1)
+		}
+	}
+	seen := map[string]int{}
+	for _, l := range labels {
+		seen[l]++
+	}
+	for i := range labels {
+		if byFile[i] && seen[labels[i]] > 1 {
+			labels[i] = names[i]
+		}
+	}
+	return labels
 }

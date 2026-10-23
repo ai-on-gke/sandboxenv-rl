@@ -31,6 +31,7 @@ from .config import FleetConfig
 from .fleet import SandboxFleet
 from .handle import SandboxHandle
 from .observability import Observer, RunReport, repo_family
+from .telemetry.metrics import status_of
 from .types import FleetPlan, Task
 
 logger = logging.getLogger("sandbox_sdk.async_fleet")
@@ -290,7 +291,8 @@ class AsyncSandboxFleet:
     ) -> list[Any]:
         """Execute tasks asynchronously with bounded concurrency.
 
-        The run's RunReport is available as ``fleet.report`` afterwards. It
+        The run's RunReport is available as ``fleet.report`` afterwards;
+        ``fleet.report.summary()`` gives the table (logged only at DEBUG). It
         holds the phases that run inside ``run()`` (``acquire``, ``process``,
         ``release``, and ``ensure_template`` on first use of an image).
         ``setup()`` and ``teardown()`` (``async with fleet:``) run outside
@@ -326,8 +328,8 @@ class AsyncSandboxFleet:
                         logger.error("Async execution failed for task %s: %s", task.id, e)
                         await _release(handle)
                         results[idx] = e
-                except BaseException:
-                    status = "error"
+                except BaseException as e:
+                    status = status_of(e)
                     raise
                 finally:
                     obs.task_done(backend, family, status, time.monotonic() - start)
@@ -337,5 +339,5 @@ class AsyncSandboxFleet:
             self._fleet.report = report
             report.environment = self._fleet.describe_environment(concurrency=max(1, c))
             await asyncio.gather(*(_worker(i, t) for i, t in enumerate(self.tasks)))
-        logger.info("\n%s", report.summary())
+        logger.debug("\n%s", report.summary())
         return results

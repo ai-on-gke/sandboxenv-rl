@@ -345,7 +345,7 @@ warm replicas:
 fleet = SandboxFleet(FleetConfig(backend="mock", strategy="naive"))
 fleet.load_tasks(tasks)
 fleet.run(process_fn)
-print(fleet.report.summary())          # table, same shape as agent-sandbox-rl
+print(fleet.report.summary())          # table, same shape as agent-sandbox-rl (run() logs it only at DEBUG)
 fleet.report.to_dict()                 # JSON-ready
 fleet.report.write(os.environ["REPORT_DIR"])   # <strategy>_<n>tasks_<stamp>.txt/.json
 ```
@@ -364,13 +364,20 @@ phases go to the Prometheus series and spans but not to the report. The sync
 every phase.
 
 **Prometheus** (`metrics` extra; `ObservabilityConfig.enable_metrics`).
-The default, `None`, records the series when the extra is installed and
-otherwise logs one INFO message; `True` asks for them, so a missing extra
-logs a WARNING; `False` turns them off. The fleet records
-`atefleet_phase_latency_seconds`, `atefleet_task_latency_seconds`,
-`atefleet_run_latency_seconds`, `atefleet_claims_total`,
-`atefleet_tasks_total` and `atefleet_warm_replicas`, and the client
-records `ate_env_client_{acquire,exec,suspend,wake,release}_seconds`.
+The default, `None`, records the series whenever `prometheus_client` is
+importable, whether from the `metrics` extra or another package (Ray
+installs it, so inside a Ray trainer the series are on unless you set
+`enable_metrics=False`), and otherwise logs one INFO message; `True` asks
+for them, so a missing `prometheus_client` logs a WARNING; `False` turns
+them off. The `ate_env_client_*` switch is process-global and one-way: once
+any fleet in the process enables metrics, the client histograms keep
+recording, even for a later fleet with `enable_metrics=False`. The fleet records
+`ate_env_fleet_phase_latency_seconds`, `ate_env_fleet_task_latency_seconds`,
+`ate_env_fleet_run_latency_seconds`, `ate_env_fleet_claims_total`,
+`ate_env_fleet_tasks_total` and `ate_env_fleet_warm_replicas`, and the client
+records `ate_env_client_{acquire,exec,suspend,warm_claim,release}_seconds`
+(`warm_claim` is the time to validate a warm claim; the resume itself
+happens on the first guest request, so it lands in the first `exec`).
 Collectors register on the first metrics-enabled `Observer`, never at
 import. Labels are limited to `phase`, `backend` (`substrate` or `mock`),
 `family` (the task's repo family, see `ate_env.observability.repo_family`),
@@ -380,6 +387,9 @@ tags never become labels. `family` has at most
 `ate_env.observability.MAX_FAMILIES` (64) values per process: the first 64
 repo families keep their name and later ones are reported as `other`, so a
 dataset with thousands of repos does not grow the series without limit.
+`repo_family` takes `metadata["repo"]` or parses a SWE-bench image name: set
+`metadata["repo"]` for non-SWE-bench datasets (e.g. R2E-Gym); otherwise
+their family is `unknown`.
 
 The warm-replica gauge adds up across fleets in one process: each fleet
 moves it by its own changes. A backend driver belongs to one fleet; a second
@@ -399,7 +409,7 @@ host-network pod it exposes `/metrics` to the network. A busy port raises
 `OSError` (`EADDRINUSE`), for example when two Ray workers on one node both
 call `serve_metrics(9095)`: give each process its own port. Pass
 `registry=` (a `prometheus_client.CollectorRegistry`) to `serve_metrics` and
-to `Observer` to keep the `atefleet_*` series off the global registry.
+to `Observer` to keep the `ate_env_fleet_*` series off the global registry.
 
 **Tracing** (`tracing` extra; off by default). The client emits
 OpenTelemetry spans and sends the W3C trace context to `ate-env-api`, so
@@ -429,16 +439,16 @@ Client("localhost:7777", tracer_config=TracerConfig(enable_tracing=True))  # cli
 One `fleet.run(...)` is one trace:
 
 ```
-atefleet.run
-  atefleet.acquire
+ate_env_fleet.run
+  ate_env_fleet.acquire
     ate_env_client.acquire
       ate_env_client.create_environment
-  atefleet.process
+  ate_env_fleet.process
     ate_env_client.exec
-  atefleet.release
+  ate_env_fleet.release
     ate_env_client.release
       ate_env_client.delete_environment
-  atefleet.teardown
+  ate_env_fleet.teardown
     ate_env_client.reap
 ```
 

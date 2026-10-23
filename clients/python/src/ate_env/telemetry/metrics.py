@@ -130,6 +130,8 @@ def _registered(name: str, registry: Any) -> Any:
     """The collector already registered under ``name`` (module reload), or None."""
     prom = _load_prom()
     reg = registry if registry is not None else (prom.REGISTRY if prom else None)
+    # _names_to_collectors is a private prometheus_client attribute (there is no
+    # public lookup by name). It is read only on this reload path.
     names = getattr(reg, "_names_to_collectors", {})
     for cand in (name, name + "_total", name + "_created"):
         if cand in names:
@@ -143,8 +145,7 @@ CLIENT_FAMILIES: dict[str, tuple[str, str]] = {
                 "Time for the client to acquire an environment (claim or create)"),
     "exec": ("ate_env_client_exec_seconds", "Time to run a command in an environment"),
     "suspend": ("ate_env_client_suspend_seconds", "Time to suspend an environment"),
-    "wake": ("ate_env_client_wake_seconds",
-             "Time to claim a suspended environment from the warm pool"),
+    "warm_claim": ("ate_env_client_warm_claim_seconds", "Time to validate a warm claim"),
     "release": ("ate_env_client_release_seconds",
                 "Time to release (delete or recycle) an environment"),
 }
@@ -156,6 +157,8 @@ _HISTOGRAMS: dict[str, Any] = {}
 def enable_client_metrics() -> bool:
     """Start recording ``ate_env_client_*`` timings in this process.
 
+    The switch is process-global and one-way: there is no way to turn it off,
+    so a later fleet with ``enable_metrics=False`` still records them.
     Returns False (after one warning) when prometheus_client is not installed.
     """
     global _ENABLED

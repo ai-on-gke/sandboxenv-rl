@@ -20,10 +20,11 @@ both stacks compare side by side:
 1. ``RunReport``: always on and dependency free; per-phase count, total and
    max, claims, task outcomes and warm replicas. ``fleet.report`` after
    ``fleet.run(...)``.
-2. Prometheus ``atefleet_*`` series (``metrics`` extra; on by default when the
-   extra is installed, see ``ObservabilityConfig.enable_metrics``). Collectors register on the first
-   metrics-enabled ``Observer``, never at import.
-3. OpenTelemetry ``atefleet.<phase>`` spans (``tracing`` extra; opt in with
+2. Prometheus ``ate_env_fleet_*`` series (``metrics`` extra; on by default whenever
+   prometheus_client is importable, see ``ObservabilityConfig.enable_metrics``).
+   Collectors register on the first metrics-enabled ``Observer``, never at
+   import.
+3. OpenTelemetry ``ate_env_fleet.<phase>`` spans (``tracing`` extra; opt in with
    ``enable_tracing``) through the client's provider, so ``ate_env_client.*``
    spans nest under them.
 
@@ -65,9 +66,9 @@ __all__ = ["MAX_FAMILIES", "Observer", "RunReport", "repo_family", "serve_metric
 
 logger = logging.getLogger("ate_env.observability")
 
-FLEET_SPAN_PREFIX = "atefleet"
+FLEET_SPAN_PREFIX = "ate_env_fleet"
 
-# The atefleet_* collectors on the default registry, created by _ensure_metrics
+# The ate_env_fleet_* collectors on the default registry, created by _ensure_metrics
 # on the first metrics-enabled Observer, never at import.
 PHASE_LATENCY = TASK_LATENCY = RUN_LATENCY = CLAIMS = TASKS = WARM_REPLICAS = None
 _METRICS_READY = False
@@ -80,26 +81,26 @@ def _build_collectors(prom: Any, registry: Any) -> SimpleNamespace:
     reg = {} if registry is None else {"registry": registry}
     return SimpleNamespace(
         phase_latency=_metric(
-            prom.Histogram, "atefleet_phase_latency_seconds", "Fleet phase latency",
+            prom.Histogram, "ate_env_fleet_phase_latency_seconds", "Fleet phase latency",
             ["phase", "backend", "family", "strategy", "status"], buckets=SEC_BUCKETS, **reg),
         task_latency=_metric(
-            prom.Histogram, "atefleet_task_latency_seconds",
+            prom.Histogram, "ate_env_fleet_task_latency_seconds",
             "Per-task acquire+process+release latency",
             ["strategy", "backend", "family", "status"], buckets=SEC_BUCKETS, **reg),
         run_latency=_metric(
-            prom.Histogram, "atefleet_run_latency_seconds", "Whole-run latency",
+            prom.Histogram, "ate_env_fleet_run_latency_seconds", "Whole-run latency",
             ["strategy", "status"], buckets=SEC_BUCKETS, **reg),
-        claims=_metric(prom.Counter, "atefleet_claims_total", "Environment claims started",
+        claims=_metric(prom.Counter, "ate_env_fleet_claims_total", "Environment claims started",
                        ["backend", "status"], **reg),
-        tasks=_metric(prom.Counter, "atefleet_tasks_total", "Tasks processed",
+        tasks=_metric(prom.Counter, "ate_env_fleet_tasks_total", "Tasks processed",
                       ["strategy", "status"], **reg),
-        warm_replicas=_metric(prom.Gauge, "atefleet_warm_replicas", "Current warm replicas",
+        warm_replicas=_metric(prom.Gauge, "ate_env_fleet_warm_replicas", "Current warm replicas",
                               ["backend"], **reg),
     )
 
 
 def _ensure_metrics(registry: Any = None) -> SimpleNamespace | None:
-    """The ``atefleet_*`` collectors for ``registry`` (default: the global one).
+    """The ``ate_env_fleet_*`` collectors for ``registry`` (default: the global one).
 
     Registers them once per registry; None (after one warning) without
     prometheus_client.
@@ -157,7 +158,9 @@ def repo_family(task_or_image: Any) -> str:
     parses a SWE-bench image name
     (``sweb.eval.x86_64.astropy__astropy-12907:latest`` -> ``astropy``); else
     ``"unknown"``. After :data:`MAX_FAMILIES` distinct families in this
-    process, any new family is ``"other"``.
+    process, any new family is ``"other"``. Only SWE-bench image names are
+    parsed: set ``metadata["repo"]`` for non-SWE-bench datasets (e.g.
+    R2E-Gym); otherwise their family is ``"unknown"``.
     """
     repo = None
     metadata = getattr(task_or_image, "metadata", None)
@@ -290,7 +293,7 @@ class Observer:
 
     One Observer belongs to one fleet, and it runs one ``run()`` at a time.
     ``registry`` selects a ``prometheus_client.CollectorRegistry`` for the
-    ``atefleet_*`` series (default: the global registry). The client's
+    ``ate_env_fleet_*`` series (default: the global registry). The client's
     ``ate_env_client_*`` histograms always use the global registry.
     """
 

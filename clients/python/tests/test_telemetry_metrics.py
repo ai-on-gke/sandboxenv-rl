@@ -29,7 +29,7 @@ FAMILIES = {
     "acquire": "ate_env_client_acquire_seconds",
     "exec": "ate_env_client_exec_seconds",
     "suspend": "ate_env_client_suspend_seconds",
-    "wake": "ate_env_client_wake_seconds",
+    "warm_claim": "ate_env_client_warm_claim_seconds",
     "release": "ate_env_client_release_seconds",
 }
 BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600)
@@ -129,5 +129,5 @@ async def test_substrate_driver_records_client_timings(fake_stack):
     await driver.release_async(inst.instance_id)
     assert count("suspend") == before["suspend"] + 1
     assert count("acquire") == before["acquire"] + 1
-    assert count("wake") == before["wake"] + 1
+    assert count("warm_claim") == before["warm_claim"] + 1
     assert count("release") == before["release"] + 1

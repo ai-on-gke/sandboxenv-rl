@@ -272,3 +272,30 @@ async def test_failed_warm_check_counts_the_put_back(fake_stack, monkeypatch):
     # The actor went back to the pool, and the count follows it.
     assert sum(len(v) for v in driver._warm_paused_pool.values()) == 1
     assert obs._warm == {"substrate": 1}
+
+
+async def test_cancelled_claim_has_status_cancelled(fake_stack, monkeypatch):
+    """A cancelled acquire counts a claim with status cancelled, not error."""
+    prom = pytest.importorskip("prometheus_client")
+    from ate_env.config import ObservabilityConfig
+    from ate_env.observability import Observer
+
+    client, _fakes = fake_stack
+    reg = prom.CollectorRegistry()
+    driver = SubstrateBackendDriver(client=client)
+    driver.observer = Observer(ObservabilityConfig(enable_metrics=True), registry=reg)
+    started = asyncio.Event()
+
+    async def slow_acquire(*args, **kwargs):
+        started.set()
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(driver, "_acquire_internal", slow_acquire)
+    acquire = asyncio.ensure_future(driver.acquire_async("tmpl", run_id="r"))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    acquire.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await acquire
+    get = reg.get_sample_value
+    assert get("ate_env_fleet_claims_total", {"backend": "substrate", "status": "cancelled"}) == 1
+    assert get("ate_env_fleet_claims_total", {"backend": "substrate", "status": "error"}) is None

@@ -110,11 +110,16 @@ class TracerConfig:
 class ObservabilityConfig:
     """Fleet observability: the always-on RunReport plus optional layers.
 
-    enable_metrics registers the ``atefleet_*`` and ``ate_env_client_*``
-    Prometheus series. The default, None, turns them on when the ``metrics``
-    extra is installed and otherwise logs one INFO message; True asks for
-    them, so a missing extra logs a WARNING; False turns them off.
-    enable_tracing emits ``atefleet.<phase>`` spans and turns on client
+    enable_metrics registers the ``ate_env_fleet_*`` and ``ate_env_client_*``
+    Prometheus series. The default, None, turns them on whenever
+    prometheus_client is importable (for example inside Ray, which installs
+    it) and otherwise logs one INFO message; True asks for them, so a missing
+    prometheus_client logs a WARNING; False turns them off. Enabling them
+    calls ``enable_client_metrics()``, which is process-global and one-way:
+    once any fleet in the process has enabled metrics, the
+    ``ate_env_client_*`` histograms keep recording, even for a later fleet
+    with enable_metrics=False.
+    enable_tracing emits ``ate_env_fleet.<phase>`` spans and turns on client
     tracing under trace_service_name (needs the ``tracing`` extra).
     Unknown fields are rejected.
     """

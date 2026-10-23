@@ -619,7 +619,7 @@ def _process(task, handle):
 
 def _assert_one_trace(finished):
     roots = [sp for sp in finished if sp.parent is None]
-    assert [r.name for r in roots] == ["atefleet.run"], [r.name for r in roots]
+    assert [r.name for r in roots] == ["ate_env_fleet.run"], [r.name for r in roots]
     assert {sp.context.trace_id for sp in finished} == {roots[0].context.trace_id}
 
 
@@ -630,20 +630,20 @@ def _assert_substrate_tree(finished, n_tasks):
     assert len(creates) == n_tasks
     for create in creates:
         assert _ancestors(create, finished) == [
-            "ate_env_client.acquire", "atefleet.acquire", "atefleet.run"
+            "ate_env_client.acquire", "ate_env_fleet.acquire", "ate_env_fleet.run"
         ]
     assert len(names["ate_env_client.exec"]) == n_tasks
     for ex in names["ate_env_client.exec"]:
-        assert _ancestors(ex, finished) == ["atefleet.process", "atefleet.run"]
+        assert _ancestors(ex, finished) == ["ate_env_fleet.process", "ate_env_fleet.run"]
         attrs = dict(ex.attributes)
         assert attrs["ate_env.command.executable"] == "echo"
         assert attrs["ate_env.exit_code"] == 0
         assert "echo hi" not in str(attrs)
     for delete in names["ate_env_client.delete_environment"]:
         assert _ancestors(delete, finished)[:3] == [
-            "ate_env_client.release", "atefleet.release", "atefleet.run"
+            "ate_env_client.release", "ate_env_fleet.release", "ate_env_fleet.run"
         ] or _ancestors(delete, finished)[:3] == [
-            "ate_env_client.reap", "atefleet.teardown", "atefleet.run"
+            "ate_env_client.reap", "ate_env_fleet.teardown", "ate_env_fleet.run"
         ]
     # Each child's parent span id is its parent's span id (checked by _ancestors);
     # spot-check one pair explicitly.
@@ -653,9 +653,9 @@ def _assert_substrate_tree(finished, n_tasks):
     create_attrs = dict(create.attributes)
     assert create_attrs["ate_env.rootfs_image"] == f"registry.example/swe/repo-a@{DIGEST}"
     assert create_attrs["ate.atespace"] == "ate-env"
-    run_attrs = dict(names["atefleet.run"][0].attributes)
+    run_attrs = dict(names["ate_env_fleet.run"][0].attributes)
     assert run_attrs == {"strategy": "none", "backend": "substrate"}
-    proc_attrs = dict(names["atefleet.process"][0].attributes)
+    proc_attrs = dict(names["ate_env_fleet.process"][0].attributes)
     assert proc_attrs["backend"] == "substrate" and proc_attrs["strategy"] == "none"
 
 
@@ -674,7 +674,7 @@ def test_nests_sync_fleet_through_loop_runner(spans, threaded_fake_server):
     _assert_substrate_tree(finished, 3)
     names = _by_name(finished)
     for wf in names["ate_env_client.write_file"]:
-        assert _ancestors(wf, finished) == ["atefleet.process", "atefleet.run"]
+        assert _ancestors(wf, finished) == ["ate_env_fleet.process", "ate_env_fleet.run"]
         assert dict(wf.attributes)["ate_env.file.size"] == 5
 
 
@@ -711,10 +711,10 @@ def test_nests_mock_fleet_phases(spans):
     execs = names["ate_env_client.exec"]
     assert len(execs) == 4
     for ex in execs:
-        assert _ancestors(ex, finished) == ["atefleet.process", "atefleet.run"]
+        assert _ancestors(ex, finished) == ["ate_env_fleet.process", "ate_env_fleet.run"]
     assert dict(execs[0].attributes)["ate_env.command.executable"] == "python3"
     for phase in ("preflight", "plan", "warm_pool", "acquire", "release", "teardown"):
-        assert _ancestors(names[f"atefleet.{phase}"][0], finished)[-1] == "atefleet.run", phase
+        assert _ancestors(names[f"ate_env_fleet.{phase}"][0], finished)[-1] == "ate_env_fleet.run", phase
 
 
 def test_nests_observability_switch_enables_client_spans(spans, threaded_fake_server):
@@ -746,7 +746,7 @@ def test_nests_user_span_parents_the_run(spans):
     with trace.get_tracer("trainer").start_as_current_span("trainer.step"):
         fleet.run(lambda task, handle: handle.exec("echo hi").exit_code)
     finished = spans.get_finished_spans()
-    run = _by_name(finished)["atefleet.run"][0]
+    run = _by_name(finished)["ate_env_fleet.run"][0]
     assert _parent_name(run, finished) == "trainer.step"
 
 

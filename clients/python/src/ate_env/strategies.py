@@ -24,6 +24,7 @@ from typing import Any
 
 from .handle import SandboxHandle
 from .observability import null_observer, repo_family
+from .telemetry.metrics import status_of
 from .types import Task
 
 logger = logging.getLogger("ate_env.strategies")
@@ -51,8 +52,8 @@ def process_parallel(fleet: Any, tasks: list[Task], process_fn: Callable[[Task, 
                     return process_fn(task, handle)
             finally:
                 fleet.release(handle)
-        except BaseException:
-            status = "error"
+        except BaseException as e:
+            status = status_of(e)
             raise
         finally:
             obs.task_done(backend, family, status, time.monotonic() - start)

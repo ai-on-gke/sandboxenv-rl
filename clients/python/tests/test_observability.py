@@ -213,16 +213,16 @@ def test_missing_metrics_extra_logs_one_warning(monkeypatch, caplog):
 # --- Prometheus registry (AC-8) -------------------------------------------- #
 
 FLEET_LABELS = {
-    "atefleet_phase_latency_seconds": ("phase", "backend", "family", "strategy", "status"),
-    "atefleet_task_latency_seconds": ("strategy", "backend", "family", "status"),
-    "atefleet_run_latency_seconds": ("strategy", "status"),
-    "atefleet_claims_total": ("backend", "status"),
-    "atefleet_tasks_total": ("strategy", "status"),
-    "atefleet_warm_replicas": ("backend",),
+    "ate_env_fleet_phase_latency_seconds": ("phase", "backend", "family", "strategy", "status"),
+    "ate_env_fleet_task_latency_seconds": ("strategy", "backend", "family", "status"),
+    "ate_env_fleet_run_latency_seconds": ("strategy", "status"),
+    "ate_env_fleet_claims_total": ("backend", "status"),
+    "ate_env_fleet_tasks_total": ("strategy", "status"),
+    "ate_env_fleet_warm_replicas": ("backend",),
 }
 CLIENT_FAMILIES = (
     "ate_env_client_acquire_seconds", "ate_env_client_exec_seconds",
-    "ate_env_client_suspend_seconds", "ate_env_client_wake_seconds",
+    "ate_env_client_suspend_seconds", "ate_env_client_warm_claim_seconds",
     "ate_env_client_release_seconds",
 )
 
@@ -263,7 +263,7 @@ def test_registry_observer_registers_documented_labels_once():
     importlib.reload(observability)  # module reload re-registers through _metric
     third = observability.Observer(ObservabilityConfig(enable_metrics=True))
     assert third.metrics
-    assert observability.PHASE_LATENCY is _collector(prom.REGISTRY, "atefleet_phase_latency_seconds")
+    assert observability.PHASE_LATENCY is _collector(prom.REGISTRY, "ate_env_fleet_phase_latency_seconds")
     for name, labels in FLEET_LABELS.items():
         collector = _collector(prom.REGISTRY, name)
         assert collector is not None, name
@@ -280,7 +280,7 @@ def test_registry_serve_metrics_answers():
     finally:
         server.shutdown()
         server.server_close()
-    assert "atefleet_phase_latency_seconds" in body
+    assert "ate_env_fleet_phase_latency_seconds" in body
 
 
 def test_registry_metrics_after_mock_run():
@@ -291,11 +291,11 @@ def test_registry_metrics_after_mock_run():
     def value(name, **labels):
         return prom.REGISTRY.get_sample_value(name, labels) or 0.0
 
-    assert value("atefleet_phase_latency_seconds_count", phase="process", backend="mock",
+    assert value("ate_env_fleet_phase_latency_seconds_count", phase="process", backend="mock",
                  family="repo0", strategy="naive", status="ok") >= 2
-    assert value("atefleet_run_latency_seconds_count", strategy="naive", status="ok") >= 1
-    assert value("atefleet_claims_total", backend="mock", status="ok") >= 4
-    assert value("atefleet_tasks_total", strategy="naive", status="ok") >= 4
+    assert value("ate_env_fleet_run_latency_seconds_count", strategy="naive", status="ok") >= 1
+    assert value("ate_env_fleet_claims_total", backend="mock", status="ok") >= 4
+    assert value("ate_env_fleet_tasks_total", strategy="naive", status="ok") >= 4
     assert value("ate_env_client_exec_seconds_count", status="ok") >= 4
 
 
@@ -327,7 +327,7 @@ _CARDINALITY_SCRIPT = textwrap.dedent(
     assert fleet.run(process, concurrency=8) == [0] * 200
     samples = []
     for metric in prometheus_client.REGISTRY.collect():
-        if metric.name.startswith(("atefleet_", "ate_env_client_")):
+        if metric.name.startswith(("ate_env_fleet_", "ate_env_client_")):
             samples += [[metric.name, s.labels] for s in metric.samples]
     print(json.dumps({
         "samples": samples,
@@ -376,7 +376,7 @@ def test_warm_gauge_adds_up_across_observers_and_resets_only_own_share():
     b = Observer(ObservabilityConfig(enable_metrics=True), registry=reg)
 
     def gauge():
-        return reg.get_sample_value("atefleet_warm_replicas", {"backend": "substrate"})
+        return reg.get_sample_value("ate_env_fleet_warm_replicas", {"backend": "substrate"})
 
     a.warm_add("substrate", 4)
     b.warm_add("substrate", 1)
@@ -486,13 +486,13 @@ def test_serve_metrics_custom_registry():
     finally:
         server.shutdown()
         server.server_close()
-    assert 'atefleet_phase_latency_seconds_count{backend="mock",family="fam"' in body
+    assert 'ate_env_fleet_phase_latency_seconds_count{backend="mock",family="fam"' in body
     assert "ate_env_client_" not in body  # client histograms stay on the global registry
     assert prom.REGISTRY.get_sample_value(
-        "atefleet_run_latency_seconds_count", {"strategy": "custom-reg-only", "status": "ok"}
+        "ate_env_fleet_run_latency_seconds_count", {"strategy": "custom-reg-only", "status": "ok"}
     ) is None
     assert reg.get_sample_value(
-        "atefleet_run_latency_seconds_count", {"strategy": "custom-reg-only", "status": "ok"}
+        "ate_env_fleet_run_latency_seconds_count", {"strategy": "custom-reg-only", "status": "ok"}
     ) == 1
 
 
@@ -584,7 +584,62 @@ async def test_cancelled_phase_has_status_cancelled():
     with pytest.raises(asyncio.CancelledError):
         await task
     labels = {"phase": "process", "backend": "mock", "family": "fam", "strategy": "-"}
-    assert reg.get_sample_value("atefleet_phase_latency_seconds_count",
+    assert reg.get_sample_value("ate_env_fleet_phase_latency_seconds_count",
                                 {**labels, "status": "cancelled"}) == 1
-    assert reg.get_sample_value("atefleet_phase_latency_seconds_count",
+    assert reg.get_sample_value("ate_env_fleet_phase_latency_seconds_count",
                                 {**labels, "status": "error"}) is None
+
+
+def test_cancelled_task_has_status_cancelled():
+    """An interrupted task in process_parallel is labeled cancelled, not error."""
+    from types import SimpleNamespace
+
+    from ate_env.strategies import process_parallel
+
+    _, reg = _custom_registry()
+    obs = Observer(ObservabilityConfig(enable_metrics=True), registry=reg)
+    fleet = SimpleNamespace(observer=obs, backend_label="mock",
+                            acquire=lambda task: object(), release=lambda handle: None)
+
+    def interrupted(task, handle):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        process_parallel(fleet, [Task(id="t0", image="img", metadata={"repo": "o/fam"})],
+                         interrupted, concurrency=1)
+    labels = {"strategy": "-", "backend": "mock", "family": "fam"}
+    assert reg.get_sample_value("ate_env_fleet_tasks_total",
+                                {"strategy": "-", "status": "cancelled"}) == 1
+    assert reg.get_sample_value("ate_env_fleet_tasks_total",
+                                {"strategy": "-", "status": "error"}) is None
+    assert reg.get_sample_value("ate_env_fleet_task_latency_seconds_count",
+                                {**labels, "status": "cancelled"}) == 1
+
+
+async def test_cancelled_async_task_has_status_cancelled():
+    """A straggler cancelled in AsyncSandboxFleet.run is labeled cancelled, not error."""
+    import asyncio
+
+    prom = pytest.importorskip("prometheus_client")
+    get = prom.REGISTRY.get_sample_value
+
+    def tasks_total(status):
+        return get("ate_env_fleet_tasks_total", {"strategy": "naive", "status": status}) or 0.0
+
+    before = {s: tasks_total(s) for s in ("cancelled", "error")}
+    fleet = AsyncSandboxFleet(FleetConfig(backend="mock", strategy="naive",
+                                          observability=ObservabilityConfig(enable_metrics=True)))
+    fleet.load_tasks([Task(id="t0", image="img")])
+    started = asyncio.Event()
+
+    async def straggler(task, handle):
+        started.set()
+        await asyncio.sleep(10)
+
+    run = asyncio.ensure_future(fleet.run(straggler))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+    assert tasks_total("cancelled") == before["cancelled"] + 1
+    assert tasks_total("error") == before["error"]

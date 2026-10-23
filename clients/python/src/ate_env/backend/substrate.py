@@ -276,8 +276,8 @@ class SubstrateBackendDriver(BackendDriver):
                 raise SandboxStartError(
                     f"Timed out acquiring sandbox for template {template_id} after {to_s:g}s"
                 ) from e
-            except BaseException:
-                self._observe("claim", "error")
+            except BaseException as e:
+                self._observe("claim", metrics.status_of(e))
                 raise
             self._observe("claim", "ok")
             set_attributes(span, {"ate.actor.name": instance.instance_id})
@@ -304,7 +304,7 @@ class SubstrateBackendDriver(BackendDriver):
 
             if actor_id:
                 self._observe("warm_remove", 1)
-                wake_start = time.monotonic()
+                claim_start = time.monotonic()
                 logger.info(
                     "Claimed warm paused actor %s for template %s (rootfs_image=%s)",
                     actor_id,
@@ -329,7 +329,7 @@ class SubstrateBackendDriver(BackendDriver):
                         self._warm_paused_pool.setdefault(pool_key, []).append(actor_id)
                     self._observe("warm_add", 1)
                     raise SandboxStartError(f"Error checking warm actor {actor_id}: {e}") from e
-                metrics.observe("wake", time.monotonic() - wake_start)
+                metrics.observe("warm_claim", time.monotonic() - claim_start)
                 break
             else:
                 actor_id = f"sb-{uuid.uuid4().hex[:16]}"

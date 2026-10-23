@@ -30,7 +30,6 @@ from .handle import SandboxHandle
 from .observability import Observer, RunReport, repo_family
 from .runtime.base import RuntimeGuestHook
 from .strategies import STRATEGIES
-from .telemetry.tracing import tracer_from_config
 from .types import (
     DataPlaneEndpoint,
     FleetPlan,
@@ -59,7 +58,7 @@ class SandboxFleet:
 
         # Telemetry. Either FleetConfig.tracing or observability.enable_tracing
         # turns on tracing for the whole fleet under one service name, so
-        # atefleet.* spans parent ate_env_client.* spans in one trace.
+        # ate_env_fleet.* spans parent ate_env_client.* spans in one trace.
         obs_cfg = self.config.observability
         tracing_on = self.config.tracing.enable_tracing or obs_cfg.enable_tracing
         service = (obs_cfg.trace_service_name if obs_cfg.enable_tracing
@@ -75,7 +74,9 @@ class SandboxFleet:
         self._obs = Observer(dataclasses.replace(
             obs_cfg, enable_tracing=tracing_on, trace_service_name=service
         ))
-        self._tracer = tracer_from_config(self._tracer_config)
+        # The Observer was built from the same switch and service name, so its
+        # tracer (None when tracing is off) is the fleet's; no second tracer.
+        self._tracer = self._obs.tracer
         self.report: RunReport | None = None  # set by run()
 
         # Initialize Backend Driver
@@ -350,7 +351,8 @@ class SandboxFleet:
             concurrency: int | None = None) -> list[Any]:
         """Execute all tasks using the configured strategy.
 
-        The run's RunReport is available as ``fleet.report`` afterwards.
+        The run's RunReport is available as ``fleet.report`` afterwards;
+        ``fleet.report.summary()`` gives the table (logged only at DEBUG).
         """
         strat_fn = STRATEGIES.get(self.config.strategy)
         if not strat_fn:
@@ -360,7 +362,7 @@ class SandboxFleet:
             self.report = report
             report.environment = self.describe_environment(concurrency=max(1, c))
             results = strat_fn(self, process_fn, max(1, c))
-        logger.info("\n%s", report.summary())
+        logger.debug("\n%s", report.summary())
         return results
 
     def describe_environment(self, concurrency: int | None = None) -> dict[str, dict[str, Any]]:

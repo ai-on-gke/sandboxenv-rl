@@ -350,6 +350,15 @@ fleet.report.to_dict()                 # JSON-ready
 fleet.report.write(os.environ["REPORT_DIR"])   # <strategy>_<n>tasks_<stamp>.txt/.json
 ```
 
+`release_errors` counts releases whose delete failed. `release()` logs the
+failure and does not raise, so cleanup never stops a trainer, but it is
+recorded: the `ate_env_client.release` span and the
+`ate_env_client_release_seconds` sample get status `error`, the fleet counts
+it in `ate_env_fleet_release_failures_total`, and the environment stays owned
+by the driver, so `teardown()` (the run's reap) tries the delete again and
+raises `InfrastructureError` if it still fails. An environment that is
+already gone (NotFound) counts as released.
+
 `write` never overwrites a report: when the name is taken (another report in
 the same second, for example from a Ray worker that shares the directory), it
 appends `-1`, `-2`, ... Runs on one fleet do not overlap: a second `run()`
@@ -374,7 +383,8 @@ any fleet in the process enables metrics, the client histograms keep
 recording, even for a later fleet with `enable_metrics=False`. The fleet records
 `ate_env_fleet_phase_latency_seconds`, `ate_env_fleet_task_latency_seconds`,
 `ate_env_fleet_run_latency_seconds`, `ate_env_fleet_claims_total`,
-`ate_env_fleet_tasks_total` and `ate_env_fleet_warm_replicas`, and the client
+`ate_env_fleet_tasks_total`, `ate_env_fleet_warm_replicas` and
+`ate_env_fleet_release_failures_total`, and the client
 records `ate_env_client_{acquire,exec,suspend,warm_claim,release}_seconds`
 (`warm_claim` is the time to validate a warm claim; the resume itself
 happens on the first guest request, so it lands in the first `exec`).

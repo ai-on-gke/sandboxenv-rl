@@ -36,6 +36,7 @@ from ..loop_runner import LoopRunner
 from ..telemetry import metrics
 from ..telemetry.tracing import (
     CLIENT_SPAN_PREFIX,
+    mark_error,
     set_attributes,
     start_span,
     tracer_from_config,
@@ -525,12 +526,31 @@ class SubstrateBackendDriver(BackendDriver):
 
         Note: Recycling suspends the actor and returns it to the warm pool
         without resetting guest filesystem or processes.
+
+        A failed delete does not raise, so a cleanup error never stops a
+        trainer, but it is not hidden either: the ``ate_env_client.release``
+        span and the ``ate_env_client_release_seconds`` sample get status
+        error, the fleet observer counts it
+        (``ate_env_fleet_release_failures_total``, ``RunReport.release_errors``),
+        and the environment stays owned by this driver so the run's ``reap``
+        tries again and raises if it still cannot delete it. An environment
+        that is already gone (NotFound) counts as released.
         """
-        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.release", {"ate.actor.name": instance_id}):
-            with metrics.timed("release"):
-                await self._release_internal(instance_id, recycle)
+        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.release",
+                        {"ate.actor.name": instance_id}) as span:
+            try:
+                with metrics.timed("release"):
+                    await self._release_internal(instance_id, recycle)
+            except Exception as e:
+                # Only the error type reaches the trace; the message can carry
+                # bucket paths and other server details.
+                mark_error(span, f"release failed: {type(e).__name__}")
+                set_attributes(span, {"error.type": type(e).__name__})
+                self._observe("release_failed")
+                logger.warning("Failed to delete environment %s: %s", instance_id, e)
 
     async def _release_internal(self, instance_id: str, recycle: bool) -> None:
+        """Suspend into the warm pool or delete; raises when the delete fails."""
         with self._lock:
             instance = self._owned_actors.pop(instance_id, None)
 
@@ -549,9 +569,16 @@ class SubstrateBackendDriver(BackendDriver):
 
         try:
             await self.client.delete(instance_id, atespace=self.atespace)
-            logger.info("Deleted environment %s", instance_id)
-        except Exception as e:
-            logger.warning("Failed to delete environment %s: %s", instance_id, e)
+        except NotFoundError:
+            logger.info("Environment %s was already deleted", instance_id)
+            return
+        except BaseException:
+            # Keep it owned, so the run's reap retries the delete.
+            if instance is not None:
+                with self._lock:
+                    self._owned_actors.setdefault(instance_id, instance)
+            raise
+        logger.info("Deleted environment %s", instance_id)
 
     def release(self, instance_id: str, recycle: bool = False) -> None:
         self._sync(self.release_async(instance_id, recycle=recycle))
@@ -586,6 +613,8 @@ class SubstrateBackendDriver(BackendDriver):
                     await self.client.delete(aid, atespace=self.atespace)
                     async with reap_lock:
                         reaped_count += 1
+                except NotFoundError:
+                    pass  # already gone (e.g. a release that timed out after the delete landed)
                 except Exception as e:
                     logger.warning("Failed deleting actor %s during reap: %s", aid, e)
                     async with reap_lock:

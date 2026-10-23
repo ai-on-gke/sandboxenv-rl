@@ -71,6 +71,7 @@ FLEET_SPAN_PREFIX = "ate_env_fleet"
 # The ate_env_fleet_* collectors on the default registry, created by _ensure_metrics
 # on the first metrics-enabled Observer, never at import.
 PHASE_LATENCY = TASK_LATENCY = RUN_LATENCY = CLAIMS = TASKS = WARM_REPLICAS = None
+RELEASE_FAILURES = None
 _METRICS_READY = False
 _METRICS_LOCK = threading.Lock()
 # Collector sets for caller-supplied registries, keyed by id(registry).
@@ -94,6 +95,10 @@ def _build_collectors(prom: Any, registry: Any) -> SimpleNamespace:
                        ["backend", "status"], **reg),
         tasks=_metric(prom.Counter, "ate_env_fleet_tasks_total", "Tasks processed",
                       ["strategy", "status"], **reg),
+        release_failures=_metric(
+            prom.Counter, "ate_env_fleet_release_failures_total",
+            "Environment releases (deletes) that failed; the environment may have leaked",
+            ["backend"], **reg),
         warm_replicas=_metric(prom.Gauge, "ate_env_fleet_warm_replicas", "Current warm replicas",
                               ["backend"], **reg),
     )
@@ -106,7 +111,7 @@ def _ensure_metrics(registry: Any = None) -> SimpleNamespace | None:
     prometheus_client.
     """
     global _METRICS_READY, PHASE_LATENCY, TASK_LATENCY, RUN_LATENCY
-    global CLAIMS, TASKS, WARM_REPLICAS
+    global CLAIMS, TASKS, WARM_REPLICAS, RELEASE_FAILURES
     prom = _load_prom()
     if prom is None:
         log_missing_extra()
@@ -121,10 +126,12 @@ def _ensure_metrics(registry: Any = None) -> SimpleNamespace | None:
             c = _build_collectors(prom, None)
             PHASE_LATENCY, TASK_LATENCY, RUN_LATENCY = c.phase_latency, c.task_latency, c.run_latency
             CLAIMS, TASKS, WARM_REPLICAS = c.claims, c.tasks, c.warm_replicas
+            RELEASE_FAILURES = c.release_failures
             _METRICS_READY = True
         return SimpleNamespace(
             phase_latency=PHASE_LATENCY, task_latency=TASK_LATENCY, run_latency=RUN_LATENCY,
-            claims=CLAIMS, tasks=TASKS, warm_replicas=WARM_REPLICAS)
+            claims=CLAIMS, tasks=TASKS, warm_replicas=WARM_REPLICAS,
+            release_failures=RELEASE_FAILURES)
 
 
 _FAMILY_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
@@ -195,6 +202,7 @@ class RunReport:
     claims: int = 0
     tasks_ok: int = 0
     tasks_err: int = 0
+    release_errors: int = 0
     warm_total: int = 0
     peak_warm: int = 0
     environment: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -217,6 +225,9 @@ class RunReport:
     def add_claim(self) -> None:
         self.claims += 1
 
+    def add_release_error(self) -> None:
+        self.release_errors += 1
+
     def _ordered(self) -> list[tuple[str, list[float]]]:
         names = list(self.ORDER) + [p for p in self.phases if p not in self.ORDER]
         return [(p, self.phases[p]) for p in names if p in self.phases]
@@ -230,6 +241,7 @@ class RunReport:
             "claims": self.claims,
             "tasks_ok": self.tasks_ok,
             "tasks_err": self.tasks_err,
+            "release_errors": self.release_errors,
             "warm_replicas_total": self.warm_total,
             "warm_replicas_peak": self.peak_warm,
             "environment": self.environment,
@@ -259,6 +271,9 @@ class RunReport:
         lines.append(f"  {'TOTAL':<18} {self.total_s:8.2f}s")
         lines.append(f"  claims={self.claims}  tasks={self.tasks_ok}ok/{self.tasks_err}err"
                      f"  warm_replicas total={self.warm_total} peak={self.peak_warm}")
+        if self.release_errors:
+            lines.append(f"  release_errors={self.release_errors}  (failed deletes; "
+                         "environments may have leaked)")
         return "\n".join(lines)
 
     def write(self, report_dir: str | pathlib.Path, n_tasks: int | None = None) -> pathlib.Path:
@@ -318,6 +333,7 @@ class Observer:
             self._phase_latency, self._task_latency, self._run_latency = (
                 c.phase_latency, c.task_latency, c.run_latency)
             self._claims, self._tasks, self._warm_replicas = c.claims, c.tasks, c.warm_replicas
+            self._release_failures = c.release_failures
         self.tracer = tracer_from_config(TracerConfig(
             enable_tracing=self.config.enable_tracing,
             trace_service_name=self.config.trace_service_name,
@@ -403,6 +419,14 @@ class Observer:
         if self._in_run and self.report is not None and status == "ok":
             with self._lock:
                 self.report.add_claim()
+
+    def release_failed(self, backend: str) -> None:
+        """Record a release (delete) that failed; the driver logged and did not raise."""
+        if self.metrics:
+            self._release_failures.labels(backend=backend).inc()
+        if self._in_run and self.report is not None:
+            with self._lock:
+                self.report.add_release_error()
 
     # The warm-replica gauge is shared by every Observer in the process, so
     # each one moves it by its own deltas (inc/dec) instead of setting it to

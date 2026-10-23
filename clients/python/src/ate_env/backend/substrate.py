@@ -594,8 +594,8 @@ class SubstrateBackendDriver(BackendDriver):
                     else:
                         async def _pause_bg(aid: str, img: str) -> None:
                             bg_token = _IN_TRACKED_LIFECYCLE.set(True)
+                            t_s0 = time.perf_counter()
                             try:
-                                t_s0 = time.perf_counter()
                                 await self.client.suspend(aid, atespace=self.atespace)
                                 if (
                                     self.telemetry is not None
@@ -610,6 +610,22 @@ class SubstrateBackendDriver(BackendDriver):
                                         source="warm_pool",
                                         trace_only=True,
                                     )
+                            except Exception as exc:
+                                if (
+                                    self.telemetry is not None
+                                    and getattr(self.telemetry, "mode", "off") == "trace"
+                                ):
+                                    self.telemetry.record_op(
+                                        "suspend",
+                                        (time.perf_counter() - t_s0) * 1000.0,
+                                        ok=False,
+                                        env_id=aid,
+                                        image=img,
+                                        source="warm_pool",
+                                        err=f"{type(exc).__name__}: {exc}",
+                                        trace_only=True,
+                                    )
+                                raise
                             finally:
                                 _IN_TRACKED_LIFECYCLE.reset(bg_token)
 

@@ -22,7 +22,12 @@ from __future__ import annotations
 import asyncio
 import importlib.resources
 import json
+import os
+import shutil
+import subprocess
+import sys
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,9 +43,13 @@ from ate_env.telemetry import (
     CANONICAL_TRACE_OPS,
     BenchTelemetry,
     TraceEventRecord,
+    _load_w1_schema,
     instrument_client,
     validate_event_dict,
     validate_trace_event_dict,
+)
+from ate_env.telemetry import (
+    bench as _bench_mod,
 )
 from ate_env.types import ShellResult
 
@@ -727,10 +736,13 @@ async def test_concurrent_async_overhead_benchmark() -> None:
     assert len(measure_telemetry._step_aggregates) <= 2
 
 
-def test_package_data_includes_w1_schemas() -> None:
-    """Verify pyproject.toml packages W1 schemas and importlib.resources resolves them."""
-    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    pyproject_text = pyproject_path.read_text(encoding="utf-8")
+def test_package_data_includes_w1_schemas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify wheel packages W1 schemas, lazy loading in off mode, and fail-fast missing schema."""
+    monkeypatch.delenv("ENV_BENCH_MODE", raising=False)
+    pkg_root = Path(__file__).resolve().parents[1]
+    pyproject_text = (pkg_root / "pyproject.toml").read_text(encoding="utf-8")
     assert '"schemas/v1/*.json"' in pyproject_text
     assert (
         importlib.resources.files("ate_env")
@@ -742,3 +754,77 @@ def test_package_data_includes_w1_schemas() -> None:
         .joinpath("schemas", "v1", "event.schema.json")
         .is_file()
     )
+
+    # 1. Build an actual wheel in an isolated tmp copy and verify both W1 JSON Schema files
+    staged_pkg = tmp_path / "pkg"
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    (staged_pkg / "src").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(pkg_root / "pyproject.toml", staged_pkg / "pyproject.toml")
+    shutil.copy2(pkg_root / "README.md", staged_pkg / "README.md")
+    shutil.copytree(pkg_root / "src" / "ate_env", staged_pkg / "src" / "ate_env")
+    pip_res = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--no-deps",
+            "--no-build-isolation",
+            str(staged_pkg),
+            "-w",
+            str(dist_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if pip_res.returncode != 0:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import setuptools.build_meta as bm, sys; bm.build_wheel(sys.argv[1])",
+                str(dist_dir),
+            ],
+            cwd=str(staged_pkg),
+            check=True,
+        )
+    wheels = list(dist_dir.glob("ate_env_client-*.whl"))
+    assert len(wheels) == 1
+    with zipfile.ZipFile(wheels[0], "r") as zf:
+        names = set(zf.namelist())
+        assert "ate_env/schemas/v1/trace_event.schema.json" in names
+        assert "ate_env/schemas/v1/event.schema.json" in names
+
+    # 2. Verify no hand-written _FALLBACK_SCHEMAS exists and missing schema raises RuntimeError
+    assert not hasattr(_bench_mod, "_FALLBACK_SCHEMAS")
+    with pytest.raises(RuntimeError, match="W1 JSON Schema"):
+        _load_w1_schema("nonexistent.schema.json")
+
+    # 3. Verify lazy schema loading: import ate_env and BenchTelemetry(mode="off") read 0 schemas
+    _load_w1_schema.cache_clear()
+    assert _load_w1_schema.cache_info().currsize == 0
+    off_tel = BenchTelemetry(mode="off")
+    assert off_tel.mode == "off"
+    assert _load_w1_schema.cache_info().currsize == 0
+
+    env_copy = dict(os.environ)
+    env_copy.pop("ENV_BENCH_MODE", None)
+    env_copy["PYTHONPATH"] = str(pkg_root / "src")
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import ate_env; from ate_env.telemetry import bench; "
+                "assert bench._load_w1_schema.cache_info().currsize == 0"
+            ),
+        ],
+        env=env_copy,
+        check=True,
+    )
+
+    measure_tel = BenchTelemetry(mode="measure")
+    assert measure_tel.mode == "measure"
+    assert _load_w1_schema.cache_info().currsize == 2

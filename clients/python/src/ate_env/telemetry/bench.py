@@ -30,6 +30,7 @@ Supports three modes configured explicitly or via ``ENV_BENCH_MODE``:
 # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
 # pylint: disable=too-many-instance-attributes,too-many-branches,too-many-statements
 # pylint: disable=broad-exception-caught,too-many-lines,too-many-return-statements
+# pylint: disable=undefined-all-variable
 
 from __future__ import annotations
 
@@ -50,7 +51,15 @@ import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    TRACE_EVENT_SCHEMA: dict[str, Any]
+    EVENT_SCHEMA: dict[str, Any]
+    TRACE_EVENT_ALLOWED_KEYS: frozenset[str]
+    EVENT_ALLOWED_KEYS: frozenset[str]
+    CANONICAL_TRACE_OPS: frozenset[str]
+    CANONICAL_EVENT_SOURCES: frozenset[str]
 
 logger = logging.getLogger("ate_env.telemetry")
 
@@ -97,93 +106,22 @@ _CURRENT_TASK_META: contextvars.ContextVar[tuple[str, str]] = contextvars.Contex
 )
 
 
-_FALLBACK_SCHEMAS: dict[str, dict[str, Any]] = {
-    "trace_event.schema.json": {
-        "required": ["ts", "env", "op", "dur_ms", "ok"],
-        "properties": {
-            "schema_version": {"type": "string", "enum": ["v1"]},
-            "ts": {"type": "string", "minLength": 1},
-            "run": {"type": "string"},
-            "job": {"type": "string"},
-            "env": {"type": "string", "minLength": 1},
-            "instance": {"type": "string"},
-            "image": {"type": "string"},
-            "step": {"type": "integer", "minimum": 0},
-            "op": {
-                "type": "string",
-                "enum": [
-                    "create",
-                    "exec",
-                    "write_file",
-                    "read_file",
-                    "suspend",
-                    "wake",
-                    "fork",
-                    "delete",
-                    "get",
-                    "start_process",
-                    "shell",
-                ],
-            },
-            "command": {"type": "array", "items": {"type": "string"}},
-            "path": {"type": "string"},
-            "bytes": {"type": "integer", "minimum": 0},
-            "dur_ms": {"type": "number", "minimum": 0},
-            "exit": {"type": "integer"},
-            "ok": {"type": "boolean"},
-            "err": {"type": "string"},
-        },
-    },
-    "event.schema.json": {
-        "required": ["ts", "run", "event", "dur_ms", "ok"],
-        "properties": {
-            "schema_version": {"type": "string", "enum": ["v1"]},
-            "ts": {"type": "string", "minLength": 1},
-            "run": {"type": "string", "minLength": 1},
-            "job": {"type": "string"},
-            "worker": {"type": "string"},
-            "event": {"type": "string", "minLength": 1},
-            "name": {"type": "string"},
-            "phase": {"type": "string"},
-            "source": {
-                "type": "string",
-                "enum": ["warm_pool", "cold_create", "golden_restore", "fork", "resume"],
-            },
-            "env": {"type": "string"},
-            "instance": {"type": "string"},
-            "image": {"type": "string"},
-            "task": {"type": "integer", "minimum": 0},
-            "step": {"type": "integer", "minimum": 0},
-            "dur_ms": {"type": "number", "minimum": 0},
-            "slot_wait_ms": {"type": "number", "minimum": 0},
-            "ok": {"type": "boolean"},
-            "timeout": {"type": "boolean"},
-            "exit": {"type": "integer"},
-            "reward": {"type": "integer"},
-            "detail": {"type": "string"},
-            "attempts": {"type": "integer", "minimum": 0},
-            "count": {"type": "integer", "minimum": 0},
-            "err": {"type": "string"},
-            "tail": {"type": "string"},
-            "snapshot": {"type": "string"},
-            "node": {"type": "string"},
-            "bytes": {"type": "integer", "minimum": 0},
-            "cache_hit": {"type": "boolean"},
-            "tags": {"type": "object", "additionalProperties": {"type": "string"}},
-            "metrics": {"type": "object", "additionalProperties": {"type": "number"}},
-        },
-    },
-}
-
-
+@functools.lru_cache(maxsize=4)
 def _load_w1_schema(filename: str) -> dict[str, Any]:
-    """Load a W1 JSON Schema file from the repo, package resources, or fallback."""
+    """Load a W1 JSON Schema file from the repo or bundled package schemas."""
     here = Path(__file__).resolve()
-    repo_candidate = (
-        here.parents[5] / "internal" / "benchmarking" / "rlbench" / "schema" / "v1" / filename
-    )
-    bundled_candidate = here.parents[1] / "schemas" / "v1" / filename
-    for candidate in (repo_candidate, bundled_candidate):
+    candidates: list[Path] = []
+    try:
+        candidates.append(
+            here.parents[5] / "internal" / "benchmarking" / "rlbench" / "schema" / "v1" / filename
+        )
+    except IndexError:
+        pass
+    try:
+        candidates.append(here.parents[1] / "schemas" / "v1" / filename)
+    except IndexError:
+        pass
+    for candidate in candidates:
         if candidate.is_file():
             with candidate.open("r", encoding="utf-8") as fh:
                 loaded = json.load(fh)
@@ -195,26 +133,59 @@ def _load_w1_schema(filename: str) -> dict[str, Any]:
             loaded = json.loads(pkg_res.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 return loaded
-    logger.warning(
-        "ate_env: W1 JSON Schema %r not found on disk; using built-in fallback", filename
-    )
-    return dict(_FALLBACK_SCHEMAS.get(filename, {"properties": {}}))
+    raise RuntimeError(f"ate_env: W1 JSON Schema {filename!r} not found")
 
 
-TRACE_EVENT_SCHEMA: dict[str, Any] = _load_w1_schema("trace_event.schema.json")
-EVENT_SCHEMA: dict[str, Any] = _load_w1_schema("event.schema.json")
+def _get_trace_event_schema() -> dict[str, Any]:
+    """Lazily load and return the W1 TraceEvent JSON Schema."""
+    return _load_w1_schema("trace_event.schema.json")
 
-# Derived directly from the W1 JSON Schema files (Guardrail 1: never hand-copied).
-TRACE_EVENT_ALLOWED_KEYS: frozenset[str] = frozenset(
-    TRACE_EVENT_SCHEMA.get("properties", {}).keys()
-)
-EVENT_ALLOWED_KEYS: frozenset[str] = frozenset(EVENT_SCHEMA.get("properties", {}).keys())
-CANONICAL_TRACE_OPS: frozenset[str] = frozenset(
-    TRACE_EVENT_SCHEMA["properties"]["op"]["enum"]
-)
-CANONICAL_EVENT_SOURCES: frozenset[str] = frozenset(
-    EVENT_SCHEMA["properties"]["source"]["enum"]
-)
+
+def _get_event_schema() -> dict[str, Any]:
+    """Lazily load and return the W1 Event JSON Schema."""
+    return _load_w1_schema("event.schema.json")
+
+
+@functools.lru_cache(maxsize=1)
+def _get_trace_event_allowed_keys() -> frozenset[str]:
+    """Lazily derive allowed TraceEvent keys from the W1 JSON Schema (Guardrail 1)."""
+    return frozenset(_get_trace_event_schema().get("properties", {}).keys())
+
+
+@functools.lru_cache(maxsize=1)
+def _get_event_allowed_keys() -> frozenset[str]:
+    """Lazily derive allowed Event keys from the W1 JSON Schema (Guardrail 1)."""
+    return frozenset(_get_event_schema().get("properties", {}).keys())
+
+
+@functools.lru_cache(maxsize=1)
+def _get_canonical_trace_ops() -> frozenset[str]:
+    """Lazily derive canonical TraceEvent op enum values from the W1 JSON Schema."""
+    return frozenset(_get_trace_event_schema()["properties"]["op"]["enum"])
+
+
+@functools.lru_cache(maxsize=1)
+def _get_canonical_event_sources() -> frozenset[str]:
+    """Lazily derive canonical Event source enum values from the W1 JSON Schema."""
+    return frozenset(_get_event_schema()["properties"]["source"]["enum"])
+
+
+_LAZY_SCHEMA_ATTRS: dict[str, Callable[[], Any]] = {
+    "TRACE_EVENT_SCHEMA": _get_trace_event_schema,
+    "EVENT_SCHEMA": _get_event_schema,
+    "TRACE_EVENT_ALLOWED_KEYS": _get_trace_event_allowed_keys,
+    "EVENT_ALLOWED_KEYS": _get_event_allowed_keys,
+    "CANONICAL_TRACE_OPS": _get_canonical_trace_ops,
+    "CANONICAL_EVENT_SOURCES": _get_canonical_event_sources,
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily resolve W1 schema constants on first attribute access (PEP 562)."""
+    getter = _LAZY_SCHEMA_ATTRS.get(name)
+    if getter is not None:
+        return getter()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 _DEFAULT_BUCKETS_MS: tuple[float, ...] = (
     1.0,
@@ -361,12 +332,12 @@ def validate_trace_event_dict(payload: Mapping[str, Any]) -> None:
             f"trace event schema_version must be {SCHEMA_VERSION!r}, "
             f"got {payload.get('schema_version')!r}"
         )
-    _validate_against_schema(payload, TRACE_EVENT_SCHEMA, "trace event")
+    _validate_against_schema(payload, _get_trace_event_schema(), "trace event")
 
 
 def validate_event_dict(payload: Mapping[str, Any]) -> None:
     """Validate a dict against the W1 Event JSON schema (Guardrail 1)."""
-    _validate_against_schema(payload, EVENT_SCHEMA, "event")
+    _validate_against_schema(payload, _get_event_schema(), "event")
 
 
 def _escape_prom_label(value: str) -> str:
@@ -653,6 +624,10 @@ class BenchTelemetry:
         self._events_fd: int | None = None
         self._events_fd_path: Path | None = None
 
+        if self.mode != "off":
+            _get_trace_event_schema()
+            _get_event_schema()
+
         if self.mode == "trace" and self.trace_path is not None:
             self.trace_path.parent.mkdir(parents=True, exist_ok=True)
             self._trace_fd = os.open(
@@ -792,11 +767,12 @@ class BenchTelemetry:
 
             # Guardrail 4: Per-call JSONL file logging is strictly restricted to trace mode
             # and canonical W1 TraceEvent operations.
-            effective_trace_op = trace_op or (op if op in CANONICAL_TRACE_OPS else "")
+            canonical_ops = _get_canonical_trace_ops()
+            effective_trace_op = trace_op or (op if op in canonical_ops else "")
             if (
                 self.mode == "trace"
                 and emit_trace
-                and effective_trace_op in CANONICAL_TRACE_OPS
+                and effective_trace_op in canonical_ops
             ):
                 if not env_id or not env_id.strip():
                     logger.warning(
@@ -1127,7 +1103,7 @@ class BenchTelemetry:
             tags: dict[str, str] = {"worker": self.worker_id, "op": agg.op}
             if agg.source:
                 tags["source"] = agg.source
-            if agg.source in CANONICAL_EVENT_SOURCES:
+            if agg.source in _get_canonical_event_sources():
                 ev["source"] = agg.source
             ev["tags"] = tags
 

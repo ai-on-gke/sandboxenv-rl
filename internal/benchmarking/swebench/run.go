@@ -86,18 +86,31 @@ type Config struct {
 	// Keep leaves the environments in place when the run ends.
 	Keep bool
 	// Labels are recorded on the run event over the loader's own labels
-	// (mode, width, images, trajectory, the shape flags); a clash goes to
-	// Labels. The Substrate commit, the cluster and the arm belong here.
+	// (LoaderLabelKeys); a clash goes to Labels. The Substrate commit, the
+	// cluster and the arm belong here.
 	Labels map[string]string
+}
+
+// LoaderLabelKeys are the labels the loader records about its own invocation
+// on the run event: the run's shape and the settings that move its latencies
+// and failure counts. report -arm pools only reps that agree on all of them.
+var LoaderLabelKeys = []string{
+	"mode", "width", "images", "trajectory", "tasks_per_image", "rollouts", "steps", "park",
+	"create_timeout", "step_timeout", "wake_budget", "wake_backoff",
+	"dataset", "connections", "base_template", "exclude_file", "instances",
 }
 
 // labels describes the run for its run event.
 func (c *Config) labels() map[string]string {
 	l := map[string]string{
-		"mode":       string(c.Mode),
-		"width":      strconv.Itoa(c.Width),
-		"images":     strconv.Itoa(len(c.Instances)),
-		"trajectory": c.Trajectory.Name,
+		"mode":           string(c.Mode),
+		"width":          strconv.Itoa(c.Width),
+		"images":         strconv.Itoa(len(c.Instances)),
+		"trajectory":     c.Trajectory.Name,
+		"create_timeout": c.CreateTimeout.String(),
+		"step_timeout":   c.StepTimeout.String(),
+		"wake_budget":    c.WakeBudget.String(),
+		"wake_backoff":   c.WakeBackoff.String(),
 	}
 	switch c.Mode {
 	case ModeEval:

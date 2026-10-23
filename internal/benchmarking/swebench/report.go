@@ -23,6 +23,7 @@ import (
 	"io"
 	"math"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,8 +71,11 @@ type StepStat struct {
 // Report is the summary of one run's JSONL, stable enough to diff between
 // runs.
 type Report struct {
-	RunID      string     `json:"run"`
-	Mode       string     `json:"mode,omitempty"`
+	RunID string `json:"run"`
+	Mode  string `json:"mode,omitempty"`
+	// Reps is how many runs the report pools, the run events it saw: one for
+	// a file, the reps of an arm under report -arm (see Pool).
+	Reps       int        `json:"reps,omitempty"`
 	RunMS      float64    `json:"run_ms,omitempty"`
 	Tasks      int        `json:"tasks"`
 	Failed     int        `json:"failed"`
@@ -175,10 +179,12 @@ func Build(events []Event) *Report {
 	wakes := map[int][]float64{}
 	// Per step, one value per run: a report built over the merged events of
 	// several runs (report -arm) takes the median, which is the value itself
-	// for one run.
+	// for one run. The run durations and labels pool the same way.
 	barriers := map[int][]float64{}
 	parks := map[int][]float64{}
 	lives := map[int][]float64{}
+	var runs []float64
+	labels := labelUnion{}
 	errs := map[string]int{}
 
 	for _, e := range events {
@@ -211,11 +217,12 @@ func Build(events []Event) *Report {
 		}
 		switch e.Event {
 		case EventRun:
-			rep.Mode = e.Name
-			rep.RunMS = e.DurMS
-			if rep.Labels == nil && len(e.Labels) > 0 {
-				rep.Labels = e.Labels
+			rep.Reps++
+			if rep.Mode == "" {
+				rep.Mode = e.Name
 			}
+			runs = append(runs, e.DurMS)
+			labels.add(e.Labels)
 		case EventTask:
 			rep.Tasks++
 			if !e.OK {
@@ -250,15 +257,13 @@ func Build(events []Event) *Report {
 	if rep.Tasks > 0 {
 		rep.RewardRate = float64(rep.Rewarded) / float64(rep.Tasks)
 	}
+	rep.RunMS = median(runs)
+	rep.Labels = labels.merged()
 	for _, k := range order {
 		d := durs[k]
 		sort.Float64s(d)
 		rep.Stats = append(rep.Stats, Stat{Event: k.event, Name: k.name, Count: len(d) + failed[k], Failed: failed[k],
 			P50MS: percentile(d, 0.50), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1), Retried: retried[k]})
-	}
-	median := func(d []float64) float64 {
-		sort.Float64s(d)
-		return percentile(d, 0.5)
 	}
 	for step, s := range steps {
 		w := wakes[step]
@@ -329,6 +334,86 @@ func stepStat(m map[int]*StepStat, step int) *StepStat {
 
 // percentile of a sorted slice by the nearest-rank method, ceil(p*n)-1; 0
 // for an empty slice.
+// median sorts d and returns its middle value, or the mean of the two
+// middle values for an even count, so two reps of an arm pool to the value
+// between them rather than the lower one. 0 for no values.
+func median(d []float64) float64 {
+	n := len(d)
+	if n == 0 {
+		return 0
+	}
+	sort.Float64s(d)
+	if n%2 == 1 {
+		return d[n/2]
+	}
+	return (d[n/2-1] + d[n/2]) / 2
+}
+
+// labelUnion merges the labels of pooled runs' run events: a key keeps its
+// value when every run agrees, else every value in the order first seen,
+// "|"-joined, so a column that mixes commits says so.
+type labelUnion map[string][]string
+
+func (u labelUnion) add(labels map[string]string) {
+	for k, v := range labels {
+		if !slices.Contains(u[k], v) {
+			u[k] = append(u[k], v)
+		}
+	}
+}
+
+func (u labelUnion) merged() map[string]string {
+	if len(u) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(u))
+	for k, vs := range u {
+		out[k] = strings.Join(vs, "|")
+	}
+	return out
+}
+
+// Pool builds one report over the reps of an arm: the raw events of every run
+// merged, so the percentiles are exact over all of them; per-step barrier,
+// park and live the median across the reps; the run duration the median of
+// the runs' durations; Reps the number of runs. The reps must be complete
+// runs, each with a run event, distinct runs, no run id twice, and one
+// workload: the labels in LoaderLabelKeys must agree. Operator labels may
+// differ and then show every value, "|"-joined.
+func Pool(runs [][]Event) (*Report, error) {
+	var all []Event
+	seen := map[string]int{}
+	var shape map[string]string
+	for i, events := range runs {
+		first := i == 0
+		var run *Event
+		for j := range events {
+			if events[j].Event == EventRun {
+				run = &events[j]
+				break
+			}
+		}
+		if run == nil {
+			return nil, fmt.Errorf("rep %d has no run event: an interrupted run cannot be pooled", i+1)
+		}
+		if prev, dup := seen[run.RunID]; dup {
+			return nil, fmt.Errorf("rep %d repeats run id %q of rep %d", i+1, run.RunID, prev)
+		}
+		seen[run.RunID] = i + 1
+		if first {
+			shape = run.Labels
+		} else {
+			for _, k := range LoaderLabelKeys {
+				if shape[k] != run.Labels[k] {
+					return nil, fmt.Errorf("reps differ in %s (%q, %q): pool only reps of one workload", k, shape[k], run.Labels[k])
+				}
+			}
+		}
+		all = append(all, events...)
+	}
+	return Build(all), nil
+}
+
 func percentile(sorted []float64, p float64) float64 {
 	n := len(sorted)
 	if n == 0 {
@@ -410,10 +495,8 @@ func (rep *Report) WriteText(w io.Writer) {
 			for _, p := range g.Phases {
 				fmt.Fprintf(tw, "%s\t%s\t%d\t%.0f\t%.0f\t%.0f\n", label, p.Phase, p.Count, p.P50MS, p.P95MS, p.MaxMS)
 			}
-			for _, p := range []*PhaseStat{g.Outside, g.Cold, g.Warm} {
-				if p != nil {
-					fmt.Fprintf(tw, "%s\t%s\t%d\t%.0f\t%.0f\t%.0f\n", label, p.Phase, p.Count, p.P50MS, p.P95MS, p.MaxMS)
-				}
+			if p := g.Outside; p != nil {
+				fmt.Fprintf(tw, "%s\t%s\t%d\t%.0f\t%.0f\t%.0f\n", label, p.Phase, p.Count, p.P50MS, p.P95MS, p.MaxMS)
 			}
 			if g.Failed > 0 {
 				fmt.Fprintf(tw, "%s\tfailed\t%d\t\t\t\n", label, g.Failed)
@@ -479,11 +562,15 @@ func WriteComparison(w io.Writer, reps []*Report, names []string) {
 	}
 	fmt.Fprintln(tw)
 	row("mode", func(r *Report) string { return r.Mode })
+	row("reps", func(r *Report) string { return fmt.Sprintf("%d", r.Reps) })
 	row("tasks", func(r *Report) string { return fmt.Sprintf("%d", r.Tasks) })
 	row("failed", func(r *Report) string { return fmt.Sprintf("%d", r.Failed) })
 	row("reward_rate", func(r *Report) string { return fmt.Sprintf("%.3f", r.RewardRate) })
 	row("run_s", func(r *Report) string { return fmt.Sprintf("%.1f", r.RunMS/1000) })
 	for _, k := range labelKeys(reps) {
+		if k == "mode" {
+			continue // the mode row above says it
+		}
 		row(k, func(r *Report) string {
 			if v, ok := r.Labels[k]; ok {
 				return v
@@ -870,7 +957,7 @@ type PhaseStat struct {
 }
 
 // RestoreGroup is the phase breakdown of the restores paired with one kind
-// of event: ttfi (the environment's cold start) or wake.
+// of event: ttfi (the environment's first start) or wake.
 type RestoreGroup struct {
 	Restores int `json:"restores"`
 	// Failed counts records with an error.type; their phases are left out.
@@ -882,11 +969,6 @@ type RestoreGroup struct {
 	// Outside is the event's span minus atelet's total: ateapi, the
 	// scheduler, the router and the command itself. Nil when nothing paired.
 	Outside *PhaseStat `json:"outside,omitempty"`
-	// Cold and Warm split the paired events' spans by whether atelet unpacked
-	// image layers for the restore: cold means the node did not have the
-	// image, warm means it did. Nil when the kind did not occur.
-	Cold *PhaseStat `json:"cold,omitempty"`
-	Warm *PhaseStat `json:"warm,omitempty"`
 }
 
 // RestoreBreakdown is atelet's restore records joined to a run's events.
@@ -910,7 +992,7 @@ const pairSlack = 2 * time.Second
 // JoinRestores pairs each restore record with the ttfi or wake event of its
 // environment whose window, the event's end minus its duration up to its
 // end, contains the record's time. A record paired with a ttfi event is a
-// cold start; one paired with a wake is a wake. Records outside the run's
+// first start; one paired with a wake is a wake. Records outside the run's
 // span, for unknown actors, or inside no window are counted, not paired.
 func JoinRestores(events []Event, timings map[string][]RestoreTiming) *RestoreBreakdown {
 	b := &RestoreBreakdown{}
@@ -930,7 +1012,6 @@ func JoinRestores(events []Event, timings map[string][]RestoreTiming) *RestoreBr
 	}
 	var firstRecs, wakeRecs []RestoreTiming
 	var firstOutside, wakeOutside []float64
-	var firstCold, firstWarm, wakeCold, wakeWarm []float64
 	for actor, recs := range timings {
 		for _, rt := range recs {
 			if spanStart.IsZero() || rt.Time.Before(spanStart.Add(-pairSlack)) || rt.Time.After(spanEnd.Add(pairSlack)) {
@@ -956,9 +1037,9 @@ func JoinRestores(events []Event, timings map[string][]RestoreTiming) *RestoreBr
 				b.Unpaired++
 				continue
 			}
-			g, recsOut, outside, cold, warm := &b.Wakes, &wakeRecs, &wakeOutside, &wakeCold, &wakeWarm
+			g, recsOut, outside := &b.Wakes, &wakeRecs, &wakeOutside
 			if ev.Event == EventTTFI {
-				g, recsOut, outside, cold, warm = &b.First, &firstRecs, &firstOutside, &firstCold, &firstWarm
+				g, recsOut, outside = &b.First, &firstRecs, &firstOutside
 			}
 			if rt.Err != "" {
 				g.Failed++
@@ -970,17 +1051,10 @@ func JoinRestores(events []Event, timings map[string][]RestoreTiming) *RestoreBr
 				continue
 			}
 			*outside = append(*outside, ev.DurMS-rt.Phases["total"]*1000)
-			if rt.Phases["oci_unpack"] > 0 {
-				*cold = append(*cold, ev.DurMS)
-			} else {
-				*warm = append(*warm, ev.DurMS)
-			}
 		}
 	}
 	b.First.Restores, b.First.Phases, b.First.Outside = len(firstRecs), phaseStats(firstRecs), spanStat("outside", firstOutside)
-	b.First.Cold, b.First.Warm = spanStat("cold (image unpacked)", firstCold), spanStat("warm (image cached)", firstWarm)
 	b.Wakes.Restores, b.Wakes.Phases, b.Wakes.Outside = len(wakeRecs), phaseStats(wakeRecs), spanStat("outside", wakeOutside)
-	b.Wakes.Cold, b.Wakes.Warm = spanStat("cold (image unpacked)", wakeCold), spanStat("warm (image cached)", wakeWarm)
 	return b
 }
 

@@ -28,11 +28,16 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -50,7 +55,7 @@ func main() {
 	case "run":
 		err = runCmd(os.Args[2:])
 	case "report":
-		err = reportCmd(os.Args[2:])
+		err = reportCmd(os.Args[2:], os.Stdout)
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -87,7 +92,7 @@ func resolveAuthToken(file string, getenv func(string) string) (string, error) {
 	return token, nil
 }
 
-// labelFlags collects repeated KEY=VALUE flags (-label on run, -arm on report).
+// labelFlags collects repeated -label KEY=VALUE flags.
 type labelFlags map[string]string
 
 func (l labelFlags) String() string {
@@ -108,11 +113,85 @@ func (l labelFlags) Set(v string) error {
 	if !ok || k == "" {
 		return fmt.Errorf("want KEY=VALUE, got %q", v)
 	}
+	if strings.ContainsAny(v, "\t\n") {
+		return fmt.Errorf("label %q: no tabs or newlines, they break the report's table", v)
+	}
 	if _, dup := l[k]; dup {
 		return fmt.Errorf("%s is given twice", k)
 	}
 	l[k] = val
 	return nil
+}
+
+// arm is one -arm value: a column of the comparison and the files pooled
+// into it.
+type arm struct {
+	name  string
+	files []string
+}
+
+// armFlags collects repeated -arm NAME=FILE[,FILE...] flags in command-line
+// order, so the baseline given first is the first column.
+type armFlags []arm
+
+func (a *armFlags) String() string {
+	parts := make([]string, 0, len(*a))
+	for _, x := range *a {
+		parts = append(parts, x.name+"="+strings.Join(x.files, ","))
+	}
+	return strings.Join(parts, " ")
+}
+
+func (a *armFlags) Set(v string) error {
+	name, list, ok := strings.Cut(v, "=")
+	if !ok || name == "" || strings.TrimSpace(list) == "" {
+		return fmt.Errorf("want NAME=FILE[,FILE...], got %q", v)
+	}
+	for _, x := range *a {
+		if x.name == name {
+			return fmt.Errorf("arm %s is given twice", name)
+		}
+	}
+	var files []string
+	for _, f := range strings.Split(list, ",") {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			return fmt.Errorf("arm %s: empty file name in %q", name, list)
+		}
+		if slices.Contains(files, f) {
+			return fmt.Errorf("arm %s: %s is given twice", name, f)
+		}
+		files = append(files, f)
+	}
+	*a = append(*a, arm{name, files})
+	return nil
+}
+
+// datasetLabel is the dataset's file name. For an https URL that is the last
+// path element without the query, so a signed URL's signature stays out of
+// the events file, which operators share.
+func datasetLabel(dataset string) string {
+	if u, err := url.Parse(dataset); err == nil && u.Scheme != "" && u.Host != "" {
+		return path.Base(u.Path)
+	}
+	return filepath.Base(dataset)
+}
+
+// ownLabels are the loader's labels that only the command line knows (the
+// rest come from Config.labels); every key is in swebench.LoaderLabelKeys.
+func ownLabels(dataset string, connections int, baseTemplate, excludeFile string, instances []string) map[string]string {
+	l := map[string]string{
+		"dataset":       datasetLabel(dataset),
+		"connections":   strconv.Itoa(connections),
+		"base_template": baseTemplate,
+	}
+	if excludeFile != "" {
+		l["exclude_file"] = filepath.Base(excludeFile)
+	}
+	if len(instances) > 0 {
+		l["instances"] = strconv.Itoa(len(instances))
+	}
+	return l
 }
 
 func usage() {
@@ -148,7 +227,7 @@ func runCmd(args []string) (retErr error) {
 		authTokenFile = fs.String("auth-token-file", "", "File that holds the bearer token for ate-env-api; surrounding whitespace is ignored. Without it, SUBSTRATE_ENV_AUTH_TOKEN is used when set.")
 		labels        = labelFlags{}
 	)
-	fs.Var(labels, "label", "KEY=VALUE recorded on the run event, repeatable: the Substrate commit, the cluster, the arm. The loader records mode, width, images, trajectory, dataset and the shape flags itself; a -label with the same key wins.")
+	fs.Var(labels, "label", "KEY=VALUE recorded on the run event, repeatable: the Substrate commit, the cluster, the arm. The loader records its own flags itself (mode, width, images, trajectory, dataset, the shape flags, connections, base-template, exclude-file, instances and the timeouts); a -label with the same key wins.")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -239,8 +318,10 @@ func runCmd(args []string) (retErr error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if _, ok := labels["dataset"]; !ok {
-		labels["dataset"] = filepath.Base(*dataset)
+	for k, v := range ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, ids) {
+		if _, ok := labels[k]; !ok {
+			labels[k] = v
+		}
 	}
 	sum, err := swebench.Run(ctx, swebench.Config{
 		RunID:         *runID,
@@ -275,12 +356,12 @@ func runCmd(args []string) (retErr error) {
 	return nil
 }
 
-func reportCmd(args []string) error {
+func reportCmd(args []string, w io.Writer) error {
 	files, rest := leadingFiles(args)
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
-	arms := labelFlags{}
-	fs.Var(arms, "arm", "NAME=FILE[,FILE...], repeatable: one column per arm, its percentiles computed over the merged raw events of its files (the reps of one cluster or build). No positional files with -arm.")
-	top := fs.Int("top", 0, "List the N slowest first commands and wakes by environment. One file only.")
+	var arms armFlags
+	fs.Var(&arms, "arm", "NAME=FILE[,FILE...], repeatable: one column per arm, in flag order, its percentiles computed over the merged raw events of its files, the reps of one cluster or build, which must be complete runs of one workload (same loader labels, distinct run ids). A path may not contain a comma. No positional files with -arm.")
+	top := fs.Int("top", 0, "List the N slowest successful first commands and wakes by environment. One file only.")
 	jsonOut := fs.String("json", "", "Also write the summary as JSON to this path (an array when several files are given).")
 	unresolvedOut := fs.String("unresolved", "", "Write the unresolved instances to this path in -exclude-file format; one file only.")
 	unresolvedNote := fs.String("unresolved-note", "Instances graded unresolved", "First comment line of the -unresolved file.")
@@ -295,6 +376,9 @@ func reportCmd(args []string) error {
 		// dropped without a word.
 		return fmt.Errorf("unexpected arguments after the flags: %s; put every events file before the flags", strings.Join(fs.Args(), " "))
 	}
+	if *top < 0 {
+		return fmt.Errorf("-top wants 0 or more, got %d", *top)
+	}
 	if len(arms) > 0 {
 		if len(files) > 0 {
 			return fmt.Errorf("with -arm, give every events file inside an -arm value")
@@ -302,7 +386,7 @@ func reportCmd(args []string) error {
 		if *unresolvedOut != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" || *top > 0 {
 			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log and -top take one events file, not -arm")
 		}
-		return reportArms(arms, *jsonOut)
+		return reportArms(arms, *jsonOut, w)
 	}
 	if len(files) == 0 {
 		return fmt.Errorf("report needs at least one JSONL file, or -arm")
@@ -323,7 +407,7 @@ func reportCmd(args []string) error {
 		if *unresolvedOut != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" || *top > 0 {
 			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log and -top take one events file")
 		}
-		swebench.WriteComparison(os.Stdout, reps, files)
+		swebench.WriteComparison(w, reps, files)
 		if *jsonOut != "" {
 			b, err := json.MarshalIndent(reps, "", "  ")
 			if err != nil {
@@ -364,7 +448,7 @@ func reportCmd(args []string) error {
 	if *top > 0 {
 		rep.Slowest = swebench.Slowest(events, *top)
 	}
-	rep.WriteText(os.Stdout)
+	rep.WriteText(w)
 	if *unresolvedOut != "" {
 		uf, err := os.Create(*unresolvedOut)
 		if err != nil {
@@ -418,36 +502,30 @@ func loadCacheSample(path string) (*swebench.NodeCacheSample, error) {
 	return s, nil
 }
 
-// reportArms prints one column per arm, each over the merged raw events of
-// its files, so three reps of one cluster become one set of exact percentiles
-// rather than three columns to read by eye.
-func reportArms(arms labelFlags, jsonOut string) error {
+// reportArms prints one column per arm, each pooled over its files, so three
+// reps of one cluster become one set of exact percentiles rather than three
+// columns to read by eye.
+func reportArms(arms armFlags, jsonOut string, w io.Writer) error {
 	names := make([]string, 0, len(arms))
-	for name := range arms {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	reps := make([]*swebench.Report, 0, len(names))
-	for _, name := range names {
-		var events []swebench.Event
-		for _, path := range strings.Split(arms[name], ",") {
-			if path = strings.TrimSpace(path); path == "" {
-				continue
-			}
-			evs, err := readEventsFile(path)
+	reps := make([]*swebench.Report, 0, len(arms))
+	for _, a := range arms {
+		runs := make([][]swebench.Event, 0, len(a.files))
+		for _, file := range a.files {
+			evs, err := readEventsFile(file)
 			if err != nil {
-				return fmt.Errorf("arm %s: %s: %w", name, path, err)
+				return fmt.Errorf("arm %s: %s: %w", a.name, file, err)
 			}
-			events = append(events, evs...)
+			runs = append(runs, evs)
 		}
-		if len(events) == 0 {
-			return fmt.Errorf("arm %s has no events", name)
+		rep, err := swebench.Pool(runs)
+		if err != nil {
+			return fmt.Errorf("arm %s: %w", a.name, err)
 		}
-		rep := swebench.Build(events)
-		rep.RunID = name
+		rep.RunID = a.name
+		names = append(names, a.name)
 		reps = append(reps, rep)
 	}
-	swebench.WriteComparison(os.Stdout, reps, names)
+	swebench.WriteComparison(w, reps, names)
 	if jsonOut != "" {
 		b, err := json.MarshalIndent(reps, "", "  ")
 		if err != nil {

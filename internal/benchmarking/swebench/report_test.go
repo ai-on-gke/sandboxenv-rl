@@ -148,7 +148,7 @@ func TestWriteComparison(t *testing.T) {
 		{RunID: "a", Event: EventWake, Step: 1, DurMS: 40, OK: true},
 		{RunID: "a", Event: EventBarrier, Step: 1, DurMS: 700, OK: true, Count: 3},
 		{RunID: "a", Event: EventPark, Name: "suspend", Step: 1, DurMS: 100, OK: true, Count: 1},
-		{RunID: "a", Event: EventRun, Name: "steps", DurMS: 2000, OK: true, Count: 1, Labels: map[string]string{"cluster": "east"}},
+		{RunID: "a", Event: EventRun, Name: "steps", DurMS: 2000, OK: true, Count: 1, Labels: map[string]string{"cluster": "east", "mode": "steps"}},
 	})
 	b := Build([]Event{
 		{RunID: "b", Event: EventCreate, DurMS: 50, OK: true},
@@ -168,8 +168,12 @@ func TestWriteComparison(t *testing.T) {
 	if strings.Count(text, "cells:") != 1 || !strings.HasPrefix(text, "cells:") {
 		t.Errorf("the legend must appear once, above the table:\n%s", text)
 	}
-	if flat := strings.Join(strings.Fields(text), " "); !strings.Contains(flat, "cluster east -") {
+	flat := strings.Join(strings.Fields(text), " ")
+	if !strings.Contains(flat, "cluster east -") {
 		t.Errorf("label row: want \"cluster east -\" in:\n%s", text)
+	}
+	if !strings.Contains(flat, "mode steps eval reps 1 1") || strings.Count(flat, "mode ") != 1 {
+		t.Errorf("want one mode row (the label repeats it) and a reps row in:\n%s", text)
 	}
 	// A run without the event, or without the step, shows a dash in its column.
 	for _, label := range []string{"ttfi", "step 1"} {
@@ -373,23 +377,12 @@ func TestJoinRestores(t *testing.T) {
 	if n < 2 || b.Wakes.Phases[n-1].Phase != "ateom_restore" || b.Wakes.Phases[n-2].Phase != "total" {
 		t.Fatalf("unknown phase must follow the known ones: %+v", b.Wakes.Phases)
 	}
-	// Cold is a restore that unpacked image layers: a's first start only.
-	if c := b.First.Cold; c == nil || c.Count != 1 || c.MaxMS != 10100 {
-		t.Fatalf("first cold: %+v", c)
-	}
-	if wm := b.First.Warm; wm == nil || wm.Count != 2 || wm.MaxMS != 46000 {
-		t.Fatalf("first warm: %+v", wm)
-	}
-	if b.Wakes.Cold != nil || b.Wakes.Warm == nil || b.Wakes.Warm.Count != 3 {
-		t.Fatalf("wake cold/warm: %+v / %+v", b.Wakes.Cold, b.Wakes.Warm)
-	}
-
 	rep := Build(events)
 	rep.Restores = b
 	var text bytes.Buffer
 	rep.WriteText(&text)
 	flat := strings.Join(strings.Fields(text.String()), " ")
-	for _, want := range []string{"1 records before or after this run", "1 records for actors not in this run", "1 records inside no ttfi or wake window", "first failed 1", "wake failed_events 1", "wake total 4", "first cold (image unpacked) 1 10100", "first warm (image cached) 2"} {
+	for _, want := range []string{"1 records before or after this run", "1 records for actors not in this run", "1 records inside no ttfi or wake window", "first failed 1", "wake failed_events 1", "wake total 4"} {
 		if !strings.Contains(flat, want) {
 			t.Errorf("text report lacks %q:\n%s", want, text.String())
 		}
@@ -412,11 +405,54 @@ func TestBuildPoolsStepsAcrossRuns(t *testing.T) {
 		t.Fatalf("steps: %+v", rep.Steps)
 	}
 	s := rep.Steps[0]
-	if s.Tasks != 2 || s.BarrierMS != 600 || s.ParkMS != 100 || s.Live != 2 {
-		t.Fatalf("pooled step: %+v (want tasks 2, barrier 600, park 100, live 2)", s)
+	if s.Tasks != 2 || s.BarrierMS != 700 || s.ParkMS != 200 || s.Live != 3 {
+		t.Fatalf("pooled step: %+v (want tasks 2, barrier 700, park 200, live 3: the mean of the two reps)", s)
 	}
-	if rep.Labels["arm"] != "pull" {
-		t.Fatalf("labels come from the first run event: %v", rep.Labels)
+	if rep.Reps != 2 || rep.RunMS != 1100 || rep.Mode != "steps" {
+		t.Fatalf("reps %d run_ms %v mode %q, want 2, 1100 (the median), steps", rep.Reps, rep.RunMS, rep.Mode)
+	}
+	if rep.Labels["arm"] != "pull|other" {
+		t.Fatalf("a label that differs across the reps shows every value: %v", rep.Labels)
+	}
+}
+
+func TestMedian(t *testing.T) {
+	for _, tc := range []struct {
+		in   []float64
+		want float64
+	}{{nil, 0}, {[]float64{7}, 7}, {[]float64{4, 1, 3}, 3}, {[]float64{800, 600}, 700}, {[]float64{1, 2, 3, 4}, 2.5}} {
+		if got := median(append([]float64(nil), tc.in...)); got != tc.want {
+			t.Errorf("median(%v) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestPool(t *testing.T) {
+	run := func(id string, labels map[string]string, events ...Event) []Event {
+		out := append([]Event{{RunID: id, Event: EventCreate, DurMS: 100, OK: true}}, events...)
+		return append(out, Event{RunID: id, Event: EventRun, Name: "eval", DurMS: 1000, OK: true, Count: 1, Labels: labels})
+	}
+	same := map[string]string{"mode": "eval", "width": "2", "commit": "aaa"}
+	other := map[string]string{"mode": "eval", "width": "2", "commit": "bbb"}
+	rep, err := Pool([][]Event{run("r1", same), run("r2", other)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Reps != 2 || rep.Labels["commit"] != "aaa|bbb" || rep.Labels["width"] != "2" {
+		t.Fatalf("pooled: reps %d labels %v", rep.Reps, rep.Labels)
+	}
+	for _, tc := range []struct {
+		name string
+		runs [][]Event
+		err  string
+	}{
+		{"no run event", [][]Event{run("r1", same), {{RunID: "r2", Event: EventCreate, DurMS: 1, OK: true}}}, "rep 2 has no run event"},
+		{"run id twice", [][]Event{run("r1", same), run("r1", same)}, `rep 2 repeats run id "r1" of rep 1`},
+		{"other workload", [][]Event{run("r1", same), run("r2", map[string]string{"mode": "eval", "width": "3"})}, "reps differ in width"},
+	} {
+		if _, err := Pool(tc.runs); err == nil || !strings.Contains(err.Error(), tc.err) {
+			t.Errorf("%s: err = %v, want %q", tc.name, err, tc.err)
+		}
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -665,5 +666,23 @@ func TestValidateChecksTheLongestName(t *testing.T) {
 	cfg.Mode, cfg.TasksPerImage = ModeEval, 100001 // largest index 100000
 	if err := cfg.validate(); err == nil {
 		t.Fatal("eval mode with a 6-digit replay index: want the long name refused")
+	}
+}
+
+func TestLabelsAreDeclared(t *testing.T) {
+	cfg := Config{Mode: ModeSteps, Width: 3, Trajectory: &Trajectory{Name: "t"}, Rollouts: 2, Steps: 4, Park: ParkSuspend,
+		CreateTimeout: time.Minute, StepTimeout: time.Minute, WakeBudget: time.Minute, WakeBackoff: time.Second,
+		Labels: map[string]string{"commit": "abc", "width": "operator"}}
+	l := cfg.labels()
+	if l["commit"] != "abc" || l["width"] != "operator" || l["rollouts"] != "2" || l["wake_budget"] != "1m0s" {
+		t.Fatalf("labels = %v", l)
+	}
+	for k := range l {
+		if k == "commit" {
+			continue
+		}
+		if !slices.Contains(LoaderLabelKeys, k) {
+			t.Errorf("the loader records %s but LoaderLabelKeys lacks it, so report -arm would not compare it", k)
+		}
 	}
 }

@@ -33,10 +33,6 @@ extra every entry point is a no-op and enabling tracing logs one error naming
 the missing extra.
 """
 
-# pylint: disable=missing-function-docstring,missing-class-docstring
-# pylint: disable=global-statement,import-outside-toplevel,broad-exception-caught
-# pylint: disable=too-few-public-methods
-
 from __future__ import annotations
 
 import asyncio
@@ -214,7 +210,6 @@ def initialize_tracer(service_name: str) -> None:
       ``OTEL_EXPORTER_OTLP_ENDPOINT`` or ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT``
       is set, the client's own OTLP provider; else the no-op API proxy.
     """
-    _ = service_name
     if _load_otel() is None:
         _log_missing_extra()
 

@@ -15,7 +15,7 @@
 """Unit tests and microbenchmarks for W11 SDK telemetry and trace emission."""
 
 # pylint: disable=redefined-builtin,redefined-outer-name,protected-access
-# pylint: disable=too-many-locals,use-implicit-booleaness-not-comparison
+# pylint: disable=too-many-locals,too-many-statements,use-implicit-booleaness-not-comparison
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from typing import Any
 import grpc.aio
 import pytest
 
-from ate_env import AsyncSandboxFleet, Client, FleetConfig, Task
+from ate_env import AsyncSandboxFleet, Client, FleetConfig, SandboxFleet, Task
 from ate_env._gen.ateenv.v1alpha import env_pb2_grpc, guest_pb2_grpc
 from ate_env.telemetry import (
     _MAX_RESERVOIR_SAMPLES,
@@ -241,10 +241,11 @@ async def test_real_client_and_env_no_double_counting(
         assert rec["env"] == "real-sbx-1"
         assert rec["step"] == 3
 
-    # Verify direct client.get() was recorded with source="direct" (not hardcoded "warm_pool")
+    # Verify direct client.get() was recorded with source="direct" and event="get" (not "wake")
     flushed = telemetry.flush_step_events(step=3)
     get_events = [ev for ev in flushed if ev["tags"].get("op") == "get"]
     assert len(get_events) == 1
+    assert get_events[0]["event"] == "get"
     assert get_events[0]["tags"]["source"] == "direct"
     assert "source" not in get_events[0]
 
@@ -358,14 +359,17 @@ def test_strict_schema_validation_enforces_enums_types_and_formats(tmp_path: Pat
     with pytest.raises(ValueError, match="valid RFC3339 timestamp"):
         validate_trace_event_dict({**good_trace, "ts": "yesterday"})
 
-    # Empty env string rejected in both validator and trace-mode record_op
+    # Empty env string rejected in validator and TraceEventRecord.to_dict(),
+    # while record_op logs a warning and skips writing to trace.jsonl on empty env_id
     with pytest.raises(ValueError, match="env is required"):
         validate_trace_event_dict({**good_trace, "env": ""})
+    with pytest.raises(ValueError, match="env is required"):
+        TraceEventRecord(op="shell", dur_ms=1.0, job="j1", env="").to_dict()
 
     trace_tel = BenchTelemetry(mode="trace", job="j1", trace_path=tmp_path / "t.jsonl")
     try:
-        with pytest.raises(ValueError, match="env is required"):
-            trace_tel.record_op("shell", 1.0, ok=True, env_id="")
+        trace_tel.record_op("shell", 1.0, ok=True, env_id="")
+        assert (tmp_path / "t.jsonl").read_text(encoding="utf-8") == ""
     finally:
         trace_tel.close()
 
@@ -489,6 +493,7 @@ def test_trace_mode_requires_path_and_supports_artifact_dir_and_worker_shards(
     """Verify trace mode validates path configuration and writes per-worker event shards."""
     monkeypatch.delenv("ENV_BENCH_TRACE_PATH", raising=False)
     monkeypatch.delenv("ENV_BENCH_EVENTS_PATH", raising=False)
+    monkeypatch.delenv("ENV_BENCH_METRICS_PATH", raising=False)
     monkeypatch.delenv("ARTIFACT_DIR", raising=False)
 
     with pytest.raises(ValueError, match="trace mode requires trace_path"):
@@ -497,14 +502,43 @@ def test_trace_mode_requires_path_and_supports_artifact_dir_and_worker_shards(
     monkeypatch.setenv("ARTIFACT_DIR", str(tmp_path))
     telemetry = BenchTelemetry(mode="trace", job="art-job", worker_id="worker-7")
     telemetry.record_op("create", 4.2, ok=True, env_id="sbx-7", step=1)
+    # Empty env_id in trace mode logs a warning and skips writing to trace.jsonl
+    # rather than raising inside track()'s finally block.
+    telemetry.record_op("exec", 1.5, ok=True, env_id="", step=1)
     flushed = telemetry.flush_step_events(step=1)
-    assert len(flushed) == 1
+    assert len(flushed) == 2
 
     prom_out = telemetry.dump_prometheus()
     assert prom_out is not None and prom_out.exists()
     assert (tmp_path / "trace.jsonl").exists()
+    trace_lines = (tmp_path / "trace.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(trace_lines) == 1
     assert (tmp_path / "events" / "worker-7.jsonl").exists()
     telemetry.close()
+
+
+def test_sandbox_fleet_default_telemetry_reads_env_bench_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify SandboxFleet and AsyncSandboxFleet honor ENV_BENCH_MODE and telemetry= kwarg."""
+    monkeypatch.delenv("ARTIFACT_DIR", raising=False)
+    monkeypatch.delenv("ENV_BENCH_TRACE_PATH", raising=False)
+    monkeypatch.setenv("ENV_BENCH_MODE", "measure")
+
+    cfg = FleetConfig(backend="mock")
+    fleet = SandboxFleet(cfg)
+    assert fleet.telemetry.mode == "measure"
+    assert fleet.telemetry.run_id == fleet.run_id
+    fleet.close()
+
+    explicit_tel = BenchTelemetry(mode="measure", run_id="explicit-run", job="kwarg-job")
+    fleet_kw = SandboxFleet(FleetConfig(backend="mock"), telemetry=explicit_tel)
+    assert fleet_kw.telemetry is explicit_tel
+    fleet_kw.close()
+
+    async_fleet_kw = AsyncSandboxFleet(FleetConfig(backend="mock"), telemetry=explicit_tel)
+    assert async_fleet_kw.telemetry is explicit_tel
+    async_fleet_kw.close()
 
 
 @pytest.mark.asyncio
@@ -527,9 +561,13 @@ async def test_prometheus_label_escaping_and_error_truncation() -> None:
 
 @pytest.mark.asyncio
 async def test_substrate_driver_and_runtime_sdk_telemetry_integration(
-    local_grpc_stack: Any, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, local_grpc_stack: Any, tmp_path: Path
 ) -> None:
     """Verify Fleet, Driver, Runtime, and SandboxHandle emit W1 telemetry ops and ttfi/wake."""
+    monkeypatch.delenv("ARTIFACT_DIR", raising=False)
+    monkeypatch.delenv("ENV_BENCH_TRACE_PATH", raising=False)
+    monkeypatch.delenv("ENV_BENCH_EVENTS_PATH", raising=False)
+    monkeypatch.delenv("ENV_BENCH_METRICS_PATH", raising=False)
     client, _envs, processes, _fs = local_grpc_stack
     trace_file = tmp_path / "sdk_trace.jsonl"
     telemetry = BenchTelemetry(
@@ -554,10 +592,10 @@ async def test_substrate_driver_and_runtime_sdk_telemetry_integration(
     task2 = Task(id="t-cold", image=img)
     fleet.load_tasks([task1, task2])
 
-    # 1. Prewarm 1 sandbox -> records 'prewarm' in histograms/events (not trace.jsonl)
+    # 1. Prewarm 1 sandbox -> records 'prewarm' event and canonical 'create'+'suspend' trace lines
     await fleet.setup()
 
-    # 2. Acquire from warm pool -> records 'acquire' with source='warm_pool', cache_state='hit'
+    # 2. Acquire from warm pool -> records 'acquire' event and canonical 'wake' trace line
     handle_warm = await fleet.acquire(task1)
     await asyncio.sleep(0.03)
     processes.next_procs.append(FakeProc(chunks=[("stdout", b"warm-ready\n")], exit_code=0))
@@ -597,18 +635,32 @@ async def test_substrate_driver_and_runtime_sdk_telemetry_integration(
     assert stats["ttfi"]["max_ms"] > stats["exec"]["max_ms"]
 
     # Verify every line in trace.jsonl is strictly a canonical W1 TraceEvent
-    # and the first command is emitted once (under op="exec", not duplicated under ttfi/wake)
+    # and the Fleet lifecycle emits the full per-environment op sequence with image & instance
     trace_records = [
         json.loads(line)
         for line in trace_file.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert trace_records
+    assert [r["op"] for r in trace_records] == [
+        "create",
+        "suspend",
+        "wake",
+        "exec",
+        "suspend",
+        "delete",
+        "create",
+        "exec",
+        "delete",
+    ]
     for rec in trace_records:
         validate_trace_event_dict(rec)
         assert rec["op"] in CANONICAL_TRACE_OPS
-    exec_traces = [r for r in trace_records if r["op"] == "exec"]
-    assert len(exec_traces) == 2
+    assert trace_records[2]["env"] == handle_warm.sandbox_id
+    assert trace_records[2]["image"] == img
+    assert trace_records[2]["instance"] == "t-warm"
+    assert trace_records[6]["env"] == handle_cold.sandbox_id
+    assert trace_records[6]["image"] == img
+    assert trace_records[6]["instance"] == "t-cold"
 
     flushed = telemetry.flush_step_events(step=5)
     for ev in flushed:

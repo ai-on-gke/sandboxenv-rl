@@ -74,6 +74,12 @@ def run(coro):
     return asyncio.run(coro)
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_token(monkeypatch):
+    # A token in the developer's environment would change what the provider sends.
+    monkeypatch.delenv("SUBSTRATE_ENV_AUTH_TOKEN", raising=False)
+
+
 def _probe_count(fake: FakeAteEnv) -> int:
     return sum(1 for s in fake.starts if s["command"][-1:] == ["true"])
 
@@ -587,3 +593,77 @@ def test_endpoint_base_defaults_to_the_api_url():
     SandboxEndpoint(endpoint=cfg.endpoint_base(), headers={})
     with pytest.raises(ValueError, match="unknown option"):
         provider_mod.ConnectionConfig.from_mapping({"endpoint": "x"})
+
+
+# -- bearer token for an ate-env-api that requires one ------------------------
+
+
+def _token_file(tmp_path: Path, content: str) -> str:
+    path = tmp_path / "token"
+    path.write_text(content)
+    return str(path)
+
+
+def test_auth_token_file_reaches_the_api_and_the_endpoint(tmp_path):
+    async def t():
+        state = FakeAteEnv(require_token="s3cret")
+        token_file = _token_file(tmp_path, " s3cret\n")
+        async with stack(state=state, connection={"auth_token_file": token_file}) as (provider, fake):
+            handle = await provider.create(SandboxSpec(ports=(6000,)))
+            result = await provider.exec(handle, "echo hi")
+            assert result.return_code == 0
+            ep = await provider.endpoint(handle, 6000)
+            assert ep.headers["X-Env-Authorization"] == "Bearer s3cret"
+            await provider.close(handle)
+        # Lifecycle and guest calls, unary and streaming, all carried the token.
+        assert fake.auth_seen and all(v == ["Bearer s3cret"] for _, v in fake.auth_seen)
+        assert {m.rsplit("/", 1)[-1] for m, _ in fake.auth_seen} >= {
+            "CreateEnvironment", "GetEnvironment", "StartProcess", "DeleteEnvironment",
+        }
+        # The config names the file; the token is not in its repr.
+        assert "s3cret" not in repr(provider._connection)
+
+    run(t())
+
+
+def test_auth_token_comes_from_the_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("SUBSTRATE_ENV_AUTH_TOKEN", "from-env")
+
+    async def t():
+        async with stack(state=FakeAteEnv(require_token="from-env")) as (provider, _fake):
+            handle = await provider.create(SandboxSpec(ports=(6000,)))
+            ep = await provider.endpoint(handle, 6000)
+            assert ep.headers["X-Env-Authorization"] == "Bearer from-env"
+
+    run(t())
+    # The file wins over the environment.
+    cfg = provider_mod.ConnectionConfig.from_mapping({"auth_token_file": _token_file(tmp_path, "file")})
+    assert cfg.resolve_auth_token() == "file"
+
+
+def test_no_token_sends_no_credential():
+    async def t():
+        async with stack() as (provider, fake):
+            handle = await provider.create(SandboxSpec(ports=(6000,)))
+            await provider.exec(handle, "echo hi")
+            ep = await provider.endpoint(handle, 6000)
+            assert "X-Env-Authorization" not in ep.headers
+        assert fake.auth_seen and all(v == [] for _, v in fake.auth_seen)
+
+    run(t())
+
+
+def test_a_required_token_that_is_missing_fails_the_create():
+    async def t():
+        async with stack(state=FakeAteEnv(require_token="s3cret")) as (provider, _fake):
+            with pytest.raises(Exception, match="bearer token"):
+                await provider.create(SandboxSpec())
+
+    run(t())
+
+
+def test_an_empty_or_missing_token_file_is_a_config_error(tmp_path):
+    with pytest.raises(ValueError, match="is empty"):
+        SubstrateSandboxProvider({"connection": {"auth_token_file": _token_file(tmp_path, " \n")}})
+    with pytest.raises(ValueError, match="auth_token_file"):
+        SubstrateSandboxProvider({"connection": {"auth_token_file": str(tmp_path / "nope")}})

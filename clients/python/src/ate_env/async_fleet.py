@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# pylint: disable=missing-function-docstring,broad-exception-caught,unused-argument,protected-access,duplicate-code,line-too-long
 
 """`AsyncSandboxFleet` — an awaitable, event-loop-native fleet.
 
@@ -31,7 +30,7 @@ from typing import Any
 from .config import FleetConfig
 from .fleet import SandboxFleet
 from .handle import SandboxHandle
-from .telemetry import _CURRENT_SLOT_WAIT_MS, BenchTelemetry
+from .telemetry import _CURRENT_SLOT_WAIT_MS, _CURRENT_TASK_META, BenchTelemetry
 from .types import FleetPlan, Task
 
 logger = logging.getLogger("sandbox_sdk.async_fleet")
@@ -50,8 +49,9 @@ class AsyncSandboxFleet:
         driver: Any | None = None,
         *,
         sync_fleet: SandboxFleet | None = None,
+        telemetry: BenchTelemetry | dict[str, Any] | None = None,
     ):
-        self._fleet = sync_fleet or SandboxFleet(config, driver)
+        self._fleet = sync_fleet or SandboxFleet(config, driver, telemetry=telemetry)
 
     def close(self, *, wait: bool = True) -> None:
         """Close fleet resources."""
@@ -179,19 +179,25 @@ class AsyncSandboxFleet:
         else:
             template_id, rootfs_image = await self._ensure_template_for_image_async(task_obj.image)
         to_s = timeout_s or self.config.acquire_timeout_s
-
-        if hasattr(self.backend, "acquire_async"):
-            raw_inst = await self.backend.acquire_async(
-                template_id, self._fleet.run_id, timeout_s=to_s, rootfs_image=rootfs_image
-            )
-        else:
-            raw_inst = await asyncio.to_thread(
-                self.backend.acquire,
-                template_id,
-                self._fleet.run_id,
-                timeout_s=to_s,
-                rootfs_image=rootfs_image,
-            )
+        effective_img = rootfs_image or (
+            task_obj.image if task_obj.image and task_obj.image != "default" else template_id
+        )
+        meta_tok = _CURRENT_TASK_META.set((task_obj.id, effective_img))
+        try:
+            if hasattr(self.backend, "acquire_async"):
+                raw_inst = await self.backend.acquire_async(
+                    template_id, self._fleet.run_id, timeout_s=to_s, rootfs_image=rootfs_image
+                )
+            else:
+                raw_inst = await asyncio.to_thread(
+                    self.backend.acquire,
+                    template_id,
+                    self._fleet.run_id,
+                    timeout_s=to_s,
+                    rootfs_image=rootfs_image,
+                )
+        finally:
+            _CURRENT_TASK_META.reset(meta_tok)
 
         try:
             runtime, data_plane = self._fleet._build_runtime(raw_inst)

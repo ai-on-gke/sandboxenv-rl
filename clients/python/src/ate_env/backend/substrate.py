@@ -40,6 +40,7 @@ from ..errors import (
 from ..loop_runner import LoopRunner
 from ..telemetry import (
     _CURRENT_SLOT_WAIT_MS,
+    _CURRENT_TASK_META,
     _IN_TRACKED_LIFECYCLE,
     BenchTelemetry,
     instrument_client,
@@ -275,10 +276,15 @@ class SubstrateBackendDriver(BackendDriver):
         run_id: str,
         timeout_s: float = 180.0,
         rootfs_image: str | None = None,
+        *,
+        instance: str = "",
     ) -> RawSandboxInstance:
         """Acquire a live sandbox instance within timeout_s."""
         to_s = timeout_s or self.acquire_timeout_s
         slot_wait_ms = float(_CURRENT_SLOT_WAIT_MS.get() or 0.0)
+        task_id_ctx, task_img_ctx = _CURRENT_TASK_META.get()
+        effective_instance = instance or task_id_ctx
+        effective_image = rootfs_image or task_img_ctx or template_id
         t_wire0 = time.perf_counter()
         state: dict[str, Any] = {
             "source": "cold_create",
@@ -307,12 +313,15 @@ class SubstrateBackendDriver(BackendDriver):
                         wire_dur_ms,
                         ok=False,
                         env_id=str(state.get("actor_id") or template_id),
+                        image=effective_image,
+                        instance=effective_instance,
                         source=src,
                         cache_state="hit" if src == "warm_pool" else "miss",
                         slot_wait_ms=slot_wait_ms,
                         retried=int(state.get("retries") or 0),
                         timed_out=False,
                         err="CancelledError",
+                        trace_op="wake" if src == "warm_pool" else "create",
                     )
                 raise
             except asyncio.TimeoutError as e:
@@ -324,12 +333,15 @@ class SubstrateBackendDriver(BackendDriver):
                         wire_dur_ms,
                         ok=False,
                         env_id=str(state.get("actor_id") or template_id),
+                        image=effective_image,
+                        instance=effective_instance,
                         source=src,
                         cache_state="hit" if src == "warm_pool" else "miss",
                         slot_wait_ms=slot_wait_ms,
                         retried=int(state.get("retries") or 0),
                         timed_out=True,
                         err=f"SandboxStartError: Timed out acquiring sandbox for template {template_id}",
+                        trace_op="wake" if src == "warm_pool" else "create",
                     )
                 raise SandboxStartError(
                     f"Timed out acquiring sandbox for template {template_id} after {to_s:g}s"
@@ -344,12 +356,15 @@ class SubstrateBackendDriver(BackendDriver):
                         wire_dur_ms,
                         ok=False,
                         env_id=str(state.get("actor_id") or template_id),
+                        image=effective_image,
+                        instance=effective_instance,
                         source=src,
                         cache_state="hit" if src == "warm_pool" else "miss",
                         slot_wait_ms=slot_wait_ms,
                         retried=int(state.get("retries") or 0),
                         timed_out=timed_out,
                         err=f"{type(e).__name__}: {e}",
+                        trace_op="wake" if src == "warm_pool" else "create",
                     )
                 raise
             finally:
@@ -370,10 +385,13 @@ class SubstrateBackendDriver(BackendDriver):
                 wire_dur_ms,
                 ok=True,
                 env_id=inst.instance_id,
+                image=effective_image,
+                instance=effective_instance,
                 source=src,
                 cache_state=cache_state,
                 slot_wait_ms=slot_wait_ms,
                 retried=int(state.get("retries") or 0),
+                trace_op="wake" if src == "warm_pool" else "create",
             )
         return inst
 
@@ -475,9 +493,17 @@ class SubstrateBackendDriver(BackendDriver):
         run_id: str,
         timeout_s: float = 180.0,
         rootfs_image: str | None = None,
+        *,
+        instance: str = "",
     ) -> RawSandboxInstance:
         return self._sync(
-            self.acquire_async(template_id, run_id, timeout_s=timeout_s, rootfs_image=rootfs_image)
+            self.acquire_async(
+                template_id,
+                run_id,
+                timeout_s=timeout_s,
+                rootfs_image=rootfs_image,
+                instance=instance,
+            )
         )
 
     async def warm_pool_async(
@@ -525,17 +551,40 @@ class SubstrateBackendDriver(BackendDriver):
 
         async def _warm_one() -> str | None:
             actor_id = f"warm-{uuid.uuid4().hex[:10]}"
+            effective_image = rootfs_image or template_id
             async with sem:
                 token = _IN_TRACKED_LIFECYCLE.set(True)
                 try:
+                    t_c0 = time.perf_counter()
                     await self.client.create(
                         actor_id,
                         template_name=template_id,
                         atespace=self.atespace,
                         rootfs_image=rootfs_image,
                     )
+                    if self.telemetry is not None and getattr(self.telemetry, "mode", "off") == "trace":
+                        self.telemetry.record_op(
+                            "create",
+                            (time.perf_counter() - t_c0) * 1000.0,
+                            ok=True,
+                            env_id=actor_id,
+                            image=effective_image,
+                            source="warm_pool",
+                            trace_only=True,
+                        )
                     if wait:
+                        t_s0 = time.perf_counter()
                         await self.client.suspend(actor_id, atespace=self.atespace)
+                        if self.telemetry is not None and getattr(self.telemetry, "mode", "off") == "trace":
+                            self.telemetry.record_op(
+                                "suspend",
+                                (time.perf_counter() - t_s0) * 1000.0,
+                                ok=True,
+                                env_id=actor_id,
+                                image=effective_image,
+                                source="warm_pool",
+                                trace_only=True,
+                            )
                     else:
                         task = asyncio.create_task(self.client.suspend(actor_id, atespace=self.atespace))
                         self._background_tasks.add(task)
@@ -625,15 +674,42 @@ class SubstrateBackendDriver(BackendDriver):
 
         async def _delete_one(actor_id: str) -> None:
             async with sem:
+                with self._lock:
+                    inst = self._owned_actors.pop(actor_id, None)
+                effective_image = (
+                    (inst.rootfs_image or inst.template_id)
+                    if inst is not None
+                    else (rootfs_image or template_id)
+                )
                 token = _IN_TRACKED_LIFECYCLE.set(True)
+                t_d0 = time.perf_counter()
                 try:
                     await self.client.delete(actor_id, atespace=self.atespace)
+                    if self.telemetry is not None and getattr(self.telemetry, "mode", "off") == "trace":
+                        self.telemetry.record_op(
+                            "delete",
+                            (time.perf_counter() - t_d0) * 1000.0,
+                            ok=True,
+                            env_id=actor_id,
+                            image=effective_image,
+                            source="warm_pool",
+                            trace_only=True,
+                        )
                 except Exception as e:
+                    if self.telemetry is not None and getattr(self.telemetry, "mode", "off") == "trace":
+                        self.telemetry.record_op(
+                            "delete",
+                            (time.perf_counter() - t_d0) * 1000.0,
+                            ok=False,
+                            env_id=actor_id,
+                            image=effective_image,
+                            source="warm_pool",
+                            err=f"{type(e).__name__}: {e}",
+                            trace_only=True,
+                        )
                     logger.warning("Failed deleting warm actor %s: %s", actor_id, e)
                 finally:
                     _IN_TRACKED_LIFECYCLE.reset(token)
-                with self._lock:
-                    self._owned_actors.pop(actor_id, None)
 
         await asyncio.gather(*[_delete_one(aid) for aid in to_delete], return_exceptions=True)
         dur_ms = (time.perf_counter() - t_retire0) * 1000.0
@@ -770,19 +846,44 @@ class SubstrateBackendDriver(BackendDriver):
         async def _reap_one(aid: str) -> None:
             nonlocal reaped_count
             async with sem:
+                with self._lock:
+                    inst = self._owned_actors.pop(aid, None)
+                effective_image = (
+                    (inst.rootfs_image or inst.template_id) if inst is not None else ""
+                )
                 token = _IN_TRACKED_LIFECYCLE.set(True)
+                t_d0 = time.perf_counter()
                 try:
                     await self.client.delete(aid, atespace=self.atespace)
+                    if self.telemetry is not None and getattr(self.telemetry, "mode", "off") == "trace":
+                        self.telemetry.record_op(
+                            "delete",
+                            (time.perf_counter() - t_d0) * 1000.0,
+                            ok=True,
+                            env_id=aid,
+                            image=effective_image,
+                            source="warm_pool" if aid in warm_actors else "direct",
+                            trace_only=True,
+                        )
                     async with reap_lock:
                         reaped_count += 1
                 except Exception as e:
+                    if self.telemetry is not None and getattr(self.telemetry, "mode", "off") == "trace":
+                        self.telemetry.record_op(
+                            "delete",
+                            (time.perf_counter() - t_d0) * 1000.0,
+                            ok=False,
+                            env_id=aid,
+                            image=effective_image,
+                            source="warm_pool" if aid in warm_actors else "direct",
+                            err=f"{type(e).__name__}: {e}",
+                            trace_only=True,
+                        )
                     logger.warning("Failed deleting actor %s during reap: %s", aid, e)
                     async with reap_lock:
                         failed_actors.append(aid)
                 finally:
                     _IN_TRACKED_LIFECYCLE.reset(token)
-                with self._lock:
-                    self._owned_actors.pop(aid, None)
 
         t_reap0 = time.perf_counter()
         await asyncio.gather(*[_reap_one(aid) for aid in to_reap], return_exceptions=True)

@@ -20,6 +20,7 @@ import time; without the extra every call is a no-op.
 
 from .bench import (
     _CURRENT_SLOT_WAIT_MS,
+    _CURRENT_TASK_META,
     _IN_TRACKED_EXEC,
     _IN_TRACKED_LIFECYCLE,
     _IN_TRACKED_SHELL,
@@ -61,6 +62,7 @@ __all__ = [
     "TraceEventRecord",
     "TracerManager",
     "_CURRENT_SLOT_WAIT_MS",
+    "_CURRENT_TASK_META",
     "_IN_TRACKED_EXEC",
     "_IN_TRACKED_LIFECYCLE",
     "_IN_TRACKED_SHELL",

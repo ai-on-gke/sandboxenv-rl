@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# pylint: disable=missing-module-docstring,missing-function-docstring,too-many-instance-attributes,broad-exception-caught,import-outside-toplevel,duplicate-code,line-too-long
 
 from __future__ import annotations
 
@@ -29,7 +28,7 @@ from .config import FleetConfig
 from .handle import SandboxHandle
 from .runtime.base import RuntimeGuestHook
 from .strategies import STRATEGIES
-from .telemetry import BenchTelemetry
+from .telemetry import _CURRENT_TASK_META, BenchTelemetry
 from .telemetry.tracing import tracer_from_config
 from .types import (
     DataPlaneEndpoint,
@@ -49,7 +48,13 @@ class SandboxFleet:
     task acquisition, and execution strategies across any backend driver.
     """
 
-    def __init__(self, config: FleetConfig | None = None, driver: BackendDriver | None = None):
+    def __init__(
+        self,
+        config: FleetConfig | None = None,
+        driver: BackendDriver | None = None,
+        *,
+        telemetry: BenchTelemetry | dict[str, Any] | None = None,
+    ):
         self.config = config or FleetConfig()
         self.run_id = uuid.uuid4().hex[:12]
         self._tasks: list[Task] = []
@@ -59,16 +64,21 @@ class SandboxFleet:
         # Tracing (FleetConfig.tracing): spans on handles and the Substrate driver.
         self._tracer = tracer_from_config(self.config.tracing)
 
-        if isinstance(self.config.telemetry, BenchTelemetry):
-            self.telemetry = self.config.telemetry
-        elif isinstance(self.config.telemetry, dict):
-            self.telemetry = BenchTelemetry(**self.config.telemetry)
+        raw_telemetry = telemetry if telemetry is not None else self.config.telemetry
+        if isinstance(raw_telemetry, BenchTelemetry):
+            self.telemetry = raw_telemetry
+        elif isinstance(raw_telemetry, dict):
+            params = dict(raw_telemetry)
+            params.setdefault("run_id", self.run_id)
+            self.telemetry = BenchTelemetry(**params)
         else:
-            self.telemetry = BenchTelemetry(mode="off")
+            self.telemetry = BenchTelemetry(run_id=self.run_id)
 
         # Initialize Backend Driver
         if driver is not None:
             self.backend = driver
+            if hasattr(self.backend, "telemetry") and getattr(self.backend, "telemetry", None) is None:
+                self.backend.telemetry = self.telemetry
         elif self.config.backend == "mock":
             self.backend = MockBackendDriver()
         elif self.config.backend == "substrate":
@@ -237,9 +247,16 @@ class SandboxFleet:
             template_id, rootfs_image = self._ensure_template_for_image(task_obj.image)
 
         to_s = timeout_s or self.config.acquire_timeout_s
-        raw_inst = self.backend.acquire(
-            template_id, self.run_id, timeout_s=to_s, rootfs_image=rootfs_image
+        effective_img = rootfs_image or (
+            task_obj.image if task_obj.image and task_obj.image != "default" else template_id
         )
+        meta_tok = _CURRENT_TASK_META.set((task_obj.id, effective_img))
+        try:
+            raw_inst = self.backend.acquire(
+                template_id, self.run_id, timeout_s=to_s, rootfs_image=rootfs_image
+            )
+        finally:
+            _CURRENT_TASK_META.reset(meta_tok)
 
         try:
             runtime, data_plane = self._build_runtime(raw_inst)

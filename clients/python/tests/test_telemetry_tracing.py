@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# pylint: disable=missing-function-docstring,missing-class-docstring,import-outside-toplevel,import-error,global-statement,subprocess-run-check,redefined-outer-name,unused-variable,unused-argument,unnecessary-comprehension,too-few-public-methods,too-many-locals,protected-access,duplicate-code
 
 """Tracing: the no-op path, span names, nesting, and W3C context on the wire.
 

@@ -39,6 +39,7 @@ import contextvars
 import dataclasses
 import functools
 import json
+import logging
 import math
 import os
 import random
@@ -49,6 +50,8 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("ate_env.telemetry")
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -86,6 +89,10 @@ _IN_TRACKED_EXEC: contextvars.ContextVar[bool] = contextvars.ContextVar(
 # Task-local slot-wait latency observed at existing fleet concurrency boundaries.
 _CURRENT_SLOT_WAIT_MS: contextvars.ContextVar[float] = contextvars.ContextVar(
     "_ate_env_slot_wait_ms", default=0.0
+)
+# Task-local (instance_id, image_ref) metadata propagated from Fleet.acquire into driver.acquire.
+_CURRENT_TASK_META: contextvars.ContextVar[tuple[str, str]] = contextvars.ContextVar(
+    "_ate_env_task_meta", default=("", "")
 )
 
 
@@ -140,7 +147,7 @@ _DEFAULT_BUCKETS_MS: tuple[float, ...] = (
 _OP_TO_EVENT_KIND: dict[str, str] = {
     "acquire": "acquire",
     "create": "create",
-    "get": "wake",
+    "get": "get",
     "wake": "wake",
     "ttfi": "ttfi",
     "suspend": "suspend",
@@ -603,6 +610,8 @@ class BenchTelemetry:
         *,
         ok: bool = True,
         env_id: str = "",
+        image: str = "",
+        instance: str = "",
         step: int | None = None,
         step_name: str = "",
         command: Sequence[str] = (),
@@ -617,6 +626,8 @@ class BenchTelemetry:
         timed_out: bool = False,
         ts: str = "",
         emit_trace: bool = True,
+        trace_op: str = "",
+        trace_only: bool = False,
     ) -> None:
         """Record a completed SDK operation.
 
@@ -625,9 +636,11 @@ class BenchTelemetry:
         (``CANONICAL_TRACE_OPS``) with ``emit_trace=True`` are written to
         ``trace.jsonl``; higher-level fleet/sub-phase aggregates (``acquire``,
         ``ttfi``, ``prewarm``, ``retire``, ``reap``, ``task_exec``) are routed
-        to step-boundary ``Event`` records and Prometheus histograms.
+        to step-boundary ``Event`` records and Prometheus histograms unless
+        ``trace_op`` maps them to a canonical ``TraceEvent`` op (e.g.,
+        ``acquire`` -> ``create`` or ``wake``).
         """
-        if self.mode == "off":
+        if self.mode == "off" or (trace_only and self.mode != "trace"):
             return
 
         completion_ts = ts or _utc_now_iso()
@@ -637,81 +650,101 @@ class BenchTelemetry:
 
         with self._lock:
             effective_step = self.current_step if step is None else step
-            key = (op, source, cache_state, "true" if ok else "false")
-            hist = self._histograms.get(key)
-            if hist is None:
-                hist = _HistogramState()
-                self._histograms[key] = hist
-            hist.observe(dur_ms)
+            if not trace_only:
+                key = (op, source, cache_state, "true" if ok else "false")
+                hist = self._histograms.get(key)
+                if hist is None:
+                    hist = _HistogramState()
+                    self._histograms[key] = hist
+                hist.observe(dur_ms)
 
-            if slot_wait_ms > 0.0:
-                sw_hist = self._slot_wait_histograms.get(op)
-                if sw_hist is None:
-                    sw_hist = _HistogramState()
-                    self._slot_wait_histograms[op] = sw_hist
-                sw_hist.observe(slot_wait_ms)
+                if slot_wait_ms > 0.0:
+                    sw_hist = self._slot_wait_histograms.get(op)
+                    if sw_hist is None:
+                        sw_hist = _HistogramState()
+                        self._slot_wait_histograms[op] = sw_hist
+                    sw_hist.observe(slot_wait_ms)
 
-            if not ok:
-                self._counters[(op, "error")] = self._counters.get((op, "error"), 0) + 1
-            if retried > 0:
-                self._counters[(op, "retry")] = self._counters.get((op, "retry"), 0) + retried
-            if timed_out:
-                self._counters[(op, "timeout")] = self._counters.get((op, "timeout"), 0) + 1
+                if not ok:
+                    self._counters[(op, "error")] = self._counters.get((op, "error"), 0) + 1
+                if retried > 0:
+                    self._counters[(op, "retry")] = (
+                        self._counters.get((op, "retry"), 0) + retried
+                    )
+                if timed_out:
+                    self._counters[(op, "timeout")] = (
+                        self._counters.get((op, "timeout"), 0) + 1
+                    )
 
-            effective_name = step_name or op
-            agg_key = (op, effective_name, source, effective_step)
-            agg = self._step_aggregates.get(agg_key)
-            if agg is None:
-                agg = _StepAggregate(
-                    op=op,
-                    name=effective_name,
-                    source=source,
-                    step=effective_step,
-                )
-                self._step_aggregates[agg_key] = agg
-            agg.observe(
-                ts=completion_ts,
-                dur_ms=dur_ms,
-                ok=ok,
-                env_id=env_id,
-                bytes_count=bytes_count,
-                exit_code=exit_code,
-                err=formatted_err,
-                cache_state=cache_state,
-                slot_wait_ms=slot_wait_ms,
-                retried=retried,
-                timed_out=timed_out,
-            )
-
-            # Guardrail 4: Per-call JSONL file logging is strictly restricted to trace mode
-            # and canonical W1 TraceEvent operations.
-            if self.mode == "trace" and emit_trace and op in CANONICAL_TRACE_OPS:
-                record = TraceEventRecord(
-                    op=op,
+                effective_name = step_name or op
+                agg_key = (op, effective_name, source, effective_step)
+                agg = self._step_aggregates.get(agg_key)
+                if agg is None:
+                    agg = _StepAggregate(
+                        op=op,
+                        name=effective_name,
+                        source=source,
+                        step=effective_step,
+                    )
+                    self._step_aggregates[agg_key] = agg
+                agg.observe(
+                    ts=completion_ts,
                     dur_ms=dur_ms,
                     ok=ok,
-                    ts=completion_ts,
-                    run=self.run_id,
-                    job=self.job,
-                    env=env_id,
-                    step=effective_step,
-                    command=command,
-                    path=path,
+                    env_id=env_id,
                     bytes_count=bytes_count,
                     exit_code=exit_code,
                     err=formatted_err,
+                    cache_state=cache_state,
+                    slot_wait_ms=slot_wait_ms,
+                    retried=retried,
+                    timed_out=timed_out,
                 )
-                payload = record.to_dict()
-                line_bytes = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
-                if self._trace_fd is None and self.trace_path is not None:
-                    self.trace_path.parent.mkdir(parents=True, exist_ok=True)
-                    self._trace_fd = os.open(
-                        str(self.trace_path),
-                        os.O_APPEND | os.O_CREAT | os.O_WRONLY,
-                        0o644,
+
+            # Guardrail 4: Per-call JSONL file logging is strictly restricted to trace mode
+            # and canonical W1 TraceEvent operations.
+            effective_trace_op = trace_op or (op if op in CANONICAL_TRACE_OPS else "")
+            if (
+                self.mode == "trace"
+                and emit_trace
+                and effective_trace_op in CANONICAL_TRACE_OPS
+            ):
+                if not env_id or not env_id.strip():
+                    logger.warning(
+                        "Skipping W1 TraceEvent %r in trace mode because env_id is empty",
+                        effective_trace_op,
                     )
-                if self._trace_fd is not None:
-                    os.write(self._trace_fd, line_bytes)
+                else:
+                    record = TraceEventRecord(
+                        op=effective_trace_op,
+                        dur_ms=dur_ms,
+                        ok=ok,
+                        ts=completion_ts,
+                        run=self.run_id,
+                        job=self.job,
+                        env=env_id,
+                        instance=instance,
+                        image=image,
+                        step=effective_step,
+                        command=command,
+                        path=path,
+                        bytes_count=bytes_count,
+                        exit_code=exit_code,
+                        err=formatted_err,
+                    )
+                    payload = record.to_dict()
+                    line_bytes = (json.dumps(payload, separators=(",", ":")) + "\n").encode(
+                        "utf-8"
+                    )
+                    if self._trace_fd is None and self.trace_path is not None:
+                        self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+                        self._trace_fd = os.open(
+                            str(self.trace_path),
+                            os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+                            0o644,
+                        )
+                    if self._trace_fd is not None:
+                        os.write(self._trace_fd, line_bytes)
 
     @contextlib.asynccontextmanager
     async def track(
@@ -719,6 +752,8 @@ class BenchTelemetry:
         op: str,
         *,
         env_id: str = "",
+        image: str = "",
+        instance: str = "",
         step: int | None = None,
         step_name: str = "",
         command: Sequence[str] = (),
@@ -726,6 +761,7 @@ class BenchTelemetry:
         bytes_count: int = 0,
         source: str = "direct",
         cache_state: str = "unknown",
+        trace_op: str = "",
     ) -> AsyncIterator[dict[str, Any]]:
         """Async context manager that times an SDK call and records telemetry."""
         if self.mode == "off":
@@ -734,6 +770,8 @@ class BenchTelemetry:
 
         ctx_meta: dict[str, Any] = {
             "env_id": env_id,
+            "image": image,
+            "instance": instance,
             "step_name": step_name,
             "bytes": bytes_count,
             "exit_code": None,
@@ -742,6 +780,7 @@ class BenchTelemetry:
             "slot_wait_ms": 0.0,
             "retried": 0,
             "timed_out": False,
+            "trace_op": trace_op,
         }
         start = time.perf_counter()
         ok = True
@@ -769,6 +808,8 @@ class BenchTelemetry:
                 dur_ms,
                 ok=ok,
                 env_id=str(ctx_meta.get("env_id") or env_id),
+                image=str(ctx_meta.get("image") or image),
+                instance=str(ctx_meta.get("instance") or instance),
                 step=step,
                 step_name=str(ctx_meta.get("step_name") or step_name),
                 command=command,
@@ -781,6 +822,7 @@ class BenchTelemetry:
                 slot_wait_ms=float(ctx_meta.get("slot_wait_ms") or 0.0),
                 retried=int(ctx_meta.get("retried") or 0),
                 timed_out=bool(ctx_meta.get("timed_out")),
+                trace_op=str(ctx_meta.get("trace_op") or trace_op),
             )
 
     def render_prometheus(self) -> str:
@@ -932,6 +974,10 @@ class BenchTelemetry:
         ``(op, name, source, step)`` key: ``dur_ms`` is the total duration
         across those ``count`` operations, while ``metrics["dur_ms_mean"]``
         and ``metrics["dur_ms_max"]`` report the per-operation mean and max.
+
+        Note on ``ttfi``: SDK ``ttfi`` measures the Ready-to-first-command-end
+        sub-phase (``acquire`` measures create/claim-start to Ready, so total
+        create-start to first-command completion is ``acquire + ttfi``).
         """
         with self._lock:
             effective_step = self.current_step if step is None else step

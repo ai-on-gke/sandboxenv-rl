@@ -249,14 +249,21 @@ func (in Instance) Validate() error {
 // RequireGrading checks that every instance carries what a grading
 // trajectory needs (an eval script and a log parser for SWE-bench), so a
 // missing field is a configuration error before the run and not a reward of
-// zero after it. A trajectory that only exercises the image (a pull or compile
-// workload) does not need them, so this is applied only when the trajectory
-// grades.
-func RequireGrading(instances []Instance) error {
+// zero after it. When a trajectory is supplied, each instance's adapter
+// decides via Adapter.Grades whether that trajectory requires grading material
+// for that instance's Kind.
+func RequireGrading(instances []Instance, traj ...*Trajectory) error {
+	var t *Trajectory
+	if len(traj) > 0 {
+		t = traj[0]
+	}
 	for _, in := range instances {
 		a := AdapterFor(in.Kind)
 		if a == nil {
 			return fmt.Errorf("%s: no dataset adapter registered for kind %q", in.InstanceID, in.Kind)
+		}
+		if t != nil && !a.Grades(t) {
+			continue
 		}
 		if err := a.RequireGrading(in); err != nil {
 			return err

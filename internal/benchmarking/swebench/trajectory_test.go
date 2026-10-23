@@ -273,3 +273,49 @@ steps:
 		t.Fatal("TemplateData error must fail Render")
 	}
 }
+
+type alwaysGradesAdapter struct{}
+
+func (alwaysGradesAdapter) Kind() string            { return "always-grades" }
+func (alwaysGradesAdapter) Validate(Instance) error { return nil }
+func (alwaysGradesAdapter) RequireGrading(in Instance) error {
+	if len(in.Material) == 0 {
+		return os.ErrInvalid
+	}
+	return nil
+}
+func (alwaysGradesAdapter) TemplateData(in Instance) (any, error) { return in, nil }
+func (alwaysGradesAdapter) Grades(*Trajectory) bool {
+	// Exercise a recursive AdapterFor lookup inside Grades while a concurrent
+	// writer might contend on adaptersMu.
+	_ = AdapterFor(DefaultKind)
+	return true
+}
+func (alwaysGradesAdapter) Grader() Grader { return nil }
+
+func TestGradesPerInstanceKindAndLockSafety(t *testing.T) {
+	RegisterAdapter(alwaysGradesAdapter{})
+	t.Cleanup(func() { unregisterAdapter("always-grades") })
+
+	workload, err := LoadTrajectory("workload-file-read")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An unrelated registered adapter that always returns true from Grades must
+	// not cause default SWE-bench trajectories or instances to require grading.
+	if workload.Grades() || workload.Grades(DefaultKind) {
+		t.Fatal("workload-file-read must not grade for DefaultKind even when always-grades is registered")
+	}
+	if !workload.Grades("always-grades") {
+		t.Fatal("workload-file-read must report Grades=true when queried for always-grades")
+	}
+
+	sweImageOnly := []Instance{{InstanceID: "swe-1", Image: "reg/img@" + goodDigest}}
+	if err := RequireGrading(sweImageOnly, workload); err != nil {
+		t.Fatalf("SWE-bench image-only instance with non-grading trajectory: got %v, want nil", err)
+	}
+	customMissing := []Instance{{InstanceID: "cust-1", Image: "reg/img@" + goodDigest, Kind: "always-grades"}}
+	if err := RequireGrading(customMissing, workload); err == nil {
+		t.Fatal("always-grades instance without grading material must fail RequireGrading")
+	}
+}

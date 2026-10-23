@@ -79,7 +79,6 @@ type EnvBackend struct {
 	next             atomic.Uint64
 	atespace         string
 	baseTemplate     string
-	authToken        string
 	minPoll, maxPoll time.Duration
 }
 
@@ -92,12 +91,12 @@ func NewEnvBackend(endpoint, atespace, baseTemplate string, connections int, aut
 	if connections < 1 {
 		connections = 1
 	}
-	b := &EnvBackend{atespace: atespace, baseTemplate: baseTemplate, authToken: authToken}
+	b := &EnvBackend{atespace: atespace, baseTemplate: baseTemplate}
 	for _, opt := range opts {
 		opt(b)
 	}
 	for i := 0; i < connections; i++ {
-		c, err := env.NewClient(env.ClientOptions{Endpoint: endpoint, AuthToken: b.authToken})
+		c, err := env.NewClient(env.ClientOptions{Endpoint: endpoint, AuthToken: authToken})
 		if err != nil {
 			b.Close()
 			return nil, err

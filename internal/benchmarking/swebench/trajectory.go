@@ -100,11 +100,13 @@ type Step struct {
 	// Timeout bounds a Run step; zero means the runner's default.
 	Timeout Duration `json:"timeout,omitempty"`
 	// ExpectExit, when set, fails the task if the exit code differs. A
-	// Reward step never fails the task on exit code: its exit code is the
-	// reward.
+	// Reward step never fails the task on exit code: its output or exit
+	// code decides the reward.
 	ExpectExit *int `json:"expect_exit,omitempty"`
-	// Reward marks the step whose exit code decides the task reward:
-	// 1 when it exits 0, else 0. At most one step per trajectory.
+	// Reward marks the step that decides the task reward: the dataset
+	// adapter's Grader parses its output when present, falling back to 1
+	// when the step exits 0 and 0 otherwise. At most one step per
+	// trajectory.
 	Reward bool `json:"reward,omitempty"`
 }
 
@@ -259,14 +261,27 @@ func (s Step) validate() error {
 }
 
 // Grades reports whether the trajectory uses the instance's grading
-// material as determined by any registered dataset adapter (for SWE-bench: a
-// step references the eval script or the log parser, or hands the whole
-// instance to a script). Such a trajectory needs RequireGrading on its
-// dataset.
-func (t *Trajectory) Grades() bool {
+// material for any of the given dataset kinds (defaulting to DefaultKind when
+// no kinds are specified; for SWE-bench, a step references the eval script or
+// the log parser, or hands the whole instance to a script). Adapter lookups are
+// snapshotted before invoking Adapter.Grades so a recursive AdapterFor inside
+// an adapter cannot deadlock on adaptersMu.
+func (t *Trajectory) Grades(kinds ...string) bool {
+	if len(kinds) == 0 {
+		kinds = []string{DefaultKind}
+	}
+	snapshot := make([]Adapter, 0, len(kinds))
 	adaptersMu.RLock()
-	defer adaptersMu.RUnlock()
-	for _, a := range adapters {
+	for _, k := range kinds {
+		if k == "" {
+			k = DefaultKind
+		}
+		if a := adapters[k]; a != nil {
+			snapshot = append(snapshot, a)
+		}
+	}
+	adaptersMu.RUnlock()
+	for _, a := range snapshot {
 		if a.Grades(t) {
 			return true
 		}

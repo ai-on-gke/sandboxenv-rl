@@ -225,6 +225,30 @@ func TestBuildAndSummarizeParity(t *testing.T) {
 	if !reflect.DeepEqual(fromBuild, fromStream) {
 		t.Fatalf("Build vs Summarize mismatch:\nBuild:     %+v\nSummarize: %+v", fromBuild, fromStream)
 	}
+	if fromStream.RunID != "parity" || fromStream.Mode != "steps" || fromStream.RunMS != 2500 {
+		t.Fatalf("unexpected header: %+v", fromStream)
+	}
+	if fromStream.Tasks != 3 || fromStream.Failed != 1 || fromStream.Rewarded != 1 || fromStream.RewardRate != 1.0/3.0 {
+		t.Fatalf("unexpected task totals: Tasks=%d Failed=%d Rewarded=%d RewardRate=%v",
+			fromStream.Tasks, fromStream.Failed, fromStream.Rewarded, fromStream.RewardRate)
+	}
+	if len(fromStream.Errors) != 1 || fromStream.Errors[0] != (ErrorCount{Err: "create boom", Count: 1}) {
+		t.Fatalf("unexpected errors: %+v", fromStream.Errors)
+	}
+	wantUnresolved := []Unresolved{
+		{Instance: "repo__a-1", Reason: "f2p 0/1 p2p 3/3"},
+		{Instance: "repo__a-2", Reason: "f2p 0/2 p2p 1/1"},
+	}
+	if !reflect.DeepEqual(fromStream.Unresolved, wantUnresolved) {
+		t.Fatalf("unexpected unresolved: got %+v, want %+v", fromStream.Unresolved, wantUnresolved)
+	}
+	wantSteps := []StepStat{
+		{Step: 1, Tasks: 2, Failed: 1, Rewarded: 0, Live: 2, BarrierMS: 1250, ParkMS: 80},
+		{Step: 2, Tasks: 1, Failed: 0, Rewarded: 1, WakeP50MS: 35, WakeP95MS: 35},
+	}
+	if !reflect.DeepEqual(fromStream.Steps, wantSteps) {
+		t.Fatalf("unexpected steps: got %+v, want %+v", fromStream.Steps, wantSteps)
+	}
 }
 
 func TestWriteComparison(t *testing.T) {

@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.resources
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -724,3 +725,20 @@ async def test_concurrent_async_overhead_benchmark() -> None:
     for hist in measure_telemetry._histograms.values():
         assert len(hist.reservoir) <= _MAX_RESERVOIR_SAMPLES
     assert len(measure_telemetry._step_aggregates) <= 2
+
+
+def test_package_data_includes_w1_schemas() -> None:
+    """Verify pyproject.toml packages W1 schemas and importlib.resources resolves them."""
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    pyproject_text = pyproject_path.read_text(encoding="utf-8")
+    assert '"schemas/v1/*.json"' in pyproject_text
+    assert (
+        importlib.resources.files("ate_env")
+        .joinpath("schemas", "v1", "trace_event.schema.json")
+        .is_file()
+    )
+    assert (
+        importlib.resources.files("ate_env")
+        .joinpath("schemas", "v1", "event.schema.json")
+        .is_file()
+    )

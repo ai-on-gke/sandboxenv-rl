@@ -308,11 +308,12 @@ class SubstrateBackendDriver(BackendDriver):
                 wire_dur_ms = (time.perf_counter() - t_wire0) * 1000.0
                 if self.telemetry is not None and getattr(self.telemetry, "mode", "off") != "off":
                     src = str(state.get("source") or "cold_create")
+                    actor_id = str(state.get("actor_id") or "")
                     self.telemetry.record_op(
                         "acquire",
                         wire_dur_ms,
                         ok=False,
-                        env_id=str(state.get("actor_id") or template_id),
+                        env_id=actor_id,
                         image=effective_image,
                         instance=effective_instance,
                         source=src,
@@ -322,17 +323,19 @@ class SubstrateBackendDriver(BackendDriver):
                         timed_out=False,
                         err="CancelledError",
                         trace_op="wake" if src == "warm_pool" else "create",
+                        emit_trace=bool(actor_id),
                     )
                 raise
             except asyncio.TimeoutError as e:
                 wire_dur_ms = (time.perf_counter() - t_wire0) * 1000.0
                 if self.telemetry is not None and getattr(self.telemetry, "mode", "off") != "off":
                     src = str(state.get("source") or "cold_create")
+                    actor_id = str(state.get("actor_id") or "")
                     self.telemetry.record_op(
                         "acquire",
                         wire_dur_ms,
                         ok=False,
-                        env_id=str(state.get("actor_id") or template_id),
+                        env_id=actor_id,
                         image=effective_image,
                         instance=effective_instance,
                         source=src,
@@ -342,6 +345,7 @@ class SubstrateBackendDriver(BackendDriver):
                         timed_out=True,
                         err=f"SandboxStartError: Timed out acquiring sandbox for template {template_id}",
                         trace_op="wake" if src == "warm_pool" else "create",
+                        emit_trace=bool(actor_id),
                     )
                 raise SandboxStartError(
                     f"Timed out acquiring sandbox for template {template_id} after {to_s:g}s"
@@ -350,12 +354,13 @@ class SubstrateBackendDriver(BackendDriver):
                 wire_dur_ms = (time.perf_counter() - t_wire0) * 1000.0
                 if self.telemetry is not None and getattr(self.telemetry, "mode", "off") != "off":
                     src = str(state.get("source") or "cold_create")
+                    actor_id = str(state.get("actor_id") or "")
                     timed_out = "timed out" in str(e).lower()
                     self.telemetry.record_op(
                         "acquire",
                         wire_dur_ms,
                         ok=False,
-                        env_id=str(state.get("actor_id") or template_id),
+                        env_id=actor_id,
                         image=effective_image,
                         instance=effective_instance,
                         source=src,
@@ -365,6 +370,7 @@ class SubstrateBackendDriver(BackendDriver):
                         timed_out=timed_out,
                         err=f"{type(e).__name__}: {e}",
                         trace_op="wake" if src == "warm_pool" else "create",
+                        emit_trace=bool(actor_id),
                     )
                 raise
             finally:
@@ -586,7 +592,28 @@ class SubstrateBackendDriver(BackendDriver):
                                 trace_only=True,
                             )
                     else:
-                        task = asyncio.create_task(self.client.suspend(actor_id, atespace=self.atespace))
+                        async def _pause_bg(aid: str, img: str) -> None:
+                            bg_token = _IN_TRACKED_LIFECYCLE.set(True)
+                            try:
+                                t_s0 = time.perf_counter()
+                                await self.client.suspend(aid, atespace=self.atespace)
+                                if (
+                                    self.telemetry is not None
+                                    and getattr(self.telemetry, "mode", "off") == "trace"
+                                ):
+                                    self.telemetry.record_op(
+                                        "suspend",
+                                        (time.perf_counter() - t_s0) * 1000.0,
+                                        ok=True,
+                                        env_id=aid,
+                                        image=img,
+                                        source="warm_pool",
+                                        trace_only=True,
+                                    )
+                            finally:
+                                _IN_TRACKED_LIFECYCLE.reset(bg_token)
+
+                        task = asyncio.create_task(_pause_bg(actor_id, effective_image))
                         self._background_tasks.add(task)
                         def _done(t: asyncio.Task[Any]) -> None:
                             self._background_tasks.discard(t)

@@ -38,6 +38,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+import importlib.resources
 import json
 import logging
 import math
@@ -96,8 +97,87 @@ _CURRENT_TASK_META: contextvars.ContextVar[tuple[str, str]] = contextvars.Contex
 )
 
 
+_FALLBACK_SCHEMAS: dict[str, dict[str, Any]] = {
+    "trace_event.schema.json": {
+        "required": ["ts", "env", "op", "dur_ms", "ok"],
+        "properties": {
+            "schema_version": {"type": "string", "enum": ["v1"]},
+            "ts": {"type": "string", "minLength": 1},
+            "run": {"type": "string"},
+            "job": {"type": "string"},
+            "env": {"type": "string", "minLength": 1},
+            "instance": {"type": "string"},
+            "image": {"type": "string"},
+            "step": {"type": "integer", "minimum": 0},
+            "op": {
+                "type": "string",
+                "enum": [
+                    "create",
+                    "exec",
+                    "write_file",
+                    "read_file",
+                    "suspend",
+                    "wake",
+                    "fork",
+                    "delete",
+                    "get",
+                    "start_process",
+                    "shell",
+                ],
+            },
+            "command": {"type": "array", "items": {"type": "string"}},
+            "path": {"type": "string"},
+            "bytes": {"type": "integer", "minimum": 0},
+            "dur_ms": {"type": "number", "minimum": 0},
+            "exit": {"type": "integer"},
+            "ok": {"type": "boolean"},
+            "err": {"type": "string"},
+        },
+    },
+    "event.schema.json": {
+        "required": ["ts", "run", "event", "dur_ms", "ok"],
+        "properties": {
+            "schema_version": {"type": "string", "enum": ["v1"]},
+            "ts": {"type": "string", "minLength": 1},
+            "run": {"type": "string", "minLength": 1},
+            "job": {"type": "string"},
+            "worker": {"type": "string"},
+            "event": {"type": "string", "minLength": 1},
+            "name": {"type": "string"},
+            "phase": {"type": "string"},
+            "source": {
+                "type": "string",
+                "enum": ["warm_pool", "cold_create", "golden_restore", "fork", "resume"],
+            },
+            "env": {"type": "string"},
+            "instance": {"type": "string"},
+            "image": {"type": "string"},
+            "task": {"type": "integer", "minimum": 0},
+            "step": {"type": "integer", "minimum": 0},
+            "dur_ms": {"type": "number", "minimum": 0},
+            "slot_wait_ms": {"type": "number", "minimum": 0},
+            "ok": {"type": "boolean"},
+            "timeout": {"type": "boolean"},
+            "exit": {"type": "integer"},
+            "reward": {"type": "integer"},
+            "detail": {"type": "string"},
+            "attempts": {"type": "integer", "minimum": 0},
+            "count": {"type": "integer", "minimum": 0},
+            "err": {"type": "string"},
+            "tail": {"type": "string"},
+            "snapshot": {"type": "string"},
+            "node": {"type": "string"},
+            "bytes": {"type": "integer", "minimum": 0},
+            "cache_hit": {"type": "boolean"},
+            "tags": {"type": "object", "additionalProperties": {"type": "string"}},
+            "metrics": {"type": "object", "additionalProperties": {"type": "number"}},
+        },
+    },
+}
+
+
 def _load_w1_schema(filename: str) -> dict[str, Any]:
-    """Load a W1 JSON Schema file from the repo or bundled package schemas."""
+    """Load a W1 JSON Schema file from the repo, package resources, or fallback."""
     here = Path(__file__).resolve()
     repo_candidate = (
         here.parents[5] / "internal" / "benchmarking" / "rlbench" / "schema" / "v1" / filename
@@ -109,7 +189,16 @@ def _load_w1_schema(filename: str) -> dict[str, Any]:
                 loaded = json.load(fh)
                 if isinstance(loaded, dict):
                     return loaded
-    raise RuntimeError(f"ate_env: W1 JSON Schema {filename!r} not found")
+    with contextlib.suppress(Exception):
+        pkg_res = importlib.resources.files("ate_env").joinpath("schemas", "v1", filename)
+        if pkg_res.is_file():
+            loaded = json.loads(pkg_res.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                return loaded
+    logger.warning(
+        "ate_env: W1 JSON Schema %r not found on disk; using built-in fallback", filename
+    )
+    return dict(_FALLBACK_SCHEMAS.get(filename, {"properties": {}}))
 
 
 TRACE_EVENT_SCHEMA: dict[str, Any] = _load_w1_schema("trace_event.schema.json")
@@ -975,9 +1064,14 @@ class BenchTelemetry:
         across those ``count`` operations, while ``metrics["dur_ms_mean"]``
         and ``metrics["dur_ms_max"]`` report the per-operation mean and max.
 
-        Note on ``ttfi``: SDK ``ttfi`` measures the Ready-to-first-command-end
-        sub-phase (``acquire`` measures create/claim-start to Ready, so total
-        create-start to first-command completion is ``acquire + ttfi``).
+        Note on ``ttfi`` and ``wake``:
+        - SDK ``ttfi`` (in ``events/*.jsonl``) measures the Ready-to-first-command-end
+          sub-phase on a cold create (``acquire`` measures create-start to Ready, so
+          total create-start to first-command completion is ``acquire + ttfi``).
+        - On warm-pool or snapshot acquire, ``trace.jsonl`` ``op="wake"`` records the
+          wire claim-to-Ready duration, whereas ``events/*.jsonl`` ``event="wake"``
+          (emitted on the first ``exec`` after warm/snapshot acquire) records the
+          Ready-to-first-command-end sub-phase (matching ``event="ttfi"`` on cold start).
         """
         with self._lock:
             effective_step = self.current_step if step is None else step

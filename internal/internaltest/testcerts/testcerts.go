@@ -25,10 +25,12 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -120,6 +122,20 @@ func (a *Authority) ClientBundle(t testing.TB, spiffeID string) []byte {
 	}
 	bundle := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	return append(bundle, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})...)
+}
+
+// Allow is a server's VerifyPeerCertificate that admits only client
+// certificates whose first URI SAN is one of ids, the way the router's
+// ingress allow-list does; any other client gets a bad certificate alert.
+func Allow(ids ...string) func([][]byte, [][]*x509.Certificate) error {
+	return func(_ [][]byte, chains [][]*x509.Certificate) error {
+		for _, chain := range chains {
+			if len(chain) > 0 && len(chain[0].URIs) > 0 && slices.Contains(ids, chain[0].URIs[0].String()) {
+				return nil
+			}
+		}
+		return errors.New("testcerts: client identity not allowed")
+	}
 }
 
 // WriteFile writes data under dir and returns the path.

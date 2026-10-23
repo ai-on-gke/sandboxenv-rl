@@ -821,8 +821,9 @@ func TestConnectOverTLS(t *testing.T) {
 		t.Fatalf("got %d %q", resp.StatusCode, body)
 	}
 
-	// Without a certificate the router refuses the handshake and the proxy
-	// answers 502, not a hang.
+	// Without TLS the proxy sends a plaintext CONNECT to the TLS listener,
+	// which Go's TLS server answers with HTTP 400; the proxy maps that to
+	// 502, not a hang.
 	plain := mustNew(t, portproxy.Options{ConnectAddr: addr, DefaultAtespace: "ate-env", HandshakeTimeout: 5 * time.Second})
 	proxy2 := httptest.NewServer(portproxy.Dispatch(plain, http.NotFoundHandler()))
 	t.Cleanup(proxy2.Close)
@@ -833,5 +834,48 @@ func TestConnectOverTLS(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode < 500 {
 		t.Fatalf("plaintext to a TLS router: got %d, want a 5xx", resp.StatusCode)
+	}
+}
+
+// A router whose allow-list lacks the API's identity turns the certificate
+// away after the handshake; the proxy answers 502 and names the setting.
+func TestConnectRejectedIdentity(t *testing.T) {
+	ca := testcerts.NewAuthority(t, "test podcert")
+	rr := fakerouter.New()
+	addr, stop := rr.ServeTLS(&tls.Config{
+		Certificates:          []tls.Certificate{ca.Server(t, "atenet-router.ate-system.svc")},
+		ClientAuth:            tls.RequireAndVerifyClientCert,
+		ClientCAs:             ca.Pool(),
+		VerifyPeerCertificate: testcerts.Allow(routertls.SPIFFEID("ate-env", "someone-else")),
+	})
+	t.Cleanup(stop)
+	rr.RegisterPort("env1", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "unreachable")
+	}))
+	dir := t.TempDir()
+	cfg, err := routertls.Options{
+		CredentialBundleFile: testcerts.WriteFile(t, dir, "bundle.pem", ca.ClientBundle(t, routertls.SPIFFEID("ate-env", "ate-env-api"))),
+		TrustBundleFile:      testcerts.WriteFile(t, dir, "trust.pem", ca.PEM),
+		ServerName:           "atenet-router.ate-system.svc",
+	}.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := mustNew(t, portproxy.Options{ConnectAddr: addr, TLS: cfg, DefaultAtespace: "ate-env", HandshakeTimeout: 5 * time.Second, WakeBudget: 30 * time.Second})
+	proxy := httptest.NewServer(portproxy.Dispatch(p, http.NotFoundHandler()))
+	t.Cleanup(proxy.Close)
+
+	start := time.Now()
+	resp, err := http.Get(proxy.URL + "/v1alpha/envs/env1/ports/8000/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(string(body), "ATE_INGRESS_ALLOWED_SPIFFE_IDS") {
+		t.Fatalf("got %d %q, want 502 naming the allow-list setting", resp.StatusCode, body)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("took %s; the wake budget must not apply to a rejected certificate", elapsed)
 	}
 }

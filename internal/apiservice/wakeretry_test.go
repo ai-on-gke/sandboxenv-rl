@@ -16,12 +16,15 @@ package apiservice_test
 
 import (
 	"context"
+	"crypto/tls"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/agent-substrate/env/guest"
 	"github.com/agent-substrate/env/internal/apiservice"
+	"github.com/agent-substrate/env/internal/internaltest/testcerts"
+	"github.com/agent-substrate/env/internal/routertls"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
@@ -69,6 +72,46 @@ func TestGuestCallWaitsForWake(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < 500*time.Millisecond {
 		t.Errorf("call returned after %s, before the environment was running", elapsed)
+	}
+}
+
+// A router whose allow-list lacks the API's SPIFFE ID rejects the client
+// certificate after the handshake. That is a deployment error, not a sleeping
+// environment: the call fails at once, naming the ID and the setting, instead
+// of waiting out the wake budget as it would for any other Unavailable.
+func TestGuestCallFailsFastOnRejectedIdentity(t *testing.T) {
+	ca := testcerts.NewAuthority(t, "test podcert")
+	serverTLS := &tls.Config{
+		Certificates:          []tls.Certificate{ca.Server(t, "atenet-router.ate-system.svc")},
+		ClientAuth:            tls.RequireAndVerifyClientCert,
+		ClientCAs:             ca.Pool(),
+		VerifyPeerCertificate: testcerts.Allow(routertls.SPIFFEID("ate-env", "someone-else")),
+	}
+	dir := t.TempDir()
+	id := routertls.SPIFFEID("ate-env", "ate-env-api")
+	clientTLS, err := routertls.Options{
+		CredentialBundleFile: testcerts.WriteFile(t, dir, "bundle.pem", ca.ClientBundle(t, id)),
+		TrustBundleFile:      testcerts.WriteFile(t, dir, "trust.pem", ca.PEM),
+		ServerName:           "atenet-router.ate-system.svc",
+	}.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	te := newFullTestEnvTLS(t, serverTLS, clientTLS)
+	te.srv.RouterIdentity = id
+	envCtx := registerGuest(t, te, "identity-test")
+	te.control.SetState("identity-test", ateapipb.ActorState_ACTOR_STATE_RUNNING)
+
+	start := time.Now()
+	_, err = te.procClient.StartProcess(envCtx, &ateenvv1alpha.StartProcessRequest{Command: []string{"sh", "-c", "true"}})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code %v (%v), want FailedPrecondition", status.Code(err), err)
+	}
+	if msg := status.Convert(err).Message(); !strings.Contains(msg, id) || !strings.Contains(msg, "ATE_INGRESS_ALLOWED_SPIFFE_IDS") {
+		t.Errorf("message %q should name the API's SPIFFE ID and the allow-list setting", msg)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("took %s to report; the wake budget must not apply", elapsed)
 	}
 }
 

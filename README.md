@@ -192,14 +192,32 @@ environments in.
 Since Substrate v0.6.0 the atenet router serves only TLS listeners and admits
 only clients whose SPIFFE ID is on its allow-list. The manifest mounts the pod
 identity certificate and the servicedns trust bundle into `ate-env-api` for
-that (`--api-router-tls`, on by default; it needs the PodCertificate
-projected volume, Kubernetes 1.34 or newer, which Substrate's installer
-already requires). The API's identity is
-`spiffe://cluster.local/ns/<namespace>/sa/ate-env-api`; give it to the
-Substrate install (`ATE_INGRESS_ALLOWED_SPIFFE_IDS` for cmd/ate-setup) or the
-router refuses every tunnel with a TLS error. `ate-env manifest` prints the
-exact ID. For a control plane that still serves the plaintext listeners, pass
-`--api-router-tls=false`.
+that (`--api-router-tls`, on by default), as the `podCertificate` and
+`clusterTrustBundle` projected volumes. GKE 1.37 and later serve both by
+default. A 1.36 cluster must be created with
+`--enable-kubernetes-unstable-apis=certificates.k8s.io/v1beta1/podcertificaterequests,certificates.k8s.io/v1beta1/clustertrustbundles`
+and its node pools created after that, or the mount fails with
+`MountVolume.SetUp failed: unimplemented`; Substrate's `setup-gcp create
+cluster` does both. Versions below 1.36 are not supported. The API's identity
+is `spiffe://cluster.local/ns/<namespace>/sa/ate-env-api`, and `ate-env
+manifest` prints the exact ID. Add it to the Substrate install's allow-list,
+one comma-separated value that becomes the router's whole
+`--ingress-allowed-spiffe-ids`, so keep the IDs already on it, and rerun the
+deploy for a running install:
+
+```bash
+# In the Substrate checkout.
+ATE_INGRESS_ALLOWED_SPIFFE_IDS=spiffe://cluster.local/ns/ate-env/sa/ate-env-api,<existing IDs> \
+  go run ./cmd/ate-setup deploy ate-system
+```
+
+Editing the `atenet-router` Deployment's `--ingress-allowed-spiffe-ids`
+argument does the same by hand. ate-setup requires the list for its default
+Envoy ingress dataplane, which enforces it. Without the ID the router rejects
+the API's certificate: guest calls fail at once with `FailedPrecondition`
+naming the ID and this setting, the port proxy answers 502 with the same
+cause, and the API logs the ID it presents at startup. For a control plane
+that still serves the plaintext listeners, pass `--api-router-tls=false`.
 
 Deploy the namespace, worker pool, ServiceAccount and API service:
 

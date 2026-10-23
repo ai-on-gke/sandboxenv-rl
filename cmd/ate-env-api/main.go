@@ -55,7 +55,7 @@ func main() {
 		listen            = flag.String("listen", "0.0.0.0:7777", "address to serve the API on")
 		ateapi            = flag.String("ateapi", ate.DefaultControlAddr, "address of the ateapi gRPC control plane")
 		atenet            = flag.String("atenet", ate.DefaultRouterAddr, "address of the atenet HTTP router")
-		atenetConn        = flag.String("atenet-connect", ate.DefaultRouterConnectAddr, "address of the atenet router's plaintext CONNECT listener; HTTP requests carrying X-Env-Id and X-Env-Port, or to /v1alpha/envs/{id}/ports/{port}/..., are forwarded through it to that port in the environment. Without -auth-token-file the forwarding does not authenticate callers, and it reaches any port of any actor the router serves. Empty disables it")
+		atenetConn        = flag.String("atenet-connect", ate.DefaultRouterConnectAddr, "address of the atenet router's CONNECT listener: the TLS one (8444) with -atenet-client-cert, else the plaintext one that only a Substrate before v0.6.0 serves; HTTP requests carrying X-Env-Id and X-Env-Port, or to /v1alpha/envs/{id}/ports/{port}/..., are forwarded through it to that port in the environment. Without -auth-token-file the forwarding does not authenticate callers, and it reaches any port of any actor the router serves. Empty disables it")
 		ppOrigins         = flag.String("port-proxy-trusted-origins", "", "comma-separated browser origins (scheme://host[:port]) whose pages may use the port proxy's path form, next to the listener's own origin")
 		ppHeaderTimeout   = flag.Duration("port-proxy-response-header-timeout", 0, "how long the port proxy waits for a daemon's response headers; 0 means no limit, and the caller's deadline applies")
 		hostSuffix        = flag.String("host-suffix", ate.DefaultHostSuffix, "atenet router host suffix for actor routing")
@@ -85,22 +85,30 @@ func main() {
 	// the only ones a v0.6.0 Substrate serves; the plaintext defaults are
 	// replaced unless the operator named other addresses.
 	var routerTLS *tls.Config
+	var routerIdentity string
 	if *atenetClientCert != "" || *atenetCAFile != "" {
-		cfg, err := routertls.Options{
+		opts := routertls.Options{
 			CredentialBundleFile: *atenetClientCert,
 			TrustBundleFile:      *atenetCAFile,
 			ServerName:           *atenetServerName,
-		}.Config()
+		}
+		cfg, err := opts.Config()
 		if err != nil {
-			log.Fatalf("-atenet-client-cert: %v", err)
+			log.Fatalf("router TLS: %v", err)
 		}
 		routerTLS = cfg
+		if routerIdentity, err = opts.Identity(); err != nil {
+			log.Fatalf("router TLS: %v", err)
+		}
+		log.Printf("router TLS: presenting %s to the atenet router, whose --ingress-allowed-spiffe-ids (ATE_INGRESS_ALLOWED_SPIFFE_IDS for ate-setup) must list it", routerIdentity)
 		if *atenet == ate.DefaultRouterAddr {
 			*atenet = ate.DefaultRouterTLSAddr
 		}
 		if *atenetConn == ate.DefaultRouterConnectAddr {
 			*atenetConn = ate.DefaultRouterConnectTLSAddr
 		}
+	} else {
+		log.Printf("WARNING: no -atenet-client-cert: dialing the router's plaintext listeners (%s, CONNECT %q), which Substrate v0.6.0 and later do not serve", *atenet, *atenetConn)
 	}
 
 	client, err := ate.New(ate.Options{
@@ -130,6 +138,8 @@ func main() {
 	apisvc := apiservice.New(client, *atenet, *hostSuffix)
 	apisvc.WakeBudget = *wakeBudget
 	apisvc.WakeRunningBudget = *wakeRunningBudget
+	apisvc.RouterTLS = routerTLS
+	apisvc.RouterIdentity = routerIdentity
 	defer apisvc.Close()
 
 	var grpcOpts []grpc.ServerOption

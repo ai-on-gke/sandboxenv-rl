@@ -17,9 +17,10 @@
 // HTTPS for the guest's gRPC and a TLS CONNECT listener for other ports, and
 // each requires a client certificate whose SPIFFE ID is on the router's
 // ingress allow-list. The certificate is the pod identity credential bundle
-// the kubelet projects into the pod and rotates about hourly; the router's own
-// serving certificate chains to the servicedns trust bundle. Both files are
-// read at every handshake, so a rotation needs no restart.
+// the kubelet projects into the pod: the signer issues it for 24 hours and
+// the kubelet renews it 30 minutes before expiry. The router's own serving
+// certificate chains to the servicedns trust bundle. Both files are read at
+// every handshake, so a rotation needs no restart.
 package routertls
 
 import (
@@ -28,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // Options name the files and the router.
@@ -48,6 +50,33 @@ type Options struct {
 // router's --ingress-allowed-spiffe-ids must list for ate-env-api.
 func SPIFFEID(namespace, serviceAccount string) string {
 	return fmt.Sprintf("spiffe://cluster.local/ns/%s/sa/%s", namespace, serviceAccount)
+}
+
+// Identity is the SPIFFE ID the credential bundle's certificate carries, its
+// URI SAN: what the router's allow-list must hold.
+func (o Options) Identity() (string, error) {
+	cert, err := loadBundle(o.CredentialBundleFile)
+	if err != nil {
+		return "", err
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return "", fmt.Errorf("routertls: parsing the client certificate: %w", err)
+	}
+	if len(leaf.URIs) == 0 {
+		return "", fmt.Errorf("routertls: the client certificate in %s carries no SPIFFE ID (URI SAN)", o.CredentialBundleFile)
+	}
+	return leaf.URIs[0].String(), nil
+}
+
+// RejectedIdentity reports whether err is the router turning the client
+// certificate away, which it does when the certificate's SPIFFE ID is not on
+// its ingress allow-list. The router sends a TLS alert, which Go reports on
+// the first read or write after the handshake as "remote error: tls: ...",
+// inside a gRPC Unavailable or a plain error, so the text identifies it. No
+// wait or retry fixes it.
+func RejectedIdentity(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "remote error: tls:")
 }
 
 // Config returns the TLS configuration for the router's listeners. It reads
@@ -74,30 +103,24 @@ func (o Options) Config() (*tls.Config, error) {
 		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 			return loadBundle(o.CredentialBundleFile)
 		},
-		// The chain is verified in VerifyPeerCertificate against a trust
-		// bundle read at that moment, so a rotated CA is honored without a
-		// restart; InsecureSkipVerify only turns off the built-in check that
-		// would use a pool fixed at startup.
-		InsecureSkipVerify:    true,
-		VerifyPeerCertificate: o.verify,
+		// The chain is verified in VerifyConnection against a trust bundle
+		// read at that moment, so a rotated CA is honored without a restart;
+		// InsecureSkipVerify only turns off the built-in check that would use
+		// a pool fixed at startup. VerifyConnection also runs on a resumed
+		// session, which VerifyPeerCertificate would skip.
+		InsecureSkipVerify: true,
+		VerifyConnection:   o.verify,
 	}, nil
 }
 
-func (o Options) verify(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-	if len(rawCerts) == 0 {
+func (o Options) verify(cs tls.ConnectionState) error {
+	certs := cs.PeerCertificates
+	if len(certs) == 0 {
 		return errors.New("routertls: the router presented no certificate")
 	}
 	roots, err := loadPool(o.TrustBundleFile)
 	if err != nil {
 		return err
-	}
-	certs := make([]*x509.Certificate, 0, len(rawCerts))
-	for _, raw := range rawCerts {
-		c, err := x509.ParseCertificate(raw)
-		if err != nil {
-			return fmt.Errorf("routertls: parsing the router's certificate: %w", err)
-		}
-		certs = append(certs, c)
 	}
 	intermediates := x509.NewCertPool()
 	for _, c := range certs[1:] {

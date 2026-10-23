@@ -56,6 +56,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/env/internal/ate"
+	"github.com/agent-substrate/env/internal/routertls"
 )
 
 // The routing headers. They match the x-env-id and x-env-atespace metadata
@@ -544,6 +545,8 @@ func (p *Proxy) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, context.Canceled):
 		return // the caller went away; nobody reads an answer
+	case routertls.RejectedIdentity(err):
+		cause = "is behind a router that rejected ate-env-api's client certificate; the router's ingress allow-list (ATE_INGRESS_ALLOWED_SPIFFE_IDS) must hold the API's SPIFFE ID"
 	case errors.As(err, &re):
 		// 404 (no such environment) and 503 (not running) mean the same to
 		// the caller as to the router; anything else is a gateway failure.

@@ -219,7 +219,8 @@ func TestDialGuestOverTLS(t *testing.T) {
 		t.Fatalf("RPC through the TLS router: %v, want Unimplemented from the guest's gRPC server", err)
 	}
 
-	// Without the certificate the handshake is refused.
+	// Without TLS the client speaks h2c to a TLS listener; the call fails
+	// with a transport error, no handshake takes place.
 	plain, err := ate.New(ate.Options{ControlAddr: controlAddr, RouterAddr: addr, SkipVerify: true})
 	if err != nil {
 		t.Fatal(err)

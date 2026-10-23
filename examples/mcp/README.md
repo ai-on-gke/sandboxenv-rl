@@ -62,6 +62,11 @@ kubectl port-forward -n ate-env svc/ate-env-api 7777:7777
 go run ./examples/mcp/main.go
 ```
 
+When `ate-env-api` requires a bearer token (`-auth-token-file`), export it first:
+`export SUBSTRATE_ENV_AUTH_TOKEN=<token>`. The example then sends it on the gRPC calls and as
+`Authorization: Bearer <token>` on each MCP request. Add the same header to the `curl` commands
+below.
+
 The example will:
 1. Create a sandbox environment (`mcp-demo`).
 2. Initialize an MCP client via `github.com/modelcontextprotocol/go-sdk/mcp`.

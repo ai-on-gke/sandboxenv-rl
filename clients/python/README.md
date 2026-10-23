@@ -326,6 +326,130 @@ results = await asyncio.gather(
 )
 ```
 
+### Trace calls with OpenTelemetry (optional)
+
+The client can emit OpenTelemetry spans and send the W3C trace context to
+`ate-env-api`. This lets you see whether time goes to the client, the API
+server or Substrate. Tracing is off by default and needs the `tracing` extra:
+
+```bash
+pip install "./clients/python[tracing]"
+```
+
+Turn it on with `TracerConfig`, either on a `Client` or with
+`FleetConfig.tracing` for a fleet:
+
+```python
+from ate_env import Client, FleetConfig, SandboxFleet, TracerConfig
+
+client = Client("localhost:7777", tracer_config=TracerConfig(enable_tracing=True))
+
+fleet = SandboxFleet(FleetConfig(tracing=TracerConfig(enable_tracing=True)))
+# A plain dict also works: FleetConfig(tracing={"enable_tracing": True})
+```
+
+`TracerConfig` fields:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enable_tracing` | `False` | Emit spans and propagate the trace context. |
+| `trace_service_name` | `"ate-env-client"` | OTel resource `service.name` of the client's own OTLP provider (case 2 below). Spans are always named `ate_env_client.<op>`. |
+
+When tracing is on:
+
+- **Spans.** `Client`, `SandboxHandle` and the Substrate backend emit
+  `ate_env_client.<op>` spans, for example `create_environment`, `acquire`,
+  `exec`, `write_file`, `read_file` and `release`. Their attributes (below)
+  hold ids, the executable name (leading `NAME=value` assignments are
+  skipped) and sizes. They never hold command arguments, file content or
+  image tags. A command that fails with `check=True` marks its `exec` span
+  as an error.
+- **Propagation.** Every gRPC call on a channel the client creates carries
+  `traceparent` / `tracestate`. Baggage is never sent. A channel you pass
+  with `Client(channel=...)` is left as is.
+- **Nesting.** Client spans nest under the caller's current span, including
+  across the fleet's worker threads and background event loop.
+
+**Span attributes.** Substrate identities use Substrate's own keys (its
+`ateattr` keys), so a backend can join a client span to Substrate's logs,
+traces and lifecycle records without a mapping. Client-only fields use the
+`ate_env.` prefix.
+
+| Key | Value | On |
+| --- | --- | --- |
+| `ate.actor.name` | environment id (the Substrate actor name) | every span of one environment: `Client` spans, `acquire`, `release`, `exec`, `write_file`, `read_file` |
+| `ate.atespace` | atespace | `Client` spans |
+| `ate.template.name` | template name | `create_environment`, `ensure_template`, `acquire`, `warm_pool` |
+| `ate.template.atespace` | template atespace, when given | `create_environment` |
+| `ate_env.run_id` | fleet run id | `exec`, `write_file`, `read_file`, `acquire`, `warm_pool`, `reap` |
+| `ate_env.command.executable` | executable name only | `exec` |
+| `ate_env.exit_code`, `ate_env.timed_out` | exit state | `exec` |
+| `ate_env.first_command` | `true` on the first `exec` of each acquired sandbox | `exec` |
+| `ate_env.file.path`, `ate_env.file.size` | path and size in bytes | `write_file`, `read_file` |
+| `ate_env.replicas` | warm pool size | `warm_pool` |
+| `ate_env.rootfs_image` | image reference without its tag | `create_environment` |
+
+`Client` spans also carry `rpc.system`, `rpc.service`, `rpc.method`,
+`server.address` and `server.port`, and have kind `CLIENT`.
+
+**Time to first command (TTFC).** `acquire` ends when the create call
+returns. The wake and readiness wait happen inside the first command, so the
+first `exec` span of each sandbox holds wake time plus command time. Compute
+TTFC per sandbox as the start of `ate_env_client.acquire` to the end of the
+`ate_env_client.exec` span with `ate_env.first_command=true` and the same
+`ate.actor.name`. This equals the swebench loader's `ttfi` (create start to
+first command returning), so a real trainer and the loader report the same
+client-side number.
+
+**Where spans go.** The client never installs the process-global
+OpenTelemetry `TracerProvider`. Its tracers choose a provider each time a span
+starts, so there are two cases:
+
+1. **Your application configures OpenTelemetry** (the usual case). Install
+   your SDK `TracerProvider` and exporters as you normally do, before or after
+   you create the client: the order does not matter, also when
+   `OTEL_EXPORTER_OTLP_ENDPOINT` is set. From the moment your provider is
+   installed, client spans go to it and nest under your spans.
+2. **Your application does not configure OpenTelemetry.** Set
+   `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`). On
+   the first client span, the client builds its own `TracerProvider` with
+   service name `trace_service_name`, which batches spans to an OTLP/gRPC
+   exporter and is shut down (flushed) at exit. It is never made the global
+   provider, so you can still install yours later (case 1). Configure the
+   exporter with the standard OpenTelemetry environment variables, for
+   example:
+
+   ```bash
+   export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+   export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer <token>"
+   # Also: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_EXPORTER_OTLP_INSECURE,
+   # OTEL_EXPORTER_OTLP_CERTIFICATE, OTEL_EXPORTER_OTLP_TIMEOUT, ...
+   ```
+
+   **Size the batch processor for wide runs.** With the SDK defaults, the
+   processor queues at most 2048 spans and exports 512 every 5 s. When the
+   queue is full it drops spans. A 500-wide RL step emits a few thousand spans
+   in seconds, so raise the limits, for example:
+
+   ```bash
+   export OTEL_BSP_MAX_QUEUE_SIZE=16384        # default 2048
+   export OTEL_BSP_SCHEDULE_DELAY=1000         # ms between exports, default 5000
+   export OTEL_BSP_MAX_EXPORT_BATCH_SIZE=2048  # default 512; at most the queue size
+   ```
+
+   Each dropped span logs the SDK warning `Queue full, dropping Span.` (logger
+   `opentelemetry.sdk._shared_internal`). If you see it, the trace is
+   incomplete: raise the limits before you read latencies from it. In case 1,
+   the same variables apply to an SDK `BatchSpanProcessor` that you create
+   without arguments.
+
+If neither applies (no provider and no OTLP endpoint), spans are created but
+not exported, and nothing is sent over the network.
+
+Without the extra, `import ate_env` never loads OpenTelemetry. Enabling
+tracing then logs one error naming the missing extra, and the client keeps
+working without spans.
+
 ### Develop against a local guest daemon (no cluster)
 
 The guest daemon example serves the process and filesystem services

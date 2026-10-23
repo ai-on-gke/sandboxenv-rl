@@ -49,7 +49,7 @@ On the cluster:
    `server closed the stream without sending trailers`.
 2. **The `ate-env` system deployed** from this repo at or after the `ateenv.v1alpha` proto
    move: namespace, WorkerPool, ActorTemplate(s), and the `ate-env-api` service (see the
-   [root README](../../README.md#quickstart)).
+   [root README](../../README.md#deployment-guide)).
 
    ```bash
    ate-env manifest \
@@ -155,6 +155,7 @@ sandbox:
     connection:
       api_url: ate-env-api.ate-env:7777    # host:port or http(s):// URL; port-forward for dev
       request_timeout_s: 30                # deadline per lifecycle RPC (create/get/delete)
+      # auth_token_file: /var/run/secrets/ate-env/token   # ate-env-api bearer token; see below
     create:
       template: default-template           # ActorTemplate when the spec names none
       atespace: ate-env                    # atespace the templates live in and envs are created in
@@ -167,6 +168,12 @@ sandbox:
 `namespace` is still accepted as an alias for `atespace` (the name this provider used before
 ate-env adopted substrate's vocabulary); setting both is an error. `api_url` is plain gRPC
 (h2c) like the Go client and CLI; an `https://` URL opens a TLS channel instead.
+
+When ate-env-api requires a bearer token (`-auth-token-file` on the API), point
+`connection.auth_token_file` at a file that holds it, or set `SUBSTRATE_ENV_AUTH_TOKEN`, the
+variable the `ate-env` CLI also reads; the file wins when both are set. The provider sends the
+token on its gRPC calls and in the `X-Env-Authorization` header of each `endpoint()`. Without
+either, it sends no token. An empty `auth_token_file` is a configuration error.
 
 Then run your resource server / `gym env start` as usual. Sandboxes created by Gym's resource
 lifecycle now appear as Substrate actors; `kubectl get pods -n ate-env` shows the warm workers
@@ -277,9 +284,11 @@ Limits:
 - **The daemon must listen on `0.0.0.0`.** The router reaches the port on the actor's address; a
   daemon bound to `127.0.0.1` only answers processes inside the sandbox, and requests through the
   endpoint fail with 502.
-- **No authentication in front of the daemon.** Anyone who can reach ate-env-api can call any port
-  in any sandbox through it. Keep ate-env-api inside the cluster, and give the daemon its own
-  credential when the sandbox runs untrusted code.
+- **The API token is the only check in front of the daemon.** With `-auth-token-file` on
+  ate-env-api, each `endpoint()` request must carry the token in `X-Env-Authorization`; the proxy
+  removes it before the daemon sees the request. Without it, anyone who can reach ate-env-api can
+  call any port in any sandbox. Either way, keep ate-env-api inside the cluster, and give the
+  daemon its own credential when the sandbox runs untrusted code.
 - Port 80 belongs to the guest. The daemon shares the task image's user, environment and
   filesystem.
 - Each distinct task image yields one derived ActorTemplate on its base, created on first use and

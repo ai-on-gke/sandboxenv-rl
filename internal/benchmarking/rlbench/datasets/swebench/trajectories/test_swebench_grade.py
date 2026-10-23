@@ -14,15 +14,11 @@
 
 """Tests for the in-sandbox grader next to it:
 
-    python3 -m pytest internal/benchmarking/rlbench/datasets/swebench/trajectories -q
+    python3 -m pytest internal/benchmarking/swebench/trajectories -q
 """
-
-# pylint: disable=missing-function-docstring
 
 import importlib.util
 import pathlib
-
-import pytest
 
 GRADER = pathlib.Path(__file__).resolve().with_name("swebench-grade.py")
 
@@ -32,10 +28,7 @@ spec.loader.exec_module(grader)
 
 
 def wrap(body, exit_code=0):
-    return (
-        f"+ : '>>>>> Start Test Output'\n{body}\n"
-        f"+ : '>>>>> End Test Output'\n>>>>> Test Exit Code: {exit_code}\n"
-    )
+    return f"+ : '>>>>> Start Test Output'\n{body}\n+ : '>>>>> End Test Output'\n>>>>> Test Exit Code: {exit_code}\n"
 
 
 PYTEST_LOG = """\
@@ -81,17 +74,9 @@ def test_f2p_failed_is_not_resolved():
 
 def test_skipped_f2p_is_not_resolved_but_skipped_p2p_is_maintained():
     log = "SKIPPED tests/test_x.py::test_a\nPASSED tests/test_x.py::test_b\n"
-    inst = {
-        "log_parser": "parse_log_pytest",
-        "fail_to_pass": ["tests/test_x.py::test_a"],
-        "pass_to_pass": [],
-    }
+    inst = {"log_parser": "parse_log_pytest", "fail_to_pass": ["tests/test_x.py::test_a"], "pass_to_pass": []}
     assert not grader.grade(inst, wrap(log))["resolved"]
-    inst = {
-        "log_parser": "parse_log_pytest",
-        "fail_to_pass": ["tests/test_x.py::test_b"],
-        "pass_to_pass": ["tests/test_x.py::test_a"],
-    }
+    inst = {"log_parser": "parse_log_pytest", "fail_to_pass": ["tests/test_x.py::test_b"], "pass_to_pass": ["tests/test_x.py::test_a"]}
     assert grader.grade(inst, wrap(log))["resolved"]
 
 
@@ -129,10 +114,7 @@ def test_django_resolution():
 
 
 def test_sympy_parser():
-    log = (
-        "test_one ok\ntest_two F\ntest_three E\n"
-        "________ sympy/core/tests/test_x.py:test_four ________\n"
-    )
+    log = "test_one ok\ntest_two F\ntest_three E\n________ sympy/core/tests/test_x.py:test_four ________\n"
     sm = grader.parse_sympy(log)
     assert sm == {"test_one": "PASSED", "test_two": "FAILED", "test_three": "ERROR",
                   "sympy/core/tests/test_x.py:test_four": "FAILED"}
@@ -151,8 +133,7 @@ def test_invalid_runs():
     # Nonzero exit with a log that shows no failure means the log is not the run.
     assert not grader.grade(inst, wrap("PASSED t", exit_code=1))["valid"]
     # Markers in the wrong order, or no parsed result and no sign the suite ran.
-    bad_order = "+ : '>>>>> End Test Output'\nPASSED t\n+ : '>>>>> Start Test Output'\n"
-    assert not grader.grade(inst, bad_order)["valid"]
+    assert not grader.grade(inst, "+ : '>>>>> End Test Output'\nPASSED t\n+ : '>>>>> Start Test Output'\n")["valid"]
     assert not grader.grade(inst, wrap("nothing here"))["valid"]
     assert grader.grade(inst, wrap("Executed 3 of 3 specs"))["valid"]
 
@@ -177,5 +158,6 @@ def test_unknown_status_counts_for_nothing():
 
 
 def test_unknown_parser_exits():
+    import pytest
     with pytest.raises(SystemExit):
         grader.grade({"log_parser": "nope"}, wrap(""))

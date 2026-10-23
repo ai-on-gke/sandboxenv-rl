@@ -37,7 +37,7 @@ const DefaultKind = "swebench"
 // Grader parses the stdout/stderr of a trajectory's reward step into a 0/1
 // reward and a human-readable detail/verdict string (for example
 // "f2p 1/1 p2p 3/4" or "invalid run"). When Parse returns a non-nil error or
-// an empty detail, the runner falls back to grading by process exit code.
+// a nil reward, the runner falls back to grading by process exit code.
 type Grader interface {
 	Parse(stdout []byte) (reward *int, detail string, err error)
 }

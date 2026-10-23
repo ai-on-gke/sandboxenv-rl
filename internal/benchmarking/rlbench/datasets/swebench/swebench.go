@@ -78,8 +78,8 @@ func Decode(in rlbench.Instance) (Instance, error) {
 	return swe, nil
 }
 
-// Pack wraps a SWE-bench Instance into a dataset-agnostic rlbench.Instance.
-func Pack(in Instance) (rlbench.Instance, error) {
+// pack wraps a SWE-bench Instance into a dataset-agnostic rlbench.Instance.
+func pack(in Instance) (rlbench.Instance, error) {
 	raw, err := json.Marshal(in)
 	if err != nil {
 		return rlbench.Instance{}, err
@@ -92,9 +92,9 @@ func Pack(in Instance) (rlbench.Instance, error) {
 	}, nil
 }
 
-// ErrNoVerdict indicates that a reward step's output did not end with a
+// errNoVerdict indicates that a reward step's output did not end with a
 // swebench-grade.py JSON line.
-var ErrNoVerdict = errors.New("no swebench grader JSON in output")
+var errNoVerdict = errors.New("no swebench grader JSON in output")
 
 // Grader parses swebench-grade.py JSON lines ({"valid","resolved","f2p","p2p"})
 // into a 0/1 reward and a "f2p A/B p2p C/D" or "invalid run" detail string.
@@ -105,7 +105,7 @@ func (Grader) Parse(stdout []byte) (reward *int, detail string, err error) {
 	s := string(stdout)
 	i := strings.LastIndex(s, `{"valid"`)
 	if i < 0 {
-		return nil, "", ErrNoVerdict
+		return nil, "", errNoVerdict
 	}
 	var g struct {
 		Valid    bool   `json:"valid"`
@@ -130,10 +130,10 @@ func (Grader) Parse(stdout []byte) (reward *int, detail string, err error) {
 	return reward, fmt.Sprintf("f2p %s p2p %s", g.F2P, g.P2P), nil
 }
 
-// Verdict extracts the grader's verdict from the end of a reward step's
+// verdict extracts the grader's verdict from the end of a reward step's
 // output: "invalid run", "f2p A/B p2p C/D", or "reward 0" when the output
 // does not end in the grader's JSON line.
-func Verdict(tail string) string {
+func verdict(tail string) string {
 	_, detail, err := (Grader{}).Parse([]byte(tail))
 	if err != nil || detail == "" {
 		return "reward 0"

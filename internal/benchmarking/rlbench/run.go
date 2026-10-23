@@ -533,11 +533,13 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 			}
 			out := res.Stdout + res.Stderr
 			if a := AdapterFor(e.inst.Kind); a != nil && a.Grader() != nil {
-				if parsedReward, detail, gerr := a.Grader().Parse([]byte(out)); gerr == nil && detail != "" {
-					if parsedReward != nil && res.ExitCode != 0 {
+				if parsedReward, detail, gerr := a.Grader().Parse([]byte(out)); gerr == nil {
+					if parsedReward != nil {
 						reward = parsedReward
 					}
-					ev.Detail = detail
+					if detail != "" {
+						ev.Detail = detail
+					}
 				}
 			}
 			ev.Reward = reward

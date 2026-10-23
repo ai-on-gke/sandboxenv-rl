@@ -52,7 +52,7 @@ SUITE_RAN = re.compile(
     r"|^# tests [1-9]\d*"
     r"|[1-9]\d* specs?, \d+ failures?"
     r"|': ok$",
-    re.MULTILINE,
+    re.M,
 )
 SKIP_SUMMARY = re.compile(r"^\[\d+\]$")
 CONTROL = str.maketrans("", "", "".join(chr(c) for c in range(1, 32)))
@@ -289,7 +289,7 @@ def grade(instance, content):
         return success, failure
 
     if fail_only:
-        bad = lambda t: status_map.get(t) == FAILED
+        bad = lambda t: status_map.get(t) == FAILED  # noqa: E731
         f2p_ok, f2p_bad = split(f2p, lambda t: not bad(t), bad)
         p2p_ok, p2p_bad = split(p2p, lambda t: not bad(t), bad)
     else:

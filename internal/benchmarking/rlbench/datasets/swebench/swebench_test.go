@@ -78,7 +78,7 @@ func TestBuiltinSWEBenchGoldTrajectoryAndGrades(t *testing.T) {
 	if !def.HasReward() {
 		t.Fatal("swebench-gold has a reward step")
 	}
-	in, err := Pack(Instance{
+	in, err := pack(Instance{
 		InstanceID: "x",
 		Image:      "reg/img@" + goodDigest,
 		Patch:      "PATCH",
@@ -121,7 +121,7 @@ func TestJSONTemplateFuncRoundTripsSWEBenchInstance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in, err := Pack(Instance{
+	in, err := pack(Instance{
 		InstanceID: "x",
 		Image:      "reg/img@" + goodDigest,
 		FailToPass: []string{"a::b[1]"},
@@ -144,14 +144,14 @@ func TestJSONTemplateFuncRoundTripsSWEBenchInstance(t *testing.T) {
 }
 
 func TestGraderAndSummarizeVerdictFallback(t *testing.T) {
-	if v := Verdict(`{"valid": false}`); v != "invalid run" {
-		t.Fatalf("Verdict = %q, want invalid run", v)
+	if v := verdict(`{"valid": false}`); v != "invalid run" {
+		t.Fatalf("verdict = %q, want invalid run", v)
 	}
-	if v := Verdict(`{"valid": true, "resolved": false, "f2p": "1/1", "p2p": "3/4"}`); v != "f2p 1/1 p2p 3/4" {
-		t.Fatalf("Verdict = %q", v)
+	if v := verdict(`{"valid": true, "resolved": false, "f2p": "1/1", "p2p": "3/4"}`); v != "f2p 1/1 p2p 3/4" {
+		t.Fatalf("verdict = %q", v)
 	}
-	if v := Verdict("no json"); v != "reward 0" {
-		t.Fatalf("Verdict = %q", v)
+	if v := verdict("no json"); v != "reward 0" {
+		t.Fatalf("verdict = %q", v)
 	}
 
 	// Verify that old events.jsonl files with only Tail (and empty Detail) still

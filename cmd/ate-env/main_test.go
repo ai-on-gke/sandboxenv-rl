@@ -16,8 +16,12 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 func TestCommandRouting(t *testing.T) {
@@ -232,5 +236,61 @@ func TestManifestTemplateRootfsImageFlags(t *testing.T) {
 		if cmd.Flags().Lookup(name) == nil {
 			t.Errorf("manifest template has no --%s flag", name)
 		}
+	}
+}
+
+func TestAuthFlagsResolve(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "token")
+	if err := os.WriteFile(file, []byte("  from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	empty := filepath.Join(dir, "empty")
+	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, env string
+		args      []string
+		want      string
+		wantErr   string
+	}{
+		{name: "token flag", args: []string{"--auth-token", "flag-tok"}, want: "flag-tok"},
+		{name: "environment variable", env: "env-tok", want: "env-tok"},
+		{name: "file", args: []string{"--auth-token-file", file}, want: "from-file"},
+		{name: "file over environment variable", env: "env-tok", args: []string{"--auth-token-file", file}, want: "from-file"},
+		{name: "both flags", args: []string{"--auth-token", "x", "--auth-token-file", file}, wantErr: "cannot be used together"},
+		{name: "empty file", args: []string{"--auth-token-file", empty}, wantErr: "is empty"},
+		{name: "missing file", args: []string{"--auth-token-file", file + ".missing"}, wantErr: "reading --auth-token-file"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SUBSTRATE_ENV_AUTH_TOKEN", tc.env)
+			var a authFlags
+			cmd := &cobra.Command{Use: "x"}
+			a.register(cmd, false)
+			if err := cmd.ParseFlags(tc.args); err != nil {
+				t.Fatal(err)
+			}
+			got, err := a.resolve(cmd)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("resolve = %q, %v; want error containing %q", got, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("resolve = %q, %v; want %q", got, err, tc.want)
+			}
+		})
+	}
+
+	// The guest commands inherit the flags from their parent; the check
+	// still sees both and stops before any connection.
+	args := []string{"dev1", "read", "f", "--auth-token", "x", "--auth-token-file", file}
+	root := newRootCommand(args)
+	root.SetArgs(args)
+	root.SetOut(&bytes.Buffer{})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "cannot be used together") {
+		t.Fatalf("guest command with both flags: %v, want the exclusion error", err)
 	}
 }

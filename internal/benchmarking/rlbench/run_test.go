@@ -656,3 +656,51 @@ func TestValidateChecksTheLongestName(t *testing.T) {
 		t.Fatal("eval mode with a 6-digit replay index: want the long name refused")
 	}
 }
+
+type zeroRewardGrader struct{}
+
+func (zeroRewardGrader) Parse([]byte) (*int, string, error) {
+	r := 0
+	return &r, "custom-zero-verdict", nil
+}
+
+type zeroRewardAdapter struct{}
+
+func (zeroRewardAdapter) Kind() string                  { return "zero-reward-test" }
+func (zeroRewardAdapter) Validate(Instance) error       { return nil }
+func (zeroRewardAdapter) RequireGrading(Instance) error { return nil }
+func (zeroRewardAdapter) TemplateData(in Instance) (any, error) {
+	var m map[string]any
+	_ = json.Unmarshal(in.Material, &m)
+	return map[string]any{"InstanceID": in.InstanceID, "Patch": m["patch"], "EvalScript": m["eval_script"]}, nil
+}
+func (zeroRewardAdapter) Grades(*Trajectory) bool   { return true }
+func (zeroRewardAdapter) Grader() Grader            { return zeroRewardGrader{} }
+func (zeroRewardAdapter) Trajectories() fs.FS       { return nil }
+func (zeroRewardAdapter) DefaultTrajectory() string { return "" }
+
+func TestGraderRewardOverridesZeroExitCode(t *testing.T) {
+	RegisterAdapter(zeroRewardAdapter{})
+	f := newFake()
+	var out bytes.Buffer
+	cfg := baseConfig(t, f, &out)
+	cfg.Mode = ModeEval
+	cfg.TasksPerImage = 1
+	inst := makeInstance("repo__repo-a", "PATCH", "EVAL")
+	inst.Kind = "zero-reward-test"
+	cfg.Instances = []Instance{inst}
+	// Reward step runs "true" (exit code 0), but the adapter's Grader returns reward=0.
+	cfg.Trajectory = testTrajectory(t, "true")
+
+	sum, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Tasks != 1 || sum.Failed != 0 || sum.Rewarded != 0 {
+		t.Fatalf("summary = %+v, want Tasks=1 Failed=0 Rewarded=0", sum)
+	}
+	rep := Build(parseEvents(t, out.String()))
+	if rep.RewardRate != 0 || len(rep.Unresolved) != 1 || rep.Unresolved[0].Reason != "custom-zero-verdict" {
+		t.Fatalf("report = %+v, want RewardRate=0 and unresolved reason custom-zero-verdict", rep)
+	}
+}

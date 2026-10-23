@@ -15,18 +15,6 @@
     "cache_after_ref": { "type": "string" },
     "restore_timings_ref": { "type": "string" },
     "logs_archive": { "type": "string" },
-    "node_cache_before": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/NodeCacheSample" }
-    },
-    "node_cache_after": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/NodeCacheSample" }
-    },
-    "restores": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/RestoreSample" }
-    },
     "prom_metrics": {
       "type": "array",
       "items": { "$ref": "#/$defs/PrometheusSeries" }
@@ -41,40 +29,6 @@
     }
   },
   "$defs": {
-    "NodeCacheSample": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["node", "hits", "misses"],
-      "properties": {
-        "node": { "type": "string", "minLength": 1 },
-        "ts": { "type": "string" },
-        "hits": { "type": "integer", "minimum": 0 },
-        "misses": { "type": "integer", "minimum": 0 },
-        "errors": { "type": "integer", "minimum": 0 },
-        "evictions": { "type": "integer", "minimum": 0 },
-        "bytes_used": { "type": "integer", "minimum": 0 }
-      }
-    },
-    "RestoreSample": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["env", "total_ms"],
-      "properties": {
-        "schema_version": { "type": "string", "enum": ["v1"] },
-        "node": { "type": "string" },
-        "env": { "type": "string", "minLength": 1 },
-        "snapshot": { "type": "string" },
-        "kind": { "type": "string" },
-        "ts": { "type": "string" },
-        "total_ms": { "type": "number", "minimum": 0 },
-        "manifest_fetch_ms": { "type": "number", "minimum": 0 },
-        "download_ms": { "type": "number", "minimum": 0 },
-        "oci_unpack_ms": { "type": "number", "minimum": 0 },
-        "worker_restore_ms": { "type": "number", "minimum": 0 },
-        "persist_ms": { "type": "number", "minimum": 0 },
-        "cache_hit": { "type": "boolean" }
-      }
-    },
     "PrometheusSeries": {
       "type": "object",
       "additionalProperties": false,

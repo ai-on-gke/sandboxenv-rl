@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"path"
 	"strings"
 	"time"
@@ -87,7 +88,7 @@ type Scenario struct {
 	Repeat        int              `json:"repeat,omitempty"`
 	SUT           SUTSpec          `json:"sut"`
 	Jobs          []JobSpec        `json:"jobs"`
-	WindowPolicy  WindowPolicy     `json:"window_policy,omitempty"`
+	WindowPolicy  *WindowPolicy    `json:"window_policy,omitempty"`
 	Variants      []FeatureOverlay `json:"variants,omitempty"`
 }
 
@@ -118,8 +119,10 @@ func (s Scenario) Validate() error {
 		}
 		seenJobs[j.Name] = true
 	}
-	if err := s.WindowPolicy.Validate(); err != nil {
-		return fmt.Errorf("scenario window_policy: %w", err)
+	if s.WindowPolicy != nil {
+		if err := s.WindowPolicy.Validate(); err != nil {
+			return fmt.Errorf("scenario window_policy: %w", err)
+		}
 	}
 	for i, v := range s.Variants {
 		if err := v.Validate(); err != nil {
@@ -574,6 +577,7 @@ type Event struct {
 	Timeout       *bool              `json:"timeout,omitempty"`
 	Exit          *int               `json:"exit,omitempty"`
 	Reward        *int               `json:"reward,omitempty"`
+	Detail        string             `json:"detail,omitempty"`
 	Attempts      int                `json:"attempts,omitempty"`
 	Count         int                `json:"count,omitempty"`
 	Err           string             `json:"err,omitempty"`
@@ -640,7 +644,7 @@ func (m MetricSummary) Validate() error {
 	return nil
 }
 
-// Measurements holds server-side telemetry, references or inline samples for node
+// Measurements holds server-side telemetry, artifact references for node
 // image-cache and restore timings, and typed custom_metrics extensions.
 type Measurements struct {
 	SchemaVersion     string                   `json:"schema_version"`
@@ -652,9 +656,6 @@ type Measurements struct {
 	CacheAfterRef     string                   `json:"cache_after_ref,omitempty"`
 	RestoreTimingsRef string                   `json:"restore_timings_ref,omitempty"`
 	LogsArchive       string                   `json:"logs_archive,omitempty"`
-	NodeCacheBefore   []NodeCacheSample        `json:"node_cache_before,omitempty"`
-	NodeCacheAfter    []NodeCacheSample        `json:"node_cache_after,omitempty"`
-	Restores          []RestoreSample          `json:"restores,omitempty"`
 	PromMetrics       []PrometheusSeries       `json:"prom_metrics,omitempty"`
 	ServerSummary     map[string]MetricSummary `json:"server_summary,omitempty"`
 	CustomMetrics     map[string]MetricSummary `json:"custom_metrics,omitempty"`
@@ -673,21 +674,6 @@ func (m Measurements) Validate() error {
 	}
 	if m.StartTS != nil && m.EndTS != nil && m.EndTS.Before(*m.StartTS) {
 		return errors.New("measurements: end_ts is before start_ts")
-	}
-	for i, s := range m.NodeCacheBefore {
-		if err := s.Validate(); err != nil {
-			return fmt.Errorf("measurements node_cache_before[%d]: %w", i, err)
-		}
-	}
-	for i, s := range m.NodeCacheAfter {
-		if err := s.Validate(); err != nil {
-			return fmt.Errorf("measurements node_cache_after[%d]: %w", i, err)
-		}
-	}
-	for i, r := range m.Restores {
-		if err := r.Validate(); err != nil {
-			return fmt.Errorf("measurements restores[%d]: %w", i, err)
-		}
 	}
 	for i, p := range m.PromMetrics {
 		if err := p.Validate(); err != nil {
@@ -741,13 +727,13 @@ func (a NodeCacheArtifact) Validate() error {
 // Optional counters use pointers so measured 0 is preserved and distinguished from
 // missing/uncollected counters (DESIGN §7.3).
 type NodeCacheSample struct {
-	Node      string    `json:"node"`
-	TS        time.Time `json:"ts,omitempty"`
-	Hits      int64     `json:"hits"`
-	Misses    int64     `json:"misses"`
-	Errors    *int64    `json:"errors,omitempty"`
-	Evictions *int64    `json:"evictions,omitempty"`
-	BytesUsed *int64    `json:"bytes_used,omitempty"`
+	Node      string     `json:"node"`
+	TS        *time.Time `json:"ts,omitempty"`
+	Hits      int64      `json:"hits"`
+	Misses    int64      `json:"misses"`
+	Errors    *int64     `json:"errors,omitempty"`
+	Evictions *int64     `json:"evictions,omitempty"`
+	BytesUsed *int64     `json:"bytes_used,omitempty"`
 }
 
 // Validate checks NodeCacheSample invariants.
@@ -772,19 +758,19 @@ func (n NodeCacheSample) Validate() error {
 
 // RestoreSample captures per-actor atelet restore timing sub-phases (restore_timings.jsonl).
 type RestoreSample struct {
-	SchemaVersion   string    `json:"schema_version,omitempty"`
-	Node            string    `json:"node,omitempty"`
-	Env             string    `json:"env"`
-	Snapshot        string    `json:"snapshot,omitempty"`
-	Kind            string    `json:"kind,omitempty"`
-	TS              time.Time `json:"ts,omitempty"`
-	TotalMS         float64   `json:"total_ms"`
-	ManifestFetchMS float64   `json:"manifest_fetch_ms,omitempty"`
-	DownloadMS      float64   `json:"download_ms,omitempty"`
-	OCIUnpackMS     float64   `json:"oci_unpack_ms,omitempty"`
-	WorkerRestoreMS float64   `json:"worker_restore_ms,omitempty"`
-	PersistMS       float64   `json:"persist_ms,omitempty"`
-	CacheHit        *bool     `json:"cache_hit,omitempty"`
+	SchemaVersion   string     `json:"schema_version,omitempty"`
+	Node            string     `json:"node,omitempty"`
+	Env             string     `json:"env"`
+	Snapshot        string     `json:"snapshot,omitempty"`
+	Kind            string     `json:"kind,omitempty"`
+	TS              *time.Time `json:"ts,omitempty"`
+	TotalMS         float64    `json:"total_ms"`
+	ManifestFetchMS float64    `json:"manifest_fetch_ms,omitempty"`
+	DownloadMS      float64    `json:"download_ms,omitempty"`
+	OCIUnpackMS     float64    `json:"oci_unpack_ms,omitempty"`
+	WorkerRestoreMS float64    `json:"worker_restore_ms,omitempty"`
+	PersistMS       float64    `json:"persist_ms,omitempty"`
+	CacheHit        *bool      `json:"cache_hit,omitempty"`
 }
 
 // Validate checks RestoreSample invariants.
@@ -817,9 +803,12 @@ func (p PrometheusSeries) Validate() error {
 	if p.Name == "" {
 		return errors.New("metric name is required")
 	}
+	if p.Err != "" && p.Status != "error" {
+		return fmt.Errorf("metric %q: err is set but status is not \"error\"", p.Name)
+	}
 	switch p.Status {
 	case "", "ok":
-		if p.Err == "" && p.Value == nil && len(p.Values) == 0 {
+		if p.Value == nil && len(p.Values) == 0 {
 			return fmt.Errorf("metric %q: value or values is required when status is ok", p.Name)
 		}
 	case "error":
@@ -1066,19 +1055,32 @@ func (s StatsRow) Validate() error {
 	return nil
 }
 
-// LoadJSONSchema loads and resolves one of the embedded v1 JSON Schema files
-// (for example, "scenario.schema.json" or "v1/scenario.schema.json").
-func LoadJSONSchema(schemaFile string) (*jsonschema.Resolved, error) {
-	rel := strings.TrimPrefix(schemaFile, "v1/")
+func readEmbeddedSchema(name string) (*jsonschema.Schema, error) {
+	rel := path.Base(strings.TrimPrefix(name, "v1/"))
 	data, err := SchemaFS.ReadFile(path.Join("v1", rel))
 	if err != nil {
-		return nil, fmt.Errorf("read embedded schema %q: %w", schemaFile, err)
+		return nil, fmt.Errorf("read embedded schema %q: %w", name, err)
 	}
 	var s jsonschema.Schema
 	if err := json.Unmarshal(data, &s); err != nil {
-		return nil, fmt.Errorf("unmarshal schema %q: %w", schemaFile, err)
+		return nil, fmt.Errorf("unmarshal schema %q: %w", name, err)
 	}
-	resolved, err := s.Resolve(nil)
+	return &s, nil
+}
+
+// LoadJSONSchema loads and resolves one of the embedded v1 JSON Schema files
+// (for example, "scenario.schema.json" or "v1/scenario.schema.json"), resolving
+// any sibling v1/*.schema.json $ref targets from SchemaFS.
+func LoadJSONSchema(schemaFile string) (*jsonschema.Resolved, error) {
+	s, err := readEmbeddedSchema(schemaFile)
+	if err != nil {
+		return nil, err
+	}
+	resolved, err := s.Resolve(&jsonschema.ResolveOptions{
+		Loader: func(uri *url.URL) (*jsonschema.Schema, error) {
+			return readEmbeddedSchema(path.Base(uri.Path))
+		},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("resolve schema %q: %w", schemaFile, err)
 	}

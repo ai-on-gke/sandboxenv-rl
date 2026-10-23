@@ -23,9 +23,56 @@ from typing import Any
 
 SCHEMA_DIR = Path(__file__).resolve().parent / "v1"
 
+SUPPORTED_SCHEMA_KEYWORDS = frozenset(
+    {
+        "$schema",
+        "$id",
+        "title",
+        "description",
+        "$defs",
+        "$ref",
+        "type",
+        "enum",
+        "const",
+        "minLength",
+        "minimum",
+        "minItems",
+        "items",
+        "required",
+        "minProperties",
+        "properties",
+        "additionalProperties",
+    }
+)
+
 
 class SchemaValidationError(ValueError):
     """Raised when a JSON/JSONL document violates a W1 JSON Schema."""
+
+
+def _check_schema_keywords(schema: dict[str, Any], path: str = "$") -> None:
+    """Reject unsupported JSON Schema keywords so future schema additions never silently pass."""
+    for key in schema:
+        if key not in SUPPORTED_SCHEMA_KEYWORDS:
+            raise SchemaValidationError(
+                f"{path}: unsupported JSON Schema keyword {key!r}"
+            )
+    defs = schema.get("$defs")
+    if isinstance(defs, dict):
+        for def_name, def_schema in defs.items():
+            if isinstance(def_schema, dict):
+                _check_schema_keywords(def_schema, f"{path}.$defs.{def_name}")
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        for prop_name, prop_schema in props.items():
+            if isinstance(prop_schema, dict):
+                _check_schema_keywords(prop_schema, f"{path}.properties.{prop_name}")
+    items = schema.get("items")
+    if isinstance(items, dict):
+        _check_schema_keywords(items, f"{path}.items")
+    addl = schema.get("additionalProperties")
+    if isinstance(addl, dict):
+        _check_schema_keywords(addl, f"{path}.additionalProperties")
 
 
 def resolve_schema_path(schema_name: str, schema_dir: Path = SCHEMA_DIR) -> Path:
@@ -46,21 +93,41 @@ def load_schema(schema_name: str, schema_dir: Path = SCHEMA_DIR) -> dict[str, An
         data = json.load(fh)
     if not isinstance(data, dict):
         raise SchemaValidationError(f"root schema in {path} must be a JSON object")
+    _check_schema_keywords(data, "$")
     return data
 
 
-def _resolve_ref(ref: str, root_schema: dict[str, Any]) -> dict[str, Any]:
-    """Resolve an internal JSON Pointer reference like '#/$defs/JobSpec'."""
-    if not ref.startswith("#/"):
-        raise SchemaValidationError(f"unsupported non-local $ref: {ref!r}")
+def _resolve_pointer(pointer: str, root_schema: dict[str, Any], ref: str) -> dict[str, Any]:
+    """Resolve a JSON Pointer fragment ('/...') against root_schema."""
     node: Any = root_schema
-    for part in ref[2:].split("/"):
+    for part in pointer.lstrip("/").split("/"):
+        if not part:
+            continue
         if not isinstance(node, dict) or part not in node:
             raise SchemaValidationError(f"unresolved $ref: {ref!r}")
         node = node[part]
     if not isinstance(node, dict):
         raise SchemaValidationError(f"target of $ref {ref!r} is not a schema object")
     return node
+
+
+def _resolve_ref(
+    ref: str,
+    root_schema: dict[str, Any],
+    schema_dir: Path = SCHEMA_DIR,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Resolve a local ('#/$defs/...') or sibling-file ('measurements.schema.json#...') $ref."""
+    if ref.startswith("#"):
+        target = _resolve_pointer(ref[1:], root_schema, ref)
+        return target, root_schema
+    file_part, has_frag, frag_part = ref.partition("#")
+    if not file_part or "://" in file_part:
+        raise SchemaValidationError(f"unsupported non-local $ref: {ref!r}")
+    target_root = load_schema(file_part, schema_dir=schema_dir)
+    if not has_frag or not frag_part:
+        return target_root, target_root
+    target = _resolve_pointer(frag_part, target_root, ref)
+    return target, target_root
 
 
 def _check_type(instance: Any, expected_type: str, path: str) -> None:
@@ -92,6 +159,7 @@ def _validate_object(
     schema: dict[str, Any],
     root_schema: dict[str, Any],
     path: str,
+    schema_dir: Path = SCHEMA_DIR,
 ) -> None:
     """Validate object keywords (required, minProperties, properties, additionalProperties)."""
     for req_key in schema.get("required", []):
@@ -107,34 +175,23 @@ def _validate_object(
     for key, val in instance.items():
         subpath = f"{path}.{key}"
         if key in props:
-            _validate_node(val, props[key], root_schema, subpath)
+            _validate_node(val, props[key], root_schema, subpath, schema_dir)
         elif addl is False:
             raise SchemaValidationError(f'{path}: unknown field "{key}"')
         elif isinstance(addl, dict):
-            _validate_node(val, addl, root_schema, subpath)
+            _validate_node(val, addl, root_schema, subpath, schema_dir)
 
 
-def _validate_node(
-    instance: Any,
-    schema: dict[str, Any],
-    root_schema: dict[str, Any],
-    path: str = "$",
-) -> None:
-    """Recursively validate a parsed JSON value against a schema node."""
-    if "$ref" in schema:
-        target = _resolve_ref(schema["$ref"], root_schema)
-        _validate_node(instance, target, root_schema, path)
-        return
-
-    expected_type = schema.get("type")
-    if isinstance(expected_type, str):
-        _check_type(instance, expected_type, path)
-
+def _validate_constraints(instance: Any, schema: dict[str, Any], path: str) -> None:
+    """Validate const, enum, minLength, and minimum constraints on an instance."""
+    if "const" in schema and instance != schema["const"]:
+        raise SchemaValidationError(
+            f"{path}: value {instance!r} != const {schema['const']!r}"
+        )
     if "enum" in schema and instance not in schema["enum"]:
         raise SchemaValidationError(
             f"{path}: value {instance!r} not in allowed enum {schema['enum']!r}"
         )
-
     if isinstance(instance, str):
         min_len = schema.get("minLength")
         if min_len is not None and len(instance) < min_len:
@@ -145,7 +202,36 @@ def _validate_node(
         minimum = schema.get("minimum")
         if minimum is not None and instance < minimum:
             raise SchemaValidationError(f"{path}: value {instance} < minimum {minimum}")
-    elif isinstance(instance, list):
+
+
+def _validate_node(
+    instance: Any,
+    schema: dict[str, Any],
+    root_schema: dict[str, Any],
+    path: str = "$",
+    schema_dir: Path = SCHEMA_DIR,
+) -> None:
+    """Recursively validate a parsed JSON value against a schema node."""
+    for key in schema:
+        if key not in SUPPORTED_SCHEMA_KEYWORDS:
+            raise SchemaValidationError(
+                f"{path}: unsupported JSON Schema keyword {key!r}"
+            )
+
+    if "$ref" in schema:
+        target, target_root = _resolve_ref(
+            schema["$ref"], root_schema, schema_dir=schema_dir
+        )
+        _validate_node(instance, target, target_root, path, schema_dir)
+        return
+
+    expected_type = schema.get("type")
+    if isinstance(expected_type, str):
+        _check_type(instance, expected_type, path)
+
+    _validate_constraints(instance, schema, path)
+
+    if isinstance(instance, list):
         min_items = schema.get("minItems")
         if min_items is not None and len(instance) < min_items:
             raise SchemaValidationError(
@@ -154,9 +240,11 @@ def _validate_node(
         item_schema = schema.get("items")
         if isinstance(item_schema, dict):
             for idx, elem in enumerate(instance):
-                _validate_node(elem, item_schema, root_schema, f"{path}[{idx}]")
+                _validate_node(
+                    elem, item_schema, root_schema, f"{path}[{idx}]", schema_dir
+                )
     elif isinstance(instance, dict):
-        _validate_object(instance, schema, root_schema, path)
+        _validate_object(instance, schema, root_schema, path, schema_dir)
 
 
 def validate_instance(
@@ -165,12 +253,12 @@ def validate_instance(
     schema_dir: Path = SCHEMA_DIR,
 ) -> None:
     """Validate a single decoded Python object against a W1 JSON Schema."""
-    schema = (
-        load_schema(schema_or_name, schema_dir=schema_dir)
-        if isinstance(schema_or_name, str)
-        else schema_or_name
-    )
-    _validate_node(instance, schema, schema, "$")
+    if isinstance(schema_or_name, str):
+        schema = load_schema(schema_or_name, schema_dir=schema_dir)
+    else:
+        schema = schema_or_name
+        _check_schema_keywords(schema, "$")
+    _validate_node(instance, schema, schema, "$", schema_dir=schema_dir)
 
 
 def validate_file(
@@ -195,7 +283,7 @@ def validate_file(
                     f"{path}:{line_no}: invalid JSON: {exc}"
                 ) from exc
             try:
-                validate_instance(record, schema)
+                validate_instance(record, schema, schema_dir=schema_dir)
             except SchemaValidationError as exc:
                 raise SchemaValidationError(f"{path}:{line_no}: {exc}") from exc
             count += 1
@@ -205,7 +293,7 @@ def validate_file(
         doc = json.loads(text)
     except json.JSONDecodeError as exc:
         raise SchemaValidationError(f"{path}: invalid JSON: {exc}") from exc
-    validate_instance(doc, schema)
+    validate_instance(doc, schema, schema_dir=schema_dir)
     return 1
 
 

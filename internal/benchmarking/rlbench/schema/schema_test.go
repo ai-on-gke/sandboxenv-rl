@@ -182,11 +182,8 @@ func TestGoldenFixturesValidateAndRoundTrip(t *testing.T) {
 
 	t.Run("measurements.json", func(t *testing.T) {
 		m := assertRoundTripJSON[Measurements](t, "measurements.json", "measurements.schema.json")
-		if m.CacheBeforeRef != "cache_before.json" || len(m.CustomMetrics) != 1 || m.PromMetrics[0].Value == nil || *m.PromMetrics[0].Value != 0 {
+		if m.CacheBeforeRef != "cache_before.json" || m.RestoreTimingsRef != "restore_timings.jsonl" || len(m.CustomMetrics) != 1 || m.PromMetrics[0].Value == nil || *m.PromMetrics[0].Value != 0 {
 			t.Fatalf("unexpected Measurements: %+v", m)
-		}
-		if m.NodeCacheBefore[0].Errors == nil || *m.NodeCacheBefore[0].Errors != 0 {
-			t.Fatalf("expected measured 0 errors pointer to be preserved, got %+v", m.NodeCacheBefore[0])
 		}
 	})
 
@@ -481,9 +478,44 @@ func TestJobAndRunWindowSemanticValidation(t *testing.T) {
 	if _, err := DecodeJSONStrict[PrometheusSeries](strings.NewReader(missingVal)); err == nil {
 		t.Fatal("expected PrometheusSeries with status=ok and no value to fail")
 	}
+	errWithoutErrorStatus := `{"name":"m1","err":"scrape timeout"}`
+	if _, err := DecodeJSONStrict[PrometheusSeries](strings.NewReader(errWithoutErrorStatus)); err == nil || !strings.Contains(err.Error(), `status is not "error"`) {
+		t.Fatalf("expected PrometheusSeries with err set and status omitted to fail, got: %v", err)
+	}
+	errWithOkStatus := `{"name":"m1","status":"ok","err":"scrape timeout","value":1}`
+	if _, err := DecodeJSONStrict[PrometheusSeries](strings.NewReader(errWithOkStatus)); err == nil || !strings.Contains(err.Error(), `status is not "error"`) {
+		t.Fatalf("expected PrometheusSeries with err set and status=ok to fail, got: %v", err)
+	}
 	errSeries := `{"name":"m1","status":"error","err":"connection refused"}`
 	if _, err := DecodeJSONStrict[PrometheusSeries](strings.NewReader(errSeries)); err != nil {
 		t.Fatalf("expected PrometheusSeries with status=error and err message to pass, got: %v", err)
+	}
+
+	// Optional *time.Time / *WindowPolicy pointers omit unset fields on Marshal instead of 0001-01-01T00:00:00Z or {}.
+	sampleBytes, err := json.Marshal(NodeCacheSample{Node: "n1", Hits: 1, Misses: 0})
+	if err != nil {
+		t.Fatalf("marshal NodeCacheSample: %v", err)
+	}
+	if strings.Contains(string(sampleBytes), `"ts"`) {
+		t.Fatalf("expected unset NodeCacheSample.TS to be omitted, got %s", string(sampleBytes))
+	}
+	restoreBytes, err := json.Marshal(RestoreSample{Env: "e1", TotalMS: 10})
+	if err != nil {
+		t.Fatalf("marshal RestoreSample: %v", err)
+	}
+	if strings.Contains(string(restoreBytes), `"ts"`) {
+		t.Fatalf("expected unset RestoreSample.TS to be omitted, got %s", string(restoreBytes))
+	}
+	minScenarioBytes, err := json.Marshal(Scenario{
+		SchemaVersion: "v1",
+		Name:          "min",
+		Jobs:          []JobSpec{{Name: "j1", Kind: "real", RealMode: "measure"}},
+	})
+	if err != nil {
+		t.Fatalf("marshal Scenario: %v", err)
+	}
+	if strings.Contains(string(minScenarioBytes), `"window_policy"`) {
+		t.Fatalf("expected unset Scenario.WindowPolicy to be omitted, got %s", string(minScenarioBytes))
 	}
 
 	// Report requires reasons when valid=false.
@@ -580,5 +612,17 @@ func TestPythonSchemaValidatorHelper(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	if err == nil || !strings.Contains(string(out), `unknown field "bogus"`) {
 		t.Fatalf("expected validate_schema.py to reject unknown field \"bogus\", err=%v out=%s", err, string(out))
+	}
+
+	// Unknown JSON Schema keyword must fail loudly instead of being silently ignored.
+	kwCmd := exec.Command(
+		pyBin,
+		"-B",
+		"-c",
+		`import validate_schema; validate_schema.validate_instance({"a": "x"}, {"type": "object", "properties": {"a": {"type": "string", "pattern": "^x$"}}})`,
+	)
+	kwOut, kwErr := kwCmd.CombinedOutput()
+	if kwErr == nil || !strings.Contains(string(kwOut), "unsupported JSON Schema keyword 'pattern'") {
+		t.Fatalf("expected validate_schema.py to reject unsupported keyword 'pattern', err=%v out=%s", kwErr, string(kwOut))
 	}
 }

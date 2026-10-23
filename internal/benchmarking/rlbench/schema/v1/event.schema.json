@@ -29,6 +29,7 @@
     "timeout": { "type": "boolean" },
     "exit": { "type": "integer" },
     "reward": { "type": "integer" },
+    "detail": { "type": "string" },
     "attempts": { "type": "integer", "minimum": 0 },
     "count": { "type": "integer", "minimum": 0 },
     "err": { "type": "string" },

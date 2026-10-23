@@ -137,9 +137,14 @@ _ARCH_MARKERS = ("x86_64.", "arm64.")
 MAX_FAMILIES = 64
 _FAMILIES: set[str] = set()
 _FAMILIES_LOCK = threading.Lock()
+#: Label values with a fixed meaning (no repo family, overflow). A repo
+#: family with one of these names is labelled ``<name>_repo`` instead.
+_RESERVED_FAMILIES = ("other", "unknown")
 
 
 def _bounded_family(name: str) -> str:
+    if name in _RESERVED_FAMILIES:
+        name += "_repo"
     if name in _FAMILIES:
         return name
     with _FAMILIES_LOCK:
@@ -157,8 +162,11 @@ def repo_family(task_or_image: Any) -> str:
     Prefers ``task.metadata["repo"]`` (``django/django`` -> ``django``); else
     parses a SWE-bench image name
     (``sweb.eval.x86_64.astropy__astropy-12907:latest`` -> ``astropy``); else
-    ``"unknown"``. After :data:`MAX_FAMILIES` distinct families in this
-    process, any new family is ``"other"``. Only SWE-bench image names are
+    ``"unknown"``. A repo whose family is ``other`` or ``unknown`` is
+    labelled ``other_repo`` / ``unknown_repo``, so it cannot be mistaken for
+    the overflow or no-family value. After :data:`MAX_FAMILIES` distinct
+    families in this process, any new family is ``"other"``; families seen
+    before keep their name. Only SWE-bench image names are
     parsed: set ``metadata["repo"]`` for non-SWE-bench datasets (e.g.
     R2E-Gym); otherwise their family is ``"unknown"``.
     """
@@ -200,9 +208,15 @@ class RunReport:
     environment: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     ORDER = ("preflight", "plan", "ensure_template", "warm_pool", "acquire", "process",
-             "recycle", "release", "teardown")
+             "recycle", "release", "reap", "teardown")
 
     def add_phase(self, name: str, dur: float) -> None:
+        """Add one ``name`` phase of ``dur`` seconds.
+
+        Durations come from a monotonic clock; a negative value is clamped
+        to 0, so every phase keeps ``0 <= max_s <= total_s``.
+        """
+        dur = max(0.0, dur)
         c = self.phases.setdefault(name, [0, 0.0, 0.0])
         c[0] += 1
         c[1] += dur
@@ -389,6 +403,12 @@ class Observer:
                 self._run_latency.labels(strategy=strategy, status=status).observe(report.total_s)
 
     def task_done(self, backend: str, family: str, status: str, seconds: float) -> None:
+        """Record one finished task that took ``seconds``.
+
+        Durations come from a monotonic clock; a negative value is clamped
+        to 0.
+        """
+        seconds = max(0.0, seconds)
         if self.metrics:
             self._task_latency.labels(strategy=self._strategy, backend=backend,
                                 family=family, status=status).observe(seconds)

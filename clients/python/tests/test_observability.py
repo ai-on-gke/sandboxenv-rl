@@ -721,3 +721,21 @@ async def test_cancelled_async_task_has_status_cancelled():
         await run
     assert tasks_total("cancelled") == before["cancelled"] + 1
     assert tasks_total("error") == before["error"]
+
+
+def test_registry_new_custom_registry_gets_its_own_collectors():
+    """An Observer on a new registry records there, even when the id is reused."""
+    import gc
+
+    seen_ids = set()
+    for _ in range(50):
+        _, reg = _custom_registry()
+        seen_ids.add(id(reg))
+        obs = Observer(ObservabilityConfig(enable_metrics=True), registry=reg)
+        obs.task_done("mock", "fam", "ok", 0.1)
+        assert reg.get_sample_value("ate_env_fleet_tasks_total",
+                                    {"strategy": "-", "status": "ok"}) == 1
+        del obs, reg
+        gc.collect()
+    # CPython reuses the freed id almost every time, so the loop hit the reuse case.
+    assert len(seen_ids) < 50

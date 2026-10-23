@@ -45,6 +45,7 @@ import pathlib
 import re
 import threading
 import time
+import weakref
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -73,8 +74,11 @@ FLEET_SPAN_PREFIX = "ate_env_fleet"
 PHASE_LATENCY = TASK_LATENCY = RUN_LATENCY = CLAIMS = TASKS = WARM_REPLICAS = None
 _METRICS_READY = False
 _METRICS_LOCK = threading.Lock()
-# Collector sets for caller-supplied registries, keyed by id(registry).
-_CUSTOM_COLLECTORS: dict[int, SimpleNamespace] = {}
+# Collector sets for caller-supplied registries, held weakly so that each set
+# goes away with its registry. Keying by id(registry) is not safe: a new registry
+# can reuse a dead one's id and would get the dead one's collectors.
+_CUSTOM_COLLECTORS: weakref.WeakKeyDictionary[Any, SimpleNamespace] = (
+    weakref.WeakKeyDictionary())
 
 
 def _build_collectors(prom: Any, registry: Any) -> SimpleNamespace:
@@ -113,10 +117,9 @@ def _ensure_metrics(registry: Any = None) -> SimpleNamespace | None:
         return None
     with _METRICS_LOCK:
         if registry is not None and registry is not prom.REGISTRY:
-            key = id(registry)
-            if key not in _CUSTOM_COLLECTORS:
-                _CUSTOM_COLLECTORS[key] = _build_collectors(prom, registry)
-            return _CUSTOM_COLLECTORS[key]
+            if registry not in _CUSTOM_COLLECTORS:
+                _CUSTOM_COLLECTORS[registry] = _build_collectors(prom, registry)
+            return _CUSTOM_COLLECTORS[registry]
         if not _METRICS_READY:
             c = _build_collectors(prom, None)
             PHASE_LATENCY, TASK_LATENCY, RUN_LATENCY = c.phase_latency, c.task_latency, c.run_latency

@@ -35,7 +35,7 @@ from ate_env.observability import Observer, RunReport, repo_family, serve_metric
 from ate_env.telemetry import metrics as client_metrics
 
 REPORT_KEYS = {
-    "strategy", "total_s", "phases", "claims", "tasks_ok", "tasks_err",
+    "strategy", "total_s", "phases", "claims", "tasks_ok", "tasks_err", "release_errors",
     "warm_replicas_total", "warm_replicas_peak", "environment",
 }
 MOCK_RUN_PHASES = {
@@ -219,6 +219,7 @@ FLEET_LABELS = {
     "ate_env_fleet_claims_total": ("backend", "status"),
     "ate_env_fleet_tasks_total": ("strategy", "status"),
     "ate_env_fleet_warm_replicas": ("backend",),
+    "ate_env_fleet_release_failures_total": ("backend",),
 }
 CLIENT_FAMILIES = (
     "ate_env_client_acquire_seconds", "ate_env_client_exec_seconds",

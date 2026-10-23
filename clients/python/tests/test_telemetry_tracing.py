@@ -639,6 +639,7 @@ def _assert_substrate_tree(finished, n_tasks):
         assert attrs["ate_env.command.executable"] == "echo"
         assert attrs["ate_env.exit_code"] == 0
         assert "echo hi" not in str(attrs)
+    assert len(names["ate_env_client.delete_environment"]) == n_tasks
     for delete in names["ate_env_client.delete_environment"]:
         assert _ancestors(delete, finished)[:3] == [
             "ate_env_client.release", "ate_env_fleet.release", "ate_env_fleet.run"
@@ -677,6 +678,36 @@ def test_nests_sync_fleet_through_loop_runner(spans, threaded_fake_server):
         assert _ancestors(wf, finished) == ["ate_env_fleet.process", "ate_env_fleet.run"]
         assert dict(wf.attributes)["ate_env.file.size"] == 5
 
+
+def test_nests_context_manager_fleet_deletes_every_environment(spans, threaded_fake_server):
+    """`with SandboxFleet(...)`: fleet phases parent client spans; each sandbox is deleted once."""
+    tasks = [Task(id=f"t{i}", image=IMAGE) for i in range(3)]
+    with SandboxFleet(_substrate_cfg(threaded_fake_server, max_concurrent=3)) as fleet:
+        fleet.load_tasks(tasks)
+        results = fleet.run(_process)
+    assert results == [0, 0, 0]
+    finished = spans.get_finished_spans()
+    print("\n" + format_span_tree(finished))
+    names = _by_name(finished)
+    # The run is one trace; close() at the end of the with block adds a
+    # teardown root that only reaps (nothing is left to delete).
+    roots = sorted(sp.name for sp in finished if sp.parent is None)
+    assert roots == ["ate_env_fleet.run", "ate_env_fleet.teardown"], roots
+    for create in names["ate_env_client.create_environment"]:
+        assert _ancestors(create, finished) == [
+            "ate_env_client.acquire", "ate_env_fleet.acquire", "ate_env_fleet.run"
+        ]
+    for ex in names["ate_env_client.exec"]:
+        assert _ancestors(ex, finished) == ["ate_env_fleet.process", "ate_env_fleet.run"]
+    deletes = names["ate_env_client.delete_environment"]
+    assert len(deletes) == 3
+    for delete in deletes:
+        assert _ancestors(delete, finished) == [
+            "ate_env_client.release", "ate_env_fleet.release", "ate_env_fleet.run"
+        ]
+    for sp in finished:
+        if sp.name.startswith("ate_env_client."):
+            assert _ancestors(sp, finished)[-1].startswith("ate_env_fleet."), sp.name
 
 async def test_nests_async_fleet(spans):
     server, port = await _start_fake_server()

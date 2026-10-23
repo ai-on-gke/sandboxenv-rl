@@ -45,6 +45,7 @@ import pathlib
 import re
 import threading
 import time
+import weakref
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -73,8 +74,11 @@ FLEET_SPAN_PREFIX = "ate_env_fleet"
 PHASE_LATENCY = TASK_LATENCY = RUN_LATENCY = CLAIMS = TASKS = WARM_REPLICAS = None
 _METRICS_READY = False
 _METRICS_LOCK = threading.Lock()
-# Collector sets for caller-supplied registries, keyed by id(registry).
-_CUSTOM_COLLECTORS: dict[int, SimpleNamespace] = {}
+# Collector sets for caller-supplied registries, held weakly so that each set
+# goes away with its registry. Keying by id(registry) is not safe: a new registry
+# can reuse a dead one's id and would get the dead one's collectors.
+_CUSTOM_COLLECTORS: weakref.WeakKeyDictionary[Any, SimpleNamespace] = (
+    weakref.WeakKeyDictionary())
 
 
 def _build_collectors(prom: Any, registry: Any) -> SimpleNamespace:
@@ -113,10 +117,9 @@ def _ensure_metrics(registry: Any = None) -> SimpleNamespace | None:
         return None
     with _METRICS_LOCK:
         if registry is not None and registry is not prom.REGISTRY:
-            key = id(registry)
-            if key not in _CUSTOM_COLLECTORS:
-                _CUSTOM_COLLECTORS[key] = _build_collectors(prom, registry)
-            return _CUSTOM_COLLECTORS[key]
+            if registry not in _CUSTOM_COLLECTORS:
+                _CUSTOM_COLLECTORS[registry] = _build_collectors(prom, registry)
+            return _CUSTOM_COLLECTORS[registry]
         if not _METRICS_READY:
             c = _build_collectors(prom, None)
             PHASE_LATENCY, TASK_LATENCY, RUN_LATENCY = c.phase_latency, c.task_latency, c.run_latency
@@ -137,9 +140,14 @@ _ARCH_MARKERS = ("x86_64.", "arm64.")
 MAX_FAMILIES = 64
 _FAMILIES: set[str] = set()
 _FAMILIES_LOCK = threading.Lock()
+#: Label values with a fixed meaning (no repo family, overflow). A repo
+#: family with one of these names is labelled ``<name>_repo`` instead.
+_RESERVED_FAMILIES = ("other", "unknown")
 
 
 def _bounded_family(name: str) -> str:
+    if name in _RESERVED_FAMILIES:
+        name += "_repo"
     if name in _FAMILIES:
         return name
     with _FAMILIES_LOCK:
@@ -157,8 +165,11 @@ def repo_family(task_or_image: Any) -> str:
     Prefers ``task.metadata["repo"]`` (``django/django`` -> ``django``); else
     parses a SWE-bench image name
     (``sweb.eval.x86_64.astropy__astropy-12907:latest`` -> ``astropy``); else
-    ``"unknown"``. After :data:`MAX_FAMILIES` distinct families in this
-    process, any new family is ``"other"``. Only SWE-bench image names are
+    ``"unknown"``. A repo whose family is ``other`` or ``unknown`` is
+    labelled ``other_repo`` / ``unknown_repo``, so it cannot be mistaken for
+    the overflow or no-family value. After :data:`MAX_FAMILIES` distinct
+    families in this process, any new family is ``"other"``; families seen
+    before keep their name. Only SWE-bench image names are
     parsed: set ``metadata["repo"]`` for non-SWE-bench datasets (e.g.
     R2E-Gym); otherwise their family is ``"unknown"``.
     """
@@ -200,9 +211,15 @@ class RunReport:
     environment: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     ORDER = ("preflight", "plan", "ensure_template", "warm_pool", "acquire", "process",
-             "recycle", "release", "teardown")
+             "recycle", "release", "reap", "teardown")
 
     def add_phase(self, name: str, dur: float) -> None:
+        """Add one ``name`` phase of ``dur`` seconds.
+
+        Durations come from a monotonic clock; a negative value is clamped
+        to 0, so every phase keeps ``0 <= max_s <= total_s``.
+        """
+        dur = max(0.0, dur)
         c = self.phases.setdefault(name, [0, 0.0, 0.0])
         c[0] += 1
         c[1] += dur
@@ -389,6 +406,12 @@ class Observer:
                 self._run_latency.labels(strategy=strategy, status=status).observe(report.total_s)
 
     def task_done(self, backend: str, family: str, status: str, seconds: float) -> None:
+        """Record one finished task that took ``seconds``.
+
+        Durations come from a monotonic clock; a negative value is clamped
+        to 0.
+        """
+        seconds = max(0.0, seconds)
         if self.metrics:
             self._task_latency.labels(strategy=self._strategy, backend=backend,
                                 family=family, status=status).observe(seconds)

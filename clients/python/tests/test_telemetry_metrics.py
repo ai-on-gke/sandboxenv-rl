@@ -131,3 +131,22 @@ async def test_substrate_driver_records_client_timings(fake_stack):
     assert count("acquire") == before["acquire"] + 1
     assert count("warm_claim") == before["warm_claim"] + 1
     assert count("release") == before["release"] + 1
+
+
+def test_metric_cache_does_not_outlive_a_custom_registry():
+    """A new registry gets its own collector, even when it reuses a dead one's id."""
+    import gc
+
+    prom = pytest.importorskip("prometheus_client")
+    seen_ids = set()
+    for _ in range(50):
+        reg = prom.CollectorRegistry()
+        seen_ids.add(id(reg))
+        metrics._metric(prom.Counter, "ate_env_test_registry_reuse", "test",
+                        ["status"], registry=reg).labels(status="ok").inc()
+        assert reg.get_sample_value("ate_env_test_registry_reuse_total",
+                                    {"status": "ok"}) == 1
+        del reg
+        gc.collect()
+    # CPython reuses the freed id almost every time, so the loop hit the reuse case.
+    assert len(seen_ids) < 50

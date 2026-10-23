@@ -205,19 +205,43 @@ func TestBuildActorTemplateResources(t *testing.T) {
 	}
 }
 
+func TestResourceLimitsRoundUp(t *testing.T) {
+	for _, tc := range []struct {
+		cpu, memory string
+		millicores  int64
+		bytes       int64
+	}{
+		{"1.5", "1.5Gi", 1500, 1610612736},
+		{"999.999", "1G", 999999, 1000000000},
+		{"2", "4Gi", 2000, 4 << 30},
+		// A fraction of a millicore or of a byte rounds up to one; the
+		// flag validation keeps such values out, the conversion stays total.
+		{"100u", "0.5", 1, 1},
+	} {
+		l := resourceLimits(tc.cpu, tc.memory).GetLimits()
+		if l.GetCpuMillicores() != tc.millicores || l.GetMemoryBytes() != tc.bytes {
+			t.Errorf("resourceLimits(%q, %q) = %d millicores, %d bytes; want %d, %d",
+				tc.cpu, tc.memory, l.GetCpuMillicores(), l.GetMemoryBytes(), tc.millicores, tc.bytes)
+		}
+	}
+}
+
 func TestTemplateConfigRejectsBadResources(t *testing.T) {
 	for _, tc := range []struct{ cpu, memory string }{
 		{"two", ""},
 		{"", "4GB!"},
 		{"0", ""},
 		{"", "-1Gi"},
-		// Substrate's bounds: cpu below 1000 cores, memory an int64 byte
-		// count, each quantity at most 32 characters.
+		// env's bounds: cpu from 1m below 1000 cores, memory from 1Mi to an
+		// int64 byte count. 512m is millibytes, the typo for 512Mi.
 		{"1000", ""},
 		{"1e3", ""},
 		{"999.9991", ""},
 		{"", "9223372036854775808"},
 		{"0.0000000000000000000000000000001", ""},
+		{"100u", ""},
+		{"", "512m"},
+		{"", "512Ki"},
 	} {
 		cfg := testTemplateConfig()
 		cfg.cpu, cfg.memory = tc.cpu, tc.memory

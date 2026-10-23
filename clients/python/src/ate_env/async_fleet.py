@@ -30,7 +30,7 @@ from typing import Any
 from .config import FleetConfig
 from .fleet import SandboxFleet
 from .handle import SandboxHandle
-from .telemetry import _CURRENT_SLOT_WAIT_MS, _CURRENT_TASK_META, BenchTelemetry
+from .telemetry.tracing import current_slot_wait_ms, current_task_id
 from .types import FleetPlan, Task
 
 logger = logging.getLogger("sandbox_sdk.async_fleet")
@@ -49,16 +49,11 @@ class AsyncSandboxFleet:
         driver: Any | None = None,
         *,
         sync_fleet: SandboxFleet | None = None,
-        telemetry: BenchTelemetry | dict[str, Any] | None = None,
     ):
-        self._fleet = sync_fleet or SandboxFleet(config, driver, telemetry=telemetry)
+        self._fleet = sync_fleet or SandboxFleet(config, driver)
 
     def close(self, *, wait: bool = True) -> None:
         """Close fleet resources."""
-        try:
-            self._fleet.telemetry.close()
-        except Exception:
-            pass
         if hasattr(self.backend, "close"):
             self.backend.close()
 
@@ -76,10 +71,6 @@ class AsyncSandboxFleet:
     @property
     def backend(self) -> Any:
         return self._fleet.backend
-
-    @property
-    def telemetry(self) -> BenchTelemetry:
-        return self._fleet.telemetry
 
     @property
     def tasks(self) -> list[Task]:
@@ -179,10 +170,7 @@ class AsyncSandboxFleet:
         else:
             template_id, rootfs_image = await self._ensure_template_for_image_async(task_obj.image)
         to_s = timeout_s or self.config.acquire_timeout_s
-        effective_img = rootfs_image or (
-            task_obj.image if task_obj.image and task_obj.image != "default" else template_id
-        )
-        meta_tok = _CURRENT_TASK_META.set((task_obj.id, effective_img))
+        task_tok = current_task_id.set(task_obj.id)
         try:
             if hasattr(self.backend, "acquire_async"):
                 raw_inst = await self.backend.acquire_async(
@@ -197,7 +185,7 @@ class AsyncSandboxFleet:
                     rootfs_image=rootfs_image,
                 )
         finally:
-            _CURRENT_TASK_META.reset(meta_tok)
+            current_task_id.reset(task_tok)
 
         try:
             runtime, data_plane = self._fleet._build_runtime(raw_inst)
@@ -282,11 +270,11 @@ class AsyncSandboxFleet:
             t_wait0 = time.perf_counter()
             async with sem:
                 slot_wait_ms = max(0.0, (time.perf_counter() - t_wait0) * 1000.0)
-                tok = _CURRENT_SLOT_WAIT_MS.set(slot_wait_ms)
+                tok = current_slot_wait_ms.set(slot_wait_ms)
                 try:
                     handle = await self.acquire(task)
                 finally:
-                    _CURRENT_SLOT_WAIT_MS.reset(tok)
+                    current_slot_wait_ms.reset(tok)
                 try:
                     res = await self._call_process_fn(process_fn, task, handle)
                     results[idx] = res

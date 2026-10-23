@@ -14,7 +14,7 @@
 
 """Unit tests and microbenchmarks for W11 SDK telemetry and trace emission."""
 
-# pylint: disable=redefined-builtin,redefined-outer-name,protected-access
+# pylint: disable=redefined-builtin,redefined-outer-name,protected-access,no-member
 # pylint: disable=too-many-locals,too-many-statements,use-implicit-booleaness-not-comparison
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ from ate_env.telemetry import (
     TraceEventRecord,
     _load_w1_schema,
     instrument_client,
+    instrument_fleet,
     validate_event_dict,
     validate_trace_event_dict,
 )
@@ -530,25 +531,43 @@ def test_trace_mode_requires_path_and_supports_artifact_dir_and_worker_shards(
 def test_sandbox_fleet_default_telemetry_reads_env_bench_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify SandboxFleet and AsyncSandboxFleet honor ENV_BENCH_MODE and telemetry= kwarg."""
+    """Verify instrument_fleet honors ENV_BENCH_MODE, explicit telemetry, and one-way dependency."""
     monkeypatch.delenv("ARTIFACT_DIR", raising=False)
     monkeypatch.delenv("ENV_BENCH_TRACE_PATH", raising=False)
     monkeypatch.setenv("ENV_BENCH_MODE", "measure")
 
     cfg = FleetConfig(backend="mock")
-    fleet = SandboxFleet(cfg)
+    fleet = instrument_fleet(SandboxFleet(cfg))
     assert fleet.telemetry.mode == "measure"
     assert fleet.telemetry.run_id == fleet.run_id
     fleet.close()
 
     explicit_tel = BenchTelemetry(mode="measure", run_id="explicit-run", job="kwarg-job")
-    fleet_kw = SandboxFleet(FleetConfig(backend="mock"), telemetry=explicit_tel)
+    fleet_kw = instrument_fleet(SandboxFleet(FleetConfig(backend="mock")), explicit_tel)
     assert fleet_kw.telemetry is explicit_tel
     fleet_kw.close()
 
-    async_fleet_kw = AsyncSandboxFleet(FleetConfig(backend="mock"), telemetry=explicit_tel)
+    async_fleet_kw = instrument_fleet(AsyncSandboxFleet(FleetConfig(backend="mock")), explicit_tel)
     assert async_fleet_kw.telemetry is explicit_tel
     async_fleet_kw.close()
+
+    # Verify strict one-way dependency: no core SDK module imports bench.py.
+    src_root = Path(__file__).resolve().parents[1] / "src" / "ate_env"
+    for rel_path in (
+        "__init__.py",
+        "config.py",
+        "client.py",
+        "fleet.py",
+        "async_fleet.py",
+        "handle.py",
+        "strategies.py",
+        "backend/substrate.py",
+        "runtime/substrate_env_client.py",
+        "telemetry/tracing.py",
+    ):
+        text = (src_root / rel_path).read_text(encoding="utf-8")
+        assert "BenchTelemetry" not in text, f"{rel_path} references BenchTelemetry"
+        assert "telemetry.bench" not in text, f"{rel_path} imports telemetry.bench"
 
 
 @pytest.mark.asyncio
@@ -594,9 +613,8 @@ async def test_substrate_driver_and_runtime_sdk_telemetry_integration(
         template="tmpl-test",
         max_warmpool_replicas=1,
         max_concurrent=1,
-        telemetry=telemetry,
     )
-    fleet = AsyncSandboxFleet(cfg)
+    fleet = instrument_fleet(AsyncSandboxFleet(cfg), telemetry)
     img = "docker.io/library/python@sha256:" + "d" * 64
     task1 = Task(id="t-warm", image=img)
     task2 = Task(id="t-cold", image=img)

@@ -28,8 +28,7 @@ from .config import FleetConfig
 from .handle import SandboxHandle
 from .runtime.base import RuntimeGuestHook
 from .strategies import STRATEGIES
-from .telemetry import _CURRENT_TASK_META, BenchTelemetry
-from .telemetry.tracing import tracer_from_config
+from .telemetry.tracing import current_task_id, tracer_from_config
 from .types import (
     DataPlaneEndpoint,
     FleetPlan,
@@ -48,13 +47,7 @@ class SandboxFleet:
     task acquisition, and execution strategies across any backend driver.
     """
 
-    def __init__(
-        self,
-        config: FleetConfig | None = None,
-        driver: BackendDriver | None = None,
-        *,
-        telemetry: BenchTelemetry | dict[str, Any] | None = None,
-    ):
+    def __init__(self, config: FleetConfig | None = None, driver: BackendDriver | None = None):
         self.config = config or FleetConfig()
         self.run_id = uuid.uuid4().hex[:12]
         self._tasks: list[Task] = []
@@ -64,21 +57,9 @@ class SandboxFleet:
         # Tracing (FleetConfig.tracing): spans on handles and the Substrate driver.
         self._tracer = tracer_from_config(self.config.tracing)
 
-        raw_telemetry = telemetry if telemetry is not None else self.config.telemetry
-        if isinstance(raw_telemetry, BenchTelemetry):
-            self.telemetry = raw_telemetry
-        elif isinstance(raw_telemetry, dict):
-            params = dict(raw_telemetry)
-            params.setdefault("run_id", self.run_id)
-            self.telemetry = BenchTelemetry(**params)
-        else:
-            self.telemetry = BenchTelemetry(run_id=self.run_id)
-
         # Initialize Backend Driver
         if driver is not None:
             self.backend = driver
-            if hasattr(self.backend, "telemetry") and getattr(self.backend, "telemetry", None) is None:
-                self.backend.telemetry = self.telemetry
         elif self.config.backend == "mock":
             self.backend = MockBackendDriver()
         elif self.config.backend == "substrate":
@@ -94,7 +75,6 @@ class SandboxFleet:
                 acquire_timeout_s=self.config.acquire_timeout_s,
                 ready_timeout_s=self.config.ready_timeout_s,
                 tracer_config=self.config.tracing,
-                telemetry=self.telemetry,
             )
         else:
             raise NotImplementedError(f"Backend '{self.config.backend}' is not yet supported or requires extras")
@@ -116,11 +96,6 @@ class SandboxFleet:
         except Exception as e:
             teardown_err = e
         finally:
-            try:
-                self.telemetry.close()
-            except Exception as te:
-                if teardown_err is None:
-                    teardown_err = te
             if hasattr(self.backend, "close"):
                 try:
                     self.backend.close()
@@ -247,16 +222,13 @@ class SandboxFleet:
             template_id, rootfs_image = self._ensure_template_for_image(task_obj.image)
 
         to_s = timeout_s or self.config.acquire_timeout_s
-        effective_img = rootfs_image or (
-            task_obj.image if task_obj.image and task_obj.image != "default" else template_id
-        )
-        meta_tok = _CURRENT_TASK_META.set((task_obj.id, effective_img))
+        task_tok = current_task_id.set(task_obj.id)
         try:
             raw_inst = self.backend.acquire(
                 template_id, self.run_id, timeout_s=to_s, rootfs_image=rootfs_image
             )
         finally:
-            _CURRENT_TASK_META.reset(meta_tok)
+            current_task_id.reset(task_tok)
 
         try:
             runtime, data_plane = self._build_runtime(raw_inst)
@@ -296,9 +268,6 @@ class SandboxFleet:
         ep = raw_inst.data_planes.get(name) or raw_inst.data_planes.get("ate_env")
         client = getattr(self.backend, "client", None)
         loop_runner = getattr(self.backend, "_loop_runner", None)
-        source = str(raw_inst.metadata.get("source") or "direct")
-        cache_state = raw_inst.metadata.get("cache_state")
-        acquired_at = raw_inst.metadata.get("acquired_at_monotonic")
         return SubstrateEnvClientRuntime(
             env_id=raw_inst.instance_id,
             endpoint=ep.address if ep else raw_inst.endpoint,
@@ -306,10 +275,6 @@ class SandboxFleet:
             client=client,
             loop_runner=loop_runner,
             tracer_config=self.config.tracing,
-            telemetry=self.telemetry,
-            source=source,
-            cache_state=cache_state,
-            acquired_at_monotonic=float(acquired_at) if acquired_at is not None else None,
         ), ep
 
     def release(self, handle: SandboxHandle | Sequence[SandboxHandle]) -> None:

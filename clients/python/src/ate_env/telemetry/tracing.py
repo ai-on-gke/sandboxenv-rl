@@ -39,6 +39,7 @@ import asyncio
 import atexit
 import collections
 import contextlib
+import contextvars
 import logging
 import os
 import re
@@ -59,6 +60,15 @@ logger = logging.getLogger("ate_env.telemetry.tracing")
 # TracerConfig service name is the OTel resource ``service.name``; it does not
 # rename spans, so fleet and client spans keep one vocabulary.
 CLIENT_SPAN_PREFIX = "ate_env_client"
+
+# Task-local context variables for propagating fleet concurrency slot-wait
+# latency and task identity into backend driver spans.
+current_slot_wait_ms: contextvars.ContextVar[float] = contextvars.ContextVar(
+    "ate_env_slot_wait_ms", default=0.0
+)
+current_task_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "ate_env_task_id", default=None
+)
 
 _MISSING_EXTRA_MSG = (
     "OpenTelemetry not installed; tracing disabled. "
@@ -365,6 +375,11 @@ def mark_error(span: Any, description: str) -> None:
     """
     if span is None:
         return
+    if hasattr(span, "record_error"):
+        try:
+            span.record_error(description)
+        except Exception:  # pragma: no cover
+            pass
     otel = _load_otel()
     if otel is None:
         return
@@ -372,6 +387,59 @@ def mark_error(span: Any, description: str) -> None:
         span.set_status(otel.Status(otel.StatusCode.ERROR, description))
     except Exception:  # pragma: no cover - status errors never fail a call
         pass
+
+
+class _CompositeSpan:
+    """Forwards span attribute and status mutations to two active spans."""
+
+    def __init__(self, primary: Any, secondary: Any) -> None:
+        self._primary = primary
+        self._secondary = secondary
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        for sp in (self._primary, self._secondary):
+            if sp is not None:
+                with contextlib.suppress(Exception):
+                    sp.set_attribute(key, value)
+
+    def set_status(self, status: Any) -> None:
+        for sp in (self._primary, self._secondary):
+            if sp is not None and hasattr(sp, "set_status"):
+                with contextlib.suppress(Exception):
+                    sp.set_status(status)
+
+    def record_error(self, description: str) -> None:
+        for sp in (self._primary, self._secondary):
+            if sp is not None and hasattr(sp, "record_error"):
+                with contextlib.suppress(Exception):
+                    sp.record_error(description)
+
+
+class CompositeTracer:
+    """Multiplexes span creation across two tracers (e.g. OTel + custom sink)."""
+
+    def __init__(self, primary: Any, secondary: Any) -> None:
+        self.primary = primary
+        self.secondary = secondary
+
+    @contextlib.contextmanager
+    def start_as_current_span(self, name: str, **kwargs: Any) -> Iterator[Any]:
+        with (
+            self.primary.start_as_current_span(name, **kwargs) as span_a,
+            self.secondary.start_as_current_span(name, **kwargs) as span_b,
+        ):
+            yield _CompositeSpan(span_a, span_b)
+
+
+def combine_tracers(primary: Any, secondary: Any) -> Any:
+    """Return a single tracer or a CompositeTracer when both are non-None."""
+    if primary is None:
+        return secondary
+    if secondary is None or primary is secondary:
+        return primary
+    if isinstance(primary, CompositeTracer) and primary.secondary is secondary:
+        return primary
+    return CompositeTracer(primary, secondary)
 
 
 # --- TracerManager ------------------------------------------------------- #

@@ -48,10 +48,12 @@ import random
 import socket
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from .tracing import CLIENT_SPAN_PREFIX, combine_tracers
 
 if TYPE_CHECKING:
     TRACE_EVENT_SCHEMA: dict[str, Any]
@@ -76,6 +78,7 @@ __all__ = [
     "validate_trace_event_dict",
     "validate_event_dict",
     "instrument_client",
+    "instrument_fleet",
 ]
 
 SCHEMA_VERSION = "v1"
@@ -86,23 +89,12 @@ _MEASURE_ERR_MAX_CHARS = 160
 _TRACE_ERR_MAX_CHARS = 512
 
 # Task-local re-entrancy guards so delegating calls (Env.shell -> Env.start_process,
-# Env.suspend -> Client.suspend, SubstrateBackendDriver -> Client.*) never double-count.
+# Env.suspend -> Client.suspend) never double-count in instrument_client.
 _IN_TRACKED_SHELL: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_ate_env_in_tracked_shell", default=False
 )
 _IN_TRACKED_LIFECYCLE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_ate_env_in_tracked_lifecycle", default=False
-)
-_IN_TRACKED_EXEC: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "_ate_env_in_tracked_exec", default=False
-)
-# Task-local slot-wait latency observed at existing fleet concurrency boundaries.
-_CURRENT_SLOT_WAIT_MS: contextvars.ContextVar[float] = contextvars.ContextVar(
-    "_ate_env_slot_wait_ms", default=0.0
-)
-# Task-local (instance_id, image_ref) metadata propagated from Fleet.acquire into driver.acquire.
-_CURRENT_TASK_META: contextvars.ContextVar[tuple[str, str]] = contextvars.ContextVar(
-    "_ate_env_task_meta", default=("", "")
 )
 
 
@@ -1208,8 +1200,6 @@ def _wrap_env_handle(env_handle: Any, telemetry: BenchTelemetry) -> Any:
 
     @functools.wraps(orig_shell)
     async def tracked_shell(command_line: str, *args: Any, **kwargs: Any) -> Any:
-        if _IN_TRACKED_EXEC.get():
-            return await orig_shell(command_line, *args, **kwargs)
         step_name = str(kwargs.pop("_bench_step_name", "") or "")
         token = _IN_TRACKED_SHELL.set(True)
         try:
@@ -1228,7 +1218,7 @@ def _wrap_env_handle(env_handle: Any, telemetry: BenchTelemetry) -> Any:
 
     @functools.wraps(orig_start_process)
     async def tracked_start_process(command: Sequence[str], *args: Any, **kwargs: Any) -> Any:
-        if _IN_TRACKED_SHELL.get() or _IN_TRACKED_EXEC.get():
+        if _IN_TRACKED_SHELL.get():
             return await orig_start_process(command, *args, **kwargs)
         step_name = str(kwargs.pop("_bench_step_name", "") or "")
         async with telemetry.track(
@@ -1372,3 +1362,559 @@ def instrument_client(client: Any, telemetry: BenchTelemetry) -> Any:
     client.env = tracked_env
     setattr(client, "_bench_telemetry_wrapped", True)
     return client
+
+
+class _BenchSpan:
+    """In-process span consumer that captures SDK span attributes and timing."""
+
+    def __init__(self, name: str, parent: _BenchSpan | None = None) -> None:
+        self.name = name
+        self.parent = parent
+        self.attributes: dict[str, Any] = {}
+        self.error_description: str = ""
+        self.start_perf: float = time.perf_counter()
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        """Record a span attribute."""
+        self.attributes[key] = value
+
+    def set_status(self, status: Any, description: str | None = None) -> None:
+        """Record span status description when provided."""
+        _ = status
+        if description:
+            self.error_description = str(description)
+
+    def record_error(self, description: str) -> None:
+        """Record an error description emitted via mark_error()."""
+        if description:
+            self.error_description = str(description)
+
+
+_ACTIVE_BENCH_SPANS: contextvars.ContextVar[tuple[_BenchSpan, ...]] = contextvars.ContextVar(
+    "_ate_env_active_bench_spans", default=()
+)
+
+
+class _BenchTracer:
+    """Tracer implementation that consumes ate_env_client.* spans into BenchTelemetry."""
+
+    def __init__(self, telemetry: BenchTelemetry) -> None:
+        self.telemetry = telemetry
+        self._lock = threading.Lock()
+        self._env_meta: dict[str, dict[str, Any]] = {}
+
+    def start_span(self, name: str, **kwargs: Any) -> _BenchSpan:
+        """Create a standalone benchmark span."""
+        _ = kwargs
+        stack = _ACTIVE_BENCH_SPANS.get()
+        return _BenchSpan(name=name, parent=stack[-1] if stack else None)
+
+    @contextlib.contextmanager
+    def start_as_current_span(self, name: str, **kwargs: Any) -> Iterator[_BenchSpan | None]:
+        """Start an in-process benchmark span and record W1 telemetry on exit."""
+        _ = kwargs
+        if self.telemetry.mode == "off":
+            yield None
+            return
+        stack = _ACTIVE_BENCH_SPANS.get()
+        parent = stack[-1] if stack else None
+        span = _BenchSpan(name=name, parent=parent)
+        token = _ACTIVE_BENCH_SPANS.set((*stack, span))
+        exc_caught: BaseException | None = None
+        try:
+            yield span
+        except BaseException as exc:
+            exc_caught = exc
+            raise
+        finally:
+            dur_ms = (time.perf_counter() - span.start_perf) * 1000.0
+            _ACTIVE_BENCH_SPANS.reset(token)
+            self._on_span_end(span, dur_ms, exc_caught)
+
+    def _flush_task_exec(self, env_id: str) -> None:
+        """Flush accumulated per-task exec duration for env_id on release."""
+        if not env_id:
+            return
+        with self._lock:
+            meta = self._env_meta.get(env_id)
+            if not meta or int(meta.get("task_exec_count") or 0) <= 0:
+                return
+            total_ms = float(meta.get("task_exec_ms") or 0.0)
+            source = str(meta.get("source") or "direct")
+            image = str(meta.get("image") or "")
+            instance = str(meta.get("instance") or "")
+            meta["task_exec_ms"] = 0.0
+            meta["task_exec_count"] = 0
+        cache_state = (
+            "hit"
+            if source in ("warm_pool", "snapshot")
+            else ("miss" if source == "cold_create" else "unknown")
+        )
+        self.telemetry.record_op(
+            "task_exec",
+            total_ms,
+            ok=True,
+            env_id=env_id,
+            image=image,
+            instance=instance,
+            source=source,
+            cache_state=cache_state,
+            emit_trace=False,
+        )
+
+    def _on_span_end(
+        self,
+        span: _BenchSpan,
+        dur_ms: float,
+        exc_val: BaseException | None,
+    ) -> None:
+        if self.telemetry.mode == "off":
+            return
+        attrs = span.attributes
+        parent_name = span.parent.name if span.parent is not None else ""
+        parent_attrs = span.parent.attributes if span.parent is not None else {}
+
+        ok = True
+        timed_out = False
+        err_msg = ""
+        if isinstance(exc_val, asyncio.CancelledError):
+            ok = False
+            timed_out = False
+            err_msg = _format_error(exc_val, self.telemetry.mode) or "CancelledError"
+        elif exc_val is not None:
+            ok = False
+            err_msg = _format_error(exc_val, self.telemetry.mode)
+            if isinstance(exc_val, (TimeoutError, asyncio.TimeoutError)) or (
+                type(exc_val).__name__ in ("CommandTimeoutError", "SandboxStartError")
+                and "timed out" in str(exc_val).lower()
+            ):
+                timed_out = True
+        elif span.error_description:
+            ok = False
+            err_msg = _format_error(span.error_description, self.telemetry.mode)
+            if "timed out" in span.error_description.lower():
+                timed_out = True
+
+        prefix = f"{CLIENT_SPAN_PREFIX}."
+        if not span.name.startswith(prefix):
+            return
+        short_name = span.name[len(prefix) :]
+
+        if short_name == "acquire":
+            env_id = str(attrs.get("ate.actor.name") or "")
+            source = str(attrs.get("ate_env.acquire.source") or "cold_create")
+            cache_state = "hit" if source in ("warm_pool", "snapshot") else "miss"
+            image = str(
+                attrs.get("ate_env.rootfs_image") or attrs.get("ate.template.name") or ""
+            )
+            instance = str(attrs.get("ate_env.task_id") or "")
+            retries = int(attrs.get("ate_env.retries") or 0)
+            slot_wait_ms = float(attrs.get("ate_env.slot_wait_ms") or 0.0)
+            trace_op = "wake" if source in ("warm_pool", "snapshot") else "create"
+            if ok and env_id:
+                with self._lock:
+                    self._env_meta[env_id] = {
+                        "image": image,
+                        "instance": instance,
+                        "source": source,
+                        "acquired_at": time.monotonic(),
+                        "task_exec_ms": 0.0,
+                        "task_exec_count": 0,
+                    }
+            self.telemetry.record_op(
+                "acquire",
+                dur_ms,
+                ok=ok,
+                env_id=env_id,
+                image=image,
+                instance=instance,
+                source=source,
+                cache_state=cache_state,
+                slot_wait_ms=slot_wait_ms,
+                retried=retries,
+                timed_out=timed_out,
+                err=err_msg,
+                trace_op=trace_op,
+                emit_trace=bool(env_id),
+            )
+            return
+
+        if short_name == "warm_pool":
+            warmed = int(attrs.get("ate_env.warmed_count") or 0)
+            if warmed > 0:
+                template_id = str(attrs.get("ate.template.name") or "")
+                image = str(attrs.get("ate_env.rootfs_image") or template_id)
+                self.telemetry.record_op(
+                    "prewarm",
+                    dur_ms,
+                    ok=ok,
+                    env_id=template_id,
+                    image=image,
+                    source="warm_pool",
+                    cache_state="miss",
+                    timed_out=timed_out,
+                    err=err_msg,
+                    emit_trace=False,
+                )
+            return
+
+        if short_name == "unwarm_pool":
+            deleted_count = int(attrs.get("ate_env.replicas") or 0)
+            if deleted_count > 0:
+                template_id = str(attrs.get("ate.template.name") or "")
+                image = str(attrs.get("ate_env.rootfs_image") or template_id)
+                self.telemetry.record_op(
+                    "retire",
+                    dur_ms,
+                    ok=ok,
+                    env_id=template_id,
+                    image=image,
+                    source="warm_pool",
+                    cache_state="hit",
+                    timed_out=timed_out,
+                    err=err_msg,
+                    emit_trace=False,
+                )
+            return
+
+        if short_name == "reap":
+            reaped_total = int(attrs.get("ate_env.reaped_count") or 0)
+            warm_reaped = int(attrs.get("ate_env.warm_reaped_count") or 0)
+            run_id = str(attrs.get("ate_env.run_id") or "")
+            if reaped_total > 0:
+                reap_source = "warm_pool" if warm_reaped > 0 else "direct"
+                reap_cache = "hit" if warm_reaped > 0 else "unknown"
+                self.telemetry.record_op(
+                    "reap",
+                    dur_ms,
+                    ok=ok,
+                    env_id=run_id,
+                    source=reap_source,
+                    cache_state=reap_cache,
+                    timed_out=timed_out,
+                    err=err_msg,
+                    emit_trace=False,
+                )
+                if warm_reaped > 0:
+                    self.telemetry.record_op(
+                        "retire",
+                        dur_ms,
+                        ok=ok,
+                        env_id=run_id,
+                        source="warm_pool",
+                        cache_state="hit",
+                        timed_out=timed_out,
+                        err=err_msg,
+                        emit_trace=False,
+                    )
+            return
+
+        if short_name == "release":
+            env_id = str(attrs.get("ate.actor.name") or "")
+            self._flush_task_exec(env_id)
+            return
+
+        if short_name in (
+            "create_environment",
+            "get_environment",
+            "suspend_environment",
+            "delete_environment",
+        ):
+            env_id = str(attrs.get("ate.actor.name") or "")
+            if not env_id or env_id.startswith("preflight-probe-"):
+                return
+            if parent_name == f"{CLIENT_SPAN_PREFIX}.acquire":
+                return
+            if parent_name == f"{CLIENT_SPAN_PREFIX}.warm_pool":
+                image = str(
+                    attrs.get("ate_env.rootfs_image")
+                    or parent_attrs.get("ate_env.rootfs_image")
+                    or attrs.get("ate.template.name")
+                    or parent_attrs.get("ate.template.name")
+                    or ""
+                )
+                if short_name == "create_environment":
+                    with self._lock:
+                        self._env_meta[env_id] = {
+                            "image": image,
+                            "instance": "",
+                            "source": "warm_pool",
+                            "acquired_at": None,
+                            "task_exec_ms": 0.0,
+                            "task_exec_count": 0,
+                        }
+                    self.telemetry.record_op(
+                        "create",
+                        dur_ms,
+                        ok=ok,
+                        env_id=env_id,
+                        image=image,
+                        source="warm_pool",
+                        cache_state="miss",
+                        timed_out=timed_out,
+                        err=err_msg,
+                        trace_only=True,
+                    )
+                elif short_name == "suspend_environment":
+                    with self._lock:
+                        meta = self._env_meta.get(env_id, {})
+                        eff_image = str(meta.get("image") or image)
+                    self.telemetry.record_op(
+                        "suspend",
+                        dur_ms,
+                        ok=ok,
+                        env_id=env_id,
+                        image=eff_image,
+                        source="warm_pool",
+                        cache_state="miss",
+                        timed_out=timed_out,
+                        err=err_msg,
+                        trace_only=True,
+                    )
+                return
+            if (
+                parent_name
+                in (
+                    f"{CLIENT_SPAN_PREFIX}.unwarm_pool",
+                    f"{CLIENT_SPAN_PREFIX}.reap",
+                )
+                and short_name == "delete_environment"
+            ):
+                with self._lock:
+                    meta = self._env_meta.pop(env_id, {})
+                image = str(
+                    meta.get("image")
+                    or parent_attrs.get("ate_env.rootfs_image")
+                    or parent_attrs.get("ate.template.name")
+                    or ""
+                )
+                source = str(meta.get("source") or "warm_pool")
+                cache_state = "hit" if source in ("warm_pool", "snapshot") else "unknown"
+                self.telemetry.record_op(
+                    "delete",
+                    dur_ms,
+                    ok=ok,
+                    env_id=env_id,
+                    image=image,
+                    instance=str(meta.get("instance") or ""),
+                    source=source,
+                    cache_state=cache_state,
+                    timed_out=timed_out,
+                    err=err_msg,
+                    trace_only=True,
+                )
+                return
+            if parent_name == f"{CLIENT_SPAN_PREFIX}.release" and short_name in (
+                "suspend_environment",
+                "delete_environment",
+            ):
+                self._flush_task_exec(env_id)
+                with self._lock:
+                    if short_name == "delete_environment":
+                        meta = self._env_meta.pop(env_id, {})
+                    else:
+                        meta = dict(self._env_meta.get(env_id, {}))
+                source = str(
+                    meta.get("source")
+                    or parent_attrs.get("ate_env.acquire.source")
+                    or "direct"
+                )
+                cache_state = (
+                    "hit"
+                    if source in ("warm_pool", "snapshot")
+                    else ("miss" if source == "cold_create" else "unknown")
+                )
+                op_name = "suspend" if short_name == "suspend_environment" else "delete"
+                self.telemetry.record_op(
+                    op_name,
+                    dur_ms,
+                    ok=ok,
+                    env_id=env_id,
+                    image=str(meta.get("image") or ""),
+                    instance=str(meta.get("instance") or ""),
+                    source=source,
+                    cache_state=cache_state,
+                    timed_out=timed_out,
+                    err=err_msg,
+                )
+                return
+            return
+
+        if short_name == "exec":
+            env_id = str(attrs.get("ate.actor.name") or "")
+            with self._lock:
+                meta = self._env_meta.setdefault(
+                    env_id,
+                    {
+                        "image": str(attrs.get("ate_env.rootfs_image") or ""),
+                        "instance": str(attrs.get("ate_env.task_id") or ""),
+                        "source": "direct",
+                        "acquired_at": None,
+                        "task_exec_ms": 0.0,
+                        "task_exec_count": 0,
+                    },
+                )
+                source = str(meta.get("source") or "direct")
+                image = str(
+                    meta.get("image") or attrs.get("ate_env.rootfs_image") or ""
+                )
+                instance = str(
+                    meta.get("instance") or attrs.get("ate_env.task_id") or ""
+                )
+                acquired_at = meta.get("acquired_at")
+                if attrs.get("ate_env.first_command") is True:
+                    meta["acquired_at"] = None
+                exec_dur_ms = (
+                    float(attrs.get("ate_env.duration_s") or (dur_ms / 1000.0))
+                    * 1000.0
+                )
+                meta["task_exec_ms"] = float(meta.get("task_exec_ms") or 0.0) + max(
+                    0.0, exec_dur_ms
+                )
+                meta["task_exec_count"] = int(meta.get("task_exec_count") or 0) + 1
+
+            cache_state = (
+                "hit"
+                if source in ("warm_pool", "snapshot")
+                else ("miss" if source == "cold_create" else "unknown")
+            )
+            timed_out_exec = bool(attrs.get("ate_env.timed_out")) or timed_out
+
+            if attrs.get("ate_env.first_command") is True:
+                first_cmd_window_ms = dur_ms
+                if acquired_at is not None:
+                    first_cmd_window_ms = max(
+                        dur_ms, (time.monotonic() - float(acquired_at)) * 1000.0
+                    )
+                if source in ("warm_pool", "snapshot"):
+                    self.telemetry.record_op(
+                        "wake",
+                        first_cmd_window_ms,
+                        ok=ok,
+                        env_id=env_id,
+                        image=image,
+                        instance=instance,
+                        source=source,
+                        cache_state="hit",
+                        timed_out=timed_out_exec,
+                        err=err_msg,
+                        emit_trace=False,
+                    )
+                elif source == "cold_create":
+                    self.telemetry.record_op(
+                        "ttfi",
+                        first_cmd_window_ms,
+                        ok=ok,
+                        env_id=env_id,
+                        image=image,
+                        instance=instance,
+                        source="cold_create",
+                        cache_state="miss",
+                        timed_out=timed_out_exec,
+                        err=err_msg,
+                        emit_trace=False,
+                    )
+
+            step_name = str(attrs.get("ate_env.step_name") or "exec")
+            exe = str(attrs.get("ate_env.command.executable") or "")
+            cmd_seq: tuple[str, ...] = (exe,) if exe else ()
+            exit_code = attrs.get("ate_env.exit_code")
+            self.telemetry.record_op(
+                "exec",
+                dur_ms,
+                ok=ok,
+                env_id=env_id,
+                image=image,
+                instance=instance,
+                step_name=step_name,
+                command=cmd_seq,
+                exit_code=int(exit_code) if exit_code is not None else None,
+                err=err_msg,
+                source=source,
+                cache_state=cache_state,
+                timed_out=timed_out_exec,
+            )
+            return
+
+        if short_name in ("write_file", "read_file"):
+            if parent_name == span.name:
+                return
+            env_id = str(attrs.get("ate.actor.name") or "")
+            with self._lock:
+                meta = dict(self._env_meta.get(env_id, {}))
+            source = str(meta.get("source") or "direct")
+            cache_state = (
+                "hit"
+                if source in ("warm_pool", "snapshot")
+                else ("miss" if source == "cold_create" else "unknown")
+            )
+            image = str(meta.get("image") or attrs.get("ate_env.rootfs_image") or "")
+            instance = str(meta.get("instance") or attrs.get("ate_env.task_id") or "")
+            self.telemetry.record_op(
+                short_name,
+                dur_ms,
+                ok=ok,
+                env_id=env_id,
+                image=image,
+                instance=instance,
+                path=str(attrs.get("ate_env.file.path") or ""),
+                bytes_count=int(attrs.get("ate_env.file.size") or 0),
+                err=err_msg,
+                source=source,
+                cache_state=cache_state,
+                timed_out=timed_out,
+            )
+
+
+def instrument_fleet(
+    fleet: Any,
+    telemetry: BenchTelemetry | None = None,
+) -> Any:
+    """Attach BenchTelemetry instrumentation to a SandboxFleet or AsyncSandboxFleet.
+
+    Consumes the SDK's generic ``ate_env_client.*`` spans from the outside via
+    ``CompositeTracer`` without requiring any core SDK module to import
+    ``ate_env.telemetry.bench``. Sets ``fleet.telemetry`` and returns ``fleet``.
+    """
+    sync_fleet = getattr(fleet, "_fleet", fleet)
+    run_id = getattr(sync_fleet, "run_id", None)
+    resolved = telemetry if telemetry is not None else BenchTelemetry(run_id=run_id)
+    setattr(fleet, "telemetry", resolved)
+    if sync_fleet is not fleet:
+        setattr(sync_fleet, "telemetry", resolved)
+
+    if not getattr(fleet, "_bench_close_wrapped", False):
+        orig_close = fleet.close
+
+        @functools.wraps(orig_close)
+        def tracked_close(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return orig_close(*args, **kwargs)
+            finally:
+                with contextlib.suppress(Exception):
+                    resolved.close()
+
+        fleet.close = tracked_close
+        setattr(fleet, "_bench_close_wrapped", True)
+
+    if resolved.mode == "off" or getattr(sync_fleet, "_bench_telemetry_wrapped", False):
+        return fleet
+
+    bench_tracer = _BenchTracer(resolved)
+    setattr(
+        sync_fleet,
+        "_tracer",
+        combine_tracers(getattr(sync_fleet, "_tracer", None), bench_tracer),
+    )
+    backend = getattr(sync_fleet, "backend", None)
+    if backend is not None:
+        backend.tracer = combine_tracers(
+            getattr(backend, "tracer", None), bench_tracer
+        )
+        raw_client = getattr(backend, "_client", None)
+        if raw_client is not None:
+            raw_client.tracer = combine_tracers(
+                getattr(raw_client, "tracer", None), bench_tracer
+            )
+    setattr(sync_fleet, "_bench_telemetry_wrapped", True)
+    return fleet

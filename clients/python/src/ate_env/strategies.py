@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from .handle import SandboxHandle
-from .telemetry import _CURRENT_SLOT_WAIT_MS
+from .telemetry.tracing import current_slot_wait_ms
 from .types import Task
 
 logger = logging.getLogger("ate_env.strategies")
@@ -40,11 +40,11 @@ def process_parallel(fleet: Any, tasks: list[Task], process_fn: Callable[[Task, 
             if t_submit is not None
             else 0.0
         )
-        tok = _CURRENT_SLOT_WAIT_MS.set(wait_ms)
+        tok = current_slot_wait_ms.set(wait_ms)
         try:
             handle = fleet.acquire(task)
         finally:
-            _CURRENT_SLOT_WAIT_MS.reset(tok)
+            current_slot_wait_ms.reset(tok)
         try:
             return process_fn(task, handle)
         finally:

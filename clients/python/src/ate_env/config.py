@@ -151,9 +151,8 @@ class FleetConfig:
     step_timeout_s: float = 120.0
     auth_token: SecretStr | None = None
 
-    # Telemetry (OpenTelemetry tracing + W11 Benchmark Telemetry)
+    # Telemetry
     tracing: TracerConfig = field(default_factory=TracerConfig)
-    telemetry: Any | None = None
 
     def __init__(self, **kwargs: Any):
         _init_fields(self, kwargs)

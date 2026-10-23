@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pylint: disable=missing-module-docstring,too-many-instance-attributes
-# pylint: disable=too-many-arguments,too-many-positional-arguments
-
 from __future__ import annotations
 
 from contextlib import nullcontext
@@ -27,6 +24,7 @@ from .runtime.base import RuntimeGuestHook
 from .telemetry.tracing import (
     CLIENT_SPAN_PREFIX,
     executable_attr,
+    image_ref_attr,
     mark_error,
     set_attributes,
     start_span,
@@ -63,13 +61,18 @@ class SandboxHandle:
     default_timeout_s: float = 120.0
     tracer: Any = field(default=None, repr=False, compare=False)
     _first_command_started: bool = field(default=False, init=False, repr=False, compare=False)
-    _task_exec_ms: float = field(default=0.0, init=False, repr=False, compare=False)
-    _task_exec_count: int = field(default=0, init=False, repr=False, compare=False)
 
     def _span_ids(self) -> dict[str, Any]:
-        return {"ate.actor.name": self.sandbox_id, "ate_env.run_id": self.run_id or None}
+        return {
+            "ate.actor.name": self.sandbox_id,
+            "ate_env.run_id": self.run_id or None,
+            "ate_env.task_id": self.task.id if self.task else None,
+            "ate_env.rootfs_image": (
+                image_ref_attr(self.task.image) if self.task and self.task.image else None
+            ),
+        }
 
-    def _exec_span(self, command: str | list[str]) -> Any:
+    def _exec_span(self, command: str | list[str], name: str = "") -> Any:
         if not self.tracer:
             return nullcontext()
         first = not self._first_command_started
@@ -78,6 +81,7 @@ class SandboxHandle:
             **self._span_ids(),
             "ate_env.command.executable": executable_attr(command),
             "ate_env.first_command": True if first else None,
+            "ate_env.step_name": name or None,
         })
 
     def _file_span(self, op: str, path: str, content: bytes | str | None = None) -> Any:
@@ -92,7 +96,12 @@ class SandboxHandle:
     @staticmethod
     def _exec_result_attrs(span: Any, res: ExecResult, check: bool) -> None:
         set_attributes(
-            span, {"ate_env.exit_code": res.exit_code, "ate_env.timed_out": res.timed_out}
+            span,
+            {
+                "ate_env.exit_code": res.exit_code,
+                "ate_env.timed_out": res.timed_out,
+                "ate_env.duration_s": res.duration_s,
+            },
         )
         # check=True raises after the span closes; mark it failed here so the
         # trace agrees with the caller. Only the exit state is recorded.
@@ -100,26 +109,6 @@ class SandboxHandle:
             mark_error(span, "command timed out")
         elif check and res.exit_code != 0:
             mark_error(span, f"command exited with code {res.exit_code}")
-
-    def _record_task_exec_if_needed(self) -> None:
-        if self._task_exec_count <= 0:
-            return
-        total_ms = self._task_exec_ms
-        self._task_exec_ms = 0.0
-        self._task_exec_count = 0
-        tel = getattr(self.backend, "telemetry", None) or getattr(self.runtime, "_telemetry", None)
-        if tel is not None and getattr(tel, "mode", "off") != "off":
-            source = str(getattr(self.runtime, "_source", "direct") or "direct")
-            cache_state = str(getattr(self.runtime, "_cache_state", "unknown") or "unknown")
-            tel.record_op(
-                "task_exec",
-                total_ms,
-                ok=True,
-                env_id=self.sandbox_id,
-                step_name="task_exec",
-                source=source,
-                cache_state=cache_state,
-            )
 
     def exec(
         self,
@@ -140,14 +129,9 @@ class SandboxHandle:
         Returns ExecResult.
         """
         to_s = self.default_timeout_s if timeout_s is None else timeout_s
-        with self._exec_span(command) as span:
-            if name and hasattr(self.runtime, "_supports_exec_name"):
-                res = self.runtime.exec(command, cwd=cwd, env=env, timeout_s=to_s, name=name)
-            else:
-                res = self.runtime.exec(command, cwd=cwd, env=env, timeout_s=to_s)
+        with self._exec_span(command, name=name) as span:
+            res = self.runtime.exec(command, cwd=cwd, env=env, timeout_s=to_s)
             self._exec_result_attrs(span, res, check)
-        self._task_exec_ms += max(0.0, float(res.duration_s) * 1000.0)
-        self._task_exec_count += 1
         if check and res.timed_out:
             raise CommandTimeoutError(
                 f"Command '{command}' timed out after {to_s:g}s:\n"
@@ -174,16 +158,9 @@ class SandboxHandle:
     ) -> ExecResult:
         """Asynchronously execute command inside the sandbox."""
         to_s = self.default_timeout_s if timeout_s is None else timeout_s
-        with self._exec_span(command) as span:
-            if name and hasattr(self.runtime, "_supports_exec_name"):
-                res = await self.runtime.exec_async(
-                    command, cwd=cwd, env=env, timeout_s=to_s, name=name
-                )
-            else:
-                res = await self.runtime.exec_async(command, cwd=cwd, env=env, timeout_s=to_s)
+        with self._exec_span(command, name=name) as span:
+            res = await self.runtime.exec_async(command, cwd=cwd, env=env, timeout_s=to_s)
             self._exec_result_attrs(span, res, check)
-        self._task_exec_ms += max(0.0, float(res.duration_s) * 1000.0)
-        self._task_exec_count += 1
         if check and res.timed_out:
             raise CommandTimeoutError(
                 f"Command '{command}' timed out after {to_s:g}s:\n"
@@ -233,7 +210,6 @@ class SandboxHandle:
 
     def release(self) -> None:
         """Release this sandbox back to the backend or terminate it."""
-        self._record_task_exec_if_needed()
         try:
             self.backend.release(self.sandbox_id, recycle=False)
         finally:
@@ -241,7 +217,6 @@ class SandboxHandle:
 
     async def release_async(self) -> None:
         """Asynchronously release this sandbox back to the backend or terminate it."""
-        self._record_task_exec_if_needed()
         try:
             if hasattr(self.backend, "release_async"):
                 await self.backend.release_async(self.sandbox_id, recycle=False)
@@ -260,7 +235,6 @@ class SandboxHandle:
         resetting filesystem or process state. The next claim will receive
         the actor in the state left by the previous workload.
         """
-        self._record_task_exec_if_needed()
         try:
             self.backend.release(self.sandbox_id, recycle=True)
         finally:
@@ -273,7 +247,6 @@ class SandboxHandle:
         resetting filesystem or process state. The next claim will receive
         the actor in the state left by the previous workload.
         """
-        self._record_task_exec_if_needed()
         try:
             if hasattr(self.backend, "release_async"):
                 await self.backend.release_async(self.sandbox_id, recycle=True)

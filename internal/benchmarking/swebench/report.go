@@ -23,6 +23,7 @@ import (
 	"io"
 	"math"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,8 +71,11 @@ type StepStat struct {
 // Report is the summary of one run's JSONL, stable enough to diff between
 // runs.
 type Report struct {
-	RunID      string     `json:"run"`
-	Mode       string     `json:"mode,omitempty"`
+	RunID string `json:"run"`
+	Mode  string `json:"mode,omitempty"`
+	// Reps is how many runs the report pools, the run events it saw: one for
+	// a file, the reps of an arm under report -arm (see Pool).
+	Reps       int        `json:"reps,omitempty"`
 	RunMS      float64    `json:"run_ms,omitempty"`
 	Tasks      int        `json:"tasks"`
 	Failed     int        `json:"failed"`
@@ -89,6 +93,40 @@ type Report struct {
 	// Restores is atelet's restore phase breakdown joined to the run's
 	// environments (report -restore-log); nil without it.
 	Restores *RestoreBreakdown `json:"restores,omitempty"`
+	// Labels are the run event's labels: the loader's own and the operator's.
+	Labels map[string]string `json:"labels,omitempty"`
+	// Slowest lists the slowest first commands and wakes (report -top N).
+	Slowest []SlowEvent `json:"slowest,omitempty"`
+}
+
+// SlowEvent is one of the slowest first commands or wakes of a run.
+type SlowEvent struct {
+	Event    string  `json:"event"`
+	Env      string  `json:"env"`
+	Instance string  `json:"instance,omitempty"`
+	Step     int     `json:"step,omitempty"`
+	DurMS    float64 `json:"dur_ms"`
+	Attempts int     `json:"attempts,omitempty"`
+}
+
+// Slowest returns the n slowest successful ttfi events, then the n slowest
+// successful wake events, longest first.
+func Slowest(events []Event, n int) []SlowEvent {
+	var out []SlowEvent
+	for _, kind := range []string{EventTTFI, EventWake} {
+		var picked []SlowEvent
+		for _, e := range events {
+			if e.Event == kind && e.OK {
+				picked = append(picked, SlowEvent{Event: e.Event, Env: e.Env, Instance: e.Instance, Step: e.Step, DurMS: e.DurMS, Attempts: e.Attempts})
+			}
+		}
+		sort.SliceStable(picked, func(i, j int) bool { return picked[i].DurMS > picked[j].DurMS })
+		if len(picked) > n {
+			picked = picked[:n]
+		}
+		out = append(out, picked...)
+	}
+	return out
 }
 
 // ErrorCount is one error string and how often it occurred.
@@ -139,6 +177,14 @@ func Build(events []Event) *Report {
 	var order []key
 	steps := map[int]*StepStat{}
 	wakes := map[int][]float64{}
+	// Per step, one value per run: a report built over the merged events of
+	// several runs (report -arm) takes the median, which is the value itself
+	// for one run. The run durations and labels pool the same way.
+	barriers := map[int][]float64{}
+	parks := map[int][]float64{}
+	lives := map[int][]float64{}
+	var runs []float64
+	labels := labelUnion{}
 	errs := map[string]int{}
 
 	for _, e := range events {
@@ -171,8 +217,12 @@ func Build(events []Event) *Report {
 		}
 		switch e.Event {
 		case EventRun:
-			rep.Mode = e.Name
-			rep.RunMS = e.DurMS
+			rep.Reps++
+			if rep.Mode == "" {
+				rep.Mode = e.Name
+			}
+			runs = append(runs, e.DurMS)
+			labels.add(e.Labels)
 		case EventTask:
 			rep.Tasks++
 			if !e.OK {
@@ -192,10 +242,12 @@ func Build(events []Event) *Report {
 				}
 			}
 		case EventBarrier:
-			stepStat(steps, e.Step).BarrierMS = e.DurMS
-			stepStat(steps, e.Step).Live = e.Count
+			stepStat(steps, e.Step)
+			barriers[e.Step] = append(barriers[e.Step], e.DurMS)
+			lives[e.Step] = append(lives[e.Step], float64(e.Count))
 		case EventPark:
-			stepStat(steps, e.Step).ParkMS = e.DurMS
+			stepStat(steps, e.Step)
+			parks[e.Step] = append(parks[e.Step], e.DurMS)
 		case EventWake:
 			if e.OK {
 				wakes[e.Step] = append(wakes[e.Step], e.DurMS)
@@ -205,6 +257,8 @@ func Build(events []Event) *Report {
 	if rep.Tasks > 0 {
 		rep.RewardRate = float64(rep.Rewarded) / float64(rep.Tasks)
 	}
+	rep.RunMS = median(runs)
+	rep.Labels = labels.merged()
 	for _, k := range order {
 		d := durs[k]
 		sort.Float64s(d)
@@ -216,6 +270,9 @@ func Build(events []Event) *Report {
 		sort.Float64s(w)
 		s.WakeP50MS = percentile(w, 0.5)
 		s.WakeP95MS = percentile(w, 0.95)
+		s.BarrierMS = median(barriers[step])
+		s.ParkMS = median(parks[step])
+		s.Live = int(median(lives[step]))
 		rep.Steps = append(rep.Steps, *s)
 	}
 	sort.Slice(rep.Steps, func(i, j int) bool { return rep.Steps[i].Step < rep.Steps[j].Step })
@@ -277,6 +334,86 @@ func stepStat(m map[int]*StepStat, step int) *StepStat {
 
 // percentile of a sorted slice by the nearest-rank method, ceil(p*n)-1; 0
 // for an empty slice.
+// median sorts d and returns its middle value, or the mean of the two
+// middle values for an even count, so two reps of an arm pool to the value
+// between them rather than the lower one. 0 for no values.
+func median(d []float64) float64 {
+	n := len(d)
+	if n == 0 {
+		return 0
+	}
+	sort.Float64s(d)
+	if n%2 == 1 {
+		return d[n/2]
+	}
+	return (d[n/2-1] + d[n/2]) / 2
+}
+
+// labelUnion merges the labels of pooled runs' run events: a key keeps its
+// value when every run agrees, else every value in the order first seen,
+// "|"-joined, so a column that mixes commits says so.
+type labelUnion map[string][]string
+
+func (u labelUnion) add(labels map[string]string) {
+	for k, v := range labels {
+		if !slices.Contains(u[k], v) {
+			u[k] = append(u[k], v)
+		}
+	}
+}
+
+func (u labelUnion) merged() map[string]string {
+	if len(u) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(u))
+	for k, vs := range u {
+		out[k] = strings.Join(vs, "|")
+	}
+	return out
+}
+
+// Pool builds one report over the reps of an arm: the raw events of every run
+// merged, so the percentiles are exact over all of them; per-step barrier,
+// park and live the median across the reps; the run duration the median of
+// the runs' durations; Reps the number of runs. The reps must be complete
+// runs, each with a run event, distinct runs, no run id twice, and one
+// workload: the labels in LoaderLabelKeys must agree. Operator labels may
+// differ and then show every value, "|"-joined.
+func Pool(runs [][]Event) (*Report, error) {
+	var all []Event
+	seen := map[string]int{}
+	var shape map[string]string
+	for i, events := range runs {
+		first := i == 0
+		var run *Event
+		for j := range events {
+			if events[j].Event == EventRun {
+				run = &events[j]
+				break
+			}
+		}
+		if run == nil {
+			return nil, fmt.Errorf("rep %d has no run event: an interrupted run cannot be pooled", i+1)
+		}
+		if prev, dup := seen[run.RunID]; dup {
+			return nil, fmt.Errorf("rep %d repeats run id %q of rep %d", i+1, run.RunID, prev)
+		}
+		seen[run.RunID] = i + 1
+		if first {
+			shape = run.Labels
+		} else {
+			for _, k := range LoaderLabelKeys {
+				if shape[k] != run.Labels[k] {
+					return nil, fmt.Errorf("reps differ in %s (%q, %q): pool only reps of one workload", k, shape[k], run.Labels[k])
+				}
+			}
+		}
+		all = append(all, events...)
+	}
+	return Build(all), nil
+}
+
 func percentile(sorted []float64, p float64) float64 {
 	n := len(sorted)
 	if n == 0 {
@@ -297,8 +434,12 @@ func percentile(sorted []float64, p float64) float64 {
 
 // WriteText prints the report as tables.
 func (rep *Report) WriteText(w io.Writer) {
-	fmt.Fprintf(w, "run %s mode=%s tasks=%d failed=%d rewarded=%d reward_rate=%.3f run=%.1fs\n\n",
+	fmt.Fprintf(w, "run %s mode=%s tasks=%d failed=%d rewarded=%d reward_rate=%.3f run=%.1fs\n",
 		rep.RunID, rep.Mode, rep.Tasks, rep.Failed, rep.Rewarded, rep.RewardRate, rep.RunMS/1000)
+	if len(rep.Labels) > 0 {
+		fmt.Fprintf(w, "labels: %s\n", labelLine(rep.Labels))
+	}
+	fmt.Fprintln(w)
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "event\tname\tcount\tfailed\tretried\tp50_ms\tp95_ms\tmax_ms")
 	for _, s := range rep.Stats {
@@ -368,6 +509,16 @@ func (rep *Report) WriteText(w io.Writer) {
 		group("wake", b.Wakes)
 		tw.Flush()
 	}
+	if len(rep.Slowest) > 0 {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "slowest first commands and wakes:")
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "event\tenv\tinstance\tstep\tms\tattempts")
+		for _, e := range rep.Slowest {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%.0f\t%d\n", e.Event, e.Env, e.Instance, e.Step, e.DurMS, e.Attempts)
+		}
+		tw.Flush()
+	}
 	if len(rep.Unresolved) > 0 {
 		fmt.Fprintf(w, "\nunresolved: %d instances (report -unresolved FILE writes them in exclude-file format)\n", len(rep.Unresolved))
 	}
@@ -411,10 +562,22 @@ func WriteComparison(w io.Writer, reps []*Report, names []string) {
 	}
 	fmt.Fprintln(tw)
 	row("mode", func(r *Report) string { return r.Mode })
+	row("reps", func(r *Report) string { return fmt.Sprintf("%d", r.Reps) })
 	row("tasks", func(r *Report) string { return fmt.Sprintf("%d", r.Tasks) })
 	row("failed", func(r *Report) string { return fmt.Sprintf("%d", r.Failed) })
 	row("reward_rate", func(r *Report) string { return fmt.Sprintf("%.3f", r.RewardRate) })
 	row("run_s", func(r *Report) string { return fmt.Sprintf("%.1f", r.RunMS/1000) })
+	for _, k := range labelKeys(reps) {
+		if k == "mode" {
+			continue // the mode row above says it
+		}
+		row(k, func(r *Report) string {
+			if v, ok := r.Labels[k]; ok {
+				return v
+			}
+			return "-"
+		})
+	}
 
 	type key struct{ event, name string }
 	var order []key
@@ -794,7 +957,7 @@ type PhaseStat struct {
 }
 
 // RestoreGroup is the phase breakdown of the restores paired with one kind
-// of event: ttfi (the environment's cold start) or wake.
+// of event: ttfi (the environment's first start) or wake.
 type RestoreGroup struct {
 	Restores int `json:"restores"`
 	// Failed counts records with an error.type; their phases are left out.
@@ -829,7 +992,7 @@ const pairSlack = 2 * time.Second
 // JoinRestores pairs each restore record with the ttfi or wake event of its
 // environment whose window, the event's end minus its duration up to its
 // end, contains the record's time. A record paired with a ttfi event is a
-// cold start; one paired with a wake is a wake. Records outside the run's
+// first start; one paired with a wake is a wake. Records outside the run's
 // span, for unknown actors, or inside no window are counted, not paired.
 func JoinRestores(events []Event, timings map[string][]RestoreTiming) *RestoreBreakdown {
 	b := &RestoreBreakdown{}
@@ -890,8 +1053,8 @@ func JoinRestores(events []Event, timings map[string][]RestoreTiming) *RestoreBr
 			*outside = append(*outside, ev.DurMS-rt.Phases["total"]*1000)
 		}
 	}
-	b.First.Restores, b.First.Phases, b.First.Outside = len(firstRecs), phaseStats(firstRecs), outsideStat(firstOutside)
-	b.Wakes.Restores, b.Wakes.Phases, b.Wakes.Outside = len(wakeRecs), phaseStats(wakeRecs), outsideStat(wakeOutside)
+	b.First.Restores, b.First.Phases, b.First.Outside = len(firstRecs), phaseStats(firstRecs), spanStat("outside", firstOutside)
+	b.Wakes.Restores, b.Wakes.Phases, b.Wakes.Outside = len(wakeRecs), phaseStats(wakeRecs), spanStat("outside", wakeOutside)
 	return b
 }
 
@@ -931,10 +1094,36 @@ func phaseStats(recs []RestoreTiming) []PhaseStat {
 	return out
 }
 
-func outsideStat(d []float64) *PhaseStat {
+// spanStat summarizes event spans under name; nil when there are none.
+func spanStat(name string, d []float64) *PhaseStat {
 	if len(d) == 0 {
 		return nil
 	}
 	sort.Float64s(d)
-	return &PhaseStat{Phase: "outside", Count: len(d), P50MS: percentile(d, 0.50), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1)}
+	return &PhaseStat{Phase: name, Count: len(d), P50MS: percentile(d, 0.50), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1)}
+}
+
+// labelKeys is the sorted union of the reports' label keys.
+func labelKeys(reps []*Report) []string {
+	seen := map[string]bool{}
+	for _, r := range reps {
+		for k := range r.Labels {
+			seen[k] = true
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for k := range seen {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// labelLine renders labels as "k=v k=v", keys sorted.
+func labelLine(labels map[string]string) string {
+	parts := make([]string, 0, len(labels))
+	for _, k := range labelKeys([]*Report{{Labels: labels}}) {
+		parts = append(parts, k+"="+labels[k])
+	}
+	return strings.Join(parts, " ")
 }

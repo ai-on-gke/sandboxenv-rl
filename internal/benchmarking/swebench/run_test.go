@@ -19,9 +19,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -198,6 +201,7 @@ func TestEvalCreatesReplaysDeletes(t *testing.T) {
 	cfg := baseConfig(t, f, &out)
 	cfg.Mode = ModeEval
 	cfg.TasksPerImage = 2
+	cfg.Labels = map[string]string{"cluster": "a", "mode": "custom"}
 
 	sum, err := Run(context.Background(), cfg)
 	if err != nil {
@@ -227,6 +231,15 @@ func TestEvalCreatesReplaysDeletes(t *testing.T) {
 	rep := Build(parseEvents(t, out.String()))
 	if rep.Tasks != 6 || rep.RewardRate != 1 {
 		t.Fatalf("report %+v", rep)
+	}
+	// The run event carries the loader's own labels under the operator's.
+	for k, want := range map[string]string{"cluster": "a", "mode": "custom", "width": "2", "images": "3", "tasks_per_image": "2"} {
+		if rep.Labels[k] != want {
+			t.Errorf("label %s = %q, want %q (labels %v)", k, rep.Labels[k], want, rep.Labels)
+		}
+	}
+	if rep.Labels["trajectory"] == "" {
+		t.Errorf("no trajectory label: %v", rep.Labels)
 	}
 	for _, ev := range []string{EventCreate, EventTTFI, EventTask, EventDelete, EventRun} {
 		if !hasStat(rep, ev) {
@@ -655,5 +668,66 @@ func TestValidateChecksTheLongestName(t *testing.T) {
 	cfg.Mode, cfg.TasksPerImage = ModeEval, 100001 // largest index 100000
 	if err := cfg.validate(); err == nil {
 		t.Fatal("eval mode with a 6-digit replay index: want the long name refused")
+	}
+}
+
+func TestLabelsAreDeclared(t *testing.T) {
+	cfg := Config{Mode: ModeSteps, Width: 3, Trajectory: &Trajectory{Name: "t"}, Rollouts: 2, Steps: 4, Park: ParkSuspend,
+		CreateTimeout: time.Minute, StepTimeout: time.Minute, WakeBudget: time.Minute, WakeBackoff: time.Second,
+		Labels: map[string]string{"commit": "abc", "width": "operator"}}
+	l := cfg.labels()
+	if l["commit"] != "abc" || l["width"] != "operator" || l["rollouts"] != "2" || l["wake_budget"] != "1m0s" {
+		t.Fatalf("labels = %v", l)
+	}
+	for k := range l {
+		if k == "commit" {
+			continue
+		}
+		if !slices.Contains(LoaderLabelKeys, k) {
+			t.Errorf("the loader records %s but LoaderLabelKeys lacks it, so report -arm would not compare it", k)
+		}
+	}
+}
+
+func TestMixedTrajectoriesDrawPerEnvironment(t *testing.T) {
+	run := func(seed int64) map[string]string {
+		f := newFake()
+		var out bytes.Buffer
+		cfg := baseConfig(t, f, &out)
+		cfg.Mode = ModeEval
+		cfg.TasksPerImage = 4
+		a := testTrajectory(t, "true")
+		a.Name = "alpha"
+		b := testTrajectory(t, "true")
+		b.Name = "beta"
+		cfg.Trajectories = []*Trajectory{a, b}
+		cfg.Seed = seed
+		if _, err := Run(context.Background(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		byEnv := map[string]string{}
+		for _, e := range parseEvents(t, out.String()) {
+			if e.Event == EventTask {
+				byEnv[e.Env] = e.Name
+			}
+			if e.Event == EventRun && (e.Labels["trajectory"] != "alpha,beta" || e.Labels["seed"] != strconv.FormatInt(seed, 10)) {
+				t.Fatalf("run labels: %v", e.Labels)
+			}
+		}
+		return byEnv
+	}
+	first := run(7)
+	if len(first) != 12 {
+		t.Fatalf("task events: %v", first)
+	}
+	seen := map[string]int{}
+	for _, name := range first {
+		seen[name]++
+	}
+	if seen["alpha"] == 0 || seen["beta"] == 0 {
+		t.Fatalf("both trajectories must be drawn over 12 environments: %v", seen)
+	}
+	if again := run(7); fmt.Sprint(again) != fmt.Sprint(first) {
+		t.Fatalf("the same seed must give the same assignment:\n%v\n%v", first, again)
 	}
 }

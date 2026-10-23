@@ -20,7 +20,9 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"math/rand"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -84,6 +86,66 @@ type Config struct {
 	WakeBackoff time.Duration
 	// Keep leaves the environments in place when the run ends.
 	Keep bool
+	// Labels are recorded on the run event over the loader's own labels
+	// (LoaderLabelKeys); a clash goes to Labels. The Substrate commit, the
+	// cluster and the arm belong here.
+	Labels map[string]string
+	// Trajectories, when it holds more than one, is the mix: each
+	// environment gets one of them, drawn with Seed, so a run can interleave
+	// workloads the way a training step mixes task shapes. Trajectory is the
+	// first of them.
+	Trajectories []*Trajectory
+	Seed         int64
+}
+
+// trajectoryNames joins the names of the run's trajectories.
+func (c *Config) trajectoryNames() string {
+	if len(c.Trajectories) <= 1 {
+		return c.Trajectory.Name
+	}
+	names := make([]string, len(c.Trajectories))
+	for i, t := range c.Trajectories {
+		names[i] = t.Name
+	}
+	return strings.Join(names, ",")
+}
+
+// LoaderLabelKeys are the labels the loader records about its own invocation
+// on the run event: the run's shape and the settings that move its latencies
+// and failure counts. report -arm pools only reps that agree on all of them.
+var LoaderLabelKeys = []string{
+	"mode", "width", "images", "trajectory", "tasks_per_image", "rollouts", "steps", "park",
+	"create_timeout", "step_timeout", "wake_budget", "wake_backoff",
+	"dataset", "connections", "base_template", "exclude_file", "instances", "seed",
+}
+
+// labels describes the run for its run event.
+func (c *Config) labels() map[string]string {
+	l := map[string]string{
+		"mode":           string(c.Mode),
+		"width":          strconv.Itoa(c.Width),
+		"images":         strconv.Itoa(len(c.Instances)),
+		"trajectory":     c.trajectoryNames(),
+		"create_timeout": c.CreateTimeout.String(),
+		"step_timeout":   c.StepTimeout.String(),
+		"wake_budget":    c.WakeBudget.String(),
+		"wake_backoff":   c.WakeBackoff.String(),
+	}
+	if len(c.Trajectories) > 1 {
+		l["seed"] = strconv.FormatInt(c.Seed, 10)
+	}
+	switch c.Mode {
+	case ModeEval:
+		l["tasks_per_image"] = strconv.Itoa(c.TasksPerImage)
+	case ModeSteps:
+		l["rollouts"] = strconv.Itoa(c.Rollouts)
+		l["steps"] = strconv.Itoa(c.Steps)
+		l["park"] = string(c.Park)
+	}
+	for k, v := range c.Labels {
+		l[k] = v
+	}
+	return l
 }
 
 // Summary is what a run produced, for the exit status and the log.
@@ -257,7 +319,7 @@ func Run(ctx context.Context, cfg Config) (*Summary, error) {
 	dur := time.Since(start)
 	s := &Summary{Tasks: r.tasks, Failed: r.failed, Rewarded: r.rewarded, Duration: dur}
 	r.rec.Record(Event{RunID: cfg.RunID, Event: EventRun, Name: string(cfg.Mode), DurMS: ms(dur),
-		OK: s.Failed == 0, Count: s.Tasks})
+		OK: s.Failed == 0, Count: s.Tasks, Labels: cfg.labels()})
 	return s, ctx.Err()
 }
 
@@ -268,12 +330,22 @@ func (r *runner) plan() ([]*environment, error) {
 		fanout = r.cfg.Rollouts
 	}
 	envs := make([]*environment, 0, len(r.cfg.Instances)*fanout)
+	// With a mix, each environment draws its trajectory from a seeded
+	// source, so the same seed gives the same assignment on every rep.
+	var pick *rand.Rand
+	if len(r.cfg.Trajectories) > 1 {
+		pick = rand.New(rand.NewSource(r.cfg.Seed))
+	}
 	for _, in := range r.cfg.Instances {
-		traj, err := r.cfg.Trajectory.Render(in)
-		if err != nil {
-			return nil, err
-		}
 		for k := 0; k < fanout; k++ {
+			source := r.cfg.Trajectory
+			if pick != nil {
+				source = r.cfg.Trajectories[pick.Intn(len(r.cfg.Trajectories))]
+			}
+			traj, err := source.Render(in)
+			if err != nil {
+				return nil, err
+			}
 			id := EnvID(r.cfg.RunID, in.InstanceID, k)
 			envs = append(envs, &environment{
 				id:   id,
@@ -651,6 +723,10 @@ func (r *runner) remove(ctx context.Context, e *environment, step int) {
 func (r *runner) event(kind string, e *environment, step int, d time.Duration, err error) Event {
 	ev := Event{RunID: r.cfg.RunID, Event: kind, Env: e.id, Instance: e.inst.InstanceID,
 		Step: step, Task: e.task, DurMS: ms(d), OK: err == nil}
+	if kind == EventTask {
+		// Which trajectory the task replayed; one run can mix several.
+		ev.Name = e.traj.Name
+	}
 	if err != nil {
 		ev.Err = err.Error()
 	}

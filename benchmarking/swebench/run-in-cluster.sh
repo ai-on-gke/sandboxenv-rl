@@ -15,8 +15,9 @@
 # limitations under the License.
 
 # Run swebench-loader inside the cluster, next to ate-env-api, and bring the
-# events file back. The dataset and offline-exclusions.txt are baked into the
-# loader image (ko's kodata directory), so the pod needs no bucket access; a
+# events file back. The dataset, offline-exclusions.txt and any -trajectory
+# file (with the files next to it) are baked into the loader image (ko's
+# kodata directory), so the pod needs no bucket access; a
 # sidecar keeps the pod alive after the loader exits so the results can be
 # copied out with kubectl cp. The Job is deleted when the script exits, on
 # success or failure.
@@ -83,6 +84,42 @@ KODATA=cmd/benchmarking/swebench-loader/kodata
 rm -rf "${KODATA}" && mkdir -p "${KODATA}"
 cp "${DATASET}" "${KODATA}/dataset.jsonl"
 cp benchmarking/swebench/offline-exclusions.txt "${KODATA}/offline-exclusions.txt"
+
+# A -trajectory value that names a file on this machine is baked into the
+# image too, with the other files of its directory (a grader script next to
+# its trajectory), and the flag is rewritten to the baked path. Built-in
+# names pass through. A comma-separated mix is handled element by element.
+TRAJ_N=0
+bake_trajectory() {
+  local -a parts out=()
+  local el dir base
+  IFS=',' read -r -a parts <<< "$1"
+  for el in "${parts[@]}"; do
+    if [[ -f "${el}" ]]; then
+      dir="$(cd "$(dirname "${el}")" && pwd)"
+      base="$(basename "${el}")"
+      TRAJ_N=$((TRAJ_N + 1))
+      mkdir -p "${KODATA}/traj/${TRAJ_N}"
+      find "${dir}" -maxdepth 1 -type f -exec cp {} "${KODATA}/traj/${TRAJ_N}/" \;
+      el="/var/run/ko/traj/${TRAJ_N}/${base}"
+    fi
+    out+=("${el}")
+  done
+  local IFS=','
+  echo "${out[*]}"
+}
+ARGS=()
+while (( $# )); do
+  case "$1" in
+    -trajectory|--trajectory)
+      [[ $# -ge 2 ]] || { echo "$1 needs a value" >&2; exit 2; }
+      ARGS+=("$1" "$(bake_trajectory "$2")"); shift 2 ;;
+    -trajectory=*|--trajectory=*)
+      ARGS+=("${1%%=*}=$(bake_trajectory "${1#*=}")"); shift ;;
+    *)
+      ARGS+=("$1"); shift ;;
+  esac
+done
 IMAGE="$(KO_DOCKER_REPO="${KO_DOCKER_REPO}/swebench-loader" ko build --bare ./cmd/benchmarking/swebench-loader)"
 rm -rf "${KODATA}"
 echo "loader image ${IMAGE}"
@@ -92,7 +129,7 @@ JOB="swebench-loader-${RUN_ID}"
 # metacharacters in a flag value cannot break the manifest.
 ARGS_JSON="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' \
   run "-endpoint=ate-env-api.${NS}.svc:7777" "-dataset=/var/run/ko/dataset.jsonl" \
-  "-exclude-file=/var/run/ko/offline-exclusions.txt" "-run-id=${RUN_ID}" "-out=/work/${RUN_ID}.jsonl" "$@")"
+  "-exclude-file=/var/run/ko/offline-exclusions.txt" "-run-id=${RUN_ID}" "-out=/work/${RUN_ID}.jsonl" ${ARGS[@]+"${ARGS[@]}"})"
 
 KUBECTL_ERR="$(mktemp)"
 # shellcheck disable=SC2329 # invoked by the EXIT trap

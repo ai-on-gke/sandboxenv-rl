@@ -34,6 +34,7 @@ from ate_env import AsyncSandboxFleet, Client, FleetConfig, Task
 from ate_env._gen.ateenv.v1alpha import env_pb2_grpc, guest_pb2_grpc
 from ate_env.telemetry import (
     _MAX_RESERVOIR_SAMPLES,
+    CANONICAL_TRACE_OPS,
     BenchTelemetry,
     TraceEventRecord,
     instrument_client,
@@ -142,6 +143,25 @@ async def local_grpc_stack(tmp_path: Path):
         await server.stop(None)
 
 
+def test_bundled_w1_schemas_match_canonical_if_present() -> None:
+    """Verify bundled schemas/v1/*.schema.json match internal/benchmarking/rlbench/schema/v1/."""
+    py_root = Path(__file__).resolve().parents[1]
+    bundled_dir = py_root / "src" / "ate_env" / "schemas" / "v1"
+    repo_root = py_root.parents[1]
+    canonical_dir = repo_root / "internal" / "benchmarking" / "rlbench" / "schema" / "v1"
+
+    for name in ("trace_event.schema.json", "event.schema.json"):
+        bundled_file = bundled_dir / name
+        assert bundled_file.is_file(), f"missing bundled schema {bundled_file}"
+        parsed = json.loads(bundled_file.read_text(encoding="utf-8"))
+        assert parsed["additionalProperties"] is False
+        canonical_file = canonical_dir / name
+        if canonical_file.is_file():
+            assert bundled_file.read_bytes() == canonical_file.read_bytes(), (
+                f"{bundled_file} drifted from canonical {canonical_file}"
+            )
+
+
 @pytest.mark.asyncio
 async def test_default_mode_is_off_and_instrument_client_is_noop(
     monkeypatch: pytest.MonkeyPatch,
@@ -217,8 +237,16 @@ async def test_real_client_and_env_no_double_counting(
     ]
     for rec in records:
         validate_trace_event_dict(rec)
+        assert "source" not in rec
         assert rec["env"] == "real-sbx-1"
         assert rec["step"] == 3
+
+    # Verify direct client.get() was recorded with source="direct" (not hardcoded "warm_pool")
+    flushed = telemetry.flush_step_events(step=3)
+    get_events = [ev for ev in flushed if ev["tags"].get("op") == "get"]
+    assert len(get_events) == 1
+    assert get_events[0]["tags"]["source"] == "direct"
+    assert "source" not in get_events[0]
 
 
 @pytest.mark.asyncio
@@ -275,6 +303,9 @@ async def test_measure_mode_zero_extra_rpcs_and_zero_per_call_files(tmp_path: Pa
         assert ev["run"] == "run-m1"
         assert ev["job"] == "grpo-trainer"
         assert ev["step"] == 1
+        assert "dur_ms_mean" in ev["metrics"]
+        assert "dur_ms_sum" in ev["metrics"]
+        assert "dur_ms_max" in ev["metrics"]
 
 
 def test_operation_completion_timestamps_preserved_across_delayed_flush(tmp_path: Path) -> None:
@@ -301,36 +332,42 @@ def test_operation_completion_timestamps_preserved_across_delayed_flush(tmp_path
     assert flushed[1]["name"] == "run_tests"
 
 
-def test_strict_schema_validation_enforces_enums_types_and_formats() -> None:
+def test_strict_schema_validation_enforces_enums_types_and_formats(tmp_path: Path) -> None:
     """Verify W1 schema validator enforces enums, RFC3339 ts, non-negative numbers, and keys."""
     good_trace = TraceEventRecord(
         op="shell",
         dur_ms=12.5,
         job="j1",
         env="e1",
-        source="warm_pool",
     ).to_dict()
     validate_trace_event_dict(good_trace)
+
+    # TraceEvent does NOT allow a 'source' field under W1 trace_event.schema.json
+    with pytest.raises(ValueError, match="unknown W1 fields"):
+        validate_trace_event_dict({**good_trace, "source": "warm_pool"})
 
     # Unknown top-level field
     with pytest.raises(ValueError, match="unknown W1 fields"):
         validate_trace_event_dict({**good_trace, "unexpected_field": 42})
 
-    # Invalid op enum
+    # Invalid op enum (including non-canonical trace ops like prewarm/retire/reap)
     with pytest.raises(ValueError, match="op must be one of"):
-        validate_trace_event_dict({**good_trace, "op": "not_an_op"})
-
-    # Invalid source enum
-    with pytest.raises(ValueError, match="source must be one of"):
-        validate_trace_event_dict({**good_trace, "source": "bogus_source"})
+        validate_trace_event_dict({**good_trace, "op": "prewarm"})
 
     # Invalid RFC3339 timestamp
     with pytest.raises(ValueError, match="valid RFC3339 timestamp"):
         validate_trace_event_dict({**good_trace, "ts": "yesterday"})
 
-    # Empty env string
+    # Empty env string rejected in both validator and trace-mode record_op
     with pytest.raises(ValueError, match="env is required"):
         validate_trace_event_dict({**good_trace, "env": ""})
+
+    trace_tel = BenchTelemetry(mode="trace", job="j1", trace_path=tmp_path / "t.jsonl")
+    try:
+        with pytest.raises(ValueError, match="env is required"):
+            trace_tel.record_op("shell", 1.0, ok=True, env_id="")
+    finally:
+        trace_tel.close()
 
     # Negative dur_ms
     with pytest.raises(ValueError, match="dur_ms must be >= 0"):
@@ -354,7 +391,34 @@ def test_strict_schema_validation_enforces_enums_types_and_formats() -> None:
         validate_event_dict({**good_event, "bogus_key": "nope"})
 
     with pytest.raises(ValueError, match="source must be one of"):
-        validate_event_dict({**good_event, "source": "bad_source"})
+        validate_event_dict({**good_event, "source": "direct"})
+
+
+@pytest.mark.asyncio
+async def test_cancelled_error_vs_timeout_distinguished() -> None:
+    """Verify CancelledError sets timed_out=False whereas TimeoutError sets timed_out=True."""
+    telemetry = BenchTelemetry(mode="measure", job="cancel-vs-timeout")
+
+    with pytest.raises(asyncio.CancelledError):
+        async with telemetry.track("exec", env_id="e1", step=1):
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.TimeoutError):
+        async with telemetry.track("acquire", env_id="e1", step=1):
+            raise asyncio.TimeoutError("deadline exceeded")
+
+    stats = telemetry.summary_stats()
+    assert stats["exec"]["timeouts"] == 0.0
+    assert stats["exec"]["errors"] == 1.0
+    assert stats["acquire"]["timeouts"] == 1.0
+    assert stats["acquire"]["errors"] == 1.0
+
+    flushed = {ev["event"]: ev for ev in telemetry.flush_step_events(step=1)}
+    assert flushed["step"]["err"] == "CancelledError"
+    assert "timeout" not in flushed["step"]
+    assert flushed["step"]["metrics"].get("timeouts", 0.0) == 0.0
+    assert flushed["acquire"]["timeout"] is True
+    assert flushed["acquire"]["metrics"]["timeouts"] == 1.0
 
 
 def test_bounded_memory_retention_for_histograms_and_step_aggregates() -> None:
@@ -384,6 +448,10 @@ def test_bounded_memory_retention_for_histograms_and_step_aggregates() -> None:
     flushed = telemetry.flush_step_events(step=1)
     assert len(flushed) == 1
     assert flushed[0]["count"] == 3000
+    assert flushed[0]["dur_ms"] == pytest.approx(148500.0, abs=0.01)
+    assert flushed[0]["metrics"]["dur_ms_sum"] == pytest.approx(148500.0, abs=0.01)
+    assert flushed[0]["metrics"]["dur_ms_mean"] == pytest.approx(49.5, abs=0.01)
+    assert flushed[0]["metrics"]["dur_ms_max"] == 99.0
 
 
 def test_thread_safety_under_concurrent_workers() -> None:
@@ -459,11 +527,17 @@ async def test_prometheus_label_escaping_and_error_truncation() -> None:
 
 @pytest.mark.asyncio
 async def test_substrate_driver_and_runtime_sdk_telemetry_integration(
-    local_grpc_stack: Any,
+    local_grpc_stack: Any, tmp_path: Path
 ) -> None:
-    """Verify Fleet, Driver, Runtime, and SandboxHandle emit W1 telemetry ops."""
+    """Verify Fleet, Driver, Runtime, and SandboxHandle emit W1 telemetry ops and ttfi/wake."""
     client, _envs, processes, _fs = local_grpc_stack
-    telemetry = BenchTelemetry(mode="measure", run_id="run-sdk", job="sdk-int")
+    trace_file = tmp_path / "sdk_trace.jsonl"
+    telemetry = BenchTelemetry(
+        mode="trace",
+        run_id="run-sdk",
+        job="sdk-int",
+        trace_path=trace_file,
+    )
     telemetry.set_step(5)
 
     cfg = FleetConfig(
@@ -480,11 +554,12 @@ async def test_substrate_driver_and_runtime_sdk_telemetry_integration(
     task2 = Task(id="t-cold", image=img)
     fleet.load_tasks([task1, task2])
 
-    # 1. Prewarm 1 sandbox -> records 'prewarm'
+    # 1. Prewarm 1 sandbox -> records 'prewarm' in histograms/events (not trace.jsonl)
     await fleet.setup()
 
     # 2. Acquire from warm pool -> records 'acquire' with source='warm_pool', cache_state='hit'
     handle_warm = await fleet.acquire(task1)
+    await asyncio.sleep(0.03)
     processes.next_procs.append(FakeProc(chunks=[("stdout", b"warm-ready\n")], exit_code=0))
     res1 = await handle_warm.exec_async("echo warm", name="apply_patch")
     assert res1.ok
@@ -493,6 +568,7 @@ async def test_substrate_driver_and_runtime_sdk_telemetry_integration(
     # 3. Drain warm pool so next acquire is cold_create
     await fleet.teardown()
     handle_cold = await fleet.acquire(task2)
+    await asyncio.sleep(0.03)
     processes.next_procs.append(FakeProc(chunks=[("stdout", b"cold-ready\n")], exit_code=0))
     res2 = await handle_cold.exec_async("pytest -q", name="run_tests")
     assert res2.ok
@@ -513,7 +589,30 @@ async def test_substrate_driver_and_runtime_sdk_telemetry_integration(
     ):
         assert expected_op in stats, f"missing expected SDK op {expected_op!r} in {list(stats)}"
 
+    # Verify ttfi and wake include the Ready-to-first-command idle gap (~30ms)
+    # while exec records pure command execution duration
+    assert stats["wake"]["max_ms"] >= 25.0
+    assert stats["ttfi"]["max_ms"] >= 25.0
+    assert stats["exec"]["count"] == 2.0
+    assert stats["ttfi"]["max_ms"] > stats["exec"]["max_ms"]
+
+    # Verify every line in trace.jsonl is strictly a canonical W1 TraceEvent
+    # and the first command is emitted once (under op="exec", not duplicated under ttfi/wake)
+    trace_records = [
+        json.loads(line)
+        for line in trace_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert trace_records
+    for rec in trace_records:
+        validate_trace_event_dict(rec)
+        assert rec["op"] in CANONICAL_TRACE_OPS
+    exec_traces = [r for r in trace_records if r["op"] == "exec"]
+    assert len(exec_traces) == 2
+
     flushed = telemetry.flush_step_events(step=5)
+    for ev in flushed:
+        validate_event_dict(ev)
     by_event_source = {
         (e["event"], e.get("source", "direct"), e.get("name", "")): e for e in flushed
     }
@@ -527,9 +626,10 @@ async def test_substrate_driver_and_runtime_sdk_telemetry_integration(
 
 @pytest.mark.asyncio
 async def test_concurrent_async_overhead_benchmark() -> None:
-    """Verify measure mode and off mode add negligible overhead under concurrent async load."""
+    """Verify measure mode and off mode add negligible relative overhead under concurrent load."""
     concurrency = 16
     ops_per_worker = 50
+    total_ops = concurrency * ops_per_worker
 
     async def _run_workload(client_obj: Any) -> float:
         env = await client_obj.create("bench-env")
@@ -545,17 +645,30 @@ async def test_concurrent_async_overhead_benchmark() -> None:
     # Warm up event loop
     await _run_workload(_FakeClient())
 
+    # 1. Unwrapped baseline
+    base_ms = await _run_workload(_FakeClient())
+    per_op_base_us = (base_ms * 1000.0) / total_ops
+
+    # 2. Mode="off"
     off_telemetry = BenchTelemetry(mode="off", job="bench-off")
     off_client = instrument_client(_FakeClient(), off_telemetry)
+    assert off_client is not None
     off_ms = await _run_workload(off_client)
+    per_op_off_us = (off_ms * 1000.0) / total_ops
 
+    # 3. Mode="measure"
     measure_telemetry = BenchTelemetry(mode="measure", job="bench-measure")
     measure_client = instrument_client(_FakeClient(), measure_telemetry)
     measure_ms = await _run_workload(measure_client)
-
-    total_ops = concurrency * ops_per_worker
     per_op_measure_us = (measure_ms * 1000.0) / total_ops
-    assert per_op_measure_us < 100.0
-    assert off_ms >= 0.0
+
+    # Relative overhead over unwrapped baseline must stay well below 60us/op
+    assert (per_op_off_us - per_op_base_us) < 25.0
+    assert (per_op_measure_us - per_op_base_us) < 60.0
+
+    # Verify bounded memory state after concurrent benchmark
     stats = measure_telemetry.summary_stats()
     assert stats["shell"]["count"] == float(total_ops)
+    for hist in measure_telemetry._histograms.values():
+        assert len(hist.reservoir) <= _MAX_RESERVOIR_SAMPLES
+    assert len(measure_telemetry._step_aggregates) <= 2

@@ -1,0 +1,519 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""OpenTelemetry tracing for the ate_env client, behind the ``tracing`` extra.
+
+Derived from agent-sandbox's ``k8s_agent_sandbox/trace_manager.py``:
+``ate_env_client.<op>`` span names, a per-client ``TracerManager`` and W3C
+``traceparent``/``tracestate`` propagation (never baggage).
+
+As a library, the client never installs the process-global
+``TracerProvider``. Its tracers choose a provider each time a span starts, so
+spans go to whatever provider the application installs, before or after the
+client starts tracing. While the application has none and
+``OTEL_EXPORTER_OTLP_ENDPOINT`` or ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` is
+set, spans go to the client's own SDK provider with an OTLP/gRPC exporter;
+that provider is never made global, so OpenTelemetry never refuses the
+application's provider.
+
+OpenTelemetry is imported lazily, the first time tracing is enabled, so
+``import ate_env`` never imports it even when it is installed. Without the
+extra every entry point is a no-op and enabling tracing logs one error naming
+the missing extra.
+"""
+
+# pylint: disable=missing-function-docstring,missing-class-docstring
+# pylint: disable=global-statement,import-outside-toplevel,broad-exception-caught
+# pylint: disable=too-few-public-methods
+
+from __future__ import annotations
+
+import asyncio
+import atexit
+import collections
+import contextlib
+import logging
+import os
+import re
+import shlex
+import threading
+from collections.abc import Iterator, Mapping
+from typing import TYPE_CHECKING, Any
+
+import grpc
+import grpc.aio
+
+if TYPE_CHECKING:
+    from ..config import TracerConfig
+
+logger = logging.getLogger("ate_env.telemetry.tracing")
+
+# Span name prefix of every span the ate_env client library emits. The
+# TracerConfig service name is the OTel resource ``service.name``; it does not
+# rename spans, so fleet and client spans keep one vocabulary.
+CLIENT_SPAN_PREFIX = "ate_env_client"
+
+_MISSING_EXTRA_MSG = (
+    "OpenTelemetry not installed; tracing disabled. "
+    "Install the tracing extra: pip install 'ate-env-client[tracing]'"
+)
+
+# W3C trace-context carrier keys. Baggage is deliberately never propagated.
+_CARRIER_KEYS = ("traceparent", "tracestate")
+
+
+# --- lazy OpenTelemetry import ------------------------------------------- #
+
+_OTEL_LOCK = threading.Lock()
+_OTEL: Any = None  # a namespace of the OTel API modules once imported, or False
+_MISSING_LOGGED = False
+
+
+def _load_otel() -> Any:
+    """Import the OpenTelemetry API on first use; returns a namespace or None.
+
+    Only the API is imported here. The SDK and the OTLP exporter are imported
+    by _private_provider, and only when it builds the client's own provider.
+    """
+    global _OTEL
+    if _OTEL is None:
+        with _OTEL_LOCK:
+            if _OTEL is None:
+                try:
+                    from opentelemetry import context as otel_context
+                    from opentelemetry import trace as otel_trace
+                    from opentelemetry.trace import (
+                        ProxyTracerProvider,
+                        SpanKind,
+                        Status,
+                        StatusCode,
+                    )
+                    from opentelemetry.trace.propagation.tracecontext import (
+                        TraceContextTextMapPropagator,
+                    )
+                except ImportError:
+                    _OTEL = False
+                else:
+                    ns = collections.namedtuple(
+                        "_Otel",
+                        "trace context ProxyTracerProvider SpanKind Status StatusCode Propagator",
+                    )
+                    _OTEL = ns(
+                        otel_trace,
+                        otel_context,
+                        ProxyTracerProvider,
+                        SpanKind,
+                        Status,
+                        StatusCode,
+                        TraceContextTextMapPropagator,
+                    )
+    return _OTEL or None
+
+
+def _log_missing_extra() -> None:
+    """Log the missing-extra error once per process."""
+    global _MISSING_LOGGED
+    with _OTEL_LOCK:
+        if _MISSING_LOGGED:
+            return
+        _MISSING_LOGGED = True
+    logger.error(_MISSING_EXTRA_MSG)
+
+
+def __getattr__(name: str) -> Any:
+    # OPENTELEMETRY_AVAILABLE resolves lazily (PEP 562) so importing this
+    # module never imports OTel.
+    if name == "OPENTELEMETRY_AVAILABLE":
+        return _load_otel() is not None
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+# --- TracerProvider ------------------------------------------------------ #
+
+# The environment variables that opt in to the client's own OTLP exporter.
+OTLP_ENDPOINT_ENV_VARS = ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT")
+
+# The client's own SDK TracerProvider (OTLP exporter), built on first use when
+# the application has no provider and an OTLP endpoint variable is set. It is
+# never installed as the process-global provider.
+_PRIVATE_PROVIDER: Any | None = None
+_PRIVATE_PROVIDER_LOCK = threading.Lock()
+_WARNED_SERVICE_NAMES: set[str] = set()
+
+
+def _otlp_endpoint_configured() -> bool:
+    return any(os.environ.get(name) for name in OTLP_ENDPOINT_ENV_VARS)
+
+
+def _service_name_of(provider: Any) -> str | None:
+    try:
+        return provider.resource.attributes.get("service.name")
+    except Exception:
+        return None
+
+
+def _private_provider(service_name: str) -> Any | None:
+    """The client's own OTLP provider, or None when no OTLP endpoint is set.
+
+    Built once per process, on the first span that needs it, with
+    ``service.name`` = service_name; its shutdown (flush) is registered with
+    atexit. A later caller with another service name gets one warning and
+    shares the existing provider.
+    """
+    global _PRIVATE_PROVIDER
+    if not _otlp_endpoint_configured():
+        return None
+    with _PRIVATE_PROVIDER_LOCK:
+        if _PRIVATE_PROVIDER is None:
+            try:
+                from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+                    OTLPSpanExporter,
+                )
+                from opentelemetry.sdk.resources import Resource
+                from opentelemetry.sdk.trace import TracerProvider
+                from opentelemetry.sdk.trace.export import BatchSpanProcessor
+            except ImportError:
+                _log_missing_extra()
+                return None
+            provider = TracerProvider(resource=Resource(attributes={"service.name": service_name}))
+            provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+            atexit.register(provider.shutdown)
+            _PRIVATE_PROVIDER = provider
+            logger.info("OpenTelemetry OTLP exporter configured for service %r", service_name)
+            return provider
+        existing = _service_name_of(_PRIVATE_PROVIDER)
+        if existing and existing != service_name and service_name not in _WARNED_SERVICE_NAMES:
+            _WARNED_SERVICE_NAMES.add(service_name)
+            logger.warning(
+                "OTLP TracerProvider already initialized with service name %r; "
+                "ignoring request to initialize with %r.",
+                existing,
+                service_name,
+            )
+        return _PRIVATE_PROVIDER
+
+
+def initialize_tracer(service_name: str) -> None:
+    """Check that tracing can run; never installs a process-global provider.
+
+    - Without OpenTelemetry: logs an error naming the extra and returns.
+    - Otherwise nothing happens here. Client tracers choose their provider
+      each time a span starts (see ``TracerManager``): the application's
+      provider once it is installed, before or after the client; else, when
+      ``OTEL_EXPORTER_OTLP_ENDPOINT`` or ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT``
+      is set, the client's own OTLP provider; else the no-op API proxy.
+    """
+    _ = service_name
+    if _load_otel() is None:
+        _log_missing_extra()
+
+
+class _ResolvingTracer:
+    """A tracer that chooses its provider each time a span starts.
+
+    The application's provider wins as soon as it is installed, so the setup
+    order never matters and the client never has to install a global
+    provider (which OpenTelemetry would then refuse to replace). Until the
+    application installs one, spans go to the client's own OTLP provider when
+    an OTLP endpoint variable is set, and to the no-op API proxy otherwise.
+    """
+
+    def __init__(self, scope_name: str, service_name: str) -> None:
+        self._scope_name = scope_name
+        self._service_name = service_name
+        self._cached: tuple[Any, Any] = (None, None)  # (provider, tracer)
+
+    def _tracer(self) -> Any:
+        otel = _load_otel()
+        provider = otel.trace.get_tracer_provider()
+        if isinstance(provider, otel.ProxyTracerProvider):
+            provider = _private_provider(self._service_name) or provider
+        cached_provider, tracer = self._cached
+        if cached_provider is not provider:
+            tracer = provider.get_tracer(self._scope_name)
+            self._cached = (provider, tracer)
+        return tracer
+
+    def start_as_current_span(self, name: str, **kwargs: Any) -> Any:
+        return self._tracer().start_as_current_span(name, **kwargs)
+
+    def start_span(self, name: str, **kwargs: Any) -> Any:
+        return self._tracer().start_span(name, **kwargs)
+
+
+# --- span helpers -------------------------------------------------------- #
+
+
+@contextlib.contextmanager
+def start_span(
+    tracer: Any,
+    name: str,
+    attributes: Mapping[str, Any] | None = None,
+    *,
+    client_kind: bool = False,
+) -> Iterator[Any]:
+    """Start ``name`` as the current span on ``tracer``; yields None when disabled.
+
+    Attributes whose value is None are dropped. Exceptions are recorded on the
+    span and mark it as an error (the SDK default). Cancellation
+    (``asyncio.CancelledError``, which the SDK does not record) marks the span
+    as an error with the description ``cancelled``. ``client_kind`` gives the
+    span kind ``CLIENT`` (for a span that wraps exactly one outgoing RPC);
+    otherwise the kind is ``INTERNAL``.
+    """
+    if not tracer:
+        yield None
+        return
+    kwargs: dict[str, Any] = {}
+    if client_kind:
+        otel = _load_otel()
+        if otel is not None:
+            kwargs["kind"] = otel.SpanKind.CLIENT
+    with tracer.start_as_current_span(name, **kwargs) as span:
+        if attributes:
+            set_attributes(span, attributes)
+        try:
+            yield span
+        except asyncio.CancelledError:
+            mark_error(span, "cancelled")
+            raise
+
+
+def rpc_attrs(service: str, method: str, target: str | None) -> dict[str, Any]:
+    """OTel semantic-convention attributes of one gRPC call.
+
+    service is the fully qualified gRPC service (``ateenv.v1alpha.X``) and
+    target the ``host:port`` of the channel (None for a caller-owned channel).
+    """
+    attrs: dict[str, Any] = {"rpc.system": "grpc", "rpc.service": service, "rpc.method": method}
+    if target:
+        host, sep, port = target.rpartition(":")
+        if sep and port.isdigit() and host:
+            attrs["server.address"] = host.strip("[]")
+            attrs["server.port"] = int(port)
+        else:
+            attrs["server.address"] = target
+    return attrs
+
+
+def set_attributes(span: Any, attributes: Mapping[str, Any]) -> None:
+    """Set the non-None attributes on span; a None span is ignored."""
+    if span is None:
+        return
+    for key, value in attributes.items():
+        if value is None:
+            continue
+        try:
+            span.set_attribute(key, value)
+        except Exception:  # pragma: no cover - attribute type errors never fail a call
+            pass
+
+
+def image_ref_attr(ref: str | None) -> str | None:
+    """An image reference without its tag, for span attributes.
+
+    ``repo@sha256:...`` (the digest is an id) and ``repo`` are kept;
+    ``repo:tag`` and ``repo:tag@sha256:...`` drop the tag.
+    """
+    if not ref:
+        return None
+    name, at, digest = ref.partition("@")
+    slash = name.rfind("/")
+    colon = name.rfind(":")
+    if colon > slash:
+        name = name[:colon]
+    return f"{name}{at}{digest}"
+
+
+# A leading shell variable assignment (``NAME=value``), e.g. ``API_KEY=x cmd``.
+_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def executable_attr(command: str | list[str] | tuple[str, ...]) -> str | None:
+    """The executable name of a command (never its arguments), for span attributes.
+
+    Leading ``NAME=value`` words are skipped so environment assignments such as
+    ``API_KEY=s3cr3t python x.py`` never reach the trace backend. A string
+    command that cannot be split like a shell would split it yields None.
+    """
+    if isinstance(command, (list, tuple)):
+        words = [str(w) for w in command]
+    else:
+        try:
+            words = shlex.split(command)
+        except ValueError:
+            return None
+    for word in words:
+        if _ENV_ASSIGNMENT.match(word):
+            continue
+        return word.rsplit("/", 1)[-1] or None
+    return None
+
+
+def mark_error(span: Any, description: str) -> None:
+    """Set span's status to ERROR with description; a None span is ignored.
+
+    For failures reported as results rather than exceptions raised inside the
+    span (e.g. a non-zero exit with ``check=True``). Nothing else is recorded,
+    so command lines and output never reach the trace backend.
+    """
+    if span is None:
+        return
+    otel = _load_otel()
+    if otel is None:
+        return
+    try:
+        span.set_status(otel.Status(otel.StatusCode.ERROR, description))
+    except Exception:  # pragma: no cover - status errors never fail a call
+        pass
+
+
+# --- TracerManager ------------------------------------------------------- #
+
+
+class TracerManager:
+    """The tracer of one client instance.
+
+    ``service_name`` is the OTel resource ``service.name`` (from
+    ``TracerConfig.trace_service_name``); the instrumentation scope is that
+    name with ``-`` replaced by ``_``. It never renames spans: client spans are
+    always ``ate_env_client.<op>``.
+    """
+
+    def __init__(self, service_name: str) -> None:
+        otel = _load_otel()
+        if otel is None:
+            raise RuntimeError(_MISSING_EXTRA_MSG)
+        self.service_name = service_name
+        self.instrumentation_scope_name = service_name.replace("-", "_")
+        # Chooses the provider at each span start: the application's once it
+        # is installed, else the client's own OTLP provider (endpoint set),
+        # else the no-op API proxy.
+        self.tracer = _ResolvingTracer(self.instrumentation_scope_name, service_name)
+
+
+def create_tracer_manager(config: TracerConfig) -> tuple[TracerManager | None, Any | None]:
+    """Build a TracerManager from config; ``(None, None)`` when disabled or OTel absent."""
+    if config is None or not config.enable_tracing:
+        return None, None
+    if _load_otel() is None:
+        _log_missing_extra()
+        return None, None
+    manager = TracerManager(service_name=config.trace_service_name)
+    return manager, manager.tracer
+
+
+def tracer_from_config(config: TracerConfig | None) -> Any | None:
+    """The tracer for config (None when disabled or OTel absent).
+
+    The tracer never installs a global provider; see initialize_tracer for
+    where its spans go.
+    """
+    if config is None or not config.enable_tracing:
+        return None
+    initialize_tracer(config.trace_service_name)
+    return create_tracer_manager(config)[1]
+
+
+# --- propagation --------------------------------------------------------- #
+
+
+def _current_carrier() -> dict[str, str]:
+    otel = _load_otel()
+    if otel is None:
+        return {}
+    carrier: dict[str, str] = {}
+    otel.Propagator().inject(carrier)
+    return {k: v for k, v in carrier.items() if k in _CARRIER_KEYS}
+
+
+def inject_metadata(metadata: list[tuple[str, str]] | None) -> list[tuple[str, str]]:
+    """Return metadata plus the W3C carrier of the current context.
+
+    Keys already present (case-insensitive) are kept, never doubled.
+    """
+    md = list(metadata or [])
+    carrier = _current_carrier()
+    if not carrier:
+        return md
+    present = {k.lower() for k, _ in md}
+    for key, value in carrier.items():
+        if key not in present:
+            md.append((key, value))
+    return md
+
+
+class _TraceCallDetails(
+    collections.namedtuple(
+        "_TraceCallDetails",
+        ["method", "timeout", "metadata", "credentials", "wait_for_ready"],
+    ),
+    grpc.aio.ClientCallDetails,
+):
+    pass
+
+
+class TraceContextInterceptor:
+    """Base of the interceptor family that injects the W3C trace context.
+
+    grpc.aio dispatches one interceptor class per call kind, so the family has
+    one subclass per kind, mirroring the auth interceptors in client.py.
+    """
+
+    def _inject(self, details: grpc.aio.ClientCallDetails) -> _TraceCallDetails:
+        return _TraceCallDetails(
+            details.method,
+            details.timeout,
+            inject_metadata(details.metadata),
+            details.credentials,
+            details.wait_for_ready,
+        )
+
+
+class UnaryUnaryTraceContextInterceptor(
+    TraceContextInterceptor, grpc.aio.UnaryUnaryClientInterceptor
+):
+    async def intercept_unary_unary(self, continuation, client_call_details, request):
+        return await continuation(self._inject(client_call_details), request)
+
+
+class UnaryStreamTraceContextInterceptor(
+    TraceContextInterceptor, grpc.aio.UnaryStreamClientInterceptor
+):
+    async def intercept_unary_stream(self, continuation, client_call_details, request):
+        return await continuation(self._inject(client_call_details), request)
+
+
+class StreamUnaryTraceContextInterceptor(
+    TraceContextInterceptor, grpc.aio.StreamUnaryClientInterceptor
+):
+    async def intercept_stream_unary(self, continuation, client_call_details, request_iterator):
+        return await continuation(self._inject(client_call_details), request_iterator)
+
+
+class StreamStreamTraceContextInterceptor(
+    TraceContextInterceptor, grpc.aio.StreamStreamClientInterceptor
+):
+    async def intercept_stream_stream(self, continuation, client_call_details, request_iterator):
+        return await continuation(self._inject(client_call_details), request_iterator)
+
+
+def _trace_interceptors() -> list[grpc.aio.ClientInterceptor]:
+    """One trace-context interceptor per grpc.aio call kind."""
+    return [
+        UnaryUnaryTraceContextInterceptor(),
+        UnaryStreamTraceContextInterceptor(),
+        StreamUnaryTraceContextInterceptor(),
+        StreamStreamTraceContextInterceptor(),
+    ]

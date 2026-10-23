@@ -29,6 +29,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from ..client import DEFAULT_ATESPACE, Client
+from ..config import TracerConfig
 from ..errors import (
     FailedPreconditionError,
     InfrastructureError,
@@ -37,7 +38,18 @@ from ..errors import (
     SandboxStartError,
 )
 from ..loop_runner import LoopRunner
-from ..telemetry import _IN_TRACKED_LIFECYCLE, BenchTelemetry, instrument_client
+from ..telemetry import (
+    _CURRENT_SLOT_WAIT_MS,
+    _IN_TRACKED_LIFECYCLE,
+    BenchTelemetry,
+    instrument_client,
+)
+from ..telemetry.tracing import (
+    CLIENT_SPAN_PREFIX,
+    set_attributes,
+    start_span,
+    tracer_from_config,
+)
 from ..types import DataPlaneEndpoint, EnvironmentSpec, RawSandboxInstance
 from .base import BackendDriver
 
@@ -80,6 +92,10 @@ class SubstrateBackendDriver(BackendDriver):
     Manages environment lifecycle directly against the ate-env-api gRPC service
     via ate_env.Client: creating environments, suspending for pre-warmed pools,
     and deleting on release.
+
+    tracer_config enables ``ate_env_client.ensure_template`` / ``.warm_pool`` /
+    ``.acquire`` / ``.release`` / ``.reap`` spans and is handed to the Client
+    the driver builds (needs the ``tracing`` extra).
     """
 
     def __init__(
@@ -95,9 +111,9 @@ class SubstrateBackendDriver(BackendDriver):
         labels: Mapping[str, str] | None = None,
         acquire_timeout_s: float = 180.0,
         ready_timeout_s: float = 180.0,
-        max_concurrent: int | None = None,
-        telemetry: BenchTelemetry | None = None,
         loop_runner: LoopRunner | None = None,
+        tracer_config: TracerConfig | None = None,
+        telemetry: BenchTelemetry | None = None,
     ):
         target = (
             api_endpoint
@@ -114,7 +130,8 @@ class SubstrateBackendDriver(BackendDriver):
         self.labels = dict(labels or {})
         self.acquire_timeout_s = acquire_timeout_s
         self.ready_timeout_s = ready_timeout_s
-        self.max_concurrent = max_concurrent
+        self.tracer_config = tracer_config or TracerConfig()
+        self.tracer = tracer_from_config(self.tracer_config)
         self.telemetry: BenchTelemetry | None = telemetry
 
         self._loop_runner = loop_runner
@@ -131,29 +148,6 @@ class SubstrateBackendDriver(BackendDriver):
         self._owned_actors: dict[str, RawSandboxInstance] = {}
         self._warm_paused_pool: _WarmPoolDict = _WarmPoolDict()
         self._background_tasks: set[asyncio.Task[Any]] = set()
-        self._slot_sems: dict[int, asyncio.Semaphore] = {}
-        self._slot_holders: dict[str, asyncio.Semaphore] = {}
-
-    def _get_slot_sem(self) -> asyncio.Semaphore | None:
-        if self.max_concurrent is None or self.max_concurrent <= 0:
-            return None
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return None
-        loop_id = id(loop)
-        with self._lock:
-            sem = self._slot_sems.get(loop_id)
-            if sem is None:
-                sem = asyncio.Semaphore(self.max_concurrent)
-                self._slot_sems[loop_id] = sem
-            return sem
-
-    def _release_slot_for_actor(self, actor_id: str) -> None:
-        with self._lock:
-            sem = self._slot_holders.pop(actor_id, None)
-        if sem is not None:
-            sem.release()
 
     def _get_loop_runner(self) -> LoopRunner:
         with self._lock:
@@ -165,7 +159,9 @@ class SubstrateBackendDriver(BackendDriver):
     @property
     def client(self) -> Client:
         if self._client is None:
-            self._client = Client(self.api_endpoint, auth_token=self.auth_token)
+            self._client = Client(
+                self.api_endpoint, auth_token=self.auth_token, tracer_config=self.tracer_config
+            )
         if self.telemetry is not None and getattr(self.telemetry, "mode", "off") != "off":
             instrument_client(self._client, self.telemetry)
         return self._client
@@ -222,6 +218,12 @@ class SubstrateBackendDriver(BackendDriver):
         fields in EnvironmentSpec are reserved for future scheduling extensions.
         Current Substrate environments are provisioned from pre-registered ActorTemplates.
         """
+        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.ensure_template") as span:
+            template = self._resolve_template(env)
+            set_attributes(span, {"ate.template.name": template})
+            return template
+
+    def _resolve_template(self, env: EnvironmentSpec | str) -> str:
         if isinstance(env, str):
             image = env
             if image in self.image_templates:
@@ -276,82 +278,91 @@ class SubstrateBackendDriver(BackendDriver):
     ) -> RawSandboxInstance:
         """Acquire a live sandbox instance within timeout_s."""
         to_s = timeout_s or self.acquire_timeout_s
-        slot_sem = self._get_slot_sem()
-        slot_wait_ms = 0.0
-        if slot_sem is not None:
-            t_slot0 = time.perf_counter()
-            await slot_sem.acquire()
-            slot_wait_ms = max((time.perf_counter() - t_slot0) * 1000.0, 1e-4)
-
+        slot_wait_ms = float(_CURRENT_SLOT_WAIT_MS.get() or 0.0)
         t_wire0 = time.perf_counter()
         state: dict[str, Any] = {
             "source": "cold_create",
             "retries": 0,
             "actor_id": "",
         }
-        token = _IN_TRACKED_LIFECYCLE.set(True)
-        try:
-            inst = await asyncio.wait_for(
-                self._acquire_internal(
-                    template_id, run_id, rootfs_image=rootfs_image, _telemetry_state=state
-                ),
-                timeout=to_s,
-            )
-        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
-            if slot_sem is not None:
-                slot_sem.release()
-            wire_dur_ms = (time.perf_counter() - t_wire0) * 1000.0
-            if self.telemetry is not None and getattr(self.telemetry, "mode", "off") != "off":
-                src = str(state.get("source") or "cold_create")
-                self.telemetry.record_op(
-                    "acquire",
-                    wire_dur_ms,
-                    ok=False,
-                    env_id=str(state.get("actor_id") or template_id),
-                    source=src,
-                    cache_state="hit" if src == "warm_pool" else "miss",
-                    slot_wait_ms=slot_wait_ms,
-                    retried=int(state.get("retries") or 0),
-                    timed_out=True,
-                    err=f"SandboxStartError: Timed out acquiring sandbox for template {template_id}",
+        with start_span(
+            self.tracer,
+            f"{CLIENT_SPAN_PREFIX}.acquire",
+            {"ate.template.name": template_id, "ate_env.run_id": run_id},
+        ) as span:
+            token = _IN_TRACKED_LIFECYCLE.set(True)
+            try:
+                inst = await asyncio.wait_for(
+                    self._acquire_internal(
+                        template_id, run_id, rootfs_image=rootfs_image, _telemetry_state=state
+                    ),
+                    timeout=to_s,
                 )
-            if isinstance(e, asyncio.TimeoutError):
+            except asyncio.CancelledError:
+                wire_dur_ms = (time.perf_counter() - t_wire0) * 1000.0
+                if self.telemetry is not None and getattr(self.telemetry, "mode", "off") != "off":
+                    src = str(state.get("source") or "cold_create")
+                    self.telemetry.record_op(
+                        "acquire",
+                        wire_dur_ms,
+                        ok=False,
+                        env_id=str(state.get("actor_id") or template_id),
+                        source=src,
+                        cache_state="hit" if src == "warm_pool" else "miss",
+                        slot_wait_ms=slot_wait_ms,
+                        retried=int(state.get("retries") or 0),
+                        timed_out=False,
+                        err="CancelledError",
+                    )
+                raise
+            except asyncio.TimeoutError as e:
+                wire_dur_ms = (time.perf_counter() - t_wire0) * 1000.0
+                if self.telemetry is not None and getattr(self.telemetry, "mode", "off") != "off":
+                    src = str(state.get("source") or "cold_create")
+                    self.telemetry.record_op(
+                        "acquire",
+                        wire_dur_ms,
+                        ok=False,
+                        env_id=str(state.get("actor_id") or template_id),
+                        source=src,
+                        cache_state="hit" if src == "warm_pool" else "miss",
+                        slot_wait_ms=slot_wait_ms,
+                        retried=int(state.get("retries") or 0),
+                        timed_out=True,
+                        err=f"SandboxStartError: Timed out acquiring sandbox for template {template_id}",
+                    )
                 raise SandboxStartError(
                     f"Timed out acquiring sandbox for template {template_id} after {to_s:g}s"
                 ) from e
-            raise
-        except Exception as e:
-            if slot_sem is not None:
-                slot_sem.release()
-            wire_dur_ms = (time.perf_counter() - t_wire0) * 1000.0
-            if self.telemetry is not None and getattr(self.telemetry, "mode", "off") != "off":
-                src = str(state.get("source") or "cold_create")
-                timed_out = "timed out" in str(e).lower()
-                self.telemetry.record_op(
-                    "acquire",
-                    wire_dur_ms,
-                    ok=False,
-                    env_id=str(state.get("actor_id") or template_id),
-                    source=src,
-                    cache_state="hit" if src == "warm_pool" else "miss",
-                    slot_wait_ms=slot_wait_ms,
-                    retried=int(state.get("retries") or 0),
-                    timed_out=timed_out,
-                    err=f"{type(e).__name__}: {e}",
-                )
-            raise
-        finally:
-            _IN_TRACKED_LIFECYCLE.reset(token)
+            except Exception as e:
+                wire_dur_ms = (time.perf_counter() - t_wire0) * 1000.0
+                if self.telemetry is not None and getattr(self.telemetry, "mode", "off") != "off":
+                    src = str(state.get("source") or "cold_create")
+                    timed_out = "timed out" in str(e).lower()
+                    self.telemetry.record_op(
+                        "acquire",
+                        wire_dur_ms,
+                        ok=False,
+                        env_id=str(state.get("actor_id") or template_id),
+                        source=src,
+                        cache_state="hit" if src == "warm_pool" else "miss",
+                        slot_wait_ms=slot_wait_ms,
+                        retried=int(state.get("retries") or 0),
+                        timed_out=timed_out,
+                        err=f"{type(e).__name__}: {e}",
+                    )
+                raise
+            finally:
+                _IN_TRACKED_LIFECYCLE.reset(token)
+
+            set_attributes(span, {"ate.actor.name": inst.instance_id})
 
         wire_dur_ms = (time.perf_counter() - t_wire0) * 1000.0
         src = str(state.get("source") or "cold_create")
         cache_state = "hit" if src == "warm_pool" else "miss"
         inst.metadata["source"] = src
         inst.metadata["cache_state"] = cache_state
-        inst.metadata["acquired_at_monotonic"] = time.perf_counter()
-        if slot_sem is not None:
-            with self._lock:
-                self._slot_holders[inst.instance_id] = slot_sem
+        inst.metadata["acquired_at_monotonic"] = time.monotonic()
 
         if self.telemetry is not None and getattr(self.telemetry, "mode", "off") != "off":
             self.telemetry.record_op(
@@ -478,6 +489,23 @@ class SubstrateBackendDriver(BackendDriver):
         rootfs_image: str | None = None,
     ) -> None:
         """Pre-warm a pool of actors by creating and suspending them."""
+        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.warm_pool", {
+            "ate.template.name": template_id,
+            "ate_env.replicas": replicas,
+            "ate_env.run_id": run_id,
+        }):
+            await self._warm_pool_internal(
+                template_id, replicas, wait=wait, run_id=run_id, rootfs_image=rootfs_image
+            )
+
+    async def _warm_pool_internal(
+        self,
+        template_id: str,
+        replicas: int,
+        wait: bool,
+        run_id: str | None,
+        rootfs_image: str | None,
+    ) -> None:
         logger.info(
             "Sizing warm pool for template %s (rootfs_image=%s) to %d paused actors...",
             template_id,
@@ -631,7 +659,10 @@ class SubstrateBackendDriver(BackendDriver):
         Note: Recycling suspends the actor and returns it to the warm pool
         without resetting guest filesystem or processes.
         """
-        self._release_slot_for_actor(instance_id)
+        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.release", {"ate.actor.name": instance_id}):
+            await self._release_internal(instance_id, recycle)
+
+    async def _release_internal(self, instance_id: str, recycle: bool) -> None:
         with self._lock:
             instance = self._owned_actors.pop(instance_id, None)
 
@@ -715,6 +746,10 @@ class SubstrateBackendDriver(BackendDriver):
 
     async def reap_async(self, run_id: str) -> int:
         """Force delete all environments tagged with this run_id and all warm pool actors."""
+        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.reap", {"ate_env.run_id": run_id}):
+            return await self._reap_internal(run_id)
+
+    async def _reap_internal(self, run_id: str) -> int:
         with self._lock:
             warm_actors: list[str] = []
             for tid, actors in list(self._warm_paused_pool.items()):
@@ -726,9 +761,6 @@ class SubstrateBackendDriver(BackendDriver):
                 if inst.run_id == run_id or aid in warm_actors or inst.run_id == "warm-pool"
             ]
             to_reap = list(dict.fromkeys(to_reap + warm_actors))
-
-        for aid in to_reap:
-            self._release_slot_for_actor(aid)
 
         sem = asyncio.Semaphore(16)
         failed_actors: list[str] = []
@@ -798,14 +830,18 @@ class SubstrateBackendDriver(BackendDriver):
         from ..runtime.substrate_env_client import SubstrateEnvClientRuntime
 
         ep = instance.data_planes.get(data_plane) or instance.data_planes.get("ate_env")
+        source = str(instance.metadata.get("source") or "direct")
+        cache_state = str(instance.metadata.get("cache_state") or "unknown")
+        acquired_at = instance.metadata.get("acquired_at_monotonic")
         return SubstrateEnvClientRuntime(
             env_id=instance.instance_id,
             endpoint=ep.address if ep else instance.endpoint,
             atespace=self.atespace,
             client=self.client,
             loop_runner=self._get_loop_runner(),
+            tracer_config=self.tracer_config,
             telemetry=self.telemetry,
-            source=str(instance.metadata.get("source") or "direct"),
-            cache_state=str(instance.metadata.get("cache_state") or "unknown"),
-            acquired_at_monotonic=instance.metadata.get("acquired_at_monotonic"),
+            source=source,
+            cache_state=cache_state,
+            acquired_at_monotonic=float(acquired_at) if acquired_at is not None else None,
         ), ep

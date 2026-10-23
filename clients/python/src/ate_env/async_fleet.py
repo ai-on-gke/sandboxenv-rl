@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# pylint: disable=missing-function-docstring,broad-exception-caught,unused-argument,protected-access,duplicate-code,line-too-long
 
 """`AsyncSandboxFleet` — an awaitable, event-loop-native fleet.
 
@@ -18,20 +19,19 @@ Enables RL post-training frameworks (TorchRL, VeRL, SkyRL) to overlap LLM token
 generation with background sandbox pre-warming and non-blocking batch acquisition.
 """
 
-# pylint: disable=missing-function-docstring,line-too-long,broad-exception-caught
-# pylint: disable=unused-argument,protected-access,duplicate-code
-
 from __future__ import annotations
 
 import asyncio
 import inspect
 import logging
+import time
 from collections.abc import Callable
 from typing import Any
 
 from .config import FleetConfig
 from .fleet import SandboxFleet
 from .handle import SandboxHandle
+from .telemetry import _CURRENT_SLOT_WAIT_MS, BenchTelemetry
 from .types import FleetPlan, Task
 
 logger = logging.getLogger("sandbox_sdk.async_fleet")
@@ -62,10 +62,6 @@ class AsyncSandboxFleet:
         if hasattr(self.backend, "close"):
             self.backend.close()
 
-    @property
-    def telemetry(self) -> Any:
-        return self._fleet.telemetry
-
     def __del__(self) -> None:
         try:
             self.close(wait=False)
@@ -80,6 +76,10 @@ class AsyncSandboxFleet:
     @property
     def backend(self) -> Any:
         return self._fleet.backend
+
+    @property
+    def telemetry(self) -> BenchTelemetry:
+        return self._fleet.telemetry
 
     @property
     def tasks(self) -> list[Task]:
@@ -218,6 +218,7 @@ class AsyncSandboxFleet:
             runtime=runtime,
             data_plane=data_plane,
             default_timeout_s=self.config.step_timeout_s,
+            tracer=self._fleet._tracer,
         )
 
     async def acquire_batch(
@@ -272,8 +273,14 @@ class AsyncSandboxFleet:
         results: list[Any] = [None] * len(self.tasks)
 
         async def _worker(idx: int, task: Task) -> None:
+            t_wait0 = time.perf_counter()
             async with sem:
-                handle = await self.acquire(task)
+                slot_wait_ms = max(0.0, (time.perf_counter() - t_wait0) * 1000.0)
+                tok = _CURRENT_SLOT_WAIT_MS.set(slot_wait_ms)
+                try:
+                    handle = await self.acquire(task)
+                finally:
+                    _CURRENT_SLOT_WAIT_MS.reset(tok)
                 try:
                     res = await self._call_process_fn(process_fn, task, handle)
                     results[idx] = res

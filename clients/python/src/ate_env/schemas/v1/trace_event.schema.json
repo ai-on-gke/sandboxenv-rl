@@ -1,105 +1,44 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/ai-on-gke/sandboxenv-rl/schemas/v1/trace_event.schema.json",
+  "$id": "https://ai-on-gke.github.io/sandboxenv-rl/schema/v1/trace_event.schema.json",
   "title": "TraceEvent",
-  "description": "W1 SDK call trace record emitted in trace mode (trace.jsonl).",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "ts",
-    "env",
-    "op",
-    "dur_ms",
-    "ok"
-  ],
+  "required": ["ts", "env", "op", "dur_ms", "ok"],
   "properties": {
-    "schema_version": {
-      "type": "string",
-      "const": "v1"
-    },
-    "ts": {
-      "type": "string",
-      "format": "date-time",
-      "minLength": 1
-    },
-    "run": {
-      "type": "string"
-    },
-    "job": {
-      "type": "string"
-    },
-    "env": {
-      "type": "string",
-      "minLength": 1
-    },
-    "instance": {
-      "type": "string"
-    },
-    "image": {
-      "type": "string"
-    },
-    "step": {
-      "type": "integer",
-      "minimum": 0
-    },
+    "schema_version": { "type": "string", "enum": ["v1"] },
+    "ts": { "type": "string", "minLength": 1 },
+    "run": { "type": "string" },
+    "job": { "type": "string" },
+    "env": { "type": "string", "minLength": 1 },
+    "instance": { "type": "string" },
+    "image": { "type": "string" },
+    "step": { "type": "integer", "minimum": 0 },
     "op": {
       "type": "string",
       "enum": [
-        "acquire",
         "create",
-        "get",
         "exec",
-        "start_process",
-        "shell",
         "write_file",
         "read_file",
         "suspend",
         "wake",
         "fork",
         "delete",
-        "ttfi",
-        "prewarm",
-        "retire",
-        "reap",
-        "task_exec"
-      ]
-    },
-    "source": {
-      "type": "string",
-      "enum": [
-        "warm_pool",
-        "cold_create",
-        "golden_restore",
-        "fork",
-        "resume",
-        "direct"
+        "get",
+        "start_process",
+        "shell"
       ]
     },
     "command": {
       "type": "array",
-      "items": {
-        "type": "string"
-      }
+      "items": { "type": "string" }
     },
-    "path": {
-      "type": "string"
-    },
-    "bytes": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "dur_ms": {
-      "type": "number",
-      "minimum": 0
-    },
-    "exit": {
-      "type": "integer"
-    },
-    "ok": {
-      "type": "boolean"
-    },
-    "err": {
-      "type": "string"
-    }
+    "path": { "type": "string" },
+    "bytes": { "type": "integer", "minimum": 0 },
+    "dur_ms": { "type": "number", "minimum": 0 },
+    "exit": { "type": "integer" },
+    "ok": { "type": "boolean" },
+    "err": { "type": "string" }
   }
 }

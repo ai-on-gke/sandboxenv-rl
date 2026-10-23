@@ -31,6 +31,7 @@ from typing import Any
 import grpc
 
 from ..client import Client as AteClient
+from ..config import TracerConfig
 from ..env import Env as AteEnv
 from ..errors import (
     CommandStartError,
@@ -67,6 +68,7 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
         client: AteClient | None = None,
         env: AteEnv | None = None,
         loop_runner: LoopRunner | None = None,
+        tracer_config: TracerConfig | None = None,
         telemetry: BenchTelemetry | None = None,
         source: str = "direct",
         cache_state: str = "unknown",
@@ -77,6 +79,9 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
         self.env_id = env_id
         self.endpoint = endpoint or "localhost:7777"
         self.atespace = atespace
+        # Used only for a client the runtime builds itself; a shared client
+        # keeps its own tracing configuration.
+        self.tracer_config = tracer_config
 
         self._loop_runner = loop_runner
         self._owns_loop_runner = loop_runner is None
@@ -113,7 +118,7 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
         with self._lock:
             if self._env is None:
                 if self._client is None:
-                    self._client = AteClient(self.endpoint)
+                    self._client = AteClient(self.endpoint, tracer_config=self.tracer_config)
                 self._env = self._client.env(self.env_id, atespace=self.atespace)
             if (
                 self._telemetry is not None
@@ -166,6 +171,7 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
         command: str | list[str],
         name: str,
         dur_ms: float,
+        t_end: float,
         ok: bool,
         exit_code: int | None,
         timed_out: bool,
@@ -185,9 +191,14 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
             or self._source in ("warm_pool", "cold_create")
         ):
             first_op = "wake" if self._source == "warm_pool" else "ttfi"
+            first_dur_ms = (
+                max(dur_ms, (t_end - self._acquired_at_monotonic) * 1000.0)
+                if self._acquired_at_monotonic is not None
+                else dur_ms
+            )
             self._telemetry.record_op(
                 first_op,
-                dur_ms,
+                first_dur_ms,
                 ok=ok,
                 env_id=self.env_id,
                 step_name=first_op,
@@ -197,6 +208,7 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
                 source=self._source,
                 cache_state=self._cache_state,
                 timed_out=timed_out,
+                emit_trace=False,
             )
 
         self._telemetry.record_op(
@@ -283,11 +295,13 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
                         await active_proc.kill()
                     except Exception:
                         pass
-                duration = time.monotonic() - t0
+                t_end = time.monotonic()
+                duration = t_end - t0
                 self._record_exec_telemetry(
                     command=command,
                     name=name,
                     dur_ms=duration * 1000.0,
+                    t_end=t_end,
                     ok=False,
                     exit_code=None,
                     timed_out=True,
@@ -301,7 +315,8 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
                     timed_out=True,
                 )
 
-            duration = time.monotonic() - t0
+            t_end = time.monotonic()
+            duration = t_end - t0
             # 137 = 128 + 9 (SIGKILL sent by guest when guest-side timeout elapsed).
             # Note: checking exit_code == 137 and duration >= timeout_s is a heuristic;
             # external kills (like OOM) can also produce exit_code 137.
@@ -317,17 +332,33 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
                 command=command,
                 name=name,
                 dur_ms=duration * 1000.0,
+                t_end=t_end,
                 ok=bool(res.ok),
                 exit_code=res.exit_code,
                 timed_out=timed_out,
                 err="TimeoutError" if timed_out else "",
             )
             return res
-        except InvalidArgumentError as e:
+        except asyncio.CancelledError:
+            t_end = time.monotonic()
             self._record_exec_telemetry(
                 command=command,
                 name=name,
-                dur_ms=(time.monotonic() - t0) * 1000.0,
+                dur_ms=(t_end - t0) * 1000.0,
+                t_end=t_end,
+                ok=False,
+                exit_code=None,
+                timed_out=False,
+                err="CancelledError",
+            )
+            raise
+        except InvalidArgumentError as e:
+            t_end = time.monotonic()
+            self._record_exec_telemetry(
+                command=command,
+                name=name,
+                dur_ms=(t_end - t0) * 1000.0,
+                t_end=t_end,
                 ok=False,
                 exit_code=None,
                 timed_out=False,
@@ -335,10 +366,12 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
             )
             raise SandboxProtocolError(str(e), sandbox_id=self.env_id) from e
         except NotFoundError as e:
+            t_end = time.monotonic()
             self._record_exec_telemetry(
                 command=command,
                 name=name,
-                dur_ms=(time.monotonic() - t0) * 1000.0,
+                dur_ms=(t_end - t0) * 1000.0,
+                t_end=t_end,
                 ok=False,
                 exit_code=None,
                 timed_out=False,
@@ -349,10 +382,12 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
                 raise SandboxUnavailableError(str(e), sandbox_id=self.env_id) from e
             raise CommandStartError(str(e), sandbox_id=self.env_id) from e
         except RpcError as e:
+            t_end = time.monotonic()
             self._record_exec_telemetry(
                 command=command,
                 name=name,
-                dur_ms=(time.monotonic() - t0) * 1000.0,
+                dur_ms=(t_end - t0) * 1000.0,
+                t_end=t_end,
                 ok=False,
                 exit_code=None,
                 timed_out=e.code == grpc.StatusCode.DEADLINE_EXCEEDED,
@@ -371,10 +406,12 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
                 ) from e
             raise SandboxProtocolError(str(e), sandbox_id=self.env_id, status=status_name) from e
         except InfrastructureError as e:
+            t_end = time.monotonic()
             self._record_exec_telemetry(
                 command=command,
                 name=name,
-                dur_ms=(time.monotonic() - t0) * 1000.0,
+                dur_ms=(t_end - t0) * 1000.0,
+                t_end=t_end,
                 ok=False,
                 exit_code=None,
                 timed_out=False,
@@ -382,10 +419,12 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
             )
             raise
         except Exception as e:
+            t_end = time.monotonic()
             self._record_exec_telemetry(
                 command=command,
                 name=name,
-                dur_ms=(time.monotonic() - t0) * 1000.0,
+                dur_ms=(t_end - t0) * 1000.0,
+                t_end=t_end,
                 ok=False,
                 exit_code=None,
                 timed_out=False,

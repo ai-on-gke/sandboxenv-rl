@@ -41,6 +41,7 @@ import functools
 import json
 import math
 import os
+import random
 import socket
 import threading
 import time
@@ -55,6 +56,8 @@ __all__ = [
     "EVENT_SCHEMA",
     "TRACE_EVENT_ALLOWED_KEYS",
     "EVENT_ALLOWED_KEYS",
+    "CANONICAL_TRACE_OPS",
+    "CANONICAL_EVENT_SOURCES",
     "TraceEventRecord",
     "BenchTelemetry",
     "validate_trace_event_dict",
@@ -72,7 +75,7 @@ _TRACE_ERR_MAX_CHARS = 512
 # Task-local re-entrancy guards so delegating calls (Env.shell -> Env.start_process,
 # Env.suspend -> Client.suspend, SubstrateBackendDriver -> Client.*) never double-count.
 _IN_TRACKED_SHELL: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "_ ate_env_in_tracked_shell", default=False
+    "_ate_env_in_tracked_shell", default=False
 )
 _IN_TRACKED_LIFECYCLE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_ate_env_in_tracked_lifecycle", default=False
@@ -80,15 +83,19 @@ _IN_TRACKED_LIFECYCLE: contextvars.ContextVar[bool] = contextvars.ContextVar(
 _IN_TRACKED_EXEC: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_ate_env_in_tracked_exec", default=False
 )
+# Task-local slot-wait latency observed at existing fleet concurrency boundaries.
+_CURRENT_SLOT_WAIT_MS: contextvars.ContextVar[float] = contextvars.ContextVar(
+    "_ate_env_slot_wait_ms", default=0.0
+)
 
 
 def _load_w1_schema(filename: str) -> dict[str, Any]:
     """Load a W1 JSON Schema file from the repo or bundled package schemas."""
     here = Path(__file__).resolve()
     repo_candidate = (
-        here.parents[4] / "internal" / "benchmarking" / "rlbench" / "schema" / "v1" / filename
+        here.parents[5] / "internal" / "benchmarking" / "rlbench" / "schema" / "v1" / filename
     )
-    bundled_candidate = here.parent / "schemas" / "v1" / filename
+    bundled_candidate = here.parents[1] / "schemas" / "v1" / filename
     for candidate in (repo_candidate, bundled_candidate):
         if candidate.is_file():
             with candidate.open("r", encoding="utf-8") as fh:
@@ -106,6 +113,12 @@ TRACE_EVENT_ALLOWED_KEYS: frozenset[str] = frozenset(
     TRACE_EVENT_SCHEMA.get("properties", {}).keys()
 )
 EVENT_ALLOWED_KEYS: frozenset[str] = frozenset(EVENT_SCHEMA.get("properties", {}).keys())
+CANONICAL_TRACE_OPS: frozenset[str] = frozenset(
+    TRACE_EVENT_SCHEMA["properties"]["op"]["enum"]
+)
+CANONICAL_EVENT_SOURCES: frozenset[str] = frozenset(
+    EVENT_SCHEMA["properties"]["source"]["enum"]
+)
 
 _DEFAULT_BUCKETS_MS: tuple[float, ...] = (
     1.0,
@@ -241,13 +254,13 @@ def _validate_against_schema(
             raise ValueError(
                 f"{label} {key} must be >= {prop_spec['minimum']}, got {val!r}"
             )
-        if prop_spec.get("format") == "date-time":
+        if key == "ts" or prop_spec.get("format") == "date-time":
             _validate_rfc3339(val, label)
 
 
 def validate_trace_event_dict(payload: Mapping[str, Any]) -> None:
     """Validate a dict against the W1 TraceEvent JSON schema (Guardrail 1)."""
-    if payload.get("schema_version") != SCHEMA_VERSION:
+    if "schema_version" in payload and payload.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(
             f"trace event schema_version must be {SCHEMA_VERSION!r}, "
             f"got {payload.get('schema_version')!r}"
@@ -303,10 +316,12 @@ class TraceEventRecord:
     dur_ms: float
     ok: bool = True
     ts: str = ""
+    run: str = ""
     job: str = ""
     env: str = ""
+    instance: str = ""
+    image: str = ""
     step: int = 0
-    source: str = ""
     command: Sequence[str] = ()
     path: str = ""
     bytes_count: int = 0
@@ -328,12 +343,16 @@ class TraceEventRecord:
             "dur_ms": round(float(self.dur_ms), 4),
             "ok": bool(self.ok),
         }
+        if self.run:
+            out["run"] = self.run
         if self.job:
             out["job"] = self.job
+        if self.instance:
+            out["instance"] = self.instance
+        if self.image:
+            out["image"] = self.image
         if self.step > 0:
             out["step"] = int(self.step)
-        if self.source:
-            out["source"] = self.source
         if self.command:
             out["command"] = list(self.command)
         if self.path:
@@ -365,8 +384,7 @@ class _HistogramState:
             self.counts = [0] * len(self.buckets)
 
     def observe(self, value_ms: float) -> None:
-        """Record one latency observation in milliseconds in O(1) memory."""
-        idx_zero = self.total_count
+        """Record one latency observation in milliseconds using Algorithm R reservoir sampling."""
         self.total_count += 1
         self.total_sum += value_ms
         self.min_val = min(self.min_val, value_ms)
@@ -374,7 +392,9 @@ class _HistogramState:
         if len(self.reservoir) < _MAX_RESERVOIR_SAMPLES:
             self.reservoir.append(value_ms)
         else:
-            self.reservoir[idx_zero % _MAX_RESERVOIR_SAMPLES] = value_ms
+            replace_idx = random.randint(0, self.total_count - 1)
+            if replace_idx < _MAX_RESERVOIR_SAMPLES:
+                self.reservoir[replace_idx] = value_ms
         for idx, bound in enumerate(self.buckets):
             if value_ms <= bound:
                 self.counts[idx] += 1
@@ -596,10 +616,16 @@ class BenchTelemetry:
         retried: int = 0,
         timed_out: bool = False,
         ts: str = "",
+        emit_trace: bool = True,
     ) -> None:
         """Record a completed SDK operation.
 
         ``ts`` is captured at operation completion (UTC RFC3339 with ``Z``).
+        In ``trace`` mode, only canonical W1 ``TraceEvent`` ops
+        (``CANONICAL_TRACE_OPS``) with ``emit_trace=True`` are written to
+        ``trace.jsonl``; higher-level fleet/sub-phase aggregates (``acquire``,
+        ``ttfi``, ``prewarm``, ``retire``, ``reap``, ``task_exec``) are routed
+        to step-boundary ``Event`` records and Prometheus histograms.
         """
         if self.mode == "off":
             return
@@ -657,17 +683,18 @@ class BenchTelemetry:
                 timed_out=timed_out,
             )
 
-            # Guardrail 4: Per-call JSONL file logging is strictly restricted to trace mode.
-            if self.mode == "trace":
+            # Guardrail 4: Per-call JSONL file logging is strictly restricted to trace mode
+            # and canonical W1 TraceEvent operations.
+            if self.mode == "trace" and emit_trace and op in CANONICAL_TRACE_OPS:
                 record = TraceEventRecord(
                     op=op,
                     dur_ms=dur_ms,
                     ok=ok,
                     ts=completion_ts,
+                    run=self.run_id,
                     job=self.job,
-                    env=env_id or "default",
+                    env=env_id,
                     step=effective_step,
-                    source=source if source and source != "direct" else "",
                     command=command,
                     path=path,
                     bytes_count=bytes_count,
@@ -721,10 +748,15 @@ class BenchTelemetry:
         err_msg = ""
         try:
             yield ctx_meta
+        except asyncio.CancelledError as exc:
+            ok = False
+            ctx_meta["timed_out"] = False
+            err_msg = _format_error(exc, self.mode) or "CancelledError"
+            raise
         except BaseException as exc:
             ok = False
             err_msg = _format_error(exc, self.mode)
-            if isinstance(exc, (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError)) or (
+            if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or (
                 type(exc).__name__ in ("CommandTimeoutError", "SandboxStartError")
                 and "timed out" in str(exc).lower()
             ):
@@ -894,7 +926,13 @@ class BenchTelemetry:
         *,
         path: str | Path | None = None,
     ) -> list[dict[str, Any]]:
-        """Flush bounded per-step operation aggregates as W1 Event JSONL lines."""
+        """Flush bounded per-step operation aggregates as W1 Event JSONL lines.
+
+        Each emitted ``Event`` aggregates ``count`` operations for a given
+        ``(op, name, source, step)`` key: ``dur_ms`` is the total duration
+        across those ``count`` operations, while ``metrics["dur_ms_mean"]``
+        and ``metrics["dur_ms_max"]`` report the per-operation mean and max.
+        """
         with self._lock:
             effective_step = self.current_step if step is None else step
             drained = list(self._step_aggregates.values())
@@ -910,11 +948,15 @@ class BenchTelemetry:
 
         for agg in drained:
             ev_kind = _OP_TO_EVENT_KIND.get(agg.op, "step")
+            dur_sum = round(float(agg.dur_ms_sum), 4)
+            dur_mean = round(float(agg.dur_ms_sum) / max(1, agg.count), 4)
             ev: dict[str, Any] = {
+                "schema_version": SCHEMA_VERSION,
                 "ts": agg.last_ts or fallback_iso,
                 "run": self.run_id,
+                "worker": self.worker_id,
                 "event": ev_kind,
-                "dur_ms": round(float(agg.dur_ms_sum), 4),
+                "dur_ms": dur_sum,
                 "ok": agg.err_count == 0,
                 "count": agg.count,
             }
@@ -942,13 +984,16 @@ class BenchTelemetry:
             if agg.timeouts_count > 0:
                 ev["timeout"] = True
 
-            tags: dict[str, str] = {"worker": self.worker_id}
-            if agg.source and agg.source != "direct":
-                ev["source"] = agg.source
+            tags: dict[str, str] = {"worker": self.worker_id, "op": agg.op}
+            if agg.source:
                 tags["source"] = agg.source
+            if agg.source in CANONICAL_EVENT_SOURCES:
+                ev["source"] = agg.source
             ev["tags"] = tags
 
             metrics: dict[str, float] = {
+                "dur_ms_sum": dur_sum,
+                "dur_ms_mean": dur_mean,
                 "dur_ms_max": round(float(agg.dur_ms_max), 4),
                 "ok_count": float(agg.ok_count),
                 "err_count": float(agg.err_count),
@@ -997,7 +1042,7 @@ class BenchTelemetry:
         return emitted
 
     def summary_stats(self) -> dict[str, dict[str, float]]:
-        """Return p50, p95, max, and count per operation using bounded reservoirs."""
+        """Return p50, p95, max, count, errors, retries, and timeouts per operation."""
         out: dict[str, dict[str, float]] = {}
         by_op_samples: dict[str, list[float]] = {}
         by_op_count: dict[str, int] = {}
@@ -1008,6 +1053,7 @@ class BenchTelemetry:
                 by_op_count[op] = by_op_count.get(op, 0) + hist.total_count
                 if hist.total_count > 0:
                     by_op_max[op] = max(by_op_max.get(op, 0.0), hist.max_val)
+            counters_snapshot = dict(self._counters)
         for op, samples in by_op_samples.items():
             ordered = sorted(samples)
             out[op] = {
@@ -1015,6 +1061,9 @@ class BenchTelemetry:
                 "p50_ms": _percentile(ordered, 0.50),
                 "p95_ms": _percentile(ordered, 0.95),
                 "max_ms": float(by_op_max.get(op, _percentile(ordered, 1.00))),
+                "errors": float(counters_snapshot.get((op, "error"), 0)),
+                "retries": float(counters_snapshot.get((op, "retry"), 0)),
+                "timeouts": float(counters_snapshot.get((op, "timeout"), 0)),
             }
         return out
 
@@ -1163,7 +1212,7 @@ def instrument_client(client: Any, telemetry: BenchTelemetry) -> Any:
             env_id = _extract_env_id(args, kwargs)
             token = _IN_TRACKED_LIFECYCLE.set(True)
             try:
-                async with telemetry.track("get", env_id=env_id, source="warm_pool"):
+                async with telemetry.track("get", env_id=env_id, source="direct"):
                     return await orig_get(*args, **kwargs)
             finally:
                 _IN_TRACKED_LIFECYCLE.reset(token)

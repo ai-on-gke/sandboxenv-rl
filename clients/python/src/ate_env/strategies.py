@@ -11,16 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# pylint: disable=missing-module-docstring,broad-exception-caught,too-many-locals,line-too-long
 
 from __future__ import annotations
 
 import collections
+import contextvars
 import logging
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from .handle import SandboxHandle
+from .telemetry import _CURRENT_SLOT_WAIT_MS
 from .types import Task
 
 logger = logging.getLogger("ate_env.strategies")
@@ -31,8 +35,17 @@ def process_parallel(fleet: Any, tasks: list[Task], process_fn: Callable[[Task, 
     """Execute acquire -> process_fn -> release across tasks up to concurrency."""
     results: list[Any] = [None] * len(tasks)
 
-    def _execute_single(task: Task) -> Any:
-        handle = fleet.acquire(task)
+    def _execute_single(task: Task, t_submit: float | None = None) -> Any:
+        wait_ms = (
+            max(0.0, (time.perf_counter() - t_submit) * 1000.0)
+            if t_submit is not None
+            else 0.0
+        )
+        tok = _CURRENT_SLOT_WAIT_MS.set(wait_ms)
+        try:
+            handle = fleet.acquire(task)
+        finally:
+            _CURRENT_SLOT_WAIT_MS.reset(tok)
         try:
             return process_fn(task, handle)
         finally:
@@ -48,7 +61,17 @@ def process_parallel(fleet: Any, tasks: list[Task], process_fn: Callable[[Task, 
         return results
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = {executor.submit(_execute_single, t): i for i, t in enumerate(tasks)}
+        # Each worker runs in a copy of the caller's context, so spans started
+        # per task nest under the caller's current span.
+        futures = {
+            executor.submit(
+                contextvars.copy_context().run,
+                _execute_single,
+                t,
+                time.perf_counter(),
+            ): i
+            for i, t in enumerate(tasks)
+        }
         for fut in as_completed(futures):
             i = futures[fut]
             try:
@@ -120,7 +143,7 @@ def run_pipelined(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
                   concurrency: int, teardown: bool = True) -> list[Any]:
     """
     Double-buffered pipelined sliding window.
-    
+
     While window N tasks run, prefetch window N+1 in the background to overlap
     image pull or snapshot restore with GPU rollout time.
     """
@@ -144,7 +167,9 @@ def run_pipelined(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
         for n, batch in enumerate(batches):
             # Asynchronously prefetch window N+1
             nxt_future = (
-                prefetch_executor.submit(fleet.warm_images, batches[n + 1], wait=True)
+                prefetch_executor.submit(
+                    contextvars.copy_context().run, fleet.warm_images, batches[n + 1], wait=True
+                )
                 if n + 1 < len(batches) else None
             )
 

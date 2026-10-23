@@ -36,7 +36,7 @@ Quickstart:
 # Layer 2: High-Level Fleet Management & Abstractions
 from .async_fleet import AsyncSandboxFleet
 from .client import DEFAULT_ATESPACE, Client
-from .config import FleetConfig
+from .config import FleetConfig, TracerConfig
 from .env import Env, Process
 
 # Exceptions
@@ -98,6 +98,7 @@ __all__ = [
     "Process",
     # High-level Fleet API
     "FleetConfig",
+    "TracerConfig",
     "SandboxFleet",
     "AsyncSandboxFleet",
     "SandboxHandle",

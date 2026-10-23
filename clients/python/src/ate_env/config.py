@@ -11,14 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# pylint: disable=missing-module-docstring,missing-function-docstring
-# pylint: disable=too-many-instance-attributes,line-too-long
+# pylint: disable=missing-module-docstring,missing-function-docstring,too-many-instance-attributes,line-too-long
 
 from __future__ import annotations
 
 import re
-from dataclasses import MISSING, dataclass, field, fields
+from dataclasses import MISSING, asdict, dataclass, field, fields
 from typing import Any, Literal
 
 BackendType = Literal["substrate", "mock"]
@@ -62,6 +60,64 @@ class SecretStr:
         return hash(self._secret_value)
 
 
+def _init_fields(obj: Any, kwargs: dict[str, Any]) -> None:
+    """Set dataclass fields from kwargs, rejecting unknown names."""
+    valid_fields = {f.name: f for f in fields(obj)}
+    unknown = set(kwargs.keys()) - set(valid_fields.keys())
+    if unknown:
+        raise ValidationError(f"Unknown fields for {type(obj).__name__}: {sorted(unknown)}")
+    for name, f in valid_fields.items():
+        if name in kwargs:
+            val = kwargs[name]
+        elif f.default is not MISSING:
+            val = f.default
+        elif f.default_factory is not MISSING:
+            val = f.default_factory()
+        else:
+            val = None
+        object.__setattr__(obj, name, val)
+
+
+@dataclass(frozen=True)
+class TracerConfig:
+    """OpenTelemetry tracing for the ate_env client (needs the ``tracing`` extra).
+
+    trace_service_name is the OTel resource ``service.name`` of the process's
+    TracerProvider; client spans are always named ``ate_env_client.<op>``.
+    Unknown fields are rejected.
+    """
+
+    enable_tracing: bool = False
+    trace_service_name: str = "ate-env-client"
+
+    def __init__(self, **kwargs: Any):
+        _init_fields(self, kwargs)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enable_tracing, bool):
+            raise ValidationError(f"enable_tracing must be a bool, got {self.enable_tracing!r}")
+        if not isinstance(self.trace_service_name, str) or not self.trace_service_name:
+            raise ValidationError(
+                f"trace_service_name must be a non-empty str, got {self.trace_service_name!r}"
+            )
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TracerConfig:
+        return cls(**data)
+
+
+def _nested(cls: Any, name: str, value: Any) -> Any:
+    """Accept a config dataclass or a plain dict for a nested FleetConfig field."""
+    if value is None:
+        return cls()
+    if isinstance(value, cls):
+        return value
+    if isinstance(value, dict):
+        return cls(**value)
+    raise ValidationError(f"{name} must be a {cls.__name__} or a dict, got {type(value).__name__}")
+
+
 @dataclass(frozen=True)
 class FleetConfig:
     """Configuration for SandboxFleet and associated BackendDriver.
@@ -95,23 +151,13 @@ class FleetConfig:
     ready_timeout_s: float = 180.0
     step_timeout_s: float = 120.0
     auth_token: SecretStr | None = None
+
+    # Telemetry (OpenTelemetry tracing + W11 Benchmark Telemetry)
+    tracing: TracerConfig = field(default_factory=TracerConfig)
     telemetry: Any | None = None
 
     def __init__(self, **kwargs: Any):
-        valid_fields = {f.name: f for f in fields(self)}
-        unknown = set(kwargs.keys()) - set(valid_fields.keys())
-        if unknown:
-            raise ValidationError(f"Unknown fields for FleetConfig: {sorted(unknown)}")
-        for name, f in valid_fields.items():
-            if name in kwargs:
-                val = kwargs[name]
-            elif f.default is not MISSING:
-                val = f.default
-            elif f.default_factory is not MISSING:
-                val = f.default_factory()
-            else:
-                val = None
-            object.__setattr__(self, name, val)
+        _init_fields(self, kwargs)
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -160,11 +206,18 @@ class FleetConfig:
         if self.auth_token is not None and not isinstance(self.auth_token, SecretStr):
             object.__setattr__(self, "auth_token", SecretStr(str(self.auth_token)))
 
+        object.__setattr__(self, "tracing", _nested(TracerConfig, "tracing", self.tracing))
+
     def to_dict(self) -> dict[str, Any]:
-        """Serialize configuration to dict, keeping auth_token as SecretStr for safe round-tripping."""
+        """Serialize configuration to dict, keeping auth_token as SecretStr for safe round-tripping.
+
+        Nested configs (``tracing``) become plain dicts, which from_dict accepts.
+        """
         res: dict[str, Any] = {}
         for f in fields(self):
             val = getattr(self, f.name)
+            if isinstance(val, TracerConfig):
+                val = asdict(val)
             res[f.name] = val
         return res
 

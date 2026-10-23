@@ -251,13 +251,16 @@ func TestEnvBackendSpreadsConnections(t *testing.T) {
 			t.Fatalf("connection %d picked %d times, want 3: %v", j, seen[j], seen)
 		}
 	}
-	one, err := NewEnvBackend("127.0.0.1:1", "ate-env", "default-template", 0, "")
+	one, err := NewEnvBackend("127.0.0.1:1", "ate-env", "default-template", 0, "", WithPollBounds(3*time.Millisecond, 15*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer one.Close()
 	if len(one.clients) != 1 {
 		t.Fatalf("connections 0 must mean 1, got %d", len(one.clients))
+	}
+	if one.minPoll != 3*time.Millisecond || one.maxPoll != 15*time.Millisecond {
+		t.Fatalf("WithPollBounds: got (%v, %v), want (3ms, 15ms)", one.minPoll, one.maxPoll)
 	}
 }
 

@@ -17,6 +17,7 @@ package swebench
 import (
 	"bytes"
 	"errors"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -142,6 +143,87 @@ func TestRecorderKeepsFirstWriteError(t *testing.T) {
 	}
 	if NewRecorder(nil).Err() != nil {
 		t.Fatal("a discarding recorder has no error")
+	}
+}
+
+type spyWriter struct {
+	buf    bytes.Buffer
+	writes int
+}
+
+func (s *spyWriter) Write(p []byte) (int, error) {
+	s.writes++
+	return s.buf.Write(p)
+}
+
+func TestRecorderBufferedFlushAndClose(t *testing.T) {
+	spy := &spyWriter{}
+	rec := NewRecorder(spy)
+	// Normal fine-grained events stay in the 64 KiB buffer until a boundary event or Flush/Close.
+	rec.Record(Event{RunID: "r", Event: EventCreate, Env: "e1", DurMS: 10, OK: true})
+	rec.Record(Event{RunID: "r", Event: EventStep, Name: "explore", Env: "e1", DurMS: 20, OK: true})
+	if spy.writes != 0 {
+		t.Fatalf("writes before boundary/flush = %d, want 0", spy.writes)
+	}
+	// Coarse boundary events (step_barrier, park, run) auto-flush immediately.
+	rec.Record(Event{RunID: "r", Event: EventBarrier, Step: 1, DurMS: 30, OK: true, Count: 1})
+	if spy.writes != 1 {
+		t.Fatalf("writes after EventBarrier = %d, want 1", spy.writes)
+	}
+	rec.Record(Event{RunID: "r", Event: EventPark, Name: "suspend", Step: 1, DurMS: 15, OK: true, Count: 1})
+	if spy.writes != 2 {
+		t.Fatalf("writes after EventPark = %d, want 2", spy.writes)
+	}
+	rec.Record(Event{RunID: "r", Event: EventDelete, Env: "e1", DurMS: 5, OK: true})
+	if spy.writes != 2 {
+		t.Fatalf("writes after EventDelete = %d, want 2 (still buffered)", spy.writes)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+	if spy.writes != 3 {
+		t.Fatalf("writes after Close() = %d, want 3", spy.writes)
+	}
+	evs, err := ReadEvents(&spy.buf)
+	if err != nil || len(evs) != 5 {
+		t.Fatalf("ReadEvents = %d, %v; want 5 events", len(evs), err)
+	}
+}
+
+func TestBuildAndSummarizeParity(t *testing.T) {
+	var buf bytes.Buffer
+	rec := NewRecorder(&buf)
+	input := []Event{
+		{RunID: "parity", Event: EventCreate, Env: "e1", Instance: "repo__a-1", DurMS: 110, OK: true},
+		{RunID: "parity", Event: EventCreate, Env: "e2", Instance: "repo__a-2", DurMS: 210, OK: false, Err: "create boom"},
+		{RunID: "parity", Event: EventTTFI, Env: "e1", Instance: "repo__a-1", Step: 1, DurMS: 950, OK: true, Attempts: 2},
+		{RunID: "parity", Event: EventStep, Name: "grade", Env: "e1", Instance: "repo__a-1", Step: 1, DurMS: 45, OK: true, Reward: intp(0), Detail: "f2p 0/1 p2p 3/3"},
+		{RunID: "parity", Event: EventStep, Name: "grade", Env: "e2", Instance: "repo__a-2", Step: 1, DurMS: 55, OK: true, Reward: intp(0), Tail: `{"valid": true, "resolved": false, "f2p": "0/2", "p2p": "1/1"}`},
+		{RunID: "parity", Event: EventTask, Env: "e1", Instance: "repo__a-1", Step: 1, DurMS: 1000, OK: true, Reward: intp(0)},
+		{RunID: "parity", Event: EventTask, Env: "e2", Instance: "repo__a-2", Step: 1, DurMS: 1200, OK: false},
+		{RunID: "parity", Event: EventBarrier, Step: 1, DurMS: 1250, OK: true, Count: 2},
+		{RunID: "parity", Event: EventPark, Name: "suspend", Step: 1, DurMS: 80, OK: true, Count: 1},
+		{RunID: "parity", Event: EventWake, Env: "e1", Instance: "repo__a-1", Step: 2, DurMS: 35, OK: true, Attempts: 1},
+		{RunID: "parity", Event: EventTask, Env: "e1", Instance: "repo__a-1", Step: 2, DurMS: 800, OK: true, Reward: intp(1)},
+		{RunID: "parity", Event: EventRun, Name: "steps", DurMS: 2500, OK: false, Count: 3},
+	}
+	for _, e := range input {
+		rec.Record(e)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	evs, err := ReadEvents(strings.NewReader(buf.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromBuild := Build(evs)
+	fromStream, err := Summarize(strings.NewReader(buf.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(fromBuild, fromStream) {
+		t.Fatalf("Build vs Summarize mismatch:\nBuild:     %+v\nSummarize: %+v", fromBuild, fromStream)
 	}
 }
 

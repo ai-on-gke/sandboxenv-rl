@@ -288,13 +288,11 @@ func (t *Trajectory) HasReward() bool {
 // the concrete copy to replay. The original is not modified.
 func (t *Trajectory) Render(in Instance) (*Trajectory, error) {
 	var data any = in
-	if in.Kind != "" && in.Kind != DefaultKind {
-		if a := AdapterFor(in.Kind); a != nil {
-			var err error
-			data, err = a.TemplateData(in)
-			if err != nil {
-				return nil, fmt.Errorf("trajectory %s instance %s: %w", t.Name, in.InstanceID, err)
-			}
+	if a := AdapterFor(in.Kind); a != nil {
+		var err error
+		data, err = a.TemplateData(in)
+		if err != nil {
+			return nil, fmt.Errorf("trajectory %s instance %s: %w", t.Name, in.InstanceID, err)
 		}
 	}
 	out := &Trajectory{Name: t.Name}

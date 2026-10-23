@@ -296,8 +296,10 @@ func Build(events []Event) *Report {
 // output: "invalid run", "f2p A/B p2p C/D", or "reward 0" when the output
 // does not end in the grader's JSON line.
 func verdict(tail string) string {
-	if _, detail, err := (SWEBenchGrader{}).Parse([]byte(tail)); err == nil && detail != "" {
-		return detail
+	if a := AdapterFor(DefaultKind); a != nil && a.Grader() != nil {
+		if _, detail, err := a.Grader().Parse([]byte(tail)); err == nil && detail != "" {
+			return detail
+		}
 	}
 	return "reward 0"
 }

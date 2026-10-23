@@ -716,3 +716,40 @@ func TestGraderRewardOverridesZeroExitCode(t *testing.T) {
 		t.Fatalf("report = %+v, want RewardRate=0 and unresolved reason custom-zero-verdict", rep)
 	}
 }
+
+type nilGraderAdapter struct{}
+
+func (nilGraderAdapter) Kind() string                          { return "nil-grader-test" }
+func (nilGraderAdapter) Validate(Instance) error               { return nil }
+func (nilGraderAdapter) RequireGrading(Instance) error         { return nil }
+func (nilGraderAdapter) TemplateData(in Instance) (any, error) { return in, nil }
+func (nilGraderAdapter) Grades(*Trajectory) bool               { return false }
+func (nilGraderAdapter) Grader() Grader                        { return nil }
+
+func TestGraderNilFallbackUsesExitCode(t *testing.T) {
+	RegisterAdapter(nilGraderAdapter{})
+	t.Cleanup(func() { unregisterAdapter("nil-grader-test") })
+
+	for _, tc := range []struct {
+		cmd        string
+		wantReward int
+	}{
+		{cmd: "true", wantReward: 1},
+		{cmd: "exit 1", wantReward: 0},
+	} {
+		f := newFake()
+		var out bytes.Buffer
+		cfg := baseConfig(t, f, &out)
+		cfg.Mode = ModeEval
+		cfg.TasksPerImage = 1
+		cfg.Instances = []Instance{{InstanceID: "repo__repo-a", Image: "reg/img@" + goodDigest, Kind: "nil-grader-test"}}
+		cfg.Trajectory = testTrajectory(t, tc.cmd)
+		sum, err := Run(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.cmd, err)
+		}
+		if sum.Rewarded != tc.wantReward {
+			t.Fatalf("%s: Rewarded = %d, want %d", tc.cmd, sum.Rewarded, tc.wantReward)
+		}
+	}
+}

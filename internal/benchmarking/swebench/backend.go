@@ -68,14 +68,6 @@ func WithPollBounds(minPoll, maxPoll time.Duration) EnvBackendOption {
 	}
 }
 
-// WithAuthToken sets the bearer token sent on each ate-env API call, for an
-// ate-env-api that runs with -auth-token-file.
-func WithAuthToken(token string) EnvBackendOption {
-	return func(b *EnvBackend) {
-		b.authToken = token
-	}
-}
-
 // EnvBackend is the Backend over the ate-env API through the Go SDK.
 //
 // It holds several connections and hands them out round-robin per

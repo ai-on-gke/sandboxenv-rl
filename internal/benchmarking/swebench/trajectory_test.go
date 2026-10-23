@@ -215,3 +215,61 @@ func TestGrades(t *testing.T) {
 		t.Fatal("a trajectory that uses only the patch does not grade")
 	}
 }
+
+type customTemplateAdapter struct {
+	kind string
+	err  error
+}
+
+func (a customTemplateAdapter) Kind() string                  { return a.kind }
+func (a customTemplateAdapter) Validate(Instance) error       { return nil }
+func (a customTemplateAdapter) RequireGrading(Instance) error { return nil }
+func (a customTemplateAdapter) TemplateData(in Instance) (any, error) {
+	if a.err != nil {
+		return nil, a.err
+	}
+	var m map[string]any
+	if err := json.Unmarshal(in.Material, &m); err != nil {
+		return nil, err
+	}
+	m["InstanceID"] = in.InstanceID
+	return m, nil
+}
+func (a customTemplateAdapter) Grades(*Trajectory) bool { return false }
+func (a customTemplateAdapter) Grader() Grader          { return nil }
+
+func TestRenderCustomAdapterTemplateData(t *testing.T) {
+	RegisterAdapter(customTemplateAdapter{kind: "custom-tmpl"})
+	t.Cleanup(func() { unregisterAdapter("custom-tmpl") })
+
+	tr, err := ParseTrajectory([]byte(`
+name: custom
+steps:
+  - name: w
+    write: {path: /tmp/custom.txt, content: "{{.InstanceID}}:{{.Prompt}}"}
+  - name: r
+    run: "echo {{.Prompt}}"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := Instance{
+		InstanceID: "task-1",
+		Image:      "reg/img@" + goodDigest,
+		Kind:       "custom-tmpl",
+		Material:   json.RawMessage(`{"Prompt":"solve-me"}`),
+	}
+	rendered, err := tr.Render(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rendered.Steps[0].Write.Content != "task-1:solve-me" || rendered.Steps[1].Run != "echo solve-me" {
+		t.Fatalf("rendered custom template data = %+v", rendered.Steps)
+	}
+
+	RegisterAdapter(customTemplateAdapter{kind: "custom-tmpl-err", err: os.ErrInvalid})
+	t.Cleanup(func() { unregisterAdapter("custom-tmpl-err") })
+	if _, err := tr.Render(Instance{InstanceID: "task-2", Kind: "custom-tmpl-err"}); err == nil {
+		t.Fatal("TemplateData error must fail Render")
+	}
+}

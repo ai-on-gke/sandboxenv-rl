@@ -185,30 +185,31 @@ func (SWEBenchAdapter) Grader() Grader { return SWEBenchGrader{} }
 // produced by benchmarking/swebench/make-dataset.py, one JSON object per line.
 type Instance struct {
 	InstanceID string `json:"instance_id"`
-	Repo       string `json:"repo,omitempty"`
+	Repo       string `json:"repo"`
 	// Image is the task image, pinned by digest (repo@sha256:...). Substrate
 	// requires pinned images because changing the image invalidates snapshots.
 	Image string `json:"image"`
-	// Kind identifies the dataset adapter (defaults to DefaultKind when empty).
+	// Kind identifies the dataset adapter; when omitted in JSON it stays ""
+	// and AdapterFor("") resolves to DefaultKind.
 	Kind string `json:"kind,omitempty"`
 	// Material holds optional raw dataset-specific JSON for non-default
 	// dataset kinds.
 	Material json.RawMessage `json:"material,omitempty"`
 	// Patch is the gold patch; applying it makes FailToPass pass.
-	Patch string `json:"patch,omitempty"`
+	Patch string `json:"patch"`
 	// TestPatch adds or changes the tests that check the fix.
-	TestPatch string `json:"test_patch,omitempty"`
+	TestPatch string `json:"test_patch"`
 	// EvalScript is the SWE-bench harness eval script for this instance: it
 	// applies TestPatch, runs the repo's test command and restores the test
 	// files. Exit code 0 means every selected test passed.
-	EvalScript string   `json:"eval_script,omitempty"`
-	FailToPass []string `json:"fail_to_pass,omitempty"`
-	PassToPass []string `json:"pass_to_pass,omitempty"`
+	EvalScript string   `json:"eval_script"`
+	FailToPass []string `json:"fail_to_pass"`
+	PassToPass []string `json:"pass_to_pass"`
 	// LogParser names the SWE-bench harness parser for this repo's test
 	// output (parse_log_pytest, parse_log_django, ...); EvalType is
 	// pass_and_fail or fail_only. Both come from the dataset row.
-	LogParser string `json:"log_parser,omitempty"`
-	EvalType  string `json:"eval_type,omitempty"`
+	LogParser string `json:"log_parser"`
+	EvalType  string `json:"eval_type"`
 }
 
 // UnmarshalJSON decodes a manifest row, preserving raw JSON in Material when a
@@ -238,10 +239,11 @@ func (in Instance) Validate() error {
 	case !digestPinned.MatchString(in.Image):
 		return fmt.Errorf("%s: image %q is not digest-pinned", in.InstanceID, in.Image)
 	}
-	if a := AdapterFor(in.Kind); a != nil {
-		return a.Validate(in)
+	a := AdapterFor(in.Kind)
+	if a == nil {
+		return fmt.Errorf("%s: no dataset adapter registered for kind %q", in.InstanceID, in.Kind)
 	}
-	return nil
+	return a.Validate(in)
 }
 
 // RequireGrading checks that every instance carries what a grading

@@ -15,6 +15,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,6 +39,14 @@ import (
 
 // apiName is the name of the API service Deployment and Service.
 const apiName = "ate-env-api"
+
+// defaultAuthTokenSecret is the Secret, key token, that holds the bearer
+// token ate-env-api requires from its callers unless --insecure-no-auth is
+// given. "ate-env manifest auth-secret" prints one.
+const defaultAuthTokenSecret = "ate-env-api-token"
+
+// authTokenBytes is the size of a generated caller token before hex encoding.
+const authTokenBytes = 32
 
 // workerPoolLabel labels the WorkerPool with its own name, and templates
 // select their pool by it. Substrate copies a pool's labels to its workers and
@@ -94,6 +104,24 @@ type manifestConfig struct {
 	apiReplicas     int32
 	apiPort         int32
 	authTokenSecret string
+	insecureNoAuth  bool
+}
+
+// resolveAuth applies --insecure-no-auth: it clears the Secret, and refuses an
+// explicit --auth-token-secret next to it. An empty --auth-token-secret is
+// refused too, so turning the token off is always the explicit flag.
+func (c *manifestConfig) resolveAuth(secretChanged bool) error {
+	if c.insecureNoAuth {
+		if secretChanged {
+			return errors.New("--auth-token-secret and --insecure-no-auth cannot be used together")
+		}
+		c.authTokenSecret = ""
+		return nil
+	}
+	if c.authTokenSecret == "" {
+		return errors.New("--auth-token-secret is empty; pass --insecure-no-auth to deploy ate-env-api without a caller token")
+	}
+	return nil
 }
 
 func (c *manifestConfig) resolveImages() error {
@@ -271,10 +299,19 @@ a cluster that already runs the Agent Substrate system: the target
 namespace, a WorkerPool of pre-warmed workers, and the ate-env-api service.
 It prints YAML to stdout without touching the cluster; apply it with kubectl.
 
+ate-env-api requires a bearer token from its callers, read from the Secret
+--auth-token-secret names (key token). Create that Secret once, in the
+namespace this manifest creates, with
+"ate-env manifest auth-secret | kubectl create -f -"; ate-env-api starts when
+the Secret exists. --insecure-no-auth deploys without the token.
+
 To generate the Substrate ActorTemplate manifest (for kubectl-ate), use
 the "template" subcommand: ate-env manifest template`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := mCfg.resolveAuth(cmd.Flags().Changed("auth-token-secret")); err != nil {
+				return err
+			}
 			if mCfg.template == "" {
 				mCfg.template = apiservice.DefaultTemplate
 			}
@@ -298,14 +335,75 @@ the "template" subcommand: ate-env manifest template`,
 	cmd.Flags().StringVar(&mCfg.apiImage, "api-image", defaultAPIImage, imageDefaultHelp("digest-pinned ate-env-api image for the API service", defaultAPIImage))
 	cmd.Flags().Int32Var(&mCfg.apiReplicas, "api-replicas", 1, "number of API service replicas")
 	cmd.Flags().Int32Var(&mCfg.apiPort, "api-port", 7777, "port the ate-env-api service listens on")
-	cmd.Flags().StringVar(&mCfg.authTokenSecret, "auth-token-secret", "", "Kubernetes Secret name (with key 'token') to mount into ate-env-api and require as a caller bearer token")
+	cmd.Flags().StringVar(&mCfg.authTokenSecret, "auth-token-secret", defaultAuthTokenSecret, "Kubernetes Secret (key 'token') mounted into ate-env-api; its value is the bearer token ate-env-api requires from callers. Create it with 'ate-env manifest auth-secret'")
+	cmd.Flags().BoolVar(&mCfg.insecureNoAuth, "insecure-no-auth", false, "deploy ate-env-api without a caller token: anyone who can reach its Service can create environments, run commands in them and reach their ports")
 	cmd.Flags().StringVar(&mCfg.workerPool, "workerpool", "", "WorkerPool name (defaults to <template>-workerpool)")
 	cmd.Flags().Int32Var(&mCfg.replicas, "replicas", 5, "number of pre-warmed worker pods")
 
 	cmd.AddCommand(newManifestTemplateCommand())
 	cmd.AddCommand(newManifestAccessPolicyCommand())
+	cmd.AddCommand(newManifestAuthSecretCommand())
 
 	return cmd
+}
+
+func newManifestAuthSecretCommand() *cobra.Command {
+	namespace := apiservice.DefaultNamespace
+	name := defaultAuthTokenSecret
+	cmd := &cobra.Command{
+		Use:   "auth-secret",
+		Short: "Generate the Secret with the bearer token ate-env-api requires from callers",
+		Long: `Auth-secret prints a Kubernetes Secret whose key token holds a new random
+bearer token (32 bytes, hex). ate-env manifest mounts it into ate-env-api, which
+then refuses gRPC, MCP and port-proxy calls without it. Each run prints a new
+token, thus create the Secret once and do not apply it again:
+
+  ate-env manifest auth-secret | kubectl create -f -
+
+Callers read the token back from the Secret:
+
+  export SUBSTRATE_ENV_AUTH_TOKEN="$(kubectl -n ate-env get secret ate-env-api-token -o jsonpath='{.data.token}' | base64 -d)"
+
+The ate-env CLI and swebench-loader read SUBSTRATE_ENV_AUTH_TOKEN (or
+--auth-token-file); the Python client takes Client(auth_token=...) or
+FleetConfig(auth_token=...). To rotate the token, replace the Secret's value;
+ate-env-api reads the new value once the kubelet updates the mounted file.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			token, err := newAuthToken()
+			if err != nil {
+				return err
+			}
+			return writeManifests(cmd.OutOrStdout(), []any{buildAuthSecret(namespace, name, token)})
+		},
+	}
+	cmd.Flags().StringVar(&namespace, "namespace", namespace, "Kubernetes namespace ate-env-api runs in")
+	cmd.Flags().StringVar(&name, "name", name, "Secret name; pass the same value to ate-env manifest --auth-token-secret")
+	return cmd
+}
+
+// newAuthToken returns a random caller token: authTokenBytes from
+// crypto/rand, hex encoded.
+func newAuthToken() (string, error) {
+	b := make([]byte, authTokenBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generating the token: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// buildAuthSecret returns the Secret that holds ate-env-api's caller token.
+func buildAuthSecret(namespace, name, token string) *corev1.Secret {
+	return &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    map[string]string{"app": apiName},
+		},
+		Type:       corev1.SecretTypeOpaque,
+		StringData: map[string]string{"token": token},
+	}
 }
 
 func newManifestAccessPolicyCommand() *cobra.Command {

@@ -236,7 +236,7 @@ func (b *Builder) Finish() *Report {
 }
 
 // resolveUnresolvedReason returns e.Detail when present, falls back to asking
-// registered dataset graders to parse e.Tail (for pre-existing JSONL files),
+// the default dataset grader to parse e.Tail (for pre-existing JSONL files),
 // and otherwise returns "reward 0".
 func resolveUnresolvedReason(e Event) string {
 	if e.Detail != "" {
@@ -246,15 +246,6 @@ func resolveUnresolvedReason(e Event) string {
 		if a := AdapterFor(DefaultKind); a != nil && a.Grader() != nil {
 			if _, detail, err := a.Grader().Parse([]byte(e.Tail)); err == nil && detail != "" {
 				return detail
-			}
-		}
-		adaptersMu.RLock()
-		defer adaptersMu.RUnlock()
-		for _, a := range adapters {
-			if g := a.Grader(); g != nil {
-				if _, detail, err := g.Parse([]byte(e.Tail)); err == nil && detail != "" {
-					return detail
-				}
 			}
 		}
 	}

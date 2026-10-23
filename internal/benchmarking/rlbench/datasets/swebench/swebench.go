@@ -130,17 +130,6 @@ func (Grader) Parse(stdout []byte) (reward *int, detail string, err error) {
 	return reward, fmt.Sprintf("f2p %s p2p %s", g.F2P, g.P2P), nil
 }
 
-// verdict extracts the grader's verdict from the end of a reward step's
-// output: "invalid run", "f2p A/B p2p C/D", or "reward 0" when the output
-// does not end in the grader's JSON line.
-func verdict(tail string) string {
-	_, detail, err := (Grader{}).Parse([]byte(tail))
-	if err != nil || detail == "" {
-		return "reward 0"
-	}
-	return detail
-}
-
 // Adapter plugs SWE-bench into rlbench.
 type Adapter struct{}
 

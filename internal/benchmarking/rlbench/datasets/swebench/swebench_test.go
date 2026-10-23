@@ -143,6 +143,17 @@ func TestJSONTemplateFuncRoundTripsSWEBenchInstance(t *testing.T) {
 	}
 }
 
+// verdict extracts the grader's verdict from the end of a reward step's
+// output: "invalid run", "f2p A/B p2p C/D", or "reward 0" when the output
+// does not end in the grader's JSON line.
+func verdict(tail string) string {
+	_, detail, err := (Grader{}).Parse([]byte(tail))
+	if err != nil || detail == "" {
+		return "reward 0"
+	}
+	return detail
+}
+
 func TestGraderAndSummarizeVerdictFallback(t *testing.T) {
 	if v := verdict(`{"valid": false}`); v != "invalid run" {
 		t.Fatalf("verdict = %q, want invalid run", v)

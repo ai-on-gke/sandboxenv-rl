@@ -112,6 +112,9 @@ func (s *fakeSandbox) Run(ctx context.Context, command string, timeout time.Dura
 	if strings.HasPrefix(command, "exit ") {
 		return Result{ExitCode: int(command[5] - '0'), Stderr: "failed"}, nil
 	}
+	if strings.HasPrefix(command, "echo ") {
+		return Result{Stdout: strings.TrimPrefix(command, "echo ")}, nil
+	}
 	return Result{Stdout: "ok"}, nil
 }
 
@@ -659,7 +662,10 @@ func TestValidateChecksTheLongestName(t *testing.T) {
 
 type zeroRewardGrader struct{}
 
-func (zeroRewardGrader) Parse([]byte) (*int, string, error) {
+func (zeroRewardGrader) Parse(stdout []byte) (*int, string, error) {
+	if !strings.Contains(string(stdout), "RESOLVED=0") {
+		return nil, "", errors.New("no zero-reward marker")
+	}
 	r := 0
 	return &r, "custom-zero-verdict", nil
 }
@@ -674,13 +680,23 @@ func (zeroRewardAdapter) TemplateData(in Instance) (any, error) {
 	_ = json.Unmarshal(in.Material, &m)
 	return map[string]any{"InstanceID": in.InstanceID, "Patch": m["patch"], "EvalScript": m["eval_script"]}, nil
 }
-func (zeroRewardAdapter) Grades(*Trajectory) bool   { return true }
+func (zeroRewardAdapter) Grades(t *Trajectory) bool {
+	for _, steps := range [][]Step{t.Setup, t.Reset, t.Steps} {
+		for _, s := range steps {
+			if strings.Contains(s.Run, "RESOLVED=0") {
+				return true
+			}
+		}
+	}
+	return false
+}
 func (zeroRewardAdapter) Grader() Grader            { return zeroRewardGrader{} }
 func (zeroRewardAdapter) Trajectories() fs.FS       { return nil }
 func (zeroRewardAdapter) DefaultTrajectory() string { return "" }
 
 func TestGraderRewardOverridesZeroExitCode(t *testing.T) {
 	RegisterAdapter(zeroRewardAdapter{})
+	t.Cleanup(func() { unregisterAdapter("zero-reward-test") })
 	f := newFake()
 	var out bytes.Buffer
 	cfg := baseConfig(t, f, &out)
@@ -689,8 +705,8 @@ func TestGraderRewardOverridesZeroExitCode(t *testing.T) {
 	inst := makeInstance("repo__repo-a", "PATCH", "EVAL")
 	inst.Kind = "zero-reward-test"
 	cfg.Instances = []Instance{inst}
-	// Reward step runs "true" (exit code 0), but the adapter's Grader returns reward=0.
-	cfg.Trajectory = testTrajectory(t, "true")
+	// Reward step runs "echo RESOLVED=0" (exit code 0), and the adapter's Grader returns reward=0.
+	cfg.Trajectory = testTrajectory(t, "echo RESOLVED=0")
 
 	sum, err := Run(context.Background(), cfg)
 	if err != nil {

@@ -82,6 +82,12 @@ func RegisterAdapter(a Adapter) {
 	adapters[a.Kind()] = a
 }
 
+func unregisterAdapter(kind string) {
+	adaptersMu.Lock()
+	defer adaptersMu.Unlock()
+	delete(adapters, kind)
+}
+
 // AdapterFor returns the registered adapter for kind (defaulting an empty kind
 // to DefaultKind), or nil if none is registered.
 func AdapterFor(kind string) Adapter {

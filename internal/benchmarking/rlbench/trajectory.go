@@ -348,9 +348,28 @@ func templateData(in Instance) (any, error) {
 		m["Image"] = in.Image
 		m["instance_id"] = in.InstanceID
 		m["image"] = in.Image
+		for k, v := range m {
+			if pascal := snakeToPascal(k); pascal != "" && pascal != k {
+				if _, exists := m[pascal]; !exists {
+					m[pascal] = v
+				}
+			}
+		}
 		return m, nil
 	}
 	return in, nil
+}
+
+func snakeToPascal(s string) string {
+	parts := strings.Split(s, "_")
+	var b strings.Builder
+	for _, p := range parts {
+		if p == "" {
+			continue
+		}
+		b.WriteString(strings.ToUpper(p[:1]) + p[1:])
+	}
+	return b.String()
 }
 
 func renderSteps(tname string, steps []Step, data any) ([]Step, error) {

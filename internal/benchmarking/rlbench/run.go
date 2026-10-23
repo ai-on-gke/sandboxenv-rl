@@ -94,11 +94,6 @@ type Summary struct {
 	Duration time.Duration
 }
 
-// Validate checks that the run configuration is well-formed.
-func (c *Config) Validate() error {
-	return c.validate()
-}
-
 func (c *Config) validate() error {
 	switch {
 	case c.RunID == "":

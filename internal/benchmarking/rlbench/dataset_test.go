@@ -37,8 +37,8 @@ func manifest(ids ...string) string {
 
 func makeInstance(id, patch, evalScript string) Instance {
 	raw, _ := json.Marshal(map[string]any{
-		"Patch":      patch,
-		"EvalScript": evalScript,
+		"patch":       patch,
+		"eval_script": evalScript,
 	})
 	return Instance{
 		InstanceID: id,

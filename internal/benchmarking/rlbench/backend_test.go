@@ -28,6 +28,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
@@ -260,5 +261,62 @@ func TestEnvBackendSpreadsConnections(t *testing.T) {
 	defer one.Close()
 	if len(one.clients) != 1 {
 		t.Fatalf("connections 0 must mean 1, got %d", len(one.clients))
+	}
+}
+
+// authRecorder answers DeleteEnvironment and records the authorization
+// metadata of each call.
+type authRecorder struct {
+	ateenvv1alpha.UnimplementedEnvironmentServiceServer
+	mu   sync.Mutex
+	seen [][]string
+}
+
+func (a *authRecorder) DeleteEnvironment(ctx context.Context, _ *ateenvv1alpha.DeleteEnvironmentRequest) (*ateenvv1alpha.DeleteEnvironmentResponse, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	a.mu.Lock()
+	a.seen = append(a.seen, md.Get("authorization"))
+	a.mu.Unlock()
+	return &ateenvv1alpha.DeleteEnvironmentResponse{}, nil
+}
+
+func TestNewEnvBackendSendsTheAuthToken(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &authRecorder{}
+	srv := grpc.NewServer()
+	ateenvv1alpha.RegisterEnvironmentServiceServer(srv, rec)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(srv.Stop)
+
+	for _, token := range []string{"s3cret", ""} {
+		b, err := NewEnvBackend(lis.Addr().String(), "ate-env", "default-template", 2, WithAuthToken(token))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Two deletes reach both connections of the pool.
+		for i := 0; i < 2; i++ {
+			if err := b.Delete(context.Background(), fmt.Sprintf("e%d", i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_ = b.Close()
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.seen) != 4 {
+		t.Fatalf("%d calls recorded, want 4", len(rec.seen))
+	}
+	for i, got := range rec.seen[:2] {
+		if len(got) != 1 || got[0] != "Bearer s3cret" {
+			t.Errorf("call %d with a token: authorization = %q, want one %q", i, got, "Bearer s3cret")
+		}
+	}
+	for i, got := range rec.seen[2:] {
+		if len(got) != 0 {
+			t.Errorf("call %d without a token: authorization = %q, want none", i+2, got)
+		}
 	}
 }

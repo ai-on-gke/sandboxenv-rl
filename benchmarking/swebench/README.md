@@ -6,10 +6,11 @@ the "Fast" rung of the RL benchmark ladder: regular runs that catch
 regressions in the sandbox SDK, Substrate or the controller, on a workload
 that is the real thing rather than a Python image printing READY.
 
-Code: `internal/benchmarking/rlbench` (dataset-agnostic library, tested against
-an in-memory backend), `internal/benchmarking/rlbench/datasets/swebench`
-(SWE-bench dataset and grader adapter), and `cmd/benchmarking/swebench-loader`
-(binary). The layout follows
+Code: `internal/benchmarking/rlbench` (dataset-agnostic execution and reporting
+library, tested against an in-memory backend),
+`internal/benchmarking/rlbench/datasets/swebench` (SWE-bench dataset adapter,
+built-in `swebench-gold` trajectory, and grader), and
+`cmd/benchmarking/swebench-loader` (binary). The layout follows
 substrate's `internal/benchmarking/boomer` so a user class can be lifted into
 that harness later; Go does not allow importing another module's `internal`
 packages, so nothing is imported from it.
@@ -25,8 +26,9 @@ in numbers.
 | eval (SWE-bench Verified evaluation) | `-mode eval -images 500 -tasks-per-image 6 -width 500` | 500 in flight. Each task: create from the image, replay the trajectory, record the reward, delete. With the offline exclusion list the 500 become 445 images and 2,670 tasks; the loader prints the reduced count. |
 | steps (training loop) | `-mode steps -images 500 -rollouts 2 -steps 8 -park suspend` | 1,000 environments created once. Each step replays the trajectory on all of them, waits for the last (the barrier), then parks the fleet. `-park` is `suspend`, `delete` or `none`. |
 
-The trajectory is YAML (`internal/benchmarking/rlbench/datasets/swebench/trajectories/`
-and `internal/benchmarking/rlbench/trajectories/`,
+The trajectory is YAML (`internal/benchmarking/rlbench/trajectories/` for
+image-delivery workloads,
+`internal/benchmarking/rlbench/datasets/swebench/trajectories/` for SWE-bench,
 or `-trajectory FILE`). The built-in `swebench-gold` does what a SWE agent
 does on a task, with the gold patch as the model's edit: explore, read, write
 the patch, `git apply`, write the harness eval script, run it. The reward is
@@ -36,8 +38,9 @@ instance's FAIL_TO_PASS and PASS_TO_PASS tests, the same rules the harness
 applies. Neither the script's nor the test command's exit code is the
 verdict: unrelated tests in the same files fail routinely. A healthy run
 rewards every task and a drop in reward rate is a correctness regression.
-`python3 -m pytest internal/benchmarking/rlbench/datasets/swebench/trajectories` covers the grader. Steps carry think times, the
-simulated policy latency between commands.
+`python3 -m pytest internal/benchmarking/rlbench/datasets/swebench/trajectories -q`
+covers the grader. Steps carry think times, the simulated policy latency
+between commands.
 
 ## What is measured
 
@@ -59,7 +62,10 @@ API server included, which is what a trainer sees):
 `swebench-loader report RUN.jsonl -json summary.json` prints count, failed,
 p50, p95 and max per event, a per-step table (tasks, barrier, park, wake
 p50/p95) and the most frequent errors. The JSON is the artifact to diff
-between runs.
+between runs. Given several files, `report a.jsonl b.jsonl` prints one table
+with a column per run: p50/p95 per event, and per step the live environments,
+tasks, failures, barrier, park and wake p50/p95. `-json` then writes the
+summaries as an array. Files go before the flags.
 
 ## How many actors, and on which clusters
 
@@ -85,11 +91,13 @@ and read the packing from Substrate's metrics, not from the report.
 The loader never talks to Kubernetes. `-endpoint` is an ate-env API address,
 so "which cluster" is "which API". To compare clusters (builds, node images,
 image delivery) run the same manifest, trajectory and flags once per
-cluster and diff the summaries; the in-cluster script uses the current
-`kubectl` context, so switch context between runs. Each cluster needs the
-full setup below: Substrate and the ate-env API installed, the images
-reachable from it, and the golden tags baked there (a golden tag is per
-cluster, so the first run on a fresh cluster pays the bake for every image).
+cluster, with `CONTEXT=<kubectl context>` pointing the in-cluster script at
+each cluster and the cluster's name in the run id, then put the events files
+side by side with `swebench-loader report a.jsonl b.jsonl`. Each cluster
+needs the full setup below: Substrate and the ate-env API installed, the
+images reachable from it, and the golden tags baked there (a golden tag is
+per cluster, so the first run on a fresh cluster pays the bake for every
+image).
 One run never spans clusters.
 
 Telemetry is the JSONL file only. There is no OpenTelemetry export yet; the
@@ -148,6 +156,12 @@ go run ./cmd/benchmarking/swebench-loader report smoke.jsonl
 `-dry-run` loads and renders everything and prints the plan without touching
 the API. `-keep` leaves the fleet in place for inspection.
 
+When ate-env-api requires a bearer token (`-auth-token-file` on the API), give
+the loader the same token: `-auth-token-file PATH`, or the
+`SUBSTRATE_ENV_AUTH_TOKEN` environment variable that the `ate-env` CLI also
+reads. The file wins when both are set. Without either, the loader sends no
+token.
+
 For the 500-wide shapes run inside the cluster so the loader sits next to the
 API and spreads over its replicas (`-connections`, default 4):
 
@@ -159,7 +173,11 @@ KO_DOCKER_REPO=gcr.io/PROJECT/repo benchmarking/swebench/run-in-cluster.sh swe-e
 The script bakes the dataset and the exclusion list into the loader image,
 runs a Job next to ate-env-api, follows the full loader log (step failures
 included), copies the events file back to the current directory, prints the
-report and deletes the Job.
+report and deletes the Job. `CONTEXT=<kubectl context>` selects the cluster;
+the same command with a different context and run id is how two clusters are
+compared. For an API with a token, set `AUTH_TOKEN_SECRET`
+to a Secret in the namespace whose key `token` holds it; the Job passes it to
+the loader as `SUBSTRATE_ENV_AUTH_TOKEN`.
 
 ## Image-delivery workloads
 
@@ -187,6 +205,56 @@ Run the same command against each delivery mechanism and diff the reports;
 the loader sees wall time per phase as a trainer would, and the split of a
 cold start into pull, unpack and restore comes from Substrate's own metrics
 over the run window, joined on the run id.
+
+To know whether those first pulls were cold, sample the node image caches
+before and after the run and hand both files to the report:
+
+```bash
+benchmarking/swebench/sample-node-cache.sh before.txt
+benchmarking/swebench/run-in-cluster.sh pull-baseline images.jsonl -trajectory workload-read-all -images 200 -width 200
+benchmarking/swebench/sample-node-cache.sh after.txt
+swebench-loader report pull-baseline.jsonl -cache-before before.txt -cache-after after.txt
+```
+
+The sample reads each atelet's `ate_imagecache_requests_total` counters and
+its process start time through the API server's pod proxy (atelet has no
+shell), so it needs kubectl with RBAC `get` on `pods/proxy` in `ate-system`.
+The report then adds a line with the run's misses, which are its cold pulls,
+the nodes they landed on, hits, errors, and misses per first command: 1.0
+means every environment pulled its image, 0 means every start was served
+from a node's cache. The count is cluster-wide for the window, so it also
+holds golden bakes and wakes that landed on a node without the image. A node
+whose atelet restarted between the samples, and a node the autoscaler added
+in between, count from zero; a node removed in between is left out; a node
+present only in the after sample with an atelet older than the before sample
+had a failed before scrape and is reported and left out. The report cannot
+label one environment cold or warm, because the ate-env API does not say
+which node an environment ran on.
+
+To split the first-command window itself, harvest atelet's restore records
+for the run and give them to the report:
+
+```bash
+benchmarking/swebench/harvest-restore-timings.sh pull-baseline restores.jsonl
+swebench-loader report pull-baseline.jsonl -restore-log restores.jsonl
+```
+
+atelet logs one record per actor restore with the seconds each phase took:
+manifest fetch, snapshot download, image unpack, the worker's restore, and
+the total. The actor's name is the environment's name, so the report pairs
+each record with the `ttfi` or `wake` event of that environment whose window
+(the event's end minus its duration, up to its end) contains the record's
+time: a record inside a `ttfi` window is a cold start, one inside a `wake`
+window is a wake. The table gives p50/p95/max per phase plus an `outside`
+row, the event's span minus atelet's total, which is ateapi, the scheduler,
+the router and the command itself. Failed restores are counted and left out
+of the percentiles; restores whose event failed are counted and left out of
+`outside`. Records before the run's first event or after its last (a rerun
+with the same run id), for actors the run never created, or inside no window
+(a restore after an eviction or a failed suspend) are counted, not paired.
+The records come from the kubelet's container logs, which rotate, so harvest
+right after the run; when atelet restarted, the previous container's log is
+read too, one restart back.
 
 ## Network and the offline exclusion list
 

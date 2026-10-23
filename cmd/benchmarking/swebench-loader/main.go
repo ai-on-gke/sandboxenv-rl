@@ -18,6 +18,8 @@
 //	swebench-loader run    -dataset manifest.jsonl -mode eval  -images 500 -tasks-per-image 6 -width 500 -out run.jsonl
 //	swebench-loader run    -dataset manifest.jsonl -mode steps -images 500 -rollouts 2 -steps 8 -park suspend -out run.jsonl
 //	swebench-loader report run.jsonl [-json summary.json]
+//	swebench-loader report a.jsonl b.jsonl   (one table, a column per run)
+//	swebench-loader report run.jsonl -cache-before before.txt -cache-after after.txt -restore-log restores.jsonl
 package main
 
 import (
@@ -60,8 +62,31 @@ func main() {
 	}
 }
 
+// authTokenEnv names the environment variable that holds the bearer token,
+// the same one the ate-env CLI reads.
+const authTokenEnv = "SUBSTRATE_ENV_AUTH_TOKEN"
+
+// resolveAuthToken returns the token from file when file is set, otherwise
+// from authTokenEnv, otherwise "" (no token sent). A file that holds only
+// whitespace is an error, because it is a misconfiguration and not a request
+// to run without the token.
+func resolveAuthToken(file string, getenv func(string) string) (string, error) {
+	if file == "" {
+		return strings.TrimSpace(getenv(authTokenEnv)), nil
+	}
+	b, err := os.ReadFile(file)
+	if err != nil {
+		return "", fmt.Errorf("reading -auth-token-file: %w", err)
+	}
+	token := strings.TrimSpace(string(b))
+	if token == "" {
+		return "", fmt.Errorf("-auth-token-file %s is empty", file)
+	}
+	return token, nil
+}
+
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: swebench-loader run [flags] | swebench-loader report FILE [-json OUT]")
+	fmt.Fprintln(os.Stderr, "usage: swebench-loader run [flags] | swebench-loader report FILE... [-json OUT]")
 }
 
 func runCmd(args []string) (retErr error) {
@@ -90,12 +115,17 @@ func runCmd(args []string) (retErr error) {
 		out           = fs.String("out", "", "JSONL events file; default <run-id>.jsonl in the working directory.")
 		keep          = fs.Bool("keep", false, "Leave the environments in place when the run ends.")
 		dryRun        = fs.Bool("dry-run", false, "Load and render everything, print the plan and exit without touching the API.")
+		authTokenFile = fs.String("auth-token-file", "", "File that holds the bearer token for ate-env-api; surrounding whitespace is ignored. Without it, SUBSTRATE_ENV_AUTH_TOKEN is used when set.")
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *dataset == "" {
 		return fmt.Errorf("-dataset is required")
+	}
+	authToken, err := resolveAuthToken(*authTokenFile, os.Getenv)
+	if err != nil {
+		return err
 	}
 	if *runID == "" {
 		*runID = fmt.Sprintf("swe-%d", time.Now().Unix())
@@ -152,7 +182,7 @@ func runCmd(args []string) (retErr error) {
 		return nil
 	}
 
-	backend, err := rlbench.NewEnvBackend(*endpoint, *atespace, *baseTemplate, *connections)
+	backend, err := rlbench.NewEnvBackend(*endpoint, *atespace, *baseTemplate, *connections, rlbench.WithAuthToken(authToken))
 	if err != nil {
 		return err
 	}
@@ -210,25 +240,86 @@ func runCmd(args []string) (retErr error) {
 }
 
 func reportCmd(args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("report needs the JSONL file")
+	files, rest := leadingFiles(args)
+	if len(files) == 0 {
+		return fmt.Errorf("report needs at least one JSONL file")
 	}
-	path := args[0]
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
-	jsonOut := fs.String("json", "", "Also write the summary as JSON to this path.")
-	unresolvedOut := fs.String("unresolved", "", "Write the unresolved instances to this path in -exclude-file format.")
+	jsonOut := fs.String("json", "", "Also write the summary as JSON to this path (an array when several files are given).")
+	unresolvedOut := fs.String("unresolved", "", "Write the unresolved instances to this path in -exclude-file format; one file only.")
 	unresolvedNote := fs.String("unresolved-note", "Instances graded unresolved", "First comment line of the -unresolved file.")
-	if err := fs.Parse(args[1:]); err != nil {
+	cacheBefore := fs.String("cache-before", "", "Node cache sample taken before the run (benchmarking/swebench/sample-node-cache.sh); with -cache-after, the report adds the run's cache misses. One file only.")
+	cacheAfter := fs.String("cache-after", "", "Node cache sample taken after the run.")
+	restoreLog := fs.String("restore-log", "", "atelet restore records for the run (benchmarking/swebench/harvest-restore-timings.sh); the report adds the restore phases per environment. One file only.")
+	if err := fs.Parse(rest); err != nil {
 		return err
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return err
+	if fs.NArg() > 0 {
+		// flag stops at the first non-flag, so a file after a flag would be
+		// dropped without a word.
+		return fmt.Errorf("unexpected arguments after the flags: %s; put every events file before the flags", strings.Join(fs.Args(), " "))
 	}
-	defer f.Close()
-	rep, err := rlbench.Summarize(f)
-	if err != nil {
-		return err
+	reps := make([]*rlbench.Report, 0, len(files))
+	var events []rlbench.Event // of the single file, for the restore join
+	for _, path := range files {
+		if *restoreLog != "" && len(files) == 1 {
+			evs, err := readEventsFile(path)
+			if err != nil {
+				return fmt.Errorf("%s: %w", path, err)
+			}
+			events = evs
+			reps = append(reps, rlbench.Build(evs))
+			continue
+		}
+		rep, err := summarizeFile(path)
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		reps = append(reps, rep)
+	}
+	if len(reps) > 1 {
+		// Several runs: one table, a column per run, for the same workload on
+		// different clusters or builds.
+		if *unresolvedOut != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" {
+			return fmt.Errorf("-unresolved, -cache-before, -cache-after and -restore-log take one events file")
+		}
+		rlbench.WriteComparison(os.Stdout, reps, files)
+		if *jsonOut != "" {
+			b, err := json.MarshalIndent(reps, "", "  ")
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(*jsonOut, b, 0o644)
+		}
+		return nil
+	}
+	rep := reps[0]
+	if (*cacheBefore == "") != (*cacheAfter == "") {
+		return fmt.Errorf("-cache-before and -cache-after go together")
+	}
+	if *cacheBefore != "" {
+		before, err := loadCacheSample(*cacheBefore)
+		if err != nil {
+			return err
+		}
+		after, err := loadCacheSample(*cacheAfter)
+		if err != nil {
+			return err
+		}
+		d := before.Delta(after)
+		rep.Cache = &d
+	}
+	if *restoreLog != "" {
+		f, err := os.Open(*restoreLog)
+		if err != nil {
+			return err
+		}
+		timings, err := rlbench.ParseRestoreTimings(f)
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("%s: %w", *restoreLog, err)
+		}
+		rep.Restores = rlbench.JoinRestores(events, timings)
 	}
 	rep.WriteText(os.Stdout)
 	if *unresolvedOut != "" {
@@ -249,4 +340,46 @@ func reportCmd(args []string) error {
 		return os.WriteFile(*jsonOut, b, 0o644)
 	}
 	return nil
+}
+
+// leadingFiles splits report's arguments into the events files, which come
+// first, and the flags that follow them.
+func leadingFiles(args []string) (files, rest []string) {
+	for i, a := range args {
+		if strings.HasPrefix(a, "-") {
+			return args[:i], args[i:]
+		}
+	}
+	return args, nil
+}
+
+func summarizeFile(path string) (*rlbench.Report, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return rlbench.Summarize(f)
+}
+
+func readEventsFile(path string) ([]rlbench.Event, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return rlbench.ReadEvents(f)
+}
+
+func loadCacheSample(path string) (*rlbench.NodeCacheSample, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	s, err := rlbench.ParseNodeCacheSample(f)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return s, nil
 }

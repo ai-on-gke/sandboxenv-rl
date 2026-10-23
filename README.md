@@ -32,7 +32,7 @@ The focus moves from a general environment service to RL training and evaluation
 | Daemons inside an environment | A port proxy on `ate-env-api` reaches any port in an environment by header or by path, WebSockets included ([details](#reaching-a-service-inside-an-environment)). |
 | Framework integrations | A [NeMo Gym](integrations/nemo-gym/README.md) sandbox provider and a [GRPO](examples/grpo/README.md) training loop on TRL. |
 | Benchmarks | A [SWE-bench Verified loader](benchmarking/swebench/README.md) that drives real task images the way an RL job does, and the [design](internal/benchmarking/DESIGN.md) of the benchmark system. |
-| Platform | Built against Substrate `ddb46651`: the WorkerPool chooses the sandbox, each template selects its pool by label, suspends are durable, and `ate-env-api` runs as its own identity under Substrate authorization. The guest runs as a PID 1 init that reaps orphans, and it allocates PTYs. |
+| Platform | Built against Substrate `v0.6.0` (actor limits are integer millicores and bytes): the WorkerPool chooses the sandbox, each template selects its pool by label, suspends are durable, and `ate-env-api` runs as its own identity under Substrate authorization. The guest runs as a PID 1 init that reaps orphans, and it allocates PTYs. The control plane must run v0.6.0 or later: the release renumbered proto fields env reads and writes, so an older control plane cannot serve this build. v0.6.0 also serves the router only over TLS; the stacked change makes `ate-env-api` present its pod identity certificate, and the two merge together. |
 
 ## Architecture
 
@@ -85,8 +85,7 @@ what each phase cost.
 
 ## Get started
 
-You need a cluster with Agent Substrate at or after
-[`0443aec3`](https://github.com/agent-substrate/substrate/commit/0443aec3), a snapshots bucket,
+You need a cluster with Agent Substrate v0.6.0 or later, a snapshots bucket,
 `kubectl` with `kubectl-ate`, Go, [ko](https://ko.build), and Python 3.10 or later for the SDK. This
 repo publishes no release binaries or images yet, thus build them:
 
@@ -135,13 +134,13 @@ Then pick an [example](#examples) or an [integration](#integrations).
 
 Prerequisites: a cluster with [Agent Substrate](https://github.com/agent-substrate/substrate)
 installed and a snapshots bucket. ate-env is built against Substrate
-[`ddb46651`](https://github.com/agent-substrate/substrate/commit/ddb46651) (2026-10-18, Go module
-`go.ate.dev/substrate`). The cluster needs Substrate at or after
-[`0443aec3`](https://github.com/agent-substrate/substrate/commit/0443aec3) (2026-10-17): from that
-commit the WorkerPool alone chooses the sandbox (`spec.sandboxClasses`), the ActorTemplate names
-none, and Substrate rejects a template that still sends `sandboxConfig`, while an older Substrate
-requires one. With an older Substrate, use ate-env from before the Substrate bump (merge commit
-`a21ead9`). Because the template no
+[`v0.6.0`](https://github.com/agent-substrate/substrate/releases/tag/v0.6.0) (Go module
+`go.ate.dev/substrate`), and the control plane must run v0.6.0 or later: the release renumbered
+the wire fields of Actor, ActorStatus, ActorTemplate, SnapshotConfig and Volume, so this build
+cannot create or read actors on an older control plane, and its templates carry limits as integer
+millicores and bytes. Upgrade the control plane and the ate-env images together; with an older
+Substrate, use ate-env from before the v0.6.0 bump. The WorkerPool alone chooses the sandbox
+(`spec.sandboxClasses`) and the ActorTemplate names none. Because the template no
 longer names a class, an actor booting without a snapshot can land on any pool whose labels its
 template's `workerSelector` matches, and on any pool at all without a selector. `ate-env` labels its
 WorkerPool `ate-env/workerpool: <pool>` and each template selects that label, thus actors stay on

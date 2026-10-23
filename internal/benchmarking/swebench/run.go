@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package rlbench
+package swebench
 
 import (
 	"context"
@@ -258,7 +258,6 @@ func Run(ctx context.Context, cfg Config) (*Summary, error) {
 	s := &Summary{Tasks: r.tasks, Failed: r.failed, Rewarded: r.rewarded, Duration: dur}
 	r.rec.Record(Event{RunID: cfg.RunID, Event: EventRun, Name: string(cfg.Mode), DurMS: ms(dur),
 		OK: s.Failed == 0, Count: s.Tasks})
-	_ = r.rec.Flush()
 	return s, ctx.Err()
 }
 
@@ -543,7 +542,8 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 				}
 			}
 			ev.Reward = reward
-			// Keep the trailing output so unresolved steps can be inspected.
+			// The grader's verdict is the last line of a reward step's
+			// output; keep enough of it for the report to read it back.
 			ev.Tail = tail(out, 4000)
 		case s.ExpectExit != nil && res.ExitCode != *s.ExpectExit:
 			ok = false

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package rlbench
+package swebench
 
 import (
 	"bufio"
@@ -45,7 +45,7 @@ type Stat struct {
 }
 
 // Unresolved is an instance whose reward step scored 0, with the grader's
-// verdict when available.
+// verdict when the step's output ended in one.
 type Unresolved struct {
 	Instance string `json:"instance"`
 	Reason   string `json:"reason"`
@@ -144,7 +144,11 @@ func (b *Builder) Add(e Event) {
 	}
 	if e.Event == EventStep && e.Reward != nil && *e.Reward == 0 {
 		if _, seen := b.unresolved[e.Instance]; !seen {
-			b.unresolved[e.Instance] = resolveUnresolvedReason(e)
+			if e.Detail != "" {
+				b.unresolved[e.Instance] = e.Detail
+			} else {
+				b.unresolved[e.Instance] = verdict(e.Tail)
+			}
 		}
 	}
 	if e.OK {
@@ -235,24 +239,7 @@ func (b *Builder) Finish() *Report {
 	return &rep
 }
 
-// resolveUnresolvedReason returns e.Detail when present, falls back to asking
-// the default dataset grader to parse e.Tail (for pre-existing JSONL files),
-// and otherwise returns "reward 0".
-func resolveUnresolvedReason(e Event) string {
-	if e.Detail != "" {
-		return e.Detail
-	}
-	if e.Tail != "" {
-		if a := AdapterFor(DefaultKind); a != nil && a.Grader() != nil {
-			if _, detail, err := a.Grader().Parse([]byte(e.Tail)); err == nil && detail != "" {
-				return detail
-			}
-		}
-	}
-	return "reward 0"
-}
-
-// Summarize streams JSONL events from r into a Builder and returns the Report.
+// Summarize streams JSONL events from r into a Builder and returns the report.
 func Summarize(r io.Reader) (*Report, error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 1<<20), 16<<20)
@@ -303,6 +290,16 @@ func Build(events []Event) *Report {
 		b.Add(e)
 	}
 	return b.Finish()
+}
+
+// verdict extracts the grader's verdict from the end of a reward step's
+// output: "invalid run", "f2p A/B p2p C/D", or "reward 0" when the output
+// does not end in the grader's JSON line.
+func verdict(tail string) string {
+	if _, detail, err := (SWEBenchGrader{}).Parse([]byte(tail)); err == nil && detail != "" {
+		return detail
+	}
+	return "reward 0"
 }
 
 // WriteExclusions writes the unresolved instances in the exclude-file format:

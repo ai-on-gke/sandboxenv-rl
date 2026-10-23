@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package rlbench
+package swebench
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -35,19 +34,6 @@ func manifest(ids ...string) string {
 	return b.String()
 }
 
-func makeInstance(id, patch, evalScript string) Instance {
-	raw, _ := json.Marshal(map[string]any{
-		"patch":       patch,
-		"eval_script": evalScript,
-	})
-	return Instance{
-		InstanceID: id,
-		Image:      "reg/img@" + goodDigest,
-		Kind:       DefaultKind,
-		Material:   raw,
-	}
-}
-
 func TestParseDataset(t *testing.T) {
 	got, err := ParseDataset(strings.NewReader("\n" + manifest("a__a-1", "b__b-2") + "\n"))
 	if err != nil {
@@ -55,9 +41,6 @@ func TestParseDataset(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].InstanceID != "a__a-1" || got[1].InstanceID != "b__b-2" {
 		t.Fatalf("got %+v", got)
-	}
-	if got[0].Kind != DefaultKind || len(got[0].Material) == 0 {
-		t.Fatalf("expected default kind %q and material, got %+v", DefaultKind, got[0])
 	}
 }
 
@@ -160,5 +143,26 @@ func TestLoadDatasetRefusesARedirectToPlainHTTP(t *testing.T) {
 	got, err := LoadDataset(secure.URL + "/to-https")
 	if err != nil || len(got) != 1 {
 		t.Fatalf("redirect to https: %v, %v; want the manifest", got, err)
+	}
+}
+
+func TestRequireGrading(t *testing.T) {
+	full, err := ParseDataset(strings.NewReader(manifest("a")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := RequireGrading(full); err != nil {
+		t.Fatalf("complete record: %v", err)
+	}
+	imageOnly, err := ParseDataset(strings.NewReader(`{"instance_id":"x","image":"reg/img@` + goodDigest + `"}` + "\n"))
+	if err != nil {
+		t.Fatalf("an image-only record must parse: %v", err)
+	}
+	if err := RequireGrading(imageOnly); err == nil || !strings.Contains(err.Error(), "eval_script") {
+		t.Fatalf("image-only record must fail grading requirement: %v", err)
+	}
+	noParser, _ := ParseDataset(strings.NewReader(`{"instance_id":"x","image":"reg/img@` + goodDigest + `","eval_script":"e"}` + "\n"))
+	if err := RequireGrading(noParser); err == nil || !strings.Contains(err.Error(), "log_parser") {
+		t.Fatalf("missing log_parser must fail grading requirement: %v", err)
 	}
 }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package rlbench
+package swebench
 
 import (
 	"context"
@@ -127,7 +127,7 @@ func (f *fakeAPI) SignalProcess(_ context.Context, req *ateenvv1alpha.SignalProc
 }
 
 // newFakeBackend serves fakeAPI over an in-memory connection and returns an
-// EnvBackend configured with fast poll bounds via WithPollBounds.
+// EnvBackend on it, the same path the binary uses with a real address.
 func newFakeBackend(t *testing.T, api *fakeAPI) *EnvBackend {
 	t.Helper()
 	api.polls = map[string]int{}
@@ -229,16 +229,13 @@ func TestEnvBackendDeleteByName(t *testing.T) {
 func TestEnvBackendSpreadsConnections(t *testing.T) {
 	// grpc.NewClient does not dial until the first call, so a backend over
 	// an unreachable address is enough to check the pool and the rotation.
-	b, err := NewEnvBackend("127.0.0.1:1", "ate-env", "default-template", 3, WithPollBounds(time.Millisecond, 5*time.Millisecond))
+	b, err := NewEnvBackend("127.0.0.1:1", "ate-env", "default-template", 3, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer b.Close()
 	if len(b.clients) != 3 {
 		t.Fatalf("%d clients, want 3", len(b.clients))
-	}
-	if b.minPoll != time.Millisecond || b.maxPoll != 5*time.Millisecond {
-		t.Fatalf("poll bounds = (%v, %v)", b.minPoll, b.maxPoll)
 	}
 	seen := map[int]int{}
 	for i := 0; i < 9; i++ {
@@ -254,7 +251,7 @@ func TestEnvBackendSpreadsConnections(t *testing.T) {
 			t.Fatalf("connection %d picked %d times, want 3: %v", j, seen[j], seen)
 		}
 	}
-	one, err := NewEnvBackend("127.0.0.1:1", "ate-env", "default-template", 0)
+	one, err := NewEnvBackend("127.0.0.1:1", "ate-env", "default-template", 0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +289,7 @@ func TestNewEnvBackendSendsTheAuthToken(t *testing.T) {
 	t.Cleanup(srv.Stop)
 
 	for _, token := range []string{"s3cret", ""} {
-		b, err := NewEnvBackend(lis.Addr().String(), "ate-env", "default-template", 2, WithAuthToken(token))
+		b, err := NewEnvBackend(lis.Addr().String(), "ate-env", "default-template", 2, token)
 		if err != nil {
 			t.Fatal(err)
 		}

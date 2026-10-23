@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package rlbench
+package swebench
 
 import (
 	"bytes"
@@ -59,13 +59,18 @@ func TestSummarizeRoundTrip(t *testing.T) {
 	rec.Record(Event{RunID: "r", Event: EventStep, Name: "grade", Instance: "repo__x-1", DurMS: 9, OK: true, Reward: intp(0),
 		Detail: "f2p 1/1 p2p 3/4"})
 	rec.Record(Event{RunID: "r", Event: EventStep, Name: "grade", Instance: "repo__x-2", DurMS: 9, OK: true, Reward: intp(0), Tail: "no json"})
+	rec.Record(Event{RunID: "r", Event: EventStep, Name: "grade", Instance: "repo__x-3", DurMS: 9, OK: true, Reward: intp(0),
+		Tail: `{"valid": true, "resolved": false, "f2p": "0/1", "p2p": "2/2"}`})
 	rec.Record(Event{RunID: "r", Event: EventStep, Name: "grade", Instance: "repo__x-1", DurMS: 9, OK: true, Reward: intp(0),
-		Detail: "invalid run"})
+		Tail: `{"valid": false, "resolved": false}`})
 	rec.Record(Event{RunID: "r", Event: EventTask, Step: 2, DurMS: 700, OK: true, Reward: intp(0)})
 	rec.Record(Event{RunID: "r", Event: EventBarrier, Step: 1, DurMS: 650, OK: true, Count: 2})
 	rec.Record(Event{RunID: "r", Event: EventPark, Name: "suspend", Step: 1, DurMS: 90, OK: true, Count: 1})
 	rec.Record(Event{RunID: "r", Event: EventRun, Name: "steps", DurMS: 2000, OK: false, Count: 3})
-	if rec.Len() != 14 {
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Len() != 15 {
 		t.Fatalf("recorded %d", rec.Len())
 	}
 
@@ -103,14 +108,17 @@ func TestSummarizeRoundTrip(t *testing.T) {
 	if w := find(EventWake, ""); w.Retried != 1 {
 		t.Fatalf("wake retried: %+v", w)
 	}
-	if len(rep.Unresolved) != 2 || rep.Unresolved[0].Instance != "repo__x-1" || rep.Unresolved[0].Reason != "f2p 1/1 p2p 3/4" ||
-		rep.Unresolved[1].Reason != "reward 0" {
+	if len(rep.Unresolved) != 3 || rep.Unresolved[0].Instance != "repo__x-1" || rep.Unresolved[0].Reason != "f2p 1/1 p2p 3/4" ||
+		rep.Unresolved[1].Reason != "reward 0" || rep.Unresolved[2].Reason != "f2p 0/1 p2p 2/2" {
 		t.Fatalf("unresolved: %+v", rep.Unresolved)
 	}
 	var excl bytes.Buffer
 	rep.WriteExclusions(&excl, "test list")
 	if !strings.Contains(excl.String(), "# test list\n") || !strings.Contains(excl.String(), "repo__x-1  f2p 1/1 p2p 3/4\n") {
 		t.Fatalf("exclusions:\n%s", excl.String())
+	}
+	if v := verdict(`{"valid": false}`); v != "invalid run" {
+		t.Fatalf("verdict: %q", v)
 	}
 	var text bytes.Buffer
 	rep.WriteText(&text)

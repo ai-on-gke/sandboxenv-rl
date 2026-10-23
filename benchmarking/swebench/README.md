@@ -6,11 +6,8 @@ the "Fast" rung of the RL benchmark ladder: regular runs that catch
 regressions in the sandbox SDK, Substrate or the controller, on a workload
 that is the real thing rather than a Python image printing READY.
 
-Code: `internal/benchmarking/rlbench` (dataset-agnostic execution and reporting
-library, tested against an in-memory backend),
-`internal/benchmarking/rlbench/datasets/swebench` (SWE-bench dataset adapter,
-built-in `swebench-gold` trajectory, and grader), and
-`cmd/benchmarking/swebench-loader` (binary). The layout follows
+Code: `internal/benchmarking/swebench` (library, tested against an in-memory
+backend) and `cmd/benchmarking/swebench-loader` (binary). The layout follows
 substrate's `internal/benchmarking/boomer` so a user class can be lifted into
 that harness later; Go does not allow importing another module's `internal`
 packages, so nothing is imported from it.
@@ -26,9 +23,7 @@ in numbers.
 | eval (SWE-bench Verified evaluation) | `-mode eval -images 500 -tasks-per-image 6 -width 500` | 500 in flight. Each task: create from the image, replay the trajectory, record the reward, delete. With the offline exclusion list the 500 become 445 images and 2,670 tasks; the loader prints the reduced count. |
 | steps (training loop) | `-mode steps -images 500 -rollouts 2 -steps 8 -park suspend` | 1,000 environments created once. Each step replays the trajectory on all of them, waits for the last (the barrier), then parks the fleet. `-park` is `suspend`, `delete` or `none`. |
 
-The trajectory is YAML (`internal/benchmarking/rlbench/trajectories/` for
-image-delivery workloads,
-`internal/benchmarking/rlbench/datasets/swebench/trajectories/` for SWE-bench,
+The trajectory is YAML (`internal/benchmarking/swebench/trajectories/`,
 or `-trajectory FILE`). The built-in `swebench-gold` does what a SWE agent
 does on a task, with the gold patch as the model's edit: explore, read, write
 the patch, `git apply`, write the harness eval script, run it. The reward is
@@ -38,9 +33,8 @@ instance's FAIL_TO_PASS and PASS_TO_PASS tests, the same rules the harness
 applies. Neither the script's nor the test command's exit code is the
 verdict: unrelated tests in the same files fail routinely. A healthy run
 rewards every task and a drop in reward rate is a correctness regression.
-`python3 -m pytest internal/benchmarking/rlbench/datasets/swebench/trajectories -q`
-covers the grader. Steps carry think times, the simulated policy latency
-between commands.
+`python3 -m pytest benchmarking/swebench/tests` covers the grader. Steps carry think times, the
+simulated policy latency between commands.
 
 ## What is measured
 

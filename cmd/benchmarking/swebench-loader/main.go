@@ -34,8 +34,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/agent-substrate/env/internal/benchmarking/rlbench"
-	"github.com/agent-substrate/env/internal/benchmarking/rlbench/datasets/swebench"
+	"github.com/agent-substrate/env/internal/benchmarking/swebench"
 )
 
 func main() {
@@ -100,17 +99,17 @@ func runCmd(args []string) (retErr error) {
 		images        = fs.Int("images", 0, "Use the first N instances of the dataset; 0 means all.")
 		instances     = fs.String("instances", "", "Comma-separated instance ids to use instead of the first N.")
 		excludeFile   = fs.String("exclude-file", "", "File of instance ids to leave out, one per line; text after the id is a comment.")
-		trajectory    = fs.String("trajectory", swebench.DefaultTrajectory, fmt.Sprintf("Trajectory file or built-in name (%s).", strings.Join(rlbench.Names(), ", ")))
-		mode          = fs.String("mode", string(rlbench.ModeEval), "eval (images x tasks-per-image, each create/replay/delete) or steps (images x rollouts kept across steps).")
+		trajectory    = fs.String("trajectory", swebench.DefaultTrajectory, fmt.Sprintf("Trajectory file or built-in name (%s).", strings.Join(swebench.Names(), ", ")))
+		mode          = fs.String("mode", string(swebench.ModeEval), "eval (images x tasks-per-image, each create/replay/delete) or steps (images x rollouts kept across steps).")
 		width         = fs.Int("width", 50, "Most tasks in flight at once.")
 		tasksPerImage = fs.Int("tasks-per-image", 1, "eval: replays per image.")
 		rollouts      = fs.Int("rollouts", 2, "steps: environments per image.")
 		steps         = fs.Int("steps", 8, "steps: training steps.")
-		park          = fs.String("park", string(rlbench.ParkSuspend), "steps: what happens between steps: suspend, delete or none.")
+		park          = fs.String("park", string(swebench.ParkSuspend), "steps: what happens between steps: suspend, delete or none.")
 		createTimeout = fs.Duration("create-timeout", 5*time.Minute, "Deadline for one create call.")
 		stepTimeout   = fs.Duration("step-timeout", 10*time.Minute, "Default deadline for a run step without its own timeout.")
 		wakeBudget    = fs.Duration("wake-budget", 3*time.Minute, "How long a task's first command is retried while the environment is still waking or its image is still being baked.")
-		wakeBackoff   = fs.Duration("wake-backoff", rlbench.DefaultWakeBackoff, "Initial pause between wake retries; doubles up to five times this.")
+		wakeBackoff   = fs.Duration("wake-backoff", swebench.DefaultWakeBackoff, "Initial pause between wake retries; doubles up to five times this.")
 		runID         = fs.String("run-id", "", "Run id, prefix of every environment name: lowercase letters, digits and '-', at most 20 characters; default swe-<unix time>.")
 		out           = fs.String("out", "", "JSONL events file; default <run-id>.jsonl in the working directory.")
 		keep          = fs.Bool("keep", false, "Leave the environments in place when the run ends.")
@@ -135,7 +134,7 @@ func runCmd(args []string) (retErr error) {
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 
-	all, err := rlbench.LoadDataset(*dataset)
+	all, err := swebench.LoadDataset(*dataset)
 	if err != nil {
 		return err
 	}
@@ -145,23 +144,23 @@ func runCmd(args []string) (retErr error) {
 	}
 	var exclude []string
 	if *excludeFile != "" {
-		if exclude, err = rlbench.ReadIDList(*excludeFile); err != nil {
+		if exclude, err = swebench.ReadIDList(*excludeFile); err != nil {
 			return err
 		}
 	}
-	selected, err := rlbench.Select(all, ids, exclude, *images)
+	selected, err := swebench.Select(all, ids, exclude, *images)
 	if err != nil {
 		return err
 	}
 	if *images > 0 && len(selected) < *images && len(ids) == 0 {
 		fmt.Fprintf(os.Stderr, "note: %d instances requested, %d available after the exclude list\n", *images, len(selected))
 	}
-	traj, err := rlbench.LoadTrajectory(*trajectory)
+	traj, err := swebench.LoadTrajectory(*trajectory)
 	if err != nil {
 		return err
 	}
 	if traj.Grades() {
-		if err := rlbench.RequireGrading(selected); err != nil {
+		if err := swebench.RequireGrading(selected); err != nil {
 			return err
 		}
 	}
@@ -172,7 +171,7 @@ func runCmd(args []string) (retErr error) {
 	}
 
 	fanout := *tasksPerImage
-	if rlbench.Mode(*mode) == rlbench.ModeSteps {
+	if swebench.Mode(*mode) == swebench.ModeSteps {
 		fanout = *rollouts
 	}
 	log.Info("plan", slog.String("run", *runID), slog.String("mode", *mode), slog.Int("images", len(selected)),
@@ -182,7 +181,7 @@ func runCmd(args []string) (retErr error) {
 		return nil
 	}
 
-	backend, err := rlbench.NewEnvBackend(*endpoint, *atespace, *baseTemplate, *connections, rlbench.WithAuthToken(authToken))
+	backend, err := swebench.NewEnvBackend(*endpoint, *atespace, *baseTemplate, *connections, authToken)
 	if err != nil {
 		return err
 	}
@@ -192,7 +191,7 @@ func runCmd(args []string) (retErr error) {
 	if err != nil {
 		return err
 	}
-	rec := rlbench.NewRecorder(f)
+	rec := swebench.NewRecorder(f)
 	// Events lost to a write error, or a file that does not flush, must fail
 	// the run rather than produce a report with holes.
 	defer func() {
@@ -207,19 +206,19 @@ func runCmd(args []string) (retErr error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	sum, err := rlbench.Run(ctx, rlbench.Config{
+	sum, err := swebench.Run(ctx, swebench.Config{
 		RunID:         *runID,
 		Backend:       backend,
 		Instances:     selected,
 		Trajectory:    traj,
 		Recorder:      rec,
 		Logger:        log,
-		Mode:          rlbench.Mode(*mode),
+		Mode:          swebench.Mode(*mode),
 		Width:         *width,
 		TasksPerImage: *tasksPerImage,
 		Rollouts:      *rollouts,
 		Steps:         *steps,
-		Park:          rlbench.Park(*park),
+		Park:          swebench.Park(*park),
 		CreateTimeout: *createTimeout,
 		StepTimeout:   *stepTimeout,
 		WakeBudget:    *wakeBudget,
@@ -259,8 +258,8 @@ func reportCmd(args []string) error {
 		// dropped without a word.
 		return fmt.Errorf("unexpected arguments after the flags: %s; put every events file before the flags", strings.Join(fs.Args(), " "))
 	}
-	reps := make([]*rlbench.Report, 0, len(files))
-	var events []rlbench.Event // of the single file, for the restore join
+	reps := make([]*swebench.Report, 0, len(files))
+	var events []swebench.Event // of the single file, for the restore join
 	for _, path := range files {
 		if *restoreLog != "" && len(files) == 1 {
 			evs, err := readEventsFile(path)
@@ -268,7 +267,7 @@ func reportCmd(args []string) error {
 				return fmt.Errorf("%s: %w", path, err)
 			}
 			events = evs
-			reps = append(reps, rlbench.Build(evs))
+			reps = append(reps, swebench.Build(evs))
 			continue
 		}
 		rep, err := summarizeFile(path)
@@ -283,7 +282,7 @@ func reportCmd(args []string) error {
 		if *unresolvedOut != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" {
 			return fmt.Errorf("-unresolved, -cache-before, -cache-after and -restore-log take one events file")
 		}
-		rlbench.WriteComparison(os.Stdout, reps, files)
+		swebench.WriteComparison(os.Stdout, reps, files)
 		if *jsonOut != "" {
 			b, err := json.MarshalIndent(reps, "", "  ")
 			if err != nil {
@@ -314,12 +313,12 @@ func reportCmd(args []string) error {
 		if err != nil {
 			return err
 		}
-		timings, err := rlbench.ParseRestoreTimings(f)
+		timings, err := swebench.ParseRestoreTimings(f)
 		f.Close()
 		if err != nil {
 			return fmt.Errorf("%s: %w", *restoreLog, err)
 		}
-		rep.Restores = rlbench.JoinRestores(events, timings)
+		rep.Restores = swebench.JoinRestores(events, timings)
 	}
 	rep.WriteText(os.Stdout)
 	if *unresolvedOut != "" {
@@ -353,31 +352,31 @@ func leadingFiles(args []string) (files, rest []string) {
 	return args, nil
 }
 
-func summarizeFile(path string) (*rlbench.Report, error) {
+func summarizeFile(path string) (*swebench.Report, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	return rlbench.Summarize(f)
+	return swebench.Summarize(f)
 }
 
-func readEventsFile(path string) ([]rlbench.Event, error) {
+func readEventsFile(path string) ([]swebench.Event, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	return rlbench.ReadEvents(f)
+	return swebench.ReadEvents(f)
 }
 
-func loadCacheSample(path string) (*rlbench.NodeCacheSample, error) {
+func loadCacheSample(path string) (*swebench.NodeCacheSample, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	s, err := rlbench.ParseNodeCacheSample(f)
+	s, err := swebench.ParseNodeCacheSample(f)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}

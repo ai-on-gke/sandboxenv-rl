@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package rlbench
+package swebench
 
 import (
 	"bytes"
@@ -23,7 +23,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"text/template"
@@ -35,14 +34,8 @@ import (
 //go:embed trajectories/*
 var trajectoryFS embed.FS
 
-// DefaultTrajectory returns the default built-in trajectory name from the
-// default dataset adapter when registered, or "workload-file-read" otherwise.
-func DefaultTrajectory() string {
-	if a := AdapterFor(DefaultKind); a != nil && a.DefaultTrajectory() != "" {
-		return a.DefaultTrajectory()
-	}
-	return "workload-file-read"
-}
+// DefaultTrajectory is the built-in trajectory used when none is given.
+const DefaultTrajectory = "swebench-gold"
 
 // Duration is a time.Duration that decodes from a string such as "1s".
 type Duration time.Duration
@@ -67,7 +60,7 @@ func (d Duration) MarshalJSON() ([]byte, error) {
 }
 
 // WriteSpec puts a file into the sandbox. Content is a template over the
-// Instance, so a step can write task material or scripts.
+// Instance, so a step can write the gold patch or the eval script.
 type WriteSpec struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
@@ -110,9 +103,8 @@ type Step struct {
 	// Reward step never fails the task on exit code: its exit code is the
 	// reward.
 	ExpectExit *int `json:"expect_exit,omitempty"`
-	// Reward marks the step whose exit code (or adapter Grader output)
-	// decides the task reward: 1 when resolved, else 0. At most one step
-	// per trajectory.
+	// Reward marks the step whose exit code decides the task reward:
+	// 1 when it exits 0, else 0. At most one step per trajectory.
 	Reward bool `json:"reward,omitempty"`
 }
 
@@ -124,52 +116,32 @@ type Trajectory struct {
 	// Reset returns to.
 	Setup []Step `json:"setup,omitempty"`
 	// Reset runs before Steps on every later step an environment survives
-	// into, so a rollout starts from the image's state again.
+	// into, so a rollout starts from the image's state again (the gold patch
+	// cannot be applied twice).
 	Reset []Step `json:"reset,omitempty"`
 	Steps []Step `json:"steps"`
 }
 
-func trajectorySources() []fs.FS {
-	var sources []fs.FS
-	if sub, err := fs.Sub(trajectoryFS, "trajectories"); err == nil {
-		sources = append(sources, sub)
-	}
-	adaptersMu.RLock()
-	defer adaptersMu.RUnlock()
-	for _, a := range adapters {
-		if tfs := a.Trajectories(); tfs != nil {
-			sources = append(sources, tfs)
-		}
-	}
-	return sources
-}
-
-// Names lists all built-in trajectories across the core package and any
-// registered dataset adapters.
+// Names lists the built-in trajectories.
 func Names() []string {
-	seen := map[string]bool{}
+	entries, err := fs.ReadDir(trajectoryFS, "trajectories")
+	if err != nil {
+		return nil
+	}
 	var names []string
-	for _, src := range trajectorySources() {
-		entries, err := fs.ReadDir(src, ".")
-		if err != nil {
-			continue
-		}
-		for _, e := range entries {
-			if n, ok := strings.CutSuffix(e.Name(), ".yaml"); ok && !seen[n] {
-				seen[n] = true
-				names = append(names, n)
-			}
+	for _, e := range entries {
+		if n, ok := strings.CutSuffix(e.Name(), ".yaml"); ok {
+			names = append(names, n)
 		}
 	}
-	sort.Strings(names)
 	return names
 }
 
 // LoadTrajectory returns a built-in trajectory by name or one read from a
-// file when source names an existing path. Empty means DefaultTrajectory().
+// file when source names an existing path. Empty means DefaultTrajectory.
 func LoadTrajectory(source string) (*Trajectory, error) {
 	if source == "" {
-		source = DefaultTrajectory()
+		source = DefaultTrajectory
 	}
 	if data, err := os.ReadFile(source); err == nil {
 		dir := filepath.Dir(source)
@@ -177,16 +149,13 @@ func LoadTrajectory(source string) (*Trajectory, error) {
 			return os.ReadFile(filepath.Join(dir, name))
 		})
 	}
-	for _, src := range trajectorySources() {
-		data, err := fs.ReadFile(src, source+".yaml")
-		if err == nil {
-			s := src
-			return parseWithAssets(data, func(name string) ([]byte, error) {
-				return fs.ReadFile(s, name)
-			})
-		}
+	data, err := trajectoryFS.ReadFile("trajectories/" + source + ".yaml")
+	if err != nil {
+		return nil, fmt.Errorf("no file or built-in trajectory %q (built-in: %s)", source, strings.Join(Names(), ", "))
 	}
-	return nil, fmt.Errorf("no file or built-in trajectory %q (built-in: %s)", source, strings.Join(Names(), ", "))
+	return parseWithAssets(data, func(name string) ([]byte, error) {
+		return trajectoryFS.ReadFile("trajectories/" + name)
+	})
 }
 
 // parseWithAssets parses the trajectory and resolves every write.file
@@ -289,8 +258,11 @@ func (s Step) validate() error {
 	return nil
 }
 
-// Grades reports whether the trajectory uses dataset grading material,
-// consulting any registered dataset adapters.
+// Grades reports whether the trajectory uses the instance's grading
+// material as determined by any registered dataset adapter (for SWE-bench: a
+// step references the eval script or the log parser, or hands the whole
+// instance to a script). Such a trajectory needs RequireGrading on its
+// dataset.
 func (t *Trajectory) Grades() bool {
 	adaptersMu.RLock()
 	defer adaptersMu.RUnlock()
@@ -315,11 +287,18 @@ func (t *Trajectory) HasReward() bool {
 // Render evaluates every template in the trajectory against in and returns
 // the concrete copy to replay. The original is not modified.
 func (t *Trajectory) Render(in Instance) (*Trajectory, error) {
-	data, err := templateData(in)
-	if err != nil {
-		return nil, err
+	var data any = in
+	if in.Kind != "" && in.Kind != DefaultKind {
+		if a := AdapterFor(in.Kind); a != nil {
+			var err error
+			data, err = a.TemplateData(in)
+			if err != nil {
+				return nil, fmt.Errorf("trajectory %s instance %s: %w", t.Name, in.InstanceID, err)
+			}
+		}
 	}
 	out := &Trajectory{Name: t.Name}
+	var err error
 	if out.Setup, err = renderSteps(t.Name, t.Setup, data); err != nil {
 		return nil, err
 	}
@@ -330,46 +309,6 @@ func (t *Trajectory) Render(in Instance) (*Trajectory, error) {
 		return nil, err
 	}
 	return out, nil
-}
-
-func templateData(in Instance) (any, error) {
-	if a := AdapterFor(in.Kind); a != nil {
-		return a.TemplateData(in)
-	}
-	if len(in.Material) > 0 {
-		var m map[string]any
-		if err := json.Unmarshal(in.Material, &m); err != nil {
-			return nil, err
-		}
-		if m == nil {
-			m = map[string]any{}
-		}
-		m["InstanceID"] = in.InstanceID
-		m["Image"] = in.Image
-		m["instance_id"] = in.InstanceID
-		m["image"] = in.Image
-		for k, v := range m {
-			if pascal := snakeToPascal(k); pascal != "" && pascal != k {
-				if _, exists := m[pascal]; !exists {
-					m[pascal] = v
-				}
-			}
-		}
-		return m, nil
-	}
-	return in, nil
-}
-
-func snakeToPascal(s string) string {
-	parts := strings.Split(s, "_")
-	var b strings.Builder
-	for _, p := range parts {
-		if p == "" {
-			continue
-		}
-		b.WriteString(strings.ToUpper(p[:1]) + p[1:])
-	}
-	return b.String()
 }
 
 func renderSteps(tname string, steps []Step, data any) ([]Step, error) {

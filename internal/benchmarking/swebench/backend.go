@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package rlbench
+package swebench
 
 import (
 	"bytes"
@@ -94,12 +94,13 @@ type EnvBackend struct {
 // NewEnvBackend dials the ate-env API over connections connections (at
 // least one). Environments are created in atespace from baseTemplate with
 // the task image as rootfs; the API derives and bakes one template per
-// distinct image on first use.
-func NewEnvBackend(endpoint, atespace, baseTemplate string, connections int, opts ...EnvBackendOption) (*EnvBackend, error) {
+// distinct image on first use. A non-empty authToken is sent as the bearer
+// token on each call, for an ate-env-api that runs with -auth-token-file.
+func NewEnvBackend(endpoint, atespace, baseTemplate string, connections int, authToken string, opts ...EnvBackendOption) (*EnvBackend, error) {
 	if connections < 1 {
 		connections = 1
 	}
-	b := &EnvBackend{atespace: atespace, baseTemplate: baseTemplate}
+	b := &EnvBackend{atespace: atespace, baseTemplate: baseTemplate, authToken: authToken}
 	for _, opt := range opts {
 		opt(b)
 	}

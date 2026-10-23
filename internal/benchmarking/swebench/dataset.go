@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package rlbench
+package swebench
 
 import (
 	"bufio"
@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"net/http"
 	"os"
 	"regexp"
@@ -42,12 +41,12 @@ type Grader interface {
 	Parse(stdout []byte) (reward *int, detail string, err error)
 }
 
-// Adapter plugs a dataset kind (such as "swebench") into the dataset-agnostic
-// rlbench core.
+// Adapter plugs a dataset kind (such as "swebench" or a trace-replayed dataset)
+// into the benchmark runner and reporter.
 type Adapter interface {
 	// Kind returns the dataset identifier matched against Instance.Kind.
 	Kind() string
-	// Validate checks any dataset-specific invariants on in.Material.
+	// Validate checks any dataset-specific invariants on in.
 	Validate(in Instance) error
 	// RequireGrading checks that in carries the material needed by a grading
 	// trajectory.
@@ -61,13 +60,6 @@ type Adapter interface {
 	// Grader returns the output parser for reward steps of this dataset kind,
 	// or nil when exit code alone decides the reward.
 	Grader() Grader
-	// Trajectories returns an optional embedded filesystem of built-in
-	// trajectories (<name>.yaml and companion assets) contributed by this
-	// adapter.
-	Trajectories() fs.FS
-	// DefaultTrajectory names the default built-in trajectory for this dataset
-	// kind, or "".
-	DefaultTrajectory() string
 }
 
 var (
@@ -99,62 +91,139 @@ func AdapterFor(kind string) Adapter {
 	return adapters[kind]
 }
 
-// Instance is one benchmark task in a dataset manifest: the unique instance
-// id, the digest-pinned sandbox image, the dataset kind (defaulting to
-// DefaultKind), and the opaque dataset-specific JSON payload consumed by
-// trajectory templates and dataset adapters.
-type Instance struct {
-	InstanceID string `json:"instance_id"`
-	// Image is the task image, pinned by digest (repo@sha256:...). Substrate
-	// requires pinned images because changing the image invalidates snapshots.
-	Image    string          `json:"image"`
-	Kind     string          `json:"kind,omitempty"`
-	Material json.RawMessage `json:"material,omitempty"`
+func init() {
+	RegisterAdapter(SWEBenchAdapter{})
 }
 
-// UnmarshalJSON decodes a manifest row. Rows may either nest dataset-specific
-// fields under "material" or place them at the top level alongside
-// "instance_id" and "image"; when "kind" is omitted it defaults to DefaultKind.
-func (in *Instance) UnmarshalJSON(b []byte) error {
-	var wire struct {
-		InstanceID string          `json:"instance_id"`
-		Image      string          `json:"image"`
-		Kind       string          `json:"kind"`
-		Material   json.RawMessage `json:"material"`
+// errNoVerdict indicates that a reward step's output did not end with a
+// swebench-grade.py JSON line.
+var errNoVerdict = errors.New("no swebench grader JSON in output")
+
+// SWEBenchGrader parses swebench-grade.py JSON lines
+// ({"valid","resolved","f2p","p2p"}) into a 0/1 reward and a
+// "f2p A/B p2p C/D" or "invalid run" detail string.
+type SWEBenchGrader struct{}
+
+// Parse implements Grader.
+func (SWEBenchGrader) Parse(stdout []byte) (reward *int, detail string, err error) {
+	s := string(stdout)
+	i := strings.LastIndex(s, `{"valid"`)
+	if i < 0 {
+		return nil, "", errNoVerdict
 	}
-	if err := json.Unmarshal(b, &wire); err != nil {
-		return err
+	var g struct {
+		Valid    bool   `json:"valid"`
+		Resolved *bool  `json:"resolved"`
+		F2P      string `json:"f2p"`
+		P2P      string `json:"p2p"`
 	}
-	if wire.Kind == "" {
-		wire.Kind = DefaultKind
+	if err := json.Unmarshal([]byte(strings.TrimSpace(s[i:])), &g); err != nil {
+		return nil, "", err
 	}
-	in.InstanceID = wire.InstanceID
-	in.Image = wire.Image
-	in.Kind = wire.Kind
-	if len(wire.Material) > 0 && string(wire.Material) != "null" {
-		in.Material = append(json.RawMessage(nil), wire.Material...)
-	} else {
-		in.Material = append(json.RawMessage(nil), b...)
+	if !g.Valid {
+		r := 0
+		return &r, "invalid run", nil
+	}
+	if g.Resolved != nil {
+		r := 0
+		if *g.Resolved {
+			r = 1
+		}
+		reward = &r
+	}
+	return reward, fmt.Sprintf("f2p %s p2p %s", g.F2P, g.P2P), nil
+}
+
+// SWEBenchAdapter is the built-in default Adapter for SWE-bench manifests.
+type SWEBenchAdapter struct{}
+
+// Kind implements Adapter.
+func (SWEBenchAdapter) Kind() string { return DefaultKind }
+
+// Validate implements Adapter.
+func (SWEBenchAdapter) Validate(Instance) error { return nil }
+
+// RequireGrading checks that in carries an eval_script and a log_parser, as
+// required by a grading SWE-bench trajectory.
+func (SWEBenchAdapter) RequireGrading(in Instance) error {
+	switch {
+	case in.EvalScript == "":
+		return fmt.Errorf("%s: eval_script is required by a grading trajectory", in.InstanceID)
+	case in.LogParser == "":
+		return fmt.Errorf("%s: log_parser is required by a grading trajectory", in.InstanceID)
 	}
 	return nil
 }
 
-// MarshalJSON encodes the instance back to a flat JSON object merging Material
-// with InstanceID, Image, and Kind so "{{json .}}" in templates produces the
-// full instance record.
-func (in Instance) MarshalJSON() ([]byte, error) {
-	m := map[string]any{}
-	if len(in.Material) > 0 {
-		if err := json.Unmarshal(in.Material, &m); err != nil {
-			return nil, err
+// TemplateData implements Adapter.
+func (SWEBenchAdapter) TemplateData(in Instance) (any, error) { return in, nil }
+
+// Grades reports whether t references SWE-bench grading material (.EvalScript,
+// .LogParser, or the full instance JSON).
+func (SWEBenchAdapter) Grades(t *Trajectory) bool {
+	for _, steps := range [][]Step{t.Setup, t.Reset, t.Steps} {
+		for _, s := range steps {
+			texts := []string{s.Run}
+			if s.Write != nil {
+				texts = append(texts, s.Write.Content)
+			}
+			for _, text := range texts {
+				if strings.Contains(text, ".EvalScript") || strings.Contains(text, ".LogParser") || strings.Contains(text, "json .}}") {
+					return true
+				}
+			}
 		}
 	}
-	m["instance_id"] = in.InstanceID
-	m["image"] = in.Image
-	if in.Kind != "" && in.Kind != DefaultKind {
-		m["kind"] = in.Kind
+	return false
+}
+
+// Grader implements Adapter.
+func (SWEBenchAdapter) Grader() Grader { return SWEBenchGrader{} }
+
+// Instance is one SWE-bench (or custom dataset) task: the digest-pinned task
+// image and the material a trajectory needs to evaluate it. The manifest is
+// produced by benchmarking/swebench/make-dataset.py, one JSON object per line.
+type Instance struct {
+	InstanceID string `json:"instance_id"`
+	Repo       string `json:"repo,omitempty"`
+	// Image is the task image, pinned by digest (repo@sha256:...). Substrate
+	// requires pinned images because changing the image invalidates snapshots.
+	Image string `json:"image"`
+	// Kind identifies the dataset adapter (defaults to DefaultKind when empty).
+	Kind string `json:"kind,omitempty"`
+	// Material holds optional raw dataset-specific JSON for non-default
+	// dataset kinds.
+	Material json.RawMessage `json:"material,omitempty"`
+	// Patch is the gold patch; applying it makes FailToPass pass.
+	Patch string `json:"patch,omitempty"`
+	// TestPatch adds or changes the tests that check the fix.
+	TestPatch string `json:"test_patch,omitempty"`
+	// EvalScript is the SWE-bench harness eval script for this instance: it
+	// applies TestPatch, runs the repo's test command and restores the test
+	// files. Exit code 0 means every selected test passed.
+	EvalScript string   `json:"eval_script,omitempty"`
+	FailToPass []string `json:"fail_to_pass,omitempty"`
+	PassToPass []string `json:"pass_to_pass,omitempty"`
+	// LogParser names the SWE-bench harness parser for this repo's test
+	// output (parse_log_pytest, parse_log_django, ...); EvalType is
+	// pass_and_fail or fail_only. Both come from the dataset row.
+	LogParser string `json:"log_parser,omitempty"`
+	EvalType  string `json:"eval_type,omitempty"`
+}
+
+// UnmarshalJSON decodes a manifest row, preserving raw JSON in Material when a
+// non-default Kind is specified without an explicit "material" sub-object.
+func (in *Instance) UnmarshalJSON(b []byte) error {
+	type plain Instance
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
 	}
-	return json.Marshal(m)
+	*in = Instance(p)
+	if in.Kind != "" && in.Kind != DefaultKind && (len(in.Material) == 0 || string(in.Material) == "null") {
+		in.Material = append(json.RawMessage(nil), b...)
+	}
+	return nil
 }
 
 var digestPinned = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
@@ -175,9 +244,12 @@ func (in Instance) Validate() error {
 	return nil
 }
 
-// RequireGrading checks that every instance carries what a grading trajectory
-// needs via its dataset adapter, so a missing field is a configuration error
-// before the run rather than a reward of zero after it.
+// RequireGrading checks that every instance carries what a grading
+// trajectory needs (an eval script and a log parser for SWE-bench), so a
+// missing field is a configuration error before the run and not a reward of
+// zero after it. A trajectory that only exercises the image (a pull or compile
+// workload) does not need them, so this is applied only when the trajectory
+// grades.
 func RequireGrading(instances []Instance) error {
 	for _, in := range instances {
 		a := AdapterFor(in.Kind)

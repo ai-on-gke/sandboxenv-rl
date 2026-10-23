@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package rlbench
+package swebench
 
 import (
 	"bytes"
@@ -152,7 +152,8 @@ func (s *fakeSandbox) Delete(ctx context.Context) error {
 func instances(n int) []Instance {
 	out := make([]Instance, n)
 	for i := range out {
-		out[i] = makeInstance("repo__repo-"+string(rune('a'+i)), "PATCH", "EVAL")
+		out[i] = Instance{InstanceID: "repo__repo-" + string(rune('a'+i)), Image: "reg/img@" + goodDigest,
+			Patch: "PATCH", EvalScript: "EVAL"}
 	}
 	return out
 }
@@ -622,7 +623,7 @@ func TestStepsFailedDeleteParkDoesNotLeak(t *testing.T) {
 }
 
 func TestValidateChecksTheLongestName(t *testing.T) {
-	long := makeInstance(strings.Repeat("a", 40), "P", "E")
+	long := Instance{InstanceID: strings.Repeat("a", 40), Image: "reg/img@" + goodDigest, Patch: "P", EvalScript: "E"}
 	base := func() Config {
 		cfg := baseConfig(t, newFake(), nil)
 		cfg.RunID = strings.Repeat("r", maxRunIDLen)
@@ -676,9 +677,7 @@ func (zeroRewardAdapter) Kind() string                  { return "zero-reward-te
 func (zeroRewardAdapter) Validate(Instance) error       { return nil }
 func (zeroRewardAdapter) RequireGrading(Instance) error { return nil }
 func (zeroRewardAdapter) TemplateData(in Instance) (any, error) {
-	var m map[string]any
-	_ = json.Unmarshal(in.Material, &m)
-	return map[string]any{"InstanceID": in.InstanceID, "Patch": m["patch"], "EvalScript": m["eval_script"]}, nil
+	return in, nil
 }
 func (zeroRewardAdapter) Grades(t *Trajectory) bool {
 	for _, steps := range [][]Step{t.Setup, t.Reset, t.Steps} {
@@ -690,9 +689,7 @@ func (zeroRewardAdapter) Grades(t *Trajectory) bool {
 	}
 	return false
 }
-func (zeroRewardAdapter) Grader() Grader            { return zeroRewardGrader{} }
-func (zeroRewardAdapter) Trajectories() fs.FS       { return nil }
-func (zeroRewardAdapter) DefaultTrajectory() string { return "" }
+func (zeroRewardAdapter) Grader() Grader { return zeroRewardGrader{} }
 
 func TestGraderRewardOverridesZeroExitCode(t *testing.T) {
 	RegisterAdapter(zeroRewardAdapter{})
@@ -702,8 +699,7 @@ func TestGraderRewardOverridesZeroExitCode(t *testing.T) {
 	cfg := baseConfig(t, f, &out)
 	cfg.Mode = ModeEval
 	cfg.TasksPerImage = 1
-	inst := makeInstance("repo__repo-a", "PATCH", "EVAL")
-	inst.Kind = "zero-reward-test"
+	inst := Instance{InstanceID: "repo__repo-a", Image: "reg/img@" + goodDigest, Kind: "zero-reward-test", Patch: "PATCH", EvalScript: "EVAL"}
 	cfg.Instances = []Instance{inst}
 	// Reward step runs "echo RESOLVED=0" (exit code 0), and the adapter's Grader returns reward=0.
 	cfg.Trajectory = testTrajectory(t, "echo RESOLVED=0")

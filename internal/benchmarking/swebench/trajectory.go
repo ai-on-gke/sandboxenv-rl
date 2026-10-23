@@ -120,6 +120,9 @@ type Trajectory struct {
 	// cannot be applied twice).
 	Reset []Step `json:"reset,omitempty"`
 	Steps []Step `json:"steps"`
+	// Vars are the operator's -set KEY=VALUE values, read by the var
+	// template function; not part of the YAML.
+	Vars map[string]string `json:"-"`
 }
 
 // Names lists the built-in trajectories.
@@ -292,32 +295,32 @@ func (t *Trajectory) HasReward() bool {
 // Render evaluates every template in the trajectory against in and returns
 // the concrete copy to replay. The original is not modified.
 func (t *Trajectory) Render(in Instance) (*Trajectory, error) {
-	out := &Trajectory{Name: t.Name}
+	out := &Trajectory{Name: t.Name, Vars: t.Vars}
 	var err error
-	if out.Setup, err = renderSteps(t.Name, t.Setup, in); err != nil {
+	if out.Setup, err = renderSteps(t.Name, t.Setup, in, t.Vars); err != nil {
 		return nil, err
 	}
-	if out.Reset, err = renderSteps(t.Name, t.Reset, in); err != nil {
+	if out.Reset, err = renderSteps(t.Name, t.Reset, in, t.Vars); err != nil {
 		return nil, err
 	}
-	if out.Steps, err = renderSteps(t.Name, t.Steps, in); err != nil {
+	if out.Steps, err = renderSteps(t.Name, t.Steps, in, t.Vars); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func renderSteps(tname string, steps []Step, in Instance) ([]Step, error) {
+func renderSteps(tname string, steps []Step, in Instance, vars map[string]string) ([]Step, error) {
 	out := make([]Step, len(steps))
 	for i, s := range steps {
 		r := s
 		var err error
-		if r.Run, err = renderText(s.Run, in); err != nil {
+		if r.Run, err = renderText(s.Run, in, vars); err != nil {
 			return nil, fmt.Errorf("trajectory %s step %s run: %w", tname, s.Name, err)
 		}
 		if s.Write != nil {
 			w := *s.Write
 			if !w.raw {
-				if w.Content, err = renderText(s.Write.Content, in); err != nil {
+				if w.Content, err = renderText(s.Write.Content, in, vars); err != nil {
 					return nil, fmt.Errorf("trajectory %s step %s write: %w", tname, s.Name, err)
 				}
 			}
@@ -328,20 +331,34 @@ func renderSteps(tname string, steps []Step, in Instance) ([]Step, error) {
 	return out, nil
 }
 
-// templateFuncs are available in step templates. json renders a value as
-// JSON, for handing an instance's fields to a script in the sandbox.
-var templateFuncs = template.FuncMap{
-	"json": func(v any) (string, error) {
-		b, err := json.Marshal(v)
-		return string(b), err
-	},
+// templateFuncs returns the functions available in step templates. json
+// renders a value as JSON, for handing an instance's fields to a script in
+// the sandbox. var reads an operator value (-set KEY=VALUE): the value when
+// set, else the default given as the second argument, else an error, so a
+// workload names its knobs and their defaults in one place.
+func templateFuncs(vars map[string]string) template.FuncMap {
+	return template.FuncMap{
+		"json": func(v any) (string, error) {
+			b, err := json.Marshal(v)
+			return string(b), err
+		},
+		"var": func(name string, def ...string) (string, error) {
+			if v, ok := vars[name]; ok {
+				return v, nil
+			}
+			if len(def) > 0 {
+				return def[0], nil
+			}
+			return "", fmt.Errorf("variable %s is not set and has no default; pass -set %s=VALUE", name, name)
+		},
+	}
 }
 
-func renderText(text string, in Instance) (string, error) {
+func renderText(text string, in Instance, vars map[string]string) (string, error) {
 	if !strings.Contains(text, "{{") {
 		return text, nil
 	}
-	tmpl, err := template.New("step").Option("missingkey=error").Funcs(templateFuncs).Parse(text)
+	tmpl, err := template.New("step").Option("missingkey=error").Funcs(templateFuncs(vars)).Parse(text)
 	if err != nil {
 		return "", err
 	}

@@ -25,6 +25,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -179,19 +181,29 @@ func datasetLabel(dataset string) string {
 
 // ownLabels are the loader's labels that only the command line knows (the
 // rest come from Config.labels); every key is in swebench.LoaderLabelKeys.
-func ownLabels(dataset string, connections int, baseTemplate, excludeFile string, instances []string) map[string]string {
+// The exclude file and the instance list are named by their file name or
+// count plus a digest of their ids, so two lists of one length differ.
+func ownLabels(dataset string, connections int, baseTemplate, excludeFile string, exclude, instances []string) map[string]string {
 	l := map[string]string{
 		"dataset":       datasetLabel(dataset),
 		"connections":   strconv.Itoa(connections),
 		"base_template": baseTemplate,
 	}
 	if excludeFile != "" {
-		l["exclude_file"] = filepath.Base(excludeFile)
+		l["exclude_file"] = filepath.Base(excludeFile) + "@" + idsDigest(exclude)
 	}
 	if len(instances) > 0 {
-		l["instances"] = strconv.Itoa(len(instances))
+		l["instances"] = strconv.Itoa(len(instances)) + "@" + idsDigest(instances)
 	}
 	return l
+}
+
+// idsDigest is the first eight hex digits of the SHA-256 of the sorted ids.
+func idsDigest(ids []string) string {
+	sorted := slices.Clone(ids)
+	slices.Sort(sorted)
+	sum := sha256.Sum256([]byte(strings.Join(sorted, "\n")))
+	return hex.EncodeToString(sum[:4])
 }
 
 func usage() {
@@ -318,7 +330,7 @@ func runCmd(args []string) (retErr error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	for k, v := range ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, ids) {
+	for k, v := range ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids) {
 		if _, ok := labels[k]; !ok {
 			labels[k] = v
 		}
@@ -360,7 +372,7 @@ func reportCmd(args []string, w io.Writer) error {
 	files, rest := leadingFiles(args)
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
 	var arms armFlags
-	fs.Var(&arms, "arm", "NAME=FILE[,FILE...], repeatable: one column per arm, in flag order, its percentiles computed over the merged raw events of its files, the reps of one cluster or build, which must be complete runs of one workload (same loader labels, distinct run ids). A path may not contain a comma. No positional files with -arm.")
+	fs.Var(&arms, "arm", "NAME=FILE[,FILE...], repeatable: one column per arm, in flag order, its percentiles computed over the merged raw events of its files, the reps of one cluster or build, which must be complete runs of one workload (same loader labels, distinct run ids, a run in one arm only). A path may not contain a comma. No positional files with -arm.")
 	top := fs.Int("top", 0, "List the N slowest successful first commands and wakes by environment. One file only.")
 	jsonOut := fs.String("json", "", "Also write the summary as JSON to this path (an array when several files are given).")
 	unresolvedOut := fs.String("unresolved", "", "Write the unresolved instances to this path in -exclude-file format; one file only.")
@@ -508,6 +520,7 @@ func loadCacheSample(path string) (*swebench.NodeCacheSample, error) {
 func reportArms(arms armFlags, jsonOut string, w io.Writer) error {
 	names := make([]string, 0, len(arms))
 	reps := make([]*swebench.Report, 0, len(arms))
+	owner := map[string]string{} // run id -> the arm that has it
 	for _, a := range arms {
 		runs := make([][]swebench.Event, 0, len(a.files))
 		for _, file := range a.files {
@@ -520,6 +533,12 @@ func reportArms(arms armFlags, jsonOut string, w io.Writer) error {
 		rep, err := swebench.Pool(runs)
 		if err != nil {
 			return fmt.Errorf("arm %s: %w", a.name, err)
+		}
+		for _, id := range rep.Runs {
+			if other, dup := owner[id]; dup {
+				return fmt.Errorf("run %s is in arms %s and %s; a run belongs to one arm", id, other, a.name)
+			}
+			owner[id] = a.name
 		}
 		rep.RunID = a.name
 		names = append(names, a.name)

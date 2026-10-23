@@ -74,8 +74,10 @@ type Report struct {
 	RunID string `json:"run"`
 	Mode  string `json:"mode,omitempty"`
 	// Reps is how many runs the report pools, the run events it saw: one for
-	// a file, the reps of an arm under report -arm (see Pool).
+	// a file, the reps of an arm under report -arm (see Pool). Runs lists
+	// their run ids in order.
 	Reps       int        `json:"reps,omitempty"`
+	Runs       []string   `json:"runs,omitempty"`
 	RunMS      float64    `json:"run_ms,omitempty"`
 	Tasks      int        `json:"tasks"`
 	Failed     int        `json:"failed"`
@@ -178,8 +180,10 @@ func Build(events []Event) *Report {
 	steps := map[int]*StepStat{}
 	wakes := map[int][]float64{}
 	// Per step, one value per run: a report built over the merged events of
-	// several runs (report -arm) takes the median, which is the value itself
-	// for one run. The run durations and labels pool the same way.
+	// several runs (report -arm) takes the median of durations, which is the
+	// value itself for one run, and the sum of counts, as the task counts
+	// and the event rows' n are sums. The run durations and labels pool the
+	// same way.
 	barriers := map[int][]float64{}
 	parks := map[int][]float64{}
 	lives := map[int][]float64{}
@@ -218,6 +222,7 @@ func Build(events []Event) *Report {
 		switch e.Event {
 		case EventRun:
 			rep.Reps++
+			rep.Runs = append(rep.Runs, e.RunID)
 			if rep.Mode == "" {
 				rep.Mode = e.Name
 			}
@@ -272,7 +277,9 @@ func Build(events []Event) *Report {
 		s.WakeP95MS = percentile(w, 0.95)
 		s.BarrierMS = median(barriers[step])
 		s.ParkMS = median(parks[step])
-		s.Live = int(median(lives[step]))
+		for _, n := range lives[step] {
+			s.Live += int(n)
+		}
 		rep.Steps = append(rep.Steps, *s)
 	}
 	sort.Slice(rep.Steps, func(i, j int) bool { return rep.Steps[i].Step < rep.Steps[j].Step })
@@ -332,8 +339,6 @@ func stepStat(m map[int]*StepStat, step int) *StepStat {
 	return s
 }
 
-// percentile of a sorted slice by the nearest-rank method, ceil(p*n)-1; 0
-// for an empty slice.
 // median sorts d and returns its middle value, or the mean of the two
 // middle values for an even count, so two reps of an arm pool to the value
 // between them rather than the lower one. 0 for no values.
@@ -375,11 +380,12 @@ func (u labelUnion) merged() map[string]string {
 
 // Pool builds one report over the reps of an arm: the raw events of every run
 // merged, so the percentiles are exact over all of them; per-step barrier,
-// park and live the median across the reps; the run duration the median of
-// the runs' durations; Reps the number of runs. The reps must be complete
-// runs, each with a run event, distinct runs, no run id twice, and one
-// workload: the labels in LoaderLabelKeys must agree. Operator labels may
-// differ and then show every value, "|"-joined.
+// park the median across the reps and live their sum; the run duration the
+// median of the runs' durations; Reps the number of runs and Runs their ids.
+// The reps must be complete runs, each with a run event and the loader's
+// labels, distinct runs, no run id twice, and one workload: the labels in
+// LoaderLabelKeys must agree. Operator labels may differ and then show every
+// value, "|"-joined.
 func Pool(runs [][]Event) (*Report, error) {
 	var all []Event
 	seen := map[string]int{}
@@ -396,6 +402,9 @@ func Pool(runs [][]Event) (*Report, error) {
 		if run == nil {
 			return nil, fmt.Errorf("rep %d has no run event: an interrupted run cannot be pooled", i+1)
 		}
+		if run.Labels["mode"] == "" {
+			return nil, fmt.Errorf("rep %d (run %q) has no loader labels: pool only runs whose loader labeled the run event", i+1, run.RunID)
+		}
 		if prev, dup := seen[run.RunID]; dup {
 			return nil, fmt.Errorf("rep %d repeats run id %q of rep %d", i+1, run.RunID, prev)
 		}
@@ -405,7 +414,7 @@ func Pool(runs [][]Event) (*Report, error) {
 		} else {
 			for _, k := range LoaderLabelKeys {
 				if shape[k] != run.Labels[k] {
-					return nil, fmt.Errorf("reps differ in %s (%q, %q): pool only reps of one workload", k, shape[k], run.Labels[k])
+					return nil, fmt.Errorf("rep %d differs from rep 1 in %s (%q, %q): pool only reps of one workload", i+1, k, run.Labels[k], shape[k])
 				}
 			}
 		}
@@ -414,6 +423,8 @@ func Pool(runs [][]Event) (*Report, error) {
 	return Build(all), nil
 }
 
+// percentile of a sorted slice by the nearest-rank method, ceil(p*n)-1; 0
+// for an empty slice.
 func percentile(sorted []float64, p float64) float64 {
 	n := len(sorted)
 	if n == 0 {
@@ -567,11 +578,16 @@ func WriteComparison(w io.Writer, reps []*Report, names []string) {
 	row("failed", func(r *Report) string { return fmt.Sprintf("%d", r.Failed) })
 	row("reward_rate", func(r *Report) string { return fmt.Sprintf("%.3f", r.RewardRate) })
 	row("run_s", func(r *Report) string { return fmt.Sprintf("%.1f", r.RunMS/1000) })
+	builtin := map[string]bool{"run": true, "mode": true, "reps": true, "tasks": true, "failed": true, "reward_rate": true, "run_s": true}
 	for _, k := range labelKeys(reps) {
-		if k == "mode" {
-			continue // the mode row above says it
+		if k == "mode" && labelMatchesMode(reps) {
+			continue // the loader's own label; the mode row above says it
 		}
-		row(k, func(r *Report) string {
+		name := k
+		if builtin[k] {
+			name = "label." + k // an operator label named like a built-in row
+		}
+		row(name, func(r *Report) string {
 			if v, ok := r.Labels[k]; ok {
 				return v
 			}
@@ -1101,6 +1117,17 @@ func spanStat(name string, d []float64) *PhaseStat {
 	}
 	sort.Float64s(d)
 	return &PhaseStat{Phase: name, Count: len(d), P50MS: percentile(d, 0.50), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1)}
+}
+
+// labelMatchesMode reports whether every report's mode label, where it has
+// one, is its mode: the loader's own label, which the mode row already shows.
+func labelMatchesMode(reps []*Report) bool {
+	for _, r := range reps {
+		if v, ok := r.Labels["mode"]; ok && v != r.Mode {
+			return false
+		}
+	}
+	return true
 }
 
 // labelKeys is the sorted union of the reports' label keys.

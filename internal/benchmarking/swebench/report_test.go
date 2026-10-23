@@ -155,7 +155,7 @@ func TestWriteComparison(t *testing.T) {
 		{RunID: "b", Event: EventCreate, DurMS: 70, OK: false, Err: "boom"},
 		{RunID: "b", Event: EventDelete, DurMS: 70, OK: false, Err: "boom"},
 		{RunID: "b", Event: EventTask, DurMS: 400, OK: true, Reward: intp(1)}, // eval mode: step 0
-		{RunID: "b", Event: EventRun, Name: "eval", DurMS: 1000, OK: true, Count: 1},
+		{RunID: "b", Event: EventRun, Name: "eval", DurMS: 1000, OK: true, Count: 1, Labels: map[string]string{"tasks": "operator"}},
 	})
 	var out bytes.Buffer
 	WriteComparison(&out, []*Report{a, b}, []string{"runs/a.jsonl", "runs/b.jsonl"})
@@ -174,6 +174,10 @@ func TestWriteComparison(t *testing.T) {
 	}
 	if !strings.Contains(flat, "mode steps eval reps 1 1") || strings.Count(flat, "mode ") != 1 {
 		t.Errorf("want one mode row (the label repeats it) and a reps row in:\n%s", text)
+	}
+	// An operator label named like a built-in row keeps its own row, prefixed.
+	if !strings.Contains(flat, "label.tasks - operator") || strings.Count(flat, " tasks ") != 2 {
+		t.Errorf("want a label.tasks row next to the tasks row in:\n%s", text)
 	}
 	// A run without the event, or without the step, shows a dash in its column.
 	for _, label := range []string{"ttfi", "step 1"} {
@@ -405,11 +409,12 @@ func TestBuildPoolsStepsAcrossRuns(t *testing.T) {
 		t.Fatalf("steps: %+v", rep.Steps)
 	}
 	s := rep.Steps[0]
-	if s.Tasks != 2 || s.BarrierMS != 700 || s.ParkMS != 200 || s.Live != 3 {
-		t.Fatalf("pooled step: %+v (want tasks 2, barrier 700, park 200, live 3: the mean of the two reps)", s)
+	// Counts add up, durations take the median.
+	if s.Tasks != 2 || s.Live != 6 || s.BarrierMS != 700 || s.ParkMS != 200 {
+		t.Fatalf("pooled step: %+v (want tasks 2, live 6, barrier 700, park 200)", s)
 	}
-	if rep.Reps != 2 || rep.RunMS != 1100 || rep.Mode != "steps" {
-		t.Fatalf("reps %d run_ms %v mode %q, want 2, 1100 (the median), steps", rep.Reps, rep.RunMS, rep.Mode)
+	if rep.Reps != 2 || strings.Join(rep.Runs, ",") != "r1,r2" || rep.RunMS != 1100 || rep.Mode != "steps" {
+		t.Fatalf("reps %d runs %v run_ms %v mode %q, want 2, r1,r2, 1100 (the median), steps", rep.Reps, rep.Runs, rep.RunMS, rep.Mode)
 	}
 	if rep.Labels["arm"] != "pull|other" {
 		t.Fatalf("a label that differs across the reps shows every value: %v", rep.Labels)
@@ -438,8 +443,8 @@ func TestPool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.Reps != 2 || rep.Labels["commit"] != "aaa|bbb" || rep.Labels["width"] != "2" {
-		t.Fatalf("pooled: reps %d labels %v", rep.Reps, rep.Labels)
+	if rep.Reps != 2 || strings.Join(rep.Runs, ",") != "r1,r2" || rep.Labels["commit"] != "aaa|bbb" || rep.Labels["width"] != "2" {
+		t.Fatalf("pooled: reps %d runs %v labels %v", rep.Reps, rep.Runs, rep.Labels)
 	}
 	for _, tc := range []struct {
 		name string
@@ -448,7 +453,8 @@ func TestPool(t *testing.T) {
 	}{
 		{"no run event", [][]Event{run("r1", same), {{RunID: "r2", Event: EventCreate, DurMS: 1, OK: true}}}, "rep 2 has no run event"},
 		{"run id twice", [][]Event{run("r1", same), run("r1", same)}, `rep 2 repeats run id "r1" of rep 1`},
-		{"other workload", [][]Event{run("r1", same), run("r2", map[string]string{"mode": "eval", "width": "3"})}, "reps differ in width"},
+		{"other workload", [][]Event{run("r1", same), run("r2", map[string]string{"mode": "eval", "width": "3"})}, `rep 2 differs from rep 1 in width ("3", "2")`},
+		{"no loader labels", [][]Event{run("r1", same), run("r2", nil)}, `rep 2 (run "r2") has no loader labels`},
 	} {
 		if _, err := Pool(tc.runs); err == nil || !strings.Contains(err.Error(), tc.err) {
 			t.Errorf("%s: err = %v, want %q", tc.name, err, tc.err)

@@ -210,7 +210,7 @@ func TestReportArms(t *testing.T) {
 	if err := json.Unmarshal(raw, &reps); err != nil {
 		t.Fatal(err)
 	}
-	if len(reps) != 2 || reps[0].RunID != "pull" || reps[0].Reps != 2 || reps[1].RunID != "stream" || reps[1].Reps != 1 {
+	if len(reps) != 2 || reps[0].RunID != "pull" || reps[0].Reps != 2 || strings.Join(reps[0].Runs, ",") != "r1,r2" || reps[1].RunID != "stream" || reps[1].Reps != 1 {
 		t.Fatalf("-json: %+v", reps)
 	}
 
@@ -222,7 +222,8 @@ func TestReportArms(t *testing.T) {
 		{"missing file", []string{"-arm", "pull=" + filepath.Join(dir, "nope.jsonl")}, "arm pull"},
 		{"empty arm", []string{"-arm", "pull="}, "want NAME=FILE[,FILE...]"},
 		{"file twice", []string{"-arm", "pull=" + a + "," + a}, "is given twice"},
-		{"other workload", []string{"-arm", "pull=" + a + "," + wide}, "reps differ in width"},
+		{"other workload", []string{"-arm", "pull=" + a + "," + wide}, "differs from rep 1 in width"},
+		{"run in two arms", []string{"-arm", "pull=" + a + "," + b, "-arm", "again=" + a}, "run r1 is in arms pull and again"},
 	} {
 		if err := reportCmd(tc.args, io.Discard); err == nil || !strings.Contains(err.Error(), tc.err) {
 			t.Errorf("%s: err = %v, want %q", tc.name, err, tc.err)
@@ -231,17 +232,22 @@ func TestReportArms(t *testing.T) {
 }
 
 func TestOwnLabels(t *testing.T) {
-	l := ownLabels("https://host/bucket/swebench.jsonl?X-Goog-Signature=secret", 4, "base", "lists/offline.txt", []string{"a", "b"})
-	want := map[string]string{"dataset": "swebench.jsonl", "connections": "4", "base_template": "base", "exclude_file": "offline.txt", "instances": "2"}
+	l := ownLabels("https://host/bucket/swebench.jsonl?X-Goog-Signature=secret", 4, "base", "lists/offline.txt", []string{"x", "y"}, []string{"a", "b"})
+	want := map[string]string{"dataset": "swebench.jsonl", "connections": "4", "base_template": "base",
+		"exclude_file": "offline.txt@" + idsDigest([]string{"x", "y"}), "instances": "2@" + idsDigest([]string{"a", "b"})}
 	if !reflect.DeepEqual(l, want) {
 		t.Fatalf("labels = %v, want %v", l, want)
+	}
+	// The digest tells two lists of one length apart and ignores their order.
+	if idsDigest([]string{"a", "b"}) != idsDigest([]string{"b", "a"}) || idsDigest([]string{"a", "b"}) == idsDigest([]string{"a", "c"}) || len(idsDigest(nil)) != 8 {
+		t.Errorf("idsDigest: %s %s %s", idsDigest([]string{"a", "b"}), idsDigest([]string{"b", "a"}), idsDigest([]string{"a", "c"}))
 	}
 	for k := range l {
 		if !slices.Contains(swebench.LoaderLabelKeys, k) {
 			t.Errorf("label %s is not in LoaderLabelKeys, so report -arm would not compare it", k)
 		}
 	}
-	l = ownLabels("data/swebench.jsonl", 1, "t", "", nil)
+	l = ownLabels("data/swebench.jsonl", 1, "t", "", nil, nil)
 	if _, ok := l["exclude_file"]; ok || l["dataset"] != "swebench.jsonl" || len(l) != 3 {
 		t.Fatalf("labels without an exclude file or instances = %v", l)
 	}

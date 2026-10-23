@@ -67,15 +67,20 @@ file, instances and the timeouts) plus any `run -label KEY=VALUE`, which is
 where the Substrate commit, the cluster and the arm go. The report prints
 them under its header, and the comparison shows one row per label key, so a
 column's provenance is in the table. `report -arm pull=p1.jsonl,p2.jsonl
--arm stream=s1.jsonl,s2.jsonl` gives one column per arm, in flag order, with
-the percentiles computed over the merged raw events of its files, never over
-per-run percentiles; per-step barrier, park and live and the run duration
-become the median across the reps (the mean of the two middle values for an
-even count), and a `reps` row says how many runs each column pools. The reps
-of an arm must be complete runs of one workload: each with a run event, no
-run id twice, and the loader's own labels equal; a `-label` value that
-differs across them shows every value `|`-joined, so a column that mixes
-commits says so. A path in `-arm` may not contain a comma. `report RUN.jsonl
+-arm stream=s1.jsonl,s2.jsonl` gives one column per arm, in flag order. Two
+rules pool an arm's reps: counts add up (tasks, failed, rewarded, a step's
+live environments, and the `n` of every event row, whose percentiles are
+computed over the merged raw events, never over per-run percentiles), and
+durations take the median across the reps (a step's barrier and park, and
+the run), the mean of the two middle values for an even count. A `reps` row
+says how many runs each column pools, and the JSON lists their run ids. The
+reps of an arm must be complete runs of one workload: each with a run event
+and the loader's labels, no run id twice or in two arms, and the loader's
+own labels equal (`exclude_file` and `instances` compare by name or count
+plus a digest of their ids); a `-label` value that differs across them shows
+every value `|`-joined, so a column that mixes commits says so. An operator
+label named like a built-in row (`tasks`, say) prints as `label.tasks`. A
+path in `-arm` may not contain a comma. `report RUN.jsonl
 -top 10` lists the ten slowest successful first commands and the ten slowest
 successful wakes by environment, for finding the straggler.
 

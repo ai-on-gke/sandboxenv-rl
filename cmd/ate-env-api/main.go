@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"io"
@@ -32,6 +33,7 @@ import (
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/mcp"
 	"github.com/agent-substrate/env/internal/portproxy"
+	"github.com/agent-substrate/env/internal/routertls"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"google.golang.org/grpc"
 )
@@ -53,10 +55,13 @@ func main() {
 		listen            = flag.String("listen", "0.0.0.0:7777", "address to serve the API on")
 		ateapi            = flag.String("ateapi", ate.DefaultControlAddr, "address of the ateapi gRPC control plane")
 		atenet            = flag.String("atenet", ate.DefaultRouterAddr, "address of the atenet HTTP router")
-		atenetConn        = flag.String("atenet-connect", ate.DefaultRouterConnectAddr, "address of the atenet router's plaintext CONNECT listener; HTTP requests carrying X-Env-Id and X-Env-Port, or to /v1alpha/envs/{id}/ports/{port}/..., are forwarded through it to that port in the environment. Without -auth-token-file the forwarding does not authenticate callers, and it reaches any port of any actor the router serves. Empty disables it")
+		atenetConn        = flag.String("atenet-connect", ate.DefaultRouterConnectAddr, "address of the atenet router's CONNECT listener: the TLS one (8444) with -atenet-client-cert, else the plaintext one that only a Substrate before v0.6.0 serves; HTTP requests carrying X-Env-Id and X-Env-Port, or to /v1alpha/envs/{id}/ports/{port}/..., are forwarded through it to that port in the environment. Without -auth-token-file the forwarding does not authenticate callers, and it reaches any port of any actor the router serves. Empty disables it")
 		ppOrigins         = flag.String("port-proxy-trusted-origins", "", "comma-separated browser origins (scheme://host[:port]) whose pages may use the port proxy's path form, next to the listener's own origin")
 		ppHeaderTimeout   = flag.Duration("port-proxy-response-header-timeout", 0, "how long the port proxy waits for a daemon's response headers; 0 means no limit, and the caller's deadline applies")
 		hostSuffix        = flag.String("host-suffix", ate.DefaultHostSuffix, "atenet router host suffix for actor routing")
+		atenetClientCert  = flag.String("atenet-client-cert", "", "PEM credential bundle (certificate chain and key) presented to the atenet router's TLS listeners: the pod identity bundle the kubelet projects. Substrate v0.6.0 serves only those listeners; with this flag, -atenet and -atenet-connect default to them (443 and 8444). The file is re-read at every handshake, so rotation needs no restart")
+		atenetCAFile      = flag.String("atenet-ca-file", "", "PEM trust bundle that signs the router's serving certificate (the servicedns bundle); required with -atenet-client-cert")
+		atenetServerName  = flag.String("atenet-server-name", "atenet-router.ate-system.svc", "name the router's serving certificate must carry; used with -atenet-client-cert")
 		skipVerify        = flag.Bool("skip-verify", true, "skip TLS certificate verification on the control plane connection")
 		tokenFile         = flag.String("ateapi-token-file", "", "file with a bearer token for the control plane, e.g. a projected ServiceAccount token with the ateapi audience")
 		authTokenFile     = flag.String("auth-token-file", "", "file with a bearer token required from gRPC, MCP and port-proxy callers; re-read when the file changes")
@@ -76,12 +81,43 @@ func main() {
 		log.Printf("WARNING: listening on %s without --auth-token-file; all gRPC, MCP and port-proxy callers are unauthenticated", *listen)
 	}
 
+	// With a client certificate the router is reached on its TLS listeners,
+	// the only ones a v0.6.0 Substrate serves; the plaintext defaults are
+	// replaced unless the operator named other addresses.
+	var routerTLS *tls.Config
+	var routerIdentity string
+	if *atenetClientCert != "" || *atenetCAFile != "" {
+		opts := routertls.Options{
+			CredentialBundleFile: *atenetClientCert,
+			TrustBundleFile:      *atenetCAFile,
+			ServerName:           *atenetServerName,
+		}
+		cfg, err := opts.Config()
+		if err != nil {
+			log.Fatalf("router TLS: %v", err)
+		}
+		routerTLS = cfg
+		if routerIdentity, err = opts.Identity(); err != nil {
+			log.Fatalf("router TLS: %v", err)
+		}
+		log.Printf("router TLS: presenting %s to the atenet router, whose --ingress-allowed-spiffe-ids (ATE_INGRESS_ALLOWED_SPIFFE_IDS for ate-setup) must list it", routerIdentity)
+		if *atenet == ate.DefaultRouterAddr {
+			*atenet = ate.DefaultRouterTLSAddr
+		}
+		if *atenetConn == ate.DefaultRouterConnectAddr {
+			*atenetConn = ate.DefaultRouterConnectTLSAddr
+		}
+	} else {
+		log.Printf("WARNING: no -atenet-client-cert: dialing the router's plaintext listeners (%s, CONNECT %q), which Substrate v0.6.0 and later do not serve", *atenet, *atenetConn)
+	}
+
 	client, err := ate.New(ate.Options{
 		ControlAddr:     *ateapi,
 		RouterAddr:      *atenet,
 		HostSuffix:      *hostSuffix,
 		SkipVerify:      *skipVerify,
 		BearerTokenFile: *tokenFile,
+		RouterTLS:       routerTLS,
 	})
 	if err != nil {
 		log.Fatalf("creating env client: %v", err)
@@ -102,6 +138,8 @@ func main() {
 	apisvc := apiservice.New(client, *atenet, *hostSuffix)
 	apisvc.WakeBudget = *wakeBudget
 	apisvc.WakeRunningBudget = *wakeRunningBudget
+	apisvc.RouterTLS = routerTLS
+	apisvc.RouterIdentity = routerIdentity
 	defer apisvc.Close()
 
 	var grpcOpts []grpc.ServerOption
@@ -140,6 +178,7 @@ func main() {
 		}
 		ppOpts := portproxy.Options{
 			ConnectAddr:           *atenetConn,
+			TLS:                   routerTLS,
 			HostSuffix:            *hostSuffix,
 			DefaultAtespace:       ate.DefaultAtespace,
 			ResponseHeaderTimeout: *ppHeaderTimeout,
@@ -178,7 +217,7 @@ func main() {
 		_ = srv.Shutdown(context.Background())
 	}()
 
-	log.Printf("ate-env-api listening on %s (ateapi %s, atenet %s, atenet CONNECT %q)", *listen, *ateapi, *atenet, *atenetConn)
+	log.Printf("ate-env-api listening on %s (ateapi %s, atenet %s, atenet CONNECT %q, router TLS %v)", *listen, *ateapi, *atenet, *atenetConn, routerTLS != nil)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server error: %v", err)
 	}

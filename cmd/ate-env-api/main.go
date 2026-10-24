@@ -67,6 +67,7 @@ func main() {
 		authTokenFile     = flag.String("auth-token-file", "", "file with a bearer token required from gRPC, MCP and port-proxy callers; re-read when the file changes")
 		wakeBudget        = flag.Duration("wake-budget", apiservice.DefaultWakeBudget, "how long a guest call or a port-proxy request waits for a suspended environment to wake before failing; cold image pulls and cross-region snapshot reads exceed the router's own parking budget")
 		wakeRunningBudget = flag.Duration("wake-running-budget", apiservice.DefaultWakeRunningBudget, "how long a guest call waits when the environment is already RUNNING but the router still answers Unavailable (guest not yet listening vs. path down)")
+		maxStreams        = flag.Int("max-concurrent-streams", DefaultMaxConcurrentStreams, "most concurrent HTTP/2 streams (gRPC calls) one client connection may have open; calls beyond it queue in the client. Go's default is 250, which a single trainer process reaches with a few hundred sandboxes, because every exec holds a stream for the whole command and its wake")
 	)
 	flag.Parse()
 
@@ -198,15 +199,7 @@ func main() {
 
 	// Enable both HTTP/1.1 (for /healthz and /v1alpha/ HTTP endpoints) and
 	// unencrypted HTTP/2 (h2c, for gRPC services) on the same plaintext TCP listener.
-	var protocols http.Protocols
-	protocols.SetHTTP1(true)
-	protocols.SetUnencryptedHTTP2(true)
-
-	srv := &http.Server{
-		Addr:      *listen,
-		Handler:   handler,
-		Protocols: &protocols,
-	}
+	srv := newHTTPServer(*listen, handler, *maxStreams)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -221,4 +214,30 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server error: %v", err)
 	}
+}
+
+// DefaultMaxConcurrentStreams is the default -max-concurrent-streams. Each
+// in-flight exec holds one stream for the whole command, including the wait
+// for a suspended environment to wake, so one trainer process with a few
+// hundred sandboxes reaches Go's built-in limit of 250 and its further calls
+// queue in the client before ate-env-api sees them.
+const DefaultMaxConcurrentStreams = 4096
+
+// newHTTPServer serves handler on addr over HTTP/1.1 (for /healthz and the
+// /v1alpha/ HTTP endpoints) and unencrypted HTTP/2 (h2c, for the gRPC
+// services) on one plaintext listener, allowing maxStreams concurrent HTTP/2
+// streams per client connection (Go's default when maxStreams <= 0).
+func newHTTPServer(addr string, handler http.Handler, maxStreams int) *http.Server {
+	var protocols http.Protocols
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
+	srv := &http.Server{
+		Addr:      addr,
+		Handler:   handler,
+		Protocols: &protocols,
+	}
+	if maxStreams > 0 {
+		srv.HTTP2 = &http.HTTP2Config{MaxConcurrentStreams: maxStreams}
+	}
+	return srv
 }

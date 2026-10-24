@@ -30,6 +30,7 @@ while this project adds the environment-shaped API on top.
 - **`clients/go`** — The Go client library to manage environments, run commands, and perform file operations.
 - **`clients/python`** — Python client for environment lifecycle management and batch sandbox orchestration ([README](clients/python/README.md)).
 - **`integrations/nemo-gym`** — A [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) sandbox provider that runs rollout sandboxes as environments, built on the Python client ([README](integrations/nemo-gym/README.md)).
+- **`integrations/uni-agent`** — A [uni-agent](https://github.com/verl-project/uni-agent) sandbox provider plus an R2E-Gym task graded by hidden tests in the same environment, with the SWE dataset and image tooling ([README](integrations/uni-agent/README.md)).
 
 ## Installation
 
@@ -444,7 +445,7 @@ For complete runnable Go programs:
 - **MCP**: See [mcp](examples/mcp/main.go) to connect to an environment's MCP endpoint, discover tools, and execute tool calls.
 - **Guest Daemon**: See [guest-daemon](examples/guest-daemon/main.go) to run a standalone in-actor gRPC service for asynchronous process execution and chunked file transfer.
 
-For using environments from a framework, see [integrations/nemo-gym](integrations/nemo-gym/README.md): a NeMo Gym sandbox provider registered through the `nemo_gym.sandbox_providers` entry point.
+For using environments from a framework, see [integrations/nemo-gym](integrations/nemo-gym/README.md): a NeMo Gym sandbox provider registered through the `nemo_gym.sandbox_providers` entry point, or [integrations/uni-agent](integrations/uni-agent/README.md): a uni-agent sandbox provider and task used by the agentic SWE training recipe in `examples/Qwen3.5-35B-A3B-verl`.
 
 ## Cleanup
 

@@ -1,0 +1,278 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""R2E-Gym adapter: R2E-Gym's ``RepoEnv`` on a sandbox a fleet acquired.
+
+The same names as ``agent_sandbox_rl.adapters.r2egym``, so Tunix's r2egym and
+sweagent scaffolds change only their imports. R2E-Gym's ``DockerRuntime`` has a
+``kubernetes-sandbox`` backend with four hooks; ``AteEnvRuntime`` overrides
+them: bind the fleet handle instead of claiming a pod, no-op teardown (the
+fleet releases), ``handle.exec`` for commands and ``handle.write_file`` plus
+``tar`` for file copies. Everything else in the runtime (setup, patches, reward
+grading) runs unchanged against the environment.
+
+    from ate_env import SandboxFleet, FleetConfig
+    from ate_env_openhands.r2egym import make_fleet_repo_env, r2egym_command_files
+
+    def rollout(task, handle):                 # task.metadata["ds"] is the dataset row
+        env = make_fleet_repo_env(handle, command_files=r2egym_command_files())
+        try:
+            obs, reward, done, info = env.step(action)
+            return env.compute_reward()
+        finally:
+            env.close()                        # no-op on the sandbox; the fleet releases
+
+    fleet.run(rollout)
+
+A Substrate actor has one container, thus the clean grading container of the
+MLPerf setup is a second environment from the same image: ``fresh_eval_env``
+acquires it from the warm pool and releases it after the grade.
+
+R2E-Gym is not on PyPI; install it from its checkout
+(``pip install -e path/to/R2E-Gym``). Importing this module is cheap and the
+R2E-Gym subclasses are built on first use, so the package works without it.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import logging
+import os
+import re
+import shlex
+import tarfile
+import threading
+import uuid
+from collections.abc import Iterator
+from types import SimpleNamespace
+from typing import Any
+from unittest import mock
+
+logger = logging.getLogger("ate_env_openhands.r2egym")
+
+_HINT = "requires R2E-Gym: pip install -e path/to/R2E-Gym (it is not on PyPI)"
+
+_CLASSES: tuple[type, type] | None = None
+_BUILD_LOCK = threading.Lock()
+_ANSI = re.compile(r"\x1b\[[0-9;]*m|\r")
+
+
+def _import_r2egym():
+    try:
+        from r2egym.agenthub.environment.env import EnvArgs, RepoEnv  # noqa: F401
+        from r2egym.agenthub.runtime import docker as docker_mod
+    except ImportError as e:
+        raise RuntimeError(f"ate_env_openhands.r2egym {_HINT}") from e
+    return docker_mod, RepoEnv
+
+
+def _dataset_row(handle: Any) -> dict:
+    ds = (getattr(getattr(handle, "task", None), "metadata", None) or {}).get("ds")
+    if ds is None:
+        raise RuntimeError(
+            "Task.metadata['ds'] is required for the R2E-Gym adapter: load tasks with the "
+            "dataset row kept (SweBenchSource(keep_row=True) in agent-sandbox-rl terms)."
+        )
+    return ds
+
+
+@contextlib.contextmanager
+def _without_kubernetes(docker_mod: Any) -> Iterator[None]:
+    """R2E-Gym's runtime loads a kubeconfig and builds a CoreV1Api for the
+    kubernetes-sandbox backend. Neither exists where ate-env runs, and the
+    hooks below never use them, so both are stubbed while the base class
+    initialises. Serialised, because it patches module attributes."""
+    with _BUILD_LOCK:
+        config = SimpleNamespace(load_incluster_config=lambda: None, load_kube_config=lambda: None)
+        client = SimpleNamespace(CoreV1Api=lambda *a, **k: None)
+        with mock.patch.object(docker_mod, "config", config, create=True), \
+                mock.patch.object(docker_mod, "client", client, create=True):
+            yield
+
+
+def _build_classes() -> tuple[type, type]:
+    """Build (and memoise) the R2E-Gym subclasses; RuntimeError without R2E-Gym."""
+    global _CLASSES
+    if _CLASSES is not None:
+        return _CLASSES
+    docker_mod, RepoEnv = _import_r2egym()
+    DockerRuntime = docker_mod.DockerRuntime
+    cmd_timeout = getattr(docker_mod, "CMD_TIMEOUT", 90)
+
+    class AteEnvRuntime(DockerRuntime):
+        """A ``DockerRuntime`` bound to an ate-env environment the fleet acquired."""
+
+        def __init__(self, handle: Any, *, command=("/bin/bash", "-l"), logger=None, **docker_kwargs):
+            self._handle = handle
+            ds = _dataset_row(handle)
+            with _without_kubernetes(docker_mod):
+                super().__init__(
+                    ds=ds, docker_image=handle.task.image, command=list(command),
+                    logger=logger, backend="kubernetes-sandbox", **docker_kwargs,
+                )
+            # The base start_container swallows errors from the bind hook; a
+            # half-built runtime is worse than an exception.
+            if getattr(self, "container", None) is None or self.container_name != handle.sandbox_id:
+                raise RuntimeError(f"failed to bind environment {handle.sandbox_id!r} into the R2E-Gym runtime")
+
+        # --- the four kubernetes-sandbox hooks ------------------------------
+        def _start_kubernetes_sandbox(self) -> None:
+            if not getattr(self._handle, "sandbox_id", None):
+                raise RuntimeError("the fleet handle names no sandbox_id")
+            self.sb_client = None
+            self.custom_api = None
+            self.container_name = self._handle.sandbox_id
+            self.container = self._handle  # any truthy object: the base only tests it
+            self.logger.info("Bound environment %s from the fleet handle", self.container_name)
+
+        def _stop_kubernetes_sandbox(self) -> None:
+            self.logger.debug("teardown is a no-op: the fleet releases environment %s", self.container_name)
+
+        def _run_kubernetes(self, code, timeout=cmd_timeout, args="", workdir=""):
+            command = f"{code} {args}".strip() if args else code
+            try:
+                res = self._handle.exec(command, cwd=workdir or "", timeout_s=timeout)
+            except Exception as e:  # transport: unreachable sandbox, gRPC error
+                self.logger.error("exec in environment failed: %r", e)
+                return f"Error executing command in environment: {e!r}", "-1"
+            output = (res.stdout or "") + (res.stderr or "")
+            if res.timed_out or res.exit_code is None or res.exit_code == 124:
+                self.logger.error("command timed out after %ss", timeout)
+                return f"The command took too long to execute (>{timeout}s)", "-1"
+            if res.exit_code != 0:
+                self.logger.error("exec error: exit code %s\n%s", res.exit_code, output)
+                return output, f"Error: Exit code {res.exit_code}"
+            return _ANSI.sub("", output), str(res.exit_code)
+
+        def _copy_to_container_kubernetes(self, src_path, dest_path) -> None:
+            dest_dir = os.path.dirname(dest_path) or "/"
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w") as tar:
+                tar.add(src_path, arcname=os.path.basename(dest_path))
+            staged = f"/tmp/ate-env-copy-{uuid.uuid4().hex[:12]}.tar"
+            self._handle.write_file(staged, buf.getvalue())
+            cmd = (
+                f"mkdir -p {shlex.quote(dest_dir)} && tar xmf {shlex.quote(staged)} "
+                f"-C {shlex.quote(dest_dir)}; rc=$?; rm -f {shlex.quote(staged)}; exit $rc"
+            )
+            res = self._handle.exec(cmd, timeout_s=120)
+            if res.exit_code != 0:
+                raise RuntimeError(
+                    f"copy {src_path} -> {dest_path} failed (exit {res.exit_code}): {res.stderr or res.stdout}"
+                )
+
+    class AteEnvRepoEnv(RepoEnv):
+        """``RepoEnv`` whose runtime is an ``AteEnvRuntime``: no cold start."""
+
+        def __init__(self, handle: Any, args: Any, *, logger=None, verbose=True,
+                     step_timeout: int = 90, reward_timeout: int = 300):
+            if logger is None:
+                from r2egym.agenthub.utils.log import get_logger
+
+                self.logger = get_logger("AteEnvRepoEnv")
+            else:
+                self.logger = logger
+            if not verbose:
+                self.logger.setLevel(logging.CRITICAL)
+            self.runtime = AteEnvRuntime(handle, logger=self.logger)
+            self.args = args
+            self.done = False
+            self.observation = None
+            self.state = None
+            self.commands = []
+            from r2egym.agenthub.agent.commands import ParseCommandBash
+
+            self.cmd_parser = ParseCommandBash()
+            self.backend = "kubernetes-sandbox"
+            self.step_timeout = step_timeout
+            self.reward_timeout = reward_timeout
+            self.logger.info("Initialized AteEnvRepoEnv: %s image: %s", self.runtime.repo_name, self.runtime.docker_image)
+
+        def reset(self):
+            """Soft reset: the binding is checked again, nothing is recreated. For
+            a clean episode, release the handle and acquire a new one."""
+            self.runtime.start_container(self.runtime.docker_image, self.runtime.command, self.runtime.container_name)
+            if getattr(self.runtime, "container", None) is None:
+                raise RuntimeError("AteEnvRepoEnv.reset: rebinding the environment failed")
+            self.observation = "Environment reset"
+            self.state = None
+            self.done = False
+            return self.observation
+
+    with _BUILD_LOCK:
+        if _CLASSES is None:
+            _CLASSES = (AteEnvRuntime, AteEnvRepoEnv)
+    return _CLASSES
+
+
+def make_fleet_repo_env(handle: Any, *, command_files=None, verbose: bool = False,
+                        step_timeout: int = 90, reward_timeout: int = 300):
+    """An R2E-Gym ``RepoEnv`` on the environment ``handle`` holds.
+
+    ``handle.task.metadata["ds"]`` must be the dataset row (the setup and the
+    reward grading read it). ``command_files`` are R2E-Gym tool files copied
+    into the environment (see ``r2egym_command_files``). ``env.close()`` is a
+    no-op on the environment; the fleet releases it.
+    """
+    _, AteEnvRepoEnv = _build_classes()
+    from r2egym.agenthub.environment.env import EnvArgs
+
+    env = AteEnvRepoEnv(handle, EnvArgs(ds=_dataset_row(handle)), verbose=verbose,
+                        step_timeout=step_timeout, reward_timeout=reward_timeout)
+    if command_files:
+        env.add_commands(list(command_files))
+    return env
+
+
+@contextlib.contextmanager
+def fresh_eval_env(fleet: Any, handle: Any, **repo_env_kwargs: Any) -> Iterator[tuple[Any, Any]]:
+    """A second environment from the same task image, for grading in a clean
+    filesystem (the ``eval`` container of the MLPerf setup). Yields
+    ``(eval_handle, repo_env)``; the handle is released on exit. Apply the
+    agent's patch with ``repo_env.runtime.apply_patch(...)`` and grade with
+    ``repo_env.compute_reward()``."""
+    eval_handle = fleet.acquire(handle.task)
+    try:
+        env = make_fleet_repo_env(eval_handle, **repo_env_kwargs)
+        try:
+            yield eval_handle, env
+        finally:
+            env.close()
+    finally:
+        fleet.release(eval_handle)
+
+
+def r2egym_command_files() -> list[str]:
+    """R2E-Gym's default tool files for the ``r2egym`` scaffold (what Tunix's
+    deepswe example loads), from the installed package."""
+    try:
+        import r2egym
+    except ImportError as e:
+        raise RuntimeError(f"r2egym_command_files {_HINT}") from e
+    base = os.path.join(os.path.dirname(r2egym.__file__), "agenthub", "tools")
+    return [
+        os.path.join(base, "r2egym", "file_editor.py"),
+        os.path.join(base, "search.py"),
+        os.path.join(base, "r2egym", "execute_bash.py"),
+        os.path.join(base, "finish.py"),
+    ]
+
+
+def __getattr__(name: str):
+    """``AteEnvRuntime`` and ``AteEnvRepoEnv`` are built on first use."""
+    if name in ("AteEnvRuntime", "AteEnvRepoEnv"):
+        runtime_cls, env_cls = _build_classes()
+        return runtime_cls if name == "AteEnvRuntime" else env_cls
+    raise AttributeError(name)

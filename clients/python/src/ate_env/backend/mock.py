@@ -56,6 +56,17 @@ class MockBackendDriver(BackendDriver):
         if rootfs_image is not None:
             self.warm_pools[(template_id, rootfs_image)] = replicas
 
+    def resize_pool(
+        self,
+        template_id: str,
+        replicas: int,
+        wait: bool = True,
+        rootfs_image: str | None = None,
+    ) -> None:
+        self.warm_pools[template_id] = replicas
+        if rootfs_image is not None:
+            self.warm_pools[(template_id, rootfs_image)] = replicas
+
     def unwarm_pool(self, template_id: str, rootfs_image: str | None = None) -> None:
         self.warm_pools[template_id] = 0
         if rootfs_image is not None:

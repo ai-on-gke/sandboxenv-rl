@@ -99,12 +99,12 @@ const (
 
 // manifestConfig holds configuration for generating Kubernetes deployment manifests.
 type manifestConfig struct {
-	namespace       string
-	template        string
-	workerPool      string
-	workerImage     string
-	replicas        int32
-	apiImage        string
+	namespace          string
+	template           string
+	workerPool         string
+	workerImage        string
+	replicas           int32
+	apiImage           string
 	apiReplicas        int32
 	apiPort            int32
 	authTokenSecret    string

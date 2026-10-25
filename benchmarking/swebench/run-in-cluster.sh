@@ -110,6 +110,12 @@ bake_trajectory() {
       cp "${dir}/${base}" "${KODATA}/traj/${TRAJ_N}/"
       while IFS= read -r asset; do
         [[ -n "${asset}" ]] || continue
+        # Only a regular file inside the trajectory's directory is copied
+        # into the image: no absolute path, no .., no symlink out of it.
+        case "${asset}" in
+          /*|..|../*|*/..|*/../*) echo "${base}: write.file ${asset} must be a relative path inside the trajectory's directory" >&2; exit 2 ;;
+        esac
+        [[ -f "${dir}/${asset}" && ! -L "${dir}/${asset}" ]] || { echo "${base}: write.file ${asset} is not a regular file next to the trajectory" >&2; exit 2; }
         mkdir -p "$(dirname "${KODATA}/traj/${TRAJ_N}/${asset}")"
         cp "${dir}/${asset}" "${KODATA}/traj/${TRAJ_N}/${asset}"
       done < <(sed -n 's/^[[:space:]]*file:[[:space:]]*//p' "${dir}/${base}" | tr -d "\"'")

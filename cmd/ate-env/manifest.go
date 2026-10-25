@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/agent-substrate/env/internal/apiservice"
+	"github.com/agent-substrate/env/internal/routertls"
 	"github.com/spf13/cobra"
 	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
@@ -37,6 +38,14 @@ import (
 
 // apiName is the name of the API service Deployment and Service.
 const apiName = "ate-env-api"
+
+// Where the API deployment mounts the credentials for the router's TLS
+// listeners: the pod identity credential bundle and the servicedns trust
+// bundle, the same paths the router itself uses.
+const (
+	routerCredentialBundlePath = "/run/podidentity.podcert.ate.dev/credential-bundle.pem"
+	routerTrustBundlePath      = "/run/servicedns-ca/trust-bundle.pem"
+)
 
 // workerPoolLabel labels the WorkerPool with its own name, and templates
 // select their pool by it. Substrate copies a pool's labels to its workers and
@@ -94,6 +103,11 @@ type manifestConfig struct {
 	apiReplicas     int32
 	apiPort         int32
 	authTokenSecret string
+	// routerTLS mounts the pod identity certificate and the servicedns trust
+	// bundle into ate-env-api and points it at the router's TLS listeners,
+	// the only ones Substrate serves since v0.6.0. Off only for the test
+	// fakes, which serve the plaintext listeners.
+	routerTLS bool
 }
 
 func (c *manifestConfig) resolveImages() error {
@@ -284,7 +298,14 @@ the "template" subcommand: ate-env manifest template`,
 			if err := mCfg.resolveImages(); err != nil {
 				return err
 			}
-			return writeManifests(cmd.OutOrStdout(), buildManifests(mCfg))
+			if err := writeManifests(cmd.OutOrStdout(), buildManifests(mCfg)); err != nil {
+				return err
+			}
+			if mCfg.routerTLS {
+				fmt.Fprintf(cmd.ErrOrStderr(), "note: ate-env-api presents %s to the atenet router; install Substrate with that ID in the router's ingress allow-list (ate-setup: ATE_INGRESS_ALLOWED_SPIFFE_IDS)\n",
+					routertls.SPIFFEID(mCfg.namespace, apiName))
+			}
+			return nil
 		},
 	}
 
@@ -296,6 +317,7 @@ the "template" subcommand: ate-env manifest template`,
 	cmd.Flags().Int32Var(&mCfg.apiReplicas, "api-replicas", 1, "number of API service replicas")
 	cmd.Flags().Int32Var(&mCfg.apiPort, "api-port", 7777, "port the ate-env-api service listens on")
 	cmd.Flags().StringVar(&mCfg.authTokenSecret, "auth-token-secret", "", "Kubernetes Secret name (with key 'token') to mount into ate-env-api and require as a caller bearer token")
+	cmd.Flags().BoolVar(&mCfg.routerTLS, "api-router-tls", true, "mount the pod identity certificate and the servicedns trust bundle into ate-env-api and dial the atenet router's TLS listeners, the only ones Substrate serves since v0.6.0; the API's SPIFFE ID must then be in the router's --ingress-allowed-spiffe-ids. Off, the API dials the plaintext addresses, which only the test fakes serve")
 	cmd.Flags().StringVar(&mCfg.workerPool, "workerpool", "", "WorkerPool name (defaults to <template>-workerpool)")
 	cmd.Flags().Int32Var(&mCfg.replicas, "replicas", 5, "number of pre-warmed worker pods")
 
@@ -705,6 +727,33 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 			},
 		},
 	}}
+	if cfg.routerTLS {
+		// The router's TLS listeners need the pod's identity certificate and
+		// the CA of the router's own certificate; both are projected by the
+		// kubelet and rotated in place (see internal/routertls).
+		args = append(args,
+			"-atenet-client-cert="+routerCredentialBundlePath,
+			"-atenet-ca-file="+routerTrustBundlePath)
+		mounts = append(mounts,
+			corev1.VolumeMount{Name: "podidentity", MountPath: "/run/podidentity.podcert.ate.dev", ReadOnly: true},
+			corev1.VolumeMount{Name: "servicedns-ca", MountPath: "/run/servicedns-ca", ReadOnly: true})
+		servicednsSigner := "servicedns.podcert.ate.dev/identity"
+		volumes = append(volumes,
+			corev1.Volume{Name: "podidentity", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+				Sources: []corev1.VolumeProjection{{PodCertificate: &corev1.PodCertificateProjection{
+					SignerName:           "podidentity.podcert.ate.dev/identity",
+					KeyType:              "ECDSAP256",
+					CredentialBundlePath: "credential-bundle.pem",
+				}}},
+			}}},
+			corev1.Volume{Name: "servicedns-ca", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+				Sources: []corev1.VolumeProjection{{ClusterTrustBundle: &corev1.ClusterTrustBundleProjection{
+					SignerName:    &servicednsSigner,
+					LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"podcert.ate.dev/canarying": "live"}},
+					Path:          "trust-bundle.pem",
+				}}},
+			}}})
+	}
 	if cfg.authTokenSecret != "" {
 		args = append(args, "-auth-token-file=/var/run/secrets/ate-env-auth/token")
 		mounts = append(mounts, corev1.VolumeMount{

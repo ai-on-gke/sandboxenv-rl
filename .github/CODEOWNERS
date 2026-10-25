@@ -19,6 +19,8 @@
 /.github/                       @tomergee
 
 # Clients and integrations.
+/cmd/ate-env/                   @tomergee
+/clients/go/                    @tomergee
 /clients/python/                @sunnylovestiramisu @tomergee
 /integrations/nemo-gym/         @tomergee
 

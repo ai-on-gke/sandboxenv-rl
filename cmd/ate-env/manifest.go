@@ -193,15 +193,15 @@ func parseLayers(values []string) ([]runtimeLayer, error) {
 	return layers, nil
 }
 
-// Bounds Substrate applies to an ActorTemplate's limits
-// (go.ate.dev/substrate/internal/resources.ValidateLimit and the
-// Limits.quantity maxLength), checked here so the CLI never prints a template
-// the control plane rejects.
-const maxQuantityLen = 32
-
+// Bounds on --cpu and --memory. Substrate v0.6.0 carries the limits as
+// integer millicores and bytes and requires only that each is non-zero, so
+// these are env's own: the minimum keeps a typo such as 512m (millibytes)
+// from rendering as one byte, and the maximum keeps the integers in range.
 var (
-	maxCPULimit    = resource.MustParse("999.999")             // the wire carries millicores below 1000 cores
-	maxMemoryLimit = resource.MustParse("9223372036854775807") // the wire carries an int64 byte count
+	minCPULimit    = resource.MustParse("1m")
+	maxCPULimit    = resource.MustParse("999.999")
+	minMemoryLimit = resource.MustParse("1Mi")
+	maxMemoryLimit = resource.MustParse("9223372036854775807") // an int64 byte count
 )
 
 // validateResources checks --cpu and --memory the way Substrate validates
@@ -209,23 +209,20 @@ var (
 func (c *templateConfig) validateResources() error {
 	for _, l := range []struct {
 		flag, value string
-		max         resource.Quantity
-	}{{"--cpu", c.cpu, maxCPULimit}, {"--memory", c.memory, maxMemoryLimit}} {
+		min, max    resource.Quantity
+	}{{"--cpu", c.cpu, minCPULimit, maxCPULimit}, {"--memory", c.memory, minMemoryLimit, maxMemoryLimit}} {
 		if l.value == "" {
 			continue
-		}
-		if len(l.value) > maxQuantityLen {
-			return fmt.Errorf("%s %q is longer than %d characters, which Substrate rejects", l.flag, l.value, maxQuantityLen)
 		}
 		q, err := resource.ParseQuantity(l.value)
 		if err != nil {
 			return fmt.Errorf("%s %q is not a Kubernetes quantity (e.g. 2, 500m, 4Gi): %w", l.flag, l.value, err)
 		}
-		if q.Sign() <= 0 {
-			return fmt.Errorf("%s must be greater than zero, got %q", l.flag, l.value)
+		if q.Cmp(l.min) < 0 {
+			return fmt.Errorf("%s %q is below %s, the smallest limit", l.flag, l.value, l.min.String())
 		}
 		if q.Cmp(l.max) > 0 {
-			return fmt.Errorf("%s %q is above Substrate's maximum of %s", l.flag, l.value, l.max.String())
+			return fmt.Errorf("%s %q is above the maximum of %s", l.flag, l.value, l.max.String())
 		}
 	}
 	return nil
@@ -399,8 +396,8 @@ It prints YAML to stdout without touching the cluster.`,
 	cmd.Flags().StringArrayVar(&tCfg.layers, "layer", nil, "extra runtime mounted as a read-only image volume, as name=image@sha256:...=/mount/path (repeatable)")
 	cmd.Flags().StringArrayVar(&tCfg.sidecars, "sidecar", nil, "command the guest starts and keeps running next to itself, an absolute binary path plus arguments, e.g. '/opt/opensandbox/execd --port 44772' (repeatable)")
 	cmd.Flags().StringArrayVar(&tCfg.sidecarReadyz, "sidecar-readyz", nil, "URL the actor's readiness waits for, e.g. http://127.0.0.1:44772/ready (repeatable)")
-	cmd.Flags().StringVar(&tCfg.cpu, "cpu", defaultActorCPU, "CPU limit of each actor, a Kubernetes quantity such as 2 or 500m; Substrate requires one")
-	cmd.Flags().StringVar(&tCfg.memory, "memory", defaultActorMemory, "memory limit of each actor, a Kubernetes quantity such as 4Gi; Substrate requires one")
+	cmd.Flags().StringVar(&tCfg.cpu, "cpu", defaultActorCPU, "CPU limit of each actor, a Kubernetes quantity such as 2 or 500m, at least 1m, rendered as whole millicores (rounded up); Substrate requires one")
+	cmd.Flags().StringVar(&tCfg.memory, "memory", defaultActorMemory, "memory limit of each actor, a Kubernetes quantity such as 4Gi, at least 1Mi, rendered as whole bytes (rounded up); Substrate requires one")
 	cmd.Flags().StringArrayVar(&tCfg.env, "env", nil, "environment variable for the actor's container as NAME=VALUE (repeatable); the guest passes it to sidecars, e.g. a layer daemon's API key")
 
 	return cmd
@@ -631,11 +628,21 @@ func buildActorTemplate(cfg templateConfig) *ateapipb.ActorTemplate {
 			// schema marks the field required, so say it explicitly.
 			PreferredFidelity: ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
 		},
-		Resources: &ateapipb.Resources{Limits: []*ateapipb.Limits{
-			{Name: "cpu", Quantity: orDefault(cfg.cpu, defaultActorCPU)},
-			{Name: "memory", Quantity: orDefault(cfg.memory, defaultActorMemory)},
-		}},
+		Resources: resourceLimits(orDefault(cfg.cpu, defaultActorCPU), orDefault(cfg.memory, defaultActorMemory)),
 	}
+}
+
+// resourceLimits renders the cpu and memory quantities as the integer limits
+// Substrate carries since v0.6.0: millicores and bytes, rounded up, so a
+// fraction of either becomes one. The flags were checked by
+// validateResources, and the defaults are constants, so the parse cannot
+// fail here.
+func resourceLimits(cpu, memory string) *ateapipb.ResourceRequirements {
+	c, m := resource.MustParse(cpu), resource.MustParse(memory)
+	return &ateapipb.ResourceRequirements{Limits: &ateapipb.Resources{
+		CpuMillicores: c.MilliValue(),
+		MemoryBytes:   m.Value(),
+	}}
 }
 
 func orDefault(v, def string) string {

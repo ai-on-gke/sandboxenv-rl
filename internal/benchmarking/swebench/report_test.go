@@ -455,6 +455,7 @@ func TestPool(t *testing.T) {
 		{"run id twice", [][]Event{run("r1", same), run("r1", same)}, `rep 2 repeats run id "r1" of rep 1`},
 		{"other workload", [][]Event{run("r1", same), run("r2", map[string]string{"mode": "eval", "width": "3"})}, `rep 2 differs from rep 1 in width ("3", "2")`},
 		{"no loader labels", [][]Event{run("r1", same), run("r2", nil)}, `rep 2 (run "r2") has no loader labels`},
+		{"two runs in one file", [][]Event{append(run("r1", same), run("r2", same)...)}, "rep 1 holds 2 run events"},
 	} {
 		if _, err := Pool(tc.runs); err == nil || !strings.Contains(err.Error(), tc.err) {
 			t.Errorf("%s: err = %v, want %q", tc.name, err, tc.err)

@@ -393,14 +393,18 @@ func Pool(runs [][]Event) (*Report, error) {
 	for i, events := range runs {
 		first := i == 0
 		var run *Event
+		n := 0
 		for j := range events {
 			if events[j].Event == EventRun {
 				run = &events[j]
-				break
+				n++
 			}
 		}
 		if run == nil {
 			return nil, fmt.Errorf("rep %d has no run event: an interrupted run cannot be pooled", i+1)
+		}
+		if n > 1 {
+			return nil, fmt.Errorf("rep %d holds %d run events: one file is one run, give each run its own file", i+1, n)
 		}
 		if run.Labels["mode"] == "" {
 			return nil, fmt.Errorf("rep %d (run %q) has no loader labels: pool only runs whose loader labeled the run event", i+1, run.RunID)

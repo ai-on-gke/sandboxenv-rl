@@ -444,18 +444,20 @@ class SubstrateBackendDriver(BackendDriver):
         replicas = max(0, replicas)
         pool_key = (template_id, rootfs_image)
         with self._lock:
-            current = len(self._warm_paused_pool.get(pool_key, []))
+            pool = self._warm_paused_pool.get(pool_key, [])
+            current = len(pool)
+            if replicas >= current:
+                surplus = []
+            else:
+                surplus = pool[replicas:]
+                del pool[replicas:]
         if replicas > current:
             await self.warm_pool_async(
                 template_id, replicas, wait=wait, rootfs_image=rootfs_image
             )
             return
-        if replicas == current:
+        if not surplus:
             return
-        with self._lock:
-            pool = self._warm_paused_pool.get(pool_key, [])
-            surplus = pool[replicas:]
-            del pool[replicas:]
         logger.info(
             "Shrinking warm pool for template %s (rootfs_image=%s) from %d to %d paused actors",
             template_id, rootfs_image, current, replicas,

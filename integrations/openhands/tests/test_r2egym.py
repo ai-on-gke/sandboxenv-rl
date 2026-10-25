@@ -177,7 +177,7 @@ def test_bind_without_kubernetes_and_no_op_teardown(fake_r2egym):
     rt = env.runtime
     assert rt.container is handle and rt.container_name == "sb-1"
     assert rt.client is None  # built from the stub, never from kubernetes
-    assert handle.execs[0][0].startswith("timeout 90 echo setup")  # setup_env ran through the handle
+    assert handle.execs[0][0] == "echo setup"  # setup_env ran through the handle
     env.close()  # no release, no delete: the fleet owns the environment
     assert rt.container is handle
     # Module attributes are back after construction.
@@ -197,7 +197,7 @@ def test_run_maps_exit_codes_timeouts_and_errors(fake_r2egym):
     assert rt.run("slow", timeout=7) == ("The command took too long to execute (>7s)", "-1")
     assert rt.run("t124") == ("The command took too long to execute (>90s)", "-1")
     command, cwd, timeout_s = handle.execs[-1]
-    assert command == "timeout 90 t124 " and cwd == "/testbed" and timeout_s == 95
+    assert command == "t124" and cwd == "/testbed" and timeout_s == 90
 
     def broken(*a, **k):
         raise ConnectionError("gone")

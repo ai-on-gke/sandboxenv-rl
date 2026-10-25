@@ -36,7 +36,7 @@ grading) runs unchanged against the environment.
     fleet.run(rollout)
 
 A Substrate actor has one container, thus the clean grading container of the
-MLPerf setup is a second environment from the same image: ``fresh_eval_env
+MLPerf setup is a second environment from the same image: ``fresh_eval_env``
 acquires it from the warm pool and releases it after the grade.
 
 R2E-Gym is not on PyPI; install it from its checkout
@@ -141,9 +141,9 @@ def _build_classes() -> tuple[type, type]:
             self.logger.debug("teardown is a no-op: the fleet releases environment %s", self.container_name)
 
         def _run_kubernetes(self, code, timeout=cmd_timeout, args="", workdir=""):
-            command = f"timeout {timeout} {code} {args}"
+            command = f"{code} {args}".strip() if args else code
             try:
-                res = self._handle.exec(command, cwd=workdir or "", timeout_s=timeout + 5)
+                res = self._handle.exec(command, cwd=workdir or "", timeout_s=timeout)
             except Exception as e:  # transport: unreachable sandbox, gRPC error
                 self.logger.error("exec in environment failed: %r", e)
                 return f"Error executing command in environment: {e!r}", "-1"

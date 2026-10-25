@@ -107,8 +107,8 @@ const guestPort = 80
 // Options configures a Proxy.
 type Options struct {
 	// ConnectAddr is the router's CONNECT listener, host:port: the TLS one
-	// (8444) with TLS set, else the plaintext one that only a Substrate
-	// before v0.6.0 serves.
+	// (8444) with TLS set, else the plaintext one, which only the test fakes
+	// serve.
 	ConnectAddr string
 	// TLS, when set, wraps each connection to ConnectAddr in TLS with it: the
 	// pod identity certificate and the router's trust bundle (see
@@ -545,8 +545,8 @@ func (p *Proxy) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, context.Canceled):
 		return // the caller went away; nobody reads an answer
-	case routertls.RejectedIdentity(err):
-		cause = "is behind a router that rejected ate-env-api's client certificate; the router's ingress allow-list (ATE_INGRESS_ALLOWED_SPIFFE_IDS) must hold the API's SPIFFE ID"
+	case routertls.RejectedCertificate(err):
+		cause = "is behind a router that rejected ate-env-api's client certificate; " + routertls.RejectionAdvice
 	case errors.As(err, &re):
 		// 404 (no such environment) and 503 (not running) mean the same to
 		// the caller as to the router; anything else is a gateway failure.

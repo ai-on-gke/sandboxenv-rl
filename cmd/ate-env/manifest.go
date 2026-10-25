@@ -105,8 +105,8 @@ type manifestConfig struct {
 	authTokenSecret string
 	// routerTLS mounts the pod identity certificate and the servicedns trust
 	// bundle into ate-env-api and points it at the router's TLS listeners,
-	// which are the only ones Substrate v0.6.0 serves. Off for a control
-	// plane that still serves the plaintext listeners.
+	// the only ones Substrate serves since v0.6.0. Off only for the test
+	// fakes, which serve the plaintext listeners.
 	routerTLS bool
 }
 
@@ -317,7 +317,7 @@ the "template" subcommand: ate-env manifest template`,
 	cmd.Flags().Int32Var(&mCfg.apiReplicas, "api-replicas", 1, "number of API service replicas")
 	cmd.Flags().Int32Var(&mCfg.apiPort, "api-port", 7777, "port the ate-env-api service listens on")
 	cmd.Flags().StringVar(&mCfg.authTokenSecret, "auth-token-secret", "", "Kubernetes Secret name (with key 'token') to mount into ate-env-api and require as a caller bearer token")
-	cmd.Flags().BoolVar(&mCfg.routerTLS, "api-router-tls", true, "mount the pod identity certificate and the servicedns trust bundle into ate-env-api and dial the atenet router's TLS listeners, as Substrate v0.6.0 requires; the API's SPIFFE ID must then be in the router's --ingress-allowed-spiffe-ids. false for a control plane that still serves the plaintext listeners")
+	cmd.Flags().BoolVar(&mCfg.routerTLS, "api-router-tls", true, "mount the pod identity certificate and the servicedns trust bundle into ate-env-api and dial the atenet router's TLS listeners, the only ones Substrate serves since v0.6.0; the API's SPIFFE ID must then be in the router's --ingress-allowed-spiffe-ids. Off, the API dials the plaintext addresses, which only the test fakes serve")
 	cmd.Flags().StringVar(&mCfg.workerPool, "workerpool", "", "WorkerPool name (defaults to <template>-workerpool)")
 	cmd.Flags().Int32Var(&mCfg.replicas, "replicas", 5, "number of pre-warmed worker pods")
 

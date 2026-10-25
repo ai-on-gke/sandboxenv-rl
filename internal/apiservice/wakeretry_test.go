@@ -79,7 +79,7 @@ func TestGuestCallWaitsForWake(t *testing.T) {
 // certificate after the handshake. That is a deployment error, not a sleeping
 // environment: the call fails at once, naming the ID and the setting, instead
 // of waiting out the wake budget as it would for any other Unavailable.
-func TestGuestCallFailsFastOnRejectedIdentity(t *testing.T) {
+func TestGuestCallFailsFastOnRejectedCertificate(t *testing.T) {
 	ca := testcerts.NewAuthority(t, "test podcert")
 	serverTLS := &tls.Config{
 		Certificates:          []tls.Certificate{ca.Server(t, "atenet-router.ate-system.svc")},

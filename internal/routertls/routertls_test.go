@@ -119,9 +119,9 @@ func TestConfigRefusesTheWrongRouter(t *testing.T) {
 }
 
 // A certificate the router's allow-list does not hold is turned away after
-// the handshake; the client sees a remote TLS alert, which RejectedIdentity
-// recognizes, and Identity names the ID to add.
-func TestRejectedIdentity(t *testing.T) {
+// the handshake; the client sees a remote TLS alert, which
+// RejectedCertificate recognizes, and Identity names the ID to add.
+func TestRejectedCertificate(t *testing.T) {
 	ca := testcerts.NewAuthority(t, "test podcert")
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(echoID))
 	srv.TLS = &tls.Config{
@@ -143,15 +143,15 @@ func TestRejectedIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _, err = get(t, cfg, srv.URL)
-	if err == nil || !routertls.RejectedIdentity(err) {
-		t.Fatalf("not allow-listed: err = %v, want a remote TLS alert that RejectedIdentity recognizes", err)
+	if err == nil || !routertls.RejectedCertificate(err) {
+		t.Fatalf("not allow-listed: err = %v, want a remote TLS alert that RejectedCertificate recognizes", err)
 	}
 	if id, err := opts.Identity(); err != nil || id != "spiffe://cluster.local/ns/ate-env/sa/ate-env-api" {
 		t.Fatalf("Identity() = %q, %v", id, err)
 	}
 	for _, other := range []error{nil, errors.New("dial tcp 10.0.0.1:443: connection refused"), errors.New("routertls: verifying the router's certificate for x: expired")} {
-		if routertls.RejectedIdentity(other) {
-			t.Errorf("RejectedIdentity(%v) = true", other)
+		if routertls.RejectedCertificate(other) {
+			t.Errorf("RejectedCertificate(%v) = true", other)
 		}
 	}
 }

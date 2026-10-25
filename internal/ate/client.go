@@ -60,7 +60,8 @@ const DefaultHostSuffix = "actors.resources.substrate.ate.dev"
 const (
 	DefaultControlAddr = "api.ate-system.svc.cluster.local:443"
 	// DefaultRouterAddr and DefaultRouterConnectAddr are the router's plaintext
-	// listeners, served by Substrate before v0.6.0 and by the fakes in tests.
+	// listeners, which only the fakes in tests serve: Substrate v0.6.0, the
+	// first release this module pairs with, removed them.
 	DefaultRouterAddr = "atenet-router.ate-system.svc.cluster.local:80"
 	// DefaultRouterConnectAddr is the router's plaintext CONNECT listener, which
 	// tunnels to a port on an actor other than 80.

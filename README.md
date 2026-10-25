@@ -198,7 +198,9 @@ default. A 1.36 cluster must be created with
 `--enable-kubernetes-unstable-apis=certificates.k8s.io/v1beta1/podcertificaterequests,certificates.k8s.io/v1beta1/clustertrustbundles`
 and its node pools created after that, or the mount fails with
 `MountVolume.SetUp failed: unimplemented`; Substrate's `setup-gcp create
-cluster` does both. Versions below 1.36 are not supported. The API's identity
+cluster` does both, and its
+[README](https://github.com/agent-substrate/substrate/blob/v0.6.0/tools/setup-gcp/README.md)
+has the details. Versions below 1.36 are not supported. The API's identity
 is `spiffe://cluster.local/ns/<namespace>/sa/ate-env-api`, and `ate-env
 manifest` prints the exact ID. Add it to the Substrate install's allow-list,
 one comma-separated value that becomes the router's whole
@@ -213,11 +215,14 @@ ATE_INGRESS_ALLOWED_SPIFFE_IDS=spiffe://cluster.local/ns/ate-env/sa/ate-env-api,
 
 Editing the `atenet-router` Deployment's `--ingress-allowed-spiffe-ids`
 argument does the same by hand. ate-setup requires the list for its default
-Envoy ingress dataplane, which enforces it. Without the ID the router rejects
-the API's certificate: guest calls fail at once with `FailedPrecondition`
-naming the ID and this setting, the port proxy answers 502 with the same
-cause, and the API logs the ID it presents at startup. For a control plane
-that still serves the plaintext listeners, pass `--api-router-tls=false`.
+Envoy ingress dataplane, which enforces it. Without the ID, or when the
+router does not trust the podidentity signer, the router rejects the API's
+certificate: guest calls fail at once with `FailedPrecondition` naming the ID
+and what to check, the port proxy answers 502 with the same cause, and the
+API logs the ID it presents at startup. `--api-router-tls=false` leaves the
+API on the router's plaintext addresses, which no Substrate release serves
+since v0.6.0, the first this build pairs with; it exists for the test fakes,
+and the API warns at startup when it runs that way.
 
 Deploy the namespace, worker pool, ServiceAccount and API service:
 

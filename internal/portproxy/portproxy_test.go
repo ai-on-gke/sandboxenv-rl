@@ -839,7 +839,7 @@ func TestConnectOverTLS(t *testing.T) {
 
 // A router whose allow-list lacks the API's identity turns the certificate
 // away after the handshake; the proxy answers 502 and names the setting.
-func TestConnectRejectedIdentity(t *testing.T) {
+func TestConnectRejectedCertificate(t *testing.T) {
 	ca := testcerts.NewAuthority(t, "test podcert")
 	rr := fakerouter.New()
 	addr, stop := rr.ServeTLS(&tls.Config{

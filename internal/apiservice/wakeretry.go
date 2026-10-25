@@ -84,11 +84,11 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 			// the guest itself.
 			return nil
 		}
-		if routertls.RejectedIdentity(err) {
+		if routertls.RejectedCertificate(err) {
 			// The router turned the API's certificate away: no wait fixes
 			// that, and every environment fails the same way.
-			return status.Errorf(codes.FailedPrecondition, "the atenet router rejected ate-env-api's client certificate%s: %v; the router's --ingress-allowed-spiffe-ids (ATE_INGRESS_ALLOWED_SPIFFE_IDS for ate-setup) must list it",
-				identityNote(s.RouterIdentity), err)
+			return status.Errorf(codes.FailedPrecondition, "the atenet router rejected ate-env-api's client certificate%s: %v; %s",
+				identityNote(s.RouterIdentity), err, routertls.RejectionAdvice)
 		}
 		state, serr := s.actorState(ctx, atespace, id)
 		if serr != nil {

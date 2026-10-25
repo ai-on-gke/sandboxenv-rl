@@ -34,6 +34,8 @@ func TestBuiltinTrajectoriesLoadAndRender(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", n, err)
 		}
+		// The knob without a default; the others take theirs.
+		tr.Vars = map[string]string{"READ_FILE": "/testbed/setup.py"}
 		r, err := tr.Render(in)
 		if err != nil {
 			t.Fatalf("%s render: %v", n, err)

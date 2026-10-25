@@ -33,6 +33,7 @@ from ..errors import (
     SandboxStartError,
 )
 from ..loop_runner import LoopRunner
+from ..telemetry import metrics
 from ..telemetry.tracing import (
     CLIENT_SPAN_PREFIX,
     set_attributes,
@@ -86,6 +87,8 @@ class SubstrateBackendDriver(BackendDriver):
     ``.acquire`` / ``.release`` / ``.reap`` spans and is handed to the Client
     the driver builds (needs the ``tracing`` extra).
     """
+
+    backend_name = "substrate"
 
     def __init__(
         self,
@@ -263,13 +266,20 @@ class SubstrateBackendDriver(BackendDriver):
         with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.acquire",
                         {"ate.template.name": template_id, "ate_env.run_id": run_id}) as span:
             try:
-                instance = await asyncio.wait_for(
-                    self._acquire_internal(template_id, run_id, rootfs_image=rootfs_image), timeout=to_s
-                )
+                with metrics.timed("acquire"):
+                    instance = await asyncio.wait_for(
+                        self._acquire_internal(template_id, run_id, rootfs_image=rootfs_image),
+                        timeout=to_s,
+                    )
             except asyncio.TimeoutError as e:
+                self._observe("claim", "error")
                 raise SandboxStartError(
                     f"Timed out acquiring sandbox for template {template_id} after {to_s:g}s"
                 ) from e
+            except BaseException as e:
+                self._observe("claim", metrics.status_of(e))
+                raise
+            self._observe("claim", "ok")
             set_attributes(span, {"ate.actor.name": instance.instance_id})
             return instance
 
@@ -293,6 +303,8 @@ class SubstrateBackendDriver(BackendDriver):
                     actor_id = warm_list.pop()
 
             if actor_id:
+                self._observe("warm_remove", 1)
+                claim_start = time.monotonic()
                 logger.info(
                     "Claimed warm paused actor %s for template %s (rootfs_image=%s)",
                     actor_id,
@@ -311,10 +323,13 @@ class SubstrateBackendDriver(BackendDriver):
                         self._owned_actors.pop(actor_id, None)
                     continue
                 except Exception as e:
-                    # Put back on unexpected error and raise
+                    # Put back on unexpected error and raise; the claim above
+                    # counted it out of the warm pool, so count it back in.
                     with self._lock:
                         self._warm_paused_pool.setdefault(pool_key, []).append(actor_id)
+                    self._observe("warm_add", 1)
                     raise SandboxStartError(f"Error checking warm actor {actor_id}: {e}") from e
+                metrics.observe("warm_claim", time.monotonic() - claim_start)
                 break
             else:
                 actor_id = f"sb-{uuid.uuid4().hex[:16]}"
@@ -440,6 +455,7 @@ class SubstrateBackendDriver(BackendDriver):
 
         tasks = [_warm_one() for _ in range(needed)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        self._observe("warm_add", sum(1 for r in results if isinstance(r, str)))
 
         for res in results:
             if isinstance(res, Exception):
@@ -486,6 +502,7 @@ class SubstrateBackendDriver(BackendDriver):
                 to_delete = []
                 for k in keys_to_pop:
                     to_delete.extend(self._warm_paused_pool.pop(k, []))
+        self._observe("warm_remove", len(to_delete))
 
         sem = asyncio.Semaphore(16)
 
@@ -510,7 +527,8 @@ class SubstrateBackendDriver(BackendDriver):
         without resetting guest filesystem or processes.
         """
         with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.release", {"ate.actor.name": instance_id}):
-            await self._release_internal(instance_id, recycle)
+            with metrics.timed("release"):
+                await self._release_internal(instance_id, recycle)
 
     async def _release_internal(self, instance_id: str, recycle: bool) -> None:
         with self._lock:
@@ -523,6 +541,7 @@ class SubstrateBackendDriver(BackendDriver):
                 with self._lock:
                     self._warm_paused_pool.setdefault(pool_key, []).append(instance_id)
                     self._owned_actors[instance_id] = instance
+                self._observe("warm_add", 1)
                 logger.info("Recycled actor %s to paused warm pool", instance_id)
                 return
             except Exception as e:

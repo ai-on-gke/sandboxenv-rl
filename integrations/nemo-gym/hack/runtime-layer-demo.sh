@@ -85,22 +85,26 @@ step "inside the environment: POST /execute to 127.0.0.1:${PORT}"
 "${ATE_ENV}" "${ID}" shell "${PY} -c \"import json,urllib.request; r=urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:${PORT}/execute', data=json.dumps({'generated_code':'print(6*7)','language':'python','timeout':10}).encode(), headers={'Content-Type':'application/json'})); print(r.read().decode())\""
 
 api="http://${SUBSTRATE_ENV_API}"
+auth=()
+if [ -n "${SUBSTRATE_ENV_AUTH_TOKEN:-}" ]; then
+  auth=(-H "X-Env-Authorization: Bearer ${SUBSTRATE_ENV_AUTH_TOKEN}")
+fi
 body='{"generated_code":"import sys; print(sys.version.split()[0]); print(6*7)","language":"python","timeout":10}'
 step "outside, header form: ${api} with X-Env-Id/X-Env-Port"
 t1=$(now)
-curl -fsS -X POST "${api}/execute" -H "X-Env-Id: ${ID}" -H "X-Env-Atespace: ${ATESPACE}" -H "X-Env-Port: ${PORT}" \
+curl -fsS -X POST "${api}/execute" "${auth[@]}" -H "X-Env-Id: ${ID}" -H "X-Env-Atespace: ${ATESPACE}" -H "X-Env-Port: ${PORT}" \
   -H 'Content-Type: application/json' -d "${body}"; echo " ($(( $(now) - t1 ))s)"
 
 step "outside, path form: ${api}/v1alpha/atespaces/${ATESPACE}/envs/${ID}/ports/${PORT}/execute"
-curl -fsS -X POST "${api}/v1alpha/atespaces/${ATESPACE}/envs/${ID}/ports/${PORT}/execute" \
+curl -fsS -X POST "${api}/v1alpha/atespaces/${ATESPACE}/envs/${ID}/ports/${PORT}/execute" "${auth[@]}" \
   -H 'Content-Type: application/json' -d '{"generated_code":"print(\"ipython session\"); x = 40","language":"ipython","timeout":10}' -H 'X-Session-ID: demo'; echo
-curl -fsS -X POST "${api}/v1alpha/atespaces/${ATESPACE}/envs/${ID}/ports/${PORT}/execute" \
+curl -fsS -X POST "${api}/v1alpha/atespaces/${ATESPACE}/envs/${ID}/ports/${PORT}/execute" "${auth[@]}" \
   -H 'Content-Type: application/json' -d '{"generated_code":"print(x + 2)","language":"ipython","timeout":10}' -H 'X-Session-ID: demo'; echo
 
 if [ -n "${EXEC_PORT}" ]; then
   step "NeMo Gym exec server on ${EXEC_PORT}: POST /exec"
   # shellcheck disable=SC2016  # $(hostname) expands inside the sandbox, not here
-  curl -fsS -X POST "${api}/exec" -H "X-Env-Id: ${ID}" -H "X-Env-Atespace: ${ATESPACE}" -H "X-Env-Port: ${EXEC_PORT}" \
+  curl -fsS -X POST "${api}/exec" "${auth[@]}" -H "X-Env-Id: ${ID}" -H "X-Env-Atespace: ${ATESPACE}" -H "X-Env-Port: ${EXEC_PORT}" \
     -H 'Content-Type: application/json' -d '{"cmd":"echo hello from $(hostname); id -u","timeout":10}'; echo
 fi
 

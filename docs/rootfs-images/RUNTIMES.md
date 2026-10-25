@@ -95,8 +95,8 @@ sidecar, run under two different rootfs images.
   environment and port.
 
   ```bash
-  curl -H 'X-Env-Id: py1' -H 'X-Env-Port: 44772' localhost:7777/ready
-  curl localhost:7777/v1alpha/envs/py1/ports/44772/ready   # the same, for clients without headers
+  curl -H "X-Env-Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" -H 'X-Env-Id: py1' -H 'X-Env-Port: 44772' localhost:7777/ready
+  curl -H "Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" localhost:7777/v1alpha/envs/py1/ports/44772/ready   # the same, for clients without routing headers
   ```
 
   The path form, `/v1alpha/envs/{id}/ports/{port}/...` (or

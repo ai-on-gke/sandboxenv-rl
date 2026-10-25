@@ -57,6 +57,8 @@ import (
 	"time"
 
 	"github.com/agent-substrate/env/internal/ate"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // The routing headers. They match the x-env-id and x-env-atespace metadata
@@ -177,6 +179,7 @@ func New(opts Options) (*Proxy, error) {
 			}
 			p.atespaces[a] = true
 		}
+		p.opts.Atespaces = nil
 	}
 	p.tr = &http.Transport{
 		DialContext:           p.dial,
@@ -404,6 +407,10 @@ func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request, t *target) 
 		t.dropAuthorization = true
 	}
 	if err := p.opts.Authenticate(credential); err != nil {
+		if status.Code(err) == codes.Internal {
+			http.Error(w, status.Convert(err).Message(), http.StatusInternalServerError)
+			return false
+		}
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		http.Error(w, "missing or invalid bearer token; send it in "+EnvAuthorizationHeader+
 			" or Authorization", http.StatusUnauthorized)

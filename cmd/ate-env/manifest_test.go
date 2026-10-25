@@ -719,9 +719,9 @@ func TestManifestRequiresTheCallerTokenByDefault(t *testing.T) {
 			t.Errorf("default manifest lacks %q:\n%s", want, out)
 		}
 	}
-	out, err = runManifest(t, "--auth-token-secret=team-token")
-	if err != nil || !strings.Contains(out, "secretName: team-token") {
-		t.Errorf("--auth-token-secret=team-token: err %v, output:\n%s", err, out)
+	out, err = runManifest(t, "--auth-token-secret=team-token", "--port-proxy-atespaces=ate-env,team-a")
+	if err != nil || !strings.Contains(out, "secretName: team-token") || !strings.Contains(out, "-port-proxy-atespaces=ate-env,team-a") {
+		t.Errorf("--auth-token-secret=team-token --port-proxy-atespaces: err %v, output:\n%s", err, out)
 	}
 }
 
@@ -738,6 +738,9 @@ func TestManifestInsecureNoAuth(t *testing.T) {
 	}
 	if _, err := runManifest(t, "--auth-token-secret="); err == nil || !strings.Contains(err.Error(), "--insecure-no-auth") {
 		t.Errorf("empty --auth-token-secret: err %v, want a pointer to --insecure-no-auth", err)
+	}
+	if _, err := runManifest(t, "--auth-token-secret=   "); err == nil || !strings.Contains(err.Error(), "--insecure-no-auth") {
+		t.Errorf("whitespace --auth-token-secret: err %v, want a pointer to --insecure-no-auth", err)
 	}
 }
 
@@ -779,5 +782,14 @@ func TestManifestAuthSecretCommand(t *testing.T) {
 	}
 	if token(a) == token(b) {
 		t.Error("two runs printed the same token")
+	}
+	for _, bad := range [][]string{{"--namespace="}, {"--namespace=  "}, {"--name="}, {"--name=  "}} {
+		cmd := newManifestCommand()
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs(append([]string{"auth-secret"}, bad...))
+		if err := cmd.Execute(); err == nil {
+			t.Errorf("auth-secret %v: want error", bad)
+		}
 	}
 }

@@ -168,6 +168,9 @@ When you upgrade an existing cluster across these changes:
 
 - Create the atespace and the access policy (step 1) before you apply the new manifest. Without them
   `ate-env-api` fails at startup with `PermissionDenied` while it checks the default atespace.
+- Create the caller token Secret (`ate-env manifest auth-secret | kubectl create -f -`) if it does
+  not exist yet: `ate-env manifest` mounts `ate-env-api-token` by default unless `--insecure-no-auth`
+  is passed.
 - Base templates registered before keep working, because Substrate keeps their old `sandboxConfig`
   as an unknown field and drops it when it reads them, but they have no `workerSelector`. On a
   cluster with more than one WorkerPool, register them again (delete the base and its
@@ -293,8 +296,9 @@ for the design.
 Then create and use an environment:
 
 ```bash
-# Port-forward the ate-env-api service.
+# Port-forward the ate-env-api service and load the caller token.
 kubectl port-forward -n ate-env svc/ate-env-api 7777:7777 &
+export SUBSTRATE_ENV_AUTH_TOKEN="$(kubectl -n ate-env get secret ate-env-api-token -o jsonpath='{.data.token}' | base64 -d)"
 
 # Create an environment.
 ate-env create dev1

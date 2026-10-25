@@ -30,8 +30,8 @@ func TestPortProxyAtespaces(t *testing.T) {
 			t.Errorf("portProxyAtespaces(%q) = %q, %v; want %q", in, got, err, want)
 		}
 	}
-	// An empty value must not mean "any atespace".
-	for _, in := range []string{"", " ", ",", " , "} {
+	// An empty value must not mean "any atespace", and "*" cannot be combined with names.
+	for _, in := range []string{"", " ", ",", " , ", "ate-env,*", "*,ate-env"} {
 		if got, err := portProxyAtespaces(in); err == nil {
 			t.Errorf("portProxyAtespaces(%q) = %q, want an error", in, got)
 		}

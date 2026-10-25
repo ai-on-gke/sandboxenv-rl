@@ -843,4 +843,20 @@ func TestAtespacesLimitTheProxy(t *testing.T) {
 	if _, err := portproxy.New(portproxy.Options{ConnectAddr: s.routerAddr, Atespaces: []string{"Team_A"}}); err == nil {
 		t.Error("New accepted an atespace that is not a DNS label")
 	}
+
+	// Without Authenticate (--insecure-no-auth), Atespaces alone still blocks foreign atespaces.
+	noAuth := httptest.NewServer(portproxy.Dispatch(mustNew(t, portproxy.Options{
+		ConnectAddr: s.routerAddr, DefaultAtespace: "ate-env", HandshakeTimeout: 5 * time.Second,
+		Atespaces: []string{"ate-env"},
+	}), http.NotFoundHandler()))
+	t.Cleanup(noAuth.Close)
+	before := s.router.connectCount()
+	resp, err := http.Get(noAuth.URL + "/v1alpha/atespaces/team-a/envs/env1/ports/8000/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden || s.router.connectCount() != before {
+		t.Errorf("no-auth foreign atespace: status=%d connects=%d, want 403 and 0 new connects", resp.StatusCode, s.router.connectCount()-before)
+	}
 }

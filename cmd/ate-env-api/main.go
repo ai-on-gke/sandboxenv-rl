@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -48,22 +49,27 @@ func isLoopbackAddr(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// portProxyAtespaces parses -port-proxy-atespaces: nil (any atespace) for
-// "*", else the comma-separated names, which portproxy.New validates. An
-// empty value is an error rather than "any": only an explicit "*" opens the
-// proxy to all atespaces.
+func splitCSV(s string) []string {
+	var out []string
+	for v := range strings.SplitSeq(s, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// portProxyAtespaces parses -port-proxy-atespaces; "*" allows any atespace and empty is an error.
 func portProxyAtespaces(v string) ([]string, error) {
 	if strings.TrimSpace(v) == "*" {
 		return nil, nil
 	}
-	var out []string
-	for a := range strings.SplitSeq(v, ",") {
-		if a = strings.TrimSpace(a); a != "" {
-			out = append(out, a)
-		}
-	}
+	out := splitCSV(v)
 	if len(out) == 0 {
 		return nil, errors.New("-port-proxy-atespaces is empty; name the atespaces, or * for any")
+	}
+	if slices.Contains(out, "*") {
+		return nil, errors.New("-port-proxy-atespaces cannot combine * with other names")
 	}
 	return out, nil
 }
@@ -73,8 +79,8 @@ func main() {
 		listen            = flag.String("listen", "0.0.0.0:7777", "address to serve the API on")
 		ateapi            = flag.String("ateapi", ate.DefaultControlAddr, "address of the ateapi gRPC control plane")
 		atenet            = flag.String("atenet", ate.DefaultRouterAddr, "address of the atenet HTTP router")
-		atenetConn        = flag.String("atenet-connect", ate.DefaultRouterConnectAddr, "address of the atenet router's plaintext CONNECT listener; HTTP requests carrying X-Env-Id and X-Env-Port, or to /v1alpha/envs/{id}/ports/{port}/..., are forwarded through it to that port in the environment, in the atespaces -port-proxy-atespaces names. Without -auth-token-file the forwarding does not authenticate callers, and it reaches any port of any actor the router serves there. Empty disables it")
-		ppAtespaces       = flag.String("port-proxy-atespaces", ate.DefaultAtespace, "comma-separated atespaces whose environments the port proxy forwards to; * means any atespace the router serves. Substrate actors carry no label that marks the ones ate-env-api created, thus keep these atespaces for ate-env")
+		atenetConn        = flag.String("atenet-connect", ate.DefaultRouterConnectAddr, "address of the atenet router's plaintext CONNECT listener for port-proxy forwarding (empty disables it)")
+		ppAtespaces       = flag.String("port-proxy-atespaces", ate.DefaultAtespace, "comma-separated atespaces whose environments the port proxy forwards to, or * for any")
 		ppOrigins         = flag.String("port-proxy-trusted-origins", "", "comma-separated browser origins (scheme://host[:port]) whose pages may use the port proxy's path form, next to the listener's own origin")
 		ppHeaderTimeout   = flag.Duration("port-proxy-response-header-timeout", 0, "how long the port proxy waits for a daemon's response headers; 0 means no limit, and the caller's deadline applies")
 		hostSuffix        = flag.String("host-suffix", ate.DefaultHostSuffix, "atenet router host suffix for actor routing")
@@ -153,12 +159,7 @@ func main() {
 	// anything else, whatever their path: the path belongs to the daemon.
 	var handler http.Handler = mux
 	if *atenetConn != "" {
-		var origins []string
-		for o := range strings.SplitSeq(*ppOrigins, ",") {
-			if o = strings.TrimSpace(o); o != "" {
-				origins = append(origins, o)
-			}
-		}
+		origins := splitCSV(*ppOrigins)
 		atespaces, err := portProxyAtespaces(*ppAtespaces)
 		if err != nil {
 			log.Fatalf("port proxy: %v", err)

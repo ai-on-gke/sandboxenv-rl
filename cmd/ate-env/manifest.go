@@ -43,7 +43,11 @@ const apiName = "ate-env-api"
 // defaultAuthTokenSecret is the Secret, key token, that holds the bearer
 // token ate-env-api requires from its callers unless --insecure-no-auth is
 // given. "ate-env manifest auth-secret" prints one.
-const defaultAuthTokenSecret = "ate-env-api-token"
+const (
+	defaultAuthTokenSecret = "ate-env-api-token"
+	authTokenSecretKey     = "token"
+	authTokenMountPath     = "/var/run/secrets/ate-env-auth"
+)
 
 // authTokenBytes is the size of a generated caller token before hex encoding.
 const authTokenBytes = 32
@@ -101,15 +105,14 @@ type manifestConfig struct {
 	workerImage     string
 	replicas        int32
 	apiImage        string
-	apiReplicas     int32
-	apiPort         int32
-	authTokenSecret string
-	insecureNoAuth  bool
+	apiReplicas        int32
+	apiPort            int32
+	authTokenSecret    string
+	insecureNoAuth     bool
+	portProxyAtespaces string
 }
 
-// resolveAuth applies --insecure-no-auth: it clears the Secret, and refuses an
-// explicit --auth-token-secret next to it. An empty --auth-token-secret is
-// refused too, so turning the token off is always the explicit flag.
+// resolveAuth applies --insecure-no-auth and rejects an empty --auth-token-secret.
 func (c *manifestConfig) resolveAuth(secretChanged bool) error {
 	if c.insecureNoAuth {
 		if secretChanged {
@@ -118,6 +121,7 @@ func (c *manifestConfig) resolveAuth(secretChanged bool) error {
 		c.authTokenSecret = ""
 		return nil
 	}
+	c.authTokenSecret = strings.TrimSpace(c.authTokenSecret)
 	if c.authTokenSecret == "" {
 		return errors.New("--auth-token-secret is empty; pass --insecure-no-auth to deploy ate-env-api without a caller token")
 	}
@@ -337,6 +341,7 @@ the "template" subcommand: ate-env manifest template`,
 	cmd.Flags().Int32Var(&mCfg.apiPort, "api-port", 7777, "port the ate-env-api service listens on")
 	cmd.Flags().StringVar(&mCfg.authTokenSecret, "auth-token-secret", defaultAuthTokenSecret, "Kubernetes Secret (key 'token') mounted into ate-env-api; its value is the bearer token ate-env-api requires from callers. Create it with 'ate-env manifest auth-secret'")
 	cmd.Flags().BoolVar(&mCfg.insecureNoAuth, "insecure-no-auth", false, "deploy ate-env-api without a caller token: anyone who can reach its Service can create environments, run commands in them and reach their ports")
+	cmd.Flags().StringVar(&mCfg.portProxyAtespaces, "port-proxy-atespaces", "", "comma-separated atespaces whose environments ate-env-api's port proxy forwards to, or * for any (defaults to ate-env)")
 	cmd.Flags().StringVar(&mCfg.workerPool, "workerpool", "", "WorkerPool name (defaults to <template>-workerpool)")
 	cmd.Flags().Int32Var(&mCfg.replicas, "replicas", 5, "number of pre-warmed worker pods")
 
@@ -370,6 +375,14 @@ FleetConfig(auth_token=...). To rotate the token, replace the Secret's value;
 ate-env-api reads the new value once the kubelet updates the mounted file.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			namespace = strings.TrimSpace(namespace)
+			name = strings.TrimSpace(name)
+			if namespace == "" {
+				return errors.New("--namespace is empty")
+			}
+			if name == "" {
+				return errors.New("--name is empty")
+			}
 			token, err := newAuthToken()
 			if err != nil {
 				return err
@@ -402,7 +415,7 @@ func buildAuthSecret(namespace, name, token string) *corev1.Secret {
 			Labels:    map[string]string{"app": apiName},
 		},
 		Type:       corev1.SecretTypeOpaque,
-		StringData: map[string]string{"token": token},
+		StringData: map[string]string{authTokenSecretKey: token},
 	}
 }
 
@@ -797,10 +810,10 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 		},
 	}}
 	if cfg.authTokenSecret != "" {
-		args = append(args, "-auth-token-file=/var/run/secrets/ate-env-auth/token")
+		args = append(args, "-auth-token-file="+authTokenMountPath+"/"+authTokenSecretKey)
 		mounts = append(mounts, corev1.VolumeMount{
 			Name:      "ate-env-auth",
-			MountPath: "/var/run/secrets/ate-env-auth",
+			MountPath: authTokenMountPath,
 			ReadOnly:  true,
 		})
 		volumes = append(volumes, corev1.Volume{
@@ -811,6 +824,9 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 				},
 			},
 		})
+	}
+	if a := strings.TrimSpace(cfg.portProxyAtespaces); a != "" {
+		args = append(args, "-port-proxy-atespaces="+a)
 	}
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},

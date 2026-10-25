@@ -672,11 +672,11 @@ func TestValidateChecksTheLongestName(t *testing.T) {
 }
 
 func TestLabelsAreDeclared(t *testing.T) {
-	cfg := Config{Mode: ModeSteps, Width: 3, Trajectory: &Trajectory{Name: "t"}, Rollouts: 2, Steps: 4, Park: ParkSuspend,
-		CreateTimeout: time.Minute, StepTimeout: time.Minute, WakeBudget: time.Minute, WakeBackoff: time.Second,
+	cfg := Config{Mode: ModeSteps, Width: 3, Trajectory: &Trajectory{Name: "t"}, Rollouts: 2, Steps: 4, Park: ParkDelete,
+		ImagesPerStep: 2, CreateTimeout: time.Minute, StepTimeout: time.Minute, WakeBudget: time.Minute, WakeBackoff: time.Second,
 		Labels: map[string]string{"commit": "abc"}, Invocation: map[string]string{"dataset": "d.jsonl"}}
 	l := cfg.labels()
-	if l["commit"] != "abc" || l["dataset"] != "d.jsonl" || l["width"] != "3" || l["rollouts"] != "2" || l["wake_budget"] != "1m0s" {
+	if l["commit"] != "abc" || l["dataset"] != "d.jsonl" || l["width"] != "3" || l["rollouts"] != "2" || l["wake_budget"] != "1m0s" || l["images_per_step"] != "2" {
 		t.Fatalf("labels = %v", l)
 	}
 	for k := range l {

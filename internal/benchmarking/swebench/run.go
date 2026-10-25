@@ -131,7 +131,7 @@ func (c *Config) trajectoryNames() string {
 var LoaderLabelKeys = []string{
 	"mode", "width", "images", "trajectory", "tasks_per_image", "rollouts", "steps", "park",
 	"create_timeout", "step_timeout", "wake_budget", "wake_backoff",
-	"dataset", "connections", "base_template", "exclude_file", "instances", "seed",
+	"dataset", "connections", "base_template", "exclude_file", "instances", "seed", "images_per_step",
 }
 
 // labels describes the run for its run event.
@@ -577,11 +577,9 @@ func (r *runner) runWindows(ctx context.Context) {
 
 		// Retire the window. The last step's retirement is the run's cleanup
 		// and runs on a context that survives a cancelled run.
-		rctx := ctx
+		rctx, stop := ctx, func() {}
 		if step == r.cfg.Steps || ctx.Err() != nil {
-			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-			defer cancel()
-			rctx = cleanup
+			rctx, stop = context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 		}
 		parkStart := time.Now()
 		forEach(rctx, len(envs), r.cfg.Width, func(i int) {
@@ -589,6 +587,7 @@ func (r *runner) runWindows(ctx context.Context) {
 				r.remove(rctx, envs[i], step)
 			}
 		})
+		stop() // the cleanup context ends with its step, not with the run
 		if step < r.cfg.Steps && ctx.Err() == nil {
 			r.rec.Record(Event{RunID: r.cfg.RunID, Event: EventPark, Name: string(ParkDelete), Step: step,
 				DurMS: ms(time.Since(parkStart)), OK: true, Count: live})

@@ -802,3 +802,54 @@ func TestManifestTemplateCommandRejectsBadEnv(t *testing.T) {
 		t.Errorf("execute with --env PORT=81: want the --env error, got %v", err)
 	}
 }
+
+func TestBuildAPIDeploymentRouterTLS(t *testing.T) {
+	cfg := testManifestConfig()
+	cfg.routerTLS = true
+	dep := buildAPIDeployment(cfg)
+	c := dep.Spec.Template.Spec.Containers[0]
+	args := strings.Join(c.Args, " ")
+	for _, want := range []string{"-atenet-client-cert=" + routerCredentialBundlePath, "-atenet-ca-file=" + routerTrustBundlePath} {
+		if !strings.Contains(args, want) {
+			t.Errorf("args %v lack %q", c.Args, want)
+		}
+	}
+	mounts := map[string]string{}
+	for _, m := range c.VolumeMounts {
+		mounts[m.Name] = m.MountPath
+	}
+	if mounts["podidentity"] != "/run/podidentity.podcert.ate.dev" || mounts["servicedns-ca"] != "/run/servicedns-ca" {
+		t.Errorf("mounts = %v", mounts)
+	}
+	var pod, trust bool
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Projected == nil || len(v.Projected.Sources) != 1 {
+			continue
+		}
+		src := v.Projected.Sources[0]
+		switch {
+		case v.Name == "podidentity" && src.PodCertificate != nil:
+			pc := src.PodCertificate
+			pod = pc.SignerName == "podidentity.podcert.ate.dev/identity" && pc.KeyType == "ECDSAP256" && pc.CredentialBundlePath == "credential-bundle.pem"
+		case v.Name == "servicedns-ca" && src.ClusterTrustBundle != nil:
+			tb := src.ClusterTrustBundle
+			trust = tb.SignerName != nil && *tb.SignerName == "servicedns.podcert.ate.dev/identity" && tb.Path == "trust-bundle.pem" &&
+				tb.LabelSelector != nil && tb.LabelSelector.MatchLabels["podcert.ate.dev/canarying"] == "live"
+		}
+	}
+	if !pod || !trust {
+		t.Errorf("volumes = %+v; pod certificate ok %v, trust bundle ok %v", dep.Spec.Template.Spec.Volumes, pod, trust)
+	}
+
+	cfg.routerTLS = false
+	dep = buildAPIDeployment(cfg)
+	c = dep.Spec.Template.Spec.Containers[0]
+	if strings.Contains(strings.Join(c.Args, " "), "-atenet-client-cert") {
+		t.Errorf("args %v: want no router TLS flags when off", c.Args)
+	}
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Name == "podidentity" || v.Name == "servicedns-ca" {
+			t.Errorf("volume %s present with router TLS off", v.Name)
+		}
+	}
+}

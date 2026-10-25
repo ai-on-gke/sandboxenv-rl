@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-substrate/env/internal/routertls"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
@@ -83,6 +84,12 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 			// the guest itself.
 			return nil
 		}
+		if routertls.RejectedCertificate(err) {
+			// The router turned the API's certificate away: no wait fixes
+			// that, and every environment fails the same way.
+			return status.Errorf(codes.FailedPrecondition, "the atenet router rejected ate-env-api's client certificate%s: %v; %s",
+				identityNote(s.RouterIdentity), err, routertls.RejectionAdvice)
+		}
 		state, serr := s.actorState(ctx, atespace, id)
 		if serr != nil {
 			return serr
@@ -117,6 +124,13 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 		}
 		backoff = min(backoff*2, wakeRetryMaxBackoff)
 	}
+}
+
+func identityNote(id string) string {
+	if id == "" {
+		return ""
+	}
+	return " (" + id + ")"
 }
 
 // actorState reads the actor's state from the control plane. A deleted

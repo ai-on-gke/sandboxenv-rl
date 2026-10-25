@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/url"
 	"os"
 	"os/signal"
@@ -94,7 +95,7 @@ func resolveAuthToken(file string, getenv func(string) string) (string, error) {
 	return token, nil
 }
 
-// labelFlags collects repeated -label KEY=VALUE flags.
+// labelFlags collects repeated KEY=VALUE flags (-label and -set on run).
 type labelFlags map[string]string
 
 func (l labelFlags) String() string {
@@ -116,7 +117,7 @@ func (l labelFlags) Set(v string) error {
 		return fmt.Errorf("want KEY=VALUE, got %q", v)
 	}
 	if strings.ContainsAny(v, "\t\n") {
-		return fmt.Errorf("label %q: no tabs or newlines, they break the report's table", v)
+		return fmt.Errorf("%q: no tabs or newlines, they break the report's table", v)
 	}
 	if _, dup := l[k]; dup {
 		return fmt.Errorf("%s is given twice", k)
@@ -180,14 +181,18 @@ func datasetLabel(dataset string) string {
 }
 
 // ownLabels are the loader's labels that only the command line knows (the
-// rest come from Config.labels); every key is in swebench.LoaderLabelKeys.
-// The exclude file and the instance list are named by their file name or
-// count plus a digest of their ids, so two lists of one length differ.
-func ownLabels(dataset string, connections int, baseTemplate, excludeFile string, exclude, instances []string) map[string]string {
+// rest come from Config.labels); every key is in swebench.LoaderLabelKeys or
+// is a -set value under set.KEY. The exclude file and the instance list are
+// named by their file name or count plus a digest of their ids, so two lists
+// of one length differ.
+func ownLabels(dataset string, connections int, baseTemplate, excludeFile string, exclude, instances []string, vars map[string]string) map[string]string {
 	l := map[string]string{
 		"dataset":       datasetLabel(dataset),
 		"connections":   strconv.Itoa(connections),
 		"base_template": baseTemplate,
+	}
+	for k, v := range vars {
+		l["set."+k] = v
 	}
 	if excludeFile != "" {
 		l["exclude_file"] = filepath.Base(excludeFile) + "@" + idsDigest(exclude)
@@ -241,7 +246,7 @@ func runCmd(args []string) (retErr error) {
 		labels        = labelFlags{}
 		vars          = labelFlags{}
 	)
-	fs.Var(vars, "set", "KEY=VALUE for the trajectories' var function, repeatable, e.g. READ_FILE=/testbed/setup.py or COMPILE_DIR=/testbed; a workload's defaults are in its file.")
+	fs.Var(vars, "set", "KEY=VALUE for the trajectories' var function, repeatable, e.g. READ_FILE=/testbed/setup.py or COMPILE_DIR=/testbed; a workload's defaults are in its file. A key no trajectory reads is an error; each value is recorded as a set.KEY label.")
 	fs.Var(labels, "label", "KEY=VALUE recorded on the run event, repeatable: the Substrate commit, the cluster, the arm. The loader records its own flags itself (mode, width, images, trajectory, dataset, the shape flags, connections, base-template, exclude-file, instances and the timeouts); a -label with one of those keys is refused, so report -arm can trust them.")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -307,6 +312,23 @@ func runCmd(args []string) (retErr error) {
 	if len(trajs) == 0 {
 		return fmt.Errorf("-trajectory names no trajectory")
 	}
+	if len(vars) > 0 && len(selected) > 0 {
+		// A -set key no trajectory reads is a typo, or a knob of another
+		// workload; with a default in place it would pass unnoticed.
+		used := map[string]bool{}
+		for _, t := range trajs {
+			u, err := t.VarsUsed(selected[0])
+			if err != nil {
+				return err
+			}
+			maps.Copy(used, u)
+		}
+		for _, k := range slices.Sorted(maps.Keys(vars)) {
+			if !used[k] {
+				return fmt.Errorf("-set %s: no trajectory reads it (they read: %s)", k, strings.Join(slices.Sorted(maps.Keys(used)), ", "))
+			}
+		}
+	}
 	traj := trajs[0]
 
 	fanout := *tasksPerImage
@@ -366,7 +388,7 @@ func runCmd(args []string) (retErr error) {
 		WakeBackoff:   *wakeBackoff,
 		Keep:          *keep,
 		Labels:        labels,
-		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids),
+		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids, vars),
 	})
 	if sum != nil {
 		log.Info("run finished", slog.Int("tasks", sum.Tasks), slog.Int("failed", sum.Failed),

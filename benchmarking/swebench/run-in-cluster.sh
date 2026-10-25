@@ -82,40 +82,52 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT}"
 KODATA=cmd/benchmarking/swebench-loader/kodata
 rm -rf "${KODATA}" && mkdir -p "${KODATA}"
+trap 'rm -rf "${KODATA}"' EXIT
 cp "${DATASET}" "${KODATA}/dataset.jsonl"
 cp benchmarking/swebench/offline-exclusions.txt "${KODATA}/offline-exclusions.txt"
 
-# A -trajectory value that names a file on this machine is baked into the
-# image too, with the other files of its directory (a grader script next to
-# its trajectory), and the flag is rewritten to the baked path. Built-in
-# names pass through. A comma-separated mix is handled element by element.
+# A -trajectory value that names a file on this machine, by an absolute path
+# or one relative to the directory the script was invoked in, is baked into
+# the image too, with the files its write steps name (a grader script next
+# to its trajectory) and nothing else from its directory, and the flag is
+# rewritten to the baked path. Built-in names pass through. A comma-separated
+# mix is handled element by element. The result is left in BAKED, not
+# printed, so the counter survives.
 TRAJ_N=0
+BAKED=""
 bake_trajectory() {
   local -a parts out=()
-  local el dir base
+  local el path dir base asset
   IFS=',' read -r -a parts <<< "$1"
   for el in "${parts[@]}"; do
-    if [[ -f "${el}" ]]; then
-      dir="$(cd "$(dirname "${el}")" && pwd)"
-      base="$(basename "${el}")"
+    path="${el}"
+    [[ "${path}" = /* ]] || path="${OUT_DIR}/${path}"
+    if [[ -f "${path}" ]]; then
+      dir="$(cd "$(dirname "${path}")" && pwd)"
+      base="$(basename "${path}")"
       TRAJ_N=$((TRAJ_N + 1))
       mkdir -p "${KODATA}/traj/${TRAJ_N}"
-      find "${dir}" -maxdepth 1 -type f -exec cp {} "${KODATA}/traj/${TRAJ_N}/" \;
+      cp "${dir}/${base}" "${KODATA}/traj/${TRAJ_N}/"
+      while IFS= read -r asset; do
+        [[ -n "${asset}" ]] || continue
+        mkdir -p "$(dirname "${KODATA}/traj/${TRAJ_N}/${asset}")"
+        cp "${dir}/${asset}" "${KODATA}/traj/${TRAJ_N}/${asset}"
+      done < <(sed -n 's/^[[:space:]]*file:[[:space:]]*//p' "${dir}/${base}" | tr -d "\"'")
       el="/var/run/ko/traj/${TRAJ_N}/${base}"
     fi
     out+=("${el}")
   done
   local IFS=','
-  echo "${out[*]}"
+  BAKED="${out[*]}"
 }
 ARGS=()
 while (( $# )); do
   case "$1" in
     -trajectory|--trajectory)
       [[ $# -ge 2 ]] || { echo "$1 needs a value" >&2; exit 2; }
-      ARGS+=("$1" "$(bake_trajectory "$2")"); shift 2 ;;
+      bake_trajectory "$2"; ARGS+=("$1" "${BAKED}"); shift 2 ;;
     -trajectory=*|--trajectory=*)
-      ARGS+=("${1%%=*}=$(bake_trajectory "${1#*=}")"); shift ;;
+      bake_trajectory "${1#*=}"; ARGS+=("${1%%=*}=${BAKED}"); shift ;;
     *)
       ARGS+=("$1"); shift ;;
   esac
@@ -135,6 +147,7 @@ KUBECTL_ERR="$(mktemp)"
 # shellcheck disable=SC2329 # invoked by the EXIT trap
 cleanup() {
   kc -n "${NS}" delete job "${JOB}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  rm -rf "${KODATA}"
   rm -f "${KUBECTL_ERR}"
 }
 trap cleanup EXIT

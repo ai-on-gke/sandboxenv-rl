@@ -192,7 +192,7 @@ func TestGrades(t *testing.T) {
 	if !def.Grades() {
 		t.Fatal("the default trajectory grades")
 	}
-	for _, n := range []string{"workload-file-read", "workload-compile", "workload-read-all"} {
+	for _, n := range []string{"workload-file-read-one", "workload-file-read", "workload-compile", "workload-read-all"} {
 		tr, err := LoadTrajectory(n)
 		if err != nil {
 			t.Fatalf("%s: %v", n, err)
@@ -230,16 +230,32 @@ steps:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Steps[0].Run != "cat /default.py && echo 200" {
+	if got.Steps[0].Run != "cat '/default.py' && echo '200'" {
 		t.Fatalf("defaults: %q", got.Steps[0].Run)
 	}
-	tr.Vars = map[string]string{"READ_FILE": "/testbed/setup.py"}
+	used, err := tr.VarsUsed(in)
+	if err != nil || !used["READ_FILE"] || !used["COUNT"] || len(used) != 2 {
+		t.Fatalf("VarsUsed = %v, %v", used, err)
+	}
+	// A value is one shell word whatever it holds: a quote cannot end it.
+	tr.Vars = map[string]string{"READ_FILE": "/testbed/it's.py; rm -rf /"}
 	got, err = tr.Render(in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Steps[0].Run != "cat /testbed/setup.py && echo 200" {
+	if got.Steps[0].Run != `cat '/testbed/it'\''s.py; rm -rf /' && echo '200'` {
 		t.Fatalf("set value: %q", got.Steps[0].Run)
+	}
+	twoDefaults, err := ParseTrajectory([]byte(`
+name: twodefaults
+steps:
+  - {name: a, run: "echo {{var \"X\" \"1\" \"2\"}}", reward: true}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := twoDefaults.Render(in); err == nil || !strings.Contains(err.Error(), "one default at most") {
+		t.Fatalf("two defaults must fail to render: %v", err)
 	}
 	noDefault, err := ParseTrajectory([]byte(`
 name: nodefault
@@ -254,7 +270,7 @@ steps:
 	}
 	noDefault.Vars = map[string]string{"MUST": "/x"}
 	got, err = noDefault.Render(in)
-	if err != nil || got.Steps[0].Run != "cat /x" {
+	if err != nil || got.Steps[0].Run != "cat '/x'" {
 		t.Fatalf("set without default: %v, %v", got, err)
 	}
 }

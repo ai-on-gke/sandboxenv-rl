@@ -295,32 +295,47 @@ func (t *Trajectory) HasReward() bool {
 // Render evaluates every template in the trajectory against in and returns
 // the concrete copy to replay. The original is not modified.
 func (t *Trajectory) Render(in Instance) (*Trajectory, error) {
+	return t.render(in, nil)
+}
+
+// VarsUsed renders t for in and returns the names its var calls read, so the
+// loader can refuse a -set key that no trajectory reads.
+func (t *Trajectory) VarsUsed(in Instance) (map[string]bool, error) {
+	used := map[string]bool{}
+	if _, err := t.render(in, used); err != nil {
+		return nil, err
+	}
+	return used, nil
+}
+
+func (t *Trajectory) render(in Instance, used map[string]bool) (*Trajectory, error) {
 	out := &Trajectory{Name: t.Name, Vars: t.Vars}
+	funcs := templateFuncs(t.Vars, used)
 	var err error
-	if out.Setup, err = renderSteps(t.Name, t.Setup, in, t.Vars); err != nil {
+	if out.Setup, err = renderSteps(t.Name, t.Setup, in, funcs); err != nil {
 		return nil, err
 	}
-	if out.Reset, err = renderSteps(t.Name, t.Reset, in, t.Vars); err != nil {
+	if out.Reset, err = renderSteps(t.Name, t.Reset, in, funcs); err != nil {
 		return nil, err
 	}
-	if out.Steps, err = renderSteps(t.Name, t.Steps, in, t.Vars); err != nil {
+	if out.Steps, err = renderSteps(t.Name, t.Steps, in, funcs); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func renderSteps(tname string, steps []Step, in Instance, vars map[string]string) ([]Step, error) {
+func renderSteps(tname string, steps []Step, in Instance, funcs template.FuncMap) ([]Step, error) {
 	out := make([]Step, len(steps))
 	for i, s := range steps {
 		r := s
 		var err error
-		if r.Run, err = renderText(s.Run, in, vars); err != nil {
+		if r.Run, err = renderText(s.Run, in, funcs); err != nil {
 			return nil, fmt.Errorf("trajectory %s step %s run: %w", tname, s.Name, err)
 		}
 		if s.Write != nil {
 			w := *s.Write
 			if !w.raw {
-				if w.Content, err = renderText(s.Write.Content, in, vars); err != nil {
+				if w.Content, err = renderText(s.Write.Content, in, funcs); err != nil {
 					return nil, fmt.Errorf("trajectory %s step %s write: %w", tname, s.Name, err)
 				}
 			}
@@ -335,30 +350,45 @@ func renderSteps(tname string, steps []Step, in Instance, vars map[string]string
 // renders a value as JSON, for handing an instance's fields to a script in
 // the sandbox. var reads an operator value (-set KEY=VALUE): the value when
 // set, else the default given as the second argument, else an error, so a
-// workload names its knobs and their defaults in one place.
-func templateFuncs(vars map[string]string) template.FuncMap {
+// workload names its knobs and their defaults in one place. The value comes
+// back as one single-quoted shell word, so a step writes {{var "X"}} bare and
+// a value with quotes or spaces cannot change the command. used, when not
+// nil, collects the names read.
+func templateFuncs(vars map[string]string, used map[string]bool) template.FuncMap {
 	return template.FuncMap{
 		"json": func(v any) (string, error) {
 			b, err := json.Marshal(v)
 			return string(b), err
 		},
 		"var": func(name string, def ...string) (string, error) {
+			if len(def) > 1 {
+				return "", fmt.Errorf("var %s: one default at most, got %d", name, len(def))
+			}
+			if used != nil {
+				used[name] = true
+			}
 			if v, ok := vars[name]; ok {
-				return v, nil
+				return shellQuote(v), nil
 			}
 			if len(def) > 0 {
-				return def[0], nil
+				return shellQuote(def[0]), nil
 			}
 			return "", fmt.Errorf("variable %s is not set and has no default; pass -set %s=VALUE", name, name)
 		},
 	}
 }
 
-func renderText(text string, in Instance, vars map[string]string) (string, error) {
+// shellQuote makes s one shell word: single-quoted, with every quote inside
+// closed, escaped and reopened.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func renderText(text string, in Instance, funcs template.FuncMap) (string, error) {
 	if !strings.Contains(text, "{{") {
 		return text, nil
 	}
-	tmpl, err := template.New("step").Option("missingkey=error").Funcs(templateFuncs(vars)).Parse(text)
+	tmpl, err := template.New("step").Option("missingkey=error").Funcs(funcs).Parse(text)
 	if err != nil {
 		return "", err
 	}

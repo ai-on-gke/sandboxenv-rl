@@ -190,8 +190,8 @@ KO_DOCKER_REPO=gcr.io/PROJECT/repo benchmarking/swebench/run-in-cluster.sh swe-e
 ```
 
 The script bakes the dataset, the exclusion list and any `-trajectory` file
-you pass (with the files next to it, so a grader script travels with its
-trajectory) into the loader image, runs a Job next to ate-env-api, follows the full loader log (step failures
+you pass (with the files its `write` steps name, so a grader script travels
+with its trajectory, and nothing else from its directory) into the loader image, runs a Job next to ate-env-api, follows the full loader log (step failures
 included), copies the events file back to the current directory, prints the
 report and deletes the Job. `CONTEXT=<kubectl context>` selects the cluster;
 the same command with a different context and run id is how two clusters are
@@ -217,17 +217,20 @@ swebench-loader run -dataset images.jsonl -trajectory workload-read-all -images 
 
 The workloads take their knobs from `run -set KEY=VALUE`, through the
 trajectories' `var` function, and each file states its defaults, which fit a
-SWE-bench image:
+SWE-bench image. A value lands in the command as one quoted shell word. Each
+`-set` is recorded as a `set.KEY` label, which the reps of an arm must agree
+on, and a key that no trajectory reads is an error:
 
 | Workload | Knobs | Default | What it reads |
 |---|---|---|---|
-| `workload-file-read-one` | `READ_FILE` | `/testbed/lib/matplotlib/pyplot.py` | one file |
+| `workload-file-read-one` | `READ_FILE` | none, pass it | one file |
 | `workload-file-read` | `READ_ROOT`, `READ_FILES` | `/`, `200` | a sample of Python files |
 | `workload-compile` | `PYTHON`, `COMPILE_DIR` | `python3`, `/testbed` | every Python file under the directory, compiled with the image's own Python |
 | `workload-read-all` | `READ_ROOT` | `/` | every regular file, the worst case for lazy loading |
 
 The reading steps print the bytes read, which the reward step's output tail
-keeps in the events file. `-trajectory workload-file-read-one,workload-compile,workload-read-all`
+keeps in the events file, and fail when nothing was read or a read reported
+an error, so a wrong path or a lazy-loading fault scores 0, not 1. `-trajectory workload-file-read-one,workload-compile,workload-read-all`
 mixes them: each environment draws one, with `-seed` fixing the draw so every
 rep gives the same environment the same workload; the task event's `name` is
 the trajectory it replayed. In steps mode the first step's work runs after the

@@ -16,7 +16,8 @@
 # with PYTHON (-set to change; the defaults fit a SWE-bench image), which
 # reads each one and writes next to it. compileall's own exit code is ignored
 # because test fixtures with syntax errors are common; the step passes when
-# at least one .pyc is newer than the sandbox. Probe first, see
+# at least one .pyc is newer than a mark taken as the step starts, so in
+# steps mode each step's compile is judged on its own. Probe first, see
 # workload-file-read.
 name: workload-compile
 steps:
@@ -24,7 +25,8 @@ steps:
     run: "true"
   - name: compile
     run: >-
-      '{{var "PYTHON" "python3"}}' -m compileall -f -q '{{var "COMPILE_DIR" "/testbed"}}' >/dev/null 2>&1;
-      test -n "$(find '{{var "COMPILE_DIR" "/testbed"}}' -xdev -name '*.pyc' -newer /proc/1 2>/dev/null | head -n 1)"
+      touch /tmp/.compile-mark &&
+      { {{var "PYTHON" "python3"}} -m compileall -f -q {{var "COMPILE_DIR" "/testbed"}} >/dev/null 2>&1 || true; } &&
+      test -n "$(find {{var "COMPILE_DIR" "/testbed"}} -xdev -name '*.pyc' -newer /tmp/.compile-mark 2>/dev/null | head -n 1)"
     timeout: 20m
     reward: true

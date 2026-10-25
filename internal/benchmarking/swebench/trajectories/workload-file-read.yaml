@@ -16,12 +16,19 @@
 # READ_ROOT; -set to change). The probe step comes first
 # so time to first instruction is the cold start alone (image pull, boot) and
 # the workload's own time lands on its own row. Needs no grading material in
-# the manifest: an image-only dataset is enough.
+# the manifest: an image-only dataset is enough. The step prints the bytes
+# read and fails when no file matched, nothing was read, or a read reported
+# an error (a wrong root, a lazy-loading fault): sh has no pipefail, so the
+# list and the errors go through files.
 name: workload-file-read
 steps:
   - name: probe
     run: "true"
   - name: file_read
-    run: find '{{var "READ_ROOT" "/"}}' -xdev -type f -name '*.py' 2>/dev/null | head -n '{{var "READ_FILES" "200"}}' | tr '\n' '\0' | xargs -0 -r cat -- 2>/dev/null | wc -c
+    run: >-
+      find {{var "READ_ROOT" "/"}} -xdev -type f -name '*.py' 2>/dev/null | head -n {{var "READ_FILES" "200"}} | tr '\n' '\0' > /tmp/.file-read.lst &&
+      test -s /tmp/.file-read.lst &&
+      n=$(xargs -0 -r cat -- < /tmp/.file-read.lst 2>/tmp/.file-read.err | wc -c) &&
+      test "$n" -gt 0 && test ! -s /tmp/.file-read.err && echo "$n"
     timeout: 10m
     reward: true

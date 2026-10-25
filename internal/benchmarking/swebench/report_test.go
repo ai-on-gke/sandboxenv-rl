@@ -456,6 +456,7 @@ func TestPool(t *testing.T) {
 		{"other workload", [][]Event{run("r1", same), run("r2", map[string]string{"mode": "eval", "width": "3"})}, `rep 2 differs from rep 1 in width ("3", "2")`},
 		{"no loader labels", [][]Event{run("r1", same), run("r2", nil)}, `rep 2 (run "r2") has no loader labels`},
 		{"two runs in one file", [][]Event{append(run("r1", same), run("r2", same)...)}, "rep 1 holds 2 run events"},
+		{"other -set value", [][]Event{run("r1", same), run("r2", map[string]string{"mode": "eval", "width": "2", "set.READ_FILES": "10"})}, `rep 2 differs from rep 1 in set.READ_FILES ("10", "")`},
 	} {
 		if _, err := Pool(tc.runs); err == nil || !strings.Contains(err.Error(), tc.err) {
 			t.Errorf("%s: err = %v, want %q", tc.name, err, tc.err)

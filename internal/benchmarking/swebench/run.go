@@ -118,7 +118,8 @@ func (c *Config) trajectoryNames() string {
 // LoaderLabelKeys are the labels the loader records about its own invocation
 // on the run event: the run's shape and the settings that move its latencies
 // and failure counts. report -arm pools only reps that agree on all of them,
-// and an operator -label may not use one of them.
+// and on every -set value, recorded as set.KEY. An operator -label may not use
+// one of them, nor the set. prefix.
 var LoaderLabelKeys = []string{
 	"mode", "width", "images", "trajectory", "tasks_per_image", "rollouts", "steps", "park",
 	"create_timeout", "step_timeout", "wake_budget", "wake_backoff",
@@ -350,15 +351,28 @@ func (r *runner) plan() ([]*environment, error) {
 	if len(r.cfg.Trajectories) > 1 {
 		pick = rand.New(rand.NewSource(r.cfg.Seed))
 	}
+	// One render per trajectory and instance, shared by that instance's
+	// environments; a replay never writes to it.
+	rendered := map[*Trajectory]map[string]*Trajectory{}
 	for _, in := range r.cfg.Instances {
 		for k := 0; k < fanout; k++ {
 			source := r.cfg.Trajectory
 			if pick != nil {
 				source = r.cfg.Trajectories[pick.Intn(len(r.cfg.Trajectories))]
 			}
-			traj, err := source.Render(in)
-			if err != nil {
-				return nil, err
+			byInstance := rendered[source]
+			if byInstance == nil {
+				byInstance = map[string]*Trajectory{}
+				rendered[source] = byInstance
+			}
+			traj := byInstance[in.InstanceID]
+			if traj == nil {
+				t, err := source.Render(in)
+				if err != nil {
+					return nil, err
+				}
+				traj = t
+				byInstance[in.InstanceID] = traj
 			}
 			id := EnvID(r.cfg.RunID, in.InstanceID, k)
 			envs = append(envs, &environment{

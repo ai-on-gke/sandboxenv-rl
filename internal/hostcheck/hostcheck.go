@@ -22,13 +22,11 @@
 // page read the answers. Refusing names the listener does not serve stops
 // that, for the MCP endpoint and the port proxy alike.
 //
-// gRPC requests are not checked: HTTP/2 requests whose Content-Type is
-// application/grpc (or application/grpc+proto and the like). gRPC clients
-// send many different authorities, the dial target among them, and always
-// send that content type. A browser request that a front proxy relays over
-// HTTP/2, for example a Gateway or a mesh hop that speaks h2c to the
-// listener, carries another content type and gets the same check as an
-// HTTP/1.x request: Go fills r.Host from :authority on HTTP/2.
+// Wrap wraps the HTTP routes (/healthz, MCP and the port proxy), while the
+// gRPC route on the mux stays unwrapped: gRPC clients send many different
+// authorities, the dial target among them. Every wrapped route checks r.Host
+// on both HTTP/1.x and HTTP/2 (where Go fills r.Host from :authority),
+// whatever Content-Type the request carries.
 //
 // The check is a browser defense, not an authentication layer. Browsers
 // always send a Host header, which the check reads; a client that sets its
@@ -139,29 +137,17 @@ func (c *Checker) Allowed(hostport string) bool {
 	return false
 }
 
-// Wrap refuses a request whose Host is not allowed with 403, except a gRPC
-// request (isGRPC), and passes all other requests to next.
+// Wrap refuses a request whose Host is not allowed with 403 and passes all
+// other requests to next.
 func (c *Checker) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isGRPC(r) || c.Allowed(r.Host) {
+		if c.Allowed(r.Host) {
 			next.ServeHTTP(w, r)
 			return
 		}
 		c.logRefused(r.Host)
 		http.Error(w, fmt.Sprintf("host %q is not served here: ate-env-api answers HTTP requests only for IP addresses, localhost, its Service names and the names in --allowed-hosts", r.Host), http.StatusForbidden)
 	})
-}
-
-// isGRPC reports whether r is a gRPC request: HTTP/2 with the Content-Type
-// application/grpc, optionally followed by "+" and a codec or by ";"
-// parameters. gRPC-Web (application/grpc-web) does not count: ate-env-api
-// does not serve it, and browsers can send it.
-func isGRPC(r *http.Request) bool {
-	if r.ProtoMajor < 2 {
-		return false
-	}
-	rest, ok := strings.CutPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/grpc")
-	return ok && (rest == "" || rest[0] == '+' || rest[0] == ';')
 }
 
 func (c *Checker) logRefused(host string) {

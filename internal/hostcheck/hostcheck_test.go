@@ -113,22 +113,17 @@ func TestWrapRefusesAndLogsOncePerHost(t *testing.T) {
 		t.Errorf("logged %d hosts (max flag %v), want %d and the flag set", len(c.logged), c.loggedMax, maxLogged)
 	}
 
-	// Only gRPC passes whatever its authority: HTTP/2 with an application/grpc
-	// content type. A browser request relayed over HTTP/2 is checked.
+	// Wrap checks Host regardless of HTTP version or Content-Type.
 	for _, tc := range []struct {
 		proto       int
 		contentType string
-		pass        bool
 	}{
-		{2, "application/grpc", true},
-		{2, "application/grpc+proto", true},
-		{2, "Application/GRPC; charset=utf-8", true},
-		{2, "", false},
-		{2, "text/html", false},
-		{2, "application/json", false},
-		{2, "application/grpc-web+proto", false},
-		{2, "application/grpcx", false},
-		{1, "application/grpc", false},
+		{2, "application/grpc"},
+		{2, "application/grpc+proto"},
+		{2, ""},
+		{2, "text/html"},
+		{2, "application/json"},
+		{1, "application/grpc"},
 	} {
 		reached = 0
 		req := httptest.NewRequest("POST", "http://attacker.example:7777/", nil)
@@ -138,8 +133,8 @@ func TestWrapRefusesAndLogsOncePerHost(t *testing.T) {
 		}
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
-		if pass := reached == 1; pass != tc.pass {
-			t.Errorf("HTTP/%d %q with a foreign host: passed %v (code %d), want %v", tc.proto, tc.contentType, pass, rec.Code, tc.pass)
+		if reached != 0 || rec.Code != http.StatusForbidden {
+			t.Errorf("HTTP/%d %q with a foreign host: reached=%d code=%d, want 403", tc.proto, tc.contentType, reached, rec.Code)
 		}
 	}
 }
@@ -186,11 +181,6 @@ func TestListenerStack(t *testing.T) {
 	healthpb.RegisterHealthServer(grpcServer, health.NewServer())
 	t.Cleanup(grpcServer.Stop)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok\n") })
-	mux.HandleFunc("/v1alpha/envs/{id}/mcp", func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "mcp\n") })
-	mux.Handle("/", grpcServer)
-
 	closed, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -206,6 +196,11 @@ func TestListenerStack(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	mux := http.NewServeMux()
+	mux.Handle("GET /healthz", c.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "ok\n") })))
+	mux.Handle("/v1alpha/envs/{id}/mcp", c.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "mcp\n") })))
+	mux.Handle("/", grpcServer)
+
 	var protocols http.Protocols
 	protocols.SetHTTP1(true)
 	protocols.SetUnencryptedHTTP2(true)
@@ -213,7 +208,7 @@ func TestListenerStack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &http.Server{Handler: c.Wrap(portproxy.Dispatch(pp, mux)), Protocols: &protocols}
+	srv := &http.Server{Handler: portproxy.Dispatch(pp, mux, c.Wrap), Protocols: &protocols}
 	go srv.Serve(lis)
 	t.Cleanup(func() { srv.Close() })
 	addr := lis.Addr().String()
@@ -253,21 +248,26 @@ func TestListenerStack(t *testing.T) {
 	}
 
 	// A browser request that a front proxy relays over h2c carries a foreign
-	// :authority and no gRPC content type: refused like HTTP/1.x.
+	// :authority: refused like HTTP/1.x, even if Content-Type is application/grpc.
 	var h2c http.Protocols
 	h2c.SetUnencryptedHTTP2(true)
 	h2Client := &http.Client{Transport: &http.Transport{Protocols: &h2c}}
 	for _, path := range []string{"/healthz", "/v1alpha/envs/dev1/mcp", "/v1alpha/envs/dev1/ports/8000/"} {
-		req, _ := http.NewRequest("GET", "http://"+addr+path, nil)
-		req.Host = "attacker.example:7777"
-		resp, err := h2Client.Do(req)
-		if err != nil {
-			t.Fatalf("h2c GET %s: %v", path, err)
-		}
-		b, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if resp.ProtoMajor != 2 || !refused(resp.StatusCode, string(b)) {
-			t.Errorf("h2c rebinding host on %s: got HTTP/%d %d %q, want the hostcheck 403 over HTTP/2", path, resp.ProtoMajor, resp.StatusCode, b)
+		for _, ct := range []string{"", "application/grpc"} {
+			req, _ := http.NewRequest("GET", "http://"+addr+path, nil)
+			req.Host = "attacker.example:7777"
+			if ct != "" {
+				req.Header.Set("Content-Type", ct)
+			}
+			resp, err := h2Client.Do(req)
+			if err != nil {
+				t.Fatalf("h2c GET %s: %v", path, err)
+			}
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.ProtoMajor != 2 || !refused(resp.StatusCode, string(b)) {
+				t.Errorf("h2c rebinding host on %s (Content-Type %q): got HTTP/%d %d %q, want the hostcheck 403 over HTTP/2", path, ct, resp.ProtoMajor, resp.StatusCode, b)
+			}
 		}
 	}
 	req, _ := http.NewRequest("GET", "http://"+addr+"/healthz", nil)

@@ -162,11 +162,13 @@ func main() {
 		mcpHandler = callerAuth.WrapHTTP(mcpHandler)
 	}
 
+	// The Host check wraps the HTTP routes (/healthz, MCP and the port
+	// proxy), while the gRPC route on / stays unwrapped.
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /healthz", hosts.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "ok\n")
-	})
-	mux.Handle("/v1alpha/envs/{id}/mcp", mcpHandler)
+	})))
+	mux.Handle("/v1alpha/envs/{id}/mcp", hosts.Wrap(mcpHandler))
 	mux.Handle("/", grpcServer)
 
 	// Requests that name an environment port go to the port proxy before
@@ -195,7 +197,7 @@ func main() {
 			log.Fatalf("--port-proxy-trusted-origins: %v", err)
 		}
 		// Header form and path form, /v1alpha/envs/{id}/ports/{port}/...
-		handler = portproxy.Dispatch(pp, mux)
+		handler = portproxy.Dispatch(pp, mux, hosts.Wrap)
 	}
 
 	// Enable both HTTP/1.1 (for /healthz and /v1alpha/ HTTP endpoints) and
@@ -204,11 +206,9 @@ func main() {
 	protocols.SetHTTP1(true)
 	protocols.SetUnencryptedHTTP2(true)
 
-	// The Host check covers every HTTP/1.x route: /healthz, MCP and both port
-	// proxy forms.
 	srv := &http.Server{
 		Addr:      *listen,
-		Handler:   hosts.Wrap(handler),
+		Handler:   handler,
 		Protocols: &protocols,
 	}
 

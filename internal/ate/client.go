@@ -350,7 +350,24 @@ func (c *Client) Delete(ctx context.Context, atespace, id string) error {
 	if err != nil {
 		return fmt.Errorf("actor: deleting %q: %w", id, wrapGRPCError(err))
 	}
+	c.evictGuest(atespace, id)
 	return nil
+}
+
+// evictGuest closes and forgets the pooled guest connection of a deleted
+// actor, so a workload that creates and deletes thousands of environments
+// does not keep a connection for each.
+func (c *Client) evictGuest(atespace, id string) {
+	if atespace == "" {
+		atespace = DefaultAtespace
+	}
+	c.mu.Lock()
+	conn := c.guestPool[atespace+"/"+id]
+	delete(c.guestPool, atespace+"/"+id)
+	c.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
 }
 
 // ref returns the ObjectRef identifying the actor backing actor id in atespace.

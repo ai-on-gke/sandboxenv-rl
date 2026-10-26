@@ -16,10 +16,12 @@ package main
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/agent-substrate/env/internal/apiservice"
+	"github.com/agent-substrate/env/internal/hostcheck"
 	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	appsv1 "k8s.io/api/apps/v1"
@@ -711,6 +713,81 @@ func TestBuildAPIDeploymentAuthTokenSecret(t *testing.T) {
 	}
 	if !foundVol {
 		t.Errorf("volumes = %+v, want Secret volume for ate-env-caller-token", dep.Spec.Template.Spec.Volumes)
+	}
+}
+
+// allowedHostsArg returns the value of the -allowed-hosts argument, or "" if
+// the deployment has none.
+func allowedHostsArg(dep *appsv1.Deployment) (string, bool) {
+	for _, a := range dep.Spec.Template.Spec.Containers[0].Args {
+		if v, ok := strings.CutPrefix(a, "-allowed-hosts="); ok {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+func TestBuildAPIDeploymentAllowedHosts(t *testing.T) {
+	cfg := testManifestConfig()
+	dep := buildAPIDeployment(cfg)
+	c := dep.Spec.Template.Spec.Containers[0]
+	// ate-env-api derives the Service names itself (in the cluster's own
+	// domain); the manifest names the Service and passes the namespace.
+	if !slices.Contains(c.Args, "-service-name="+apiName) {
+		t.Errorf("args = %v, want -service-name=%s", c.Args, apiName)
+	}
+	if got, ok := allowedHostsArg(dep); ok {
+		t.Errorf("-allowed-hosts=%q rendered without --api-allowed-hosts, want none", got)
+	}
+	ns := false
+	for _, e := range c.Env {
+		if e.Name == "POD_NAMESPACE" && e.ValueFrom != nil && e.ValueFrom.FieldRef != nil && e.ValueFrom.FieldRef.FieldPath == "metadata.namespace" {
+			ns = true
+		}
+	}
+	if !ns {
+		t.Errorf("env = %+v, want POD_NAMESPACE from metadata.namespace", c.Env)
+	}
+
+	cfg.allowedHosts = []string{"lb.internal.example", "*.corp.example"}
+	got, _ := allowedHostsArg(buildAPIDeployment(cfg))
+	checker, err := hostcheck.New(hostcheck.ParseList(got))
+	if err != nil {
+		t.Fatalf("rendered -allowed-hosts=%q does not parse: %v", got, err)
+	}
+	for _, host := range []string{"lb.internal.example", "api.corp.example:7777"} {
+		if !checker.Allowed(host) {
+			t.Errorf("rendered -allowed-hosts=%q refuses %q", got, host)
+		}
+	}
+}
+
+func TestManifestCommandAPIAllowedHosts(t *testing.T) {
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{
+		"--api-image=example.com/api@sha256:cccc",
+		"--worker-image=example.com/worker@sha256:bbbb",
+		"--api-allowed-hosts=lb.internal.example,*.corp.example",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute manifest: %v", err)
+	}
+	if want := "-allowed-hosts=lb.internal.example,*.corp.example"; !strings.Contains(buf.String(), want) {
+		t.Errorf("manifest output lacks %q:\n%s", want, buf.String())
+	}
+
+	cmd = newManifestCommand()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{
+		"--api-image=example.com/api@sha256:cccc",
+		"--worker-image=example.com/worker@sha256:bbbb",
+		"--api-allowed-hosts=http://lb.internal.example:7777",
+	})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--api-allowed-hosts") {
+		t.Errorf("a URL in --api-allowed-hosts: err = %v, want an --api-allowed-hosts error", err)
 	}
 }
 

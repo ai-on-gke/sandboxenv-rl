@@ -153,3 +153,85 @@ async def test_fleet_runs_over_the_pool(recording_server):
     finally:
         fleet.close()
     assert len(set().union(*envs.peers.values())) == 2
+
+
+def test_concurrent_first_client_access_creates_one_client():
+    import threading
+    import time
+
+    driver = SubstrateBackendDriver(api_endpoint="127.0.0.1:1", connections=4)
+    created = []
+
+    def slow_new_client():
+        time.sleep(0.01)  # widen the window between the check and the set
+        client = object()
+        created.append(client)
+        return client
+
+    driver._new_client = slow_new_client
+    start = threading.Barrier(16)
+    got = []
+
+    def worker():
+        start.wait()
+        got.append(driver.client)
+
+    threads = [threading.Thread(target=worker) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(created) == 1
+    assert all(c is created[0] for c in got)
+
+
+class _ClosingClient:
+    def __init__(self, tracker, fail=False):
+        self.tracker = tracker
+        self.fail = fail
+        self.closed = False
+
+    async def close(self):
+        import asyncio
+
+        self.tracker["in_flight"] += 1
+        self.tracker["max_in_flight"] = max(self.tracker["max_in_flight"], self.tracker["in_flight"])
+        await asyncio.sleep(0.02)
+        self.tracker["in_flight"] -= 1
+        self.closed = True
+        if self.fail:
+            raise RuntimeError("close failed")
+
+
+def _driver_with_clients(n, fail_index=None):
+    tracker = {"in_flight": 0, "max_in_flight": 0}
+    driver = SubstrateBackendDriver(api_endpoint="127.0.0.1:1", connections=n)
+    clients = [_ClosingClient(tracker, fail=(i == fail_index)) for i in range(n)]
+    driver._client, driver._extra_clients = clients[0], clients[1:]
+    return driver, clients, tracker
+
+
+async def test_close_async_closes_pooled_clients_concurrently():
+    driver, clients, tracker = _driver_with_clients(4)
+    await driver.close_async()
+    assert all(c.closed for c in clients)
+    assert tracker["max_in_flight"] == 4
+    assert driver._client is None and driver._extra_clients == []
+
+
+async def test_close_async_closes_every_client_when_one_fails():
+    driver, clients, _ = _driver_with_clients(4, fail_index=1)
+    with pytest.raises(RuntimeError, match="close failed"):
+        await driver.close_async()
+    assert all(c.closed for c in clients)
+
+
+def test_close_closes_pooled_clients_concurrently():
+    from ate_env.loop_runner import LoopRunner
+
+    driver, clients, tracker = _driver_with_clients(4)
+    driver._loop_runner = LoopRunner(name="test-close")
+    driver._owns_loop_runner = True
+    driver.close()
+    assert all(c.closed for c in clients)
+    assert tracker["max_in_flight"] == 4

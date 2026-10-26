@@ -171,9 +171,12 @@ class SubstrateBackendDriver(BackendDriver):
 
     @property
     def client(self) -> Client:
-        if self._client is None:
-            self._client = self._new_client()
-        return self._client
+        # Under the lock, so concurrent first calls (for example from
+        # _client_for with index 0) create one channel, not several.
+        with self._lock:
+            if self._client is None:
+                self._client = self._new_client()
+            return self._client
 
     def _client_for(self, actor_id: str) -> Client:
         """The client that carries every call for actor_id.
@@ -198,13 +201,20 @@ class SubstrateBackendDriver(BackendDriver):
             self._extra_clients = []
         return clients
 
+    @staticmethod
+    async def _close_clients(clients: list[Client]) -> None:
+        """Close clients concurrently; every close runs even if one fails."""
+        results = await asyncio.gather(*(c.close() for c in clients), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
     def _sync(self, coro: Any) -> Any:
         return self._get_loop_runner().run(coro)
 
     async def close_async(self) -> None:
         if self._owns_client:
-            for c in self._take_owned_clients():
-                await c.close()
+            await self._close_clients(self._take_owned_clients())
         if self._owns_loop_runner and self._loop_runner:
             self._loop_runner.stop()
             self._loop_runner = None
@@ -212,8 +222,7 @@ class SubstrateBackendDriver(BackendDriver):
     def close(self) -> None:
         if self._loop_runner:
             if self._owns_client:
-                for c in self._take_owned_clients():
-                    self._loop_runner.run(c.close())
+                self._loop_runner.run(self._close_clients(self._take_owned_clients()))
             if self._owns_loop_runner:
                 self._loop_runner.stop()
                 self._loop_runner = None

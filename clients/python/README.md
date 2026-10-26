@@ -326,6 +326,18 @@ results = await asyncio.gather(
 )
 ```
 
+### Grow the task list while the job runs
+
+`load_tasks()` replaces the fleet's tasks. A worker that is handed an episode
+nobody planned, or a trainer that streams batches from a prompt source, calls
+`add_tasks()` instead: it appends, returns the new `Task` objects and, once
+`plan()` has run, extends the plan with their images. It warms nothing:
+
+```python
+new = fleet.add_tasks(next_batch)                    # Task objects or dicts
+fleet.warm_images(sorted({t.image for t in new}), wait=False)
+```
+
 ### Observability
 
 Three layers, all off the hot path when disabled. The base install has

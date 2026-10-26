@@ -1,0 +1,91 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import threading
+
+import pytest
+
+from ate_env.async_fleet import AsyncSandboxFleet
+from ate_env.config import FleetConfig
+from ate_env.fleet import SandboxFleet
+from ate_env.types import Task
+
+
+def _fleet() -> SandboxFleet:
+    return SandboxFleet(FleetConfig(backend="mock", max_warmpool_replicas=4))
+
+
+def test_add_tasks_appends_instead_of_replacing():
+    fleet = _fleet()
+    fleet.load_tasks([Task(id="a", image="img-a")])
+    added = fleet.add_tasks([{"id": "b", "image": "img-b"}, Task(id="c", image="img-a")])
+    assert [t.id for t in added] == ["b", "c"]
+    assert all(isinstance(t, Task) for t in added)
+    assert [t.id for t in fleet.tasks] == ["a", "b", "c"]
+    assert fleet.image_counts() == {"img-a": 2, "img-b": 1}
+
+
+def test_add_tasks_extends_an_existing_plan():
+    fleet = _fleet()
+    fleet.load_tasks([Task(id="a", image="img-a")])
+    plan = fleet.plan()
+    assert plan.for_image("img-b") is None
+
+    fleet.add_tasks([Task(id="b", image="img-b"), Task(id="c", image="img-a")])
+    plan = fleet._plan
+    assert plan.for_image("img-b") is not None
+    assert plan.for_image("img-a").tasks == 2
+
+
+def test_add_tasks_before_plan_does_not_plan():
+    fleet = _fleet()
+    fleet.add_tasks([Task(id="a", image="img-a")])
+    assert fleet._plan is None
+    assert fleet.plan().for_image("img-a") is not None
+
+
+def test_add_tasks_with_nothing_is_a_no_op():
+    fleet = _fleet()
+    fleet.load_tasks([Task(id="a", image="img-a")])
+    assert fleet.add_tasks([]) == []
+    assert len(fleet.tasks) == 1
+
+
+def test_add_tasks_rejects_unsupported_items():
+    with pytest.raises(ValueError, match="Unsupported"):
+        _fleet().add_tasks([42])
+
+
+def test_add_tasks_from_many_threads_keeps_every_task():
+    fleet = _fleet()
+    fleet.plan()
+
+    def add(worker: int) -> None:
+        for i in range(50):
+            fleet.add_tasks([Task(id=f"{worker}-{i}", image=f"img-{i % 5}")])
+
+    threads = [threading.Thread(target=add, args=(w,)) for w in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(fleet.tasks) == 400
+    assert sum(e.tasks for e in fleet._plan.entries) == 400
+
+
+async def test_async_add_tasks():
+    fleet = AsyncSandboxFleet(FleetConfig(backend="mock"))
+    added = fleet.add_tasks([Task(id="a", image="img-a")])
+    assert [t.id for t in added] == ["a"]
+    assert fleet.image_counts() == {"img-a": 1}

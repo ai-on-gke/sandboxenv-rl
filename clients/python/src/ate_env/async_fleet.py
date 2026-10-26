@@ -93,6 +93,10 @@ class AsyncSandboxFleet:
     def load_tasks(self, tasks: list[Any]) -> None:
         self._fleet.load_tasks(tasks)
 
+    def add_tasks(self, tasks: list[Any]) -> list[Task]:
+        """Append tasks and extend the plan (see ``SandboxFleet.add_tasks``)."""
+        return self._fleet.add_tasks(tasks)
+
     def image_counts(self) -> dict[str, int]:
         return self._fleet.image_counts()
 

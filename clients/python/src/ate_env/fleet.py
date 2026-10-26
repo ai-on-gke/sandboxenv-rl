@@ -50,7 +50,7 @@ class SandboxFleet:
 
     def __init__(self, config: FleetConfig | None = None, driver: BackendDriver | None = None):
         self.config = config or FleetConfig()
-        self.run_id = uuid.uuid4().hex[:12]
+        self.run_id = self.config.run_id or uuid.uuid4().hex[:12]
         self._tasks: list[Task] = []
         self._image_to_template: dict[str, tuple[str, str | None]] = {}
         self._plan: FleetPlan | None = None
@@ -368,7 +368,7 @@ class SandboxFleet:
 
     def describe_environment(self, concurrency: int | None = None) -> dict[str, dict[str, Any]]:
         """The run's environment block for the RunReport, keyed by backend."""
-        info: dict[str, Any] = {"atespace": self.config.tenancy}
+        info: dict[str, Any] = {"atespace": self.config.tenancy, "run_id": self.run_id}
         if self.backend_label == "substrate":
             info["endpoint"] = getattr(self.backend, "api_endpoint", self.config.endpoint)
         info.update({

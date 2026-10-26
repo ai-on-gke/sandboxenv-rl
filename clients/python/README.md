@@ -312,6 +312,21 @@ except NotFoundError:
     data = None
 ```
 
+### Share one run id across a job's processes
+
+Each `SandboxFleet` gets a random `run_id`. A training or eval job usually has
+several processes (an orchestrator that plans and warms, workers that claim and
+step), so give them all the job's id:
+
+```python
+cfg = FleetConfig(run_id=os.environ["JOB_PREFIX"])   # a DNS-1123 label
+fleet = SandboxFleet(cfg)                             # same run_id in every process
+```
+
+Handles (`handle.run_id`), the run report's `environment` block and
+`teardown()` then all carry the job's id. Each process still releases only the
+environments it created.
+
 ### Concurrency
 
 One `Client` multiplexes any number of concurrent operations over a

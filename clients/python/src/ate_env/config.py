@@ -192,6 +192,13 @@ class FleetConfig:
     tolerations: list[dict[str, Any]] = field(default_factory=list)
     labels: dict[str, str] = field(default_factory=dict)
 
+    # Run identity. None gives each fleet a random id. Set it to the job's id
+    # (a DNS-1123 label) so every process of one training or eval job (an
+    # orchestrator that warms and the workers that claim) shares one run id:
+    # handles, reports and teardown are then scoped to the job, not to the
+    # process.
+    run_id: str | None = None
+
     # Timeouts & Breakers
     acquire_timeout_s: float = 180.0
     ready_timeout_s: float = 180.0
@@ -241,6 +248,11 @@ class FleetConfig:
         object.__setattr__(self, "node_selector", dict(self.node_selector))
         object.__setattr__(self, "tolerations", list(self.tolerations))
         object.__setattr__(self, "labels", dict(self.labels))
+
+        if self.run_id is not None and (
+            not isinstance(self.run_id, str) or not _DNS1123_LABEL.match(self.run_id)
+        ):
+            raise ValidationError(f"Invalid run_id {self.run_id!r}: must match DNS-1123 label regex")
 
         if self.acquire_timeout_s <= 0:
             raise ValidationError(f"acquire_timeout_s must be > 0, got {self.acquire_timeout_s}")

@@ -183,3 +183,37 @@ async def test_cancelled_release_propagates_and_keeps_the_environment_owned(fake
     # Not recorded as a release failure, and still owned so reap retries it.
     assert report.release_errors == 0
     assert inst.instance_id in driver._owned_actors
+
+
+
+class _FailingReap(Exception):
+    pass
+
+
+def _async_fleet_with_failing_reap(monkeypatch):
+    fleet = AsyncSandboxFleet(FleetConfig(backend="mock", strategy="naive"))
+    closed = []
+
+    def reap(run_id):
+        raise InfrastructureError("could not delete 1 environment(s)")
+
+    monkeypatch.setattr(fleet.backend, "reap", reap)
+    monkeypatch.setattr(fleet, "close", lambda *a, **kw: closed.append(True))
+    return fleet, closed
+
+
+async def test_async_fleet_exit_keeps_the_body_exception(monkeypatch, caplog):
+    fleet, closed = _async_fleet_with_failing_reap(monkeypatch)
+    with pytest.raises(_FailingReap):
+        async with fleet:
+            raise _FailingReap("body failed")
+    assert closed == [True]
+    assert "Fleet teardown failed" in caplog.text
+
+
+async def test_async_fleet_exit_raises_teardown_error_when_body_succeeds(monkeypatch):
+    fleet, closed = _async_fleet_with_failing_reap(monkeypatch)
+    with pytest.raises(InfrastructureError, match="could not delete"):
+        async with fleet:
+            pass
+    assert closed == [True]

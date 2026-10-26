@@ -16,10 +16,14 @@ package apiservice
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/agent-substrate/env/internal/telemetry"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -69,5 +73,87 @@ func TestTrackCreateIsBounded(t *testing.T) {
 	s.trackCreate(DefaultAtespace, "overflow", time.Now())
 	if _, ok := s.pending[DefaultAtespace+"/overflow"]; ok {
 		t.Error("an entry was admitted past the bound with nothing stale to evict")
+	}
+}
+
+// countEnvironments lists the atespaces concurrently but never more than
+// limit at once, and counts each atespace's actors under its own name.
+func TestCountEnvironmentsIsConcurrentAndBounded(t *testing.T) {
+	const limit = 4
+	var spaces []string
+	for i := range maxAtespaces {
+		spaces = append(spaces, fmt.Sprintf("space-%d", i))
+	}
+	var inFlight, peak atomic.Int32
+	list := func(ctx context.Context, atespace string) ([]*ateapipb.Actor, error) {
+		n := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		running := &ateapipb.Actor{Status: &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING}}
+		var i int
+		fmt.Sscanf(atespace, "space-%d", &i)
+		actors := make([]*ateapipb.Actor, i%3)
+		for j := range actors {
+			actors[j] = running
+		}
+		return actors, nil
+	}
+
+	start := time.Now()
+	counts, err := countEnvironments(context.Background(), spaces, limit, list)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if p := peak.Load(); p > limit || p < 2 {
+		t.Errorf("peak concurrent ListActors = %d, want between 2 and %d", p, limit)
+	}
+	// Sequential would take maxAtespaces * 20ms = 1.28s.
+	if elapsed > time.Duration(maxAtespaces)*20*time.Millisecond/2 {
+		t.Errorf("took %v, want the atespaces listed concurrently", elapsed)
+	}
+	if want := len(spaces) * len(environmentStates); len(counts) != want {
+		t.Fatalf("got %d samples, want %d", len(counts), want)
+	}
+	for _, c := range counts {
+		var i int
+		fmt.Sscanf(c.Atespace, "space-%d", &i)
+		want := 0
+		if c.State == "running" {
+			want = i % 3
+		}
+		if c.Count != want {
+			t.Errorf("%s/%s = %d, want %d", c.Atespace, c.State, c.Count, want)
+		}
+	}
+}
+
+// The first ListActors error is returned and cancels the calls in flight.
+func TestCountEnvironmentsReturnsFirstError(t *testing.T) {
+	boom := errors.New("boom")
+	list := func(ctx context.Context, atespace string) ([]*ateapipb.Actor, error) {
+		if atespace == "bad" {
+			return nil, boom
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(5 * time.Second):
+			return nil, nil
+		}
+	}
+	start := time.Now()
+	_, err := countEnvironments(context.Background(), []string{"a", "b", "bad", "c", "d"}, 3, list)
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want %v", err, boom)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("took %v: the error did not cancel the calls in flight", d)
 	}
 }

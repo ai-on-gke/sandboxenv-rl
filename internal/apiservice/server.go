@@ -667,6 +667,11 @@ const (
 	maxAtespaces = 64
 )
 
+// environmentListConcurrency bounds the ListActors calls EnvironmentCounts
+// has in flight, so a scrape over up to maxAtespaces atespaces finishes
+// within the collector's timeout without flooding the control plane.
+const environmentListConcurrency = 8
+
 // requestedAt returns the start of create_to_ready for a CreateEnvironment
 // call received at now: the client's x-ate-env-requested-at when it is a
 // valid RFC 3339 time no later than now, else now. A time in the future
@@ -750,7 +755,8 @@ func environmentState(st *ateapipb.ActorStatus) string {
 // by environment state. It is the source of ate_env_api_environments: the
 // control plane is the truth, so the gauge survives restarts and agrees
 // across replicas, at the cost of one ListActors per atespace per scrape
-// (cached for 15 s by the collector).
+// (cached for 15 s by the collector). The atespaces are listed concurrently,
+// at most environmentListConcurrency at a time.
 func (s *Server) EnvironmentCounts(ctx context.Context) ([]telemetry.EnvironmentCount, error) {
 	s.readyMu.Lock()
 	spaces := []string{DefaultAtespace}
@@ -760,18 +766,59 @@ func (s *Server) EnvironmentCounts(ctx context.Context) ([]telemetry.Environment
 		}
 	}
 	s.readyMu.Unlock()
+	return countEnvironments(ctx, spaces, environmentListConcurrency, s.client.List)
+}
 
-	var out []telemetry.EnvironmentCount
-	for _, a := range spaces {
-		actors, err := s.client.List(ctx, a)
-		if err != nil {
-			return nil, err
+// countEnvironments lists the actors of each atespace in spaces with list,
+// running at most limit calls at once, and counts them by environment
+// state. The first error cancels the calls still running and is returned.
+func countEnvironments(ctx context.Context, spaces []string, limit int,
+	list func(ctx context.Context, atespace string) ([]*ateapipb.Actor, error)) ([]telemetry.EnvironmentCount, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make([][]*ateapipb.Actor, len(spaces))
+	var (
+		wg       sync.WaitGroup
+		errOnce  sync.Once
+		firstErr error
+	)
+	sem := make(chan struct{}, max(limit, 1))
+	for i, a := range spaces {
+		sem <- struct{}{}
+		if ctx.Err() != nil {
+			<-sem
+			break
 		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			actors, err := list(ctx, a)
+			if err != nil {
+				errOnce.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				return
+			}
+			results[i] = actors
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make([]telemetry.EnvironmentCount, 0, len(spaces)*len(environmentStates))
+	for i, a := range spaces {
 		counts := make(map[string]int, len(environmentStates))
 		for _, st := range environmentStates {
 			counts[st] = 0
 		}
-		for _, actor := range actors {
+		for _, actor := range results[i] {
 			counts[environmentState(actor.GetStatus())]++
 		}
 		for st, n := range counts {

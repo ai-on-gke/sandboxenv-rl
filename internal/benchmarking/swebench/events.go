@@ -64,6 +64,10 @@ type Event struct {
 	// Attempts is how many tries a ttfi or wake took; above 1 means the
 	// environment was not serving when first asked.
 	Attempts int `json:"attempts,omitempty"`
+	// Labels describe the run, on its run event: the loader's own (mode,
+	// width, images, trajectory, the shape flags) and the operator's -label
+	// values, which win on a clash.
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // Recorder writes events as JSON lines. It is safe for concurrent use.

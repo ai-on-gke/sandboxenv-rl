@@ -22,6 +22,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -198,6 +199,7 @@ func TestEvalCreatesReplaysDeletes(t *testing.T) {
 	cfg := baseConfig(t, f, &out)
 	cfg.Mode = ModeEval
 	cfg.TasksPerImage = 2
+	cfg.Labels = map[string]string{"cluster": "a", "arm": "x"}
 
 	sum, err := Run(context.Background(), cfg)
 	if err != nil {
@@ -227,6 +229,15 @@ func TestEvalCreatesReplaysDeletes(t *testing.T) {
 	rep := Build(parseEvents(t, out.String()))
 	if rep.Tasks != 6 || rep.RewardRate != 1 {
 		t.Fatalf("report %+v", rep)
+	}
+	// The run event carries the loader's own labels and the operator's.
+	for k, want := range map[string]string{"cluster": "a", "arm": "x", "mode": "eval", "width": "2", "images": "3", "tasks_per_image": "2"} {
+		if rep.Labels[k] != want {
+			t.Errorf("label %s = %q, want %q (labels %v)", k, rep.Labels[k], want, rep.Labels)
+		}
+	}
+	if rep.Labels["trajectory"] == "" {
+		t.Errorf("no trajectory label: %v", rep.Labels)
 	}
 	for _, ev := range []string{EventCreate, EventTTFI, EventTask, EventDelete, EventRun} {
 		if !hasStat(rep, ev) {
@@ -655,5 +666,42 @@ func TestValidateChecksTheLongestName(t *testing.T) {
 	cfg.Mode, cfg.TasksPerImage = ModeEval, 100001 // largest index 100000
 	if err := cfg.validate(); err == nil {
 		t.Fatal("eval mode with a 6-digit replay index: want the long name refused")
+	}
+}
+
+func TestLabelsAreDeclared(t *testing.T) {
+	cfg := Config{Mode: ModeSteps, Width: 3, Trajectory: &Trajectory{Name: "t"}, Rollouts: 2, Steps: 4, Park: ParkSuspend,
+		CreateTimeout: time.Minute, StepTimeout: time.Minute, WakeBudget: time.Minute, WakeBackoff: time.Second,
+		Labels: map[string]string{"commit": "abc"}, Invocation: map[string]string{"dataset": "d.jsonl"}}
+	l := cfg.labels()
+	if l["commit"] != "abc" || l["dataset"] != "d.jsonl" || l["width"] != "3" || l["rollouts"] != "2" || l["wake_budget"] != "1m0s" {
+		t.Fatalf("labels = %v", l)
+	}
+	for k := range l {
+		if k == "commit" {
+			continue
+		}
+		if !slices.Contains(LoaderLabelKeys, k) {
+			t.Errorf("the loader records %s but LoaderLabelKeys lacks it, so report -arm would not compare it", k)
+		}
+	}
+}
+
+// An operator label may not take a key the loader records: report -arm
+// trusts those keys to tell one workload from another.
+func TestValidateRejectsLoaderLabelKeys(t *testing.T) {
+	for _, k := range []string{"width", "dataset", "set.READ_FILES"} {
+		cfg := baseConfig(t, newFake(), nil)
+		cfg.Mode, cfg.TasksPerImage = ModeEval, 1
+		cfg.Labels = map[string]string{k: "x"}
+		if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "label "+k) {
+			t.Errorf("validate() with -label %s = %v, want it refused", k, err)
+		}
+	}
+	cfg := baseConfig(t, newFake(), nil)
+	cfg.Mode, cfg.TasksPerImage = ModeEval, 1
+	cfg.Labels = map[string]string{"commit": "abc"}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate() with an operator label: %v", err)
 	}
 }

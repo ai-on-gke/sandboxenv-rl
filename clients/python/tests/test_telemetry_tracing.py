@@ -617,58 +617,99 @@ def _process(task, handle):
     return handle.exec("echo hi").exit_code
 
 
-def test_nests_client_spans_under_caller_across_loop_runner(spans, threaded_fake_server):
-    from opentelemetry import trace
+def _assert_one_trace(finished):
+    roots = [sp for sp in finished if sp.parent is None]
+    assert [r.name for r in roots] == ["ate_env_fleet.run"], [r.name for r in roots]
+    assert {sp.context.trace_id for sp in finished} == {roots[0].context.trace_id}
 
-    tasks = [Task(id=f"t{i}", image=IMAGE) for i in range(3)]
-    with trace.get_tracer("test").start_as_current_span("caller"):
-        with SandboxFleet(_substrate_cfg(threaded_fake_server, max_concurrent=3)) as fleet:
-            fleet.load_tasks(tasks)
-            results = fleet.run(_process)
-    assert results == [0, 0, 0]
-    finished = spans.get_finished_spans()
-    print("\n" + format_span_tree(finished))
+
+def _assert_substrate_tree(finished, n_tasks):
     names = _by_name(finished)
-    for create in names["ate_env_client.create_environment"]:
-        assert _ancestors(create, finished)[:2] == ["ate_env_client.acquire", "caller"]
-    assert len(names["ate_env_client.exec"]) == 3
+    _assert_one_trace(finished)
+    creates = names["ate_env_client.create_environment"]
+    assert len(creates) == n_tasks
+    for create in creates:
+        assert _ancestors(create, finished) == [
+            "ate_env_client.acquire", "ate_env_fleet.acquire", "ate_env_fleet.run"
+        ]
+    assert len(names["ate_env_client.exec"]) == n_tasks
     for ex in names["ate_env_client.exec"]:
-        assert _parent_name(ex, finished) == "caller"
+        assert _ancestors(ex, finished) == ["ate_env_fleet.process", "ate_env_fleet.run"]
         attrs = dict(ex.attributes)
         assert attrs["ate_env.command.executable"] == "echo"
         assert attrs["ate_env.exit_code"] == 0
         assert "echo hi" not in str(attrs)
-    for rel in names["ate_env_client.release"]:
-        assert _parent_name(rel, finished) == "caller"
-    deletes = names["ate_env_client.delete_environment"]
-    assert len(deletes) == 3
-    for d in deletes:
-        assert _parent_name(d, finished) == "ate_env_client.release"
-    assert {s.context.trace_id for s in finished} == {names["caller"][0].context.trace_id}
-    create_attrs = dict(names["ate_env_client.create_environment"][0].attributes)
+    assert len(names["ate_env_client.delete_environment"]) == n_tasks
+    for delete in names["ate_env_client.delete_environment"]:
+        assert _ancestors(delete, finished)[:3] == [
+            "ate_env_client.release", "ate_env_fleet.release", "ate_env_fleet.run"
+        ] or _ancestors(delete, finished)[:3] == [
+            "ate_env_client.reap", "ate_env_fleet.teardown", "ate_env_fleet.run"
+        ]
+    # Each child's parent span id is its parent's span id (checked by _ancestors);
+    # spot-check one pair explicitly.
+    create = creates[0]
+    acquire = next(sp for sp in finished if sp.context.span_id == create.parent.span_id)
+    assert acquire.name == "ate_env_client.acquire"
+    create_attrs = dict(create.attributes)
     assert create_attrs["ate_env.rootfs_image"] == f"registry.example/swe/repo-a@{DIGEST}"
     assert create_attrs["ate.atespace"] == "ate-env"
+    run_attrs = dict(names["ate_env_fleet.run"][0].attributes)
+    assert run_attrs == {"strategy": "none", "backend": "substrate"}
+    proc_attrs = dict(names["ate_env_fleet.process"][0].attributes)
+    assert proc_attrs["backend"] == "substrate" and proc_attrs["strategy"] == "none"
 
 
-def test_nests_handle_spans_on_mock_backend(spans):
-    from opentelemetry import trace
+def test_nests_sync_fleet_through_loop_runner(spans, threaded_fake_server):
+    """SandboxFleet + SubstrateBackendDriver: client RPCs run on the LoopRunner."""
+    tasks = [Task(id=f"t{i}", image=IMAGE) for i in range(3)]
+    fleet = SandboxFleet(_substrate_cfg(threaded_fake_server, max_concurrent=3))
+    try:
+        fleet.load_tasks(tasks)
+        results = fleet.run(_process)
+        finished = spans.get_finished_spans()
+    finally:
+        fleet.close()
+    assert results == [0, 0, 0]
+    print("\n" + format_span_tree(finished))
+    _assert_substrate_tree(finished, 3)
+    names = _by_name(finished)
+    for wf in names["ate_env_client.write_file"]:
+        assert _ancestors(wf, finished) == ["ate_env_fleet.process", "ate_env_fleet.run"]
+        assert dict(wf.attributes)["ate_env.file.size"] == 5
 
-    cfg = FleetConfig(backend="mock", strategy="naive", tracing=TracerConfig(enable_tracing=True))
-    fleet = SandboxFleet(cfg)
-    fleet.load_tasks([Task(id=f"t{i}", image=f"img-{i % 2}") for i in range(4)])
-    with trace.get_tracer("test").start_as_current_span("caller"):
-        fleet.run(lambda task, handle: handle.exec(["python3", "-c", "print(1)"]).exit_code,
-                  concurrency=4)
+
+def test_nests_context_manager_fleet_deletes_every_environment(spans, threaded_fake_server):
+    """`with SandboxFleet(...)`: fleet phases parent client spans; each sandbox is deleted once."""
+    tasks = [Task(id=f"t{i}", image=IMAGE) for i in range(3)]
+    with SandboxFleet(_substrate_cfg(threaded_fake_server, max_concurrent=3)) as fleet:
+        fleet.load_tasks(tasks)
+        results = fleet.run(_process)
+    assert results == [0, 0, 0]
     finished = spans.get_finished_spans()
-    execs = _by_name(finished)["ate_env_client.exec"]
-    assert len(execs) == 4
-    assert {_parent_name(s, finished) for s in execs} == {"caller"}
-    assert dict(execs[0].attributes)["ate_env.command.executable"] == "python3"
+    print("\n" + format_span_tree(finished))
+    names = _by_name(finished)
+    # The run is one trace; close() at the end of the with block adds a
+    # teardown root that only reaps (nothing is left to delete).
+    roots = sorted(sp.name for sp in finished if sp.parent is None)
+    assert roots == ["ate_env_fleet.run", "ate_env_fleet.teardown"], roots
+    for create in names["ate_env_client.create_environment"]:
+        assert _ancestors(create, finished) == [
+            "ate_env_client.acquire", "ate_env_fleet.acquire", "ate_env_fleet.run"
+        ]
+    for ex in names["ate_env_client.exec"]:
+        assert _ancestors(ex, finished) == ["ate_env_fleet.process", "ate_env_fleet.run"]
+    deletes = names["ate_env_client.delete_environment"]
+    assert len(deletes) == 3
+    for delete in deletes:
+        assert _ancestors(delete, finished) == [
+            "ate_env_client.release", "ate_env_fleet.release", "ate_env_fleet.run"
+        ]
+    for sp in finished:
+        if sp.name.startswith("ate_env_client."):
+            assert _ancestors(sp, finished)[-1].startswith("ate_env_fleet."), sp.name
 
-
-async def test_nests_client_spans_under_caller_in_async_fleet(spans):
-    from opentelemetry import trace
-
+async def test_nests_async_fleet(spans):
     server, port = await _start_fake_server()
     try:
         fleet = AsyncSandboxFleet(_substrate_cfg(f"127.0.0.1:{port}"))
@@ -678,17 +719,66 @@ async def test_nests_client_spans_under_caller_in_async_fleet(spans):
             res = await handle.exec_async("echo hi")
             return res.exit_code
 
-        with trace.get_tracer("test").start_as_current_span("caller"):
-            results = await fleet.run(process)
-        assert results == [0, 0]
+        results = await fleet.run(process)
+        finished = spans.get_finished_spans()
         await fleet.backend.close_async()
     finally:
         await server.stop(None)
+    assert results == [0, 0]
+    _assert_substrate_tree(finished, 2)
+    assert fleet.report is not None and fleet.report.tasks_ok == 2
+
+
+def test_nests_mock_fleet_phases(spans):
+    """The mock backend makes no RPCs; fleet phases still parent handle spans."""
+    cfg = FleetConfig(backend="mock", strategy="naive", tracing=TracerConfig(enable_tracing=True))
+    fleet = SandboxFleet(cfg)
+    fleet.load_tasks([Task(id=f"t{i}", image=f"img-{i % 2}") for i in range(4)])
+    fleet.run(lambda task, handle: handle.exec(["python3", "-c", "print(1)"]).exit_code,
+              concurrency=4)
     finished = spans.get_finished_spans()
+    _assert_one_trace(finished)
     names = _by_name(finished)
-    for create in names["ate_env_client.create_environment"]:
-        assert _ancestors(create, finished)[:2] == ["ate_env_client.acquire", "caller"]
-    assert {_parent_name(s, finished) for s in names["ate_env_client.exec"]} == {"caller"}
+    execs = names["ate_env_client.exec"]
+    assert len(execs) == 4
+    for ex in execs:
+        assert _ancestors(ex, finished) == ["ate_env_fleet.process", "ate_env_fleet.run"]
+    assert dict(execs[0].attributes)["ate_env.command.executable"] == "python3"
+    for phase in ("preflight", "plan", "warm_pool", "acquire", "release", "teardown"):
+        assert _ancestors(names[f"ate_env_fleet.{phase}"][0], finished)[-1] == "ate_env_fleet.run", phase
+
+
+def test_nests_observability_switch_enables_client_spans(spans, threaded_fake_server):
+    """ObservabilityConfig.enable_tracing alone traces the client too, under one service."""
+    from ate_env.config import ObservabilityConfig
+
+    cfg = FleetConfig(
+        backend="substrate",
+        endpoint=threaded_fake_server,
+        strategy="none",
+        observability=ObservabilityConfig(enable_tracing=True),
+    )
+    fleet = SandboxFleet(cfg)
+    try:
+        fleet.load_tasks([Task(id="t0", image=IMAGE)])
+        fleet.run(_process)
+        finished = spans.get_finished_spans()
+    finally:
+        fleet.close()
+    _assert_substrate_tree(finished, 1)
+
+
+def test_nests_user_span_parents_the_run(spans):
+    from opentelemetry import trace
+
+    fleet = SandboxFleet(FleetConfig(backend="mock", strategy="none",
+                                     tracing=TracerConfig(enable_tracing=True)))
+    fleet.load_tasks([Task(id="t0", image="img")])
+    with trace.get_tracer("trainer").start_as_current_span("trainer.step"):
+        fleet.run(lambda task, handle: handle.exec("echo hi").exit_code)
+    finished = spans.get_finished_spans()
+    run = _by_name(finished)["ate_env_fleet.run"][0]
+    assert _parent_name(run, finished) == "trainer.step"
 
 
 # --- span kind and cancellation ------------------------------------------ #

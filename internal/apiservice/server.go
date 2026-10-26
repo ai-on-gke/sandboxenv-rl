@@ -19,6 +19,7 @@ package apiservice
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"strings"
@@ -29,6 +30,7 @@ import (
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -65,6 +67,12 @@ type Server struct {
 	WakeRunningBudget time.Duration
 	// Info is the build and configuration GetServerInfo reports.
 	Info ServerInfo
+	// RouterTLS, when set, is the client TLS configuration for the router's
+	// listeners (see internal/routertls); nil dials them in plaintext.
+	RouterTLS *tls.Config
+	// RouterIdentity is the SPIFFE ID of the certificate RouterTLS presents,
+	// named in the error when the router rejects it.
+	RouterIdentity string
 }
 
 // New creates a new Server.
@@ -497,7 +505,7 @@ func (s *Server) guestConn(ctx context.Context, atespace, id string) (*grpc.Clie
 	targetActor := atespace + "/" + id
 	conn, err := grpc.NewClient(
 		s.routerAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(s.routerCredentials()),
 		grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 			ctx = metadata.AppendToOutgoingContext(ctx, ate.TargetActorHeader, targetActor)
 			return invoker(ctx, method, req, reply, cc, opts...)
@@ -515,6 +523,15 @@ func (s *Server) guestConn(ctx context.Context, atespace, id string) (*grpc.Clie
 		return nil, err
 	}
 	return conn, nil
+}
+
+// routerCredentials are the transport credentials for the router: TLS with
+// the pod identity certificate when RouterTLS is set, else plaintext.
+func (s *Server) routerCredentials() credentials.TransportCredentials {
+	if s.RouterTLS != nil {
+		return credentials.NewTLS(s.RouterTLS)
+	}
+	return insecure.NewCredentials()
 }
 
 // ActorToEnvironment converts an ateapipb Actor to an ateenvv1alpha Environment.

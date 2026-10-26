@@ -39,10 +39,8 @@ func modeABase() *ateapipb.ActorTemplate {
 			WakeupProbe: &ateapipb.WakeupProbe{HttpGet: &ateapipb.HttpGetAction{Path: "/readyz", Port: 80}},
 		}},
 		SnapshotConfig: &ateapipb.SnapshotConfig{StorageLocation: "gs://b/p/", PreferredFidelity: ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY},
-		Resources: &ateapipb.Resources{Limits: []*ateapipb.Limits{
-			{Name: "cpu", Quantity: "2"}, {Name: "memory", Quantity: "4Gi"},
-		}},
-		Status: &ateapipb.ActorTemplateStatus{},
+		Resources:      &ateapipb.ResourceRequirements{Limits: &ateapipb.Resources{CpuMillicores: 2000, MemoryBytes: 4 << 30}},
+		Status:         &ateapipb.ActorTemplateStatus{},
 	}
 }
 

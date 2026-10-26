@@ -33,8 +33,10 @@ from ..errors import (
     SandboxStartError,
 )
 from ..loop_runner import LoopRunner
+from ..telemetry import metrics
 from ..telemetry.tracing import (
     CLIENT_SPAN_PREFIX,
+    mark_error,
     set_attributes,
     start_span,
     tracer_from_config,
@@ -86,6 +88,8 @@ class SubstrateBackendDriver(BackendDriver):
     ``.acquire`` / ``.release`` / ``.reap`` spans and is handed to the Client
     the driver builds (needs the ``tracing`` extra).
     """
+
+    backend_name = "substrate"
 
     def __init__(
         self,
@@ -263,13 +267,20 @@ class SubstrateBackendDriver(BackendDriver):
         with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.acquire",
                         {"ate.template.name": template_id, "ate_env.run_id": run_id}) as span:
             try:
-                instance = await asyncio.wait_for(
-                    self._acquire_internal(template_id, run_id, rootfs_image=rootfs_image), timeout=to_s
-                )
+                with metrics.timed("acquire"):
+                    instance = await asyncio.wait_for(
+                        self._acquire_internal(template_id, run_id, rootfs_image=rootfs_image),
+                        timeout=to_s,
+                    )
             except asyncio.TimeoutError as e:
+                self._observe("claim", "error")
                 raise SandboxStartError(
                     f"Timed out acquiring sandbox for template {template_id} after {to_s:g}s"
                 ) from e
+            except BaseException as e:
+                self._observe("claim", metrics.status_of(e))
+                raise
+            self._observe("claim", "ok")
             set_attributes(span, {"ate.actor.name": instance.instance_id})
             return instance
 
@@ -293,6 +304,8 @@ class SubstrateBackendDriver(BackendDriver):
                     actor_id = warm_list.pop()
 
             if actor_id:
+                self._observe("warm_remove", 1)
+                claim_start = time.monotonic()
                 logger.info(
                     "Claimed warm paused actor %s for template %s (rootfs_image=%s)",
                     actor_id,
@@ -311,10 +324,13 @@ class SubstrateBackendDriver(BackendDriver):
                         self._owned_actors.pop(actor_id, None)
                     continue
                 except Exception as e:
-                    # Put back on unexpected error and raise
+                    # Put back on unexpected error and raise; the claim above
+                    # counted it out of the warm pool, so count it back in.
                     with self._lock:
                         self._warm_paused_pool.setdefault(pool_key, []).append(actor_id)
+                    self._observe("warm_add", 1)
                     raise SandboxStartError(f"Error checking warm actor {actor_id}: {e}") from e
+                metrics.observe("warm_claim", time.monotonic() - claim_start)
                 break
             else:
                 actor_id = f"sb-{uuid.uuid4().hex[:16]}"
@@ -440,6 +456,7 @@ class SubstrateBackendDriver(BackendDriver):
 
         tasks = [_warm_one() for _ in range(needed)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        self._observe("warm_add", sum(1 for r in results if isinstance(r, str)))
 
         for res in results:
             if isinstance(res, Exception):
@@ -486,6 +503,7 @@ class SubstrateBackendDriver(BackendDriver):
                 to_delete = []
                 for k in keys_to_pop:
                     to_delete.extend(self._warm_paused_pool.pop(k, []))
+        self._observe("warm_remove", len(to_delete))
 
         sem = asyncio.Semaphore(16)
 
@@ -508,11 +526,34 @@ class SubstrateBackendDriver(BackendDriver):
 
         Note: Recycling suspends the actor and returns it to the warm pool
         without resetting guest filesystem or processes.
+
+        A failed delete does not raise, so a cleanup error never stops a
+        trainer, but it is not hidden either: the ``ate_env_client.release``
+        span and the ``ate_env_client_release_seconds`` sample get status
+        error, the fleet observer counts it
+        (``ate_env_fleet_release_failures_total``, ``RunReport.release_errors``),
+        and the environment stays owned by this driver so the run's ``reap``
+        tries again and raises if it still cannot delete it. An environment
+        that is already gone (NotFound) counts as released.
         """
-        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.release", {"ate.actor.name": instance_id}):
-            await self._release_internal(instance_id, recycle)
+        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.release",
+                        {"ate.actor.name": instance_id}) as span:
+            try:
+                with metrics.timed("release"):
+                    await self._release_internal(instance_id, recycle)
+            # Exception, not BaseException: a cancellation (CancelledError)
+            # must still propagate. _release_internal catches BaseException
+            # only to keep the environment owned for reap, then re-raises.
+            except Exception as e:
+                # Only the error type reaches the trace; the message can carry
+                # bucket paths and other server details.
+                mark_error(span, f"release failed: {type(e).__name__}")
+                set_attributes(span, {"error.type": type(e).__name__})
+                self._observe("release_failed")
+                logger.warning("Failed to delete environment %s: %s", instance_id, e)
 
     async def _release_internal(self, instance_id: str, recycle: bool) -> None:
+        """Suspend into the warm pool or delete; raises when the delete fails."""
         with self._lock:
             instance = self._owned_actors.pop(instance_id, None)
 
@@ -523,6 +564,7 @@ class SubstrateBackendDriver(BackendDriver):
                 with self._lock:
                     self._warm_paused_pool.setdefault(pool_key, []).append(instance_id)
                     self._owned_actors[instance_id] = instance
+                self._observe("warm_add", 1)
                 logger.info("Recycled actor %s to paused warm pool", instance_id)
                 return
             except Exception as e:
@@ -530,9 +572,16 @@ class SubstrateBackendDriver(BackendDriver):
 
         try:
             await self.client.delete(instance_id, atespace=self.atespace)
-            logger.info("Deleted environment %s", instance_id)
-        except Exception as e:
-            logger.warning("Failed to delete environment %s: %s", instance_id, e)
+        except NotFoundError:
+            logger.info("Environment %s was already deleted", instance_id)
+            return
+        except BaseException:
+            # Keep it owned, so the run's reap retries the delete.
+            if instance is not None:
+                with self._lock:
+                    self._owned_actors.setdefault(instance_id, instance)
+            raise
+        logger.info("Deleted environment %s", instance_id)
 
     def release(self, instance_id: str, recycle: bool = False) -> None:
         self._sync(self.release_async(instance_id, recycle=recycle))
@@ -567,6 +616,8 @@ class SubstrateBackendDriver(BackendDriver):
                     await self.client.delete(aid, atespace=self.atespace)
                     async with reap_lock:
                         reaped_count += 1
+                except NotFoundError:
+                    pass  # already gone (e.g. a release that timed out after the delete landed)
                 except Exception as e:
                     logger.warning("Failed deleting actor %s during reap: %s", aid, e)
                     async with reap_lock:

@@ -15,12 +15,16 @@
 from __future__ import annotations
 
 import collections
+import contextvars
 import logging
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from .handle import SandboxHandle
+from .observability import null_observer, repo_family
+from .telemetry.metrics import status_of
 from .types import Task
 
 logger = logging.getLogger("ate_env.strategies")
@@ -28,15 +32,31 @@ logger = logging.getLogger("ate_env.strategies")
 
 def process_parallel(fleet: Any, tasks: list[Task], process_fn: Callable[[Task, SandboxHandle], Any],
                      concurrency: int) -> list[Any]:
-    """Execute acquire -> process_fn -> release across tasks up to concurrency."""
+    """Execute acquire -> process_fn -> release across tasks up to concurrency.
+
+    process_fn runs in the fleet observer's ``process`` phase; each task's
+    acquire+process+release time is reported with ``task_done``.
+    """
     results: list[Any] = [None] * len(tasks)
+    obs = getattr(fleet, "observer", None) or null_observer()
+    backend = getattr(fleet, "backend_label", "-")
 
     def _execute_single(task: Task) -> Any:
-        handle = fleet.acquire(task)
+        family = repo_family(task)
+        start = time.monotonic()
+        status = "ok"
         try:
-            return process_fn(task, handle)
+            handle = fleet.acquire(task)
+            try:
+                with obs.phase("process", backend=backend, family=family):
+                    return process_fn(task, handle)
+            finally:
+                fleet.release(handle)
+        except BaseException as e:
+            status = status_of(e)
+            raise
         finally:
-            fleet.release(handle)
+            obs.task_done(backend, family, status, time.monotonic() - start)
 
     if concurrency <= 1:
         for i, t in enumerate(tasks):
@@ -48,7 +68,12 @@ def process_parallel(fleet: Any, tasks: list[Task], process_fn: Callable[[Task, 
         return results
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = {executor.submit(_execute_single, t): i for i, t in enumerate(tasks)}
+        # Each worker runs in a copy of the caller's context, so spans started
+        # per task nest under the caller's current span.
+        futures = {
+            executor.submit(contextvars.copy_context().run, _execute_single, t): i
+            for i, t in enumerate(tasks)
+        }
         for fut in as_completed(futures):
             i = futures[fut]
             try:
@@ -144,7 +169,9 @@ def run_pipelined(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
         for n, batch in enumerate(batches):
             # Asynchronously prefetch window N+1
             nxt_future = (
-                prefetch_executor.submit(fleet.warm_images, batches[n + 1], wait=True)
+                prefetch_executor.submit(
+                    contextvars.copy_context().run, fleet.warm_images, batches[n + 1], wait=True
+                )
                 if n + 1 < len(batches) else None
             )
 

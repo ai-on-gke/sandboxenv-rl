@@ -23,6 +23,7 @@ package fakerouter
 
 import (
 	"bufio"
+	"crypto/tls"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -124,6 +125,17 @@ func (r *Router) Serve() (addr string, stop func()) {
 	srv.Config.Protocols = &protocols
 	srv.Start()
 	return strings.TrimPrefix(srv.URL, "http://"), srv.Close
+}
+
+// ServeTLS serves the router over TLS with cfg, HTTP/1.1 and HTTP/2, the way
+// Substrate v0.6.0's router does: set cfg.ClientAuth and cfg.ClientCAs to
+// require a client certificate. It returns the host:port and a stop function.
+func (r *Router) ServeTLS(cfg *tls.Config) (addr string, stop func()) {
+	srv := httptest.NewUnstartedServer(r)
+	srv.TLS = cfg
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	return strings.TrimPrefix(srv.URL, "https://"), srv.Close
 }
 
 // serveConnect answers a CONNECT like the real router: the actor comes from

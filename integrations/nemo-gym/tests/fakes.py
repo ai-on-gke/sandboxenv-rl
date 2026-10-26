@@ -76,6 +76,10 @@ class FakeAteEnv:
     delete_code: grpc.StatusCode | None = None
     ready_after_probes: int = 0  # fail this many `true` probes with UNAVAILABLE first
     hang: set[str] = field(default_factory=set)  # shell commands whose process never exits
+    # Bearer token each call must carry, as ate-env-api's -auth-token-file;
+    # None accepts any call. auth_seen records (method, authorization values).
+    require_token: str | None = None
+    auth_seen: list[tuple[str, list[str]]] = field(default_factory=list)
     _probes: int = 0
     _seq: int = 0
 
@@ -256,11 +260,46 @@ class FakeFileSystemService(guest_pb2_grpc.FileSystemServiceServicer):
         return guest_pb2.WriteFileResponse(bytes_written=len(buf))
 
 
+class _BearerCheck(grpc.aio.ServerInterceptor):
+    """Records each call's authorization metadata and, with
+    ``state.require_token`` set, refuses a call without that bearer token."""
+
+    def __init__(self, state: FakeAteEnv) -> None:
+        self.state = state
+
+    async def intercept_service(self, continuation, handler_call_details):
+        values = [v for k, v in (handler_call_details.invocation_metadata or ()) if k == "authorization"]
+        self.state.auth_seen.append((handler_call_details.method, values))
+        handler = await continuation(handler_call_details)
+        want = self.state.require_token
+        if want is None or values == [f"Bearer {want}"] or handler is None:
+            return handler
+
+        async def deny(_request, context):
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "missing or invalid bearer token")
+
+        async def deny_stream(_request, context):
+            await context.abort(grpc.StatusCode.UNAUTHENTICATED, "missing or invalid bearer token")
+            yield  # pragma: no cover - makes this an async generator
+
+        kw = {
+            "request_deserializer": handler.request_deserializer,
+            "response_serializer": handler.response_serializer,
+        }
+        if handler.request_streaming and handler.response_streaming:
+            return grpc.stream_stream_rpc_method_handler(deny_stream, **kw)
+        if handler.request_streaming:
+            return grpc.stream_unary_rpc_method_handler(deny, **kw)
+        if handler.response_streaming:
+            return grpc.unary_stream_rpc_method_handler(deny_stream, **kw)
+        return grpc.unary_unary_rpc_method_handler(deny, **kw)
+
+
 @contextlib.asynccontextmanager
 async def serve(state: FakeAteEnv | None = None):
     """Run the fake ate-env-api on a loopback port; yields ``(target, state)``."""
     state = state or FakeAteEnv()
-    server = grpc.aio.server()
+    server = grpc.aio.server(interceptors=[_BearerCheck(state)])
     env_pb2_grpc.add_EnvironmentServiceServicer_to_server(FakeEnvironmentService(state), server)
     guest_pb2_grpc.add_ProcessServiceServicer_to_server(FakeProcessService(state), server)
     guest_pb2_grpc.add_FileSystemServiceServicer_to_server(FakeFileSystemService(state), server)

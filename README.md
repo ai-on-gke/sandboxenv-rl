@@ -32,7 +32,7 @@ The focus moves from a general environment service to RL training and evaluation
 | Daemons inside an environment | A port proxy on `ate-env-api` reaches any port in an environment by header or by path, WebSockets included ([details](#reaching-a-service-inside-an-environment)). |
 | Framework integrations | A [NeMo Gym](integrations/nemo-gym/README.md) sandbox provider and a [GRPO](examples/grpo/README.md) training loop on TRL. |
 | Benchmarks | A [SWE-bench Verified loader](benchmarking/swebench/README.md) that drives real task images the way an RL job does, and the [design](internal/benchmarking/DESIGN.md) of the benchmark system. |
-| Platform | Built against Substrate `ddb46651`: the WorkerPool chooses the sandbox, each template selects its pool by label, suspends are durable, and `ate-env-api` runs as its own identity under Substrate authorization. The guest runs as a PID 1 init that reaps orphans, and it allocates PTYs. |
+| Platform | Built against Substrate `v0.6.0` (actor limits are integer millicores and bytes): the WorkerPool chooses the sandbox, each template selects its pool by label, suspends are durable, and `ate-env-api` runs as its own identity under Substrate authorization. The guest runs as a PID 1 init that reaps orphans, and it allocates PTYs. The control plane must run v0.6.0 or later: the release renumbered proto fields env reads and writes, so an older control plane cannot serve this build. `ate-env-api` reaches actors through the router's TLS listeners with its pod identity certificate (`ate-env manifest --api-router-tls`, on by default), so the install must list `spiffe://cluster.local/ns/ate-env/sa/ate-env-api` in the router's ingress allow-list. |
 
 ## Architecture
 
@@ -85,8 +85,7 @@ what each phase cost.
 
 ## Get started
 
-You need a cluster with Agent Substrate at or after
-[`0443aec3`](https://github.com/agent-substrate/substrate/commit/0443aec3), a snapshots bucket,
+You need a cluster with Agent Substrate v0.6.0 or later, a snapshots bucket,
 `kubectl` with `kubectl-ate`, Go, [ko](https://ko.build), and Python 3.10 or later for the SDK. This
 repo publishes no release binaries or images yet, thus build them:
 
@@ -140,13 +139,13 @@ Then pick an [example](#examples) or an [integration](#integrations).
 
 Prerequisites: a cluster with [Agent Substrate](https://github.com/agent-substrate/substrate)
 installed and a snapshots bucket. ate-env is built against Substrate
-[`ddb46651`](https://github.com/agent-substrate/substrate/commit/ddb46651) (2026-10-18, Go module
-`go.ate.dev/substrate`). The cluster needs Substrate at or after
-[`0443aec3`](https://github.com/agent-substrate/substrate/commit/0443aec3) (2026-10-17): from that
-commit the WorkerPool alone chooses the sandbox (`spec.sandboxClasses`), the ActorTemplate names
-none, and Substrate rejects a template that still sends `sandboxConfig`, while an older Substrate
-requires one. With an older Substrate, use ate-env from before the Substrate bump (merge commit
-`a21ead9`). Because the template no
+[`v0.6.0`](https://github.com/agent-substrate/substrate/releases/tag/v0.6.0) (Go module
+`go.ate.dev/substrate`), and the control plane must run v0.6.0 or later: the release renumbered
+the wire fields of Actor, ActorStatus, ActorTemplate, SnapshotConfig and Volume, so this build
+cannot create or read actors on an older control plane, and its templates carry limits as integer
+millicores and bytes. Upgrade the control plane and the ate-env images together; with an older
+Substrate, use ate-env from before the v0.6.0 bump. The WorkerPool alone chooses the sandbox
+(`spec.sandboxClasses`) and the ActorTemplate names none. Because the template no
 longer names a class, an actor booting without a snapshot can land on any pool whose labels its
 template's `workerSelector` matches, and on any pool at all without a selector. `ate-env` labels its
 WorkerPool `ate-env/workerpool: <pool>` and each template selects that label, thus actors stay on
@@ -197,6 +196,41 @@ An atespace has one access policy. If `ate-env` already has one, add the binding
 `ate-env manifest access-policy` prints to it with `kubectl ate get access-policy` and
 `kubectl ate update access-policy`. Repeat both commands for each other atespace you create
 environments in.
+
+Since Substrate v0.6.0 the atenet router serves only TLS listeners and admits
+only clients whose SPIFFE ID is on its allow-list. The manifest mounts the pod
+identity certificate and the servicedns trust bundle into `ate-env-api` for
+that (`--api-router-tls`, on by default), as the `podCertificate` and
+`clusterTrustBundle` projected volumes. GKE 1.37 and later serve both by
+default. A 1.36 cluster must be created with
+`--enable-kubernetes-unstable-apis=certificates.k8s.io/v1beta1/podcertificaterequests,certificates.k8s.io/v1beta1/clustertrustbundles`
+and its node pools created after that, or the mount fails with
+`MountVolume.SetUp failed: unimplemented`; Substrate's `setup-gcp create
+cluster` does both, and its
+[README](https://github.com/agent-substrate/substrate/blob/v0.6.0/tools/setup-gcp/README.md)
+has the details. Versions below 1.36 are not supported. The API's identity
+is `spiffe://cluster.local/ns/<namespace>/sa/ate-env-api`, and `ate-env
+manifest` prints the exact ID. Add it to the Substrate install's allow-list,
+one comma-separated value that becomes the router's whole
+`--ingress-allowed-spiffe-ids`, so keep the IDs already on it, and rerun the
+deploy for a running install:
+
+```bash
+# In the Substrate checkout.
+ATE_INGRESS_ALLOWED_SPIFFE_IDS=spiffe://cluster.local/ns/ate-env/sa/ate-env-api,<existing IDs> \
+  go run ./cmd/ate-setup deploy ate-system
+```
+
+Editing the `atenet-router` Deployment's `--ingress-allowed-spiffe-ids`
+argument does the same by hand. ate-setup requires the list for its default
+Envoy ingress dataplane, which enforces it. Without the ID, or when the
+router does not trust the podidentity signer, the router rejects the API's
+certificate: guest calls fail at once with `FailedPrecondition` naming the ID
+and what to check, the port proxy answers 502 with the same cause, and the
+API logs the ID it presents at startup. `--api-router-tls=false` leaves the
+API on the router's plaintext addresses, which no Substrate release serves
+since v0.6.0, the first this build pairs with; it exists for the test fakes,
+and the API warns at startup when it runs that way.
 
 Deploy the namespace, worker pool, ServiceAccount and API service:
 
@@ -519,8 +553,11 @@ MCP endpoint included.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--atenet-connect` | `atenet-router.ate-system.svc.cluster.local:8081` | The router's CONNECT listener. An empty value turns the forwarding off. |
+| `--atenet-connect` | `atenet-router.ate-system.svc.cluster.local:8081`, or `:8444` with `--atenet-client-cert` | The router's CONNECT listener. An empty value turns the forwarding off. |
 | `--port-proxy-atespaces` | `ate-env` | Comma-separated atespaces whose environments the forwarding reaches; `*` means any atespace the router serves. An empty value is an error. |
+| `--atenet-client-cert` | none | PEM credential bundle presented to the router's TLS listeners: the pod identity bundle the kubelet projects. With it, `--atenet` and `--atenet-connect` default to the TLS ports (443 and 8444), which are the only ones Substrate v0.6.0 serves. Re-read at every handshake. |
+| `--atenet-ca-file` | none | PEM trust bundle that signs the router's serving certificate, the servicedns bundle. Required with `--atenet-client-cert`; re-read at every handshake. |
+| `--atenet-server-name` | `atenet-router.ate-system.svc` | Name the router's serving certificate must carry. |
 | `--port-proxy-trusted-origins` | none | Comma-separated browser origins allowed to use the path form. |
 | `--port-proxy-response-header-timeout` | `0`, no limit | Bound on the wait for a daemon's response headers. Without it, the caller's deadline ends the wait. |
 
@@ -593,6 +630,11 @@ curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
        }
      }'
 ```
+
+## Security
+
+The trust boundaries and their known gaps are in [docs/security/threat-model.md](docs/security/threat-model.md).
+To report a vulnerability, follow [SECURITY.md](SECURITY.md).
 
 ## Cleanup
 

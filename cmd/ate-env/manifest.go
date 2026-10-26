@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/agent-substrate/env/internal/apiservice"
+	"github.com/agent-substrate/env/internal/routertls"
 	"github.com/spf13/cobra"
 	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
@@ -51,6 +52,14 @@ const (
 
 // authTokenBytes is the size of a generated caller token before hex encoding.
 const authTokenBytes = 32
+
+// Where the API deployment mounts the credentials for the router's TLS
+// listeners: the pod identity credential bundle and the servicedns trust
+// bundle, the same paths the router itself uses.
+const (
+	routerCredentialBundlePath = "/run/podidentity.podcert.ate.dev/credential-bundle.pem"
+	routerTrustBundlePath      = "/run/servicedns-ca/trust-bundle.pem"
+)
 
 // workerPoolLabel labels the WorkerPool with its own name, and templates
 // select their pool by it. Substrate copies a pool's labels to its workers and
@@ -110,6 +119,11 @@ type manifestConfig struct {
 	authTokenSecret    string
 	insecureNoAuth     bool
 	portProxyAtespaces string
+	// routerTLS mounts the pod identity certificate and the servicedns trust
+	// bundle into ate-env-api and points it at the router's TLS listeners,
+	// the only ones Substrate serves since v0.6.0. Off only for the test
+	// fakes, which serve the plaintext listeners.
+	routerTLS bool
 }
 
 // resolveAuth applies --insecure-no-auth and rejects an empty --auth-token-secret.
@@ -220,15 +234,15 @@ func parseLayers(values []string) ([]runtimeLayer, error) {
 	return layers, nil
 }
 
-// Bounds Substrate applies to an ActorTemplate's limits
-// (go.ate.dev/substrate/internal/resources.ValidateLimit and the
-// Limits.quantity maxLength), checked here so the CLI never prints a template
-// the control plane rejects.
-const maxQuantityLen = 32
-
+// Bounds on --cpu and --memory. Substrate v0.6.0 carries the limits as
+// integer millicores and bytes and requires only that each is non-zero, so
+// these are env's own: the minimum keeps a typo such as 512m (millibytes)
+// from rendering as one byte, and the maximum keeps the integers in range.
 var (
-	maxCPULimit    = resource.MustParse("999.999")             // the wire carries millicores below 1000 cores
-	maxMemoryLimit = resource.MustParse("9223372036854775807") // the wire carries an int64 byte count
+	minCPULimit    = resource.MustParse("1m")
+	maxCPULimit    = resource.MustParse("999.999")
+	minMemoryLimit = resource.MustParse("1Mi")
+	maxMemoryLimit = resource.MustParse("9223372036854775807") // an int64 byte count
 )
 
 // validateResources checks --cpu and --memory the way Substrate validates
@@ -236,23 +250,20 @@ var (
 func (c *templateConfig) validateResources() error {
 	for _, l := range []struct {
 		flag, value string
-		max         resource.Quantity
-	}{{"--cpu", c.cpu, maxCPULimit}, {"--memory", c.memory, maxMemoryLimit}} {
+		min, max    resource.Quantity
+	}{{"--cpu", c.cpu, minCPULimit, maxCPULimit}, {"--memory", c.memory, minMemoryLimit, maxMemoryLimit}} {
 		if l.value == "" {
 			continue
-		}
-		if len(l.value) > maxQuantityLen {
-			return fmt.Errorf("%s %q is longer than %d characters, which Substrate rejects", l.flag, l.value, maxQuantityLen)
 		}
 		q, err := resource.ParseQuantity(l.value)
 		if err != nil {
 			return fmt.Errorf("%s %q is not a Kubernetes quantity (e.g. 2, 500m, 4Gi): %w", l.flag, l.value, err)
 		}
-		if q.Sign() <= 0 {
-			return fmt.Errorf("%s must be greater than zero, got %q", l.flag, l.value)
+		if q.Cmp(l.min) < 0 {
+			return fmt.Errorf("%s %q is below %s, the smallest limit", l.flag, l.value, l.min.String())
 		}
 		if q.Cmp(l.max) > 0 {
-			return fmt.Errorf("%s %q is above Substrate's maximum of %s", l.flag, l.value, l.max.String())
+			return fmt.Errorf("%s %q is above the maximum of %s", l.flag, l.value, l.max.String())
 		}
 	}
 	return nil
@@ -328,7 +339,14 @@ the "template" subcommand: ate-env manifest template`,
 			if err := mCfg.resolveImages(); err != nil {
 				return err
 			}
-			return writeManifests(cmd.OutOrStdout(), buildManifests(mCfg))
+			if err := writeManifests(cmd.OutOrStdout(), buildManifests(mCfg)); err != nil {
+				return err
+			}
+			if mCfg.routerTLS {
+				fmt.Fprintf(cmd.ErrOrStderr(), "note: ate-env-api presents %s to the atenet router; install Substrate with that ID in the router's ingress allow-list (ate-setup: ATE_INGRESS_ALLOWED_SPIFFE_IDS)\n",
+					routertls.SPIFFEID(mCfg.namespace, apiName))
+			}
+			return nil
 		},
 	}
 
@@ -342,6 +360,7 @@ the "template" subcommand: ate-env manifest template`,
 	cmd.Flags().StringVar(&mCfg.authTokenSecret, "auth-token-secret", defaultAuthTokenSecret, "Kubernetes Secret (key 'token') mounted into ate-env-api; its value is the bearer token ate-env-api requires from callers. Create it with 'ate-env manifest auth-secret'")
 	cmd.Flags().BoolVar(&mCfg.insecureNoAuth, "insecure-no-auth", false, "deploy ate-env-api without a caller token: anyone who can reach its Service can create environments, run commands in them and reach their ports")
 	cmd.Flags().StringVar(&mCfg.portProxyAtespaces, "port-proxy-atespaces", "", "comma-separated atespaces whose environments ate-env-api's port proxy forwards to, or * for any (defaults to ate-env)")
+	cmd.Flags().BoolVar(&mCfg.routerTLS, "api-router-tls", true, "mount the pod identity certificate and the servicedns trust bundle into ate-env-api and dial the atenet router's TLS listeners, the only ones Substrate serves since v0.6.0; the API's SPIFFE ID must then be in the router's --ingress-allowed-spiffe-ids. Off, the API dials the plaintext addresses, which only the test fakes serve")
 	cmd.Flags().StringVar(&mCfg.workerPool, "workerpool", "", "WorkerPool name (defaults to <template>-workerpool)")
 	cmd.Flags().Int32Var(&mCfg.replicas, "replicas", 5, "number of pre-warmed worker pods")
 
@@ -496,8 +515,8 @@ It prints YAML to stdout without touching the cluster.`,
 	cmd.Flags().StringArrayVar(&tCfg.layers, "layer", nil, "extra runtime mounted as a read-only image volume, as name=image@sha256:...=/mount/path (repeatable)")
 	cmd.Flags().StringArrayVar(&tCfg.sidecars, "sidecar", nil, "command the guest starts and keeps running next to itself, an absolute binary path plus arguments, e.g. '/opt/opensandbox/execd --port 44772' (repeatable)")
 	cmd.Flags().StringArrayVar(&tCfg.sidecarReadyz, "sidecar-readyz", nil, "URL the actor's readiness waits for, e.g. http://127.0.0.1:44772/ready (repeatable)")
-	cmd.Flags().StringVar(&tCfg.cpu, "cpu", defaultActorCPU, "CPU limit of each actor, a Kubernetes quantity such as 2 or 500m; Substrate requires one")
-	cmd.Flags().StringVar(&tCfg.memory, "memory", defaultActorMemory, "memory limit of each actor, a Kubernetes quantity such as 4Gi; Substrate requires one")
+	cmd.Flags().StringVar(&tCfg.cpu, "cpu", defaultActorCPU, "CPU limit of each actor, a Kubernetes quantity such as 2 or 500m, at least 1m, rendered as whole millicores (rounded up); Substrate requires one")
+	cmd.Flags().StringVar(&tCfg.memory, "memory", defaultActorMemory, "memory limit of each actor, a Kubernetes quantity such as 4Gi, at least 1Mi, rendered as whole bytes (rounded up); Substrate requires one")
 
 	return cmd
 }
@@ -727,11 +746,21 @@ func buildActorTemplate(cfg templateConfig) *ateapipb.ActorTemplate {
 			// schema marks the field required, so say it explicitly.
 			PreferredFidelity: ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
 		},
-		Resources: &ateapipb.Resources{Limits: []*ateapipb.Limits{
-			{Name: "cpu", Quantity: orDefault(cfg.cpu, defaultActorCPU)},
-			{Name: "memory", Quantity: orDefault(cfg.memory, defaultActorMemory)},
-		}},
+		Resources: resourceLimits(orDefault(cfg.cpu, defaultActorCPU), orDefault(cfg.memory, defaultActorMemory)),
 	}
+}
+
+// resourceLimits renders the cpu and memory quantities as the integer limits
+// Substrate carries since v0.6.0: millicores and bytes, rounded up, so a
+// fraction of either becomes one. The flags were checked by
+// validateResources, and the defaults are constants, so the parse cannot
+// fail here.
+func resourceLimits(cpu, memory string) *ateapipb.ResourceRequirements {
+	c, m := resource.MustParse(cpu), resource.MustParse(memory)
+	return &ateapipb.ResourceRequirements{Limits: &ateapipb.Resources{
+		CpuMillicores: c.MilliValue(),
+		MemoryBytes:   m.Value(),
+	}}
 }
 
 func orDefault(v, def string) string {
@@ -809,6 +838,33 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 			},
 		},
 	}}
+	if cfg.routerTLS {
+		// The router's TLS listeners need the pod's identity certificate and
+		// the CA of the router's own certificate; both are projected by the
+		// kubelet and rotated in place (see internal/routertls).
+		args = append(args,
+			"-atenet-client-cert="+routerCredentialBundlePath,
+			"-atenet-ca-file="+routerTrustBundlePath)
+		mounts = append(mounts,
+			corev1.VolumeMount{Name: "podidentity", MountPath: "/run/podidentity.podcert.ate.dev", ReadOnly: true},
+			corev1.VolumeMount{Name: "servicedns-ca", MountPath: "/run/servicedns-ca", ReadOnly: true})
+		servicednsSigner := "servicedns.podcert.ate.dev/identity"
+		volumes = append(volumes,
+			corev1.Volume{Name: "podidentity", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+				Sources: []corev1.VolumeProjection{{PodCertificate: &corev1.PodCertificateProjection{
+					SignerName:           "podidentity.podcert.ate.dev/identity",
+					KeyType:              "ECDSAP256",
+					CredentialBundlePath: "credential-bundle.pem",
+				}}},
+			}}},
+			corev1.Volume{Name: "servicedns-ca", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+				Sources: []corev1.VolumeProjection{{ClusterTrustBundle: &corev1.ClusterTrustBundleProjection{
+					SignerName:    &servicednsSigner,
+					LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"podcert.ate.dev/canarying": "live"}},
+					Path:          "trust-bundle.pem",
+				}}},
+			}}})
+	}
 	if cfg.authTokenSecret != "" {
 		args = append(args, "-auth-token-file="+authTokenMountPath+"/"+authTokenSecretKey)
 		mounts = append(mounts, corev1.VolumeMount{

@@ -266,10 +266,18 @@ class AsyncSandboxFleet:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        # Like SandboxFleet.__exit__: a teardown or close error is raised only
+        # when the body succeeded, so it never replaces the body's exception
+        # (for example the InfrastructureError of a reap that cannot delete).
         try:
-            await self.teardown()
-        finally:
-            self.close()
+            try:
+                await self.teardown()
+            finally:
+                self.close()
+        except Exception:
+            if exc_type is None:
+                raise
+            logger.warning("Fleet teardown failed after an error in the body", exc_info=True)
 
     # --- Parallel Processing ---
     async def _call_process_fn(

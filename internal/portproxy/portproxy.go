@@ -41,6 +41,7 @@ package portproxy
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -55,6 +56,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/env/internal/ate"
+	"github.com/agent-substrate/env/internal/routertls"
 )
 
 // The routing headers. They match the x-env-id and x-env-atespace metadata
@@ -104,8 +106,14 @@ const guestPort = 80
 
 // Options configures a Proxy.
 type Options struct {
-	// ConnectAddr is the router's plaintext CONNECT listener, host:port.
+	// ConnectAddr is the router's CONNECT listener, host:port: the TLS one
+	// (8444) with TLS set, else the plaintext one, which only the test fakes
+	// serve.
 	ConnectAddr string
+	// TLS, when set, wraps each connection to ConnectAddr in TLS with it: the
+	// pod identity certificate and the router's trust bundle (see
+	// internal/routertls). The CONNECT and the tunnel are unchanged inside.
+	TLS *tls.Config
 	// HostSuffix is the router's actor host suffix; the CONNECT authority is
 	// <id>.<suffix>:<port>. The router reads only the port from it.
 	HostSuffix string
@@ -472,6 +480,14 @@ func (p *Proxy) connect(ctx context.Context, id, atespace, portStr string) (net.
 	if err != nil {
 		return nil, fmt.Errorf("dialing the router's CONNECT listener %s: %w", p.opts.ConnectAddr, err)
 	}
+	if p.opts.TLS != nil {
+		tc := tls.Client(conn, p.opts.TLS.Clone())
+		if err := tc.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("TLS handshake with the router's CONNECT listener %s: %w", p.opts.ConnectAddr, err)
+		}
+		conn = tc
+	}
 	// A context that ends mid-handshake unblocks the write or read below.
 	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
 
@@ -537,6 +553,8 @@ func (p *Proxy) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, context.Canceled):
 		return // the caller went away; nobody reads an answer
+	case routertls.RejectedCertificate(err):
+		cause = "is behind a router that rejected ate-env-api's client certificate; " + routertls.RejectionAdvice
 	case errors.As(err, &re):
 		// 404 (no such environment) and 503 (not running) mean the same to
 		// the caller as to the router; anything else is a gateway failure.

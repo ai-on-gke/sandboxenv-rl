@@ -225,3 +225,77 @@ async def test_substrate_rootfs_image_sent_to_server(fake_stack):
             fleet_mapped.close()
 
     await asyncio.to_thread(_run_sync_mapped)
+
+
+# --- warm-replica accounting (PR #109 review, finding 2) ------------------- #
+
+
+def _warm_observer():
+    from ate_env.config import ObservabilityConfig
+    from ate_env.observability import Observer
+
+    return Observer(ObservabilityConfig(enable_metrics=False))
+
+
+async def test_recycle_counts_the_actor_back_into_the_warm_pool(fake_stack):
+    client, _fakes = fake_stack
+    driver = SubstrateBackendDriver(client=client)
+    driver.observer = obs = _warm_observer()
+    with obs.run("naive") as report:
+        await driver.warm_pool_async("tmpl", replicas=1)
+        assert obs._warm == {"substrate": 1}
+        inst = await driver.acquire_async("tmpl", run_id="r")  # claims the warm actor
+        assert obs._warm == {"substrate": 0}
+        await driver.release_async(inst.instance_id, recycle=True)
+        assert obs._warm == {"substrate": 1}  # back in the pool, counted back in
+        again = await driver.acquire_async("tmpl", run_id="r")
+        assert again.instance_id == inst.instance_id
+        assert obs._warm == {"substrate": 0}
+    assert (report.warm_total, report.peak_warm) == (2, 1)
+
+
+async def test_failed_warm_check_counts_the_put_back(fake_stack, monkeypatch):
+    from ate_env.errors import SandboxStartError
+
+    client, _fakes = fake_stack
+    driver = SubstrateBackendDriver(client=client)
+    driver.observer = obs = _warm_observer()
+    await driver.warm_pool_async("tmpl", replicas=1)
+    assert obs._warm == {"substrate": 1}
+
+    async def broken_get(*args, **kwargs):
+        raise RuntimeError("control plane unavailable")
+
+    monkeypatch.setattr(driver.client, "get", broken_get)
+    with pytest.raises(SandboxStartError, match="Error checking warm actor"):
+        await driver.acquire_async("tmpl", run_id="r")
+    # The actor went back to the pool, and the count follows it.
+    assert sum(len(v) for v in driver._warm_paused_pool.values()) == 1
+    assert obs._warm == {"substrate": 1}
+
+
+async def test_cancelled_claim_has_status_cancelled(fake_stack, monkeypatch):
+    """A cancelled acquire counts a claim with status cancelled, not error."""
+    prom = pytest.importorskip("prometheus_client")
+    from ate_env.config import ObservabilityConfig
+    from ate_env.observability import Observer
+
+    client, _fakes = fake_stack
+    reg = prom.CollectorRegistry()
+    driver = SubstrateBackendDriver(client=client)
+    driver.observer = Observer(ObservabilityConfig(enable_metrics=True), registry=reg)
+    started = asyncio.Event()
+
+    async def slow_acquire(*args, **kwargs):
+        started.set()
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(driver, "_acquire_internal", slow_acquire)
+    acquire = asyncio.ensure_future(driver.acquire_async("tmpl", run_id="r"))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    acquire.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await acquire
+    get = reg.get_sample_value
+    assert get("ate_env_fleet_claims_total", {"backend": "substrate", "status": "cancelled"}) == 1
+    assert get("ate_env_fleet_claims_total", {"backend": "substrate", "status": "error"}) is None

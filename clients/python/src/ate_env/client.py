@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import collections
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
@@ -141,12 +141,18 @@ class Client:
         channel: grpc.aio.Channel | None = None,
         auth_token: str | None = None,
         tracer_config: TracerConfig | None = None,
+        channel_options: Sequence[tuple[str, Any]] | None = None,
     ):
         """Create a client for the ate-env-api service at endpoint.
 
         endpoint accepts a host:port or an http(s):// URL, matching the Go
         client. Pass channel to supply a caller-owned grpc.aio.Channel
         instead; the client then never closes it.
+
+        channel_options are gRPC channel arguments for a channel the client
+        creates (for example ``("grpc.use_local_subchannel_pool", 1)`` to
+        give the channel its own TCP connection). They are ignored when
+        channel is given.
 
         tracer_config enables OpenTelemetry spans (``ate_env_client.<op>``)
         and, on a channel the client owns, the W3C trace context in the
@@ -170,7 +176,9 @@ class Client:
                 # After auth, so the trace context rides on the final metadata.
                 interceptors += _trace_interceptors()
             self._channel = grpc.aio.insecure_channel(
-                _normalize_target(endpoint), interceptors=interceptors or None
+                _normalize_target(endpoint),
+                options=list(channel_options) if channel_options else None,
+                interceptors=interceptors or None,
             )
             self._owns_channel = True
         self._environments = env_pb2_grpc.EnvironmentServiceStub(self._channel)

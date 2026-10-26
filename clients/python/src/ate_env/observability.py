@@ -140,13 +140,18 @@ _ARCH_MARKERS = ("x86_64.", "arm64.")
 MAX_FAMILIES = 64
 _FAMILIES: set[str] = set()
 _FAMILIES_LOCK = threading.Lock()
-#: Label values with a fixed meaning (no repo family, overflow). A repo
-#: family with one of these names is labelled ``<name>_repo`` instead.
+#: Label values with a fixed meaning (no repo family, overflow).
 _RESERVED_FAMILIES = ("other", "unknown")
+#: Repo families that are escaped by appending ``_repo``: a reserved name
+#: followed by zero or more ``_repo``. Escaping all of them, not only the
+#: reserved names, keeps the mapping one-to-one: ``other`` -> ``other_repo``,
+#: ``other_repo`` -> ``other_repo_repo``, and so on, so no two repos share a
+#: label value and no repo shares one with a reserved value.
+_ESCAPED_FAMILY_RE = re.compile(r"^(?:other|unknown)(?:_repo)*$")
 
 
 def _bounded_family(name: str) -> str:
-    if name in _RESERVED_FAMILIES:
+    if _ESCAPED_FAMILY_RE.match(name):
         name += "_repo"
     if name in _FAMILIES:
         return name
@@ -167,7 +172,8 @@ def repo_family(task_or_image: Any) -> str:
     (``sweb.eval.x86_64.astropy__astropy-12907:latest`` -> ``astropy``); else
     ``"unknown"``. A repo whose family is ``other`` or ``unknown`` is
     labelled ``other_repo`` / ``unknown_repo``, so it cannot be mistaken for
-    the overflow or no-family value. After :data:`MAX_FAMILIES` distinct
+    the overflow or no-family value; a repo already named like an escaped
+    value (``other_repo``) gets one more ``_repo``, so labels stay unique. After :data:`MAX_FAMILIES` distinct
     families in this process, any new family is ``"other"``; families seen
     before keep their name. Only SWE-bench image names are
     parsed: set ``metadata["repo"]`` for non-SWE-bench datasets (e.g.

@@ -419,6 +419,24 @@ def test_cardinality_reserved_repo_names(monkeypatch):
     assert observability._FAMILIES == {"other_repo", "unknown_repo"}
 
 
+def test_cardinality_escaped_repo_names_stay_unique(monkeypatch):
+    """P-3: a repo literally named other_repo does not share a label with repo other."""
+    monkeypatch.setattr(observability, "_FAMILIES", set())
+    repos = ["other", "other_repo", "other_repo_repo", "unknown", "unknown_repo"]
+    labels = [_family_of(f"acme/{r}") for r in repos]
+    assert labels == [
+        "other_repo",
+        "other_repo_repo",
+        "other_repo_repo_repo",
+        "unknown_repo",
+        "unknown_repo_repo",
+    ]
+    assert len(set(labels)) == len(repos)
+    # Names that only look similar are not escaped.
+    assert _family_of("acme/other_repos") == "other_repos"
+    assert _family_of("acme/my_other_repo") == "my_other_repo"
+
+
 def test_cardinality_full_registry_only_new_families_get_other(monkeypatch):
     """P-1..P-3: past MAX_FAMILIES only new families are "other"; known ones keep their name."""
     monkeypatch.setattr(observability, "_FAMILIES", set())

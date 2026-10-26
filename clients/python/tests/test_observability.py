@@ -166,6 +166,47 @@ def test_report_phases_outside_run_are_not_counted():
     assert fleet.report.to_dict() == before
 
 
+def test_report_summary_order_has_reap():
+    rep = RunReport("naive")
+    for name in ("teardown", "reap", "release"):
+        rep.add_phase(name, 0.5)
+    rows = [line.split()[0] for line in rep.summary().splitlines()[1:]
+            if line.strip() and not line.strip().startswith(("-", "claims="))]
+    assert rows == ["release", "reap", "teardown", "TOTAL"]
+
+
+def test_report_clamps_negative_phase_duration():
+    """P-8: a negative duration counts as 0, so 0 <= max_s <= total_s <= count * max_s."""
+    rep = RunReport("naive")
+    rep.add_phase("acquire", 2.0)
+    rep.add_phase("acquire", -5.0)
+    count, total, mx = rep.phases["acquire"]
+    assert (count, total, mx) == (2, 2.0, 2.0)
+    assert 0 <= mx <= total <= count * mx
+    assert rep.to_dict()["phases"]["acquire"] == {"count": 2, "total_s": 2.0, "max_s": 2.0}
+    rep.add_phase("plan", -1.0)
+    assert rep.phases["plan"] == [1, 0.0, 0.0]
+
+
+def test_report_task_done_clamps_negative_duration():
+    obs = Observer(ObservabilityConfig(enable_metrics=False))
+    with obs.run("naive") as rep:
+        obs.task_done("mock", "fam", "ok", -5.0)
+    assert (rep.tasks_ok, rep.tasks_err) == (1, 0)
+    assert all(0 <= c[2] <= c[1] for c in rep.phases.values())
+
+
+def test_report_task_done_negative_duration_observes_zero():
+    _, reg = _custom_registry()
+    obs = Observer(ObservabilityConfig(enable_metrics=True), registry=reg)
+    with obs.run("naive") as rep:
+        obs.task_done("mock", "fam", "ok", -5.0)
+    assert rep.tasks_ok == 1
+    labels = {"strategy": "naive", "backend": "mock", "family": "fam", "status": "ok"}
+    assert reg.get_sample_value("ate_env_fleet_task_latency_seconds_count", labels) == 1
+    assert reg.get_sample_value("ate_env_fleet_task_latency_seconds_sum", labels) == 0.0
+
+
 def test_repo_family():
     assert repo_family("sweb.eval.x86_64.astropy__astropy-12907:latest") == "astropy"
     assert repo_family("docker.io/swebench/sweb.eval.x86_64.django_1776_django-11099:v1") == "django"
@@ -360,6 +401,61 @@ def test_cardinality_bounded_labels_over_many_images():
                  | set(data["images"]))
     assert not (values & forbidden)
     assert not any(":" in v or "@" in v or "/" in v for v in values), values
+
+
+def _family_of(repo):
+    return repo_family(Task(id="1", image="x", metadata={"repo": repo}))
+
+
+def test_cardinality_reserved_repo_names(monkeypatch):
+    """P-3: a repo named other or unknown is not confused with the reserved values."""
+    monkeypatch.setattr(observability, "_FAMILIES", set())
+    assert _family_of("acme/other") == "other_repo"
+    assert _family_of("acme/unknown") == "unknown_repo"
+    assert _family_of("ACME/Other") == "other_repo"
+    assert repo_family("sweb.eval.x86_64.unknown__unknown-1:latest") == "unknown_repo"
+    assert repo_family("python:3.11") == "unknown"
+    assert not ({"other", "unknown"} & observability._FAMILIES)
+    assert observability._FAMILIES == {"other_repo", "unknown_repo"}
+
+
+def test_cardinality_escaped_repo_names_stay_unique(monkeypatch):
+    """P-3: a repo literally named other_repo does not share a label with repo other."""
+    monkeypatch.setattr(observability, "_FAMILIES", set())
+    repos = ["other", "other_repo", "other_repo_repo", "unknown", "unknown_repo"]
+    labels = [_family_of(f"acme/{r}") for r in repos]
+    assert labels == [
+        "other_repo",
+        "other_repo_repo",
+        "other_repo_repo_repo",
+        "unknown_repo",
+        "unknown_repo_repo",
+    ]
+    assert len(set(labels)) == len(repos)
+    # Names that only look similar are not escaped.
+    assert _family_of("acme/other_repos") == "other_repos"
+    assert _family_of("acme/my_other_repo") == "my_other_repo"
+
+
+def test_cardinality_full_registry_only_new_families_get_other(monkeypatch):
+    """P-1..P-3: past MAX_FAMILIES only new families are "other"; known ones keep their name."""
+    monkeypatch.setattr(observability, "_FAMILIES", set())
+    names = [f"fam{i}" for i in range(observability.MAX_FAMILIES)]
+    assert [_family_of(f"org/{n}") for n in names] == names
+    assert _family_of("org/newfam") == "other"
+    assert _family_of("acme/other") == "other"  # other_repo is new, and the registry is full
+    assert [_family_of(f"org/{n}") for n in names] == names
+    assert observability._FAMILIES == set(names)
+
+    # A reserved-name repo registered before the registry fills keeps its label.
+    monkeypatch.setattr(observability, "_FAMILIES", set())
+    assert _family_of("acme/other") == "other_repo"
+    for n in names[1:]:
+        _family_of(f"org/{n}")
+    assert len(observability._FAMILIES) == observability.MAX_FAMILIES
+    assert _family_of("acme/other") == "other_repo"
+    assert _family_of("org/newfam") == "other"
+    assert not ({"other", "unknown"} & observability._FAMILIES)
 
 # --- PR #109 review findings ----------------------------------------------- #
 
@@ -643,3 +739,21 @@ async def test_cancelled_async_task_has_status_cancelled():
         await run
     assert tasks_total("cancelled") == before["cancelled"] + 1
     assert tasks_total("error") == before["error"]
+
+
+def test_registry_new_custom_registry_gets_its_own_collectors():
+    """An Observer on a new registry records there, even when the id is reused."""
+    import gc
+
+    seen_ids = set()
+    for _ in range(50):
+        _, reg = _custom_registry()
+        seen_ids.add(id(reg))
+        obs = Observer(ObservabilityConfig(enable_metrics=True), registry=reg)
+        obs.task_done("mock", "fam", "ok", 0.1)
+        assert reg.get_sample_value("ate_env_fleet_tasks_total",
+                                    {"strategy": "-", "status": "ok"}) == 1
+        del obs, reg
+        gc.collect()
+    # CPython reuses the freed id almost every time, so the loop hit the reuse case.
+    assert len(seen_ids) < 50

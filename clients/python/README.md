@@ -387,6 +387,10 @@ tags never become labels. `family` has at most
 `ate_env.observability.MAX_FAMILIES` (64) values per process: the first 64
 repo families keep their name and later ones are reported as `other`, so a
 dataset with thousands of repos does not grow the series without limit.
+A repo whose family is `other` or `unknown` is labelled `other_repo` or
+`unknown_repo`, so it is never confused with the overflow or no-family value.
+A repo already named like an escaped value gets one more suffix
+(`other_repo` -> `other_repo_repo`), so two repos never share a label.
 `repo_family` takes `metadata["repo"]` or parses a SWE-bench image name: set
 `metadata["repo"]` for non-SWE-bench datasets (e.g. R2E-Gym); otherwise
 their family is `unknown`.

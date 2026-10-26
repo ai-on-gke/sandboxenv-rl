@@ -541,6 +541,9 @@ class SubstrateBackendDriver(BackendDriver):
             try:
                 with metrics.timed("release"):
                     await self._release_internal(instance_id, recycle)
+            # Exception, not BaseException: a cancellation (CancelledError)
+            # must still propagate. _release_internal catches BaseException
+            # only to keep the environment owned for reap, then re-raises.
             except Exception as e:
                 # Only the error type reaches the trace; the message can carry
                 # bucket paths and other server details.

@@ -169,3 +169,17 @@ async def test_release_span_is_marked_error(fake_stack):
 def test_run_report_defaults_have_no_release_errors():
     r = RunReport("s")
     assert r.to_dict()["release_errors"] == 0
+
+
+async def test_cancelled_release_propagates_and_keeps_the_environment_owned(fake_stack):
+    import asyncio
+
+    client, _fakes = fake_stack
+    driver, obs, inst = await _driver_with_actor(client)
+    _failing_delete(client, asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        with obs.run("t") as report:
+            await driver.release_async(inst.instance_id)
+    # Not recorded as a release failure, and still owned so reap retries it.
+    assert report.release_errors == 0
+    assert inst.instance_id in driver._owned_actors

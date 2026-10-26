@@ -21,6 +21,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -85,15 +86,20 @@ type Config struct {
 	WakeBackoff time.Duration
 	// Keep leaves the environments in place when the run ends.
 	Keep bool
-	// Labels are recorded on the run event over the loader's own labels
-	// (LoaderLabelKeys); a clash goes to Labels. The Substrate commit, the
-	// cluster and the arm belong here.
+	// Labels are the operator's labels for the run event: the Substrate
+	// commit, the cluster, the arm. A key the loader records itself
+	// (LoaderLabelKeys, or the set. prefix) is refused by validate, so the
+	// same-workload check of report -arm cannot be overridden.
 	Labels map[string]string
+	// Invocation holds the loader's own labels that only its command line
+	// knows: dataset, connections, base_template, exclude_file, instances.
+	Invocation map[string]string
 }
 
 // LoaderLabelKeys are the labels the loader records about its own invocation
 // on the run event: the run's shape and the settings that move its latencies
-// and failure counts. report -arm pools only reps that agree on all of them.
+// and failure counts. report -arm pools only reps that agree on all of them,
+// and an operator -label may not use one of them.
 var LoaderLabelKeys = []string{
 	"mode", "width", "images", "trajectory", "tasks_per_image", "rollouts", "steps", "park",
 	"create_timeout", "step_timeout", "wake_budget", "wake_backoff",
@@ -119,6 +125,9 @@ func (c *Config) labels() map[string]string {
 		l["rollouts"] = strconv.Itoa(c.Rollouts)
 		l["steps"] = strconv.Itoa(c.Steps)
 		l["park"] = string(c.Park)
+	}
+	for k, v := range c.Invocation {
+		l[k] = v
 	}
 	for k, v := range c.Labels {
 		l[k] = v
@@ -171,6 +180,11 @@ func (c *Config) validate() error {
 	if n := c.longestName(); len(n) > maxNameLen {
 		return fmt.Errorf("environment name %q has %d characters, more than Substrate's %d; "+
 			"use a shorter run id, fewer rollouts or tasks per image, or fewer steps", n, len(n), maxNameLen)
+	}
+	for k := range c.Labels {
+		if slices.Contains(LoaderLabelKeys, k) || strings.HasPrefix(k, "set.") {
+			return fmt.Errorf("label %s: the loader records that key itself, and report -arm trusts it; choose another name", k)
+		}
 	}
 	return nil
 }

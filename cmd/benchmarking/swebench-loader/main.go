@@ -239,7 +239,7 @@ func runCmd(args []string) (retErr error) {
 		authTokenFile = fs.String("auth-token-file", "", "File that holds the bearer token for ate-env-api; surrounding whitespace is ignored. Without it, SUBSTRATE_ENV_AUTH_TOKEN is used when set.")
 		labels        = labelFlags{}
 	)
-	fs.Var(labels, "label", "KEY=VALUE recorded on the run event, repeatable: the Substrate commit, the cluster, the arm. The loader records its own flags itself (mode, width, images, trajectory, dataset, the shape flags, connections, base-template, exclude-file, instances and the timeouts); a -label with the same key wins.")
+	fs.Var(labels, "label", "KEY=VALUE recorded on the run event, repeatable: the Substrate commit, the cluster, the arm. The loader records its own flags itself (mode, width, images, trajectory, dataset, the shape flags, connections, base-template, exclude-file, instances and the timeouts); a -label with one of those keys is refused, so report -arm can trust them.")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -330,11 +330,6 @@ func runCmd(args []string) (retErr error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	for k, v := range ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids) {
-		if _, ok := labels[k]; !ok {
-			labels[k] = v
-		}
-	}
 	sum, err := swebench.Run(ctx, swebench.Config{
 		RunID:         *runID,
 		Backend:       backend,
@@ -354,6 +349,7 @@ func runCmd(args []string) (retErr error) {
 		WakeBackoff:   *wakeBackoff,
 		Keep:          *keep,
 		Labels:        labels,
+		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids),
 	})
 	if sum != nil {
 		log.Info("run finished", slog.Int("tasks", sum.Tasks), slog.Int("failed", sum.Failed),

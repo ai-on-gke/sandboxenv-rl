@@ -64,7 +64,9 @@ summaries as an array. Files go before the flags.
 Every run event carries labels: the loader's own (mode, width, images,
 trajectory, dataset, the shape flags, connections, base template, exclude
 file, instances and the timeouts) plus any `run -label KEY=VALUE`, which is
-where the Substrate commit, the cluster and the arm go. The report prints
+where the Substrate commit, the cluster and the arm go. A `-label` with a key
+the loader records itself is refused, so the same-workload check below cannot
+be overridden. The report prints
 them under its header, and the comparison shows one row per label key, so a
 column's provenance is in the table. `report -arm pull=p1.jsonl,p2.jsonl
 -arm stream=s1.jsonl,s2.jsonl` gives one column per arm, in flag order. Two

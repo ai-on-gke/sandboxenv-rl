@@ -59,10 +59,18 @@ const DefaultHostSuffix = "actors.resources.substrate.ate.dev"
 // inside the cluster.
 const (
 	DefaultControlAddr = "api.ate-system.svc.cluster.local:443"
-	DefaultRouterAddr  = "atenet-router.ate-system.svc.cluster.local:80"
+	// DefaultRouterAddr and DefaultRouterConnectAddr are the router's plaintext
+	// listeners, which only the fakes in tests serve: Substrate v0.6.0, the
+	// first release this module pairs with, removed them.
+	DefaultRouterAddr = "atenet-router.ate-system.svc.cluster.local:80"
 	// DefaultRouterConnectAddr is the router's plaintext CONNECT listener, which
 	// tunnels to a port on an actor other than 80.
 	DefaultRouterConnectAddr = "atenet-router.ate-system.svc.cluster.local:8081"
+	// DefaultRouterTLSAddr and DefaultRouterConnectTLSAddr are the router's TLS
+	// listeners, the only ones Substrate v0.6.0 serves; they need a client
+	// certificate (Options.RouterTLS).
+	DefaultRouterTLSAddr        = "atenet-router.ate-system.svc.cluster.local:443"
+	DefaultRouterConnectTLSAddr = "atenet-router.ate-system.svc.cluster.local:8444"
 )
 
 // DefaultAtespace is the Substrate atespace every environment actor lives in.
@@ -88,6 +96,13 @@ type Options struct {
 	// HostSuffix overrides the router host suffix. Defaults to
 	// DefaultHostSuffix.
 	HostSuffix string
+
+	// RouterTLS, when set, is the TLS client configuration for the router:
+	// the pod identity certificate and the trust bundle that verifies the
+	// router (see internal/routertls). Nil dials the router in plaintext,
+	// which only a Substrate before v0.6.0, or the fake router in tests,
+	// serves.
+	RouterTLS *tls.Config
 
 	// SkipVerify disables TLS certificate verification on the control
 	// plane connection. Set this when talking to a port-forwarded ateapi,
@@ -184,9 +199,13 @@ func (c *Client) DialGuest(atespace, id string) (*grpc.ClientConn, error) {
 	}
 
 	targetActor := atespace + "/" + id
+	routerCreds := insecure.NewCredentials()
+	if c.opts.RouterTLS != nil {
+		routerCreds = credentials.NewTLS(c.opts.RouterTLS)
+	}
 	conn, err := grpc.NewClient(
 		c.opts.RouterAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(routerCreds),
 		grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 			ctx = metadata.AppendToOutgoingContext(ctx, TargetActorHeader, targetActor)
 			return invoker(ctx, method, req, reply, cc, opts...)

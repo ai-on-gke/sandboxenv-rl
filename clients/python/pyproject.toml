@@ -33,7 +33,20 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=1.0",
     "grpcio-tools>=1.84",
-    "ruff==0.17.0",
+    "ruff==0.17.1",
+]
+# OpenTelemetry tracing (ate_env.telemetry.tracing). 1.43 is the first release
+# whose opentelemetry-proto accepts protobuf 7. Only the OTLP/gRPC span
+# exporter is used, so the HTTP exporter is not pulled in. No upper bound: the
+# API is stable, and a cap conflicts with applications on a newer OTel.
+tracing = [
+    "opentelemetry-api>=1.43",
+    "opentelemetry-sdk>=1.43",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.43",
+]
+# Prometheus series (ate_env.observability, ate_env.telemetry.metrics).
+metrics = [
+    "prometheus-client>=0.20",
 ]
 
 [project.urls]

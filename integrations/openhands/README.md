@@ -95,6 +95,11 @@ agent-server, sdk and tools are that version. Change the client's `openhands-sdk
 
 ## 3. Register the base template
 
+This needs ate-env installed as in the [root README](../../README.md#get-started): Substrate v0.6.0
+or later, and ate-env-api's SPIFFE ID (`spiffe://cluster.local/ns/<namespace>/sa/ate-env-api`, namespace
+`ate-env` by default) in the router's ingress allow-list. The template below uses the default limits of
+`ate-env manifest template` (2 CPUs, 4 GiB); pass `--cpu` and `--memory` to change them.
+
 ```bash
 ate-env manifest template --template oh-agent-server \
   --guest-image    <registry>/ate-env-guest@sha256:<digest> \

@@ -16,7 +16,7 @@ Images are multi-platform (linux/amd64, linux/arm64) and signed with cosign
 keyless signing bound to this repository's GitHub Actions identity. The two
 ate-env images are tagged with the release tag and `latest`; the OpenHands layer
 is tagged `<agent-server version>-<release tag>`, for example `1.55.0-v0.2.0`,
-and has no `latest`.
+after it is signed, and has no `latest`.
 
 ## What a release binary knows
 
@@ -81,7 +81,9 @@ only the image reference.
 
 A valid signature proves the image was built by this repository's `release`
 workflow from a tag: the identity is the workflow file at a `refs/tags/` ref,
-so a signature from another workflow or from a branch run does not verify.
+so a signature from another workflow or from a branch run does not verify. The
+workflow refuses to run from any ref other than the tag it publishes, thus a
+republished image verifies with the same command.
 
 The workflow signs with Cosign 3 (the version `sigstore/cosign-installer` v4
 installs by default), which writes the standardized bundle format and stores
@@ -95,13 +97,30 @@ git tag -a v0.1.0 -m "v0.1.0"
 git push origin v0.1.0
 ```
 
-The workflow creates the GitHub release with generated notes, builds and pushes
-the two ate-env images and the OpenHands layer, signs all three, builds the CLI
-for four platforms, uploads the assets, and appends an `## Images` section with
-the digests and the verify command to the notes. To republish an existing tag (a failed run, a workflow fix), start
-the workflow by hand from the Actions tab with the tag as input; it replaces the
-assets and the images section rather than duplicating them. A republish
-produces new digests, since the images are rebuilt.
+The workflow runs in this order:
+
+1. It builds the OpenHands layer for both platforms and pushes it by digest,
+   with no tag. This is the slow step.
+2. It builds and pushes the two ate-env images with the release tag and `latest`.
+3. It signs all three images in one step, directly after the push.
+4. It tags the layer `<agent-server version>-<release tag>`. The tag points at
+   the signed digest.
+5. It builds the CLI for four platforms, creates the GitHub release with
+   generated notes, uploads the assets, and appends an `## Images` section with
+   the digests and the verify command to the notes.
+
+If a step fails, the job stops there. A failed layer build leaves no tag and no
+release: the registry has at most an untagged layer index. After step 2, a tag
+points at an unsigned image only until step 3 completes. If a later step fails,
+the images are signed, but the layer tag, the assets or the notes can be
+missing until a republish.
+
+To republish an existing tag (a failed run, a workflow fix), start the workflow
+by hand from the Actions tab: select the tag in "Use workflow from" and enter
+the same tag as the input. The workflow refuses another ref, because the
+signature identity names the ref and the verify command above accepts only
+`refs/tags/`. A republish replaces the assets and the images section rather than
+duplicating them, and produces new digests, since the images are rebuilt.
 
 ## First-time setup for the organization
 

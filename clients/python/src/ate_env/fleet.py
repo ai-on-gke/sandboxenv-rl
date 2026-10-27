@@ -244,13 +244,19 @@ class SandboxFleet:
         """
         replicas = max(0, int(replicas))
         template_id, rootfs_image = self._ensure_template_for_image(image)
-        try:
-            self.backend.resize_pool(template_id, replicas, wait=wait, rootfs_image=rootfs_image)
-        except NotImplementedError:
-            if replicas == 0:
-                self.backend.unwarm_pool(template_id, rootfs_image=rootfs_image)
-            else:
-                self.backend.warm_pool(template_id, replicas, wait=wait, rootfs_image=rootfs_image)
+        with self._obs.phase("warm_pool", backend=self.backend_label, family=repo_family(image)):
+            try:
+                self.backend.resize_pool(template_id, replicas, wait=wait, rootfs_image=rootfs_image)
+            except NotImplementedError:
+                if replicas == 0:
+                    self.backend.unwarm_pool(template_id, rootfs_image=rootfs_image)
+                else:
+                    logger.warning(
+                        "backend %s has no resize_pool: set_pool_replicas(%s, %d) can grow the "
+                        "pool but cannot shrink it below its current size",
+                        self.backend_label, image, replicas,
+                    )
+                    self.backend.warm_pool(template_id, replicas, wait=wait, rootfs_image=rootfs_image)
 
     def unwarm_image(self, image: str) -> None:
         """Drain warm pool for a specific image."""

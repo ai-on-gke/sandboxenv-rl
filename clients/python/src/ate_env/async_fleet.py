@@ -172,25 +172,32 @@ class AsyncSandboxFleet:
         ``SandboxFleet.set_pool_replicas``."""
         replicas = max(0, int(replicas))
         template_id, rootfs_image = await self._ensure_template_for_image_async(image)
+        family = repo_family(image)
         try:
-            if hasattr(self.backend, "resize_pool_async"):
-                await self.backend.resize_pool_async(
-                    template_id, replicas, wait=wait, rootfs_image=rootfs_image
-                )
-            else:
-                await asyncio.to_thread(
-                    self.backend.resize_pool,
-                    template_id,
-                    replicas,
-                    wait=wait,
-                    rootfs_image=rootfs_image,
-                )
+            with self.observer.phase("warm_pool", backend=self._backend_label, family=family):
+                if hasattr(self.backend, "resize_pool_async"):
+                    await self.backend.resize_pool_async(
+                        template_id, replicas, wait=wait, rootfs_image=rootfs_image
+                    )
+                else:
+                    await asyncio.to_thread(
+                        self.backend.resize_pool,
+                        template_id,
+                        replicas,
+                        wait=wait,
+                        rootfs_image=rootfs_image,
+                    )
         except NotImplementedError:
             if replicas == 0:
                 await self.unwarm_image(image)
             else:
+                logger.warning(
+                    "backend %s has no resize_pool: set_pool_replicas(%s, %d) can grow the "
+                    "pool but cannot shrink it below its current size",
+                    self._backend_label, image, replicas,
+                )
                 await self._warm_pool_for_template(
-                    template_id, replicas, wait=wait, rootfs_image=rootfs_image
+                    template_id, replicas, wait=wait, rootfs_image=rootfs_image, family=family
                 )
 
     async def unwarm_image(self, image: str) -> None:

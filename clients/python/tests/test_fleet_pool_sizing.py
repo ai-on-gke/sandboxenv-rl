@@ -24,18 +24,20 @@ from ate_env import AsyncSandboxFleet, FleetConfig, SandboxFleet
 from ate_env._gen.ateenv.v1alpha import env_pb2
 from ate_env.backend.mock import MockBackendDriver
 from ate_env.backend.substrate import SubstrateBackendDriver
+from ate_env.observability import Observer
 
 IMG = "example.com/task@sha256:" + "b" * 64
 
 
 def test_set_pool_replicas_sizes_up_and_down_on_the_mock():
     with SandboxFleet(FleetConfig(backend="mock", template="base")) as fleet:
+        warm = fleet.observer._warm  # this observer's share of the warm-replica gauge
         fleet.set_pool_replicas(IMG, 3)
-        assert fleet.backend.warm_pools[("base", IMG)] == 3
+        assert fleet.backend.warm_pools[("base", IMG)] == 3 and warm["mock"] == 3
         fleet.set_pool_replicas(IMG, 1)
-        assert fleet.backend.warm_pools[("base", IMG)] == 1
+        assert fleet.backend.warm_pools[("base", IMG)] == 1 and warm["mock"] == 1
         fleet.set_pool_replicas(IMG, -4)  # clamped to zero, not an error
-        assert fleet.backend.warm_pools[("base", IMG)] == 0
+        assert fleet.backend.warm_pools[("base", IMG)] == 0 and warm["mock"] == 0
 
 
 def test_warm_image_is_warm_images_for_one_image():
@@ -75,17 +77,21 @@ async def test_async_fleet_set_pool_replicas_and_warm_image():
 async def test_substrate_resize_pool_deletes_only_surplus_paused_actors(fake_stack):
     client, fakes = fake_stack
     driver = SubstrateBackendDriver(client=client, atespace="ate-env", worker_family="c2")
+    driver.observer = Observer()
+    warm = driver.observer._warm  # the observer's share of the warm-replica gauge
     await driver.warm_pool_async("tmpl", replicas=3)
     pool = driver._warm_paused_pool
-    assert len(pool["tmpl"]) == 3
+    assert len(pool["tmpl"]) == 3 and warm["substrate"] == 3
     before = set(pool["tmpl"])
 
     # A claimed actor leaves the pool and is never a resize candidate.
     claimed = await driver.acquire_async("tmpl", run_id="run-1")
     assert claimed.instance_id in before and len(pool["tmpl"]) == 2
+    assert warm["substrate"] == 2
 
     await driver.resize_pool_async("tmpl", 1)
     assert len(pool["tmpl"]) == 1
+    assert warm["substrate"] == 1, "a shrink moves the gauge like unwarm_pool does"
     kept = pool["tmpl"][0]
     deleted = before - {claimed.instance_id, kept}
     assert len(deleted) == 1
@@ -97,9 +103,9 @@ async def test_substrate_resize_pool_deletes_only_surplus_paused_actors(fake_sta
 
     # Growing again provisions the difference; zero drains the pool.
     await driver.resize_pool_async("tmpl", 3)
-    assert len(pool["tmpl"]) == 3
+    assert len(pool["tmpl"]) == 3 and warm["substrate"] == 3
     await driver.resize_pool_async("tmpl", 0)
-    assert len(pool["tmpl"]) == 0
+    assert len(pool["tmpl"]) == 0 and warm["substrate"] == 0
     assert ("ate-env", claimed.instance_id) in fakes.environments.environments
 
 

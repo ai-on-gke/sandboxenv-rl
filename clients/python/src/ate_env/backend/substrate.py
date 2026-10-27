@@ -570,6 +570,9 @@ class SubstrateBackendDriver(BackendDriver):
             return
         if not surplus:
             return
+        # The actors left the pool above; the shared warm-replica gauge and the
+        # run report follow, as in unwarm_pool_async.
+        self._observe("warm_remove", len(surplus))
         logger.info(
             "Shrinking warm pool for template %s (rootfs_image=%s) from %d to %d paused actors",
             template_id, rootfs_image, current, replicas,

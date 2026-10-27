@@ -437,8 +437,30 @@ Use "ate-env manifest [command] --help" for more information about a command.
 
 ## API
 
-The `ate-env-api` service exposes gRPC APIs for environment
-lifecycle and in-actor operations, as well as HTTP endpoints for MCP.
+The `ate-env-api` service exposes gRPC APIs for environment lifecycle and in-actor operations, as
+well as HTTP endpoints for MCP.
+
+The gRPC services reject a request that carries a field the server does not know, at any depth,
+with `InvalidArgument`: a client built from another version or fork of this API fails instead of
+being served as if the field were absent. An `InvalidArgument` whose message says "carries field
+numbers" thus means that the client and the server come from different builds, not that the
+request is wrong: treat it as a configuration error and do not retry. The guest applies the same
+check to the requests that `ate-env-api` forwards to it. Limits:
+
+- The check covers requests only. In the other direction, an older client accepts a newer
+  server's response field, or a new value of `Environment.state`, and ignores it. That is proto3's
+  normal behavior.
+- Build the SWE-bench loader and `ate-env-api` from one commit. A loader flag that sets a request
+  field the server does not know fails every create with "carries field numbers".
+- A renumbered field is not caught. When both sides know field N with different meanings, nothing
+  is unknown.
+- A guest baked into a golden snapshot keeps the build it had. Guests from before this check accept
+  unknown fields and ignore them, and `ate-env-api` cannot detect an old guest. After an upgrade,
+  register the base templates again and delete the `<base>-<12 hex digits>` templates derived from
+  them, so that their golden snapshots bake with the current guest.
+- In a client stream (`WriteFile`, `WriteProcessInput`), a rejected later message ends the call,
+  but what the guest already did with the earlier messages stays: a file can be partly written. A
+  rejected first message does not wake a suspended environment.
 
 ### EnvironmentService
 

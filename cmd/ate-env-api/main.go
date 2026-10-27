@@ -35,6 +35,7 @@ import (
 	"github.com/agent-substrate/env/internal/mcp"
 	"github.com/agent-substrate/env/internal/portproxy"
 	"github.com/agent-substrate/env/internal/routertls"
+	"github.com/agent-substrate/env/internal/unknownfields"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"google.golang.org/grpc"
 )
@@ -188,14 +189,7 @@ func main() {
 	apisvc.RouterIdentity = routerIdentity
 	defer apisvc.Close()
 
-	var grpcOpts []grpc.ServerOption
-	if callerAuth != nil {
-		grpcOpts = append(grpcOpts,
-			grpc.UnaryInterceptor(callerAuth.UnaryInterceptor()),
-			grpc.StreamInterceptor(callerAuth.StreamInterceptor()),
-		)
-	}
-	grpcServer := grpc.NewServer(grpcOpts...)
+	grpcServer := grpc.NewServer(grpcServerOptions(callerAuth)...)
 	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, apisvc)
 	ateenvv1alpha.RegisterProcessServiceServer(grpcServer, apisvc)
 	ateenvv1alpha.RegisterFileSystemServiceServer(grpcServer, apisvc)
@@ -261,6 +255,21 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server error: %v", err)
 	}
+}
+
+// grpcServerOptions returns the interceptor chain of the API's gRPC server.
+// Authentication runs first, so an unauthenticated caller learns nothing from
+// the unknown-field check. callerAuth is nil when no token is required.
+func grpcServerOptions(callerAuth *apiservice.BearerAuth) []grpc.ServerOption {
+	var unary []grpc.UnaryServerInterceptor
+	var stream []grpc.StreamServerInterceptor
+	if callerAuth != nil {
+		unary = append(unary, callerAuth.UnaryInterceptor())
+		stream = append(stream, callerAuth.StreamInterceptor())
+	}
+	unary = append(unary, unknownfields.UnaryServerInterceptor())
+	stream = append(stream, unknownfields.StreamServerInterceptor())
+	return []grpc.ServerOption{grpc.ChainUnaryInterceptor(unary...), grpc.ChainStreamInterceptor(stream...)}
 }
 
 // DefaultMaxConcurrentStreams is the default -max-concurrent-streams. Each

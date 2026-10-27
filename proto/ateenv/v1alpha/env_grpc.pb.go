@@ -55,7 +55,9 @@ type EnvironmentServiceClient interface {
 	CreateEnvironment(ctx context.Context, in *CreateEnvironmentRequest, opts ...grpc.CallOption) (*CreateEnvironmentResponse, error)
 	// GetEnvironment retrieves the status and configuration of an existing environment.
 	GetEnvironment(ctx context.Context, in *GetEnvironmentRequest, opts ...grpc.CallOption) (*GetEnvironmentResponse, error)
-	// SuspendEnvironment checkpoints and stops an active environment.
+	// SuspendEnvironment checkpoints and stops an active environment. The
+	// request's mode says whether the call returns once the snapshot is in
+	// object storage (the default) or once it is on the node.
 	SuspendEnvironment(ctx context.Context, in *SuspendEnvironmentRequest, opts ...grpc.CallOption) (*SuspendEnvironmentResponse, error)
 	// DeleteEnvironment permanently removes an environment and its associated resources.
 	DeleteEnvironment(ctx context.Context, in *DeleteEnvironmentRequest, opts ...grpc.CallOption) (*DeleteEnvironmentResponse, error)
@@ -133,7 +135,9 @@ type EnvironmentServiceServer interface {
 	CreateEnvironment(context.Context, *CreateEnvironmentRequest) (*CreateEnvironmentResponse, error)
 	// GetEnvironment retrieves the status and configuration of an existing environment.
 	GetEnvironment(context.Context, *GetEnvironmentRequest) (*GetEnvironmentResponse, error)
-	// SuspendEnvironment checkpoints and stops an active environment.
+	// SuspendEnvironment checkpoints and stops an active environment. The
+	// request's mode says whether the call returns once the snapshot is in
+	// object storage (the default) or once it is on the node.
 	SuspendEnvironment(context.Context, *SuspendEnvironmentRequest) (*SuspendEnvironmentResponse, error)
 	// DeleteEnvironment permanently removes an environment and its associated resources.
 	DeleteEnvironment(context.Context, *DeleteEnvironmentRequest) (*DeleteEnvironmentResponse, error)

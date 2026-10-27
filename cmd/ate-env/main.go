@@ -250,6 +250,7 @@ func newSuspendCommand() *cobra.Command {
 	var (
 		endpoint string
 		atespace string
+		mode     string
 		auth     authFlags
 	)
 	cmd := &cobra.Command{
@@ -257,6 +258,9 @@ func newSuspendCommand() *cobra.Command {
 		Short: "Suspend an environment",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if mode != "durable" && mode != "local" {
+				return fmt.Errorf("--mode must be durable or local, got %q", mode)
+			}
 			token, err := auth.resolve(cmd)
 			if err != nil {
 				return err
@@ -270,11 +274,15 @@ func newSuspendCommand() *cobra.Command {
 			}
 			defer client.Close()
 
+			if mode == "local" {
+				return client.SuspendLocal(cmd.Context(), atespace, args[0])
+			}
 			return client.Suspend(cmd.Context(), atespace, args[0])
 		},
 	}
 	cmd.Flags().StringVar(&endpoint, "api", envOr("SUBSTRATE_ENV_API", "127.0.0.1:7777"), "address of the ate-env-api service (e.g. localhost:7777)")
 	cmd.Flags().StringVar(&atespace, "atespace", apiservice.DefaultAtespace, "Substrate atespace")
+	cmd.Flags().StringVar(&mode, "mode", "durable", "durable: return once the snapshot is in object storage; local: return once it is on the node, with the upload in the background (the environment resumes on that node until it lands and shows PAUSED meanwhile)")
 	auth.register(cmd, false)
 	return cmd
 }

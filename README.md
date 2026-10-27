@@ -150,9 +150,14 @@ the template is named. Pass it when you deploy with another `--template` or `--w
 `snapshotConfig` and `wakeupProbe` and declare CPU and memory limits, and `--worker-image` must be the
 `ateworker-gvisor` image built from the Substrate version on the cluster.
 
-`ate-env-api` suspends synchronously: a suspend returns once the snapshot is in object storage, thus a
+`ate-env-api` suspends durably by default: a suspend returns once the snapshot is in object storage, thus a
 suspended environment survives the loss of its node. Substrate's own default became asynchronous in
-[`b40d34f1`](https://github.com/agent-substrate/substrate/commit/b40d34f1).
+[`b40d34f1`](https://github.com/agent-substrate/substrate/commit/b40d34f1). `SuspendEnvironment` takes a
+`mode`: `SUSPEND_MODE_LOCAL` (`ate-env suspend --mode local`, `Client.suspend(mode=SuspendMode.LOCAL)`,
+`Client.SuspendLocal` in Go) returns once the snapshot is on the node and leaves the upload in the
+background; the environment resumes on that node until the upload lands and reports `PAUSED` meanwhile.
+One park-and-resume cycle is cheaper this way, which is what a loop that parks a sandbox between every
+command wants; a node lost before the upload lands takes the snapshot with it.
 
 Substrate enforces authorization by default. `ate-env-api` runs as its own ServiceAccount
 (`ate-env/ate-env-api`) and needs the editor role on each atespace it creates environments in; the
@@ -470,9 +475,9 @@ Manages the lifecycle of isolated execution environments (defined in [`proto/ate
 | --- | ----------- |
 | `CreateEnvironment` | Creates and starts a new environment actor from an ActorTemplate, or from a digest-pinned `rootfs_image` on top of one: the template becomes the base, the image the container, and the guest is mounted in as a read-only image volume |
 | `GetEnvironment` | Retrieves environment details and status |
-| `SuspendEnvironment` | Suspends and checkpoints the environment to snapshot storage |
+| `SuspendEnvironment` | Suspends and checkpoints the environment: to snapshot storage by default, or to its node first with `mode: SUSPEND_MODE_LOCAL` (the upload follows in the background) |
 | `DeleteEnvironment` | Deletes the environment permanently |
-| `GetServerInfo` | Reports the server implementation (`sandboxenv-rl`), its version, the version of the `go.ate.dev/substrate` module it was built against, and its optional features (`rootfs_image`, `pty`, and `port_proxy` when enabled); answered by `ate-env-api` itself. The Substrate version is a build fact, not the version of the control plane the server talks to; Substrate has no RPC that reports that. `ate-env server-info --json` prints the four fields as one JSON object |
+| `GetServerInfo` | Reports the server implementation (`sandboxenv-rl`), its version, the version of the `go.ate.dev/substrate` module it was built against, and its optional features (`rootfs_image`, `pty`, `suspend_mode`, and `port_proxy` when enabled); answered by `ate-env-api` itself. The Substrate version is a build fact, not the version of the control plane the server talks to; Substrate has no RPC that reports that. `ate-env server-info --json` prints the four fields as one JSON object |
 
 ### ProcessService
 

@@ -107,7 +107,9 @@ class EnvironmentServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
     def SuspendEnvironment(self, request, context):
-        """SuspendEnvironment checkpoints and stops an active environment.
+        """SuspendEnvironment checkpoints and stops an active environment. The
+        request's mode says whether the call returns once the snapshot is in
+        object storage (the default) or once it is on the node.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

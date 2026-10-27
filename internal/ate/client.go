@@ -316,13 +316,24 @@ func (c *Client) Get(ctx context.Context, atespace, id string) (*ateapipb.Actor,
 // Suspend checkpoints and stops the actor with ID in atespace.
 // If atespace is empty, DefaultAtespace is used.
 //
-// The suspend is synchronous: it returns once the snapshot is in durable
-// storage, thus a suspended environment survives the loss of its node.
-// Substrate's default became asynchronous in substrate#2805 (the snapshot
-// stays on the node and uploads in the background); ate-env keeps the
-// durable behavior it always had.
+// The suspend is durable: it returns once the snapshot is in object storage,
+// thus a suspended environment survives the loss of its node. Substrate's
+// default became asynchronous in substrate#2805 (the snapshot stays on the
+// node and uploads in the background); ate-env keeps the durable behavior it
+// always had here and offers the other as SuspendLocal.
 func (c *Client) Suspend(ctx context.Context, atespace, id string) error {
 	return c.suspend(ctx, atespace, id, ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS)
+}
+
+// SuspendLocal checkpoints and stops the actor with ID in atespace and returns
+// once the snapshot is on the worker's node; the upload to object storage goes
+// on in the background. Until it lands the actor resumes on that node only,
+// and a node lost before then takes the snapshot with it. One
+// checkpoint-and-resume cycle is cheaper than with Suspend, which is what a
+// caller that parks an environment between every command wants.
+// If atespace is empty, DefaultAtespace is used.
+func (c *Client) SuspendLocal(ctx context.Context, atespace, id string) error {
+	return c.suspend(ctx, atespace, id, ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS)
 }
 
 func (c *Client) suspend(ctx context.Context, atespace, id string, mode ateapipb.DurabilityMode) error {

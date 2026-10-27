@@ -275,23 +275,45 @@ func (s *Server) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorReq
 		return nil, err
 	}
 	s.SuspendModes = append(s.SuspendModes, req.GetOptions().GetMode())
-	s.suspend(a)
+	s.suspend(a, req.GetOptions().GetMode())
 	return &ateapipb.SuspendActorResponse{Actor: clone(a)}, nil
 }
 
-// suspend checkpoints a. The caller holds s.mu.
-func (s *Server) suspend(a *ateapipb.Actor) {
+// suspend checkpoints a. The caller holds s.mu. A synchronous suspend leaves
+// the snapshot in object storage; any other mode (asynchronous, which is also
+// Substrate's default when unset) leaves it on a node with the upload pending,
+// as Substrate does until atelet's background upload lands (CompleteUpload).
+func (s *Server) suspend(a *ateapipb.Actor, mode ateapipb.DurabilityMode) {
+	snap := &ateapipb.Snapshot{
+		Uuid:       fmt.Sprintf("snapshot-%s", a.GetMetadata().GetName()),
+		Generation: a.GetStatus().GetLastAssignedGeneration() + 1,
+		Owner:      ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR,
+		Fidelity:   ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+		DurableSnapshot: &ateapipb.SnapshotStorage{
+			Status: ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED,
+			Object: &ateapipb.ObjectSnapshot{},
+		},
+	}
+	if mode != ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS {
+		snap.Locality = "node-1"
+		snap.DurableSnapshot.Status = ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING
+	}
 	a.Status = &ateapipb.ActorStatus{
-		State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
-		Snapshots: []*ateapipb.Snapshot{{
-			Uuid:     fmt.Sprintf("snapshot-%s", a.GetMetadata().GetName()),
-			Owner:    ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR,
-			Fidelity: ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
-			DurableSnapshot: &ateapipb.SnapshotStorage{
-				Status: ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED,
-				Object: &ateapipb.ObjectSnapshot{},
-			},
-		}},
+		State:                  ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+		Snapshots:              []*ateapipb.Snapshot{snap},
+		LastAssignedGeneration: snap.GetGeneration(),
+	}
+}
+
+// CompleteUpload marks the actor's snapshots durable, as atelet's background
+// upload after an asynchronous suspend does once it lands.
+func (s *Server) CompleteUpload(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, snap := range s.find(name).GetStatus().GetSnapshots() {
+		if snap.GetDurableSnapshot() != nil {
+			snap.DurableSnapshot.Status = ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED
+		}
 	}
 }
 

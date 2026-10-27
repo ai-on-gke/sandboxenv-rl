@@ -171,6 +171,25 @@ func TestSuspend(t *testing.T) {
 	if st := f.control.Status("sb-susp"); st != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
 		t.Errorf("status = %v, want SUSPENDED", st)
 	}
+	if got := f.control.SuspendModes; len(got) != 1 || got[0] != ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS {
+		t.Errorf("suspend modes = %v, want one SYNCHRONOUS", got)
+	}
+}
+
+func TestSuspendLocal(t *testing.T) {
+	f := newFixture(t)
+	sb := f.create(t, "sb-local")
+	ctx := t.Context()
+
+	if err := sb.SuspendLocal(ctx); err != nil {
+		t.Fatalf("SuspendLocal: %v", err)
+	}
+	if st := f.control.Status("sb-local"); st != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		t.Errorf("status = %v, want SUSPENDED", st)
+	}
+	if got := f.control.SuspendModes; len(got) != 1 || got[0] != ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS {
+		t.Errorf("suspend modes = %v, want one ASYNCHRONOUS", got)
+	}
 }
 
 func TestDelete(t *testing.T) {
@@ -195,7 +214,7 @@ func TestClientServerInfo(t *testing.T) {
 	if info.GetVersion() != "dev" {
 		t.Errorf("version = %q, want \"dev\" for a server without a build version", info.GetVersion())
 	}
-	for _, want := range []string{apiservice.FeatureRootfsImage, apiservice.FeaturePTY} {
+	for _, want := range []string{apiservice.FeatureRootfsImage, apiservice.FeaturePTY, apiservice.FeatureSuspendMode} {
 		if !slices.Contains(info.GetFeatures(), want) {
 			t.Errorf("features = %v, want %q", info.GetFeatures(), want)
 		}

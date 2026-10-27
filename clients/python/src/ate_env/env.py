@@ -30,6 +30,7 @@ from .types import (
     ProcessOutput,
     ShellResult,
     Signal,
+    SuspendMode,
     _process_info_from_pb,
     _process_output_from_pb,
 )
@@ -83,9 +84,9 @@ class Env:
         """Retrieve the environment's current status and configuration."""
         return await self._client.get(self._id, atespace=self._atespace)
 
-    async def suspend(self) -> None:
-        """Checkpoint and stop the environment."""
-        await self._client.suspend(self._id, atespace=self._atespace)
+    async def suspend(self, *, mode: SuspendMode = SuspendMode.DURABLE) -> None:
+        """Checkpoint and stop the environment; ``mode`` as in ``Client.suspend``."""
+        await self._client.suspend(self._id, atespace=self._atespace, mode=mode)
 
     async def delete(self) -> None:
         """Remove the environment permanently."""

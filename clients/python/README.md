@@ -284,12 +284,23 @@ await env.write_file("/workspace/data.bin", patch, seek_offset=4096)
 ### Suspend and delete
 
 ```python
-await env.suspend()   # checkpoint to a snapshot and free the worker
-await env.delete()    # remove permanently (suspends first if running)
+await env.suspend()                        # checkpoint to object storage and free the worker
+await env.suspend(mode=SuspendMode.LOCAL)  # checkpoint to the node and free the worker; the upload follows
+await env.delete()                         # remove permanently (suspends first if running)
 ```
 
 A suspended environment keeps its filesystem and can be woken again just
-by sending it guest traffic. Deletion is permanent.
+by sending it guest traffic. `SuspendMode.LOCAL` returns once the snapshot is
+on the worker's node and leaves the upload to object storage in the
+background: the environment resumes on that node until the upload lands, its
+status is `PAUSED` meanwhile, and a node lost before then takes the snapshot
+with it. One park-and-resume cycle is cheaper this way, which is what a loop
+that parks a sandbox between every command wants. The default,
+`SuspendMode.DURABLE`, returns once the snapshot is in object storage and puts
+no mode on the wire, so it works against an ate-env-api that predates the
+field; such a server refuses `LOCAL` with `InvalidArgumentError`, and
+`server_info().features` lists `suspend_mode` once a server serves it.
+Deletion is permanent.
 
 ### Handle errors
 

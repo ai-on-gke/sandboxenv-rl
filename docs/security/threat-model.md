@@ -96,6 +96,13 @@ What ate-env does not control: Substrate writes and reads the snapshots. The ope
 access control, the encryption and the retention of the bucket. What stays in the bucket after an
 environment or a template is deleted follows Substrate.
 
+A local suspend (`SuspendEnvironment` with `mode: SUSPEND_MODE_LOCAL`, `ate-env suspend --mode
+local`) returns before the upload: the snapshot sits on the worker's node, under Substrate's state
+directory, until atelet's background upload lands. That is the same data the bucket holds, for a
+shorter time, on the host that already ran the environment's memory; ate-env adds no reader to it,
+and the node's own access control applies. What a local suspend does trade is availability: a node
+lost before the upload lands takes the snapshot, and the environment, with it.
+
 Operator requirements:
 
 - Grant access to the bucket only to the Substrate identities that write and read snapshots. Block
@@ -107,6 +114,7 @@ Operator requirements:
 | Threat | Current mitigation | Gap |
 |---|---|---|
 | A reader of the bucket gets the memory, files and credentials of environments | The operator's bucket settings. | ate-env does not check the access control, the encryption or the retention of the bucket. |
+| A reader of a worker node gets the snapshot of a locally suspended environment before its upload lands | The snapshot sits where the running environment's memory sat; the node's own access control. The default suspend is durable and leaves nothing new on the node. | A node lost before the upload lands loses the environment (availability, not confidentiality). |
 
 ## On-demand rootfs images
 

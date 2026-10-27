@@ -44,6 +44,7 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
     def __init__(self):
         self.environments: dict[tuple[str, str], env_pb2.Environment] = {}
         self.last_create_request: env_pb2.CreateEnvironmentRequest | None = None
+        self.last_suspend_request: env_pb2.SuspendEnvironmentRequest | None = None
 
     async def CreateEnvironment(self, request, context):
         self.last_create_request = request
@@ -84,7 +85,12 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
 
     async def SuspendEnvironment(self, request, context):
         environment = await self._lookup(request, context)
-        environment.status = env_pb2.ENVIRONMENT_STATUS_SUSPENDED
+        self.last_suspend_request = request
+        # Mirror ate-env-api: a local suspend is PAUSED until its upload lands.
+        if request.mode == env_pb2.SUSPEND_MODE_LOCAL:
+            environment.status = env_pb2.ENVIRONMENT_STATUS_PAUSED
+        else:
+            environment.status = env_pb2.ENVIRONMENT_STATUS_SUSPENDED
         return env_pb2.SuspendEnvironmentResponse()
 
     async def DeleteEnvironment(self, request, context):
@@ -97,7 +103,7 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
             server="sandboxenv-rl",
             version="v0.0.0-fake",
             substrate_version="unknown",
-            features=["rootfs_image", "pty"],
+            features=["rootfs_image", "pty", "suspend_mode"],
         )
 
     async def _lookup(self, request, context):

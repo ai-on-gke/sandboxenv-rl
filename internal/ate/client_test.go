@@ -134,6 +134,22 @@ func TestSuspend(t *testing.T) {
 	}
 }
 
+func TestSuspendLocal(t *testing.T) {
+	f := newFixture(t)
+	ctx := t.Context()
+	f.create(t, "sb-local")
+
+	if err := f.client.SuspendLocal(ctx, "", "sb-local"); err != nil {
+		t.Fatalf("SuspendLocal: %v", err)
+	}
+	if st := f.control.Status("sb-local"); st != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		t.Fatalf("status = %v, want SUSPENDED", st)
+	}
+	if got := f.control.SuspendModes; len(got) != 1 || got[0] != ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS {
+		t.Fatalf("suspend modes = %v, want one ASYNCHRONOUS", got)
+	}
+}
+
 func TestSuspendMissing(t *testing.T) {
 	f := newFixture(t)
 	ctx := t.Context()

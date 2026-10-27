@@ -122,9 +122,10 @@ IMAGES="docker.io/library/ubuntu@sha256:<digest> docker.io/library/node@sha256:<
 examples/openhands/demo.sh
 ```
 
-It also takes `PORT`, `AGENT_SERVER_ENV` (extra `NAME=VALUE` settings), `COMMAND`, `WORKDIR`,
-`API_TOKEN` (when ate-env-api runs with `-auth-token-file`) and `KEEP=1` (leave the environments up
-for the SDK scripts); see its header. It exits 1 if any agent-server did not answer.
+It also takes `BASE_IMAGE` (the glibc image the base template runs in, default a pinned
+`debian:bookworm-slim`), `PORT`, `AGENT_SERVER_ENV` (extra `NAME=VALUE` settings), `COMMAND`,
+`WORKDIR`, `API_TOKEN` (when ate-env-api runs with `-auth-token-file`) and `KEEP=1` (leave the
+environments up for the SDK scripts); see its header. It exits 1 if any agent-server did not answer.
 
 Templates are immutable and the session key is in them, also in the per-image templates that
 creates derive (`<base>-<12 hex digits of the image digest>`). The demo reuses an existing base

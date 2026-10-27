@@ -32,7 +32,8 @@
 # deletes templates only with RECREATE=1: then it deletes the base template
 # and every template derived from it, with their golden snapshots, and
 # registers the base again. Use RECREATE=1 only for templates that nobody else
-# uses.
+# uses, and once for a base registered without a glibc base image (its own
+# golden actor crashes; see BASE_IMAGE).
 #
 # The session key and the API token go to curl in a header file (mode 0600,
 # removed on exit), not on its command line. The template registration still
@@ -46,6 +47,10 @@
 #                     agent-server in; any image with /bin/sh and glibc 2.31
 #                     or newer
 # Optional:
+#   BASE_IMAGE        digest-pinned glibc image the base template runs in
+#                     (default debian:bookworm-slim, pinned). The base
+#                     template bakes its own golden snapshot with the layer
+#                     started, thus it needs glibc 2.31 or newer and /bin/sh
 #   SESSION_KEY       agent-server API key on the template. Required when the
 #                     template exists (it carries its own key) and with KEEP=1;
 #                     otherwise random and never printed
@@ -80,6 +85,8 @@ PORT=${PORT:-8000}
 # shellcheck disable=SC2016 # expanded by the environment's shell, not here
 COMMAND=${COMMAND:-'head -1 /etc/os-release; echo "user: $(id -un)"; echo "cwd: $(pwd)"'}
 TEMPLATE=${TEMPLATE:-oh-agent-server}
+# debian:bookworm-slim: glibc 2.36, /bin/sh and bash, 26 MB compressed for amd64.
+BASE_IMAGE=${BASE_IMAGE:-docker.io/library/debian@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8}
 ATESPACE=${ATESPACE:-ate-env}
 API=${API:-127.0.0.1:7777}
 ATE_ENV=${ATE_ENV:-ate-env}
@@ -176,8 +183,9 @@ else
       "${KUBECTL_ATE}" delete actor-template --atespace "${ATESPACE}" "${name}" >/dev/null
     done
   fi
-  step "register ${ATESPACE}/${TEMPLATE}: guest + agent-server layer on port ${PORT}"
+  step "register ${ATESPACE}/${TEMPLATE}: ${BASE_IMAGE%%@*} + guest + agent-server layer on port ${PORT}"
   "${ATE_ENV}" manifest template --template "${TEMPLATE}" --atespace "${ATESPACE}" \
+    --rootfs-image "${BASE_IMAGE}" \
     --guest-image "${GUEST_IMAGE}" --snapshots-bucket "${SNAPSHOTS_BUCKET}" \
     --layer "oh=${LAYER_IMAGE}=/opt/oh" \
     --sidecar "/opt/oh/python/bin/python3 -m openhands.agent_server --host 0.0.0.0 --port ${PORT}" \

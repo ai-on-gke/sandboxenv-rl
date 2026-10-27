@@ -756,7 +756,8 @@ func TestStreamedDaemonErrorPassesWithoutDelay(t *testing.T) {
 
 // A state read that panics fails like any failed read: the answer passes
 // unchanged, and the next answer for the environment does not wait on a read
-// left in flight.
+// left in flight. The panic is logged with its stack, also right after an
+// ordinary failed read was logged.
 func TestPanickingStateReadDoesNotHang(t *testing.T) {
 	var buf safeBuffer
 	log.SetOutput(&buf)
@@ -764,9 +765,17 @@ func TestPanickingStateReadDoesNotHang(t *testing.T) {
 	s := newSetup(t)
 	s.router.RegisterPort("broken", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	s.router.Deny = func(string) (int, string) { return 503, routerBody("broken", "CRASHED") }
-	srv, _ := stateProxy(t, s, func(int) (ateapipb.ActorState, error) { panic("control plane client bug") })
+	srv, _ := stateProxy(t, s, func(n int) (ateapipb.ActorState, error) {
+		if n == 1 {
+			return 0, status.Error(codes.PermissionDenied, "no access")
+		}
+		panic("control plane client bug")
+	})
 	client := &http.Client{Timeout: 3 * time.Second}
-	for i := range 2 {
+	for i := range 3 {
+		if i == 1 {
+			time.Sleep(2100 * time.Millisecond) // past the 2 s cache of the failed read
+		}
 		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
 		for k, v := range target("broken", 8000) {
 			req.Header.Set(k, v)
@@ -780,6 +789,14 @@ func TestPanickingStateReadDoesNotHang(t *testing.T) {
 		if resp.StatusCode != http.StatusServiceUnavailable || time.Since(start) > time.Second {
 			t.Errorf("request %d: got %d after %s, want the router's 503 at once", i+1, resp.StatusCode, time.Since(start))
 		}
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "reading the state of environment ate-env/broken failed") {
+		t.Errorf("the ordinary failed read is not logged:\n%s", logs)
+	}
+	if !strings.Contains(logs, "reading the state of environment ate-env/broken panicked: control plane client bug") ||
+		!strings.Contains(logs, "goroutine ") {
+		t.Errorf("the panic is not logged with its stack:\n%s", logs)
 	}
 }
 

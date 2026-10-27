@@ -54,6 +54,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -173,6 +174,8 @@ type Proxy struct {
 	stateMu    sync.Mutex
 	states     map[string]*stateEntry // see actorState
 	stateLogAt time.Time              // last failed state read logged
+	// statePanicAt is when a panicking state read was last logged.
+	statePanicAt time.Time
 }
 
 // New returns a Proxy. It fails only on a malformed trusted origin.
@@ -582,6 +585,10 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 	case st == ateapipb.ActorState_ACTOR_STATE_DELETING:
 		replaceAnswer(resp, t, http.StatusNotFound, "DELETING", "is being deleted (actor state DELETING)")
 	case resp.StatusCode == http.StatusGatewayTimeout || resp.StatusCode == http.StatusInternalServerError:
+		// A wake that ends after Envoy's timeout but before this read
+		// reads RUNNING, and the empty 504 passes unchanged: the proxy
+		// cannot tell it from a daemon's empty 504. The window is short,
+		// and a retry then reaches the daemon.
 		if name, waking := wakingStates[st]; waking {
 			replaceAnswer(resp, t, http.StatusServiceUnavailable, name, "is still waking; retry")
 			resp.Header.Set("Retry-After", "1")
@@ -689,6 +696,7 @@ func (p *Proxy) actorState(ctx context.Context, atespace, id string) (st ateapip
 	defer func() {
 		if r := recover(); r != nil {
 			e.st, e.err = 0, fmt.Errorf("reading the state panicked: %v", r)
+			p.logStatePanic(atespace, id, r, debug.Stack())
 		}
 		e.at = time.Now()
 		close(e.done) // never leave the entry in flight
@@ -698,6 +706,17 @@ func (p *Proxy) actorState(ctx context.Context, atespace, id string) (st ateapip
 	defer cancel()
 	e.st, e.err = p.opts.ActorState(rctx, atespace, id)
 	return e.st, e.err
+}
+
+// logStatePanic logs a panic in the state read with its stack, under its
+// own limit, so an earlier ordinary failure cannot hide it.
+func (p *Proxy) logStatePanic(atespace, id string, r any, stack []byte) {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	if now := time.Now(); now.Sub(p.statePanicAt) >= stateReadLogEvery {
+		p.statePanicAt = now
+		log.Printf("port proxy: reading the state of environment %s/%s panicked: %v\n%s", atespace, id, r, stack)
+	}
 }
 
 func (p *Proxy) logStateReadError(atespace, id string, err error) {

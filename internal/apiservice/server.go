@@ -127,10 +127,9 @@ func (s *Server) Close() {}
 // cannot be derived from (no containers, unpinned guest image, or a command
 // that cannot be re-rooted under the guest volume). FailedPrecondition when
 // the base template does not exist in the atespace, or when the derived name
-// is already held by a template running a different image. Unavailable when
-// a derived template whose golden snapshot failed is due for a recreate but
-// cannot be deleted or replaced in time. Other control plane failures are
-// mapped by toGRPCError.
+// is already held by a template running a different image. DeadlineExceeded
+// or Canceled when the request ends while a recreate of its derived template
+// runs. Other control plane failures are mapped by toGRPCError.
 func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (*ateenvv1alpha.CreateEnvironmentResponse, error) {
 	if req.GetId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "id is required")
@@ -190,7 +189,9 @@ func (s *Server) ensureImageTemplate(ctx context.Context, atespace, base, image 
 		return "", nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	lock := s.imageTemplates.get(atespace, name)
-	lock.mu.RLock()
+	if err := lock.rlock(ctx); err != nil {
+		return "", nil, err
+	}
 	tmpl, err := s.getOrCreateImageTemplate(ctx, atespace, base, name, image)
 	if err != nil {
 		lock.mu.RUnlock()
@@ -207,7 +208,9 @@ func (s *Server) ensureImageTemplate(ctx context.Context, atespace, base, image 
 	if err != nil {
 		return "", nil, err
 	}
-	lock.mu.RLock()
+	if err := lock.rlock(ctx); err != nil {
+		return "", nil, err
+	}
 	if _, err := s.getOrCreateImageTemplate(ctx, atespace, base, name, image); err != nil {
 		lock.mu.RUnlock()
 		return "", nil, err

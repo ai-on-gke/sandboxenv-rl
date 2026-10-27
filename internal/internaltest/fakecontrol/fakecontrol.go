@@ -63,6 +63,8 @@ type Server struct {
 	// templateDeletes and templateCreates count the DeleteActorTemplate
 	// and CreateActorTemplate calls.
 	templateDeletes, templateCreates int
+	// listCalls counts the ListActors calls.
+	listCalls int
 	// SuspendModes records the durability mode of each SuspendActor call.
 	SuspendModes []ateapipb.DurabilityMode
 }
@@ -126,6 +128,23 @@ func (s *Server) HoldTemplateLease(atespace, name string) (release func()) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		delete(s.templateLeases, key(atespace, name))
+	}
+}
+
+// ListCalls returns how many ListActors calls the fake got.
+func (s *Server) ListCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listCalls
+}
+
+// MutateActor applies f to the stored actor with the given name, for tests
+// that need a status the fake's lifecycle does not produce.
+func (s *Server) MutateActor(name string, f func(*ateapipb.Actor)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if a := s.find(name); a != nil {
+		f(a)
 	}
 }
 
@@ -384,6 +403,7 @@ func (s *Server) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorReque
 func (s *Server) ListActors(ctx context.Context, req *ateapipb.ListActorsRequest) (*ateapipb.ListActorsResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.listCalls++
 	resp := &ateapipb.ListActorsResponse{}
 	for _, a := range s.actors {
 		if req.GetAtespace() != "" && a.GetMetadata().GetAtespace() != req.GetAtespace() {

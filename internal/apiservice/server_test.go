@@ -21,7 +21,6 @@ import (
 	"io"
 	"math"
 	"net"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -792,25 +791,52 @@ func TestCreateFromImageRecreatesFailedTemplate(t *testing.T) {
 	}
 }
 
-// A failed template that an environment uses is kept: a recreate would give
-// it a new uid, and the suspended environment would resume without its
-// rootfs. Creates on it still succeed.
+// A failed template that an environment can lose state on is kept: a
+// recreate gives it a new uid, and a suspended environment would resume
+// without its rootfs. Creates on a kept template still succeed. A crashed
+// environment without a snapshot under the old uid does not block the
+// recreate.
 func TestCreateFromImageKeepsFailedTemplateInUse(t *testing.T) {
-	envClient, control := newTestEnv(t)
-	seedDerivedTemplate(t, control, failedGolden(), time.Hour)
-	createOnDerived(t, envClient, "old-env")
-	control.SetState("old-env", ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+	cases := []struct {
+		name     string
+		state    ateapipb.ActorState
+		snapshot bool // a snapshot taken under the failed template
+		recreate bool
+	}{
+		{"suspended", ateapipb.ActorState_ACTOR_STATE_SUSPENDED, true, false},
+		{"running", ateapipb.ActorState_ACTOR_STATE_RUNNING, false, false},
+		{"crashed with a snapshot", ateapipb.ActorState_ACTOR_STATE_CRASHED, true, false},
+		{"crashed without a snapshot", ateapipb.ActorState_ACTOR_STATE_CRASHED, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			envClient, control := newTestEnv(t)
+			seedDerivedTemplate(t, control, failedGolden(), time.Hour)
+			createOnDerived(t, envClient, "old-env")
+			control.MutateActor("old-env", func(a *ateapipb.Actor) {
+				a.Status = &ateapipb.ActorStatus{State: tc.state}
+				if tc.snapshot {
+					a.Status.Snapshots = []*ateapipb.Snapshot{{Uuid: "snap-1", ActorTemplateUid: "seeded"}}
+				}
+			})
 
-	for _, id := range []string{"img1", "img2"} {
-		if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: id, RootfsImage: testRootfsImage}); err != nil {
-			t.Fatalf("CreateEnvironment %s: %v", id, err)
-		}
-	}
-	if uid := control.Template("ate-env", testDerivedTemplate).GetMetadata().GetUid(); uid != "seeded" {
-		t.Errorf("derived template uid = %q, want the kept %q", uid, "seeded")
-	}
-	if deletes, _ := control.TemplateCalls(); deletes != 0 {
-		t.Errorf("DeleteActorTemplate calls = %d, want 0", deletes)
+			for _, id := range []string{"img1", "img2"} {
+				if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: id, RootfsImage: testRootfsImage}); err != nil {
+					t.Fatalf("CreateEnvironment %s: %v", id, err)
+				}
+			}
+			uid := control.Template("ate-env", testDerivedTemplate).GetMetadata().GetUid()
+			if recreated := uid != "seeded"; recreated != tc.recreate {
+				t.Errorf("derived template recreated = %v (uid %q), want %v", recreated, uid, tc.recreate)
+			}
+			wantDeletes := 0
+			if tc.recreate {
+				wantDeletes = 1
+			}
+			if deletes, _ := control.TemplateCalls(); deletes != wantDeletes {
+				t.Errorf("DeleteActorTemplate calls = %d, want %d", deletes, wantDeletes)
+			}
+		})
 	}
 }
 
@@ -870,27 +896,53 @@ func TestCreateFromImageRecreateWaitsForTemplateLease(t *testing.T) {
 	}
 }
 
-// A delete that fails for another reason fails the create with Unavailable,
-// with the template name and a truncated golden error.
-func TestCreateFromImageRecreateDeleteFails(t *testing.T) {
+// A delete that fails for another reason keeps the failed template: the
+// create goes on as a cold boot on it, and later creates wait for the
+// backoff instead of trying again.
+func TestCreateFromImageRecreateDeleteFailsColdBoots(t *testing.T) {
 	envClient, control := newTestEnv(t)
-	long := testGoldenError + ": " + strings.Repeat("x", 4000)
-	seedDerivedTemplate(t, control, &ateapipb.GoldenSnapshotStatus{ErrorMessage: long}, time.Hour)
+	seedDerivedTemplate(t, control, failedGolden(), time.Hour)
 	control.DeleteTemplateErr = status.Error(codes.Internal, "database unavailable")
 
-	_, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "img", RootfsImage: testRootfsImage})
-	if status.Code(err) != codes.Unavailable {
-		t.Fatalf("CreateEnvironment: code %v (%v), want Unavailable", status.Code(err), err)
+	if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "img1", RootfsImage: testRootfsImage}); err != nil {
+		t.Fatalf("CreateEnvironment after a failed delete: %v, want a cold boot", err)
 	}
-	msg := status.Convert(err).Message()
-	if !strings.Contains(msg, testDerivedTemplate) || !strings.Contains(msg, "GoldenActorCrashed") {
-		t.Errorf("message %q must name the template and the golden error", msg)
+	lists := control.ListCalls()
+	if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "img2", RootfsImage: testRootfsImage}); err != nil {
+		t.Fatalf("second CreateEnvironment: %v", err)
 	}
-	if len(msg) > 1024 {
-		t.Errorf("message has %d bytes, want the golden error truncated", len(msg))
+	if deletes, _ := control.TemplateCalls(); deletes != 1 {
+		t.Errorf("DeleteActorTemplate calls = %d, want 1", deletes)
 	}
-	if control.Template("ate-env", testDerivedTemplate) == nil {
-		t.Error("derived template is gone after a failed delete")
+	if n := control.ListCalls(); n != lists {
+		t.Errorf("ListActors calls after the second create = %d, want %d", n, lists)
+	}
+	if uid := control.Template("ate-env", testDerivedTemplate).GetMetadata().GetUid(); uid != "seeded" {
+		t.Errorf("derived template uid = %q, want the kept %q", uid, "seeded")
+	}
+}
+
+// A recreate that the template lease blocks past its bound keeps the failed
+// template: its create cold-boots on it, and later creates wait for the
+// backoff.
+func TestCreateFromImageRecreateLeaseTimeoutColdBoots(t *testing.T) {
+	apiservice.SetTemplateRecreateTimeout(t, time.Second)
+	envClient, control := newTestEnv(t)
+	seedDerivedTemplate(t, control, failedGolden(), time.Hour)
+	control.HoldTemplateLease("ate-env", testDerivedTemplate)
+
+	if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "img1", RootfsImage: testRootfsImage}); err != nil {
+		t.Fatalf("CreateEnvironment: %v, want a cold boot on the kept template", err)
+	}
+	deletes, _ := control.TemplateCalls()
+	if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "img2", RootfsImage: testRootfsImage}); err != nil {
+		t.Fatalf("second CreateEnvironment: %v", err)
+	}
+	if again, _ := control.TemplateCalls(); again != deletes {
+		t.Errorf("DeleteActorTemplate calls after the backoff started: %d, want %d", again, deletes)
+	}
+	if uid := control.Template("ate-env", testDerivedTemplate).GetMetadata().GetUid(); uid != "seeded" {
+		t.Errorf("derived template uid = %q, want the kept %q", uid, "seeded")
 	}
 }
 

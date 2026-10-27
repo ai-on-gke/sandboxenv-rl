@@ -247,14 +247,16 @@ kubectl get pods -n ate-env
 ```
 
 `ate-env-api` waits for a suspended environment to wake before forwarding a guest call, up to
-`--wake-budget` (default 2m; cold image pulls and cross-region snapshot reads exceed the router's own
+`--wake-budget` (default 4m; cold image pulls and cross-region snapshot reads exceed the router's own
 parking budget) and, once the control plane reports the environment RUNNING, up to
 `--wake-running-budget` (default 20s). Both are flags of the `ate-env-api` binary; `ate-env manifest`
 does not set them, thus add them to the Deployment's arguments to change them. `--wake-budget` must
 be longer than the image pull plus the template's wakeup-probe timeout (`ate-env manifest template
---wakeup-timeout`), because the control plane reports RUNNING only after the probe passes. Otherwise
-the first guest call or port-proxy request after a slow wake fails with `Unavailable`, and a retry
-succeeds once the environment is up.
+--wakeup-timeout`), because the control plane reports RUNNING only after the probe passes. The 4m
+default covers the 120 s timeout of a `--sidecar-readyz` template plus two minutes for the pull;
+raise it if you set a longer `--wakeup-timeout`. Otherwise the first call after a slow wake fails: a
+guest call with `Unavailable`, a port-proxy request with HTTP 503. A retry succeeds once the
+environment is up. A crashed or deleted environment fails a guest call at once.
 
 By default `ate-env manifest` deploys `ate-env-api` without caller authentication for use over
 `kubectl port-forward`. Before exposing `ate-env-api` beyond loopback (e.g. through an internal
@@ -303,8 +305,8 @@ holds the actor's readiness until that process answers. With `--sidecar-readyz`,
 wakeup probe waits up to 120 s instead of its default 30 s, because a runtime that boots in 20 s
 alone takes longer when many environments start on one node; `--wakeup-timeout` sets another
 value. Keep `ate-env-api --wake-budget` longer than the image pull plus this timeout (see step 1).
-Templates registered before this flag keep 30 s (see the upgrade notes above). Here a static busybox stands in for a runtime daemon and serves HTTP on port 44772 inside
-the environment:
+Templates registered before this flag keep 30 s (see the upgrade notes above). Here a static
+busybox stands in for a runtime daemon and serves HTTP on port 44772 inside the environment:
 
 ```bash
 ate-env manifest template --template layered \

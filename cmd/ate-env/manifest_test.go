@@ -23,6 +23,7 @@ import (
 
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/hostcheck"
+	"github.com/agent-substrate/env/internal/portproxy"
 	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	appsv1 "k8s.io/api/apps/v1"
@@ -572,6 +573,21 @@ func TestDerivedTemplateKeepsWakeupTimeout(t *testing.T) {
 	}
 	if got := again.GetContainers()[0].GetWakeupProbe().GetTimeoutSeconds(); got != 120 {
 		t.Errorf("derived from a rootfs base: wakeupProbe.timeoutSeconds = %d, want 120", got)
+	}
+}
+
+// ate-env-api's guest calls and port-proxy requests wait for a wake up to
+// --wake-budget, and the actor answers only after its wakeup probe passes.
+// The default budget must cover the default probe timeout of a sidecar
+// template plus the two minutes it gave image pulls and snapshot reads.
+func TestDefaultWakeBudgetCoversSidecarWakeupTimeout(t *testing.T) {
+	if want := sidecarWakeupTimeout + 2*time.Minute; apiservice.DefaultWakeBudget < want {
+		t.Errorf("apiservice.DefaultWakeBudget = %s, want at least %s (the %s sidecar wakeup timeout plus 2m)",
+			apiservice.DefaultWakeBudget, want, sidecarWakeupTimeout)
+	}
+	if portproxy.DefaultWakeBudget != apiservice.DefaultWakeBudget {
+		t.Errorf("portproxy.DefaultWakeBudget = %s, want apiservice.DefaultWakeBudget %s",
+			portproxy.DefaultWakeBudget, apiservice.DefaultWakeBudget)
 	}
 }
 

@@ -347,16 +347,20 @@ exactly what golden-snapshot starts and fork-from-golden creates are for.
   bakes a golden snapshot; later creates restore from it.
 - `spec.files` are seeded through the guest filesystem service after readiness. `spec.env` /
   `spec.workdir` are applied per exec (`StartProcess` takes `env` and `cwd` natively).
-- `exec(timeout_s=…)` is enforced guest-side and client-side. The guest kills the process group
-  with SIGKILL at the deadline, so the exit code is 137, and the provider appends
-  `substrate provider: exec timed out after …` to stderr. If the guest does not answer within
-  `timeout_s` plus a few seconds, the client kills the process and returns a `return_code=-1`
-  sentinel result rather than raising. Transport failures (env deleted mid-exec, router down)
-  raise `ate_env.EnvError` subclasses.
+- `exec()` returns a result with `return_code=125` and an `error_type` when the sandbox did not
+  run the command to completion; a nonzero exit of the command itself is a plain result with no
+  `error_type`. That is the contract Gym's own providers follow, and what `mini_swe_agent_2` checks
+  to end a rollout whose sandbox is gone instead of stepping on against it. `error_type="timeout"`:
+  the guest killed the process group with SIGKILL at `timeout_s` (the output it produced is kept,
+  and `substrate provider: exec timed out after …` follows it on stderr), or the guest did not
+  answer within `timeout_s` plus a few seconds and the client killed the process.
+  `error_type="sandbox"`: the environment is gone (`NOT_FOUND`) or the call could not reach the
+  guest (`ate_env.EnvError`, named on stderr). `upload_file()` and `download_file()` still raise.
 - `status()` reads the environment's lifecycle state from `ate-env-api` without touching the
   guest, so polling it never wakes a parked sandbox. A **suspended or paused actor reports
-  RUNNING** — the router auto-resumes it on the next command, which is the behavior a rollout
-  loop wants. `RESUMING` → `STARTING`, `CRASHED` → `ERROR`, deleted or `DELETING` → `STOPPED`.
+  `PAUSED`**: it is alive and one call away, since the router resumes it on the next command (a
+  nemo-gym before 0.7 has no `PAUSED`, and gets `RUNNING`). `RESUMING` → `STARTING`, `CRASHED` →
+  `ERROR`, deleted or `DELETING` → `STOPPED`.
 
 Known limits (tracked in the RL-on-Substrate proposal):
 
@@ -372,6 +376,6 @@ Known limits (tracked in the RL-on-Substrate proposal):
 | `SandboxCreateError: … UNAVAILABLE` at once | `api_url` unreachable — port-forward died, or wrong kubectl context (`kubectl config current-context`) |
 | Create times out (`SandboxCreateVerificationError: … UNAVAILABLE` / `INTERNAL`) | Check warm workers exist (`kubectl get pods -n ate-env`) and the template is Ready (`kubectl get actortemplate -n ate-env`). More parallel creates than warm workers will queue. If the message says `server closed the stream without sending trailers`, the router is not carrying gRPC to actors (see Prerequisites #1) |
 | Create times out and the actor is `RUNNING` | The template's image does not run `ate-env-guest` — the actor is up but nothing serves the guest API. See "Task images" |
-| Every exec fails with `NOT_FOUND` | The environment is gone (deleted by another party, or the `ate-env-api` restarted with a different atespace default). `status()` returns `STOPPED`; create a new sandbox |
+| Every exec returns `return_code=125`, `error_type="sandbox"` and `does not exist` on stderr | The environment is gone (deleted by another party, or the `ate-env-api` restarted with a different atespace default). `status()` returns `STOPPED`; create a new sandbox |
 | Every exec returns `UNAVAILABLE` with `CERTIFICATE_EXPIRED` | The atenet router's pod certificate expired and wasn't hot-reloaded (seen on routers running > ~1 day): `kubectl -n ate-system rollout restart deploy/atenet-router` |
 | Actor stuck `RESUMING` forever (`status()` stays `STARTING`) | Restore landed on a CPU-incompatible node (mixed Intel/AMD pools) or raced a router restart. Delete the env and recreate; long-term fix is CPU-aware placement |

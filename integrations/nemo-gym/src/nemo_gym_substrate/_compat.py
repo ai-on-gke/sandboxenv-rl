@@ -44,6 +44,7 @@ except ImportError:  # pragma: no cover - the in-repo test path
     class SandboxStatus(str, Enum):
         STARTING = "starting"
         RUNNING = "running"
+        PAUSED = "paused"  # nemo-gym >= 0.7
         STOPPED = "stopped"
         ERROR = "error"
         UNKNOWN = "unknown"

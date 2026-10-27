@@ -15,8 +15,9 @@ What this repository supports, and what that means.
 | [`proto/ateenv/v1alpha`](../proto/ateenv/v1alpha) | The `ateenv.v1alpha` API. |
 
 The packages under [`internal/`](../internal) that these binaries are built from are part of them:
-`internal/apiservice`, `internal/ate`, `internal/mcp`, `internal/portproxy` and `internal/tool` (the
-MCP tool adapter). Go does not let other modules import them, thus they are not an API of their own.
+`internal/apiservice`, `internal/ate`, `internal/mcp`, `internal/portproxy`, `internal/routertls` (the
+router TLS client) and `internal/tool` (the MCP tool adapter). Go does not let other modules import
+them, thus they are not an API of their own.
 
 For these paths, supported means:
 
@@ -35,7 +36,8 @@ incompatible ways until v1.0.
 [`benchmarking/`](../benchmarking/swebench/README.md), [`cmd/benchmarking`](../cmd/benchmarking) and
 [`internal/benchmarking`](../internal/benchmarking/DESIGN.md): the SWE-bench loader, its scripts and
 the benchmark design. They are kept working with the rest of the repository and CI runs their
-tests, but their flags, file formats and reports can change at any time.
+tests. Their flags can change at any time. A change to the fields of the events file or of the
+report JSON is called out in the PR description; that is notice, not a compatibility promise.
 
 ## Build, test and documentation files
 

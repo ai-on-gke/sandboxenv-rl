@@ -135,8 +135,10 @@ def test_runtime_layer_endpoint() -> None:
         )
         handle = None
         try:
+            # The first use of a task image on a cluster bakes its golden snapshot
+            # and the node pulls the image and the layer; later uses take seconds.
             handle = await provider.create(
-                SandboxSpec(image=RUNTIME_IMAGE, ports=(RUNTIME_PORT,), ready_timeout_s=240)
+                SandboxSpec(image=RUNTIME_IMAGE, ports=(RUNTIME_PORT,), ready_timeout_s=600)
             )
             ep = await provider.endpoint(handle, RUNTIME_PORT)
             url = ep.endpoint.rstrip("/") + "/execute"

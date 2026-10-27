@@ -321,7 +321,9 @@ unmodified `python:3.12-slim` and `debian:bookworm-slim` (no Python inside) were
 after `create`, with readiness gated on both sidecars' `/health`; `POST /execute` answered from
 inside the environment, through the header form and through the path form, an IPython session kept
 its state across two calls, `language: python` ran on the layer's interpreter where the image had
-none, and the exec server answered `POST /exec`. The layer image is 87 MB compressed.
+none, and the exec server answered `POST /exec`. The layer image is 87 MB compressed. That cluster
+ran Substrate `ddb46651`, before the v0.6.0 bump on `main` (#110, #111); a re-run on v0.6.0 is
+pending, because the port proxy now dials the router over TLS.
 
 Limits:
 
@@ -330,8 +332,10 @@ Limits:
   yet.
 - **The daemon must be self-contained.** A layer cannot rely on the task image's libraries: ship a
   static binary, or put the interpreter and its packages in the layer, as `layer/` does for the two
-  NeMo servers. The layer's CPython is a glibc build, so a task image needs glibc 2.17 or newer
-  (every manylinux-era distribution; not Alpine or another musl image).
+  NeMo servers. The layer's CPython is a glibc build and its wheels are locked for
+  `manylinux_2_31` (`layer/lock.sh`), so a task image needs glibc 2.31 or newer: Ubuntu 20.04,
+  Debian 11 and newer, and not Alpine or another musl image. A re-lock at `manylinux_2_17`
+  would lower the floor for older images; it needs a layer rebuild.
 - **The daemon must listen on `0.0.0.0`.** The router reaches the port on the actor's address; a
   daemon bound to `127.0.0.1` only answers processes inside the sandbox, and requests through the
   endpoint fail with 502.

@@ -363,7 +363,16 @@ nothing if an id is already in the fleet or repeats within the call.
 and keeps the tasks loaded before if an id repeats. It also recomputes an
 existing plan.
 
+Both take `Task` objects or dicts. A dict needs `image` and a non-empty
+`task_id` or `id`; a dict without one raises `ValueError`. The fleet does not
+make up ids, because `acquire()`, results and reports need ids that name the
+row in your data. Map dataset rows first:
+
 ```python
+fleet.load_tasks([{"id": r["instance_id"], "image": r["image"]} for r in rows])   # SWE-bench JSONL
+fleet.load_tasks([Task(id=f"{r['repo_name']}@{r['commit_hash'][:12]}", image=r["docker_image"])
+                  for r in rows])                                                    # R2E-Gym
+
 new = fleet.add_tasks(next_batch)                    # Task objects or dicts
 fleet.warm_images(sorted({t.image for t in new}), wait=False)
 ```

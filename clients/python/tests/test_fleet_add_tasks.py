@@ -213,3 +213,35 @@ def test_task_change_during_first_plan_is_in_the_plan(change):
     changer.join(5)
     assert not planner.is_alive() and not changer.is_alive()
     assert fleet._plan.for_image("img-b") is not None
+
+
+def test_dicts_without_an_id_are_refused_with_a_clear_error():
+    """Rows keyed only by instance_id used to become id "None" (and now collide)."""
+    fleet = _fleet()
+    fleet.load_tasks([Task(id="a", image="img-a")])
+    rows = [{"instance_id": "x1", "image": "i"}, {"instance_id": "x2", "image": "i"}]
+    with pytest.raises(ValueError, match=r"index 0 has no 'task_id' or 'id'.*instance_id"):
+        fleet.load_tasks(rows)
+    assert [t.id for t in fleet.tasks] == ["a"]          # nothing replaced
+    with pytest.raises(ValueError, match=r"index 1 has no 'task_id' or 'id'"):
+        fleet.add_tasks([{"id": "b", "image": "img-b"}, {"instance_id": "x3", "image": "i"}])
+    assert [t.id for t in fleet.tasks] == ["a"]          # nothing added
+
+
+@pytest.mark.parametrize("row", [{"id": "", "image": "i"}, {"id": None, "image": "i"},
+                                 {"task_id": "", "image": "i"}])
+def test_empty_ids_are_refused(row):
+    with pytest.raises(ValueError, match="no 'task_id' or 'id'"):
+        _fleet().load_tasks([row])
+
+
+def test_dict_ids_from_task_id_or_id():
+    fleet = _fleet()
+    fleet.load_tasks([
+        {"task_id": "t1", "id": "ignored", "image": "i"},
+        {"id": "t2", "image": "i"},
+        {"id": 7, "image": "i"},
+        {"task_id": 0, "id": "not-this", "image": "i"},   # 0 is a valid id, not missing
+    ])
+    assert [t.id for t in fleet.tasks] == ["t1", "t2", "7", "0"]
+    assert fleet.tasks[1].metadata == {"id": "t2", "image": "i"}

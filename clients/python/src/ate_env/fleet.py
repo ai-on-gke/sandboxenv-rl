@@ -41,6 +41,28 @@ from .types import (
 logger = logging.getLogger("ate_env.fleet")
 
 
+def _dict_task_id(item: dict[str, Any], index: int) -> str:
+    """The id of a task given as a dict: its ``task_id``, else its ``id``.
+
+    A dict with neither (or only empty values) is refused. A made-up id
+    would name the row's position, not the row: the same id would mean
+    another task in another process of the job, after a reload or after a
+    reorder, and a misspelled key would go unnoticed. ``acquire`` by id,
+    results and reports need ids that come from the data.
+    """
+    for key in ("task_id", "id"):
+        value = item.get(key)
+        if value is not None and value != "":
+            return str(value)
+    keys = ", ".join(sorted(map(str, item))[:10]) or "none"
+    raise ValueError(
+        f"Task dict at index {index} has no 'task_id' or 'id' (its keys: {keys}). "
+        "Give each task a stable id from your data: pass Task(id=..., image=...), "
+        "or add an 'id' key, for example from 'instance_id' (SWE-bench) or "
+        "'repo_name' and 'commit_hash' (R2E-Gym)."
+    )
+
+
 class SandboxFleet:
     """Unified Sandbox Fleet Orchestrator.
 
@@ -169,9 +191,12 @@ class SandboxFleet:
         Replaces the tasks loaded before; ``add_tasks`` appends instead. If
         ``plan()`` has run, the plan is recomputed for the new tasks.
 
+        A dict needs ``image`` and a non-empty ``task_id`` or ``id``; its
+        other keys go to ``Task.metadata``.
+
         Raises ValueError, and keeps the tasks loaded before, if a task id
-        repeats within ``tasks``: like ``add_tasks``, ``acquire`` by id must
-        resolve to one task.
+        repeats within ``tasks`` or a dict has no ``task_id`` or ``id``: like
+        ``add_tasks``, ``acquire`` by id must resolve to one task.
         """
         normalized = self._normalize_tasks(tasks)
         repeated = self._repeated_ids(normalized)
@@ -236,12 +261,12 @@ class SandboxFleet:
     @staticmethod
     def _normalize_tasks(tasks: list[Any]) -> list[Task]:
         normalized: list[Task] = []
-        for t in tasks:
+        for i, t in enumerate(tasks):
             if isinstance(t, Task):
                 normalized.append(t)
             elif isinstance(t, dict):
                 normalized.append(Task(
-                    id=str(t.get("task_id") or t.get("id")),
+                    id=_dict_task_id(t, i),
                     image=t["image"],
                     metadata=t,
                     template=t.get("template"),

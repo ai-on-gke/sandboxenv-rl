@@ -169,7 +169,7 @@ async def test_exec_as_another_user_needs_sudo_or_su(fake, make_env, tmp_path):
         sudo = bin_dir / "sudo"
         sudo.write_text(
             "#!/bin/sh\n"
-            'echo "$@" > "$SUDO_LOG"\n'
+            "printf '%s\\n' \"$*\" > \"$SUDO_LOG\"\n"  # not echo: dash's echo eats a leading -n
             'while [ "$1" != "sh" ]; do shift; done\n'
             'exec "$@"\n'
         )

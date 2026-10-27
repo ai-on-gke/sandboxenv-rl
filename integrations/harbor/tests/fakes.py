@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import os
 import shutil
+import signal
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,6 +73,9 @@ async def _subprocess(
     stdin: bytes | None = None,
     timeout: float | None = None,
 ) -> tuple[int, bytes, bytes]:
+    # Its own session, so the deadline kills the whole process group the way
+    # the guest does; killing only `sh` leaves a grandchild holding the pipes
+    # (dash forks the command instead of exec'ing it) and wait() blocks on them.
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=cwd,
@@ -79,11 +83,13 @@ async def _subprocess(
         stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(stdin), timeout)
     except TimeoutError:
-        proc.kill()
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
         await proc.wait()
         return 137, b"", b""  # what the guest reports after SIGKILL at the deadline
     return proc.returncode or 0, out, err

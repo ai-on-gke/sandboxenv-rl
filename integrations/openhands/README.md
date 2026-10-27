@@ -299,6 +299,7 @@ does: 400 for port 80, and with a bearer token 401 for a request without it, and
 the answers that stop it at once (400, 401, 403, 404), cleanup after each failure (lost create answer,
 a create that lands after its timeout, refused create, health timeout, wrong session key), ownership
 (a failed attach or validation error deletes nothing, a copy never deletes), the token at the proxy,
+secret lookups that the agent-server answers in process without the token, invalid secret names,
 attach, pause and resume, exit ordering, files, the shared loop (`close_all`, the call timeout, a
 fork), and a `RemoteConversation` whose event WebSocket goes through the proxy.
 

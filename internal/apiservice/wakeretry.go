@@ -103,6 +103,10 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 		if state == ateapipb.ActorState_ACTOR_STATE_CRASHED {
 			return status.Errorf(codes.FailedPrecondition, "environment %s/%s crashed while waking: %v", atespace, id, err)
 		}
+		if state == ateapipb.ActorState_ACTOR_STATE_DELETING {
+			// It will not wake; the port proxy answers 404 for it too.
+			return status.Errorf(codes.NotFound, "environment %s/%s is being deleted", atespace, id)
+		}
 		allowed, since, which := budget, start, "wake budget"
 		if state == ateapipb.ActorState_ACTOR_STATE_RUNNING {
 			if runningSince.IsZero() {

@@ -226,12 +226,8 @@ func main() {
 			ResponseHeaderTimeout: *ppHeaderTimeout,
 			TrustedOrigins:        origins,
 			WakeBudget:            *wakeBudget,
-			ActorState:            apisvc.ActorState,
 		}
-		if callerAuth != nil {
-			ppOpts.Authenticate = callerAuth.Check
-		}
-		pp, err := portproxy.New(ppOpts)
+		pp, err := portproxy.New(portProxyOptions(ppOpts, apisvc, callerAuth))
 		if err != nil {
 			log.Fatalf("--port-proxy-trusted-origins: %v", err)
 		}
@@ -297,4 +293,15 @@ func newHTTPServer(addr string, handler http.Handler, maxStreams int) *http.Serv
 		srv.HTTP2 = &http.HTTP2Config{MaxConcurrentStreams: maxStreams}
 	}
 	return srv
+}
+
+// portProxyOptions adds what the port proxy takes from the API server to
+// base: the state read that makes a crashed or deleted environment fail at
+// once, and the caller check when -auth-token-file is set.
+func portProxyOptions(base portproxy.Options, apisvc *apiservice.Server, callerAuth *apiservice.BearerAuth) portproxy.Options {
+	base.ActorState = apisvc.ActorState
+	if callerAuth != nil {
+		base.Authenticate = callerAuth.Check
+	}
+	return base
 }

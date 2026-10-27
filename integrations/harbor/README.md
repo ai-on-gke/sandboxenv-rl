@@ -55,7 +55,7 @@ snapshots taken from it.
   buildx and a login to the registry; `build=cloud-build` needs `gcloud` and
   a project. Only `platform` is built.
 - To run a whole dataset without building at trial time, prebuild it once:
-  `harbor admin upload-images --path <tasks> --registry <repo> --push
+  `harbor admin upload-images -t <tasks-dir> -r <repo> --tag <tag> --push
   --update-config` writes `docker_image` tags into the task files; the
   provider resolves them. Then pass `--ek build=none`.
 

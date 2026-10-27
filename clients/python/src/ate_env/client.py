@@ -37,7 +37,12 @@ from .telemetry.tracing import (
     start_span,
     tracer_from_config,
 )
-from .types import EnvironmentInfo, _environment_info_from_pb
+from .types import (
+    EnvironmentInfo,
+    ServerInfo,
+    _environment_info_from_pb,
+    _server_info_from_pb,
+)
 
 __all__ = ["Client", "DEFAULT_ATESPACE"]
 
@@ -285,6 +290,21 @@ class Client:
                 await self._environments.DeleteEnvironment(req, metadata=self._auth_metadata())
             except grpc.RpcError as e:
                 raise map_rpc_error(e) from e
+
+    async def server_info(self) -> ServerInfo:
+        """Return the server's implementation, version and optional features.
+
+        A server that predates GetServerInfo raises RpcError with code
+        UNIMPLEMENTED.
+        """
+        with self._rpc_span("get_server_info", "GetServerInfo", dict):
+            try:
+                resp = await self._environments.GetServerInfo(
+                    env_pb2.GetServerInfoRequest(), metadata=self._auth_metadata()
+                )
+            except grpc.RpcError as e:
+                raise map_rpc_error(e) from e
+        return _server_info_from_pb(resp)
 
     def env(self, id: str, *, atespace: str = DEFAULT_ATESPACE) -> Env:
         """Return a handle to an environment without checking that it exists."""

@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from google.protobuf.internal import containers as _containers
 from google.protobuf.internal import enum_type_wrapper as _enum_type_wrapper
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
-from collections.abc import Mapping as _Mapping
+from collections.abc import Iterable as _Iterable, Mapping as _Mapping
 from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
@@ -116,3 +117,19 @@ class DeleteEnvironmentRequest(_message.Message):
 class DeleteEnvironmentResponse(_message.Message):
     __slots__ = ()
     def __init__(self) -> None: ...
+
+class GetServerInfoRequest(_message.Message):
+    __slots__ = ()
+    def __init__(self) -> None: ...
+
+class GetServerInfoResponse(_message.Message):
+    __slots__ = ("server", "version", "substrate_version", "features")
+    SERVER_FIELD_NUMBER: _ClassVar[int]
+    VERSION_FIELD_NUMBER: _ClassVar[int]
+    SUBSTRATE_VERSION_FIELD_NUMBER: _ClassVar[int]
+    FEATURES_FIELD_NUMBER: _ClassVar[int]
+    server: str
+    version: str
+    substrate_version: str
+    features: _containers.RepeatedScalarFieldContainer[str]
+    def __init__(self, server: _Optional[str] = ..., version: _Optional[str] = ..., substrate_version: _Optional[str] = ..., features: _Optional[_Iterable[str]] = ...) -> None: ...

@@ -180,6 +180,10 @@ func main() {
 	apisvc := apiservice.New(client, *atenet, *hostSuffix)
 	apisvc.WakeBudget = *wakeBudget
 	apisvc.WakeRunningBudget = *wakeRunningBudget
+	apisvc.Info = apiservice.ServerInfo{
+		Version:   buildVersion(),
+		PortProxy: *atenetConn != "",
+	}
 	apisvc.RouterTLS = routerTLS
 	apisvc.RouterIdentity = routerIdentity
 	defer apisvc.Close()
@@ -253,7 +257,7 @@ func main() {
 		_ = srv.Shutdown(context.Background())
 	}()
 
-	log.Printf("ate-env-api listening on %s (ateapi %s, atenet %s, atenet CONNECT %q, router TLS %v)", *listen, *ateapi, *atenet, *atenetConn, routerTLS != nil)
+	log.Printf("ate-env-api %s listening on %s (ateapi %s, atenet %s, atenet CONNECT %q, router TLS %v)", apisvc.Info.Version, *listen, *ateapi, *atenet, *atenetConn, routerTLS != nil)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server error: %v", err)
 	}

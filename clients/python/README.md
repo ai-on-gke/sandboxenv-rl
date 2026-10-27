@@ -73,6 +73,7 @@ actor boots. Retry until it serves (see the how-to below).
 | `Client.get()` / `Env.info()` | `EnvironmentService.GetEnvironment` | ate-env-api → control plane |
 | `Client.suspend()` / `Env.suspend()` | `EnvironmentService.SuspendEnvironment` | ate-env-api → control plane |
 | `Client.delete()` / `Env.delete()` | `EnvironmentService.DeleteEnvironment` | ate-env-api → control plane |
+| `Client.server_info()` | `EnvironmentService.GetServerInfo` | answered by ate-env-api |
 | `Client.env()` | *(no RPC — returns a handle)* | — |
 | `Env.start_process()` | `ProcessService.StartProcess` | proxied to guest |
 | `Env.process()` | *(no RPC — returns a handle)* | — |

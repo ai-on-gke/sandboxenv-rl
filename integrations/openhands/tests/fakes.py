@@ -57,6 +57,8 @@ class FakeAteEnv:
     create_but_fail: bool = False  # record the env, then fail the call
     upstreams: dict[int, str] = field(default_factory=dict)  # port -> host:port
     unhealthy_polls: int = 0  # answer this many /health requests with 503 first
+    new_status: int | None = None  # status of a created environment; RUNNING when unset
+    gets: int = 0  # GetEnvironment calls
     api_token: str | None = None  # the proxy requires this bearer when set
     # answer every proxy request with this: (status, body) or (status, body, headers)
     refuse: tuple[int, str] | tuple[int, str, dict[str, str]] | None = None
@@ -108,10 +110,12 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
             "atespace": request.atespace or DEFAULT_ATESPACE,
             "template": request.template.name or DEFAULT_TEMPLATE,
             "template_atespace": request.template.atespace or DEFAULT_ATESPACE,
-            "status": int(EnvironmentStatus.RUNNING),
+            "status": self.state.new_status if self.state.new_status is not None
+            else int(EnvironmentStatus.RUNNING),
         }
 
     async def GetEnvironment(self, request, context):
+        self.state.gets += 1
         if request.id not in self.state.envs:
             await context.abort(grpc.StatusCode.NOT_FOUND, "no such env")
         return env_pb2.GetEnvironmentResponse(environment=self.state.env_pb(request.id))

@@ -25,7 +25,7 @@ from types import SimpleNamespace
 import grpc
 import httpx
 import pytest
-from ate_env import EnvError, NotFoundError
+from ate_env import EnvError, EnvironmentStatus, NotFoundError
 from openhands.sdk.workspace import RemoteWorkspace
 
 from ate_env_openhands import AteEnvWorkspace, port_url
@@ -362,6 +362,46 @@ def test_resume_stops_at_once_when_the_environment_crashed(stack, tmp_path):
     api_url, state = stack
     with make(api_url, state, tmp_path) as ws:
         state.refuse = CRASHED
+        t0 = time.monotonic()
+        with pytest.raises(RuntimeError, match="has crashed"):
+            ws.resume()
+        assert time.monotonic() - t0 < 5
+
+
+# What an ate-env-api without the port-proxy rewrite passes through for a
+# crashed environment: the Substrate router's 503, with no X-Env-State.
+ROUTER_503 = (503, "actor ate-env/x unavailable: AssignWorker prerequisite not met for Actor: "
+                   "ate-env/x (got: ACTOR_STATE_CRASHED, want ACTOR_STATE_SUSPENDED)")
+
+
+@pytest.mark.parametrize("status,match", [
+    (EnvironmentStatus.CRASHED, r"has crashed and will not recover \(state CRASHED.*delete it and create a new one"),
+    (EnvironmentStatus.DELETING, r"is being deleted \(state DELETING"),
+])
+def test_health_reads_the_state_behind_a_proxy_without_the_rewrite(no_finalizer, stack, tmp_path,
+                                                                   status, match):
+    api_url, state = stack
+    state.new_status = int(status)
+    state.refuse = ROUTER_503
+    _fails_fast(RuntimeError, match, api_url=api_url, state=state, tmp_path=tmp_path)
+    assert state.refusals == 1, "the state check stopped the wait after the first 503"
+    assert state.deletes == [state.creates[0]["id"]]
+
+
+def test_health_state_checks_are_spaced(no_finalizer, stack, tmp_path):
+    api_url, state = stack
+    state.refuse = ROUTER_503  # the environment itself stays RUNNING
+    with pytest.raises(RuntimeError, match="did not answer /health"):
+        make(api_url, state, tmp_path, health_check_timeout=4)
+    assert state.refusals >= 3
+    assert state.gets <= 1, f"{state.gets} state reads in a 4 s wait, want at most one each 5 s"
+
+
+def test_resume_reads_the_state_behind_a_proxy_without_the_rewrite(stack, tmp_path):
+    api_url, state = stack
+    with make(api_url, state, tmp_path) as ws:
+        state.envs[ws.env_id]["status"] = int(EnvironmentStatus.CRASHED)
+        state.refuse = ROUTER_503
         t0 = time.monotonic()
         with pytest.raises(RuntimeError, match="has crashed"):
             ws.resume()

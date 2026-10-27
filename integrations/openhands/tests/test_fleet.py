@@ -165,6 +165,19 @@ def test_fleet_workspace_releases_at_once_on_a_crashed_environment(stack, tmp_pa
     assert len(fleet.released) == 1 and state.deletes == []
 
 
+def test_handle_workspace_reads_the_state_behind_a_proxy_without_the_rewrite(stack, tmp_path):
+    api_url, state = stack
+    fleet = _RegisteringFleet(state)
+    handle = fleet.acquire(TASK)
+    state.envs[handle.sandbox_id]["status"] = 7  # CRASHED
+    state.refuse = (503, "actor ate-env/x unavailable: AssignWorker prerequisite not met")
+    with pytest.raises(RuntimeError, match="has crashed.*create a new one"):
+        make_handle_workspace(handle, **kw(api_url, state, tmp_path, health_check_timeout=30))
+    assert state.refusals == 1, "the health wait stopped after the first answer"
+    assert state.deletes == [] and fleet.released == []
+    fleet.release(handle)
+
+
 @pytest.mark.parametrize("field", ["template", "image", "env_id", "delete_on_exit"])
 def test_fleet_owned_fields_are_refused(field):
     handle = SimpleNamespace(sandbox_id="sb-1", data_plane=None, backend=None, task=TASK)

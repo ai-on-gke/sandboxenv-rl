@@ -140,7 +140,8 @@ class AsyncSandboxFleet:
         with self.observer.phase("warm_pool", backend=self._backend_label, family=family):
             if hasattr(self.backend, "warm_pool_async"):
                 await self.backend.warm_pool_async(
-                    template_id, replicas, wait=wait, rootfs_image=rootfs_image
+                    template_id, replicas, wait=wait, run_id=self._fleet.run_id,
+                    rootfs_image=rootfs_image,
                 )
             else:
                 await asyncio.to_thread(
@@ -148,6 +149,7 @@ class AsyncSandboxFleet:
                     template_id,
                     replicas,
                     wait=wait,
+                    run_id=self._fleet.run_id,
                     rootfs_image=rootfs_image,
                 )
 

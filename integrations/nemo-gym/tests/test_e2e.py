@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pytest
 
+from nemo_gym_substrate import provider as provider_mod
 from nemo_gym_substrate._compat import SandboxSpec, SandboxStatus
 from nemo_gym_substrate.provider import SubstrateSandboxProvider
 
@@ -83,6 +84,41 @@ def test_full_lifecycle(tmp_path: Path) -> None:
             if handle is not None:
                 await provider.close(handle)
                 assert await provider.status(handle) == SandboxStatus.STOPPED
+            await provider.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_pause_policy_parks_and_the_next_command_wakes() -> None:
+    """Parking on a real actor: create() hands back a parked sandbox, a command
+    wakes it and parks it again, pause() and resume() do the same on demand."""
+
+    async def scenario() -> None:
+        provider = SubstrateSandboxProvider(
+            {
+                "connection": {"api_url": API_URL},
+                "create": {"suspend_policy": "pause_after_exec", "idle_before_suspend_s": 0},
+            }
+        )
+        handle = None
+        try:
+            handle = await provider.create(
+                SandboxSpec(provider_options={"template": TEMPLATE}, ready_timeout_s=180)
+            )
+            assert await provider.status(handle) == provider_mod._PAUSED
+
+            result = await provider.exec(handle, "echo woke")
+            assert (result.return_code, result.error_type) == (0, None)
+            assert "woke" in (result.stdout or "")
+            assert await provider.status(handle) == provider_mod._PAUSED
+
+            await provider.resume(handle)
+            assert await provider.status(handle) == SandboxStatus.RUNNING
+            await provider.pause(handle)
+            assert await provider.status(handle) == provider_mod._PAUSED
+        finally:
+            if handle is not None:
+                await provider.close(handle)
             await provider.aclose()
 
     asyncio.run(scenario())

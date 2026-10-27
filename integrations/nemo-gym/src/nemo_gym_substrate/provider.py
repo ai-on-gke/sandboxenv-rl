@@ -35,14 +35,24 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlparse
 
 import grpc
 import grpc.aio
-from ate_env import Client, Env, EnvError, EnvironmentStatus, NotFoundError, Process
+from ate_env import (
+    Client,
+    Env,
+    EnvError,
+    EnvironmentStatus,
+    FailedPreconditionError,
+    InvalidArgumentError,
+    NotFoundError,
+    Process,
+    SuspendMode,
+)
 
 from ._compat import (
     SandboxCreateError,
@@ -91,6 +101,21 @@ _AUTH_TOKEN_ENV = "SUBSTRATE_ENV_AUTH_TOKEN"
 # The ate-env guest's own port in every environment: not a daemon port, and
 # the port proxy refuses it too.
 _GUEST_PORT = 80
+
+# Parking. How long a park may stay mid-transition (SUSPENDING) before the
+# provider stops waiting and leaves it to the control plane, and how often the
+# state is read meanwhile; how often pause() checks for requests in flight.
+_PARK_SETTLE_S = 30.0
+_PARK_POLL_S = 0.25
+_PAUSE_DRAIN_POLL_S = 0.1
+# Env lifecycle statuses of a parked sandbox, and of one on its way there.
+_PARKED = frozenset({EnvironmentStatus.SUSPENDED, EnvironmentStatus.PAUSED})
+_PARKING = frozenset({EnvironmentStatus.SUSPENDING, EnvironmentStatus.PAUSING})
+# create.suspend_policy values, and the suspend mode each one parks with.
+_POLICY_NEVER = "never"
+_POLICY_PAUSE = "pause_after_exec"
+_POLICY_SUSPEND = "suspend_after_exec"
+_POLICY_MODES = {_POLICY_PAUSE: SuspendMode.LOCAL, _POLICY_SUSPEND: SuspendMode.DURABLE}
 
 
 def _validate_ports(ports: object) -> list[int]:
@@ -161,6 +186,13 @@ def _describe(exc: BaseException) -> str:
     if isinstance(exc, EnvError):
         return f"{type(exc).__name__}: {exc}"
     return str(exc) or type(exc).__name__
+
+
+def _status_name(status: object) -> str:
+    try:
+        return EnvironmentStatus(status).name  # type: ignore[call-overload]
+    except ValueError:
+        return str(status)
 
 
 def _atespace_option(options: Mapping[str, Any], where: str) -> str | None:
@@ -245,6 +277,20 @@ class CreateConfig:
     # workloads that select sandboxes by image reference. Templates must be
     # pre-provisioned on the cluster (see README).
     image_templates: Mapping[str, str] = None  # type: ignore[assignment]
+    # Whether, and how, a sandbox is parked once it has been idle for
+    # idle_before_suspend_s after create() and after each exec, upload and
+    # download (README, "Parking"). never: leave it running between calls.
+    # pause_after_exec: SuspendMode.LOCAL, the snapshot stays on the node and
+    # uploads in the background, the cheapest park-and-resume cycle.
+    # suspend_after_exec: SuspendMode.DURABLE, the snapshot is in object
+    # storage before the park counts as done, so the sandbox survives its
+    # node. Either way the next guest call wakes the sandbox through
+    # ate-env-api; nothing has to resume it.
+    suspend_policy: str = _POLICY_NEVER
+    # Idle time a create or a call must be followed by before the park, so
+    # back-to-back commands (an eval's test runs, say) pay no checkpoint and
+    # no restore between them. 0 parks as the call returns.
+    idle_before_suspend_s: float = 1.0
 
     _ALLOWED = frozenset(
         {
@@ -254,12 +300,23 @@ class CreateConfig:
             "ready_timeout_s",
             "ready_poll_interval_s",
             "image_templates",
+            "suspend_policy",
+            "idle_before_suspend_s",
         }
     )
 
     @classmethod
     def from_mapping(cls, options: Mapping[str, Any]) -> "CreateConfig":
         _require_keys(options, cls._ALLOWED, "sandbox.substrate.create")
+        policy = str(options.get("suspend_policy", cls.suspend_policy))
+        if policy != _POLICY_NEVER and policy not in _POLICY_MODES:
+            raise ValueError(
+                "sandbox.substrate.create.suspend_policy must be one of "
+                f"{[_POLICY_NEVER, *_POLICY_MODES]}, got {policy!r}"
+            )
+        idle = float(options.get("idle_before_suspend_s", cls.idle_before_suspend_s))
+        if idle < 0:
+            raise ValueError("sandbox.substrate.create.idle_before_suspend_s must be >= 0")
         return cls(
             template=str(options.get("template", cls.template)),
             atespace=_atespace_option(options, "sandbox.substrate.create") or cls.atespace,
@@ -268,6 +325,8 @@ class CreateConfig:
                 options.get("ready_poll_interval_s", cls.ready_poll_interval_s)
             ),
             image_templates=dict(options.get("image_templates") or {}),
+            suspend_policy=policy,
+            idle_before_suspend_s=idle,
         )
 
 
@@ -289,8 +348,32 @@ class SubstrateProviderOptions:
         )
 
 
+@dataclass
+class _Parking:
+    """Provider-side parking state of one sandbox."""
+
+    # Requests to the guest in flight; the sandbox is never parked while nonzero.
+    inflight: int = 0
+    # Held while a park is under way. Requests wait on it, because ate-env-api
+    # cannot wake a sandbox that is still SUSPENDING.
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # The park waiting out its idle delay, if any.
+    task: asyncio.Task | None = None
+    # Parks past their idle wait; those are left to finish.
+    parking: int = 0
+    # True once a park settled and no request went out since, so two idle
+    # parks that both found the sandbox idle do not both call the API.
+    parked: bool = False
+
+
 class SubstrateSandboxProvider:
-    """NeMo Gym sandbox provider running sandboxes as Substrate actors."""
+    """NeMo Gym sandbox provider running sandboxes as Substrate actors.
+
+    With ``create.suspend_policy`` set, a sandbox is parked once it has been
+    idle after ``create()`` and after each call, and the next guest call wakes
+    it; ``pause()`` and ``resume()`` (``SupportsSandboxPauseResume``) do the
+    same on demand. See README, "Parking".
+    """
 
     name = _PROVIDER_NAME
 
@@ -311,6 +394,14 @@ class SubstrateSandboxProvider:
         # Sent on the gRPC calls of a client the provider opens and on each
         # endpoint() request; a caller-owned client keeps its own token.
         self._auth_token = self._connection.resolve_auth_token()
+        # Parking state per sandbox id, made on first use and dropped on close;
+        # the park tasks, so aclose() can wait for them; the mode idle parks
+        # use, None under the `never` policy. An ate-env-api that predates
+        # SuspendEnvironment's mode turns LOCAL into DURABLE (see _park).
+        self._parking: dict[str, _Parking] = {}
+        self._park_tasks: set[asyncio.Task] = set()
+        self._park_mode: SuspendMode | None = _POLICY_MODES.get(self._create.suspend_policy)
+        self._local_refused = False
         # The channel is opened lazily so constructing a provider never dials.
         self._client: Client | None = client
         self._owns_client = client is None
@@ -357,7 +448,7 @@ class SubstrateSandboxProvider:
             await self._best_effort_delete(env_id, atespace)
             raise
 
-        return SandboxHandle(
+        handle = SandboxHandle(
             sandbox_id=env_id,
             provider_name=self.name,
             raw={
@@ -368,6 +459,11 @@ class SubstrateSandboxProvider:
                 "ports": ports,
             },
         )
+        # The first command comes after the policy's first think time. Until
+        # then the sandbox would hold a worker for nothing, so it is parked
+        # like after a command; the first exec wakes it like any later one.
+        await self._park_when_idle(handle)
+        return handle
 
     async def exec(
         self,
@@ -397,6 +493,24 @@ class SubstrateSandboxProvider:
             None if timeout_s is None else max(_MIN_GUEST_TIMEOUT_S, float(timeout_s))
         )
 
+        async with self._in_flight(handle):
+            result = await self._run(
+                handle, argv, cwd=effective_cwd, env=merged_env, guest_timeout=guest_timeout,
+                timeout_s=timeout_s,
+            )
+        await self._park_when_idle(handle)
+        return result
+
+    async def _run(
+        self,
+        handle: SandboxHandle,
+        argv: list[str],
+        *,
+        cwd: str,
+        env: dict[str, str],
+        guest_timeout: float | None,
+        timeout_s: int | float | None,
+    ) -> SandboxExecResult:
         # A failure of the sandbox itself is a result with an `error_type`, not
         # an exception: that is the shape Gym's agents check to end a rollout
         # whose sandbox is gone, and it is how Gym's own providers report it.
@@ -404,9 +518,7 @@ class SubstrateSandboxProvider:
         sandbox = self._env(handle)
         started = time.monotonic()
         try:
-            process = await sandbox.start_process(
-                argv, cwd=effective_cwd, env=merged_env, timeout=guest_timeout
-            )
+            process = await sandbox.start_process(argv, cwd=cwd, env=env, timeout=guest_timeout)
         except EnvError as exc:
             return _runtime_failure("sandbox", self._sandbox_failure(handle, exc))
         try:
@@ -445,15 +557,19 @@ class SubstrateSandboxProvider:
         return f"substrate env {handle.sandbox_id!r}: {_describe(exc)}"
 
     async def upload_file(self, handle: SandboxHandle, source_path: Path, target_path: str) -> None:
-        await self._env(handle).write_file(
-            target_path, Path(source_path).read_bytes(), mode=0o644
-        )
+        async with self._in_flight(handle):
+            await self._env(handle).write_file(
+                target_path, Path(source_path).read_bytes(), mode=0o644
+            )
+        await self._park_when_idle(handle)
 
     async def download_file(self, handle: SandboxHandle, source_path: str, target_path: Path) -> None:
-        content = await self._env(handle).read_file_bytes(source_path)
+        async with self._in_flight(handle):
+            content = await self._env(handle).read_file_bytes(source_path)
         target = Path(target_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
+        await self._park_when_idle(handle)
 
     async def status(self, handle: SandboxHandle) -> SandboxStatus:
         # GetEnvironment reads the actor's state without touching the guest,
@@ -469,6 +585,57 @@ class SubstrateSandboxProvider:
         except (EnvError, asyncio.TimeoutError):
             return SandboxStatus.UNKNOWN
         return _STATUS_MAP.get(info.status, SandboxStatus.UNKNOWN)
+
+    async def pause(self, handle: SandboxHandle) -> None:
+        """Park the sandbox now (nemo-gym's ``SupportsSandboxPauseResume``).
+
+        Requests in flight finish first: a checkpoint under a running command
+        would cut its reply. The park uses the policy's mode, or
+        ``SuspendMode.LOCAL`` under the ``never`` policy, and returns once the
+        control plane reports the sandbox parked. Raises ``RuntimeError`` when
+        requests are still in flight after ``connection.request_timeout_s``,
+        when the sandbox is gone, or when it did not settle parked.
+        """
+        state = self._parking_state(handle)
+        self._cancel_pending_park(state)
+        mode = self._park_mode or SuspendMode.LOCAL
+        deadline = time.monotonic() + self._connection.request_timeout_s
+        while True:
+            async with state.lock:
+                if not state.inflight:
+                    if state.parked:
+                        return
+                    status = await self._park(handle, mode)
+                    state.parked = status in _PARKED
+                    break
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"substrate env {handle.sandbox_id!r} still has requests in flight; not pausing"
+                )
+            await asyncio.sleep(_PAUSE_DRAIN_POLL_S)
+        if status is None:
+            raise RuntimeError(f"substrate env {handle.sandbox_id!r} does not exist")
+        if not state.parked:
+            raise RuntimeError(
+                f"substrate env {handle.sandbox_id!r} is {_status_name(status)} after pause()"
+            )
+
+    async def resume(self, handle: SandboxHandle) -> None:
+        """Wake a parked sandbox (``SupportsSandboxPauseResume``): one guest
+        probe, which ate-env-api answers once the sandbox runs again. No call
+        needs this first, since every guest call wakes the sandbox the same
+        way; it is for a caller that wants the wake paid before its next step.
+        A pending idle park is dropped; the sandbox parks again once a later
+        call leaves it idle. Raises ``RuntimeError`` for a sandbox that is
+        gone or does not answer within ``create.ready_timeout_s``.
+        """
+        async with self._in_flight(handle):
+            await self._wait_ready(
+                self._env(handle),
+                self._create.ready_timeout_s,
+                error=RuntimeError,
+                stop_on_not_found=True,
+            )
 
     async def endpoint(self, handle: SandboxHandle, port: int) -> SandboxEndpoint:
         """Resolve a declared service port to a caller-reachable endpoint
@@ -521,9 +688,23 @@ class SubstrateSandboxProvider:
         return SandboxEndpoint(endpoint=self._connection.endpoint_base(), headers=headers)
 
     async def close(self, handle: SandboxHandle) -> None:
-        await self._best_effort_delete(handle.sandbox_id, self._atespace_of(handle.raw or {}))
+        atespace = self._atespace_of(handle.raw or {})
+        state = self._parking.pop(handle.sandbox_id, None)
+        if state is None:
+            await self._best_effort_delete(handle.sandbox_id, atespace)
+            return
+        # A park still waiting out its delay is dropped; one that reached the
+        # API holds the lock until the sandbox settles, and deleting under it
+        # would only collide with it.
+        self._cancel_pending_park(state)
+        async with state.lock:
+            await self._best_effort_delete(handle.sandbox_id, atespace)
 
     async def aclose(self) -> None:
+        # A park in flight must finish before its client goes away, or the
+        # sandbox is left mid-transition with nothing waiting for it.
+        if self._park_tasks:
+            await asyncio.gather(*self._park_tasks, return_exceptions=True)
         if self._client is not None and self._owns_client:
             await self._client.close()
         if self._channel is not None:
@@ -608,6 +789,151 @@ class SubstrateSandboxProvider:
                 break
             await asyncio.sleep(self._create.ready_poll_interval_s)
         raise error(f"substrate env {env.id!r} not ready after {timeout_s}s: {last_error}")
+
+    # -- parking ------------------------------------------------------------
+
+    def _parking_state(self, handle: SandboxHandle) -> _Parking:
+        state = self._parking.get(handle.sandbox_id)
+        if state is None:
+            state = self._parking[handle.sandbox_id] = _Parking()
+        return state
+
+    @contextlib.asynccontextmanager
+    async def _in_flight(self, handle: SandboxHandle):
+        """Hold a request slot on the sandbox.
+
+        A park still waiting out its idle delay is dropped; one under way
+        finishes first, because ate-env-api cannot wake a sandbox that is
+        mid-transition. While the slot is held the sandbox is never parked.
+        """
+        state = self._parking_state(handle)
+        self._cancel_pending_park(state)
+        async with state.lock:
+            state.inflight += 1
+            state.parked = False  # the guest call wakes it
+        try:
+            yield
+        finally:
+            state.inflight -= 1
+
+    @staticmethod
+    def _cancel_pending_park(state: _Parking) -> None:
+        """Drop a park that has not passed its idle wait. One past it is left
+        to finish; a caller then waits on the state's lock instead."""
+        if state.task is not None and not state.task.done() and state.parking == 0:
+            state.task.cancel()
+            state.task = None
+
+    async def _park_when_idle(self, handle: SandboxHandle) -> None:
+        """Free the sandbox's worker once it has been idle for the configured
+        delay. Nothing resumes it explicitly: the next guest call goes through
+        ate-env-api, which wakes it. Best effort: a park that fails leaves the
+        sandbox running, which costs density, not correctness."""
+        if self._park_mode is None:
+            return
+        state = self._parking_state(handle)
+        self._cancel_pending_park(state)
+        # Always a task of its own, shielded from the caller: a suspend
+        # cancelled client-side would leave the sandbox mid-transition on the
+        # server with nothing waiting for it.
+        task = asyncio.create_task(self._park_after(handle, state, self._create.idle_before_suspend_s))
+        state.task = task
+        self._park_tasks.add(task)
+        task.add_done_callback(self._park_tasks.discard)
+        if self._create.idle_before_suspend_s <= 0:
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    return  # a newer request superseded the park; the result stands
+                raise
+
+    async def _park_after(self, handle: SandboxHandle, state: _Parking, delay: float) -> None:
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        state.parking += 1
+        try:
+            async with state.lock:
+                if state.inflight or state.parked or self._park_mode is None:
+                    return
+                status = await self._park(handle, self._park_mode)
+                state.parked = status in _PARKED
+        except Exception as exc:  # noqa: BLE001 - a background task must not die silently
+            logger.warning("parking substrate env %s failed: %s", handle.sandbox_id, _describe(exc))
+        finally:
+            state.parking -= 1
+
+    async def _park(self, handle: SandboxHandle, mode: SuspendMode) -> EnvironmentStatus | None:
+        """Suspend the sandbox with ``mode`` and wait out the transition.
+
+        Returns the lifecycle status it settled in, or None when it no longer
+        exists. The caller holds the sandbox's parking lock. The suspend RPC
+        itself is never cancelled from here: a deadline overrun stops the
+        wait, not the checkpoint, and the state is read instead.
+        """
+        env_id = handle.sandbox_id
+        atespace = self._atespace_of(handle.raw or {})
+        rpc = asyncio.create_task(self._ate().suspend(env_id, atespace=atespace, mode=mode))
+        self._park_tasks.add(rpc)
+        rpc.add_done_callback(self._park_tasks.discard)
+        rpc.add_done_callback(lambda t: t.cancelled() or t.exception())  # never "never retrieved"
+        try:
+            await asyncio.wait_for(asyncio.shield(rpc), timeout=self._connection.request_timeout_s)
+        except InvalidArgumentError as exc:
+            if mode is not SuspendMode.LOCAL:
+                raise
+            # An ate-env-api that predates SuspendEnvironment's mode refuses
+            # the field. Park durably from now on, and say so once.
+            if not self._local_refused:
+                self._local_refused = True
+                logger.warning(
+                    "ate-env-api at %s does not serve suspend_mode (%s); parking durably instead "
+                    "of locally from now on",
+                    self._connection.api_url,
+                    _describe(exc),
+                )
+            if self._park_mode is SuspendMode.LOCAL:
+                self._park_mode = SuspendMode.DURABLE
+            return await self._park(handle, SuspendMode.DURABLE)
+        except NotFoundError:
+            return None
+        except FailedPreconditionError:
+            pass  # not RUNNING: parked already, by an earlier call or by the platform
+        except asyncio.TimeoutError:
+            logger.warning(
+                "suspending substrate env %s outran %.0fs; waiting for its state instead",
+                env_id,
+                self._connection.request_timeout_s,
+            )
+        deadline = time.monotonic() + _PARK_SETTLE_S
+        while True:
+            try:
+                info = await asyncio.wait_for(
+                    self._ate().get(env_id, atespace=atespace),
+                    timeout=self._connection.request_timeout_s,
+                )
+            except NotFoundError:
+                return None
+            status = info.status
+            if status not in _PARKING:
+                if status not in _PARKED:
+                    logger.warning(
+                        "parking substrate env %s (%s) left it %s", env_id, mode.name, _status_name(status)
+                    )
+                return status
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "substrate env %s is still %s after %.0fs; leaving it to the control plane, "
+                    "the next park retries",
+                    env_id,
+                    _status_name(status),
+                    _PARK_SETTLE_S,
+                )
+                return status
+            await asyncio.sleep(_PARK_POLL_S)
 
     @staticmethod
     async def _collect(process: Process) -> SandboxExecResult:

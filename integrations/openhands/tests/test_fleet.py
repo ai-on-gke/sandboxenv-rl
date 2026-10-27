@@ -148,12 +148,39 @@ def test_fleet_owned_fields_are_refused(field):
         make_fleet_workspace(SimpleNamespace(), TASK, **{field: "x"})
 
 
+def test_the_fleet_token_reaches_the_proxy_without_api_token(stack, tmp_path):
+    """With the caller token required, both adapters send the fleet's token
+    (FleetConfig.auth_token, held by the driver); the caller passes none."""
+    api_url, state = stack
+    state.api_token = "caller-token"
+    fleet = _RegisteringFleet(state)
+    fleet.backend.auth_token = "caller-token"  # as the Substrate driver holds it
+    handle = fleet.acquire(TASK)
+    ws = make_handle_workspace(handle, **kw(api_url, state, tmp_path / "a"))
+    try:
+        assert ws.api_token == "caller-token"
+        assert ws.execute_command("echo token", timeout=30).stdout.strip() == "token"
+    finally:
+        ws.cleanup()
+        fleet.release(handle)
+    with make_fleet_workspace(fleet, Task(id="t2", image=IMAGE),
+                              **kw(api_url, state, tmp_path / "b")) as ws:
+        assert ws.execute_command("echo token", timeout=30).stdout.strip() == "token"
+    with pytest.raises(PermissionError):  # an explicit api_token wins over the fleet's
+        make_fleet_workspace(fleet, Task(id="t3", image=IMAGE),
+                             **kw(api_url, state, tmp_path / "c", api_token="other"))
+
+
 def test_defaults_come_from_the_handle_and_yield_to_kwargs():
     handle = SimpleNamespace(
         sandbox_id="sb-1",
         data_plane=SimpleNamespace(address="ate-env-api.ate-env:7777"),
-        backend=SimpleNamespace(atespace="team-a"),
+        backend=SimpleNamespace(atespace="team-a", auth_token="caller-token"),
     )
-    assert _defaults_from_handle(handle) == {"api_url": "ate-env-api.ate-env:7777", "atespace": "team-a"}
+    assert _defaults_from_handle(handle) == {
+        "api_url": "ate-env-api.ate-env:7777", "atespace": "team-a", "api_token": "caller-token"}
+    no_token = SimpleNamespace(sandbox_id="sb-3", data_plane=None,
+                               backend=SimpleNamespace(atespace="team-a", auth_token=None))
+    assert _defaults_from_handle(no_token) == {"atespace": "team-a"}
     bare = SimpleNamespace(sandbox_id="sb-2", data_plane=None, backend=None)
     assert _defaults_from_handle(bare) == {}

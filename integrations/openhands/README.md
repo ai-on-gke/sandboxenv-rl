@@ -225,8 +225,9 @@ results = fleet.run(rollout)
 ```
 
 - `make_handle_workspace(handle, **kw)`: an `AteEnvWorkspace` on `handle.sandbox_id`,
-  `delete_on_exit=False`. `api_url` and `atespace` default from the handle (its data plane and
-  its backend's atespace); `api_key`, `proxy_url`, `api_token` and the timeouts pass through.
+  `delete_on_exit=False`. `api_url`, `atespace` and `api_token` default from the handle (its data
+  plane, its backend's atespace and the fleet's `auth_token`); `api_key`, `proxy_url`, the
+  timeouts and an explicit `api_token` pass through.
 - `make_fleet_workspace(fleet, task, **kw)`: acquires on construction and calls
   `fleet.release(handle)` from `cleanup()`, so `with make_fleet_workspace(...) as ws:` owns one
   episode; a failed start (health, session key) releases the handle before the error is raised.

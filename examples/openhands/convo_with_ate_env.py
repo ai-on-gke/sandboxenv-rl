@@ -74,7 +74,7 @@ with AteEnvWorkspace(
     agent = get_default_agent(llm=llm, cli_mode=True)
 
     # 4) Sanity-check the workspace with a direct command
-    result = workspace.execute_command("echo 'Hello from ate-env!' && pwd")
+    result = workspace.execute_command("echo 'Hello from agent-sandbox!' && pwd")
     logger.info(f"Command exit code: {result.exit_code}")
     logger.info(f"Output: {result.stdout}")
 
@@ -91,10 +91,10 @@ with AteEnvWorkspace(
 
         # 6) Pause and resume. Substrate suspends the environment and keeps its
         #    filesystem in a snapshot; the next request resumes it.
-        logger.info("Suspending the environment...")
+        logger.info("Pausing the sandbox (operatingMode -> Suspended)...")
         workspace.pause()
         time.sleep(3)
-        logger.info("Resuming the environment...")
+        logger.info("Resuming the sandbox (operatingMode -> Running)...")
         workspace.resume()
 
         conversation.send_message("Great! Now append a 4th fact to FACTS.txt.")

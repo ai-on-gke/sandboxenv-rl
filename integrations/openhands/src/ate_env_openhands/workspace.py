@@ -472,21 +472,23 @@ class AteEnvWorkspace(RemoteWorkspace):
         if self.env_id is None or self._deleted:
             raise RuntimeError("Cannot pause: no active environment")
         logger.info("Suspending environment %s/%s", self.atespace, self.env_id)
-        # Pooled connections tunnel to the actor that is going away.
-        self.reset_client()
+        # The HTTP client stays open: its pooled connections go to
+        # ate-env-api, not to the actor, and the port proxy re-dials the
+        # actor after the wake. A live RemoteConversation holds this client,
+        # thus closing it would break the conversation.
         self._call(self._ate().suspend(self.env_id, atespace=self.atespace))
 
     def resume(self) -> None:
         """Wake the environment and wait for the agent-server.
 
         Any request wakes a suspended environment; this one makes the wait
-        explicit. The host does not change.
+        explicit. The host and the HTTP client do not change, thus a
+        ``RemoteConversation`` created before pause() keeps working.
         """
         if self.env_id is None or self._deleted:
             raise RuntimeError("Cannot resume: no active environment")
         logger.info("Resuming environment %s/%s", self.atespace, self.env_id)
         self._wait_for_health(timeout=self.health_check_timeout)
-        self.reset_client()
 
     def __enter__(self) -> AteEnvWorkspace:
         return self

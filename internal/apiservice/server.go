@@ -356,6 +356,8 @@ func (s *Server) StreamProcessOutput(req *ateenvv1alpha.StreamProcessOutputReque
 func (s *Server) WriteProcessInput(stream grpc.ClientStreamingServer[ateenvv1alpha.WriteProcessInputRequest, ateenvv1alpha.WriteProcessInputResponse]) error {
 	// Receive the first message before waking the guest, so a request the API
 	// rejects (one with unknown fields) does not resume a suspended environment.
+	// A client that opens a stream and sends nothing therefore holds no guest
+	// connection until it closes.
 	req, err := nextMessage(stream)
 	if err != nil {
 		return err

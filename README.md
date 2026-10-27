@@ -442,6 +442,11 @@ numbers" thus means that the client and the server come from different builds, n
 request is wrong: treat it as a configuration error and do not retry. The guest applies the same
 check to the requests that `ate-env-api` forwards to it. Limits:
 
+- The check covers requests only. In the other direction, an older client accepts a newer
+  server's response field, or a new value of `Environment.state`, and ignores it. That is proto3's
+  normal behavior.
+- Build the SWE-bench loader and `ate-env-api` from one commit. A loader flag that sets a request
+  field the server does not know fails every create with "carries field numbers".
 - A renumbered field is not caught. When both sides know field N with different meanings, nothing
   is unknown.
 - A guest baked into a golden snapshot keeps the build it had. Guests from before this check accept

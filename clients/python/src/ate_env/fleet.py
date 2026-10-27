@@ -377,19 +377,17 @@ class SandboxFleet:
             self._obs.warm_reset()
 
     def run(self, process_fn: Callable[[Task, SandboxHandle], Any],
-            concurrency: int | None = None, strategy: str | None = None) -> list[Any]:
-        """Execute all tasks using ``strategy``, else ``FleetConfig.strategy``.
+            concurrency: int | None = None) -> list[Any]:
+        """Execute all tasks using the configured strategy.
 
-        ``strategy`` overrides the configured strategy for this run only.
         The run's RunReport is available as ``fleet.report`` afterwards;
         ``fleet.report.summary()`` gives the table (logged only at DEBUG).
         """
-        name = strategy or self.config.strategy
-        strat_fn = STRATEGIES.get(name)
+        strat_fn = STRATEGIES.get(self.config.strategy)
         if not strat_fn:
-            raise ValueError(f"Unknown strategy: {name}")
+            raise ValueError(f"Unknown strategy: {self.config.strategy}")
         c = concurrency or min(self.config.max_concurrent, len(self._tasks))
-        with self._obs.run(name, backend=self.backend_label) as report:
+        with self._obs.run(self.config.strategy, backend=self.backend_label) as report:
             self.report = report
             report.environment = self.describe_environment(concurrency=max(1, c))
             results = strat_fn(self, process_fn, max(1, c))

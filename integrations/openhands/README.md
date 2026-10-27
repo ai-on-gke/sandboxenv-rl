@@ -295,16 +295,19 @@ environment:
 | `SUBSTRATE_ENV_ATESPACE` | the atespace when `ClusterConfig.namespace` is `"default"` | `ate-env` |
 
 `ClusterConfig(endpoint=..., auth_token=...)` and `TemplateSpec(name=...)` set the same values in
-code; they exist only here, not in agent-sandbox-rl.
+code; they exist only here, not in agent-sandbox-rl. `auth_token` is a `SecretStr`: `repr`,
+`model_dump()`, `model_dump_json()` and validation errors do not show it. Prefer the variable for
+the token, so that it is not in the program; surrounding white space is removed from it.
 
 | agent-sandbox-rl | on ate-env |
 |---|---|
 | `ClusterConfig.namespace` | the atespace (`"default"`: see the table above) |
 | `max_concurrent`, `window_size`, `run_id` | the same `ate_env.FleetConfig` fields |
+| `window_size=None` | `run()` derives the sliding and pipelined window as agent-sandbox-rl does (`recommended_window()`): the leading images whose warm replicas fit in `max_concurrent`, half that for pipelined; without `warm_per_task` and the disk caps, which are ignored |
 | `max_warmpool_size` | `max_warmpool_replicas` |
 | `ready_timeout` | `acquire_timeout_s` and `ready_timeout_s` |
-| `observability` | `ate_env.ObservabilityConfig` (metrics, tracing, service name) |
-| `run(fn, strategy, concurrency, epochs=)` | `ate_env.SandboxFleet.run` with the same strategy, once for each epoch |
+| `observability` | `ate_env.ObservabilityConfig` (metrics, tracing, service name); `enable_metrics=True`, the default, maps to `None`: metrics when `prometheus_client` is installed, as in agent-sandbox-rl |
+| `run(fn, strategy, concurrency, epochs=)` | `ate_env`'s strategy of the same name; an unknown name (also `""`) raises `ValueError`. With `epochs > 1`, the warm pools stay between passes, the fleet tears down once after the last pass, and `fleet.report` covers all passes |
 | `handle.cluster_name` | the name of the `ClusterConfig` |
 | `make_handle_workspace`, `make_fleet_workspace` | section 6; the token comes from the fleet |
 
@@ -319,7 +322,8 @@ code; they exist only here, not in agent-sandbox-rl.
   settings, `labels`, disk-aware sizing). A session key in `extra_pod_spec` has no effect: the
   agent-server takes the base template's key.
 - Refused with `ValueError`: more than one cluster (one fleet talks to one ate-env-api; run one
-  fleet for each), `adopt_existing=True` and `run_isolation` other than `"none"`.
+  fleet for each), `adopt_existing=True` and `run_isolation` other than `"none"`. agent-sandbox-rl's
+  validators apply too, also to the ignored fields: a configuration that it refuses is refused here.
 - Refused with `NotImplementedError`: `run(keep_warm=True)`, `run(recycle=True)` and
   `run(reset=...)`. Each task gets a new environment, and the fleet deletes it on release.
   `max_reuses`, `reset_timeout`, `use_session` and `scale_on_hold` only tune that reuse and have

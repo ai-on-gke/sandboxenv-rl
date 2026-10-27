@@ -16,8 +16,9 @@
 
 The field names, defaults and validators are agent-sandbox-rl's
 (kubernetes-sigs/agent-sandbox ``examples/agent-sandbox-rl``,
-``agent_sandbox_rl/config.py``), so code written against it constructs the
-same objects unchanged. ``FleetConfig.to_ate_env()`` gives the ``ate_env``
+``agent_sandbox_rl/config.py`` at 7d956bce), so code written against it
+constructs the same objects unchanged, and a configuration it refuses is
+refused here too. ``FleetConfig.to_ate_env()`` gives the ``ate_env``
 configuration the fleet actually runs with.
 
 What maps, and what does not:
@@ -28,7 +29,9 @@ What maps, and what does not:
   endpoint and the caller token come from ``SUBSTRATE_ENV_API`` and
   ``SUBSTRATE_ENV_AUTH_TOKEN`` (the variables the ``ate-env`` CLI reads), or
   from the ate-env-only fields ``endpoint`` and ``auth_token``. One fleet
-  talks to one endpoint, thus more than one cluster is an error.
+  talks to one endpoint, thus more than one cluster is an error. The token
+  is a ``SecretStr``: ``repr``, ``model_dump()``, ``model_dump_json()`` and
+  validation errors do not show it.
 - A ``TemplateSpec`` describes a pod. On ate-env the base ActorTemplate fixes
   the command, the resources and the placement when it is registered, thus
   the spec selects that template: the ate-env-only field ``name``, else
@@ -39,7 +42,11 @@ What maps, and what does not:
   in ``extra_pod_spec`` is the base template's key on ate-env.
 - Fleet sizing maps: ``max_concurrent``, ``max_warmpool_size`` (to
   ``max_warmpool_replicas``), ``window_size``, ``ready_timeout`` (to the
-  acquire and ready timeouts), ``run_id`` and ``observability``. The
+  acquire and ready timeouts), ``run_id`` and ``observability``. With
+  ``window_size=None``, ``SandboxFleet.run`` derives the sliding and
+  pipelined window from ``max_concurrent`` as agent-sandbox-rl does.
+  ``enable_metrics=True`` (the default) means "when prometheus_client is
+  installed", as upstream, thus it maps to ate-env's None. The
   Kubernetes mechanics (placement, pool naming, create budgets, the circuit
   breaker, teardown hooks, disk-aware sizing, labels) are ignored, and one
   INFO log names each set field that is ignored. ``adopt_existing=True`` and
@@ -58,8 +65,15 @@ from typing import Any
 from ate_env import DEFAULT_ATESPACE
 from ate_env import FleetConfig as AteFleetConfig
 from ate_env import ObservabilityConfig as AteObservabilityConfig
-from ate_env.config import SecretStr
-from pydantic import BaseModel, Field, field_validator, model_validator
+from ate_env.config import SecretStr as AteSecretStr
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 logger = logging.getLogger("ate_env_openhands.agent_sandbox_rl")
 
@@ -74,7 +88,12 @@ KEEPALIVE_COMMAND = ["sleep", "infinity"]
 DEFAULT_LABELS = {"app": "agent-sandbox-rl"}
 RUN_ISOLATION_MODES = ("none", "names", "namespace")
 PLACEMENTS = ("round-robin", "least-loaded", "capacity-weighted", "image-affinity")
+RUN_ID_PLACEHOLDER = "{run_id}"
 _DNS1123_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
+_DNS1123 = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$")
+# agent-sandbox-rl checks the derived names with a sample run id and image hash.
+_SAMPLE_RUN_ID = "f" * 12
+_SAMPLE_HASH = "0" * 12
 
 
 class ResourceSpec(BaseModel):
@@ -123,6 +142,9 @@ class ObservabilityConfig(BaseModel):
 class ClusterConfig(BaseModel):
     """One target. On ate-env: one ate-env-api endpoint and one atespace."""
 
+    # A ValidationError must not show the token in its input value.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     name: str = "default"
     kubeconfig: str | None = None
     context: str | None = None
@@ -135,7 +157,7 @@ class ClusterConfig(BaseModel):
     max_replicas: int | None = None
     # ate-env only. None: SUBSTRATE_ENV_API / SUBSTRATE_ENV_AUTH_TOKEN.
     endpoint: str | None = None
-    auth_token: str | None = Field(default=None, repr=False)
+    auth_token: SecretStr | None = None
 
     @field_validator("weight")
     @classmethod
@@ -160,7 +182,9 @@ class ClusterConfig(BaseModel):
         return os.environ.get(ENV_ATESPACE) or DEFAULT_ATESPACE
 
     def ate_auth_token(self) -> str | None:
-        return self.auth_token or os.environ.get(ENV_AUTH_TOKEN) or None
+        if self.auth_token is not None and self.auth_token.get_secret_value():
+            return self.auth_token.get_secret_value()
+        return os.environ.get(ENV_AUTH_TOKEN, "").strip() or None
 
 
 # Fleet fields that drive Kubernetes objects only: accepted, ignored on ate-env.
@@ -183,6 +207,9 @@ _IGNORED_CLUSTER_FIELDS = (
 
 class FleetConfig(BaseModel):
     """agent-sandbox-rl's fleet configuration; ``to_ate_env()`` maps it."""
+
+    # The clusters hold the token; a ValidationError must not show it.
+    model_config = ConfigDict(hide_input_in_errors=True)
 
     clusters: list[ClusterConfig] = Field(default_factory=list)
     placement: str = "image-affinity"
@@ -226,6 +253,30 @@ class FleetConfig(BaseModel):
             raise ValueError("must be >= 1 or None")
         return v
 
+    @field_validator("avg_image_gb", "node_ephemeral_gb")
+    @classmethod
+    def _disk_positive(cls, v: float | None) -> float | None:
+        if v is not None and v <= 0:
+            raise ValueError("disk size hints must be > 0 or None")
+        return v
+
+    @field_validator("disk_headroom")
+    @classmethod
+    def _headroom_fraction(cls, v: float) -> float:
+        if not (0 <= v < 1):
+            raise ValueError("disk_headroom must be in [0, 1)")
+        return v
+
+    @field_validator("template_name_prefix")
+    @classmethod
+    def _valid_prefix(cls, v: str) -> str:
+        sample = f"{v}{_SAMPLE_HASH}".replace(RUN_ID_PLACEHOLDER, _SAMPLE_RUN_ID)
+        if len(sample) > 253 or not _DNS1123.match(sample):
+            raise ValueError(
+                "template_name_prefix must yield a DNS-1123 subdomain when combined "
+                f"with the 12-char image hash; got a name like {sample!r}")
+        return v
+
     @field_validator("placement")
     @classmethod
     def _known_placement(cls, v: str) -> str:
@@ -249,6 +300,39 @@ class FleetConfig(BaseModel):
                 f"run_id {v!r} must be a DNS-1123 label (lowercase alphanumerics and "
                 "'-', starting and ending with an alphanumeric, 63 chars max)")
         return v
+
+    @model_validator(mode="after")
+    def _isolation_vs_adoption(self) -> FleetConfig:
+        if self.adopt_existing and self.run_isolation == "namespace":
+            raise ValueError(
+                "adopt_existing=True cannot be combined with run_isolation='namespace': "
+                "a per-run namespace holds no pools to adopt. Adopt from the shared "
+                "namespace (run_isolation='none' or 'names') instead.")
+        return self
+
+    @model_validator(mode="after")
+    def _valid_pool_name_format(self) -> FleetConfig:
+        sample_template = (f"{self.template_name_prefix}{_SAMPLE_HASH}"
+                           .replace(RUN_ID_PLACEHOLDER, _SAMPLE_RUN_ID))
+        try:
+            sample = (self.pool_name_format
+                      .replace(RUN_ID_PLACEHOLDER, _SAMPLE_RUN_ID)
+                      .format(template=sample_template, image_hash=_SAMPLE_HASH))
+        except (KeyError, IndexError, ValueError) as e:
+            raise ValueError(
+                "pool_name_format may only reference {template}, {image_hash} and "
+                f"{{run_id}} (use {{{{ }}}} for a literal brace); got "
+                f"{self.pool_name_format!r}") from e
+        if _SAMPLE_HASH not in sample:
+            raise ValueError(
+                "pool_name_format must include {template} or {image_hash}, otherwise "
+                "every image resolves to the same pool name and they collide; got "
+                f"{self.pool_name_format!r}")
+        if len(sample) > 253 or not _DNS1123.match(sample):
+            raise ValueError(
+                "pool_name_format must yield a DNS-1123 subdomain; "
+                f"{self.pool_name_format!r} renders as {sample!r}")
+        return self
 
     @model_validator(mode="after")
     def _ate_env_support(self) -> FleetConfig:
@@ -289,7 +373,9 @@ class FleetConfig(BaseModel):
         cluster = self.cluster()
         token = cluster.ate_auth_token()
         observability: dict[str, Any] = {
-            "enable_metrics": self.observability.enable_metrics,
+            # agent-sandbox-rl turns metrics on only when prometheus_client is
+            # installed; ate-env's None means the same (one INFO log when not).
+            "enable_metrics": None if self.observability.enable_metrics else False,
             "enable_tracing": self.observability.enable_tracing,
         }
         if self.observability.trace_service_name != ObservabilityConfig().trace_service_name:
@@ -308,6 +394,6 @@ class FleetConfig(BaseModel):
             acquire_timeout_s=float(self.ready_timeout),
             ready_timeout_s=float(self.ready_timeout),
             run_id=self.run_id,
-            auth_token=SecretStr(token) if token else None,
+            auth_token=AteSecretStr(token) if token else None,
             observability=AteObservabilityConfig(**observability),
         )

@@ -19,6 +19,7 @@ and reaches the real agent-server through the fake port proxy."""
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -57,6 +58,14 @@ class _RegisteringFleet(SandboxFleet):
     def release(self, handle):  # type: ignore[override]
         self.released.append(handle.sandbox_id)
         super().release(handle)
+
+
+def _assert_token_hidden(ws, token):
+    """repr, str and the dumps of a workspace never show its api_token."""
+    assert ws.api_token == token
+    for text in (repr(ws), str(ws), str(ws.model_dump()),
+                 json.dumps(ws.model_dump(mode="json")), ws.model_dump_json()):
+        assert token not in text
 
 
 def kw(api_url, state, tmp_path, **extra):
@@ -158,13 +167,14 @@ def test_the_fleet_token_reaches_the_proxy_without_api_token(stack, tmp_path):
     handle = fleet.acquire(TASK)
     ws = make_handle_workspace(handle, **kw(api_url, state, tmp_path / "a"))
     try:
-        assert ws.api_token == "caller-token"
+        _assert_token_hidden(ws, "caller-token")
         assert ws.execute_command("echo token", timeout=30).stdout.strip() == "token"
     finally:
         ws.cleanup()
         fleet.release(handle)
     with make_fleet_workspace(fleet, Task(id="t2", image=IMAGE),
                               **kw(api_url, state, tmp_path / "b")) as ws:
+        _assert_token_hidden(ws, "caller-token")
         assert ws.execute_command("echo token", timeout=30).stdout.strip() == "token"
     with pytest.raises(PermissionError):  # an explicit api_token wins over the fleet's
         make_fleet_workspace(fleet, Task(id="t3", image=IMAGE),

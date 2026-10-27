@@ -32,6 +32,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 import ate_env
+import pydantic
 import pytest
 from ate_env import DEFAULT_ATESPACE
 from ate_env.backend.mock import MockBackendDriver
@@ -112,6 +113,21 @@ def test_ate_env_settings_default_from_the_environment(monkeypatch):
     assert ate.auth_token.get_secret_value() == "t2"
 
 
+def test_the_token_from_the_environment_is_stripped(monkeypatch):
+    monkeypatch.setenv("SUBSTRATE_ENV_AUTH_TOKEN", f"  {TOKEN}\n")
+    assert FleetConfig().to_ate_env().auth_token.get_secret_value() == TOKEN
+    monkeypatch.setenv("SUBSTRATE_ENV_AUTH_TOKEN", " \n")
+    assert FleetConfig().to_ate_env().auth_token is None
+
+
+def test_metrics_default_to_on_when_prometheus_client_is_installed():
+    # agent-sandbox-rl's enable_metrics=True only turns metrics on when
+    # prometheus_client is installed; ate-env's None means the same.
+    assert FleetConfig().to_ate_env().observability.enable_metrics is None
+    off = FleetConfig(observability=ObservabilityConfig(enable_metrics=False))
+    assert off.to_ate_env().observability.enable_metrics is False
+
+
 @pytest.mark.parametrize(("kwargs", "match"), [
     ({"clusters": [ClusterConfig(name="a"), ClusterConfig(name="b")]}, "one ate-env-api endpoint"),
     ({"adopt_existing": True}, "adopt_existing"),
@@ -128,10 +144,31 @@ def test_settings_ate_env_cannot_honour_raise(kwargs, match):
     lambda: FleetConfig(run_id="Not_A_Label"),
     lambda: TemplateSpec(image_pull_policy="Sometimes"),
     lambda: ClusterConfig(weight=0),
+    lambda: FleetConfig(avg_image_gb=0),
+    lambda: FleetConfig(node_ephemeral_gb=-1.0),
+    lambda: FleetConfig(disk_headroom=1.0),
+    lambda: FleetConfig(template_name_prefix="R2E_"),
+    lambda: FleetConfig(template_name_prefix="r2e..img-"),
+    lambda: FleetConfig(pool_name_format="pool-{run_id}"),
+    lambda: FleetConfig(pool_name_format="pool-{template"),
+    lambda: FleetConfig(pool_name_format="pool-{other}-{template}"),
+    lambda: FleetConfig(pool_name_format="Pool-{template}"),
 ])
 def test_agent_sandbox_rl_validators_still_apply(build):
     with pytest.raises(ValueError):
         build()
+
+
+def test_derived_names_that_agent_sandbox_rl_accepts_pass():
+    config = FleetConfig(template_name_prefix="r2e-{run_id}-",
+                         pool_name_format="pool-{run_id}-{image_hash}", disk_headroom=0.0,
+                         avg_image_gb=4.0, node_ephemeral_gb=100.0)
+    assert config.pool_name_format == "pool-{run_id}-{image_hash}"
+
+
+def test_adopting_into_a_run_namespace_gets_agent_sandbox_rl_error():
+    with pytest.raises(ValueError, match="per-run namespace holds no pools"):
+        FleetConfig(adopt_existing=True, run_isolation="namespace")
 
 
 def test_ignored_settings_are_named_in_one_info_log(caplog):
@@ -150,8 +187,31 @@ def test_ignored_settings_are_named_in_one_info_log(caplog):
 
 
 def test_the_token_stays_out_of_repr():
-    assert TOKEN not in repr(ClusterConfig(auth_token=TOKEN))
-    assert TOKEN not in repr(FleetConfig(clusters=[ClusterConfig(auth_token=TOKEN)]).to_ate_env())
+    cluster = ClusterConfig(auth_token=TOKEN)
+    config = FleetConfig(clusters=[cluster])
+    for model in (cluster, config):
+        assert TOKEN not in repr(model) and TOKEN not in str(model)
+        assert TOKEN not in str(model.model_dump())
+        assert TOKEN not in json.dumps(model.model_dump(mode="json"))
+        assert TOKEN not in model.model_dump_json()
+    assert TOKEN not in repr(config.to_ate_env())
+    assert config.cluster().ate_auth_token() == TOKEN
+
+
+SECRET = "s3cr3t-QZXW"
+
+
+@pytest.mark.parametrize("build", [
+    lambda: FleetConfig(clusters=[{"name": "a", "auth_token": SECRET},
+                                  {"name": "b", "auth_token": SECRET}]),
+    lambda: FleetConfig(clusters=[{"weight": 0, "auth_token": SECRET}]),
+    lambda: ClusterConfig(auth_token=SECRET, weight=0),
+    lambda: ClusterConfig(auth_token=SECRET, max_replicas="many"),
+])
+def test_the_token_stays_out_of_validation_errors(build):
+    with pytest.raises(pydantic.ValidationError) as caught:
+        build()
+    assert "QZXW" not in str(caught.value)  # not even the tail pydantic keeps
 
 
 # --- fleet -------------------------------------------------------------------
@@ -166,12 +226,82 @@ def test_run_takes_strategy_as_its_second_argument():
     assert fleet.report.strategy == "naive"  # agent-sandbox-rl's default
 
 
+@pytest.mark.parametrize("strategy", ["", "warp", None])
+def test_an_unknown_strategy_raises_as_in_agent_sandbox_rl(strategy):
+    fleet = _mock_fleet()
+    fleet.load_tasks([Task(id="t1", image=IMAGE)])
+    with pytest.raises(ValueError, match=r"unknown strategy '.*'; choose from \["):
+        fleet.run(lambda task, handle: None, strategy)
+
+
 def test_epochs_give_one_list_for_each_pass():
     fleet = _mock_fleet()
     fleet.load_tasks([Task(id="t1", image=IMAGE)])
     assert fleet.run(lambda task, handle: task.id, epochs=2) == [["t1"], ["t1"]]
     with pytest.raises(ValueError, match="epochs"):
         fleet.run(lambda task, handle: None, epochs=0)
+
+
+def test_epochs_keep_the_pools_and_share_one_report(monkeypatch):
+    fleet = _mock_fleet()
+    fleet.load_tasks([Task(id="t1", image=IMAGE), Task(id="t2", image=IMAGE)])
+    teardowns = []
+    teardown = fleet.teardown
+    monkeypatch.setattr(fleet, "teardown", lambda: (teardowns.append(1), teardown()))
+    fleet.run(lambda task, handle: task.id, epochs=3)
+    assert teardowns == [1]  # once, after the last pass
+    assert fleet.report.tasks_ok == 6
+
+
+def test_a_failed_pass_before_the_last_tears_down(monkeypatch):
+    fleet = _mock_fleet()
+    fleet.load_tasks([Task(id="t1", image=IMAGE)])
+    teardowns, setups = [], []
+    teardown, setup = fleet.teardown, fleet.setup
+
+    def failing_second_setup(tasks=None):
+        setups.append(1)
+        if len(setups) == 2:
+            raise RuntimeError("warm failed")
+        setup(tasks)
+
+    monkeypatch.setattr(fleet, "teardown", lambda: (teardowns.append(1), teardown()))
+    monkeypatch.setattr(fleet, "setup", failing_second_setup)
+    with pytest.raises(RuntimeError, match="warm failed"):
+        fleet.run(lambda task, handle: task.id, epochs=3)
+    assert teardowns == [1]
+
+
+def _windows(fleet: SandboxFleet, monkeypatch, strategy: str) -> list[int]:
+    batches: list[int] = []
+    warm_images = fleet.warm_images
+    monkeypatch.setattr(fleet, "warm_images", lambda images, **kw: (
+        batches.append(len(images)), warm_images(images, **kw)))
+    fleet.run(lambda task, handle: task.id, strategy)
+    return batches
+
+
+def test_the_window_comes_from_max_concurrent_as_in_agent_sandbox_rl(monkeypatch):
+    tasks = [Task(id=f"t{i}", image=f"img-{i}") for i in range(6)]
+    fleet = _mock_fleet(FleetConfig(max_concurrent=2))
+    fleet.load_tasks(tasks)
+    # One replica for each image, two in max_concurrent: two images at a time.
+    assert fleet.recommended_window() == 2
+    assert fleet.recommended_window(pipelined=True) == 1
+    assert _windows(fleet, monkeypatch, "sliding") == [2, 2, 2]
+    assert fleet.report.environment["mock"]["strategy"] == "sliding"
+    assert (fleet.config.strategy, fleet.config.window_size) == ("sliding", None)
+    assert _windows(fleet, monkeypatch, "pipelined") == [1] * 6
+    # Larger images take more of the budget: 4 tasks of a, 2 of b, 2 of c, max 4.
+    fleet = _mock_fleet(FleetConfig(max_concurrent=4))
+    fleet.load_tasks([Task(id=f"a{i}", image="a") for i in range(4)]
+                     + [Task(id=f"b{i}", image="b") for i in range(2)]
+                     + [Task(id=f"c{i}", image="c") for i in range(2)])
+    assert fleet.recommended_window() == 3
+    fleet = _mock_fleet(FleetConfig(max_concurrent=2, window_size=4))
+    fleet.load_tasks(tasks)
+    assert fleet.recommended_window(pipelined=True) == 4
+    assert _windows(fleet, monkeypatch, "sliding") == [4, 2]
 
 
 @pytest.mark.parametrize("kwargs", [{"keep_warm": True}, {"recycle": True}, {"reset": "cd /"}])

@@ -28,6 +28,11 @@ ALLOWED_BACKENDS = {"substrate", "mock"}
 ALLOWED_STRATEGIES = {"none", "naive", "sliding", "pipelined"}
 ALLOWED_DATA_PLANES = {"ate_env"}
 
+# Run id the Substrate backend gives warm-pool actors created without a run
+# id; reap() deletes them for any run. Reserved, so a job's claimed
+# environments never share an id with the warm pool.
+WARM_POOL_RUN_ID = "warm-pool"
+
 
 class ValidationError(ValueError):
     """Configuration validation error."""
@@ -193,10 +198,11 @@ class FleetConfig:
     labels: dict[str, str] = field(default_factory=dict)
 
     # Run identity. None gives each fleet a random id. Set it to the job's id
-    # (a DNS-1123 label) so every process of one training or eval job (an
-    # orchestrator that warms and the workers that claim) shares one run id:
-    # handles, reports and teardown are then scoped to the job, not to the
-    # process.
+    # (a DNS-1123 label other than "warm-pool") so every process of one
+    # training or eval job (an orchestrator that warms and the workers that
+    # claim) reports the same run id on its handles, spans and run report.
+    # The id stays in the client: it is not sent to ate-env-api, and
+    # teardown still reaps only the environments this process created.
     run_id: str | None = None
 
     # Timeouts & Breakers
@@ -253,6 +259,10 @@ class FleetConfig:
             not isinstance(self.run_id, str) or not _DNS1123_LABEL.match(self.run_id)
         ):
             raise ValidationError(f"Invalid run_id {self.run_id!r}: must match DNS-1123 label regex")
+        if self.run_id == WARM_POOL_RUN_ID:
+            raise ValidationError(
+                f"Invalid run_id {self.run_id!r}: reserved for the Substrate backend's warm-pool actors"
+            )
 
         if self.acquire_timeout_s <= 0:
             raise ValidationError(f"acquire_timeout_s must be > 0, got {self.acquire_timeout_s}")

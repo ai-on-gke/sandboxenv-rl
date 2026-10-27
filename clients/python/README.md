@@ -324,9 +324,14 @@ cfg = FleetConfig(run_id=os.environ["JOB_PREFIX"])   # a DNS-1123 label
 fleet = SandboxFleet(cfg)                             # same run_id in every process
 ```
 
-Handles (`handle.run_id`), the run report's `environment` block and
-`teardown()` then all carry the job's id. Each process still releases only the
-environments it created.
+Handles (`handle.run_id`), `ate_env.run_id` on spans, and the run report's
+`environment` block then all carry the job's id. `"warm-pool"` is reserved.
+
+The run id stays in the client. It is not sent to ate-env-api, and environment
+names (`sb-…`, `warm-…`) don't contain it. So `teardown()` still releases only
+the environments that this process created and tracks. An orchestrator can't
+reap a crashed worker's environments by run id. Reaping across processes needs
+server-side labels and listing in ate-env-api, which don't exist yet.
 
 ### Concurrency
 

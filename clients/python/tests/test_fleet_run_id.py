@@ -16,7 +16,7 @@ import pytest
 
 from ate_env.async_fleet import AsyncSandboxFleet
 from ate_env.backend.mock import MockBackendDriver
-from ate_env.config import FleetConfig, ValidationError
+from ate_env.config import WARM_POOL_RUN_ID, FleetConfig, ValidationError
 from ate_env.fleet import SandboxFleet
 from ate_env.types import Task
 
@@ -63,3 +63,10 @@ def test_run_report_environment_names_the_run_id():
 def test_invalid_run_id_is_rejected(run_id):
     with pytest.raises(ValidationError, match="run_id"):
         FleetConfig(run_id=run_id)
+
+
+def test_the_warm_pool_sentinel_is_reserved():
+    # The Substrate backend tags warm actors created without a run id with
+    # it, and reap() deletes those for any run.
+    with pytest.raises(ValidationError, match="reserved"):
+        FleetConfig(run_id=WARM_POOL_RUN_ID)

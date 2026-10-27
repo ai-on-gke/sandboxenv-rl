@@ -331,7 +331,11 @@ results = await asyncio.gather(
 `load_tasks()` replaces the fleet's tasks. A worker that is handed an episode
 nobody planned, or a trainer that streams batches from a prompt source, calls
 `add_tasks()` instead: it appends, returns the new `Task` objects and, once
-`plan()` has run, extends the plan with their images. It warms nothing:
+`plan()` has run, extends the plan with their images. It warms nothing, and
+a `run()` already in progress does not run the added tasks (`fleet.tasks` is
+a snapshot). Task ids must be new: `add_tasks` raises `ValueError` and adds
+nothing if an id is already in the fleet or repeats within the call.
+`load_tasks()` also recomputes an existing plan.
 
 ```python
 new = fleet.add_tasks(next_batch)                    # Task objects or dicts

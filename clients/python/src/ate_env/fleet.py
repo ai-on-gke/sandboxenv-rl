@@ -52,6 +52,7 @@ class SandboxFleet:
         self.config = config or FleetConfig()
         self.run_id = uuid.uuid4().hex[:12]
         self._tasks: list[Task] = []
+        self._task_ids: set[str] = set()
         self._image_to_template: dict[str, tuple[str, str | None]] = {}
         self._plan: FleetPlan | None = None
         self._lock = threading.Lock()
@@ -153,18 +154,32 @@ class SandboxFleet:
 
     @property
     def tasks(self) -> list[Task]:
-        return self._tasks
+        """A snapshot of the fleet's tasks.
+
+        A copy, so a ``run()`` (or any caller) that iterates it is not
+        affected by ``add_tasks`` calls made meanwhile: tasks added during a
+        ``run()`` are not run by that run.
+        """
+        with self._lock:
+            return list(self._tasks)
 
     def load_tasks(self, tasks: list[Any]) -> None:
         """Load tasks into the fleet (supports list of Task or dicts).
 
-        Replaces the tasks loaded before; ``add_tasks`` appends instead.
+        Replaces the tasks loaded before; ``add_tasks`` appends instead. If
+        ``plan()`` has run, the plan is recomputed for the new tasks.
+        Duplicate ids are accepted here; ``acquire`` by id then resolves to
+        the first task with that id.
         """
         normalized = self._normalize_tasks(tasks)
         with self._lock:
             self._tasks = normalized
+            self._task_ids = {t.id for t in normalized}
+            replan = self._plan is not None
+        if replan:
+            self._plan_entries()
         logger.info("Fleet loaded %d tasks (%d unique images)",
-                    len(self._tasks), len(self.image_counts()))
+                    len(normalized), len(self.image_counts()))
 
     def add_tasks(self, tasks: list[Any]) -> list[Task]:
         """Append tasks to the fleet and extend the plan with their images.
@@ -174,18 +189,29 @@ class SandboxFleet:
         batches from a prompt source. Takes the same items as ``load_tasks``
         and returns them as ``Task`` objects. If ``plan()`` has run, the plan
         is recomputed so ``plan.for_image()`` covers the new images; nothing
-        is warmed, call ``warm_images`` for that. Safe to call from several
-        threads.
+        is warmed, call ``warm_images`` for that. A ``run()`` in progress
+        does not run the added tasks. Safe to call from several threads.
+
+        Raises ValueError, and adds nothing, if a task id is already in the
+        fleet or repeats within ``tasks``: ``acquire`` by id must resolve to
+        one task.
         """
         new = self._normalize_tasks(tasks)
         if not new:
             return new
+        ids = [t.id for t in new]
+        repeated = {i for i, n in collections.Counter(ids).items() if n > 1}
         with self._lock:
+            dupes = sorted(repeated | (set(ids) & self._task_ids))
+            if dupes:
+                raise ValueError(f"Task ids already in the fleet or repeated: {dupes}")
             self._tasks.extend(new)
+            self._task_ids.update(ids)
             replan = self._plan is not None
+            total = len(self._tasks)
         if replan:
             self._plan_entries()
-        logger.debug("Fleet added %d tasks (%d total)", len(new), len(self._tasks))
+        logger.debug("Fleet added %d tasks (%d total)", len(new), total)
         return new
 
     @staticmethod
@@ -298,7 +324,7 @@ class SandboxFleet:
     ) -> SandboxHandle:
         task_obj: Task
         if isinstance(task, str):
-            found = next((t for t in self._tasks if t.id == task), None)
+            found = next((t for t in self.tasks if t.id == task), None)
             if found:
                 task_obj = found
             else:

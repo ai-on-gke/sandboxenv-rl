@@ -89,3 +89,78 @@ async def test_async_add_tasks():
     added = fleet.add_tasks([Task(id="a", image="img-a")])
     assert [t.id for t in added] == ["a"]
     assert fleet.image_counts() == {"img-a": 1}
+
+
+@pytest.mark.parametrize("strategy", ["none", "naive", "sliding", "pipelined"])
+@pytest.mark.parametrize("concurrency", [1, 3])
+def test_add_tasks_during_run_does_not_break_the_run(strategy, concurrency):
+    # Review repro: run() iterated the live task list, so a task added from
+    # process_fn was reached past the end of results (IndexError).
+    fleet = SandboxFleet(FleetConfig(backend="mock", strategy=strategy, batch_size=1))
+    fleet.load_tasks([Task(id=f"t{i}", image=f"img-{i % 2}") for i in range(4)])
+    added = []
+
+    def process(task, handle):
+        added.extend(fleet.add_tasks([Task(id=f"late-{task.id}", image="img-late")]))
+        return task.id
+
+    results = fleet.run(process, concurrency=concurrency)
+    assert results == ["t0", "t1", "t2", "t3"]       # the added tasks are not run
+    assert len(added) == 4
+    assert len(fleet.tasks) == 8                       # but they are in the fleet
+
+
+async def test_add_tasks_during_async_run_does_not_break_the_run():
+    fleet = AsyncSandboxFleet(FleetConfig(backend="mock"))
+    fleet.load_tasks([Task(id=f"t{i}", image="img") for i in range(3)])
+
+    async def process(task, handle):
+        fleet.add_tasks([Task(id=f"late-{task.id}", image="img")])
+        return task.id
+
+    assert await fleet.run(process) == ["t0", "t1", "t2"]
+    assert len(fleet.tasks) == 6
+
+
+def test_tasks_is_a_snapshot():
+    fleet = _fleet()
+    fleet.load_tasks([Task(id="a", image="img-a")])
+    snapshot = fleet.tasks
+    fleet.add_tasks([Task(id="b", image="img-b")])
+    snapshot.append(Task(id="c", image="img-c"))
+    assert [t.id for t in snapshot] == ["a", "c"]
+    assert [t.id for t in fleet.tasks] == ["a", "b"]
+
+
+def test_load_tasks_recomputes_an_existing_plan():
+    fleet = _fleet()
+    fleet.load_tasks([Task(id="a", image="img-a")])
+    fleet.plan()
+    fleet.load_tasks([Task(id="b", image="img-b")])
+    assert fleet._plan.for_image("img-a") is None
+    assert fleet._plan.for_image("img-b") is not None
+
+
+def test_add_tasks_rejects_ids_already_in_the_fleet():
+    fleet = _fleet()
+    fleet.load_tasks([Task(id="a", image="img-a")])
+    with pytest.raises(ValueError, match=r"\['a'\]"):
+        fleet.add_tasks([Task(id="b", image="img-b"), Task(id="a", image="img-other")])
+    assert [t.id for t in fleet.tasks] == ["a"]        # nothing added
+    assert fleet.acquire("a").task.image == "img-a"
+
+
+def test_add_tasks_rejects_ids_repeated_in_one_call():
+    fleet = _fleet()
+    with pytest.raises(ValueError, match=r"\['x'\]"):
+        fleet.add_tasks([Task(id="x", image="img-a"), Task(id="x", image="img-b")])
+    assert fleet.tasks == []
+    fleet.add_tasks([Task(id="x", image="img-a")])     # the id is still free
+
+
+def test_load_tasks_resets_the_known_ids():
+    fleet = _fleet()
+    fleet.load_tasks([Task(id="a", image="img-a")])
+    fleet.load_tasks([Task(id="b", image="img-b")])
+    fleet.add_tasks([Task(id="a", image="img-a")])     # "a" was replaced away
+    assert [t.id for t in fleet.tasks] == ["b", "a"]

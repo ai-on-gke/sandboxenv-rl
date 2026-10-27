@@ -92,6 +92,16 @@ with AteEnvWorkspace(
 
         # 6) Pause and resume. Substrate suspends the environment and keeps its
         #    filesystem in a snapshot; the next request resumes it.
+        #    The log texts are upstream example 17's, kept so the diff is only
+        #    the workspace: ate-env has no operatingMode, pause() suspends the
+        #    environment and resume() waits for the agent-server.
+        #    As upstream, the conversation stays open across pause() and
+        #    resume(): the workspace keeps its HTTP client, thus the second
+        #    message below works. But the suspend breaks the event WebSocket,
+        #    the SDK reconnects after about a second, and that request wakes
+        #    the environment: it does not stay suspended during the sleep. To
+        #    keep it suspended, close the conversation before pause() and
+        #    reattach it after resume() (integrations/openhands/README.md).
         logger.info("Pausing the sandbox (operatingMode -> Suspended)...")
         workspace.pause()
         time.sleep(3)

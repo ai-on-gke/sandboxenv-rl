@@ -22,6 +22,9 @@ pip install ./clients/python './integrations/openhands[examples]'   # from the r
 
 [`convo_with_ate_env.py`](convo_with_ate_env.py) is OpenHands' agent-sandbox example 17
 with the workspace line changed: a command, a conversation, a pause and resume, a second message.
+The conversation stays usable across `pause()` and `resume()`, but because it stays open, the
+environment does not stay suspended during the pause (see the integration's
+[Limits](../../integrations/openhands/README.md#limits)).
 
 The CodeAct agent, OpenHands' default agent (terminal, file editor, task tracker, finish) running on
 the agent-server inside an existing environment:

@@ -151,6 +151,10 @@ caller.
   ws.resume()
   conversation = Conversation(agent=agent, workspace=ws, conversation_id=conversation_id)
   ```
+
+  `pause()` and `resume()` keep the HTTP client open, thus a conversation that stays open across
+  them can still send messages after `resume()`. The environment then does not stay suspended (see
+  [Limits](#limits)).
 - `port_url(port)` is the proxy URL of another port in the same environment. A request to it from
   outside the SDK adds `proxy_headers()` (empty without `api_token`).
 - A rejected session key fails the constructor with `PermissionError`; a version difference between

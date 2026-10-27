@@ -115,11 +115,12 @@ points at an unsigned image only until step 3 completes. If a later step fails,
 the images are signed, but the layer tag, the assets or the notes can be
 missing until a republish.
 
-To republish an existing tag (a failed run, a workflow fix), start the workflow
-by hand from the Actions tab: select the tag in "Use workflow from" and enter
-the same tag as the input. The workflow refuses another ref, because the
-signature identity names the ref and the verify command above accepts only
-`refs/tags/`. A republish replaces the assets and the images section rather than
+To republish an existing tag after a failed run, start the workflow by hand
+from the Actions tab: select the tag in "Use workflow from" and enter the same
+tag as the input. The workflow refuses another ref, because the signature
+identity names the ref and the verify command above accepts only `refs/tags/`.
+The run uses the workflow file at that tag, thus a fix to the workflow on `main`
+needs a new tag. A republish replaces the assets and the images section rather than
 duplicating them, and produces new digests, since the images are rebuilt.
 
 ## First-time setup for the organization

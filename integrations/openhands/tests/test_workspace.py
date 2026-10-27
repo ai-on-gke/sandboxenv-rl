@@ -348,15 +348,155 @@ def test_an_expired_capability_does_not_open_the_websocket(stack, tmp_path, monk
     assert not _websocket_upgrades(state), "the proxy refused the expired capability"
 
 
-def test_capabilities_are_masked_in_httpx_logs(stack, tmp_path, caplog):
+def _capability_of(ws) -> str:
+    return ws.host.split("ate-env-capability:", 1)[1].split("@", 1)[0]
+
+
+def _is_upgrade(request) -> bool:
+    return request["headers"].get("Upgrade", "").lower() == "websocket"
+
+
+def test_rest_requests_never_carry_the_capability(stack, tmp_path, monkeypatch):
+    """Only the event WebSocket sends the capability: REST requests, as the proxy
+    receives them, carry no Authorization at all."""
+    monkeypatch.setenv("OPENHANDS_REMOTE_WS_READY_TIMEOUT", "5")
+    api_url, state = stack
+    state.api_token = "api-secret"
+    with make(api_url, state, tmp_path, api_token="api-secret") as ws:
+        assert ws.execute_command("echo ok", timeout=30).stdout.strip() == "ok"
+        assert ws.file_upload(b"x", str(tmp_path / "work" / "f")).success
+        assert ws.alive
+        conversation = _open_conversation(ws)
+        try:
+            assert conversation.state.id
+        finally:
+            conversation.close()
+    rest = [r for r in state.received if not _is_upgrade(r)]
+    upgrades = [r for r in state.received if _is_upgrade(r)]
+    assert len(rest) >= 5 and upgrades
+    for request in rest:
+        assert "authorization" not in {k.lower() for k in request["headers"]}, request
+        assert request["headers"].get("X-Env-Authorization") == "Bearer api-secret"
+    for request in upgrades:
+        assert request["headers"].get("Authorization", "").startswith("Basic ")
+
+
+def test_repr_and_dumps_hide_the_token_and_the_capability(stack, tmp_path):
+    api_url, state = stack
+    state.api_token = "api-secret"
+    with make(api_url, state, tmp_path, api_token="api-secret") as ws:
+        capability = _capability_of(ws)
+        for text in (repr(ws), str(ws), str(ws.model_dump()), ws.model_dump_json()):
+            assert "api-secret" not in text
+            assert capability not in text
+        assert "ate-env-capability:***@" in repr(ws)
+        assert "api_token" not in ws.model_dump()
+        assert ws.model_dump()["host"].startswith("http://ate-env-capability:***@")
+
+
+def test_errors_do_not_contain_the_capability(stack, tmp_path, no_finalizer):
+    api_url, state = stack
+    state.api_token = "api-secret"
+    ws = make(api_url, state, tmp_path, api_token="api-secret")
+    capability = _capability_of(ws)
+    try:
+        state.refuse = (500, "boom")
+        with pytest.raises(httpx.HTTPStatusError) as status_error:
+            ws._check_session_key()
+        assert capability not in str(status_error.value)
+        assert capability not in str(status_error.value.request.url)
+        state.refuse = (400, "bad port")
+        with pytest.raises(ValueError) as bad_request:
+            ws._wait_for_health(timeout=5)
+        assert capability not in str(bad_request.value)
+        assert "ate-env-capability" not in str(bad_request.value)
+    finally:
+        state.refuse = None
+        ws.cleanup()
+
+
+def test_resume_renews_the_capability(stack, tmp_path, monkeypatch):
+    """A pause longer than ws_capability_ttl: the resume renews the capability, thus
+    a conversation reattached after it opens its event WebSocket."""
+    monkeypatch.setenv("OPENHANDS_REMOTE_WS_READY_TIMEOUT", "5")
+    api_url, state = stack
+    state.api_token = "api-secret"
+    with make(api_url, state, tmp_path, api_token="api-secret", ws_capability_ttl=1) as ws:
+        before = _capability_of(ws)
+        ws.pause()
+        time.sleep(1.5)  # the first capability expires during the pause
+        ws.resume()
+        assert _capability_of(ws) != before
+        conversation = _open_conversation(ws)
+        try:
+            assert conversation.state.id
+        finally:
+            conversation.close()
+    assert _websocket_upgrades(state)
+
+
+def test_capabilities_are_masked_in_logs(stack, tmp_path, caplog, monkeypatch):
+    """httpx logs show no capability (REST URLs have none), and the websockets
+    handshake log masks the Basic header."""
+    monkeypatch.setenv("OPENHANDS_REMOTE_WS_READY_TIMEOUT", "5")
     api_url, state = stack
     state.api_token = "api-secret"
     caplog.set_level(logging.INFO, logger="httpx")
+    caplog.set_level(logging.DEBUG, logger="websockets.client")
     with make(api_url, state, tmp_path, api_token="api-secret") as ws:
-        capability = ws.host.split("ate-env-capability:", 1)[1].split("@", 1)[0]
+        capability = _capability_of(ws)
         ws.execute_command("echo ok", timeout=30)
-    assert "ate-env-capability:***@" in caplog.text
+        conversation = _open_conversation(ws)
+        conversation.close()
+    assert "HTTP Request" in caplog.text
     assert capability not in caplog.text
+    assert "YXRlLWVudi1jYXBhYmlsaXR5" not in caplog.text  # base64 of the capability user
+
+
+def test_the_log_filter_covers_child_loggers():
+    """A filter on "httpcore" would miss "httpcore.http11"; each logger is named."""
+    from ate_env_openhands import workspace as wsmod
+
+    wsmod._redact_capabilities_in_logs()
+    record = logging.LogRecord("httpcore.http11", logging.DEBUG, __file__, 1,
+                               "send_request url=%s", ("http://ate-env-capability:v1.9.ab@h/x",), None)
+    for name in ("httpcore.http11", "httpcore.connection", "websockets.client"):
+        assert wsmod._redact_filter in logging.getLogger(name).filters
+    wsmod._redact_filter.filter(record)
+    assert "v1.9.ab" not in record.getMessage()
+    header = logging.LogRecord("websockets.client", logging.DEBUG, __file__, 1, "> %s: %s",
+                               ("Authorization", "Basic YXRlLWVudi1jYXBhYmlsaXR5OnYxLjEuYQ=="), None)
+    wsmod._redact_filter.filter(header)
+    assert header.getMessage() == "> Authorization: ***"
+
+
+def test_capability_ttl_stays_below_the_proxy_maximum(stack, tmp_path):
+    from ate_env_openhands.workspace import CAPABILITY_CLOCK_MARGIN, MAX_CAPABILITY_TTL
+
+    api_url, state = stack
+    state.api_token = "api-secret"
+    with pytest.raises(ValueError):
+        make(api_url, state, tmp_path, api_token="api-secret",
+             ws_capability_ttl=MAX_CAPABILITY_TTL)
+    longest = MAX_CAPABILITY_TTL - CAPABILITY_CLOCK_MARGIN
+    with make(api_url, state, tmp_path, api_token="api-secret", ws_capability_ttl=longest) as ws:
+        expiry = int(_capability_of(ws).split(".")[1])
+        assert expiry <= time.time() + longest + 1
+
+
+def test_get_secrets_urls_carry_no_capability(monkeypatch, no_finalizer):
+    from openhands.sdk.secret import LookupSecret
+
+    from ate_env_openhands.workspace import _without_userinfo
+
+    url = "http://ate-env-capability:v1.9.ab@127.0.0.1:7777/v1alpha/atespaces/a/envs/e/ports/8000"
+    monkeypatch.setattr(RemoteWorkspace, "get_secrets", lambda self, names=None: {
+        "GH": LookupSecret(url=f"{url}/api/settings/secrets/GH", headers={})})
+    monkeypatch.setattr(AteEnvWorkspace, "model_post_init", lambda self, context: None)
+    ws = AteEnvWorkspace.model_construct(host=url)
+    secrets = ws.get_secrets()
+    assert secrets["GH"].url == _without_userinfo(url) + "/api/settings/secrets/GH"
+    assert "ate-env-capability" not in secrets["GH"].url
 
 
 # -- answers that waiting cannot change ------------------------------------------

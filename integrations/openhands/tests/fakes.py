@@ -69,6 +69,7 @@ class FakeAteEnv:
     create_lands_after: float | None = None  # create succeeds this late, after the client gave up
     wakes: int = 0
     proxied: list[dict] = field(default_factory=list)
+    received: list[dict] = field(default_factory=list)  # each request as the proxy got it
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def env_pb(self, env_id: str) -> env_pb2.Environment:
@@ -185,6 +186,9 @@ def _handler(state: FakeAteEnv):
 
         def _route(self):
             """(upstream, rest, headers to drop) for a request, or None once answered."""
+            with state.lock:
+                state.received.append({"method": self.command, "path": self.path,
+                                       "headers": dict(self.headers.items())})
             if state.refuse is not None:
                 self._reply(*state.refuse)
                 return None

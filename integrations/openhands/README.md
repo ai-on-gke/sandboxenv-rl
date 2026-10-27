@@ -336,13 +336,20 @@ GKE with gVisor workers, Substrate from 2026-10-12, ate-env-api with the port pr
 - With `api_token`, the workspace host carries a port capability in its user info, because
   `RemoteConversation` opens the event WebSocket with `websockets.connect(ws_url)`: no extra headers,
   and the host's query string is dropped. The capability is an HMAC of this environment port and an
-  expiry, keyed with the token, and ate-env-api accepts it on WebSocket upgrades only. A log line
-  or a `repr` that shows the host shows the capability, which opens this port until it expires
-  (`ws_capability_ttl`, default one day, at most seven); the workspace masks it in `httpx` and
-  `httpcore` logs, and the token itself is never in a URL. An event WebSocket of a workspace that
-  outlives `ws_capability_ttl`, or of a token that rotated, gets 401 when it reconnects. The
-  capability needs an ate-env-api whose port proxy checks port capabilities; an older one answers
-  the event WebSocket 401.
+  expiry, keyed with the token, and ate-env-api accepts it on WebSocket upgrades only. Only the event
+  WebSocket sends it: the workspace's REST client uses the host without user info, thus no REST
+  request carries the capability. `repr`, `str` and the model dumps mask the capability and leave
+  out `api_token`; error messages show the host without the capability; the workspace masks it in
+  the `httpx`, `httpcore`, `websockets` and OpenHands workspace and conversation loggers, including
+  the `Authorization: Basic` header that `websockets` logs at DEBUG level. The token itself is never
+  in a URL. A leaked capability opens this port until it expires (`ws_capability_ttl`, default one
+  day, at most seven days less five minutes for clock skew).
+- A conversation keeps the capability it opened with. Its event WebSocket gets 401 when it
+  reconnects after `ws_capability_ttl`, or after a token rotation. `resume()` and
+  `renew_ws_capability()` put a new capability in the host; reattach the conversation after them
+  (`Conversation(agent=..., workspace=..., conversation_id=...)`). The capability needs an
+  ate-env-api whose port proxy checks port capabilities; an older one answers the event WebSocket
+  401.
 - With a live `RemoteConversation`, `pause()` does not keep the environment suspended: the suspend
   breaks the event WebSocket, the SDK reconnects after about a second, and the proxy wakes the
   environment for that request. Thus a paused environment with a live conversation is a running

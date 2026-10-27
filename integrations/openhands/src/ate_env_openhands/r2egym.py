@@ -14,8 +14,7 @@
 
 """R2E-Gym adapter: R2E-Gym's ``RepoEnv`` on a sandbox a fleet acquired.
 
-The same names as ``agent_sandbox_rl.adapters.r2egym``, so Tunix's r2egym and
-sweagent scaffolds change only their imports. R2E-Gym's ``DockerRuntime`` has a
+The same names as ``agent_sandbox_rl.adapters.r2egym``. R2E-Gym's ``DockerRuntime`` has a
 ``kubernetes-sandbox`` backend with four hooks; ``AteEnvRuntime`` overrides
 them: bind the fleet handle instead of claiming a pod, no-op teardown (the
 fleet releases), ``handle.exec`` for commands and ``handle.write_file`` plus
@@ -287,8 +286,8 @@ def fresh_eval_env(fleet: Any, handle: Any, **repo_env_kwargs: Any) -> Iterator[
 
 
 def r2egym_command_files() -> list[str]:
-    """R2E-Gym's default tool files for the ``r2egym`` scaffold (what Tunix's
-    deepswe example loads), from the installed package."""
+    """R2E-Gym's default tool files for the ``r2egym`` scaffold, from the installed
+    package."""
     try:
         import r2egym
     except ImportError as e:

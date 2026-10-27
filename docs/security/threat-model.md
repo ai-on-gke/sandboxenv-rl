@@ -39,6 +39,9 @@ update this document in the same pull request. The pull request template asks fo
   `api.ate-system.svc`, that expires after `tokenExpiration` in `cmd/ate-env/manifest.go`.
 - The caller token in the Secret that `ate-env manifest --auth-token-secret` names, when it is
   configured.
+- The session key of the OpenHands agent-server (`OH_SESSION_API_KEYS_0`), in the container
+  environment of each template that `integrations/openhands` registers, and of each template that
+  `ate-env-api` derives from one.
 - ActorTemplates, golden snapshots and suspended environments in the snapshots bucket.
 - Worker capacity: the CPU, memory and actors of the WorkerPools.
 
@@ -80,7 +83,19 @@ update this document in the same pull request. The pull request template asks fo
 | Use of a guest without the API | The router runs in `ate-system`, and the guest listens only inside the actor. | The connections to the router are plaintext. The guest does not authenticate callers: a client that reaches an actor through the router can run commands as the guest user. |
 | Code in an environment attacks the node or other environments | Each actor runs in gVisor, the sandbox class of the WorkerPool. | ate-env sets no actor egress policy. Egress follows the Substrate defaults. |
 | Processes escape supervision | When the guest is PID 1, it runs as an init: it reaps orphans and forwards signals. A process timeout kills the process group. The guest refuses PTY window sizes that do not fit the 16-bit kernel fields. | — |
-| A sidecar gains extra privilege | Only a template author sets sidecars (`--sidecar`, `--sidecar-readyz`), and that author already controls the image and its command. Sidecars run inside the CPU and memory limits of the actor. | — |
+| A sidecar gains extra privilege | Only a template author sets sidecars (`--sidecar`, `--sidecar-readyz`), and that author already controls the image and its command. Sidecars run inside the CPU and memory limits of the actor. | A sidecar runs in the same container as the code in the environment. A shared credential in the environment of a sidecar, such as the OpenHands session key, is thus readable by that code. Refer to the OpenHands agent-server. |
+
+## The OpenHands agent-server
+
+`integrations/openhands` runs the OpenHands agent-server as a sidecar from a runtime layer. The
+base template sets its session key in the container environment (`ate-env manifest template --env
+OH_SESSION_API_KEYS_0=<key>`). The workspace reaches the agent-server through the port proxy.
+
+| Threat | Current mitigation | Gap |
+|---|---|---|
+| A caller reads the session key from a template | Reading a template needs viewer access to the atespace. Substrate logs redact the values of environment variables. Use a dedicated atespace for these environments, as `integrations/openhands/README.md` says. | Each caller with viewer access to the atespace reads the key with `GetActorTemplate`: reads do not redact it. Each template that `ate-env-api` derives from the base copies it. A template cannot refer to a secret. |
+| A holder of the session key drives the agent-server | With `-auth-token-file`, the port proxy also asks for the caller token. Thus the key alone does not pass the port proxy. | The agent-server checks only the session key (`check_session_api_key` in `openhands/agent_server/dependencies.py`). Without `-auth-token-file`, each network peer of `ate-env-api` that has the key controls the agent-server of each environment whose id it knows. |
+| Code in one environment drives the agent-server of another environment | Each actor runs in gVisor. The agent-server removes the key from the environment of the commands that it starts. With `-auth-token-file`, the key alone does not pass the port proxy. | All environments of one base template share one key. The key is in the environment of the guest, which starts the agent-server with that environment. Commands that the guest starts inherit it too (`guest/process/tracker.go`). The commands of the agent-server do not get it, but they run in the same container, thus code in an environment can read the key from `/proc/<pid>/environ` of the agent-server when it runs as the same user. Neither read is verified on a cluster. The risk to other environments applies when authentication is off, or when the code also has a route to `ate-env-api` and a credential that the port proxy accepts. |
 
 ## Snapshots and the snapshots bucket
 
@@ -168,3 +183,5 @@ error. This is a compatibility risk, not a boundary of this threat model.
 8. ate-env sets no actor egress policy.
 9. On-demand rootfs images accept any registry and create templates without a quota or garbage
    collection (accepted for now).
+10. The OpenHands session key is readable from the template by each viewer of the atespace, all
+    environments of one base template share it, and it is the only check of the agent-server.

@@ -34,12 +34,13 @@ image, which agent-sandbox fixes in its SandboxTemplate, is a field here.
 from __future__ import annotations
 
 import asyncio
+import re
 import secrets
 import shlex
 import sys
 import time
 from collections.abc import Coroutine
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import grpc
 import httpx
@@ -49,6 +50,9 @@ from openhands.sdk.workspace import RemoteWorkspace
 from pydantic import Field, PrivateAttr
 
 from . import _runtime
+
+if TYPE_CHECKING:
+    from openhands.sdk.secret import LookupSecret
 
 logger = get_logger(__name__)
 
@@ -64,6 +68,9 @@ CALL_TIMEOUT = 30.0
 # After a create that failed on this side, how long a delete retries NotFound:
 # the server can still be creating the environment.
 ORPHAN_DELETE_WINDOW = 10.0
+
+# The agent-server's rule for secret names (openhands-agent-server 1.55.0).
+_SECRET_NAME = re.compile(r"[a-zA-Z][a-zA-Z0-9_]{0,63}")
 
 # Create failures after which the environment can exist on the server.
 _AMBIGUOUS_CODES = {
@@ -276,15 +283,20 @@ class AteEnvWorkspace(RemoteWorkspace):
         return headers
 
     def get_secrets(self, names: list[str] | None = None, *,
-                    agent_profile_id: str | None = None):  # type: ignore[no-untyped-def,override]
+                    agent_profile_id: str | None = None) -> dict[str, LookupSecret]:
         """The SDK's ``get_secrets()``, with lookups that the agent-server answers itself.
 
         The SDK points each ``LookupSecret`` at ``host`` and copies the request headers.
         Here ``host`` is the port proxy as this process reaches it: the agent-server in
-        the sandbox cannot reach that address, and the headers carry ``api_token``. The
-        agent-server answers the secret URLs of its own loopback address in process, thus
+        the sandbox cannot reach that address, and the headers carry ``api_token``. Thus
         each lookup names ``http://127.0.0.1:<server_port>/api/settings/secrets/<name>``
         and sends the session key only. The caller token never enters the sandbox.
+
+        The agent-server answers these URLs in process when it was started with
+        ``python -m openhands.agent_server``, as the layer starts it: that start sets
+        ``OH_INTERNAL_SERVER_URL`` (``--host 0.0.0.0`` becomes ``127.0.0.1``). Started
+        another way, it falls back to an HTTP request to its own loopback address,
+        authenticated by the session key, which can stall its own event loop.
         """
         from openhands.sdk.secret import LookupSecret
 
@@ -297,7 +309,15 @@ class AteEnvWorkspace(RemoteWorkspace):
         }
 
     def local_secret_url(self, name: str) -> str:
-        """The URL of secret ``name`` on the agent-server's own loopback address."""
+        """The URL of secret ``name`` on the agent-server's own loopback address.
+
+        ``name`` must follow the agent-server's rule for secret names. It is not
+        URL-encoded: the agent-server's in-process resolver does not decode the path.
+        """
+        if not _SECRET_NAME.fullmatch(name):
+            raise ValueError(
+                f"secret name {name!r} is not valid: it must match {_SECRET_NAME.pattern}"
+            )
         return f"http://127.0.0.1:{self.server_port}/api/settings/secrets/{name}"
 
     def proxy_headers(self) -> dict[str, str]:

@@ -155,8 +155,12 @@ caller.
   outside the SDK adds `proxy_headers()` (empty without `api_token`).
 - `get_secrets()` returns `LookupSecret` references that the agent-server answers itself: each names
   `http://127.0.0.1:<server_port>/api/settings/secrets/<name>` and carries the session key only.
-  The agent-server resolves its own loopback secret URLs in process, thus a lookup never goes
-  through the port proxy, and `api_token` never enters the sandbox.
+  Thus a lookup never goes through the port proxy, and `api_token` never enters the sandbox. The
+  agent-server resolves these URLs in process when it runs as `python -m openhands.agent_server`,
+  as the layer starts it: that start sets `OH_INTERNAL_SERVER_URL`. Started another way, it falls
+  back to an HTTP request to its own loopback address, authenticated by the session key, which can
+  stall its own event loop. Secret names follow the agent-server's rule
+  (`^[a-zA-Z][a-zA-Z0-9_]{0,63}$`).
 - A rejected session key fails the constructor with `PermissionError`; a version difference between
   `openhands-sdk` and the agent-server is logged as a warning.
 - The health wait stops at once on an answer that waiting cannot change: 401 or 403 from the proxy

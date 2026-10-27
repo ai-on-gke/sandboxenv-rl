@@ -30,7 +30,7 @@ from openhands.sdk.workspace import RemoteWorkspace
 
 from ate_env_openhands import AteEnvWorkspace, port_url
 
-from .conftest import IMAGE, SESSION_KEY
+from .conftest import IMAGE, SESSION_KEY, _free_port
 from .fakes import DEFAULT_ATESPACE, FakeAteEnv, serve
 
 
@@ -312,8 +312,45 @@ def test_secret_lookups_name_the_agent_server_loopback_and_carry_no_api_token(ag
             assert "X-Env-Authorization" not in lookup.headers
             exposed = lookup.model_dump_json(context={"expose_secrets": True})
             assert "api-secret" not in exposed
-            # The agent-server's own address answers the lookup, as it does in the sandbox.
+            # This process resolves the lookup over HTTP; the in-process path that the
+            # agent-server uses in the sandbox is in the next test.
             assert lookup.get_value() == "s3cret-value"
+
+
+def test_secret_lookups_resolve_in_process_under_the_layer_start_command(tmp_path, monkeypatch):
+    """The agent-server resolves a lookup in process, without a request, when it runs as
+    the layer starts it (``python -m openhands.agent_server --host 0.0.0.0``)."""
+    pytest.importorskip("openhands.agent_server", reason="needs the [test] extra")
+    from openhands.agent_server.__main__ import _get_internal_server_url
+    from openhands.agent_server.config import Config
+    from openhands.agent_server.local_secret_resolver import local_secret_resolution
+    from openhands.agent_server.persistence import store
+    from openhands.sdk.secret import LookupSecret
+
+    port = _free_port()  # nothing listens here: a lookup that goes to HTTP fails
+    monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path / "persistence"))
+    # What __main__ sets for the layer's --host 0.0.0.0.
+    monkeypatch.setenv("OH_INTERNAL_SERVER_URL", _get_internal_server_url("0.0.0.0", port))
+    store.reset_stores()
+    try:
+        config = Config()
+        store.get_secrets_store(config).set_secret("GH_TOKEN", "s3cret-value")
+        workspace = SimpleNamespace(server_port=port)
+        url = AteEnvWorkspace.local_secret_url(workspace, "GH_TOKEN")  # type: ignore[arg-type]
+        with local_secret_resolution(config):
+            lookup = LookupSecret(url=url, headers={"X-Session-API-Key": SESSION_KEY})
+            assert lookup.get_value() == "s3cret-value"
+            other = LookupSecret(url=url.replace(f":{port}/", f":{port + 1}/"), headers={})
+            with pytest.raises(httpx.ConnectError):
+                other.get_value()
+    finally:
+        store.reset_stores()
+
+
+@pytest.mark.parametrize("name", ["", "1TOKEN", "GH-TOKEN", "GH%5FTOKEN", "a/b", "A" * 65])
+def test_local_secret_url_rejects_names_the_agent_server_refuses(name):
+    with pytest.raises(ValueError, match="secret name"):
+        AteEnvWorkspace.local_secret_url(SimpleNamespace(server_port=8000), name)  # type: ignore[arg-type]
 
 
 def test_secrets_sent_to_a_conversation_never_carry_the_api_token(agent_server, tmp_path):
@@ -327,8 +364,8 @@ def test_secrets_sent_to_a_conversation_never_carry_the_api_token(agent_server, 
     port = int(agent_server.rsplit(":", 1)[1])
     llm = LLM(usage_id="agent", model="openai/unused", api_key=SecretStr("x"),
               base_url="http://127.0.0.1:9")  # never called: the conversation is not run
-    # The workspace holds api_token and sends it on each REST request. This proxy does not
-    # require it, because this branch's event WebSocket cannot send a token yet.
+    # The workspace holds api_token and sends it on each REST request. The test checks only
+    # what reaches the agent-server, thus this proxy does not require the token.
     with serve(FakeAteEnv(upstreams={port: agent_server})) as (api_url, state):
         with make(api_url, state, tmp_path, api_token="api-secret", server_port=port) as ws:
             _put_secret(ws, "GH_TOKEN", "s3cret-value")

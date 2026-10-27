@@ -39,7 +39,8 @@ def _free_port() -> int:
 
 @pytest.fixture(scope="session")
 def agent_server(tmp_path_factory):
-    """host:port of an openhands agent-server, as the layer runs it."""
+    """host:port of an openhands agent-server, started with ``python -m openhands.agent_server``
+    as the layer starts it, but bound to 127.0.0.1 (the layer binds 0.0.0.0)."""
     pytest.importorskip("openhands.agent_server", reason="needs the [test] extra")
     port = _free_port()
     home = tmp_path_factory.mktemp("agent-server")

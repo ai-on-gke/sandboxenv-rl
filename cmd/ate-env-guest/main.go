@@ -80,13 +80,7 @@ func main() {
 	defer cleanup()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
-		if ok, why := gate.Ready(r.Context()); !ok {
-			http.Error(w, why, http.StatusServiceUnavailable)
-			return
-		}
-		io.WriteString(w, "ok\n")
-	})
+	mux.HandleFunc("GET /readyz", readyzHandler(gate))
 	mux.Handle("/", grpcServer)
 
 	// Enable both HTTP/1.1 (for the /readyz probe) and unencrypted HTTP/2
@@ -148,5 +142,17 @@ func waitBounded(wg *sync.WaitGroup, d time.Duration) {
 	select {
 	case <-done:
 	case <-time.After(d):
+	}
+}
+
+// readyzHandler answers the wakeup probe: 200 once every sidecar readiness
+// URL has answered 2xx, else 503 with the reason.
+func readyzHandler(gate *readyGate) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if ok, why := gate.Ready(r.Context()); !ok {
+			http.Error(w, why, http.StatusServiceUnavailable)
+			return
+		}
+		io.WriteString(w, "ok\n")
 	}
 }

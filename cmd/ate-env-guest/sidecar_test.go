@@ -86,6 +86,95 @@ func TestReadyGateWaitsOnceForEachURL(t *testing.T) {
 	}
 }
 
+// Substrate's wakeup probe drops each request after 250 ms and polls every
+// 1 ms. A sidecar whose readiness URL takes 300 ms to answer must still make
+// /readyz ready: its check must outlive the probe request that started it.
+func TestReadyzSlowSidecarBecomesReadyUnderProbeTimeout(t *testing.T) {
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(300 * time.Millisecond):
+			w.WriteHeader(http.StatusOK)
+		case <-r.Context().Done():
+		}
+	}))
+	defer sidecar.Close()
+	guestSrv := httptest.NewServer(readyzHandler(newReadyGate([]string{sidecar.URL + "/ready"})))
+	defer guestSrv.Close()
+
+	probe := &http.Client{Timeout: 250 * time.Millisecond} // wakeupprobe.RequestTimeout
+	deadline := time.Now().Add(5 * time.Second)
+	attempts := 0
+	for time.Now().Before(deadline) {
+		attempts++
+		resp, err := probe.Get(guestSrv.URL)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("/readyz not ready after 5s (%d attempts) with a 300 ms sidecar and a 250 ms probe", attempts)
+}
+
+func TestReadyGateSendsOneRequestAtATimeForEachURL(t *testing.T) {
+	var total, inFlight, maxInFlight atomic.Int32
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		total.Add(1)
+		n := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for {
+			m := maxInFlight.Load()
+			if n <= m || maxInFlight.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+		http.Error(w, "booting", http.StatusServiceUnavailable)
+	}))
+	defer sidecar.Close()
+	g := newReadyGate([]string{sidecar.URL + "/ready"})
+
+	// 50 probes inside one slow answer: all share the one check in flight.
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			defer cancel()
+			if ok, why := g.Ready(ctx); ok || !strings.Contains(why, "in flight") {
+				t.Errorf("Ready = %v, %q; want not ready with the check in flight", ok, why)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := total.Load(); got != 1 {
+		t.Errorf("sidecar got %d requests from 50 concurrent probes, want 1", got)
+	}
+
+	// Probes that keep polling past several slow answers never overlap them.
+	stop := time.Now().Add(time.Second)
+	for time.Now().Before(stop) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			g.Ready(context.Background())
+		}()
+		time.Sleep(time.Millisecond)
+	}
+	wg.Wait()
+	if got := maxInFlight.Load(); got != 1 {
+		t.Errorf("sidecar saw %d concurrent requests, want 1", got)
+	}
+	// The failed answer is reported to later probes.
+	time.Sleep(400 * time.Millisecond)
+	if ok, why := g.Ready(context.Background()); ok || !strings.Contains(why, "HTTP 503") {
+		t.Errorf("Ready = %v, %q; want the sidecar's HTTP 503", ok, why)
+	}
+}
+
 func TestRunSidecarRestartsAndStopsWithContext(t *testing.T) {
 	sh, err := exec.LookPath("sh")
 	if err != nil {

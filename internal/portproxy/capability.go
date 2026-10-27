@@ -147,9 +147,33 @@ func parseCapabilityCredential(credential string) (string, bool) {
 // "foo" and "websocket", or for "websocket, h2c" it serves a plain request.
 // With one field equal to "websocket", the forwarded request carries exactly
 // the value checked here.
+//
+// The comparison ignores ASCII case only and trims nothing (net/textproto
+// already removes the spaces and tabs around a field value). strings.TrimSpace
+// and strings.EqualFold follow Unicode rules: they accept "websocket" followed
+// by U+00A0, or "k" written as U+212A KELVIN SIGN, while the daemon compares
+// bytes and serves such a request as a plain one.
 func isWebSocketUpgrade(r *http.Request) bool {
 	upgrade := r.Header.Values("Upgrade")
 	return r.Method == http.MethodGet &&
 		httpguts.HeaderValuesContainsToken(r.Header["Connection"], "Upgrade") &&
-		len(upgrade) == 1 && strings.EqualFold(strings.TrimSpace(upgrade[0]), "websocket")
+		len(upgrade) == 1 && equalFoldASCII(upgrade[0], "websocket")
+}
+
+// equalFoldASCII reports whether s equals lower, a lowercase ASCII string,
+// ignoring ASCII case only. It never matches a non-ASCII byte.
+func equalFoldASCII(s, lower string) bool {
+	if len(s) != len(lower) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != lower[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -196,6 +196,12 @@ func TestWebSocketCapability(t *testing.T) {
 		"Upgrade: foo, websocket":               {"Connection: Upgrade", "Upgrade: foo, websocket", "Authorization: " + basic(valid)},
 		"Upgrade: foo, then Upgrade: websocket": {"Connection: Upgrade", "Upgrade: foo", "Upgrade: websocket", "Authorization: " + basic(valid)},
 		"Upgrade: websocket, h2c":               {"Connection: Upgrade", "Upgrade: websocket, h2c", "Authorization: " + basic(valid)},
+		// Unicode case folding or Unicode spaces must not turn a value the
+		// daemon does not see as "websocket" into one the proxy accepts.
+		"Upgrade: websocket + U+00A0":   {"Connection: Upgrade", "Upgrade: websocket\u00a0", "Authorization: " + basic(valid)},
+		"Upgrade: websocket + U+0085":   {"Connection: Upgrade", "Upgrade: websocket\u0085", "Authorization: " + basic(valid)},
+		"Upgrade: websoc + U+212A + et": {"Connection: Upgrade", "Upgrade: websoc\u212aet", "Authorization: " + basic(valid)},
+		"Upgrade: web + U+017F + ocket": {"Connection: Upgrade", "Upgrade: web\u017focket", "Authorization: " + basic(valid)},
 	} {
 		if code := rawRequest(t, addr, events, headers...); code != http.StatusUnauthorized {
 			t.Errorf("%s: got %d, want 401", name, code)

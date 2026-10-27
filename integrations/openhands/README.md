@@ -125,7 +125,8 @@ and the sidecar stay. A base registered earlier without `--rootfs-image` keeps a
 actor: delete it and register it again with the same session key. Its `<base>-<12 hex digits>`
 templates can stay, because a template derived from the new base is identical to one derived from
 the old base. Delete them only to make Substrate bake their golden snapshots again, or when the
-session key changes, because each derived template copies the key.
+session key changes, because each derived template copies the key. The cluster runs under
+[Verified](#verified) came before this base image and do not test it.
 
 ## 4. Use `AteEnvWorkspace`
 

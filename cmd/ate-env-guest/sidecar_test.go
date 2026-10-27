@@ -68,6 +68,10 @@ func TestReadyGateWaitsOnceForEachURL(t *testing.T) {
 		t.Errorf("not ready expected, got ok=%v why=%q", ok, why)
 	}
 	state.Store(1)
+	// Checks of one URL start at least sidecarCheckInterval apart. Without
+	// this pause the next check would wait out the spacing inside the 100 ms
+	// wait, and under CPU load not finish in it.
+	time.Sleep(sidecarCheckInterval)
 	if ok, why := g.Ready(ctx); !ok {
 		t.Errorf("ready expected, got %q", why)
 	}
@@ -206,12 +210,11 @@ func TestReadyGateWaitsOnceForAllURLs(t *testing.T) {
 		{30, 10 * time.Millisecond, true},  // ready inside the 100 ms wait
 		{3, 300 * time.Millisecond, false}, // only the bound on the call time
 	} {
-		// Keep each connection idle until the servers close it. With the
-		// default two idle connections per host the client would close the
-		// rest itself, and many runs of this test would use up the local
-		// ports in TIME_WAIT. Cleanups run last first: the servers close
-		// before the transport.
-		tr := &http.Transport{MaxIdleConnsPerHost: tc.n}
+		// A transport for each case, closed after its servers (cleanups run
+		// last first), so the servers close the connections and hold their
+		// TIME_WAIT. On the shared default transport the client closed them,
+		// and many runs of this test used up the local ports.
+		tr := &http.Transport{}
 		t.Cleanup(tr.CloseIdleConnections)
 		var urls []string
 		for range tc.n {

@@ -57,7 +57,7 @@ The focus moves from a general environment service to RL training and evaluation
 | [`integrations/`](#integrations) | Framework integrations. |
 | [`examples/`](#examples) | Runnable examples. |
 | [`benchmarking/`](benchmarking/swebench/README.md), [`cmd/benchmarking`](cmd/benchmarking), [`internal/benchmarking`](internal/benchmarking/DESIGN.md) | The SWE-bench loader, its scripts and the benchmark design. |
-| [`docs/`](docs) | Rootfs images and runtime layers, and how releases are cut. |
+| [`docs/`](docs) | Rootfs images and runtime layers, the [metrics reference](docs/metrics.md), the [threat model](docs/security/threat-model.md), and how releases are cut. |
 
 ## Examples
 
@@ -247,6 +247,20 @@ parking budget) and, once the control plane reports the environment RUNNING, up 
 `--wake-running-budget` (default 20s). Both are flags of the `ate-env-api` binary; `ate-env manifest`
 does not set them, thus add them to the Deployment's arguments to change them.
 
+`ate-env-api` can export traces and serve Prometheus metrics; both are off by default:
+
+- `--enable-tracing` exports OpenTelemetry traces over OTLP/gRPC, configured by
+  `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_INSECURE`. The server continues the W3C
+  `traceparent` / `tracestate` that a caller sends and passes it on to ateapi and the guests as is.
+  `ate-env manifest --enable-tracing --otlp-endpoint <url> [--otlp-insecure]` sets these.
+- `--metrics-listen-addr` (for example `:9090`) serves the families in
+  [docs/metrics.md](docs/metrics.md) at `/metrics` on a listener of its own.
+  `--metrics-environments-ttl` (default 1m) bounds how often a scrape lists the environments.
+  `ate-env manifest --metrics-port <port>` sets the flag and exposes the port on the container and
+  the Service, with `prometheus.io` scrape annotations; 0 (the default) leaves metrics off. The
+  metrics listener has no authentication and no `Host` check: anyone who reaches it reads request
+  counts, atespace names with environment counts, and the build version.
+
 By default `ate-env manifest` deploys `ate-env-api` without caller authentication for use over
 `kubectl port-forward`. Before exposing `ate-env-api` beyond loopback (e.g. through an internal
 LoadBalancer or to multi-tenant namespaces), create a Kubernetes Secret with a `token` key and pass
@@ -423,10 +437,15 @@ Flags:
       --api-image string            digest-pinned ate-env-api image for the API service (required: this ate-env was built from source; release binaries default to the image published with the release, see docs/release.md)
       --api-port int32              port the ate-env-api service listens on (default 7777)
       --api-replicas int32          number of API service replicas (default 1)
+      --api-router-tls              mount the pod identity certificate and the servicedns trust bundle into ate-env-api and dial the atenet router's TLS listeners, the only ones Substrate serves since v0.6.0; the API's SPIFFE ID must then be in the router's --ingress-allowed-spiffe-ids. Off, the API dials the plaintext addresses, which only the test fakes serve (default true)
       --ateom-image string          alias for --worker-image, kept from before Substrate renamed ateom to ateworker
       --auth-token-secret string    Kubernetes Secret name (with key 'token') to mount into ate-env-api and require as a caller bearer token
+      --enable-tracing              run ate-env-api with --enable-tracing, exporting OpenTelemetry traces over OTLP/gRPC
   -h, --help                        help for manifest
+      --metrics-port int32          port ate-env-api serves Prometheus metrics on (--metrics-listen-addr), exposed on the container and the Service as "metrics" with prometheus.io scrape annotations; 0 leaves metrics off. The metrics listener has no authentication and no Host check
       --namespace string            Kubernetes namespace to deploy into (default "ate-env")
+      --otlp-endpoint string        OTLP/gRPC collector endpoint for ate-env-api's traces, set as OTEL_EXPORTER_OTLP_ENDPOINT, e.g. http://otel-collector.observability:4317
+      --otlp-insecure               set OTEL_EXPORTER_OTLP_INSECURE=true: talk to the collector in plaintext
       --replicas int32              number of pre-warmed worker pods (default 5)
       --template string             ActorTemplate name (default "default-template")
       --worker-image string         digest-pinned worker image for the worker pool, e.g. ateworker-gvisor built from the Substrate repo

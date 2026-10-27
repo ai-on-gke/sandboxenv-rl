@@ -19,10 +19,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -703,5 +705,64 @@ func TestValidateRejectsLoaderLabelKeys(t *testing.T) {
 	cfg.Labels = map[string]string{"commit": "abc"}
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("validate() with an operator label: %v", err)
+	}
+}
+
+func TestMixedTrajectoriesDrawPerEnvironment(t *testing.T) {
+	run := func(seed int64) map[string]string {
+		f := newFake()
+		var out bytes.Buffer
+		cfg := baseConfig(t, f, &out)
+		cfg.Mode = ModeEval
+		cfg.TasksPerImage = 4
+		a := testTrajectory(t, "true")
+		a.Name = "alpha"
+		b := testTrajectory(t, "true")
+		b.Name = "beta"
+		cfg.Trajectories = []*Trajectory{a, b}
+		cfg.Seed = seed
+		if _, err := Run(context.Background(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		byEnv := map[string]string{}
+		for _, e := range parseEvents(t, out.String()) {
+			if e.Event == EventTask {
+				byEnv[e.Env] = e.Name
+			}
+			if e.Event == EventRun && (e.Labels["trajectory"] != "alpha,beta" || e.Labels["seed"] != strconv.FormatInt(seed, 10)) {
+				t.Fatalf("run labels: %v", e.Labels)
+			}
+		}
+		return byEnv
+	}
+	first := run(7)
+	if len(first) != 12 {
+		t.Fatalf("task events: %v", first)
+	}
+	seen := map[string]int{}
+	for _, name := range first {
+		seen[name]++
+	}
+	if seen["alpha"] == 0 || seen["beta"] == 0 {
+		t.Fatalf("both trajectories must be drawn over 12 environments: %v", seen)
+	}
+	if again := run(7); fmt.Sprint(again) != fmt.Sprint(first) {
+		t.Fatalf("the same seed must give the same assignment:\n%v\n%v", first, again)
+	}
+}
+
+// A caller that sets only Trajectories gets the first as Trajectory; a nil
+// entry in the mix is refused.
+func TestValidateDefaultsTrajectoryFromTheMix(t *testing.T) {
+	cfg := baseConfig(t, newFake(), nil)
+	cfg.Mode, cfg.TasksPerImage = ModeEval, 1
+	only := cfg.Trajectory
+	cfg.Trajectory, cfg.Trajectories = nil, []*Trajectory{only}
+	if err := cfg.validate(); err != nil || cfg.Trajectory != only {
+		t.Fatalf("validate() = %v, Trajectory %p; want nil and the mix's first %p", err, cfg.Trajectory, only)
+	}
+	cfg.Trajectories = []*Trajectory{only, nil}
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "trajectory 2 of the mix is nil") {
+		t.Fatalf("validate() with a nil entry = %v", err)
 	}
 }

@@ -28,10 +28,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/url"
 	"os"
 	"os/signal"
@@ -58,6 +60,8 @@ func main() {
 		err = runCmd(os.Args[2:])
 	case "report":
 		err = reportCmd(os.Args[2:], os.Stdout)
+	case "trajectory-assets":
+		err = assetsCmd(os.Args[2:], os.Stdout)
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -94,7 +98,7 @@ func resolveAuthToken(file string, getenv func(string) string) (string, error) {
 	return token, nil
 }
 
-// labelFlags collects repeated -label KEY=VALUE flags.
+// labelFlags collects repeated KEY=VALUE flags (-label and -set on run).
 type labelFlags map[string]string
 
 func (l labelFlags) String() string {
@@ -116,7 +120,7 @@ func (l labelFlags) Set(v string) error {
 		return fmt.Errorf("want KEY=VALUE, got %q", v)
 	}
 	if strings.ContainsAny(v, "\t\n") {
-		return fmt.Errorf("label %q: no tabs or newlines, they break the report's table", v)
+		return fmt.Errorf("%q: no tabs or newlines, they break the report's table", v)
 	}
 	if _, dup := l[k]; dup {
 		return fmt.Errorf("%s is given twice", k)
@@ -180,14 +184,18 @@ func datasetLabel(dataset string) string {
 }
 
 // ownLabels are the loader's labels that only the command line knows (the
-// rest come from Config.labels); every key is in swebench.LoaderLabelKeys.
-// The exclude file and the instance list are named by their file name or
-// count plus a digest of their ids, so two lists of one length differ.
-func ownLabels(dataset string, connections int, baseTemplate, excludeFile string, exclude, instances []string) map[string]string {
+// rest come from Config.labels); every key is in swebench.LoaderLabelKeys or
+// is a var's effective value under set.KEY. The exclude file and the
+// instance list are named by their file name or count plus a digest of their
+// ids, so two lists of one length differ.
+func ownLabels(dataset string, connections int, baseTemplate, excludeFile string, exclude, instances []string, vars map[string]string) map[string]string {
 	l := map[string]string{
 		"dataset":       datasetLabel(dataset),
 		"connections":   strconv.Itoa(connections),
 		"base_template": baseTemplate,
+	}
+	for k, v := range vars {
+		l["set."+k] = v
 	}
 	if excludeFile != "" {
 		l["exclude_file"] = filepath.Base(excludeFile) + "@" + idsDigest(exclude)
@@ -207,7 +215,23 @@ func idsDigest(ids []string) string {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: swebench-loader run [flags] | swebench-loader report FILE... [-json OUT]")
+	fmt.Fprintln(os.Stderr, "usage: swebench-loader run [flags] | swebench-loader report FILE... [-json OUT] | swebench-loader trajectory-assets FILE")
+}
+
+// assetsCmd prints the files a trajectory's write steps name, one per line,
+// for run-in-cluster.sh to bake next to it.
+func assetsCmd(args []string, w io.Writer) error {
+	if len(args) != 1 {
+		return errors.New("usage: swebench-loader trajectory-assets FILE")
+	}
+	names, err := swebench.TrajectoryAssets(args[0])
+	if err != nil {
+		return err
+	}
+	for _, n := range names {
+		fmt.Fprintln(w, n)
+	}
+	return nil
 }
 
 func runCmd(args []string) (retErr error) {
@@ -221,7 +245,8 @@ func runCmd(args []string) (retErr error) {
 		images        = fs.Int("images", 0, "Use the first N instances of the dataset; 0 means all.")
 		instances     = fs.String("instances", "", "Comma-separated instance ids to use instead of the first N.")
 		excludeFile   = fs.String("exclude-file", "", "File of instance ids to leave out, one per line; text after the id is a comment.")
-		trajectory    = fs.String("trajectory", swebench.DefaultTrajectory, fmt.Sprintf("Trajectory file or built-in name (%s).", strings.Join(swebench.Names(), ", ")))
+		trajectory    = fs.String("trajectory", swebench.DefaultTrajectory, fmt.Sprintf("Trajectory file or built-in name (%s); a comma-separated list mixes them, one per environment, drawn with -seed.", strings.Join(swebench.Names(), ", ")))
+		seed          = fs.Int64("seed", 1, "Seed for the trajectory mix, so reps assign the same trajectory to the same environment.")
 		mode          = fs.String("mode", string(swebench.ModeEval), "eval (images x tasks-per-image, each create/replay/delete) or steps (images x rollouts kept across steps).")
 		width         = fs.Int("width", 50, "Most tasks in flight at once.")
 		tasksPerImage = fs.Int("tasks-per-image", 1, "eval: replays per image.")
@@ -238,7 +263,9 @@ func runCmd(args []string) (retErr error) {
 		dryRun        = fs.Bool("dry-run", false, "Load and render everything, print the plan and exit without touching the API.")
 		authTokenFile = fs.String("auth-token-file", "", "File that holds the bearer token for ate-env-api; surrounding whitespace is ignored. Without it, SUBSTRATE_ENV_AUTH_TOKEN is used when set.")
 		labels        = labelFlags{}
+		vars          = labelFlags{}
 	)
+	fs.Var(vars, "set", "KEY=VALUE for the trajectories' var function, repeatable, e.g. READ_FILE=/testbed/setup.py or COMPILE_DIR=/testbed; a workload's defaults are in its file. A key no trajectory reads is an error; each value is recorded as a set.KEY label.")
 	fs.Var(labels, "label", "KEY=VALUE recorded on the run event, repeatable: the Substrate commit, the cluster, the arm. The loader records its own flags itself (mode, width, images, trajectory, dataset, the shape flags, connections, base-template, exclude-file, instances and the timeouts); a -label with one of those keys is refused, so report -arm can trust them.")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -279,20 +306,52 @@ func runCmd(args []string) (retErr error) {
 	if *images > 0 && len(selected) < *images && len(ids) == 0 {
 		fmt.Fprintf(os.Stderr, "note: %d instances requested, %d available after the exclude list\n", *images, len(selected))
 	}
-	traj, err := swebench.LoadTrajectory(*trajectory)
-	if err != nil {
-		return err
-	}
-	if traj.Grades() {
-		if err := swebench.RequireGrading(selected); err != nil {
+	var trajs []*swebench.Trajectory
+	for _, source := range strings.Split(*trajectory, ",") {
+		if source = strings.TrimSpace(source); source == "" {
+			continue
+		}
+		t, err := swebench.LoadTrajectory(source)
+		if err != nil {
 			return err
 		}
+		t.Vars = vars
+		if t.Grades() {
+			if err := swebench.RequireGrading(selected); err != nil {
+				return err
+			}
+		}
+		for _, in := range selected {
+			if _, err := t.Render(in); err != nil {
+				return err
+			}
+		}
+		trajs = append(trajs, t)
 	}
-	for _, in := range selected {
-		if _, err := traj.Render(in); err != nil {
-			return err
+	if len(trajs) == 0 {
+		return fmt.Errorf("-trajectory names no trajectory")
+	}
+	// The value each var resolved to, defaults included, goes on the run
+	// event as a set.KEY label, so a run on the defaults and a run that
+	// spelled the same values out pool together. A -set key no trajectory
+	// reads is a typo, or a knob of another workload; with a default in
+	// place it would pass unnoticed.
+	effective := map[string]string{}
+	if len(selected) > 0 {
+		for _, t := range trajs {
+			u, err := t.VarsUsed(selected[0])
+			if err != nil {
+				return err
+			}
+			maps.Copy(effective, u)
 		}
 	}
+	for _, k := range slices.Sorted(maps.Keys(vars)) {
+		if _, ok := effective[k]; !ok {
+			return fmt.Errorf("-set %s: no trajectory reads it (they read: %s)", k, strings.Join(slices.Sorted(maps.Keys(effective)), ", "))
+		}
+	}
+	traj := trajs[0]
 
 	fanout := *tasksPerImage
 	if swebench.Mode(*mode) == swebench.ModeSteps {
@@ -300,7 +359,7 @@ func runCmd(args []string) (retErr error) {
 	}
 	log.Info("plan", slog.String("run", *runID), slog.String("mode", *mode), slog.Int("images", len(selected)),
 		slog.Int("environments", len(selected)*fanout), slog.Int("width", *width), slog.Int("steps", *steps),
-		slog.String("park", *park), slog.String("trajectory", traj.Name), slog.String("out", *out))
+		slog.String("park", *park), slog.String("trajectory", *trajectory), slog.String("out", *out))
 	if *dryRun {
 		return nil
 	}
@@ -335,6 +394,8 @@ func runCmd(args []string) (retErr error) {
 		Backend:       backend,
 		Instances:     selected,
 		Trajectory:    traj,
+		Trajectories:  trajs,
+		Seed:          *seed,
 		Recorder:      rec,
 		Logger:        log,
 		Mode:          swebench.Mode(*mode),
@@ -349,7 +410,7 @@ func runCmd(args []string) (retErr error) {
 		WakeBackoff:   *wakeBackoff,
 		Keep:          *keep,
 		Labels:        labels,
-		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids),
+		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids, effective),
 	})
 	if sum != nil {
 		log.Info("run finished", slog.Int("tasks", sum.Tasks), slog.Int("failed", sum.Failed),

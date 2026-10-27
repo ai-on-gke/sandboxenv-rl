@@ -196,8 +196,8 @@ func Build(events []Event) *Report {
 			rep.RunID = e.RunID
 		}
 		k := key{e.Event, ""}
-		if e.Event == EventStep || e.Event == EventPark {
-			k.name = e.Name
+		if e.Event == EventStep || e.Event == EventPark || e.Event == EventTask {
+			k.name = e.Name // a task's name is its trajectory, so a mix gets a row each
 		}
 		if _, ok := durs[k]; !ok {
 			order = append(order, k)
@@ -378,14 +378,10 @@ func (u labelUnion) merged() map[string]string {
 	return out
 }
 
-// Pool builds one report over the reps of an arm: the raw events of every run
-// merged, so the percentiles are exact over all of them; per-step barrier,
-// park the median across the reps and live their sum; the run duration the
-// median of the runs' durations; Reps the number of runs and Runs their ids.
-// The reps must be complete runs, each with a run event and the loader's
-// labels, distinct runs, no run id twice, and one workload: the labels in
-// LoaderLabelKeys must agree. Operator labels may differ and then show every
-// value, "|"-joined.
+// Pool builds one report over the reps of an arm, as Build over their merged
+// events (counts add up, durations take the median, Runs lists the reps).
+// The reps must be complete, distinct runs of one workload: each with a run
+// event and the loader's labels, no run id twice, and poolKeys agreeing.
 func Pool(runs [][]Event) (*Report, error) {
 	var all []Event
 	seen := map[string]int{}
@@ -416,7 +412,7 @@ func Pool(runs [][]Event) (*Report, error) {
 		if first {
 			shape = run.Labels
 		} else {
-			for _, k := range LoaderLabelKeys {
+			for _, k := range poolKeys(shape, run.Labels) {
 				if shape[k] != run.Labels[k] {
 					return nil, fmt.Errorf("rep %d differs from rep 1 in %s (%q, %q): pool only reps of one workload", i+1, k, run.Labels[k], shape[k])
 				}
@@ -425,6 +421,21 @@ func Pool(runs [][]Event) (*Report, error) {
 		all = append(all, events...)
 	}
 	return Build(all), nil
+}
+
+// poolKeys are the labels two reps must agree on: the loader's own and every
+// -set value (set.KEY) either of them carries.
+func poolKeys(a, b map[string]string) []string {
+	var set []string
+	for _, m := range []map[string]string{a, b} {
+		for k := range m {
+			if strings.HasPrefix(k, "set.") && !slices.Contains(set, k) {
+				set = append(set, k)
+			}
+		}
+	}
+	sort.Strings(set)
+	return append(slices.Clone(LoaderLabelKeys), set...)
 }
 
 // percentile of a sorted slice by the nearest-rank method, ceil(p*n)-1; 0

@@ -226,6 +226,7 @@ func main() {
 			ResponseHeaderTimeout: *ppHeaderTimeout,
 			TrustedOrigins:        origins,
 			WakeBudget:            *wakeBudget,
+			ActorState:            apisvc.ActorState,
 		}
 		if callerAuth != nil {
 			ppOpts.Authenticate = callerAuth.Check

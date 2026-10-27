@@ -16,6 +16,7 @@ package portproxy_test
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -33,6 +34,9 @@ import (
 	"github.com/agent-substrate/env/internal/internaltest/testcerts"
 	"github.com/agent-substrate/env/internal/portproxy"
 	"github.com/agent-substrate/env/internal/routertls"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // recordingRouter wraps the fake router and records each CONNECT's actor
@@ -297,6 +301,110 @@ func TestWakeBudgetBoundsTheWait(t *testing.T) {
 	}
 	if n := s.router.connectCount(); n < 2 {
 		t.Errorf("router saw %d CONNECTs, want at least 2 (the budget allows retries)", n)
+	}
+}
+
+// stateProxy serves a proxy with a 30 s wake budget whose state reader
+// answers with state(n), n counting the reads from 1.
+func stateProxy(t *testing.T, s *setup, state func(n int) (ateapipb.ActorState, error)) (*httptest.Server, func() int) {
+	t.Helper()
+	var mu sync.Mutex
+	reads := 0
+	p := mustNew(t, portproxy.Options{
+		ConnectAddr:      s.routerAddr,
+		DefaultAtespace:  "ate-env",
+		HandshakeTimeout: 5 * time.Second,
+		WakeBudget:       30 * time.Second,
+		ActorState: func(_ context.Context, atespace, id string) (ateapipb.ActorState, error) {
+			mu.Lock()
+			reads++
+			n := reads
+			mu.Unlock()
+			return state(n)
+		},
+	})
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+	return srv, func() int { mu.Lock(); defer mu.Unlock(); return reads }
+}
+
+func get(t *testing.T, base string, headers map[string]string) (int, string, time.Duration) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, base+"/", nil)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode, string(b), time.Since(start)
+}
+
+// The router answers 503 for a crashed, deleting or deleted actor as for a
+// waking one. The proxy reads the state after the 503 and answers at once,
+// not after the 30 s wake budget.
+func TestEnvironmentThatWillNotWakeFailsFast(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		state  ateapipb.ActorState
+		err    error
+		status int
+		body   string
+	}{
+		{"crashed", ateapipb.ActorState_ACTOR_STATE_CRASHED, nil, http.StatusBadGateway, "actor state CRASHED"},
+		{"deleting", ateapipb.ActorState_ACTOR_STATE_DELETING, nil, http.StatusNotFound, "actor state DELETING"},
+		{"deleted", 0, status.Error(codes.NotFound, "environment not found"), http.StatusNotFound, "was not found"},
+	} {
+		s := newSetup(t)
+		s.router.RegisterPort("broken", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		s.router.Running = func(string) bool { return false }
+		srv, _ := stateProxy(t, s, func(int) (ateapipb.ActorState, error) { return tc.state, tc.err })
+		code, body, took := get(t, srv.URL, target("broken", 8000))
+		if code != tc.status || !strings.Contains(body, tc.body) {
+			t.Errorf("%s: got %d %q, want %d naming %q", tc.name, code, body, tc.status, tc.body)
+		}
+		if took > time.Second {
+			t.Errorf("%s: answered after %s, want at once (under 1s), not after the wake budget", tc.name, took)
+		}
+	}
+}
+
+// A waking environment still gets its retries, and the state is read only
+// after a 503, not for the CONNECT that succeeds.
+func TestWakingEnvironmentRetriesWithStateCheck(t *testing.T) {
+	s := newSetup(t)
+	s.router.RegisterPort("waking", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "awake") }))
+	var mu sync.Mutex
+	refusals := 0
+	s.router.Running = func(string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if refusals < 2 {
+			refusals++
+			return false
+		}
+		return true
+	}
+	srv, reads := stateProxy(t, s, func(n int) (ateapipb.ActorState, error) {
+		if n == 1 {
+			return ateapipb.ActorState_ACTOR_STATE_SUSPENDED, nil
+		}
+		return ateapipb.ActorState_ACTOR_STATE_RESUMING, nil
+	})
+	code, body, _ := get(t, srv.URL, target("waking", 8000))
+	if code != http.StatusOK || body != "awake" {
+		t.Fatalf("got %d %q, want the daemon's answer after the wake", code, body)
+	}
+	if n := reads(); n != 2 {
+		t.Errorf("state read %d times, want 2 (once for each 503, none on success)", n)
+	}
+	// The pooled tunnel serves the next request without a CONNECT or a read.
+	if code, _, _ := get(t, srv.URL, target("waking", 8000)); code != http.StatusOK || reads() != 2 {
+		t.Errorf("second request: %d, %d state reads; want 200 and no new read", code, reads())
 	}
 }
 

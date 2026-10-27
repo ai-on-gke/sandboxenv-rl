@@ -256,7 +256,8 @@ be longer than the image pull plus the template's wakeup-probe timeout (`ate-env
 default covers the 120 s timeout of a `--sidecar-readyz` template plus two minutes for the pull;
 raise it if you set a longer `--wakeup-timeout`. Otherwise the first call after a slow wake fails: a
 guest call with `Unavailable`, a port-proxy request with HTTP 503. A retry succeeds once the
-environment is up. A crashed or deleted environment fails a guest call at once.
+environment is up. A crashed or deleted environment fails at once, a guest call and a port-proxy
+request alike.
 
 By default `ate-env manifest` deploys `ate-env-api` without caller authentication for use over
 `kubectl port-forward`. Before exposing `ate-env-api` beyond loopback (e.g. through an internal
@@ -522,7 +523,8 @@ the API's listener. A plain HTTP request that carries `X-Env-Id` and `X-Env-Port
 `X-Env-Atespace` outside `ate-env`) is forwarded through the Substrate router to that port, whatever
 its path; the API strips the three headers. The router resumes a suspended environment first,
 and the proxy waits for the wake up to `--wake-budget` (the same wait as a guest call) before it
-answers 503.
+answers 503. An environment that will not wake fails at once: 502 for a crashed one, 404 for one
+that is deleted or being deleted.
 
 ```bash
 curl -H 'X-Env-Id: dev1' -H 'X-Env-Port: 6000' localhost:7777/health

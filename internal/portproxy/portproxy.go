@@ -57,6 +57,9 @@ import (
 
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/routertls"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // The routing headers. They match the x-env-id and x-env-atespace metadata
@@ -135,6 +138,13 @@ type Options struct {
 	// 503 for an environment that is suspended or still waking. Zero means
 	// DefaultWakeBudget.
 	WakeBudget time.Duration
+	// ActorState, when set, reads an environment's state from the control
+	// plane. The proxy calls it only after the router answers a CONNECT with
+	// 503, never on the fast path. The router answers 503 for a crashed or
+	// deleting actor as for a waking one, thus without this check such a
+	// request waits out WakeBudget. An error with code NotFound means the
+	// environment is gone. Other errors do not stop the retries.
+	ActorState func(ctx context.Context, atespace, id string) (ateapipb.ActorState, error)
 	// Authenticate, when set, checks the caller before a request is
 	// forwarded. It gets the value of EnvAuthorizationHeader, or of
 	// Authorization when the request has no EnvAuthorizationHeader. An error
@@ -451,6 +461,9 @@ func (p *Proxy) dial(ctx context.Context, _, addr string) (net.Conn, error) {
 		if !errors.As(err, &re) || re.status != http.StatusServiceUnavailable {
 			return conn, err
 		}
+		if serr := p.checkState(ctx, atespace, id); serr != nil {
+			return nil, serr
+		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			// Logged here: handleError keeps router 503s out of the log, and
@@ -470,6 +483,35 @@ func (p *Proxy) dial(ctx context.Context, _, addr string) (net.Conn, error) {
 		}
 		backoff = min(backoff*2, wakeRetryMaxBackoff)
 	}
+}
+
+// stateError is an environment that will not wake: crashed, being deleted,
+// or gone. status and cause are the proxy's answer.
+type stateError struct {
+	status int
+	cause  string
+}
+
+func (e *stateError) Error() string { return "environment " + e.cause }
+
+// checkState returns a stateError when the environment is in a state that no
+// wait fixes, as ensureAwake does for guest calls, else nil.
+func (p *Proxy) checkState(ctx context.Context, atespace, id string) error {
+	if p.opts.ActorState == nil {
+		return nil
+	}
+	st, err := p.opts.ActorState(ctx, atespace, id)
+	switch {
+	case status.Code(err) == codes.NotFound, errors.Is(err, ate.ErrNotFound):
+		return &stateError{http.StatusNotFound, "was not found"}
+	case err != nil:
+		return nil
+	case st == ateapipb.ActorState_ACTOR_STATE_CRASHED:
+		return &stateError{http.StatusBadGateway, "has crashed (actor state CRASHED); delete it and create a new one"}
+	case st == ateapipb.ActorState_ACTOR_STATE_DELETING:
+		return &stateError{http.StatusNotFound, "is being deleted (actor state DELETING)"}
+	}
+	return nil
 }
 
 // connect sends one CONNECT for the environment port and returns the tunnel.
@@ -549,6 +591,7 @@ func (c *bufferedConn) CloseWrite() error {
 func (p *Proxy) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	t, _ := r.Context().Value(targetKey{}).(target)
 	var re *routerError
+	var se *stateError
 	var ne net.Error
 	status, cause := http.StatusBadGateway, "is unreachable; the ate-env-api log has the cause"
 	switch {
@@ -556,6 +599,8 @@ func (p *Proxy) handleError(w http.ResponseWriter, r *http.Request, err error) {
 		return // the caller went away; nobody reads an answer
 	case routertls.RejectedCertificate(err):
 		cause = "is behind a router that rejected ate-env-api's client certificate; " + routertls.RejectionAdvice
+	case errors.As(err, &se):
+		status, cause = se.status, se.cause
 	case errors.As(err, &re):
 		// 404 (no such environment) and 503 (not running) mean the same to
 		// the caller as to the router; anything else is a gateway failure.

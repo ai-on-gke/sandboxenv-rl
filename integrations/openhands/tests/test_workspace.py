@@ -509,16 +509,17 @@ def test_capability_ttl_stays_below_the_proxy_maximum(stack, tmp_path):
 def test_get_secrets_urls_carry_no_capability(monkeypatch, no_finalizer):
     from openhands.sdk.secret import LookupSecret
 
-    from ate_env_openhands.workspace import _without_userinfo
-
     url = "http://ate-env-capability:v1.9.ab@127.0.0.1:7777/v1alpha/atespaces/a/envs/e/ports/8000"
-    monkeypatch.setattr(RemoteWorkspace, "get_secrets", lambda self, names=None: {
+    monkeypatch.setattr(RemoteWorkspace, "get_secrets", lambda self, names=None, **kw: {
         "GH": LookupSecret(url=f"{url}/api/settings/secrets/GH", headers={})})
     monkeypatch.setattr(AteEnvWorkspace, "model_post_init", lambda self, context: None)
     ws = AteEnvWorkspace.model_construct(host=url)
     secrets = ws.get_secrets()
-    assert secrets["GH"].url == _without_userinfo(url) + "/api/settings/secrets/GH"
+    # Only the property: the URL has no user info. Its host can change (the proxy here,
+    # the agent-server's loopback address with the in-process secret lookup).
+    assert "@" not in secrets["GH"].url
     assert "ate-env-capability" not in secrets["GH"].url
+    assert secrets["GH"].url.endswith("/api/settings/secrets/GH")
 
 
 # -- answers that waiting cannot change ------------------------------------------

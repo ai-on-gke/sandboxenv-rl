@@ -36,6 +36,9 @@ The focus moves from a general environment service to RL training and evaluation
 
 ## Architecture
 
+See [docs/architecture.md](./docs/architecture.md) for the full system design and
+[docs/glossary.md](./docs/glossary.md) for terminology.
+
 ```
  ╭──────────────╮    ╭──────────────╮ lifecycle  ╭────────────╮
  │    Clients   │    │              ├───────────▶│   ateapi   │ Substrate control plane
@@ -49,15 +52,15 @@ The focus moves from a general environment service to RL training and evaluation
 
 | Path | What it is |
 |---|---|
-| [`cmd/ate-env`](cmd/ate-env) | CLI: create, suspend and delete environments, run commands, move files, and print the Kubernetes and Substrate manifests. |
-| [`cmd/ate-env-api`](cmd/ate-env-api) | The API service: environment lifecycle, guest calls, MCP and the port proxy. |
-| [`cmd/ate-env-guest`](cmd/ate-env-guest) | The daemon inside each environment: processes and files. |
-| [`clients/python`](clients/python/README.md) | Python client, import name `ate_env`: `Client` and `Env` for single environments, and the fleet SDK. |
-| [`clients/go`](clients/go) | Go client. |
+| [`cmd/ate-env`](./cmd/ate-env) | CLI: create, suspend and delete environments, run commands, move files, and print the Kubernetes and Substrate manifests. |
+| [`cmd/ate-env-api`](./cmd/ate-env-api) | The API service: environment lifecycle, guest calls, MCP and the port proxy. |
+| [`cmd/ate-env-guest`](./cmd/ate-env-guest) | The daemon inside each environment: processes and files. |
+| [`clients/python`](./clients/python/README.md) | Python client, import name `ate_env`: `Client` and `Env` for single environments, and the fleet SDK. |
+| [`clients/go`](./clients/go) | Go client. |
 | [`integrations/`](#integrations) | Framework integrations. |
 | [`examples/`](#examples) | Runnable examples. |
-| [`benchmarking/`](benchmarking/swebench/README.md), [`cmd/benchmarking`](cmd/benchmarking), [`internal/benchmarking`](internal/benchmarking/DESIGN.md) | The SWE-bench loader, its scripts and the benchmark design. |
-| [`docs/`](docs) | Rootfs images and runtime layers, the [metrics reference](docs/metrics.md), the [threat model](docs/security/threat-model.md), and how releases are cut. |
+| [`benchmarking/`](./benchmarking/swebench/README.md), [`cmd/benchmarking`](./cmd/benchmarking), [`internal/benchmarking`](./internal/benchmarking/DESIGN.md) | The SWE-bench loader, its scripts and the benchmark design. |
+| [`docs/`](./docs) | Architecture, glossary, rootfs images, runtime layers, the [metrics reference](./docs/metrics.md), the [threat model](./docs/security/threat-model.md), developer guides, and how releases are cut. |
 
 ## Examples
 

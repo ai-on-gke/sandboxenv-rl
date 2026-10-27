@@ -13,10 +13,10 @@
 # limitations under the License.
 
 # Checks for pull requests and main: the Go build, vet and tests, gofmt, the
-# license headers, the freshness of the generated docs/metrics.md, the Python
-# client's unit tests (on the base install and with the telemetry extras), the
-# telemetry report tool, and the integrations' tests. Release publishing lives in
-# release.yaml. Actions are pinned by commit SHA (version in the trailing
+# license headers, Markdown formatting, the freshness of the generated
+# docs/metrics.md, the Python client's unit tests (on the base install and with
+# the telemetry extras), the telemetry report tool, and the integrations' tests.
+# Release publishing lives in
 # comment), as the organization's workflow security scan requires.
 name: ci
 
@@ -48,6 +48,7 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
       - run: make verify-gofmt
+      - run: make verify-docs
       - run: hack/verify/boilerplate.sh
       - name: docs/metrics.md is generated from internal/telemetry
         run: go run ./hack/metrics-docs > /tmp/metrics.md && diff -u docs/metrics.md /tmp/metrics.md

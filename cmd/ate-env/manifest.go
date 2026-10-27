@@ -101,7 +101,8 @@ const (
 // agent-server takes 20 to 26 s on a quiet node and 22 to 29 s with 3 to 4
 // boots per node (p50 27.9 s), and 7 boots per node exceed 30 s. RL groups
 // start this way, many rollouts of one new task image at once, thus such a
-// template gets four times the quiet boot time.
+// template gets four times Substrate's 30 s default: about twice the 60 to
+// 65 s that 8 boots on a 16-CPU node extrapolate to.
 const (
 	substrateWakeupTimeout = 30 * time.Second
 	sidecarWakeupTimeout   = 120 * time.Second
@@ -461,7 +462,7 @@ It prints YAML to stdout without touching the cluster.`,
 	cmd.Flags().StringArrayVar(&tCfg.sidecarReadyz, "sidecar-readyz", nil, "URL the actor's readiness waits for, e.g. http://127.0.0.1:44772/ready (repeatable)")
 	cmd.Flags().StringVar(&tCfg.cpu, "cpu", defaultActorCPU, "CPU limit of each actor, a Kubernetes quantity such as 2 or 500m, at least 1m, rendered as whole millicores (rounded up); Substrate requires one")
 	cmd.Flags().StringVar(&tCfg.memory, "memory", defaultActorMemory, "memory limit of each actor, a Kubernetes quantity such as 4Gi, at least 1Mi, rendered as whole bytes (rounded up); Substrate requires one")
-	cmd.Flags().DurationVar(&tCfg.wakeupTimeout, "wakeup-timeout", 0, fmt.Sprintf("how long Substrate polls the guest's /readyz at each actor start and resume before it fails the actor, whole seconds up to %s (default %s with --sidecar-readyz, else Substrate's %s)", maxWakeupTimeout, sidecarWakeupTimeout, substrateWakeupTimeout))
+	cmd.Flags().DurationVar(&tCfg.wakeupTimeout, "wakeup-timeout", 0, fmt.Sprintf("how long Substrate polls the guest's /readyz at each actor start and resume before it fails the actor, whole seconds from 1s to %s; 0 or unset means the default: %s with --sidecar-readyz, else Substrate's %s", maxWakeupTimeout, sidecarWakeupTimeout, substrateWakeupTimeout))
 
 	return cmd
 }

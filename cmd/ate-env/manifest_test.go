@@ -511,7 +511,7 @@ func TestBuildTemplateWithRuntimeLayer(t *testing.T) {
 	}
 }
 
-// F-AC7-1: 16 OpenHands agent-server boots of one image on a node took up
+// 16 OpenHands agent-server boots of one image on a node took up
 // to 29 s and crashed on Substrate's 30 s wakeup-probe default. A template
 // whose readiness waits for a sidecar gets sidecarWakeupTimeout.
 func TestBuildTemplateSidecarReadyzWakeupTimeout(t *testing.T) {

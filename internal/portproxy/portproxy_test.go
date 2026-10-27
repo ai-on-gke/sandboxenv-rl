@@ -393,6 +393,41 @@ func TestFailedStateReadIsLoggedOnce(t *testing.T) {
 	}
 }
 
+// A state read that stalls hits its own deadline; the retries go on and the
+// request ends with the wake budget instead of hanging on the read.
+func TestStalledStateReadHitsItsDeadline(t *testing.T) {
+	portproxy.SetStateReadTimeout(t, 200*time.Millisecond)
+	s := newSetup(t)
+	s.router.RegisterPort("asleep", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	s.router.Running = func(string) bool { return false }
+	p := mustNew(t, portproxy.Options{
+		ConnectAddr: s.routerAddr, DefaultAtespace: "ate-env", HandshakeTimeout: 5 * time.Second,
+		WakeBudget: time.Second,
+		ActorState: func(ctx context.Context, _, _ string) (ateapipb.ActorState, error) {
+			<-ctx.Done() // a control plane that never answers
+			return 0, ctx.Err()
+		},
+	})
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+	for k, v := range target("asleep", 8000) {
+		req.Header.Set(k, v)
+	}
+	start := time.Now()
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("request did not end within 5s with a stalled state read: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("got %d, want 503 once the 1s budget is spent", resp.StatusCode)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Errorf("took %s, want about the 1s budget plus one read", took)
+	}
+}
+
 type safeBuffer struct {
 	mu sync.Mutex
 	b  strings.Builder

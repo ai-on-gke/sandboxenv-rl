@@ -510,6 +510,11 @@ func (e *stateError) Error() string { return "environment " + e.cause }
 // fleet of waking environments makes one read for each router 503.
 const stateReadLogEvery = 10 * time.Second
 
+// stateReadTimeout bounds one state read, so a stalled control plane does
+// not hold the dial: the read fails and the retries go on within the budget.
+// A variable for the tests.
+var stateReadTimeout = 10 * time.Second
+
 // checkState returns a stateError when the environment is in a state that no
 // wait fixes, as ensureAwake does for guest calls, else nil. A crashed
 // environment gets 410 Gone, which clients treat as final, not 502, which the
@@ -520,7 +525,9 @@ func (p *Proxy) checkState(ctx context.Context, atespace, id string, logged *boo
 	if p.opts.ActorState == nil {
 		return nil
 	}
-	st, err := p.opts.ActorState(ctx, atespace, id)
+	rctx, cancel := context.WithTimeout(ctx, stateReadTimeout)
+	defer cancel()
+	st, err := p.opts.ActorState(rctx, atespace, id)
 	switch {
 	case status.Code(err) == codes.NotFound, errors.Is(err, ate.ErrNotFound):
 		return &stateError{status: http.StatusNotFound, cause: "was not found"}

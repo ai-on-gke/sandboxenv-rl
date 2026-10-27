@@ -879,3 +879,87 @@ func TestConnectRejectedCertificate(t *testing.T) {
 		t.Errorf("took %s; the wake budget must not apply to a rejected certificate", elapsed)
 	}
 }
+
+// http.Transport dials with a context that outlives the request. A caller
+// that gives up must still end the wake loop: no CONNECT after it left.
+func TestCancelledRequestStopsTheWakeLoop(t *testing.T) {
+	s := newSetup(t)
+	p := mustNew(t, portproxy.Options{ConnectAddr: s.routerAddr, DefaultAtespace: "ate-env", HandshakeTimeout: 5 * time.Second, WakeBudget: 30 * time.Second})
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+	s.router.RegisterPort("asleep", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	s.router.Running = func(string) bool { return false }
+
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+			for k, v := range target("asleep", 8000) {
+				req.Header.Set(k, v)
+			}
+			if resp, err := (&http.Client{Timeout: 300 * time.Millisecond}).Do(req); err == nil {
+				resp.Body.Close()
+				t.Errorf("got %d, want the client's own timeout", resp.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+	time.Sleep(100 * time.Millisecond) // a CONNECT in flight at the cancel ends
+	before := s.router.connectCount()
+	time.Sleep(3 * time.Second) // longer than the 2s maximum retry interval
+	if after := s.router.connectCount(); after != before {
+		t.Errorf("router saw %d CONNECTs after the callers left (%d before, %d after), want none", after-before, before, after)
+	}
+}
+
+// A router that accepts the connection and never answers the CONNECT holds
+// an attempt only until the wake budget plus one retry interval, not for
+// the whole HandshakeTimeout.
+func TestStalledConnectEndsWithTheBudget(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var held []net.Conn
+	go func() {
+		for {
+			c, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		lis.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range held {
+			c.Close()
+		}
+	})
+	p := mustNew(t, portproxy.Options{ConnectAddr: lis.Addr().String(), DefaultAtespace: "ate-env", HandshakeTimeout: 20 * time.Second, WakeBudget: 300 * time.Millisecond})
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+	for k, v := range target("stalled", 8000) {
+		req.Header.Set(k, v)
+	}
+	start := time.Now()
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("request did not end within 10s with a stalled CONNECT: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Errorf("got %d, want 504", resp.StatusCode)
+	}
+	if took := time.Since(start); took > 4*time.Second {
+		t.Errorf("took %s, want at most the 300ms budget plus the 2s retry interval", took)
+	}
+}

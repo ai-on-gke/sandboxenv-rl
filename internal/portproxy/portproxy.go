@@ -403,6 +403,9 @@ func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request, t *target) 
 
 func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 	t := pr.In.Context().Value(targetKey{}).(target)
+	// The transport dials with a context that does not end with the
+	// request; dial reads the request's own context back from this value.
+	pr.Out = pr.Out.WithContext(context.WithValue(pr.Out.Context(), callerKey{}, pr.Out.Context()))
 	pr.SetXForwarded()
 	// The URL host is the transport's pool key, not an address: one pool for
 	// each environment and port. dial reads the target back from it.
@@ -431,6 +434,26 @@ func (e *routerError) Error() string {
 	return fmt.Sprintf("router answered CONNECT with %d: %s", e.status, e.msg)
 }
 
+// callerKey holds the context of the request a dial is for (see rewrite).
+type callerKey struct{}
+
+// dialContext returns the context for one dial and its cancel. Since Go 1.23
+// http.Transport dials with context.WithoutCancel of the request context, so
+// that a finished dial can serve another request; a wake loop would then
+// keep sending CONNECTs for up to WakeBudget after its caller left. The
+// returned context ends when the request ends, and at the latest one retry
+// interval after WakeBudget, the most the attempt after the last wait needs.
+// The CONNECT attempts and anything else the loop does with it stop then.
+func (p *Proxy) dialContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(ctx, p.opts.WakeBudget+wakeRetryMaxBackoff)
+	caller, ok := ctx.Value(callerKey{}).(context.Context)
+	if !ok {
+		return ctx, cancel
+	}
+	stopAfter := context.AfterFunc(caller, cancel)
+	return ctx, func() { stopAfter(); cancel() }
+}
+
 // dial opens a CONNECT tunnel to the environment port encoded in addr (see
 // rewrite). While the router answers 503, which is what a suspended actor
 // and one still waking both look like, it tries again with backoff until
@@ -442,6 +465,8 @@ func (p *Proxy) dial(ctx context.Context, _, addr string) (net.Conn, error) {
 		return nil, err
 	}
 	id, atespace, _ := strings.Cut(host, ".")
+	ctx, stop := p.dialContext(ctx)
+	defer stop()
 	deadline := time.Now().Add(p.opts.WakeBudget)
 	backoff := wakeRetryInitialBackoff
 	for attempt := 1; ; attempt++ {

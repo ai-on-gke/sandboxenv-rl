@@ -135,13 +135,21 @@ func parseCapabilityCredential(credential string) (string, bool) {
 	return capability, true
 }
 
-// isWebSocketUpgrade reports whether r is a WebSocket handshake that
-// httputil.ReverseProxy forwards as an upgrade: a GET whose Connection lists
-// "upgrade" and whose Upgrade lists "websocket". ReverseProxy removes Upgrade
-// from a request without "Connection: upgrade" and forwards a plain request,
-// thus a capability must not authorize that request.
+// isWebSocketUpgrade reports whether r is a WebSocket handshake that the
+// daemon also sees as one: a GET whose Connection lists "upgrade" and that
+// has exactly one Upgrade field whose whole value is "websocket".
+//
+// Each part closes a way to reach the daemon with a plain request.
+// httputil.ReverseProxy removes Upgrade from a request without
+// "Connection: upgrade" and forwards a plain request. It forwards only the
+// first Upgrade value, and a server such as uvicorn starts a WebSocket only
+// when that whole value is "websocket"; for "foo, websocket", for two fields
+// "foo" and "websocket", or for "websocket, h2c" it serves a plain request.
+// With one field equal to "websocket", the forwarded request carries exactly
+// the value checked here.
 func isWebSocketUpgrade(r *http.Request) bool {
+	upgrade := r.Header.Values("Upgrade")
 	return r.Method == http.MethodGet &&
 		httpguts.HeaderValuesContainsToken(r.Header["Connection"], "Upgrade") &&
-		httpguts.HeaderValuesContainsToken(r.Header["Upgrade"], "websocket")
+		len(upgrade) == 1 && strings.EqualFold(strings.TrimSpace(upgrade[0]), "websocket")
 }

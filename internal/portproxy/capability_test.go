@@ -190,6 +190,12 @@ func TestWebSocketCapability(t *testing.T) {
 		// ReverseProxy forwards a request without "Connection: Upgrade" as a
 		// plain request, thus the capability must not open it.
 		"Upgrade: websocket without Connection: Upgrade": {"Upgrade: websocket", "Authorization: " + basic(valid)},
+		// ReverseProxy forwards only the first Upgrade value, and the daemon
+		// starts a WebSocket only when that whole value is "websocket"; for
+		// these it serves a plain GET.
+		"Upgrade: foo, websocket":               {"Connection: Upgrade", "Upgrade: foo, websocket", "Authorization: " + basic(valid)},
+		"Upgrade: foo, then Upgrade: websocket": {"Connection: Upgrade", "Upgrade: foo", "Upgrade: websocket", "Authorization: " + basic(valid)},
+		"Upgrade: websocket, h2c":               {"Connection: Upgrade", "Upgrade: websocket, h2c", "Authorization: " + basic(valid)},
 	} {
 		if code := rawRequest(t, addr, events, headers...); code != http.StatusUnauthorized {
 			t.Errorf("%s: got %d, want 401", name, code)

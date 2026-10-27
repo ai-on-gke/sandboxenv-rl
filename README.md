@@ -290,8 +290,11 @@ ate-env manifest template --template py312 \
 
 A second runtime rides along the same way: `--layer` mounts its image read-only next to the
 guest, `--sidecar` has the guest start and supervise a process from it, and `--sidecar-readyz`
-holds the actor's readiness until that process answers. Here a static busybox stands in for a
-runtime daemon and serves HTTP on port 44772 inside the environment:
+holds the actor's readiness until that process answers. With `--sidecar-readyz`, Substrate's
+wakeup probe waits up to 120 s instead of its default 30 s, because a runtime that boots in 20 s
+alone takes longer when many environments start on one node; `--wakeup-timeout` sets another
+value. Here a static busybox stands in for a runtime daemon and serves HTTP on port 44772 inside
+the environment:
 
 ```bash
 ate-env manifest template --template layered \

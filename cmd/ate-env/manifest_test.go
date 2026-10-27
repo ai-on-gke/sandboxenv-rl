@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/hostcheck"
@@ -186,6 +187,11 @@ func TestBuildActorTemplate(t *testing.T) {
 	probe := template.Containers[0].GetWakeupProbe()
 	if probe.GetHttpGet() == nil || probe.GetHttpGet().GetPath() != "/readyz" || probe.GetHttpGet().GetPort() != 80 {
 		t.Errorf("wakeupProbe = %+v, want HTTP GET /readyz on port 80", probe)
+	}
+	// Without a sidecar readiness URL the template says Substrate's own
+	// default out loud: the API schema marks the field required.
+	if got := probe.GetTimeoutSeconds(); got != 30 {
+		t.Errorf("wakeupProbe.timeoutSeconds = %d, want 30 without --sidecar-readyz", got)
 	}
 	// Substrate rejects an ActorTemplate without both limits (substrate#2285);
 	// since v0.6.0 they are integers: millicores and bytes.
@@ -502,6 +508,105 @@ func TestBuildTemplateWithRuntimeLayer(t *testing.T) {
 	}
 	if c.GetImage() != cfg.rootfsImage {
 		t.Errorf("image = %q", c.GetImage())
+	}
+}
+
+// F-AC7-1: 16 OpenHands agent-server boots of one image on a node took up
+// to 29 s and crashed on Substrate's 30 s wakeup-probe default. A template
+// whose readiness waits for a sidecar gets sidecarWakeupTimeout.
+func TestBuildTemplateSidecarReadyzWakeupTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		readyz  []string
+		timeout time.Duration
+		want    int32
+	}{
+		{"sidecar readiness URL", []string{"http://127.0.0.1:8000/health"}, 0, 120},
+		{"explicit timeout wins", []string{"http://127.0.0.1:8000/health"}, 45 * time.Second, 45},
+		{"explicit timeout without sidecar", nil, 10 * time.Minute, 600},
+	} {
+		cfg := testTemplateConfig()
+		cfg.sidecarReadyz = tc.readyz
+		cfg.wakeupTimeout = tc.timeout
+		tmpl, err := buildTemplate(cfg)
+		if err != nil {
+			t.Fatalf("%s: buildTemplate: %v", tc.name, err)
+		}
+		if got := tmpl.GetContainers()[0].GetWakeupProbe().GetTimeoutSeconds(); got != tc.want {
+			t.Errorf("%s: wakeupProbe.timeoutSeconds = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A template derived for an image, by --rootfs-image here or by ate-env-api
+// on CreateEnvironment (ensureImageTemplate), keeps the base's probe timeout.
+func TestDerivedTemplateKeepsWakeupTimeout(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.guestImage = "example.com/guest@sha256:" + testHex64
+	cfg.sidecarReadyz = []string{"http://127.0.0.1:8000/health"}
+
+	base, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatalf("buildTemplate: %v", err)
+	}
+	task := "example.com/task@sha256:" + testHex64
+	derived, err := apiservice.DeriveImageTemplate(base, "default-template-0123456789ab", task)
+	if err != nil {
+		t.Fatalf("DeriveImageTemplate: %v", err)
+	}
+	if got := derived.GetContainers()[0].GetWakeupProbe().GetTimeoutSeconds(); got != 120 {
+		t.Errorf("derived wakeupProbe.timeoutSeconds = %d, want the base's 120", got)
+	}
+
+	cfg.rootfsImage = "docker.io/library/python@sha256:" + testHex64
+	rootfs, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatalf("buildTemplate --rootfs-image: %v", err)
+	}
+	if got := rootfs.GetContainers()[0].GetWakeupProbe().GetTimeoutSeconds(); got != 120 {
+		t.Errorf("--rootfs-image wakeupProbe.timeoutSeconds = %d, want 120", got)
+	}
+	again, err := apiservice.DeriveImageTemplate(rootfs, "default-template-0123456789ab", task)
+	if err != nil {
+		t.Fatalf("DeriveImageTemplate from a rootfs base: %v", err)
+	}
+	if got := again.GetContainers()[0].GetWakeupProbe().GetTimeoutSeconds(); got != 120 {
+		t.Errorf("derived from a rootfs base: wakeupProbe.timeoutSeconds = %d, want 120", got)
+	}
+}
+
+func TestManifestTemplateCommandWakeupTimeout(t *testing.T) {
+	run := func(extra ...string) (string, error) {
+		cmd := newManifestCommand()
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs(append([]string{"template", "--guest-image=example.com/guest@sha256:aaaa", "--snapshots-bucket=gs://b/"}, extra...))
+		err := cmd.Execute()
+		return out.String(), err
+	}
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{nil, "timeoutSeconds: 30\n"},
+		{[]string{"--sidecar-readyz=http://127.0.0.1:8000/health"}, "timeoutSeconds: 120\n"},
+		{[]string{"--sidecar-readyz=http://127.0.0.1:8000/health", "--wakeup-timeout=5m"}, "timeoutSeconds: 300\n"},
+		{[]string{"--wakeup-timeout=1h"}, "timeoutSeconds: 3600\n"},
+	} {
+		out, err := run(tc.args...)
+		if err != nil {
+			t.Fatalf("%v: %v", tc.args, err)
+		}
+		if !strings.Contains(out, tc.want) {
+			t.Errorf("%v: output lacks %q:\n%s", tc.args, tc.want, out)
+		}
+	}
+	// Substrate accepts whole seconds from 1 to 3600.
+	for _, v := range []string{"500ms", "1500ms", "61m", "-1s"} {
+		if _, err := run("--wakeup-timeout=" + v); err == nil || !strings.Contains(err.Error(), "--wakeup-timeout") {
+			t.Errorf("--wakeup-timeout=%s: got %v, want a --wakeup-timeout error", v, err)
+		}
 	}
 }
 

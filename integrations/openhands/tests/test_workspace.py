@@ -288,6 +288,65 @@ def test_the_api_token_authenticates_at_the_proxy_and_never_reaches_the_sandbox(
         assert not {"authorization", "x-env-authorization"} & {k.lower() for k in request["headers"]}
 
 
+# -- secrets ---------------------------------------------------------------------
+
+
+def _put_secret(ws: AteEnvWorkspace, name: str, value: str) -> None:
+    response = ws.client.put("/api/settings/secrets", json={"name": name, "value": value},
+                             headers=ws._headers)
+    response.raise_for_status()
+
+
+def test_secret_lookups_name_the_agent_server_loopback_and_carry_no_api_token(agent_server,
+                                                                                tmp_path):
+    """With the token required, each LookupSecret names the agent-server's own loopback
+    address, carries the session key only, and resolves there."""
+    port = int(agent_server.rsplit(":", 1)[1])
+    with serve(FakeAteEnv(upstreams={port: agent_server}, api_token="api-secret")) as (
+            api_url, state):
+        with make(api_url, state, tmp_path, api_token="api-secret", server_port=port) as ws:
+            _put_secret(ws, "GH_TOKEN", "s3cret-value")
+            lookup = ws.get_secrets(names=["GH_TOKEN"])["GH_TOKEN"]
+            assert lookup.url == f"http://127.0.0.1:{port}/api/settings/secrets/GH_TOKEN"
+            assert lookup.headers.get("X-Session-API-Key") == SESSION_KEY
+            assert "X-Env-Authorization" not in lookup.headers
+            exposed = lookup.model_dump_json(context={"expose_secrets": True})
+            assert "api-secret" not in exposed
+            # The agent-server's own address answers the lookup, as it does in the sandbox.
+            assert lookup.get_value() == "s3cret-value"
+
+
+def test_secrets_sent_to_a_conversation_never_carry_the_api_token(agent_server, tmp_path):
+    """The agent-server receives the lookups in a conversation's secret update. No header
+    and no body that reaches it through the proxy contains the caller token."""
+    pytest.importorskip("openhands.tools")
+    from openhands.sdk import LLM, Conversation
+    from openhands.tools.preset.default import get_default_agent
+    from pydantic import SecretStr
+
+    port = int(agent_server.rsplit(":", 1)[1])
+    llm = LLM(usage_id="agent", model="openai/unused", api_key=SecretStr("x"),
+              base_url="http://127.0.0.1:9")  # never called: the conversation is not run
+    # The workspace holds api_token and sends it on each REST request. This proxy does not
+    # require it, because this branch's event WebSocket cannot send a token yet.
+    with serve(FakeAteEnv(upstreams={port: agent_server})) as (api_url, state):
+        with make(api_url, state, tmp_path, api_token="api-secret", server_port=port) as ws:
+            _put_secret(ws, "GH_TOKEN", "s3cret-value")
+            conversation = Conversation(agent=get_default_agent(llm=llm, cli_mode=True),
+                                        workspace=ws)
+            try:
+                conversation.update_secrets(ws.get_secrets())
+            finally:
+                conversation.close()
+    updates = [p for p in state.proxied
+               if p["method"] == "POST" and p["path"].endswith("/secrets")]
+    assert updates, "the secret update reached the agent-server through the proxy"
+    assert f"127.0.0.1:{port}/api/settings/secrets/GH_TOKEN".encode() in updates[0]["body"]
+    for request in state.proxied:
+        assert "api-secret" not in str(request["headers"])
+        assert b"api-secret" not in request["body"]
+
+
 # -- answers that waiting cannot change ------------------------------------------
 
 

@@ -151,7 +151,7 @@ def _handler(state: FakeAteEnv):
             pass
 
         def _route(self):
-            """(upstream, rest, headers to drop) for a request, or None once answered."""
+            """(upstream, rest, headers to drop, record) for a request, or None once answered."""
             if state.refuse is not None:
                 self._reply(*state.refuse)
                 return None
@@ -195,11 +195,12 @@ def _handler(state: FakeAteEnv):
                 upstream = state.upstreams.get(port)
                 # What the daemon sees: the headers after the proxy's removals.
                 forwarded = {k: v for k, v in self.headers.items() if k.lower() not in drop}
-                state.proxied.append({"method": self.command, "path": rest, "headers": forwarded})
+                record = {"method": self.command, "path": rest, "headers": forwarded, "body": b""}
+                state.proxied.append(record)
             if upstream is None:
                 self._reply(502, "connection refused")
                 return None
-            return upstream, rest, drop
+            return upstream, rest, drop, record
 
         def _reply(self, code: int, text: str) -> None:
             body = text.encode()
@@ -212,12 +213,13 @@ def _handler(state: FakeAteEnv):
             routed = self._route()
             if routed is None:
                 return
-            upstream, rest, drop = routed
+            upstream, rest, drop, record = routed
             if self.headers.get("Upgrade"):
                 self._upgrade(upstream, rest, drop)
                 return
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length) if length else None
+            record["body"] = body or b""
             headers = {k: v for k, v in self.headers.items() if k.lower() not in _HOP | drop}
             conn = http.client.HTTPConnection(upstream, timeout=120)
             try:

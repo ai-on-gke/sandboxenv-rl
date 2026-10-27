@@ -275,6 +275,31 @@ class AteEnvWorkspace(RemoteWorkspace):
         headers.update(self.proxy_headers())
         return headers
 
+    def get_secrets(self, names: list[str] | None = None, *,
+                    agent_profile_id: str | None = None):  # type: ignore[no-untyped-def,override]
+        """The SDK's ``get_secrets()``, with lookups that the agent-server answers itself.
+
+        The SDK points each ``LookupSecret`` at ``host`` and copies the request headers.
+        Here ``host`` is the port proxy as this process reaches it: the agent-server in
+        the sandbox cannot reach that address, and the headers carry ``api_token``. The
+        agent-server answers the secret URLs of its own loopback address in process, thus
+        each lookup names ``http://127.0.0.1:<server_port>/api/settings/secrets/<name>``
+        and sends the session key only. The caller token never enters the sandbox.
+        """
+        from openhands.sdk.secret import LookupSecret
+
+        found = super().get_secrets(names, agent_profile_id=agent_profile_id)
+        session_headers = super()._headers  # the SDK's headers: the session key, no api_token
+        return {
+            name: LookupSecret(url=self.local_secret_url(name), headers=dict(session_headers),
+                               description=secret.description)
+            for name, secret in found.items()
+        }
+
+    def local_secret_url(self, name: str) -> str:
+        """The URL of secret ``name`` on the agent-server's own loopback address."""
+        return f"http://127.0.0.1:{self.server_port}/api/settings/secrets/{name}"
+
     def proxy_headers(self) -> dict[str, str]:
         """Headers that authenticate a request to the port proxy itself.
 

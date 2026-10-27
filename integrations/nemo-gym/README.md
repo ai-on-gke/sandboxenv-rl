@@ -264,10 +264,11 @@ actor network.
 
    `ep.endpoint` is ate-env-api, and `ep.headers` (`X-Env-Id`, `X-Env-Atespace`, `X-Env-Port`)
    route each request through the Substrate router to port 6000 in this sandbox. `endpoint()` does
-   not touch the guest: the first request through the proxy resumes a parked sandbox, and the proxy
-   waits for the wake (ate-env-api's `--wake-budget`, four minutes by default, the same wait as a
-   guest call). It checks only that the sandbox exists, and raises `RuntimeError` at once for one
-   that is deleted or crashed. A port that `SandboxSpec.ports` did not declare is a `ValueError`,
+   not touch the guest: the first request through the proxy resumes a parked sandbox, and the
+   Substrate router holds that request while the sandbox wakes, a few seconds; a longer wake ends
+   with the router's error, and a retry succeeds once the sandbox is up. It checks only that the
+   sandbox exists, and raises `RuntimeError` at once for one that is deleted or crashed. A port
+   that `SandboxSpec.ports` did not declare is a `ValueError`,
    as in Gym's Docker provider; `create()` rejects a spec whose ports are outside 1-65535 or name
    the guest's port 80. Set `connection.endpoint_url` when the code that calls the daemon reaches
    ate-env-api at another address than the provider does.

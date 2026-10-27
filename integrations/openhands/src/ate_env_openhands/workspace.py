@@ -76,6 +76,12 @@ _AMBIGUOUS_CODES = {
 }
 
 
+# ate-env-api's port proxy names the actor state of an environment that will
+# not wake in this header: 410 Gone with CRASHED for a crashed one, 404 with
+# DELETING for one that is being deleted.
+ENV_STATE_HEADER = "X-Env-State"
+
+
 def _base_url(url: str) -> str:
     url = url.rstrip("/")
     return url if "://" in url else f"http://{url}"
@@ -204,8 +210,9 @@ class AteEnvWorkspace(RemoteWorkspace):
         description="Seconds to wait for the agent-server's /health through the proxy. "
         "The first use of a task image on a cluster bakes its golden snapshot and then "
         "pulls the image onto the node, minutes for a large image; later uses take "
-        "seconds. Answers that waiting cannot change (400, 401, 403, and 404 for a "
-        "deleted environment) stop the wait at once.",
+        "seconds. Answers that waiting cannot change (400, 401, 403, 404 for a "
+        "deleted environment, and 410 or X-Env-State for a crashed or deleting one) "
+        "stop the wait at once.",
     )
     delete_on_exit: bool | None = Field(
         default=None,
@@ -359,7 +366,9 @@ class AteEnvWorkspace(RemoteWorkspace):
         router (not running yet), a 502 and a refused connection are retried.
         Answers that waiting cannot change stop the wait at once: 401 and 403
         (the proxy refused the caller), 400 (the proxy refused the port or the
-        id) and 404 when the environment no longer exists. Otherwise the last
+        id), 404 when the environment no longer exists, and 410 Gone or an
+        ``X-Env-State`` of CRASHED or DELETING (ate-env-api's port proxy
+        answers 410 with CRASHED for a crashed environment). Otherwise the last
         answer is in the error when the deadline passes.
         """
         deadline = time.monotonic() + timeout
@@ -385,6 +394,7 @@ class AteEnvWorkspace(RemoteWorkspace):
                     return
                 text = resp.text.strip()[:200]
                 last = f"HTTP {code}: {text}"
+                self._raise_if_gone(resp, last)
                 if code in (401, 403):
                     raise PermissionError(
                         f"the port proxy refused the request for {self.atespace}/{self.env_id} "
@@ -397,6 +407,22 @@ class AteEnvWorkspace(RemoteWorkspace):
             time.sleep(min(1.0, max(deadline - time.monotonic(), 0)))
         raise RuntimeError(f"agent-server in {self.atespace}/{self.env_id} did not answer "
                            f"/health within {timeout}s; last: {last}")
+
+    def _raise_if_gone(self, resp: httpx.Response, last: str) -> None:
+        """Raise when an answer says that the environment will not wake.
+
+        A crashed environment stays crashed: only a new one helps. Any answer
+        with ``X-Env-State: CRASHED`` counts, whatever its status, and so does
+        410 Gone without the header.
+        """
+        state = resp.headers.get(ENV_STATE_HEADER, "").strip().upper()
+        where = f"environment {self.atespace}/{self.env_id}"
+        if state == "CRASHED" or resp.status_code == 410:
+            raise RuntimeError(
+                f"{where} has crashed and will not recover ({last}); delete it and "
+                "create a new one")
+        if state == "DELETING":
+            raise RuntimeError(f"{where} is being deleted ({last})")
 
     def _exists(self) -> bool:
         """Whether the environment still exists; True when that is unknown."""

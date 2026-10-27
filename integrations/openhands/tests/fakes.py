@@ -58,7 +58,9 @@ class FakeAteEnv:
     upstreams: dict[int, str] = field(default_factory=dict)  # port -> host:port
     unhealthy_polls: int = 0  # answer this many /health requests with 503 first
     api_token: str | None = None  # the proxy requires this bearer when set
-    refuse: tuple[int, str] | None = None  # answer every proxy request with this
+    # answer every proxy request with this: (status, body) or (status, body, headers)
+    refuse: tuple[int, str] | tuple[int, str, dict[str, str]] | None = None
+    refusals: int = 0  # proxy requests answered with refuse
     create_lands_after: float | None = None  # create succeeds this late, after the client gave up
     wakes: int = 0
     proxied: list[dict] = field(default_factory=list)
@@ -153,6 +155,7 @@ def _handler(state: FakeAteEnv):
         def _route(self):
             """(upstream, rest, headers to drop) for a request, or None once answered."""
             if state.refuse is not None:
+                state.refusals += 1
                 self._reply(*state.refuse)
                 return None
             path, _, query = self.path.partition("?")
@@ -201,9 +204,11 @@ def _handler(state: FakeAteEnv):
                 return None
             return upstream, rest, drop
 
-        def _reply(self, code: int, text: str) -> None:
+        def _reply(self, code: int, text: str, headers: dict[str, str] | None = None) -> None:
             body = text.encode()
             self.send_response(code)
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)

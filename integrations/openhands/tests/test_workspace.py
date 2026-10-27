@@ -328,6 +328,46 @@ def test_health_stops_at_once_on_a_rejected_port(no_finalizer, stack, tmp_path):
     assert state.deletes == [state.creates[0]["id"]]
 
 
+# ate-env-api's port proxy answers a crashed environment with 410 Gone and
+# X-Env-State: CRASHED; waiting cannot fix it.
+CRASHED = (410, "environment ate-env/x port 8000 has crashed (actor state CRASHED); "
+                "delete it and create a new one", {"X-Env-State": "CRASHED"})
+
+
+def test_health_stops_at_once_on_a_crashed_environment(no_finalizer, stack, tmp_path):
+    api_url, state = stack
+    state.refuse = CRASHED
+    _fails_fast(RuntimeError, r"has crashed and will not recover \(HTTP 410.*delete it and create a new one",
+                api_url=api_url, state=state, tmp_path=tmp_path)
+    assert state.deletes == [state.creates[0]["id"]]
+
+
+@pytest.mark.parametrize("answer", [
+    (502, "connection refused", {"X-Env-State": "CRASHED"}),  # the header decides, any status
+    (410, "gone", {}),  # 410 alone is final too
+])
+def test_health_stops_at_once_on_any_crashed_answer(no_finalizer, stack, tmp_path, answer):
+    api_url, state = stack
+    state.refuse = answer
+    _fails_fast(RuntimeError, "has crashed", api_url=api_url, state=state, tmp_path=tmp_path)
+
+
+def test_health_stops_at_once_on_a_deleting_environment(no_finalizer, stack, tmp_path):
+    api_url, state = stack
+    state.refuse = (404, "environment is being deleted (actor state DELETING)", {"X-Env-State": "DELETING"})
+    _fails_fast(RuntimeError, "is being deleted", api_url=api_url, state=state, tmp_path=tmp_path)
+
+
+def test_resume_stops_at_once_when_the_environment_crashed(stack, tmp_path):
+    api_url, state = stack
+    with make(api_url, state, tmp_path) as ws:
+        state.refuse = CRASHED
+        t0 = time.monotonic()
+        with pytest.raises(RuntimeError, match="has crashed"):
+            ws.resume()
+        assert time.monotonic() - t0 < 5
+
+
 def test_resume_stops_at_once_when_the_environment_is_gone(stack, tmp_path):
     api_url, state = stack
     with make(api_url, state, tmp_path) as ws:

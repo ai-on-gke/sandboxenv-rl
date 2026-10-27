@@ -139,6 +139,32 @@ def test_fleet_workspace_releases_when_the_start_fails(stack, tmp_path):
     assert len(fleet.released) == 1 and state.deletes == []
 
 
+# ate-env-api's port proxy answers a crashed environment with 410 Gone.
+CRASHED = (410, "has crashed (actor state CRASHED)", {"X-Env-State": "CRASHED"})
+
+
+def test_handle_workspace_stops_at_once_on_a_crashed_environment(stack, tmp_path):
+    api_url, state = stack
+    fleet = _RegisteringFleet(state)
+    handle = fleet.acquire(TASK)
+    state.refuse = CRASHED
+    with pytest.raises(RuntimeError, match="has crashed.*create a new one"):
+        make_handle_workspace(handle, **kw(api_url, state, tmp_path, health_check_timeout=30))
+    assert state.refusals == 1, "the health wait stopped after the first answer"
+    assert state.deletes == [] and fleet.released == []  # the fleet still owns it
+    fleet.release(handle)
+
+
+def test_fleet_workspace_releases_at_once_on_a_crashed_environment(stack, tmp_path):
+    api_url, state = stack
+    fleet = _RegisteringFleet(state)
+    state.refuse = CRASHED
+    with pytest.raises(RuntimeError, match="has crashed"):
+        make_fleet_workspace(fleet, TASK, **kw(api_url, state, tmp_path, health_check_timeout=30))
+    assert state.refusals == 1, "the health wait stopped after the first answer"
+    assert len(fleet.released) == 1 and state.deletes == []
+
+
 @pytest.mark.parametrize("field", ["template", "image", "env_id", "delete_on_exit"])
 def test_fleet_owned_fields_are_refused(field):
     handle = SimpleNamespace(sandbox_id="sb-1", data_plane=None, backend=None, task=TASK)

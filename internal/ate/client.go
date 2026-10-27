@@ -336,14 +336,22 @@ func (c *Client) suspend(ctx context.Context, atespace, id string, mode ateapipb
 	return nil
 }
 
-// Delete removes the actor with ID in atespace permanently. Substrate only deletes suspended
-// actors, so Delete suspends the actor first.
+// Delete removes the actor with ID in atespace permanently. Delete suspends a
+// running actor first; an actor that cannot be suspended is deleted as is.
 // If atespace is empty, DefaultAtespace is used.
 func (c *Client) Delete(ctx context.Context, atespace, id string) error {
-	// Substrate deletes only suspended actors. The snapshot is deleted right
-	// after, thus waiting for it to reach object storage is wasted time: the
-	// suspend before a delete is asynchronous.
-	if err := c.suspend(ctx, atespace, id, ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS); err != nil {
+	// Delete suspends first, as it always did (3e11804): Substrate deleted
+	// only suspended actors. The snapshot is deleted right after, thus
+	// waiting for it to reach object storage is wasted time: the suspend
+	// before a delete is asynchronous.
+	//
+	// Substrate suspends only a RUNNING or SUSPENDING actor (a SUSPENDED one
+	// is a no-op) and rejects the others, for example CRASHED, RESUMING or
+	// DELETING, with FailedPrecondition. Its DeleteActor terminates the
+	// workload in any state, thus such an actor is deleted without the
+	// suspend.
+	if err := c.suspend(ctx, atespace, id, ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS); err != nil &&
+		status.Code(err) != codes.FailedPrecondition {
 		return err
 	}
 	_, err := c.control.DeleteActor(ctx, &ateapipb.DeleteActorRequest{Actor: c.ref(atespace, id)})

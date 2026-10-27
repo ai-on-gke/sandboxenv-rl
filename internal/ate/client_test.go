@@ -168,6 +168,34 @@ func TestDelete(t *testing.T) {
 	if again, err := f.client.DialGuest("", "sb-life"); err != nil || again == conn {
 		t.Fatalf("DialGuest after Delete = %p, %v; want a new connection", again, err)
 	}
+	// A suspend error other than FailedPrecondition still fails the delete.
+	if err := f.client.Delete(ctx, "", "sb-life"); !errors.Is(err, ate.ErrNotFound) {
+		t.Fatalf("Delete of a missing actor: err = %v, want ErrNotFound", err)
+	}
+}
+
+// An actor that Substrate cannot suspend, for example a CRASHED one, is
+// deleted without the suspend: Substrate rejects that suspend with
+// FailedPrecondition, and its DeleteActor takes an actor in any state.
+func TestDeleteUnsuspendableActor(t *testing.T) {
+	for _, state := range []ateapipb.ActorState{
+		ateapipb.ActorState_ACTOR_STATE_CRASHED,
+		ateapipb.ActorState_ACTOR_STATE_RESUMING,
+		ateapipb.ActorState_ACTOR_STATE_REVERTING,
+	} {
+		t.Run(state.String(), func(t *testing.T) {
+			f := newFixture(t)
+			f.create(t, "sb-bad")
+			f.control.SetState("sb-bad", state)
+
+			if err := f.client.Delete(t.Context(), "", "sb-bad"); err != nil {
+				t.Fatalf("Delete of a %s actor: %v", state, err)
+			}
+			if _, err := f.client.Get(t.Context(), "", "sb-bad"); !errors.Is(err, ate.ErrNotFound) {
+				t.Fatalf("Get after Delete: err = %v, want ErrNotFound", err)
+			}
+		})
+	}
 }
 
 func TestCreateRequiresTemplate(t *testing.T) {

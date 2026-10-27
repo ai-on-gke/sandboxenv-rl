@@ -541,9 +541,9 @@ needs its own `Authorization`, such as an OpenAI-compatible server. A browser ca
 header to a page load or a WebSocket handshake, thus with the token on, the path form serves
 scripted clients only.
 
-A WebSocket client that cannot set headers, such as the OpenHands SDK's event stream, sends a port
-capability instead of the token: `ate-env-capability:<capability>@` in the user info of the URL,
-which the client sends as `Authorization: Basic`. The capability is `v1.<expiry>.<mac>`, where
+A WebSocket client that cannot set headers sends a port capability instead of the token:
+`ate-env-capability:<capability>@` in the user info of the URL, which the client sends as
+`Authorization: Basic`. The capability is `v1.<expiry>.<mac>`, where
 `mac` is the hex HMAC-SHA256, keyed with the API's token, of
 `"ate-env port capability v1\n<atespace>\n<id>\n<port>\n<expiry>"` and `expiry` is in Unix
 seconds, at most seven days ahead. It opens only WebSocket handshakes (a `GET` with

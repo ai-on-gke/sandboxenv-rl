@@ -30,7 +30,9 @@ How it fits together:
   `/v1alpha/atespaces/<atespace>/envs/<env>/ports/<port>/...`, with the agent-server's own session
   key, and with `api_token` in `X-Env-Authorization` when ate-env-api requires its bearer token.
   The SDK uses that URL as its workspace host, so commands, files and `RemoteConversation`
-  (the agent loop and its event WebSocket) work unchanged. No `kubectl port-forward`.
+  (the agent loop and its event WebSocket) work unchanged. With `api_token`, the event WebSocket
+  carries a port capability instead of the token, because the SDK sends no headers on it.
+  No `kubectl port-forward`.
 
 | path | what it is |
 |---|---|
@@ -131,6 +133,7 @@ caller.
 | `api_url` | `127.0.0.1:7777` | ate-env-api, host:port or URL | `host` in `direct` mode |
 | `proxy_url` | `api_url` | port proxy base URL, when it differs | none |
 | `api_token` | none | ate-env-api's bearer token: on gRPC calls, and in `X-Env-Authorization` on proxy requests, which ate-env-api removes before it forwards them | none |
+| `ws_capability_ttl` | `86400` | with `api_token`: seconds the port capability in `host` stays valid, at most `604500` (seven days less five minutes) | none |
 | `env_id` | generated | attach to this environment instead of creating one | none |
 | `server_port` | `8000` | agent-server port | `server_port` |
 | `working_dir` | `/workspace` (created) | where commands run; `/testbed` on SWE-bench images | `working_dir` |
@@ -140,8 +143,9 @@ caller.
 | `delete_on_exit` | created: yes, attached: no | delete in `cleanup()` | always deletes the claim |
 
 - `pause()` suspends the environment; its filesystem stays in Substrate's snapshot.
-  `resume()` waits for `/health`, which also wakes it; any request wakes it as well. The host does
-  not change, unlike a port-forward. To park an environment between agent turns, close the
+  `resume()` waits for `/health`, which also wakes it; any request wakes it as well. The address
+  does not change, unlike a port-forward; with `api_token`, `resume()` puts a new port capability
+  in `host`. To park an environment between agent turns, close the
   conversation first and reattach it after `resume()`; the agent-server keeps the conversation:
 
   ```python
@@ -168,6 +172,10 @@ caller.
   `__del__` does nothing during interpreter shutdown. A create that fails ambiguously (a timeout,
   a lost answer) deletes the environment by name and retries for 10 s, because the server can still
   be creating it. Get, suspend and delete have a 30 s deadline.
+- `renew_ws_capability()` puts a new port capability, valid `ws_capability_ttl` from now, in
+  `host`; without `api_token` it does nothing. Only a conversation opened or reattached after it
+  uses the new capability (see [Limits](#limits)). `port_capability(token, atespace, env_id, port,
+  expiry)` makes a capability for any port, for a WebSocket client outside the SDK.
 
 From `AgentSandboxWorkspace`:
 
@@ -292,7 +300,10 @@ the answers that stop it at once (400, 401, 403, 404), cleanup after each failur
 a create that lands after its timeout, refused create, health timeout, wrong session key), ownership
 (a failed attach or validation error deletes nothing, a copy never deletes), the token at the proxy,
 attach, pause and resume, exit ordering, files, the shared loop (`close_all`, the call timeout, a
-fork), and a `RemoteConversation` whose event WebSocket goes through the proxy.
+fork), and a `RemoteConversation` whose event WebSocket goes through the proxy. With the token,
+they cover the port capability: the proxy's test vector, the event WebSocket with a capability only,
+expiry, renewal by `resume()` and `renew_ws_capability()`, no capability on REST requests or in
+secret URLs, and masking in `repr`, errors and logs.
 
 ## Verified
 

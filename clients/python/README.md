@@ -285,7 +285,7 @@ await env.write_file("/workspace/data.bin", patch, seek_offset=4096)
 
 ```python
 await env.suspend()   # checkpoint to a snapshot and free the worker
-await env.delete()    # remove permanently (suspends first if running)
+await env.delete()    # remove permanently, in any state
 ```
 
 A suspended environment keeps its filesystem and can be woken again just

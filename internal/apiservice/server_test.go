@@ -331,8 +331,8 @@ func TestDeleteEnvironment(t *testing.T) {
 	}
 }
 
-// A crashed environment is deleted: Substrate cannot suspend it, thus the
-// delete goes ahead without the suspend.
+// A crashed environment is deleted. Substrate rejects its suspend, thus a
+// delete that suspends first cannot remove it.
 func TestDeleteCrashedEnvironment(t *testing.T) {
 	client, control := newTestEnv(t)
 	ctx := context.Background()

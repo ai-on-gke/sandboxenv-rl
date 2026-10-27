@@ -322,13 +322,9 @@ func (c *Client) Get(ctx context.Context, atespace, id string) (*ateapipb.Actor,
 // stays on the node and uploads in the background); ate-env keeps the
 // durable behavior it always had.
 func (c *Client) Suspend(ctx context.Context, atespace, id string) error {
-	return c.suspend(ctx, atespace, id, ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS)
-}
-
-func (c *Client) suspend(ctx context.Context, atespace, id string, mode ateapipb.DurabilityMode) error {
 	req := &ateapipb.SuspendActorRequest{
 		Actor:   c.ref(atespace, id),
-		Options: &ateapipb.SuspendOptions{Mode: mode},
+		Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
 	}
 	if _, err := c.control.SuspendActor(ctx, req); err != nil {
 		return fmt.Errorf("ate: suspending %q: %w", id, wrapGRPCError(err))
@@ -336,24 +332,16 @@ func (c *Client) suspend(ctx context.Context, atespace, id string, mode ateapipb
 	return nil
 }
 
-// Delete removes the actor with ID in atespace permanently. Delete suspends a
-// running actor first; an actor that cannot be suspended is deleted as is.
+// Delete removes the actor with ID in atespace permanently, in any state.
 // If atespace is empty, DefaultAtespace is used.
 func (c *Client) Delete(ctx context.Context, atespace, id string) error {
-	// Delete suspends first, as it always did (3e11804): Substrate deleted
-	// only suspended actors. The snapshot is deleted right after, thus
-	// waiting for it to reach object storage is wasted time: the suspend
-	// before a delete is asynchronous.
-	//
-	// Substrate suspends only a RUNNING or SUSPENDING actor (a SUSPENDED one
-	// is a no-op) and rejects the others, for example CRASHED, RESUMING or
-	// DELETING, with FailedPrecondition. Its DeleteActor terminates the
-	// workload in any state, thus such an actor is deleted without the
-	// suspend.
-	if err := c.suspend(ctx, atespace, id, ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS); err != nil &&
-		status.Code(err) != codes.FailedPrecondition {
-		return err
-	}
+	// Delete calls DeleteActor directly; ate-env requires Substrate v0.6.0 or
+	// later. There, DeleteActor takes an actor in any state: it marks the
+	// actor DELETING, terminates the workload, releases the worker and
+	// deletes the actor's snapshots. Older Substrate deleted only suspended
+	// actors, thus Delete suspended first. That suspend gave the workload no
+	// graceful stop, its snapshot was deleted right away, and Substrate
+	// rejects it for a CRASHED actor, which then could not be deleted.
 	_, err := c.control.DeleteActor(ctx, &ateapipb.DeleteActorRequest{Actor: c.ref(atespace, id)})
 	if err != nil {
 		return fmt.Errorf("actor: deleting %q: %w", id, wrapGRPCError(err))

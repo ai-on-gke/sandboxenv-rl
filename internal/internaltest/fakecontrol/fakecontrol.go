@@ -15,7 +15,7 @@
 // Package fakecontrol implements an in-memory fake of the Substrate ateapi
 // Control service for tests. It mimics the control plane's lifecycle
 // semantics: actors are created suspended, resume/suspend/pause flip
-// status, and only suspended actors can be deleted.
+// status, and, like Substrate v0.6.0, an actor in any state can be deleted.
 package fakecontrol
 
 import (
@@ -274,6 +274,7 @@ func (s *Server) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorReq
 	if err != nil {
 		return nil, err
 	}
+	// SuspendModes records each call, also a rejected one.
 	s.SuspendModes = append(s.SuspendModes, req.GetOptions().GetMode())
 	// Like Substrate v0.6.0: a SUSPENDED actor is a no-op, and only a
 	// RUNNING or SUSPENDING one can be suspended.

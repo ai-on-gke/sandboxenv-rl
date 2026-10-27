@@ -485,13 +485,18 @@ def test_a_conversation_survives_pause_and_resume(stack, tmp_path):
             ws.pause()
             ws.resume()
             assert ws.client is client and not client.is_closed
+            before = len(state.proxied)
             conversation.send_message("still connected after resume")
-            assert conversation.state.id
+            events = f"/api/conversations/{conversation.state.id}/events"
+            sent = [p for p in state.proxied[before:]
+                    if p["method"] == "POST" and p["path"].split("?")[0] == events]
+            assert sent, "the message after the resume reached the agent-server"
         finally:
             conversation.close()
         target = tmp_path / "work" / "after-resume.txt"
         ws.execute_command(f"echo ok > {target}", timeout=30)
         assert ws.execute_command(f"cat {target}", timeout=30).stdout.strip() == "ok"
+    assert client.is_closed, "cleanup() closes the client that pause and resume kept"
 
 
 def test_a_closed_conversation_lets_the_environment_stay_parked(stack, tmp_path):

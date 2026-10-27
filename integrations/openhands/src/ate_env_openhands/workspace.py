@@ -482,7 +482,7 @@ class AteEnvWorkspace(RemoteWorkspace):
         """Wake the environment and wait for the agent-server.
 
         Any request wakes a suspended environment; this one makes the wait
-        explicit. The host and the HTTP client do not change, thus a
+        explicit. The HTTP client does not change, thus a
         ``RemoteConversation`` created before pause() keeps working.
         """
         if self.env_id is None or self._deleted:

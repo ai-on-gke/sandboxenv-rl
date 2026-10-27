@@ -74,6 +74,7 @@ with AteEnvWorkspace(
     agent = get_default_agent(llm=llm, cli_mode=True)
 
     # 4) Sanity-check the workspace with a direct command
+    # The literal is upstream example 17's text, kept so the diff is only the workspace.
     result = workspace.execute_command("echo 'Hello from agent-sandbox!' && pwd")
     logger.info(f"Command exit code: {result.exit_code}")
     logger.info(f"Output: {result.stdout}")

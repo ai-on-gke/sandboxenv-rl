@@ -22,7 +22,12 @@ to that port in the environment, so the proxy URL is the workspace host: the
 SDK appends its ``/api/...`` paths to it, and ``RemoteConversation`` builds
 its event WebSocket from it. With ``api_token``, each request carries it in
 ``X-Env-Authorization``, which ate-env-api checks and removes before it
-forwards the request.
+forwards the request. The SDK opens the event WebSocket without extra headers
+and drops the host's query string, but keeps its user info, which the
+WebSocket client sends as ``Authorization: Basic``. Thus with ``api_token`` the
+host carries a port capability in its user info: an HMAC of this environment
+port and an expiry, keyed with the token. ate-env-api accepts it on WebSocket
+upgrades only and never forwards it; the token itself is never in a URL.
 
 Mirrors ``openhands.workspace.AgentSandboxWorkspace``: same lifecycle order
 (create, health wait, parent init; clean up on any failure after create),
@@ -34,6 +39,10 @@ image, which agent-sandbox fixes in its SandboxTemplate, is a field here.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import logging
+import re
 import secrets
 import shlex
 import sys
@@ -57,6 +66,11 @@ DEFAULT_ATESPACE = "ate-env"
 # The port proxy reads the caller's ate-env-api credential from this header
 # and does not forward it, so the agent-server's own credentials stay apart.
 ENV_AUTHORIZATION_HEADER = "X-Env-Authorization"
+
+# The user of the port capability in the host's user info (see
+# port_capability), and the latest expiry ate-env-api accepts.
+CAPABILITY_USER = "ate-env-capability"
+MAX_CAPABILITY_TTL = 7 * 24 * 3600.0
 
 # Deadline for get, suspend and delete, so that cleanup() cannot block forever.
 CALL_TIMEOUT = 30.0
@@ -84,6 +98,54 @@ def _base_url(url: str) -> str:
 def port_url(api_url: str, atespace: str, env_id: str, port: int) -> str:
     """URL of ``port`` in an environment, through ate-env-api's port proxy."""
     return f"{_base_url(api_url)}/v1alpha/atespaces/{atespace}/envs/{env_id}/ports/{port}"
+
+
+def port_capability(token: str, atespace: str, env_id: str, port: int, expiry: int) -> str:
+    """A port capability for ``port`` in an environment, signed with ``token``.
+
+    ``v1.<expiry>.<mac>``, with ``mac`` the hex HMAC-SHA256, keyed with
+    ate-env-api's bearer token, of the atespace, the environment id, the port
+    and ``expiry`` (Unix seconds). ate-env-api's port proxy accepts it on
+    WebSocket upgrades to that port until ``expiry``, at most seven days
+    ahead.
+    """
+    msg = f"ate-env port capability v1\n{atespace}\n{env_id}\n{port}\n{expiry}"
+    mac = hmac.new(token.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return f"v1.{expiry}.{mac}"
+
+
+def _with_capability(url: str, capability: str) -> str:
+    scheme, rest = url.split("://", 1)
+    return f"{scheme}://{CAPABILITY_USER}:{capability}@{rest}"
+
+
+_CAPABILITY_IN_URL = re.compile(re.escape(CAPABILITY_USER) + r":[^@/\s]+@")
+
+
+def _redact(text: str) -> str:
+    return _CAPABILITY_IN_URL.sub(CAPABILITY_USER + ":***@", text)
+
+
+class _RedactCapability(logging.Filter):
+    """Masks port capabilities in log records: httpx logs each request URL."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str) and CAPABILITY_USER in record.msg:
+            record.msg = _redact(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(_redact(str(a)) if CAPABILITY_USER in str(a) else a
+                                for a in record.args)
+        return True
+
+
+_redact_filter = _RedactCapability()
+
+
+def _redact_capabilities_in_logs() -> None:
+    for name in ("httpx", "httpcore"):
+        log = logging.getLogger(name)
+        if _redact_filter not in log.filters:
+            log.addFilter(_redact_filter)
 
 
 def _new_env_id() -> str:
@@ -180,7 +242,16 @@ class AteEnvWorkspace(RemoteWorkspace):
         description="Bearer token for ate-env-api (its -auth-token-file). Sent on gRPC "
         "calls, and on port-proxy requests in X-Env-Authorization, which ate-env-api "
         "checks and removes before it forwards a request. The conversation event "
-        "WebSocket does not carry it (see the README's Limits).",
+        "WebSocket carries a port capability derived from it instead (see "
+        "ws_capability_ttl); the token is never in a URL.",
+    )
+    ws_capability_ttl: float = Field(
+        default=86400.0,
+        gt=0.0,
+        le=MAX_CAPABILITY_TTL,
+        description="Seconds the port capability in host stays valid, with api_token. "
+        "The conversation event WebSocket reconnects with it, thus a workspace that "
+        "lives longer needs a longer value (at most seven days).",
     )
     env_id: str | None = Field(
         default=None,
@@ -247,13 +318,20 @@ class AteEnvWorkspace(RemoteWorkspace):
         # Everything past the create must clean up on failure: the caller gets
         # no object to close when the constructor raises.
         try:
-            object.__setattr__(self, "host", self.port_url(self.server_port))
+            host = self.port_url(self.server_port)
+            if self.api_token:
+                expiry = int(time.time() + self.ws_capability_ttl)
+                capability = port_capability(self.api_token, self.atespace, self.env_id,
+                                             self.server_port, expiry)
+                host = _with_capability(host, capability)
+                _redact_capabilities_in_logs()
+            object.__setattr__(self, "host", host)
             self._wait_for_health(timeout=self.health_check_timeout)
             super().model_post_init(context)
             self._check_session_key()
             self._ensure_working_dir()
             self._check_versions()
-            logger.info("ate-env workspace is ready at %s", self.host)
+            logger.info("ate-env workspace is ready at %s", _redact(self.host))
         except Exception:
             self.cleanup()
             raise

@@ -333,10 +333,16 @@ GKE with gVisor workers, Substrate from 2026-10-12, ate-env-api with the port pr
   (ate-env-api with `-auth-token-file`). An older ate-env-api forwards the header to the
   agent-server: do not set `api_token` with it. Without `-auth-token-file`, whoever reaches
   ate-env-api reaches the agent-server port and needs only the session key.
-- With `-auth-token-file`, the conversation event WebSocket gets 401: `RemoteConversation` opens it
-  with `websockets.connect(ws_url)` and sends no extra headers. Commands, files and the REST calls of
-  a conversation work. The fix is a follow-up: a query-parameter token in the port proxy, or a
-  header option in the SDK.
+- With `api_token`, the workspace host carries a port capability in its user info, because
+  `RemoteConversation` opens the event WebSocket with `websockets.connect(ws_url)`: no extra headers,
+  and the host's query string is dropped. The capability is an HMAC of this environment port and an
+  expiry, keyed with the token, and ate-env-api accepts it on WebSocket upgrades only. A log line
+  or a `repr` that shows the host shows the capability, which opens this port until it expires
+  (`ws_capability_ttl`, default one day, at most seven); the workspace masks it in `httpx` and
+  `httpcore` logs, and the token itself is never in a URL. An event WebSocket of a workspace that
+  outlives `ws_capability_ttl`, or of a token that rotated, gets 401 when it reconnects. The
+  capability needs an ate-env-api whose port proxy checks port capabilities; an older one answers
+  the event WebSocket 401.
 - With a live `RemoteConversation`, `pause()` does not keep the environment suspended: the suspend
   breaks the event WebSocket, the SDK reconnects after about a second, and the proxy wakes the
   environment for that request. Thus a paused environment with a live conversation is a running

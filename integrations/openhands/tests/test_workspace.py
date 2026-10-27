@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 import os
 import sys
 import time
@@ -28,7 +29,7 @@ import pytest
 from ate_env import EnvError, NotFoundError
 from openhands.sdk.workspace import RemoteWorkspace
 
-from ate_env_openhands import AteEnvWorkspace, port_url
+from ate_env_openhands import AteEnvWorkspace, port_capability, port_url
 
 from .conftest import IMAGE, SESSION_KEY
 from .fakes import DEFAULT_ATESPACE, FakeAteEnv, serve
@@ -286,6 +287,76 @@ def test_the_api_token_authenticates_at_the_proxy_and_never_reaches_the_sandbox(
     for request in state.proxied:
         assert "api-secret" not in str(request["headers"])
         assert not {"authorization", "x-env-authorization"} & {k.lower() for k in request["headers"]}
+
+
+def test_port_capability_matches_the_proxy_vector():
+    """The vector of ate-env-api's TestCapabilityVector, so the two stay in step."""
+    assert port_capability("s3cret", "ate-env", "env1", 8000, 1700000000) == (
+        "v1.1700000000.a2f01c6feececba10e18c15123f7f7124cd436d7ec370910c470f75325920f2f")
+
+
+def _open_conversation(ws):
+    pytest.importorskip("openhands.tools")
+    from openhands.sdk import LLM, Conversation, RemoteConversation
+    from openhands.tools.preset.default import get_default_agent
+    from pydantic import SecretStr
+
+    llm = LLM(usage_id="agent", model="openai/unused", api_key=SecretStr("x"),
+              base_url="http://127.0.0.1:9")  # never called: the conversation is not run
+    conversation = Conversation(agent=get_default_agent(llm=llm, cli_mode=True), workspace=ws)
+    assert isinstance(conversation, RemoteConversation)
+    return conversation
+
+
+def _websocket_upgrades(state):
+    return [p for p in state.proxied if p["headers"].get("Upgrade", "").lower() == "websocket"]
+
+
+def test_with_the_api_token_the_event_websocket_carries_a_capability_only(stack, tmp_path,
+                                                                         monkeypatch):
+    """The SDK's event WebSocket sends no headers; the host's capability lets it through."""
+    monkeypatch.setenv("OPENHANDS_REMOTE_WS_READY_TIMEOUT", "5")
+    api_url, state = stack
+    state.api_token = "api-secret"
+    with make(api_url, state, tmp_path, api_token="api-secret") as ws:
+        assert "ate-env-capability:v1." in ws.host and "api-secret" not in ws.host
+        conversation = _open_conversation(ws)
+        try:
+            assert conversation.state.id
+        finally:
+            conversation.close()
+    upgrades = _websocket_upgrades(state)
+    assert upgrades, "the event stream went through the proxy as a WebSocket"
+    for request in state.proxied:
+        assert "api-secret" not in str(request["headers"])
+        assert "ate-env-capability" not in str(request["headers"])
+        assert not {"authorization", "x-env-authorization"} & {k.lower() for k in request["headers"]}
+
+
+def test_an_expired_capability_does_not_open_the_websocket(stack, tmp_path, monkeypatch):
+    """Without a valid capability the SDK cannot subscribe, and the conversation fails."""
+    from openhands.sdk.conversation.exceptions import WebSocketConnectionError
+
+    monkeypatch.setenv("OPENHANDS_REMOTE_WS_READY_TIMEOUT", "3")
+    api_url, state = stack
+    state.api_token = "api-secret"
+    with make(api_url, state, tmp_path, api_token="api-secret", ws_capability_ttl=1) as ws:
+        time.sleep(1.5)
+        assert ws.execute_command("echo ok", timeout=30).stdout.strip() == "ok"  # the token
+        with pytest.raises(WebSocketConnectionError):
+            _open_conversation(ws)
+    assert not _websocket_upgrades(state), "the proxy refused the expired capability"
+
+
+def test_capabilities_are_masked_in_httpx_logs(stack, tmp_path, caplog):
+    api_url, state = stack
+    state.api_token = "api-secret"
+    caplog.set_level(logging.INFO, logger="httpx")
+    with make(api_url, state, tmp_path, api_token="api-secret") as ws:
+        capability = ws.host.split("ate-env-capability:", 1)[1].split("@", 1)[0]
+        ws.execute_command("echo ok", timeout=30)
+    assert "ate-env-capability:***@" in caplog.text
+    assert capability not in caplog.text
 
 
 # -- answers that waiting cannot change ------------------------------------------

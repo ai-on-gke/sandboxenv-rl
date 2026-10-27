@@ -235,6 +235,7 @@ func main() {
 		}
 		if callerAuth != nil {
 			ppOpts.Authenticate = callerAuth.Check
+			ppOpts.AuthenticateCapability = callerAuth.CheckCapability
 		}
 		pp, err := portproxy.New(ppOpts)
 		if err != nil {

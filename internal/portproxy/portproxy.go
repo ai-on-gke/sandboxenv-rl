@@ -32,8 +32,9 @@
 // port of any actor the router serves, in any atespace, including actors that
 // ate-env did not create. With it, a caller must present the API's bearer
 // token in EnvAuthorizationHeader or Authorization, and the token does not
-// reach the daemon. Either way, a daemon behind it must authenticate its own
-// clients. The path form refuses
+// reach the daemon. A WebSocket client that cannot set headers presents a port
+// capability instead (see CapabilityUser). Either way, a daemon behind it must
+// authenticate its own clients. The path form refuses
 // requests that a browser sends from another origin (see Options.TrustedOrigins),
 // so a web page cannot drive a daemon through a port-forwarded listener.
 package portproxy
@@ -141,6 +142,12 @@ type Options struct {
 	// daemon: the proxy drops EnvAuthorizationHeader, and drops Authorization
 	// when it carried the credential.
 	Authenticate func(credential string) error
+	// AuthenticateCapability, when set next to Authenticate, checks a port
+	// capability (see CapabilityUser) for the environment port of the
+	// request. The proxy calls it only for a WebSocket upgrade request whose
+	// Authorization is Basic with the user CapabilityUser and that has no
+	// EnvAuthorizationHeader. An error refuses the request with 401.
+	AuthenticateCapability func(capability, atespace, id string, port int) error
 }
 
 // Proxy is an http.Handler that forwards each request to the environment port
@@ -380,19 +387,35 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), targetKey{}, t)))
 }
 
-// authenticate checks the caller with Options.Authenticate and records in t
-// which header to drop upstream. It answers 401 and returns false when the
-// check fails.
+// authenticate checks the caller with Options.Authenticate, or a port
+// capability with Options.AuthenticateCapability, and records in t which
+// header to drop upstream. It answers 401 and returns false when the check
+// fails.
 func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request, t *target) bool {
+	capability, hasCapability := capabilityCredential(r)
+	if hasCapability {
+		// A capability is the API's credential, never the daemon's: drop it
+		// whether or not the proxy checks it.
+		t.dropAuthorization = true
+	}
 	if p.opts.Authenticate == nil {
 		return true
 	}
-	credential := r.Header.Get(EnvAuthorizationHeader)
-	if credential == "" {
-		credential = r.Header.Get("Authorization")
+	var err error
+	switch credential := r.Header.Get(EnvAuthorizationHeader); {
+	case credential != "":
+		err = p.opts.Authenticate(credential)
+	case hasCapability:
+		if p.opts.AuthenticateCapability == nil || !isWebSocketUpgrade(r) {
+			err = errCapability
+		} else {
+			err = p.opts.AuthenticateCapability(capability, t.atespace, t.id, t.port)
+		}
+	default:
 		t.dropAuthorization = true
+		err = p.opts.Authenticate(r.Header.Get("Authorization"))
 	}
-	if err := p.opts.Authenticate(credential); err != nil {
+	if err != nil {
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		http.Error(w, "missing or invalid bearer token; send it in "+EnvAuthorizationHeader+
 			" or Authorization", http.StatusUnauthorized)

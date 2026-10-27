@@ -425,6 +425,9 @@ def test_resume_renews_the_capability(stack, tmp_path, monkeypatch):
         before = _capability_of(ws)
         ws.pause()
         time.sleep(1.5)  # the first capability expires during the pause
+        # The expiry is in whole seconds, thus a 1 s capability can expire before the
+        # conversation opens its WebSocket. The renewed one has time for that.
+        ws.ws_capability_ttl = 60
         ws.resume()
         assert _capability_of(ws) != before
         conversation = _open_conversation(ws)

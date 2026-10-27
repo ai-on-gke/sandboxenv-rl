@@ -14,7 +14,8 @@
 # Image-delivery workload: read one file, the smallest read a lazily loaded
 # rootfs can be asked for. The probe step comes first so time to first
 # instruction is the cold start alone. READ_FILE (-set READ_FILE=...) names
-# the file; it has no default because no one file is in every image. The
+# the file; the default is the checkout's .git/HEAD, which every SWE-bench and
+# R2E-Gym image has, and is tiny, so set a real file to measure a read. The
 # step prints the bytes read, which the reward step's output tail keeps, and
 # fails when the file cannot be read or is empty.
 name: workload-file-read-one
@@ -22,6 +23,6 @@ steps:
   - name: probe
     run: "true"
   - name: file_read_one
-    run: n=$(wc -c < {{var "READ_FILE"}}) && test "$n" -gt 0 && echo "$n"
+    run: n=$(wc -c < {{var "READ_FILE" "/testbed/.git/HEAD"}}) && test "$n" -gt 0 && echo "$n"
     timeout: 10m
     reward: true

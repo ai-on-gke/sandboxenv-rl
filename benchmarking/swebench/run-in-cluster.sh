@@ -108,17 +108,19 @@ bake_trajectory() {
       TRAJ_N=$((TRAJ_N + 1))
       mkdir -p "${KODATA}/traj/${TRAJ_N}"
       cp "${dir}/${base}" "${KODATA}/traj/${TRAJ_N}/"
+      # The loader's own parser names the files the write steps need, so a
+      # flow-style step or a "file:" inside a script cannot mislead this; it
+      # allows plain file names only. A symlink is refused here, because cp
+      # would follow it out of the directory.
+      assets="$(go run ./cmd/benchmarking/swebench-loader trajectory-assets "${dir}/${base}")" || exit 2
       while IFS= read -r asset; do
         [[ -n "${asset}" ]] || continue
-        # Only a regular file inside the trajectory's directory is copied
-        # into the image: no absolute path, no .., no symlink out of it.
         case "${asset}" in
-          /*|..|../*|*/..|*/../*) echo "${base}: write.file ${asset} must be a relative path inside the trajectory's directory" >&2; exit 2 ;;
+          */*|..) echo "${base}: write.file ${asset} must be a plain file name" >&2; exit 2 ;;
         esac
         [[ -f "${dir}/${asset}" && ! -L "${dir}/${asset}" ]] || { echo "${base}: write.file ${asset} is not a regular file next to the trajectory" >&2; exit 2; }
-        mkdir -p "$(dirname "${KODATA}/traj/${TRAJ_N}/${asset}")"
         cp "${dir}/${asset}" "${KODATA}/traj/${TRAJ_N}/${asset}"
-      done < <(sed -n 's/^[[:space:]]*file:[[:space:]]*//p' "${dir}/${base}" | tr -d "\"'")
+      done <<< "${assets}"
       el="/var/run/ko/traj/${TRAJ_N}/${base}"
     fi
     out+=("${el}")

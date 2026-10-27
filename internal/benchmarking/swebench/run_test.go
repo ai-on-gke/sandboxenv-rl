@@ -750,3 +750,19 @@ func TestMixedTrajectoriesDrawPerEnvironment(t *testing.T) {
 		t.Fatalf("the same seed must give the same assignment:\n%v\n%v", first, again)
 	}
 }
+
+// A caller that sets only Trajectories gets the first as Trajectory; a nil
+// entry in the mix is refused.
+func TestValidateDefaultsTrajectoryFromTheMix(t *testing.T) {
+	cfg := baseConfig(t, newFake(), nil)
+	cfg.Mode, cfg.TasksPerImage = ModeEval, 1
+	only := cfg.Trajectory
+	cfg.Trajectory, cfg.Trajectories = nil, []*Trajectory{only}
+	if err := cfg.validate(); err != nil || cfg.Trajectory != only {
+		t.Fatalf("validate() = %v, Trajectory %p; want nil and the mix's first %p", err, cfg.Trajectory, only)
+	}
+	cfg.Trajectories = []*Trajectory{only, nil}
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "trajectory 2 of the mix is nil") {
+		t.Fatalf("validate() with a nil entry = %v", err)
+	}
+}

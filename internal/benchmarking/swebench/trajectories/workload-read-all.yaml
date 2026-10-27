@@ -21,7 +21,7 @@ steps:
     run: "true"
   - name: read_all
     run: >-
-      find {{var "READ_ROOT" "/"}} -xdev -type f -print0 2>/dev/null > /tmp/.read-all.lst &&
+      find {{var "READ_ROOT" "/"}} -xdev -type f ! -name '.read-all.*' -print0 2>/dev/null > /tmp/.read-all.lst &&
       test -s /tmp/.read-all.lst &&
       n=$(xargs -0 -r cat -- < /tmp/.read-all.lst 2>/tmp/.read-all.err | wc -c) &&
       test "$n" -gt 0 && test ! -s /tmp/.read-all.err && echo "$n"

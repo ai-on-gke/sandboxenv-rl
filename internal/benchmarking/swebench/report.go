@@ -423,8 +423,6 @@ func Pool(runs [][]Event) (*Report, error) {
 	return Build(all), nil
 }
 
-// percentile of a sorted slice by the nearest-rank method, ceil(p*n)-1; 0
-// for an empty slice.
 // poolKeys are the labels two reps must agree on: the loader's own and every
 // -set value (set.KEY) either of them carries.
 func poolKeys(a, b map[string]string) []string {
@@ -440,6 +438,8 @@ func poolKeys(a, b map[string]string) []string {
 	return append(slices.Clone(LoaderLabelKeys), set...)
 }
 
+// percentile of a sorted slice by the nearest-rank method, ceil(p*n)-1; 0
+// for an empty slice.
 func percentile(sorted []float64, p float64) float64 {
 	n := len(sorted)
 	if n == 0 {

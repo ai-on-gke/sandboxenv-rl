@@ -223,7 +223,7 @@ on, and a key that no trajectory reads is an error:
 
 | Workload | Knobs | Default | What it reads |
 |---|---|---|---|
-| `workload-file-read-one` | `READ_FILE` | none, pass it | one file |
+| `workload-file-read-one` | `READ_FILE` | `/testbed/.git/HEAD` (tiny; set a real file to measure a read) | one file |
 | `workload-file-read` | `READ_ROOT`, `READ_FILES` | `/`, `200` | a sample of Python files |
 | `workload-compile` | `PYTHON`, `COMPILE_DIR` | `python3`, `/testbed` | every Python file under the directory, compiled with the image's own Python |
 | `workload-read-all` | `READ_ROOT` | `/` | every regular file, the worst case for lazy loading |

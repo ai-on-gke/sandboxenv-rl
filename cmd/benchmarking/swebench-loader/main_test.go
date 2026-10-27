@@ -252,3 +252,13 @@ func TestOwnLabels(t *testing.T) {
 		t.Fatalf("labels without an exclude file or instances = %v", l)
 	}
 }
+
+func TestAssetsCmd(t *testing.T) {
+	var out bytes.Buffer
+	if err := assetsCmd([]string{"../../../internal/benchmarking/swebench/trajectories/swebench-gold.yaml"}, &out); err != nil || out.String() != "swebench-grade.py\n" {
+		t.Fatalf("trajectory-assets: %q, %v", out.String(), err)
+	}
+	if err := assetsCmd(nil, io.Discard); err == nil {
+		t.Fatal("trajectory-assets without a file must fail")
+	}
+}

@@ -28,6 +28,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -59,6 +60,8 @@ func main() {
 		err = runCmd(os.Args[2:])
 	case "report":
 		err = reportCmd(os.Args[2:], os.Stdout)
+	case "trajectory-assets":
+		err = assetsCmd(os.Args[2:], os.Stdout)
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -182,9 +185,9 @@ func datasetLabel(dataset string) string {
 
 // ownLabels are the loader's labels that only the command line knows (the
 // rest come from Config.labels); every key is in swebench.LoaderLabelKeys or
-// is a -set value under set.KEY. The exclude file and the instance list are
-// named by their file name or count plus a digest of their ids, so two lists
-// of one length differ.
+// is a var's effective value under set.KEY. The exclude file and the
+// instance list are named by their file name or count plus a digest of their
+// ids, so two lists of one length differ.
 func ownLabels(dataset string, connections int, baseTemplate, excludeFile string, exclude, instances []string, vars map[string]string) map[string]string {
 	l := map[string]string{
 		"dataset":       datasetLabel(dataset),
@@ -212,7 +215,23 @@ func idsDigest(ids []string) string {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: swebench-loader run [flags] | swebench-loader report FILE... [-json OUT]")
+	fmt.Fprintln(os.Stderr, "usage: swebench-loader run [flags] | swebench-loader report FILE... [-json OUT] | swebench-loader trajectory-assets FILE")
+}
+
+// assetsCmd prints the files a trajectory's write steps name, one per line,
+// for run-in-cluster.sh to bake next to it.
+func assetsCmd(args []string, w io.Writer) error {
+	if len(args) != 1 {
+		return errors.New("usage: swebench-loader trajectory-assets FILE")
+	}
+	names, err := swebench.TrajectoryAssets(args[0])
+	if err != nil {
+		return err
+	}
+	for _, n := range names {
+		fmt.Fprintln(w, n)
+	}
+	return nil
 }
 
 func runCmd(args []string) (retErr error) {
@@ -312,21 +331,24 @@ func runCmd(args []string) (retErr error) {
 	if len(trajs) == 0 {
 		return fmt.Errorf("-trajectory names no trajectory")
 	}
-	if len(vars) > 0 && len(selected) > 0 {
-		// A -set key no trajectory reads is a typo, or a knob of another
-		// workload; with a default in place it would pass unnoticed.
-		used := map[string]bool{}
+	// The value each var resolved to, defaults included, goes on the run
+	// event as a set.KEY label, so a run on the defaults and a run that
+	// spelled the same values out pool together. A -set key no trajectory
+	// reads is a typo, or a knob of another workload; with a default in
+	// place it would pass unnoticed.
+	effective := map[string]string{}
+	if len(selected) > 0 {
 		for _, t := range trajs {
 			u, err := t.VarsUsed(selected[0])
 			if err != nil {
 				return err
 			}
-			maps.Copy(used, u)
+			maps.Copy(effective, u)
 		}
-		for _, k := range slices.Sorted(maps.Keys(vars)) {
-			if !used[k] {
-				return fmt.Errorf("-set %s: no trajectory reads it (they read: %s)", k, strings.Join(slices.Sorted(maps.Keys(used)), ", "))
-			}
+	}
+	for _, k := range slices.Sorted(maps.Keys(vars)) {
+		if _, ok := effective[k]; !ok {
+			return fmt.Errorf("-set %s: no trajectory reads it (they read: %s)", k, strings.Join(slices.Sorted(maps.Keys(effective)), ", "))
 		}
 	}
 	traj := trajs[0]
@@ -388,7 +410,7 @@ func runCmd(args []string) (retErr error) {
 		WakeBackoff:   *wakeBackoff,
 		Keep:          *keep,
 		Labels:        labels,
-		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids, vars),
+		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids, effective),
 	})
 	if sum != nil {
 		log.Info("run finished", slog.Int("tasks", sum.Tasks), slog.Int("failed", sum.Failed),

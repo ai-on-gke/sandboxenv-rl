@@ -178,10 +178,18 @@ func (c *Config) validate() error {
 		return errors.New("backend is required")
 	case len(c.Instances) == 0:
 		return errors.New("no instances")
-	case c.Trajectory == nil:
+	case c.Trajectory == nil && len(c.Trajectories) == 0:
 		return errors.New("trajectory is required")
 	case c.Width < 1:
 		return errors.New("width must be >= 1")
+	}
+	for i, t := range c.Trajectories {
+		if t == nil {
+			return fmt.Errorf("trajectory %d of the mix is nil", i+1)
+		}
+	}
+	if c.Trajectory == nil {
+		c.Trajectory = c.Trajectories[0]
 	}
 	switch c.Mode {
 	case ModeEval:

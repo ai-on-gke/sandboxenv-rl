@@ -16,10 +16,10 @@
 # worker pod, each taking a whole 8-GPU node. Required pod anti-affinity keeps them on different
 # hosts; verl's trainer pool and rollout pool are each sized to a full node (8 GPUs, STRICT_PACK
 # placement groups), so the trainer lands on one machine and the vLLM rollout engines on the other.
-# deploy.sh renders __GPU_NODE_SELECTOR__ (from GPU_POOL) and __GPU_EXTRA_TOLERATIONS__ (from GPU_TOLERATIONS).
+# deploy.sh fills the node selector (GPU_POOL) and extra tolerations (GPU_TOLERATIONS) placeholders below.
 apiVersion: v1
 kind: Service
-metadata: {name: verl-ray-head, namespace: default}
+metadata: {name: verl-qwen3-1p7b-fully-async-head, namespace: default}
 spec:
   clusterIP: None
   selector: {app: verl-qwen3-1p7b-fully-async, role: head}
@@ -98,7 +98,7 @@ spec:
         command: ["/bin/bash", "-c", "bash /workspace/cfg/run_fully_async.sh"]
         env:
         - {name: ROLE, value: "worker"}
-        - {name: RAY_HEAD_HOST, value: "verl-ray-head.default.svc"}
+        - {name: RAY_HEAD_HOST, value: "verl-qwen3-1p7b-fully-async-head.default.svc"}
         - {name: MODEL_ID, value: "Qwen/Qwen3-1.7B"}
         resources:
           requests: {cpu: "48", memory: "300Gi", nvidia.com/gpu: 8}

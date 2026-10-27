@@ -26,8 +26,10 @@
 #   KUBE_CONTEXT      kube context to use, or PROJECT_ID + ZONE + CLUSTER to derive gke_<project>_<zone>_<cluster>
 #   GPU_POOL          optional node-pool label value to pin GPU pods to (default: any GPU node)
 #   GPU_TOLERATIONS   optional extra NoSchedule taints on your GPU nodes, "key=value,key2=value2"
-#   KUBECTL_ATE       optional path to kubectl-ate (Substrate repo, `go build ./cmd/kubectl-ate`); `down` uses it to
-#                     delete the warm-pool environments the tool leaves behind (actors named verl-* in atespace ate-env)
+#   KUBECTL_ATE       optional path to kubectl-ate (Substrate repo, `go build ./cmd/kubectl-ate`); `up`/`down` use it to
+#                     delete warm-pool environments a killed worker left behind (actors named ENV_PREFIX-* in atespace
+#                     ate-env; the tool deletes its own pool at process exit, so this is normally a no-op)
+#   ENV_PREFIX        environment name prefix, must match env_prefix in tool_config.yaml (default verl-qwen3-1p7b)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -z "${KUBE_CONTEXT:-}" ]; then
@@ -35,7 +37,8 @@ if [ -z "${KUBE_CONTEXT:-}" ]; then
   KUBE_CONTEXT="gke_${PROJECT_ID}_${ZONE}_${CLUSTER}"
 fi
 K="kubectl --context=$KUBE_CONTEXT"
-JOB=verl-qwen3-1p7b-fully-async; JOB_YAML=job-fully-async.yaml
+JOB=verl-qwen3-1p7b-fully-async; JOB_YAML=job-fully-async.yaml; SERVICE="$JOB-head"
+ENV_PREFIX="${ENV_PREFIX:-verl-qwen3-1p7b}"
 
 render_job() {  # GPU placement knobs into the Job manifest
   local sel="" tol=""
@@ -47,13 +50,17 @@ render_job() {  # GPU placement knobs into the Job manifest
   fi
   sed -e "s|__GPU_NODE_SELECTOR__|${sel}|" -e "s|__GPU_EXTRA_TOLERATIONS__|${tol}|" "$HERE/$1"
 }
-purge_envs() {  # environments the tool's warm pool left behind
+purge_envs() {  # environments a killed rollout worker left behind (the tool deletes its pool at a clean exit)
   if [ -n "${KUBECTL_ATE:-}" ]; then
-    for a in $("$KUBECTL_ATE" --context "$KUBE_CONTEXT" get actors -a ate-env 2>/dev/null | awk 'NR>1 && $2 ~ /^verl-/ {print $2}'); do
-      "$KUBECTL_ATE" --context "$KUBE_CONTEXT" delete actor "$a" -a ate-env --any-state >/dev/null 2>&1 || true   # running actors need --any-state
+    # `kubectl-ate get actors` prints a table: ATESPACE NAME TEMPLATE STATE ...; column 2 is the actor name.
+    for a in $("$KUBECTL_ATE" --context "$KUBE_CONTEXT" get actors -a ate-env 2>/dev/null | awk -v p="^$ENV_PREFIX-" 'NR>1 && $2 ~ p {print $2}'); do
+      # Substrate v0.6.0 deletes a running actor directly; older releases need --any-state for that.
+      "$KUBECTL_ATE" --context "$KUBE_CONTEXT" delete actor "$a" -a ate-env >/dev/null 2>&1 \
+        || "$KUBECTL_ATE" --context "$KUBE_CONTEXT" delete actor "$a" -a ate-env --any-state >/dev/null 2>&1 \
+        || echo "warning: could not delete environment $a"
     done
   else
-    echo "note: set KUBECTL_ATE=<path to kubectl-ate> to delete leftover verl-* environments in atespace ate-env"
+    echo "note: set KUBECTL_ATE=<path to kubectl-ate> to delete leftover $ENV_PREFIX-* environments in atespace ate-env"
   fi
 }
 check_substrate() {
@@ -72,9 +79,9 @@ case "${1:-up}" in
   up)   check_substrate; purge_envs; up_job; echo "started $JOB; follow with: $0 logs" ;;
   logs) $K -n default logs -f "job/$JOB" ;;
   down)
-    $K -n default delete job verl-qwen3-1p7b-fully-async verl-qwen3-1p7b-fully-async-worker --ignore-not-found --wait=true
-    $K -n default delete service verl-ray-head --ignore-not-found
-    $K -n default delete configmap verl-qwen3-1p7b-fully-async --ignore-not-found
+    $K -n default delete job "$JOB" "$JOB-worker" --ignore-not-found --wait=true
+    $K -n default delete service "$SERVICE" --ignore-not-found
+    $K -n default delete configmap "$JOB" --ignore-not-found
     purge_envs ;;
   *) echo "usage: $0 [up|logs|down]"; exit 2 ;;
 esac

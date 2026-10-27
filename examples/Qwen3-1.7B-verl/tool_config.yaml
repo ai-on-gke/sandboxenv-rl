@@ -19,4 +19,5 @@ tools:
       endpoint: "ate-env-api.ate-env.svc:7777"   # ate-env-api (Substrate environment API), namespace ate-env
       max_envs: 16                                # warm pool of environments per rollout worker process
       timeout_s: 30
+      env_prefix: verl-qwen3-1p7b                 # environment name prefix; deploy.sh purges only this prefix
       # rootfs_image: "docker.io/library/python@sha256:<digest>"   # run snippets in another image

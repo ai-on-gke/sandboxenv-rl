@@ -14,7 +14,8 @@
 # limitations under the License.
 # Fully-async, disaggregated agentic GRPO (verl.experimental.fully_async_policy) across two
 # GPU nodes. ROLE=head: start Ray head, wait for NNODES Ray nodes, run the driver. ROLE=worker:
-# join the head and block. Trainer pool and rollout pool are each one whole node, so verl's
+# join the head and block. Needs the ate-env-api of this repository's main (Substrate v0.6.0 or later,
+# installed per the Quickstart); the Python client is installed from ATE_ENV_CLIENT_REF. Trainer pool and rollout pool are each one whole node, so verl's
 # STRICT_PACK placement groups put the FSDP trainer on one machine and the vLLM rollout engines
 # on the other. Rollouts stream into a queue with a staleness bound, partial rollout resumes
 # aborted generations after a weight sync, weights move trainer -> vLLM over NCCL.
@@ -23,7 +24,7 @@ export HF_HOME=/workspace/hf PYTHONUNBUFFERED=1 VLLM_USE_V1=1 NCCL_CUMEM_ENABLE=
 : "${ROLE:=head}"                     # head | worker
 : "${NNODES:=2}"                      # Ray nodes the head waits for before training
 : "${NODE_WAIT_S:=3600}"
-: "${RAY_HEAD_HOST:=verl-ray-head.default.svc}"
+: "${RAY_HEAD_HOST:=verl-qwen3-1p7b-fully-async-head.default.svc}"
 : "${RAY_PORT:=6379}"
 : "${VERL_COMMIT:=60546ef2a7464a158cd170f58f852a62a4e552ba}"
 : "${MODEL_ID:=Qwen/Qwen3-1.7B}"
@@ -34,11 +35,20 @@ export HF_HOME=/workspace/hf PYTHONUNBUFFERED=1 VLLM_USE_V1=1 NCCL_CUMEM_ENABLE=
 : "${LOCAL_UPDATES:=4}"               # how many local updates to run
 : "${SYNC_EVERY:=2}"                  # trigger_parameter_sync_step
 : "${STALENESS:=0.5}"
-: "${ATE_ENV_CLIENT_REF:=2eccd89617ff704bb74b9ca356a24548987dd380}"   # ai-on-gke/sandboxenv-rl commit providing clients/python
+: "${ATE_ENV_CLIENT_REF:=eedeb63}"      # ai-on-gke/sandboxenv-rl main (clients/python); move to the merge commit of this PR
+: "${MODEL_REVISION:=70d244cc86ccca08cf5af4e1e306ecf908b1ad5e}"   # Qwen/Qwen3-1.7B
+: "${MATH_REVISION:=a960589a2102b8434523fe247d6edadc12d56a05}"    # verl-team/lighteval-MATH-preprocessed
+export MODEL_ID MODEL_REVISION MATH_REVISION                       # read by the download step below
 mkdir -p /workspace/results /workspace/agent
 
 echo "=== Phase 1: verl @ $VERL_COMMIT ==="
-pip install -q datasets TransferQueue "cupy-cuda12x" 2>&1 | tail -2   # cupy: required by the NCCL checkpoint engine (trainer->vLLM weight sync)
+# Constrain every install to the image's own versions of the stack (torch, transformers, huggingface-hub, ...):
+# unconstrained, `datasets` pulls huggingface-hub 2.x (rejected by the image's transformers), cupy 14 pulls
+# numpy 2 and TransferQueue pulls a tensordict that wants a newer torch.
+pip freeze 2>/dev/null | grep -iE '^(torch|torchvision|torchaudio|numpy|vllm|transformers|huggingface[-_]hub|tensordict|ray|triton|flash[-_]attn|nvidia-|cuda-)' > /workspace/pins.txt || true
+pip install -q -c /workspace/pins.txt "cupy-cuda12x==13.6.0" 2>&1 | tail -5     # cupy 14 needs numpy 2; the image pins numpy 1.26
+pip install -q --no-deps "TransferQueue==0.1.11" 2>&1 | tail -5                     # its deps (tensordict, pyzmq, msgspec, ...) ship in the image; resolving them backtracks forever
+python3 -c "import datasets, tensordict, zmq, msgspec, hydra, omegaconf, prometheus_client, psutil, transfer_queue" 2>/dev/null || python3 -c "import datasets, tensordict, zmq, msgspec, hydra, omegaconf, prometheus_client, psutil"   # datasets 4.8.5 is in the image   # cupy: required by the NCCL checkpoint engine (trainer->vLLM weight sync)
 git clone --filter=blob:none https://github.com/verl-project/verl.git /workspace/verl
 cd /workspace/verl && git checkout --detach "$VERL_COMMIT"
 pip install --no-deps -e . 2>&1 | tail -2
@@ -48,8 +58,8 @@ echo "=== Phase 2: model + data ==="
 python3 - <<'PY'
 import os
 from huggingface_hub import snapshot_download
-snapshot_download(repo_id=os.environ["MODEL_ID"], local_dir="/workspace/models/" + os.environ["MODEL_ID"].split("/")[-1])
-snapshot_download(repo_id="verl-team/lighteval-MATH-preprocessed", repo_type="dataset", local_dir="/workspace/data/math")
+snapshot_download(repo_id=os.environ["MODEL_ID"], revision=os.environ["MODEL_REVISION"], local_dir="/workspace/models/" + os.environ["MODEL_ID"].split("/")[-1])
+snapshot_download(repo_id="verl-team/lighteval-MATH-preprocessed", repo_type="dataset", revision=os.environ["MATH_REVISION"], local_dir="/workspace/data/math")
 PY
 MODEL_PATH=/workspace/models/${MODEL_ID##*/}
 
@@ -57,14 +67,16 @@ echo "=== Phase 3: tool + Substrate environment API client ==="
 cp /workspace/cfg/*.py /workspace/agent/ 2>/dev/null || true
 export PYTHONPATH=/workspace/agent:/workspace/verl:${PYTHONPATH:-}
 # Substrate environment API client (gRPC). Pulls grpcio>=1.84 / protobuf>=7.35, which this image tolerates.
-pip install -q "git+https://github.com/ai-on-gke/sandboxenv-rl.git@${ATE_ENV_CLIENT_REF}#subdirectory=clients/python" 2>&1 | tail -2
+pip install -q -c /workspace/pins.txt "git+https://github.com/ai-on-gke/sandboxenv-rl.git@${ATE_ENV_CLIENT_REF}#subdirectory=clients/python" 2>&1 | tail -2
 cp /workspace/cfg/tool_config.yaml /workspace/agent/tool_config.yaml
 [ "$ROLE" = "head" ] && python3 - <<'PY'     # one probe per run, unique name (head only)
 import asyncio, os, socket, yaml
 from ate_env import Client
 ep = yaml.safe_load(open("/workspace/agent/tool_config.yaml"))["tools"][0]["config"]["endpoint"]
 async def probe():
-  c = Client(ep); env = await c.create(f"verl-probe-{socket.gethostname()[-5:]}"); r = await env.shell("python3 -c 'print(6*7)'", timeout=120); await env.delete(); await c.close()
+  cfg = yaml.safe_load(open("/workspace/agent/tool_config.yaml"))["tools"][0]["config"]
+  c = Client(ep, auth_token=os.environ.get("SUBSTRATE_ENV_AUTH_TOKEN") or None)
+  env = await c.create(f"{cfg.get('env_prefix', 'verl')}-probe-{socket.gethostname()[-5:]}"); r = await env.shell("python3 -c 'print(6*7)'", timeout=120); await env.delete(); await c.close()
   assert r.exit_code == 0 and "42" in r.stdout, (r.exit_code, r.stdout, r.stderr); print("ate-env-api probe ok:", ep)
 asyncio.run(probe())
 PY
@@ -96,6 +108,7 @@ WAIT
 echo "=== Phase 5: fully-async disaggregated agentic GRPO ==="
 TOTAL_ROLLOUT_STEPS=$(( PPO_MINI_BATCH * LOCAL_UPDATES ))
 cd /workspace/verl
+set +e   # the pipeline's status must reach RC= below; with -e a failed trainer would exit before the DONE line
 python3 -m verl.experimental.fully_async_policy.fully_async_main \
   algorithm.adv_estimator=grpo \
   algorithm.use_kl_in_reward=False \
@@ -151,5 +164,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
   trainer.experiment_name=qwen3-1.7b-tool-agent-fully-async-substrate \
   2>&1 | tee /workspace/results/train.log
 RC=${PIPESTATUS[0]}
+set -e
 ray stop --force || true          # releases the worker pod (its ray start --block returns)
 echo "=== DONE rc=$RC ==="
+exit "$RC"

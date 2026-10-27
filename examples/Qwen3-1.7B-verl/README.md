@@ -6,14 +6,15 @@ rewarded. GRPO, full-weight FSDP, verl `fully_async_policy`: trainer on one
 8-GPU node, vLLM rollout engines on a second 8-GPU node.
 
 Pins: verl `60546ef2`, image `verlai/verl:vllm020.dev2`, client
-`ai-on-gke/sandboxenv-rl@2eccd896` (`clients/python`).
+`ai-on-gke/sandboxenv-rl@eedeb63` (`clients/python`, this repository's main), model and dataset
+revisions in `run_fully_async.sh`, `TransferQueue==0.1.11`, `cupy-cuda12x==13.6.0` (the image's `datasets` 4.8.5 is used as is).
 
 ## Prerequisites
 
-- Agent Substrate and `ate-env-api` installed in namespace `ate-env` with
-  template `default-template` (top-level README, Quickstart). Substrate must
-  be at the commit this repo's `go.mod` pins; newer Substrate changed the API
-  and this ate-env cannot talk to it.
+- Agent Substrate v0.6.0 or later with this repository's `ate-env-api` installed in namespace
+  `ate-env` per the Quickstart (which puts `ate-env-api` on the router's allow-list), with
+  template `default-template`. If `ate-env-api` requires a caller token, export
+  `SUBSTRATE_ENV_AUTH_TOKEN` in the pods; the tool and the probe send it as the bearer token.
 - Two GKE GPU nodes with 8 GPUs each (validated on a3-ultragpu-8g / H200).
   Standard `nvidia.com/gpu` taint is tolerated; extra taints go in
   `GPU_TOLERATIONS`.
@@ -51,7 +52,7 @@ optional `rootfs_image`.
 | `deploy.sh` | `up` / `logs` / `down`; renders the manifest, checks `ate-env-api` is up |
 | `job-fully-async.yaml` | Ray head Job + worker Job + headless Service, pod anti-affinity, 8 GPUs each |
 | `run_fully_async.sh` | runs in both pods: install, download, `ray start`; the head waits for the worker and trains |
-| `ate_env_tool.py`, `tool_config.yaml` | verl `BaseTool` that runs code in Substrate environments, warm pool per rollout worker |
+| `ate_env_tool.py`, `tool_config.yaml` | verl `BaseTool` that runs code in Substrate environments; warm pool per rollout worker and event loop, deleted at process exit; `env_prefix` names this run's environments |
 
 ## What it covers
 

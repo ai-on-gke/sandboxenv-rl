@@ -173,6 +173,11 @@ When you upgrade an existing cluster across these changes:
   again: Substrate cannot update an ActorTemplate in place, thus each template `ate-env-api` derives
   from it fails with `resources: Required`. Delete the base and its derived templates (named
   `<base>-<12 hex digits>`) with `kubectl-ate delete actor-template`, then register the base again.
+- A base registered before `--wakeup-timeout` keeps Substrate's 30 s wakeup-probe timeout, and so
+  does each template `ate-env-api` derived from it: `ate-env-api` reuses a derived template as it
+  is, thus registering the base again does not change it. To give a `--sidecar-readyz` template
+  the 120 s default, delete the base and its derived templates (`<base>-<12 hex digits>`), then
+  register the base again; `ate-env-api` derives each image template again from the new base.
 
 ### 1. Deploy the Kubernetes Resources
 
@@ -245,7 +250,11 @@ kubectl get pods -n ate-env
 `--wake-budget` (default 2m; cold image pulls and cross-region snapshot reads exceed the router's own
 parking budget) and, once the control plane reports the environment RUNNING, up to
 `--wake-running-budget` (default 20s). Both are flags of the `ate-env-api` binary; `ate-env manifest`
-does not set them, thus add them to the Deployment's arguments to change them.
+does not set them, thus add them to the Deployment's arguments to change them. `--wake-budget` must
+be longer than the image pull plus the template's wakeup-probe timeout (`ate-env manifest template
+--wakeup-timeout`), because the control plane reports RUNNING only after the probe passes. Otherwise
+the first guest call or port-proxy request after a slow wake fails with `Unavailable`, and a retry
+succeeds once the environment is up.
 
 By default `ate-env manifest` deploys `ate-env-api` without caller authentication for use over
 `kubectl port-forward`. Before exposing `ate-env-api` beyond loopback (e.g. through an internal
@@ -293,7 +302,8 @@ guest, `--sidecar` has the guest start and supervise a process from it, and `--s
 holds the actor's readiness until that process answers. With `--sidecar-readyz`, Substrate's
 wakeup probe waits up to 120 s instead of its default 30 s, because a runtime that boots in 20 s
 alone takes longer when many environments start on one node; `--wakeup-timeout` sets another
-value. Here a static busybox stands in for a runtime daemon and serves HTTP on port 44772 inside
+value. Keep `ate-env-api --wake-budget` longer than the image pull plus this timeout (see step 1).
+Templates registered before this flag keep 30 s (see the upgrade notes above). Here a static busybox stands in for a runtime daemon and serves HTTP on port 44772 inside
 the environment:
 
 ```bash

@@ -22,6 +22,7 @@ import (
 
 	"github.com/agent-substrate/env/guest/filesystem"
 	"github.com/agent-substrate/env/guest/process"
+	"github.com/agent-substrate/env/internal/unknownfields"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
@@ -74,7 +75,13 @@ func FormatEnabledServices(cfg Config) string {
 func NewServer(cfg Config) (*grpc.Server, func(), error) {
 	var cleanups []func()
 
-	grpcServer := grpc.NewServer()
+	// Reject requests with fields this guest does not know, as ate-env-api
+	// does: a guest baked into a golden snapshot can be older than the API
+	// that calls it, and an ignored field would change the result silently.
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(unknownfields.UnaryServerInterceptor()),
+		grpc.ChainStreamInterceptor(unknownfields.StreamServerInterceptor()),
+	)
 	reflection.Register(grpcServer)
 
 	if cfg.EnableProcess {

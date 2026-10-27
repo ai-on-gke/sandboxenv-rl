@@ -356,6 +356,14 @@ func (s *Server) StreamProcessOutput(req *ateenvv1alpha.StreamProcessOutputReque
 
 // WriteProcessInput forwards stdin chunks to a process inside the environment.
 func (s *Server) WriteProcessInput(stream grpc.ClientStreamingServer[ateenvv1alpha.WriteProcessInputRequest, ateenvv1alpha.WriteProcessInputResponse]) error {
+	// Receive the first message before waking the guest, so a request the API
+	// rejects (one with unknown fields) does not resume a suspended environment.
+	// A client that opens a stream and sends nothing therefore holds no guest
+	// connection until it closes.
+	req, err := nextMessage(stream)
+	if err != nil {
+		return err
+	}
 	client, outCtx, closeFn, err := s.processClient(stream.Context())
 	if err != nil {
 		return err
@@ -366,19 +374,15 @@ func (s *Server) WriteProcessInput(stream grpc.ClientStreamingServer[ateenvv1alp
 	if err != nil {
 		return err
 	}
-	for {
-		req, err := stream.Recv()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return err
-		}
+	for req != nil {
 		if err := clientStream.Send(req); err != nil {
 			// The guest rejected the stream; surface its status instead of io.EOF.
 			if errors.Is(err, io.EOF) {
 				_, err = clientStream.CloseAndRecv()
 			}
+			return err
+		}
+		if req, err = nextMessage(stream); err != nil {
 			return err
 		}
 	}
@@ -433,6 +437,12 @@ func (s *Server) WriteFile(stream grpc.ClientStreamingServer[ateenvv1alpha.Write
 	if err != nil {
 		return err
 	}
+	// Receive the first message before waking the guest, as WriteProcessInput
+	// does.
+	req, err := nextMessage(stream)
+	if err != nil {
+		return err
+	}
 	conn, err := s.guestConn(ctx, atespace, envID)
 	if err != nil {
 		return err
@@ -444,15 +454,11 @@ func (s *Server) WriteFile(stream grpc.ClientStreamingServer[ateenvv1alpha.Write
 		return err
 	}
 
-	for {
-		req, err := stream.Recv()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
+	for req != nil {
+		if err := clientStream.Send(req); err != nil {
 			return err
 		}
-		if err := clientStream.Send(req); err != nil {
+		if req, err = nextMessage(stream); err != nil {
 			return err
 		}
 	}
@@ -596,4 +602,14 @@ func toGRPCError(err error) error {
 	default:
 		return status.Errorf(codes.Internal, "%v", err)
 	}
+}
+
+// nextMessage receives the next message of a client stream: nil when the
+// client closed the stream.
+func nextMessage[Req any](stream interface{ Recv() (*Req, error) }) (*Req, error) {
+	req, err := stream.Recv()
+	if errors.Is(err, io.EOF) {
+		return nil, nil
+	}
+	return req, err
 }

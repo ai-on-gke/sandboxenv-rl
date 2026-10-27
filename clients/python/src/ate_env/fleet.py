@@ -219,6 +219,7 @@ class SandboxFleet:
                         entry.template_id,
                         entry.replicas,
                         wait=True,
+                        run_id=self.run_id,
                         rootfs_image=getattr(entry, "rootfs_image", None),
                     )
 
@@ -228,7 +229,8 @@ class SandboxFleet:
         for img in images:
             template_id, rootfs_image = self._ensure_template_for_image(img)
             with self._obs.phase("warm_pool", backend=self.backend_label, family=repo_family(img)):
-                self.backend.warm_pool(template_id, rep, wait=wait, rootfs_image=rootfs_image)
+                self.backend.warm_pool(template_id, rep, wait=wait, run_id=self.run_id,
+                                       rootfs_image=rootfs_image)
 
     def unwarm_image(self, image: str) -> None:
         """Drain warm pool for a specific image."""

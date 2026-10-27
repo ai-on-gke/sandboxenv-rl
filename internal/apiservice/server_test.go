@@ -27,6 +27,7 @@ import (
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/internaltest/fakecontrol"
 	"github.com/agent-substrate/env/internal/internaltest/fakerouter"
+	"github.com/agent-substrate/env/internal/unknownfields"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
@@ -97,7 +98,10 @@ func newFullTestEnvTLS(t *testing.T, serverTLS, clientTLS *tls.Config) *testEnv 
 	srv.RouterTLS = clientTLS
 	t.Cleanup(srv.Close)
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(unknownfields.UnaryServerInterceptor()),
+		grpc.ChainStreamInterceptor(unknownfields.StreamServerInterceptor()),
+	)
 	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, srv)
 	ateenvv1alpha.RegisterProcessServiceServer(grpcServer, srv)
 	ateenvv1alpha.RegisterFileSystemServiceServer(grpcServer, srv)

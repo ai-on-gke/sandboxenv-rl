@@ -113,7 +113,8 @@ func (s *Server) Close() {}
 // the container image and mounts the base's guest as a read-only image volume,
 // so the image runs unmodified (see ensureImageTemplate and
 // DeriveImageTemplate). It is created on first use and reused by later
-// creates on the same image, and the response reports it in
+// creates on the same image (created again when its golden snapshot build
+// failed), and the response reports it in
 // Environment.template. When rootfs_image is empty the template is used as is.
 //
 // Errors: InvalidArgument for a missing id, a rootfs image not pinned by digest, a
@@ -121,8 +122,9 @@ func (s *Server) Close() {}
 // cannot be derived from (no containers, unpinned guest image, or a command
 // that cannot be re-rooted under the guest volume). FailedPrecondition when
 // the base template does not exist in the atespace, or when the derived name
-// is already held by a template running a different image. Other control
-// plane failures are mapped by toGRPCError.
+// is already held by a template running a different image. Unavailable when
+// a derived template whose golden snapshot failed cannot be deleted. Other
+// control plane failures are mapped by toGRPCError.
 func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (*ateenvv1alpha.CreateEnvironmentResponse, error) {
 	if req.GetId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "id is required")
@@ -173,6 +175,13 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 // ensureImageTemplate returns the name of the ActorTemplate that runs image
 // on top of base, creating it from base on first use. The derived template
 // lives in the environment's atespace, next to base.
+//
+// A derived template whose golden snapshot build failed is deleted and
+// created again. Substrate does not retry a failed build (a nonempty
+// golden_snapshot_status.error_message is terminal), thus without the
+// recreate each later create on the image uses the failed template. Only
+// that one template is deleted, by its uid; a template that is still
+// baking or is ready is used as is, and base is never deleted.
 func (s *Server) ensureImageTemplate(ctx context.Context, atespace, base, image string) (string, error) {
 	name, err := ImageTemplateName(base, image)
 	if err != nil {
@@ -185,7 +194,18 @@ func (s *Server) ensureImageTemplate(ctx context.Context, atespace, base, image 
 			return "", status.Errorf(codes.FailedPrecondition,
 				"actor template %q exists but runs %q, not %q; delete it or use another base template", name, got, image)
 		}
-		return name, nil
+		failed := existing.GetStatus().GetGoldenSnapshotStatus().GetErrorMessage()
+		if failed == "" {
+			return name, nil
+		}
+		// Concurrent callers can see the same failed template. The uid
+		// precondition deletes only that one: NotFound means another caller
+		// deleted it, Aborted that another caller created it again.
+		if err := s.client.DeleteActorTemplate(ctx, atespace, name, existing.GetMetadata().GetUid()); err != nil &&
+			!errors.Is(err, ate.ErrNotFound) && status.Code(err) != codes.Aborted {
+			return "", status.Errorf(codes.Unavailable,
+				"actor template %q failed its golden snapshot (%s) and could not be deleted for a recreate: %v; retry the create", name, failed, err)
+		}
 	case !errors.Is(err, ate.ErrNotFound):
 		return "", toGRPCError(err)
 	}

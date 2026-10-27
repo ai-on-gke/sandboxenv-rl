@@ -51,6 +51,7 @@ type Server struct {
 	// Substrate does for an identity allowed to use but not create atespaces.
 	DenyCreateAtespace bool
 	templates          map[string]*ateapipb.ActorTemplate
+	templateSeq        int
 	// SuspendModes records the durability mode of each SuspendActor call.
 	SuspendModes []ateapipb.DurabilityMode
 }
@@ -125,10 +126,32 @@ func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateAc
 		}
 	}
 	stored := proto.Clone(t).(*ateapipb.ActorTemplate)
-	stored.Metadata.Uid = "tmpl-" + md.GetName()
+	s.templateSeq++
+	stored.Metadata.Uid = fmt.Sprintf("tmpl-%s-%d", md.GetName(), s.templateSeq)
 	stored.Metadata.Version = 1
 	s.templates[k] = stored
 	return proto.Clone(stored).(*ateapipb.ActorTemplate), nil
+}
+
+// DeleteActorTemplate deletes a template, with Substrate's uid and version
+// preconditions: a mismatch is Aborted.
+func (s *Server) DeleteActorTemplate(ctx context.Context, req *ateapipb.DeleteActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ref := req.GetActorTemplate()
+	k := key(ref.GetAtespace(), ref.GetName())
+	t, ok := s.templates[k]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "ActorTemplate %s not found", ref.GetName())
+	}
+	if uid := req.GetOptions().GetUid(); uid != "" && uid != t.GetMetadata().GetUid() {
+		return nil, status.Errorf(codes.Aborted, "ActorTemplate %s does not have uid %s", ref.GetName(), uid)
+	}
+	if v := req.GetOptions().GetVersion(); v != 0 && v != t.GetMetadata().GetVersion() {
+		return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
+	}
+	delete(s.templates, k)
+	return proto.Clone(t).(*ateapipb.ActorTemplate), nil
 }
 
 // Serve starts the fake on a random localhost port and returns its

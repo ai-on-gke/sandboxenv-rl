@@ -17,9 +17,11 @@ package apiservice_test
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"math"
 	"net"
+	"sync"
 	"testing"
 
 	"github.com/agent-substrate/env/guest"
@@ -693,6 +695,101 @@ func TestCreateFromImageUsesNamedBaseAndAtespace(t *testing.T) {
 	}
 	if control.Template("team-a", "py-base-0123456789ab") == nil {
 		t.Error("derived template not created in the environment's atespace")
+	}
+}
+
+const testDerivedTemplate = "default-template-0123456789ab"
+
+// seedDerivedTemplate registers the template that ensureImageTemplate derives
+// for testRootfsImage from default-template, with uid "seeded" and the given
+// golden snapshot status.
+func seedDerivedTemplate(t *testing.T, control *fakecontrol.Server, golden *ateapipb.GoldenSnapshotStatus) {
+	t.Helper()
+	seedGuestTemplate(control, "ate-env", "default-template")
+	derived, err := apiservice.DeriveImageTemplate(control.Template("ate-env", "default-template"), testDerivedTemplate, testRootfsImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	derived.Metadata.Uid = "seeded"
+	derived.Status = &ateapipb.ActorTemplateStatus{GoldenSnapshotStatus: golden}
+	control.AddTemplate(derived)
+}
+
+// A derived template whose golden snapshot failed is deleted and created
+// again under the same name; a baking or ready one is used as is.
+func TestCreateFromImageRecreatesFailedTemplate(t *testing.T) {
+	cases := []struct {
+		name     string
+		golden   *ateapipb.GoldenSnapshotStatus
+		recreate bool
+	}{
+		{"failed", &ateapipb.GoldenSnapshotStatus{ErrorMessage: "GoldenActorCrashed: golden actor crashed before its snapshot was taken"}, true},
+		{"baking", nil, false},
+		{"ready", &ateapipb.GoldenSnapshotStatus{GoldenTag: &ateapipb.ObjectRef{Atespace: "ate-env", Name: "golden"}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			envClient, control := newTestEnv(t)
+			seedDerivedTemplate(t, control, tc.golden)
+
+			resp, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "img", RootfsImage: testRootfsImage})
+			if err != nil {
+				t.Fatalf("CreateEnvironment: %v", err)
+			}
+			if got := resp.GetEnvironment().GetTemplate().GetName(); got != testDerivedTemplate {
+				t.Errorf("response template = %q, want %q", got, testDerivedTemplate)
+			}
+			tmpl := control.Template("ate-env", testDerivedTemplate)
+			if tmpl == nil {
+				t.Fatalf("derived template %q is gone", testDerivedTemplate)
+			}
+			if recreated := tmpl.GetMetadata().GetUid() != "seeded"; recreated != tc.recreate {
+				t.Errorf("derived template recreated = %v (uid %q), want %v", recreated, tmpl.GetMetadata().GetUid(), tc.recreate)
+			}
+			if msg := tmpl.GetStatus().GetGoldenSnapshotStatus().GetErrorMessage(); msg != "" {
+				t.Errorf("derived template still failed: %q", msg)
+			}
+			if tmpl.GetContainers()[0].GetImage() != testRootfsImage {
+				t.Errorf("derived container image = %q, want %q", tmpl.GetContainers()[0].GetImage(), testRootfsImage)
+			}
+			if control.Template("ate-env", "default-template") == nil || control.TemplateCount() != 2 {
+				t.Errorf("templates after create: base present = %v, count = %d; want the base and one derived",
+					control.Template("ate-env", "default-template") != nil, control.TemplateCount())
+			}
+		})
+	}
+}
+
+// Concurrent creates that all see the failed template recreate it once and
+// all succeed.
+func TestCreateFromImageRecreatesFailedTemplateConcurrently(t *testing.T) {
+	envClient, control := newTestEnv(t)
+	seedDerivedTemplate(t, control, &ateapipb.GoldenSnapshotStatus{ErrorMessage: "GoldenActorCrashed: golden actor crashed before its snapshot was taken"})
+
+	const n = 16
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, errs[i] = envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{
+				Id: fmt.Sprintf("img-%d", i), RootfsImage: testRootfsImage,
+			})
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("CreateEnvironment img-%d: %v", i, err)
+		}
+	}
+	tmpl := control.Template("ate-env", testDerivedTemplate)
+	if tmpl == nil || tmpl.GetMetadata().GetUid() == "seeded" || tmpl.GetStatus().GetGoldenSnapshotStatus().GetErrorMessage() != "" {
+		t.Fatalf("derived template after concurrent creates = %v, want a recreated template without an error", tmpl)
+	}
+	if n := control.TemplateCount(); n != 2 {
+		t.Errorf("template count = %d, want 2 (base + one derived)", n)
 	}
 }
 

@@ -546,10 +546,13 @@ capability instead of the token: `ate-env-capability:<capability>@` in the user 
 which the client sends as `Authorization: Basic`. The capability is `v1.<expiry>.<mac>`, where
 `mac` is the hex HMAC-SHA256, keyed with the API's token, of
 `"ate-env port capability v1\n<atespace>\n<id>\n<port>\n<expiry>"` and `expiry` is in Unix
-seconds, at most seven days ahead. It opens only WebSocket upgrades, only to that environment
-port, until it expires; a URL that lands in a log never shows the token. The API never forwards a
-capability, also when it does not check it. Capabilities signed with a token stop working when the
-token rotates.
+seconds, at most seven days ahead. It opens only WebSocket handshakes (a `GET` with
+`Connection: Upgrade` and `Upgrade: websocket`), only to that environment port, until it expires; a
+URL that lands in a log never shows the token. The capability must be the request's only
+`Authorization` credential: a second `Authorization` field or a comma-separated value next to it
+gets 400. The API never forwards a capability, also when it does not check it. Capabilities signed
+with a token stop working when the token rotates; a token rotation is also the only way to revoke a
+leaked capability before it expires.
 
 **Browsers.** The path form refuses a state-changing request or a WebSocket handshake that a browser
 sends from a page of another origin, so a web page cannot drive a daemon through a `kubectl

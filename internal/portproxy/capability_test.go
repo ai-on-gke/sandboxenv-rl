@@ -65,6 +65,10 @@ func TestVerifyCapability(t *testing.T) {
 		"the token itself": {"s3cret", "s3cret", "ate-env", "env1", 8000, now},
 		"empty":            {"s3cret", "", "ate-env", "env1", 8000, now},
 		"not hex":          {"s3cret", "v1.1700003600.zz", "ate-env", "env1", 8000, now},
+		// Only the canonical text verifies.
+		"signed expiry":       {"s3cret", strings.Replace(good, ".1700003600.", ".+1700003600.", 1), "ate-env", "env1", 8000, now},
+		"leading zero expiry": {"s3cret", strings.Replace(good, ".1700003600.", ".01700003600.", 1), "ate-env", "env1", 8000, now},
+		"uppercase mac":       {"s3cret", good[:strings.LastIndex(good, ".")+1] + strings.ToUpper(good[strings.LastIndex(good, ".")+1:]), "ate-env", "env1", 8000, now},
 	} {
 		if err := portproxy.VerifyCapability(tc.token, tc.capability, tc.atespace, tc.id, tc.port, tc.now); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -119,8 +123,15 @@ func basic(capability string) string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(portproxy.CapabilityUser+":"+capability))
 }
 
-// rawRequest sends one request line and headers and returns the status code.
+// rawRequest sends a GET with headers and returns the status code.
 func rawRequest(t *testing.T, addr, path string, headers ...string) int {
+	t.Helper()
+	return rawMethodRequest(t, addr, http.MethodGet, path, "", headers...)
+}
+
+// rawMethodRequest sends one request with exactly the given header lines, in
+// order and repeated as given, and returns the status code.
+func rawMethodRequest(t *testing.T, addr, method, path, body string, headers ...string) int {
 	t.Helper()
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -128,11 +139,14 @@ func rawRequest(t *testing.T, addr, path string, headers ...string) int {
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
-	req := "GET " + path + " HTTP/1.1\r\nHost: " + addr + "\r\n"
+	req := method + " " + path + " HTTP/1.1\r\nHost: " + addr + "\r\n"
 	for _, h := range headers {
 		req += h + "\r\n"
 	}
-	fmt.Fprint(conn, req+"\r\n")
+	if body != "" {
+		req += fmt.Sprintf("Content-Type: application/json\r\nContent-Length: %d\r\n", len(body))
+	}
+	fmt.Fprint(conn, req+"\r\n"+body)
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -173,8 +187,22 @@ func TestWebSocketCapability(t *testing.T) {
 		// A capability is for WebSocket upgrades only.
 		"plain request with a valid capability": {"Authorization: " + basic(valid)},
 		"other upgrade with a valid capability": {"Connection: Upgrade", "Upgrade: echo", "Authorization: " + basic(valid)},
+		// ReverseProxy forwards a request without "Connection: Upgrade" as a
+		// plain request, thus the capability must not open it.
+		"Upgrade: websocket without Connection: Upgrade": {"Upgrade: websocket", "Authorization: " + basic(valid)},
 	} {
 		if code := rawRequest(t, addr, events, headers...); code != http.StatusUnauthorized {
+			t.Errorf("%s: got %d, want 401", name, code)
+		}
+	}
+	// A leaked capability must not open the daemon's REST API: a POST that only
+	// names a WebSocket upgrade, and a POST with full upgrade headers.
+	for name, headers := range map[string][]string{
+		"POST with Upgrade: websocket and no Connection": {"Upgrade: websocket", "Authorization: " + basic(valid)},
+		"POST with upgrade headers":                      append(upgrade, "Authorization: "+basic(valid)),
+	} {
+		if code := rawMethodRequest(t, addr, http.MethodPost, "/v1alpha/envs/env1/ports/8000/api/bash/execute_bash_command",
+			`{"command":"id"}`, headers...); code != http.StatusUnauthorized {
 			t.Errorf("%s: got %d, want 401", name, code)
 		}
 	}
@@ -218,4 +246,63 @@ func TestDropsCapabilityWithoutAuthenticate(t *testing.T) {
 			t.Errorf("Authorization %q: daemon saw %q, want %q", value, got, want)
 		}
 	}
+}
+
+// A capability must be the only Authorization credential: a second
+// Authorization field or a comma-separated value next to it is refused before
+// the proxy dials, with or without Authenticate. Thus a capability never
+// reaches the daemon, and the daemon's own credential is never dropped
+// silently.
+func TestCapabilityMustBeTheOnlyAuthorization(t *testing.T) {
+	valid := portproxy.Capability("s3cret", "ate-env", "env1", 8000, time.Now().Add(time.Hour))
+	daemon := "Authorization: Bearer daemon-token"
+	cases := map[string][]string{
+		"daemon credential, then a capability": {daemon, "Authorization: " + basic(valid)},
+		"a capability, then daemon credential": {"Authorization: " + basic(valid), daemon},
+		"two capabilities":                     {"Authorization: " + basic(valid), "Authorization: " + basic(valid)},
+		"comma-separated value":                {"Authorization: Bearer daemon-token, " + basic(valid)},
+	}
+
+	t.Run("without Authenticate", func(t *testing.T) {
+		s := newSetup(t)
+		var reached int
+		s.router.RegisterPort("env1", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reached++
+			io.WriteString(w, "daemon")
+		}))
+		addr := strings.TrimPrefix(s.proxy.URL, "http://")
+		connects := s.router.connectCount()
+		for name, headers := range cases {
+			h := append([]string{portproxy.EnvIDHeader + ": env1", portproxy.EnvPortHeader + ": 8000"}, headers...)
+			if code := rawRequest(t, addr, "/", h...); code != http.StatusBadRequest {
+				t.Errorf("%s: got %d, want 400", name, code)
+			}
+		}
+		if n := s.router.connectCount() - connects; n != 0 || reached != 0 {
+			t.Errorf("refused requests: %d CONNECTs, %d reached the daemon; want 0 and 0", n, reached)
+		}
+		// Two Authorization fields without a capability stay the daemon's
+		// business.
+		if code := rawRequest(t, addr, "/", portproxy.EnvIDHeader+": env1", portproxy.EnvPortHeader+": 8000",
+			daemon, "Authorization: Basic dXNlcjpwdw=="); code != http.StatusOK {
+			t.Errorf("two daemon credentials: got %d, want 200", code)
+		}
+	})
+
+	t.Run("with the token in X-Env-Authorization", func(t *testing.T) {
+		s, addr, seen := capabilitySetup(t)
+		connects := s.router.connectCount()
+		for name, headers := range cases {
+			h := append([]string{portproxy.EnvAuthorizationHeader + ": Bearer s3cret"}, headers...)
+			if code := rawRequest(t, addr, "/v1alpha/envs/env1/ports/8000/health", h...); code != http.StatusBadRequest {
+				t.Errorf("%s: got %d, want 400", name, code)
+			}
+		}
+		if n := s.router.connectCount() - connects; n != 0 {
+			t.Errorf("router saw %d CONNECTs for refused requests, want 0", n)
+		}
+		if got := seen(); len(got) != 0 {
+			t.Errorf("refused requests reached the daemon: %d", len(got))
+		}
+	})
 }

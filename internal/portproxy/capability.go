@@ -24,6 +24,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 // A port capability lets a WebSocket client that cannot set headers through
@@ -74,24 +76,51 @@ func VerifyCapability(token, capability, atespace, id string, port int, now time
 	if len(parts) != 3 || parts[0] != capabilityVersion {
 		return errCapability
 	}
+	// Only the canonical text verifies: digits without a sign or a leading
+	// zero, and lowercase hex. Thus one capability has one text form.
 	expiry, err := strconv.ParseInt(parts[1], 10, 64)
-	if err != nil {
+	if err != nil || strconv.FormatInt(expiry, 10) != parts[1] {
 		return errCapability
 	}
 	if left := time.Unix(expiry, 0).Sub(now); left <= 0 || left > MaxCapabilityTTL {
 		return errCapability
 	}
 	got, err := hex.DecodeString(parts[2])
-	if err != nil || !hmac.Equal(got, capabilityMAC(token, atespace, id, port, expiry)) {
+	if err != nil || hex.EncodeToString(got) != parts[2] ||
+		!hmac.Equal(got, capabilityMAC(token, atespace, id, port, expiry)) {
 		return errCapability
 	}
 	return nil
 }
 
 // capabilityCredential returns the capability that r carries as
-// "Authorization: Basic" with the user CapabilityUser, if any.
-func capabilityCredential(r *http.Request) (string, bool) {
-	scheme, payload, ok := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " ")
+// "Authorization: Basic" with the user CapabilityUser. It looks at each
+// Authorization field and at each element of a comma-separated value, thus a
+// capability cannot hide behind another credential. ambiguous reports a
+// capability next to any other credential: Authorization is a single field,
+// and a capability must be the request's only one.
+func capabilityCredential(r *http.Request) (capability string, found, ambiguous bool) {
+	values := r.Header.Values("Authorization")
+	for _, v := range values {
+		elements := strings.Split(v, ",")
+		for _, e := range elements {
+			c, ok := parseCapabilityCredential(e)
+			if !ok {
+				continue
+			}
+			if found || len(values) > 1 || len(elements) > 1 {
+				ambiguous = true
+			}
+			capability, found = c, true
+		}
+	}
+	return capability, found, ambiguous
+}
+
+// parseCapabilityCredential returns the capability in one credential of the
+// form "Basic base64(CapabilityUser:capability)".
+func parseCapabilityCredential(credential string) (string, bool) {
+	scheme, payload, ok := strings.Cut(strings.TrimSpace(credential), " ")
 	if !ok || !strings.EqualFold(scheme, "Basic") {
 		return "", false
 	}
@@ -106,14 +135,13 @@ func capabilityCredential(r *http.Request) (string, bool) {
 	return capability, true
 }
 
-// isWebSocketUpgrade reports whether r asks to switch to WebSocket.
+// isWebSocketUpgrade reports whether r is a WebSocket handshake that
+// httputil.ReverseProxy forwards as an upgrade: a GET whose Connection lists
+// "upgrade" and whose Upgrade lists "websocket". ReverseProxy removes Upgrade
+// from a request without "Connection: upgrade" and forwards a plain request,
+// thus a capability must not authorize that request.
 func isWebSocketUpgrade(r *http.Request) bool {
-	for _, v := range r.Header.Values("Upgrade") {
-		for _, p := range strings.Split(v, ",") {
-			if strings.EqualFold(strings.TrimSpace(p), "websocket") {
-				return true
-			}
-		}
-	}
-	return false
+	return r.Method == http.MethodGet &&
+		httpguts.HeaderValuesContainsToken(r.Header["Connection"], "Upgrade") &&
+		httpguts.HeaderValuesContainsToken(r.Header["Upgrade"], "websocket")
 }

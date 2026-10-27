@@ -392,7 +392,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // header to drop upstream. It answers 401 and returns false when the check
 // fails.
 func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request, t *target) bool {
-	capability, hasCapability := capabilityCredential(r)
+	capability, hasCapability, ambiguous := capabilityCredential(r)
+	if ambiguous {
+		// Refused whether or not the proxy checks callers: forwarding would
+		// hand the daemon a capability, and dropping all Authorization would
+		// silently drop the daemon's own credential.
+		http.Error(w, "a port capability must be the only Authorization credential", http.StatusBadRequest)
+		return false
+	}
 	if hasCapability {
 		// A capability is the API's credential, never the daemon's: drop it
 		// whether or not the proxy checks it.

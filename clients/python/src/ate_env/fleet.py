@@ -168,16 +168,19 @@ class SandboxFleet:
 
         Replaces the tasks loaded before; ``add_tasks`` appends instead. If
         ``plan()`` has run, the plan is recomputed for the new tasks.
-        Duplicate ids are accepted here; ``acquire`` by id then resolves to
-        the first task with that id.
+
+        Raises ValueError, and keeps the tasks loaded before, if a task id
+        repeats within ``tasks``: like ``add_tasks``, ``acquire`` by id must
+        resolve to one task.
         """
         normalized = self._normalize_tasks(tasks)
+        repeated = self._repeated_ids(normalized)
+        if repeated:
+            raise ValueError(f"Task ids repeated: {repeated}")
         with self._lock:
             self._tasks = normalized
             self._task_ids = {t.id for t in normalized}
-            replan = self._plan is not None
-        if replan:
-            self._plan_entries()
+        self._replan_if_planned()
         logger.info("Fleet loaded %d tasks (%d unique images)",
                     len(normalized), len(self.image_counts()))
 
@@ -200,19 +203,35 @@ class SandboxFleet:
         if not new:
             return new
         ids = [t.id for t in new]
-        repeated = {i for i, n in collections.Counter(ids).items() if n > 1}
         with self._lock:
-            dupes = sorted(repeated | (set(ids) & self._task_ids))
+            dupes = sorted(set(self._repeated_ids(new)) | (set(ids) & self._task_ids))
             if dupes:
                 raise ValueError(f"Task ids already in the fleet or repeated: {dupes}")
             self._tasks.extend(new)
             self._task_ids.update(ids)
-            replan = self._plan is not None
             total = len(self._tasks)
-        if replan:
-            self._plan_entries()
+        self._replan_if_planned()
         logger.debug("Fleet added %d tasks (%d total)", len(new), total)
         return new
+
+    @staticmethod
+    def _repeated_ids(tasks: list[Task]) -> list[str]:
+        counts = collections.Counter(t.id for t in tasks)
+        return sorted(i for i, n in counts.items() if n > 1)
+
+    def _replan_if_planned(self) -> None:
+        """Recompute the plan if ``plan()`` has run, after a task change.
+
+        The decision reads ``_plan`` under ``_plan_lock``, which is the lock
+        that writes it: a ``plan()`` that took its snapshot of the tasks
+        before the change finishes first, and then this recomputes it with
+        the change. ``_lock`` is not held here, so the lock order is the one
+        of ``plan()`` (``_plan_lock``, then ``_lock`` inside
+        ``image_counts``).
+        """
+        with self._plan_lock:
+            if self._plan is not None:
+                self._plan_entries_locked()
 
     @staticmethod
     def _normalize_tasks(tasks: list[Any]) -> list[Task]:

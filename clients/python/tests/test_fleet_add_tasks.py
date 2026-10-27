@@ -164,3 +164,52 @@ def test_load_tasks_resets_the_known_ids():
     fleet.load_tasks([Task(id="b", image="img-b")])
     fleet.add_tasks([Task(id="a", image="img-a")])     # "a" was replaced away
     assert [t.id for t in fleet.tasks] == ["b", "a"]
+
+
+def test_load_tasks_rejects_repeated_ids_and_keeps_the_old_tasks():
+    fleet = _fleet()
+    fleet.load_tasks([Task(id="a", image="img-a")])
+    with pytest.raises(ValueError, match=r"\['x'\]"):
+        fleet.load_tasks([Task(id="x", image="img-1"), Task(id="y", image="img-2"),
+                          Task(id="x", image="img-3")])
+    assert [t.id for t in fleet.tasks] == ["a"]         # nothing replaced
+    fleet.add_tasks([Task(id="x", image="img-1")])      # "x" was never loaded
+
+
+@pytest.mark.parametrize("change", ["add_tasks", "load_tasks"])
+def test_task_change_during_first_plan_is_in_the_plan(change):
+    """plan() snapshots the tasks, a task change lands, then plan() stores.
+
+    The change must still reach the plan: the replan decision waits for the
+    plan() in progress instead of reading ``_plan is None`` and skipping.
+    """
+    fleet = _fleet()
+    fleet.load_tasks([Task(id="a", image="img-a")])
+    in_plan, resume = threading.Event(), threading.Event()
+    real = fleet._ensure_template_for_image
+
+    def paused(img):
+        if img == "img-a" and not resume.is_set():
+            in_plan.set()          # plan() holds _plan_lock and has its snapshot
+            assert resume.wait(5)
+        return real(img)
+
+    fleet._ensure_template_for_image = paused
+    planner = threading.Thread(target=fleet.plan)
+    planner.start()
+    assert in_plan.wait(5)
+
+    new = [Task(id="a", image="img-a"), Task(id="b", image="img-b")]
+    changer = threading.Thread(
+        target=lambda: fleet.add_tasks(new[1:]) if change == "add_tasks" else fleet.load_tasks(new))
+    changer.start()
+    for _ in range(500):           # wait until the change is in the task list
+        if "b" in {t.id for t in fleet.tasks}:
+            break
+        threading.Event().wait(0.01)
+    assert "b" in {t.id for t in fleet.tasks}
+    resume.set()
+    planner.join(5)
+    changer.join(5)
+    assert not planner.is_alive() and not changer.is_alive()
+    assert fleet._plan.for_image("img-b") is not None

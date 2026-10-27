@@ -335,7 +335,9 @@ nobody planned, or a trainer that streams batches from a prompt source, calls
 a `run()` already in progress does not run the added tasks (`fleet.tasks` is
 a snapshot). Task ids must be new: `add_tasks` raises `ValueError` and adds
 nothing if an id is already in the fleet or repeats within the call.
-`load_tasks()` also recomputes an existing plan.
+`load_tasks()` follows the same rule within its list: it raises `ValueError`
+and keeps the tasks loaded before if an id repeats. It also recomputes an
+existing plan.
 
 ```python
 new = fleet.add_tasks(next_batch)                    # Task objects or dicts

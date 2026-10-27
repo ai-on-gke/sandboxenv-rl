@@ -217,20 +217,24 @@ func (l *lineLogger) flush() {
 // The sidecar check does not run on the probe request. Substrate drops each
 // probe request after 250 ms and polls every 1 ms, so a check bound to the
 // request would be cancelled with it, and a sidecar that takes longer than
-// 250 ms to answer would never count as ready. Each URL has at most one
-// check in flight, with its own checkTimeout; Ready waits up to readyWait
-// for it, thus a fast sidecar's answer, 2xx or not, is returned at once,
-// and a slow one's is recorded for a later probe.
+// 250 ms to answer would never count as ready. Each pending URL has at most
+// one check in flight, with its own checkTimeout, and checks of one URL
+// start at least minInterval apart. Ready starts the checks of all pending
+// URLs together and waits up to readyWait in total for them, thus fast
+// sidecars' answers, 2xx or not, are returned at once, and slow ones are
+// recorded for a later probe.
 type readyGate struct {
 	urls         []string
 	client       *http.Client
 	checkTimeout time.Duration
 	readyWait    time.Duration
+	minInterval  time.Duration
 
-	mu       sync.Mutex
-	seen     map[string]bool
-	inflight map[string]*readyCheck
-	last     map[string]string
+	mu        sync.Mutex
+	seen      map[string]bool
+	inflight  map[string]*readyCheck
+	last      map[string]string
+	lastStart map[string]time.Time
 }
 
 // readyCheck is one request to a sidecar readiness URL. ok and why are set
@@ -244,9 +248,15 @@ type readyCheck struct {
 const (
 	// sidecarCheckTimeout bounds one request to a sidecar readiness URL.
 	sidecarCheckTimeout = 2 * time.Second
-	// sidecarReadyWait bounds how long /readyz waits for the check in
-	// flight; it stays well inside the wakeup probe's 250 ms request limit.
+	// sidecarReadyWait bounds how long one /readyz call waits for the checks
+	// in flight, all URLs together; it stays well inside the wakeup probe's
+	// 250 ms request limit.
 	sidecarReadyWait = 100 * time.Millisecond
+	// sidecarCheckInterval is the shortest gap between two check starts for
+	// one URL. The probe polls each 1 ms, and a sidecar that refuses
+	// connections at once would otherwise get about 1000 requests a second
+	// while it boots.
+	sidecarCheckInterval = 50 * time.Millisecond
 )
 
 func newReadyGate(urls []string) *readyGate {
@@ -255,37 +265,46 @@ func newReadyGate(urls []string) *readyGate {
 		client:       &http.Client{},
 		checkTimeout: sidecarCheckTimeout,
 		readyWait:    sidecarReadyWait,
+		minInterval:  sidecarCheckInterval,
 		seen:         make(map[string]bool, len(urls)),
 		inflight:     make(map[string]*readyCheck, len(urls)),
 		last:         make(map[string]string, len(urls)),
+		lastStart:    make(map[string]time.Time, len(urls)),
 	}
 }
 
 // Ready reports whether every URL has answered 2xx, and if not, which one is
-// still pending and why. ctx only bounds the wait; the check itself goes on.
+// still pending and why: the first in flag order. ctx only bounds the wait;
+// the checks themselves go on.
 func (g *readyGate) Ready(ctx context.Context) (bool, string) {
+	type pending struct {
+		url, last string
+		check     *readyCheck
+	}
+	var todo []pending
+	g.mu.Lock()
 	for _, u := range g.urls {
-		g.mu.Lock()
-		if g.seen[u] {
-			g.mu.Unlock()
-			continue
+		if !g.seen[u] {
+			todo = append(todo, pending{u, g.last[u], g.startCheckLocked(u)})
 		}
-		c := g.startCheckLocked(u)
-		last := g.last[u]
-		g.mu.Unlock()
+	}
+	g.mu.Unlock()
+	if len(todo) == 0 {
+		return true, ""
+	}
 
-		timer := time.NewTimer(g.readyWait)
+	timer := time.NewTimer(g.readyWait)
+	defer timer.Stop()
+	for _, p := range todo {
 		select {
-		case <-c.done:
-			timer.Stop()
-			if !c.ok {
-				return false, c.why
+		case <-p.check.done:
+			if !p.check.ok {
+				return false, p.check.why
 			}
 		case <-timer.C:
-			return false, pendingReason(u, last)
+			return false, pendingReason(p.url, p.last)
 		case <-ctx.Done():
-			timer.Stop()
-			return false, pendingReason(u, last)
+			return false, pendingReason(p.url, p.last)
 		}
 	}
 	return true, ""
@@ -298,15 +317,24 @@ func pendingReason(u, last string) string {
 	return fmt.Sprintf("sidecar readiness %s: check in flight", u)
 }
 
-// startCheckLocked returns the check in flight for u, or starts one. g.mu
-// must be held.
+// startCheckLocked returns the check in flight for u, or starts one, no
+// sooner than minInterval after the previous start. g.mu must be held.
 func (g *readyGate) startCheckLocked(u string) *readyCheck {
 	if c := g.inflight[u]; c != nil {
 		return c
 	}
+	now := time.Now()
+	delay := time.Duration(0)
+	if prev, ok := g.lastStart[u]; ok {
+		delay = max(prev.Add(g.minInterval).Sub(now), 0)
+	}
+	g.lastStart[u] = now.Add(delay)
 	c := &readyCheck{done: make(chan struct{})}
 	g.inflight[u] = c
 	go func() {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), g.checkTimeout)
 		defer cancel()
 		ok, why := g.check(ctx, u)

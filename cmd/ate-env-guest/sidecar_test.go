@@ -175,6 +175,90 @@ func TestReadyGateSendsOneRequestAtATimeForEachURL(t *testing.T) {
 	}
 }
 
+// slowSidecar answers 2xx after d and counts its requests.
+func slowSidecar(t *testing.T, d time.Duration, count *atomic.Int32) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if count != nil {
+			count.Add(1)
+		}
+		select {
+		case <-time.After(d):
+			w.WriteHeader(http.StatusOK)
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL + "/ready"
+}
+
+// One /readyz call must answer inside the probe's 250 ms request limit
+// however many sidecar readiness URLs the template has.
+func TestReadyGateWaitsOnceForAllURLs(t *testing.T) {
+	for _, d := range []time.Duration{90 * time.Millisecond, 300 * time.Millisecond} {
+		var urls []string
+		for range 3 {
+			urls = append(urls, slowSidecar(t, d, nil))
+		}
+		g := newReadyGate(urls)
+		start := time.Now()
+		ok, why := g.Ready(context.Background())
+		if took := time.Since(start); took > 200*time.Millisecond {
+			t.Errorf("3 sidecars of %s: Ready took %s, want about %s (one wait for all URLs)", d, took, sidecarReadyWait)
+		}
+		if want := d < sidecarReadyWait; ok != want {
+			t.Errorf("3 sidecars of %s: Ready = %v, %q; want %v", d, ok, why, want)
+		}
+	}
+}
+
+// A slow first sidecar must not hold back the checks of the others: the
+// time to ready is the longest boot, not the sum.
+func TestReadyGateChecksAllPendingURLsTogether(t *testing.T) {
+	var second atomic.Int32
+	g := newReadyGate([]string{
+		slowSidecar(t, time.Second, nil),
+		slowSidecar(t, time.Second, &second),
+	})
+	start := time.Now()
+	g.Ready(context.Background())
+	if got := second.Load(); got != 1 {
+		t.Errorf("second URL got %d requests while the first was pending, want 1", got)
+	}
+	for !func() bool { ok, _ := g.Ready(context.Background()); return ok }() {
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("not ready after 5s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if took := time.Since(start); took > 1600*time.Millisecond {
+		t.Errorf("two 1 s sidecars took %s to be ready, want about 1 s (checked together)", took)
+	}
+}
+
+// A sidecar that fails at once must not get a request for each 1 ms probe
+// poll while it boots.
+func TestReadyGateSpacesChecksOfOneURL(t *testing.T) {
+	var n atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n.Add(1)
+		http.Error(w, "booting", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	g := newReadyGate([]string{srv.URL + "/ready"})
+	stop := time.Now().Add(time.Second)
+	for time.Now().Before(stop) {
+		if ok, why := g.Ready(context.Background()); ok || !strings.Contains(why, "HTTP 503") && !strings.Contains(why, "in flight") {
+			t.Fatalf("Ready = %v, %q; want not ready", ok, why)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// One second at one check each 50 ms is 21 checks at most.
+	if got := n.Load(); got > 25 {
+		t.Errorf("sidecar got %d requests in 1s, want at most about %d", got, int(time.Second/sidecarCheckInterval)+1)
+	}
+}
+
 func TestRunSidecarRestartsAndStopsWithContext(t *testing.T) {
 	sh, err := exec.LookPath("sh")
 	if err != nil {

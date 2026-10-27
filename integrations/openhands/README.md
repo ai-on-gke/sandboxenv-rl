@@ -305,8 +305,8 @@ fork), and a `RemoteConversation` whose event WebSocket goes through the proxy.
 
 ## Verified
 
-GKE with gVisor workers, Substrate main from 2026-10-12 (build v0.4.0-83), ate-env-api with the
-port proxy, agent-server 1.55.0 from this layer, 2026-10-15:
+GKE with gVisor workers, Substrate main from before v0.6.0, ate-env-api with the port proxy,
+agent-server 1.55.0 from this layer, 2026-10-15:
 
 | image | base | agent-server answering after create |
 |---|---|---|

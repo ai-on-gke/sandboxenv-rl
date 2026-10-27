@@ -73,6 +73,7 @@ actor boots. Retry until it serves (see the how-to below).
 | `Client.get()` / `Env.info()` | `EnvironmentService.GetEnvironment` | ate-env-api → control plane |
 | `Client.suspend()` / `Env.suspend()` | `EnvironmentService.SuspendEnvironment` | ate-env-api → control plane |
 | `Client.delete()` / `Env.delete()` | `EnvironmentService.DeleteEnvironment` | ate-env-api → control plane |
+| `Client.server_info()` | `EnvironmentService.GetServerInfo` | answered by ate-env-api |
 | `Client.env()` | *(no RPC — returns a handle)* | — |
 | `Env.start_process()` | `ProcessService.StartProcess` | proxied to guest |
 | `Env.process()` | *(no RPC — returns a handle)* | — |
@@ -311,6 +312,21 @@ try:
 except NotFoundError:
     data = None
 ```
+
+### Share one run id across a job's processes
+
+Each `SandboxFleet` gets a random `run_id`. A training or eval job usually has
+several processes (an orchestrator that plans and warms, workers that claim and
+step), so give them all the job's id:
+
+```python
+cfg = FleetConfig(run_id=os.environ["JOB_PREFIX"])   # a DNS-1123 label
+fleet = SandboxFleet(cfg)                             # same run_id in every process
+```
+
+Handles (`handle.run_id`), the run report's `environment` block and
+`teardown()` then all carry the job's id. Each process still releases only the
+environments it created.
 
 ### Concurrency
 

@@ -176,6 +176,18 @@ func (c *Client) Delete(ctx context.Context, atespace, id string) error {
 	return nil
 }
 
+// ServerInfo returns the server implementation, its version, the Substrate
+// version it was built against and its optional features. Check a feature
+// with slices.Contains(info.GetFeatures(), name) before depending on it. A
+// server that predates GetServerInfo returns an error with codes.Unimplemented.
+func (c *Client) ServerInfo(ctx context.Context) (*ateenvv1alpha.GetServerInfoResponse, error) {
+	resp, err := c.grpc.GetServerInfo(c.withAuth(ctx), &ateenvv1alpha.GetServerInfoRequest{})
+	if err != nil {
+		return nil, fromGRPCError(err)
+	}
+	return resp, nil
+}
+
 // Env returns a handle to an environment without checking that it exists.
 func (c *Client) Env(atespace, id string) *Env {
 	if atespace == "" {

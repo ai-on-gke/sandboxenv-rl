@@ -148,14 +148,14 @@ func TestWriteComparison(t *testing.T) {
 		{RunID: "a", Event: EventWake, Step: 1, DurMS: 40, OK: true},
 		{RunID: "a", Event: EventBarrier, Step: 1, DurMS: 700, OK: true, Count: 3},
 		{RunID: "a", Event: EventPark, Name: "suspend", Step: 1, DurMS: 100, OK: true, Count: 1},
-		{RunID: "a", Event: EventRun, Name: "steps", DurMS: 2000, OK: true, Count: 1},
+		{RunID: "a", Event: EventRun, Name: "steps", DurMS: 2000, OK: true, Count: 1, Labels: map[string]string{"cluster": "east", "mode": "steps"}},
 	})
 	b := Build([]Event{
 		{RunID: "b", Event: EventCreate, DurMS: 50, OK: true},
 		{RunID: "b", Event: EventCreate, DurMS: 70, OK: false, Err: "boom"},
 		{RunID: "b", Event: EventDelete, DurMS: 70, OK: false, Err: "boom"},
 		{RunID: "b", Event: EventTask, DurMS: 400, OK: true, Reward: intp(1)}, // eval mode: step 0
-		{RunID: "b", Event: EventRun, Name: "eval", DurMS: 1000, OK: true, Count: 1},
+		{RunID: "b", Event: EventRun, Name: "eval", DurMS: 1000, OK: true, Count: 1, Labels: map[string]string{"tasks": "operator"}},
 	})
 	var out bytes.Buffer
 	WriteComparison(&out, []*Report{a, b}, []string{"runs/a.jsonl", "runs/b.jsonl"})
@@ -167,6 +167,17 @@ func TestWriteComparison(t *testing.T) {
 	}
 	if strings.Count(text, "cells:") != 1 || !strings.HasPrefix(text, "cells:") {
 		t.Errorf("the legend must appear once, above the table:\n%s", text)
+	}
+	flat := strings.Join(strings.Fields(text), " ")
+	if !strings.Contains(flat, "cluster east -") {
+		t.Errorf("label row: want \"cluster east -\" in:\n%s", text)
+	}
+	if !strings.Contains(flat, "mode steps eval reps 1 1") || strings.Count(flat, "mode ") != 1 {
+		t.Errorf("want one mode row (the label repeats it) and a reps row in:\n%s", text)
+	}
+	// An operator label named like a built-in row keeps its own row, prefixed.
+	if !strings.Contains(flat, "label.tasks - operator") || strings.Count(flat, " tasks ") != 2 {
+		t.Errorf("want a label.tasks row next to the tasks row in:\n%s", text)
 	}
 	// A run without the event, or without the step, shows a dash in its column.
 	for _, label := range []string{"ttfi", "step 1"} {
@@ -370,7 +381,6 @@ func TestJoinRestores(t *testing.T) {
 	if n < 2 || b.Wakes.Phases[n-1].Phase != "ateom_restore" || b.Wakes.Phases[n-2].Phase != "total" {
 		t.Fatalf("unknown phase must follow the known ones: %+v", b.Wakes.Phases)
 	}
-
 	rep := Build(events)
 	rep.Restores = b
 	var text bytes.Buffer
@@ -380,5 +390,97 @@ func TestJoinRestores(t *testing.T) {
 		if !strings.Contains(flat, want) {
 			t.Errorf("text report lacks %q:\n%s", want, text.String())
 		}
+	}
+}
+
+func TestBuildPoolsStepsAcrossRuns(t *testing.T) {
+	// Two reps of one arm merged: per-step figures become medians, counts sum.
+	rep := Build([]Event{
+		{RunID: "r1", Event: EventTask, Step: 1, DurMS: 500, OK: true, Reward: intp(1)},
+		{RunID: "r1", Event: EventBarrier, Step: 1, DurMS: 600, OK: true, Count: 2},
+		{RunID: "r1", Event: EventPark, Name: "suspend", Step: 1, DurMS: 100, OK: true, Count: 2},
+		{RunID: "r1", Event: EventRun, Name: "steps", DurMS: 1000, OK: true, Count: 1, Labels: map[string]string{"arm": "pull"}},
+		{RunID: "r2", Event: EventTask, Step: 1, DurMS: 400, OK: true, Reward: intp(1)},
+		{RunID: "r2", Event: EventBarrier, Step: 1, DurMS: 800, OK: true, Count: 4},
+		{RunID: "r2", Event: EventPark, Name: "suspend", Step: 1, DurMS: 300, OK: true, Count: 4},
+		{RunID: "r2", Event: EventRun, Name: "steps", DurMS: 1200, OK: true, Count: 1, Labels: map[string]string{"arm": "other"}},
+	})
+	if len(rep.Steps) != 1 {
+		t.Fatalf("steps: %+v", rep.Steps)
+	}
+	s := rep.Steps[0]
+	// Counts add up, durations take the median.
+	if s.Tasks != 2 || s.Live != 6 || s.BarrierMS != 700 || s.ParkMS != 200 {
+		t.Fatalf("pooled step: %+v (want tasks 2, live 6, barrier 700, park 200)", s)
+	}
+	if rep.Reps != 2 || strings.Join(rep.Runs, ",") != "r1,r2" || rep.RunMS != 1100 || rep.Mode != "steps" {
+		t.Fatalf("reps %d runs %v run_ms %v mode %q, want 2, r1,r2, 1100 (the median), steps", rep.Reps, rep.Runs, rep.RunMS, rep.Mode)
+	}
+	if rep.Labels["arm"] != "pull|other" {
+		t.Fatalf("a label that differs across the reps shows every value: %v", rep.Labels)
+	}
+}
+
+func TestMedian(t *testing.T) {
+	for _, tc := range []struct {
+		in   []float64
+		want float64
+	}{{nil, 0}, {[]float64{7}, 7}, {[]float64{4, 1, 3}, 3}, {[]float64{800, 600}, 700}, {[]float64{1, 2, 3, 4}, 2.5}} {
+		if got := median(append([]float64(nil), tc.in...)); got != tc.want {
+			t.Errorf("median(%v) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestPool(t *testing.T) {
+	run := func(id string, labels map[string]string, events ...Event) []Event {
+		out := append([]Event{{RunID: id, Event: EventCreate, DurMS: 100, OK: true}}, events...)
+		return append(out, Event{RunID: id, Event: EventRun, Name: "eval", DurMS: 1000, OK: true, Count: 1, Labels: labels})
+	}
+	same := map[string]string{"mode": "eval", "width": "2", "commit": "aaa"}
+	other := map[string]string{"mode": "eval", "width": "2", "commit": "bbb"}
+	rep, err := Pool([][]Event{run("r1", same), run("r2", other)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Reps != 2 || strings.Join(rep.Runs, ",") != "r1,r2" || rep.Labels["commit"] != "aaa|bbb" || rep.Labels["width"] != "2" {
+		t.Fatalf("pooled: reps %d runs %v labels %v", rep.Reps, rep.Runs, rep.Labels)
+	}
+	for _, tc := range []struct {
+		name string
+		runs [][]Event
+		err  string
+	}{
+		{"no run event", [][]Event{run("r1", same), {{RunID: "r2", Event: EventCreate, DurMS: 1, OK: true}}}, "rep 2 has no run event"},
+		{"run id twice", [][]Event{run("r1", same), run("r1", same)}, `rep 2 repeats run id "r1" of rep 1`},
+		{"other workload", [][]Event{run("r1", same), run("r2", map[string]string{"mode": "eval", "width": "3"})}, `rep 2 differs from rep 1 in width ("3", "2")`},
+		{"no loader labels", [][]Event{run("r1", same), run("r2", nil)}, `rep 2 (run "r2") has no loader labels`},
+		{"two runs in one file", [][]Event{append(run("r1", same), run("r2", same)...)}, "rep 1 holds 2 run events"},
+	} {
+		if _, err := Pool(tc.runs); err == nil || !strings.Contains(err.Error(), tc.err) {
+			t.Errorf("%s: err = %v, want %q", tc.name, err, tc.err)
+		}
+	}
+}
+
+func TestSlowest(t *testing.T) {
+	events := []Event{
+		{Event: EventTTFI, Env: "e1", Instance: "i1", DurMS: 10, OK: true},
+		{Event: EventTTFI, Env: "e2", Instance: "i2", DurMS: 30, OK: true, Attempts: 2},
+		{Event: EventTTFI, Env: "e3", Instance: "i3", DurMS: 20, OK: true},
+		{Event: EventTTFI, Env: "e4", Instance: "i4", DurMS: 99, OK: false},
+		{Event: EventWake, Env: "e1", Step: 2, DurMS: 5, OK: true},
+		{Event: EventWake, Env: "e2", Step: 2, DurMS: 7, OK: true},
+	}
+	got := Slowest(events, 2)
+	if len(got) != 4 || got[0].Env != "e2" || got[0].Attempts != 2 || got[1].Env != "e3" || got[2].Event != EventWake || got[2].Env != "e2" || got[3].Env != "e1" {
+		t.Fatalf("slowest: %+v", got)
+	}
+	rep := Build(events)
+	rep.Slowest = got
+	var text bytes.Buffer
+	rep.WriteText(&text)
+	if flat := strings.Join(strings.Fields(text.String()), " "); !strings.Contains(flat, "slowest first commands and wakes: event env instance step ms attempts ttfi e2 i2 0 30 2") {
+		t.Fatalf("slowest table:\n%s", text.String())
 	}
 }

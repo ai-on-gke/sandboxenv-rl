@@ -45,6 +45,7 @@ import pathlib
 import re
 import threading
 import time
+import weakref
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -71,10 +72,14 @@ FLEET_SPAN_PREFIX = "ate_env_fleet"
 # The ate_env_fleet_* collectors on the default registry, created by _ensure_metrics
 # on the first metrics-enabled Observer, never at import.
 PHASE_LATENCY = TASK_LATENCY = RUN_LATENCY = CLAIMS = TASKS = WARM_REPLICAS = None
+RELEASE_FAILURES = None
 _METRICS_READY = False
 _METRICS_LOCK = threading.Lock()
-# Collector sets for caller-supplied registries, keyed by id(registry).
-_CUSTOM_COLLECTORS: dict[int, SimpleNamespace] = {}
+# Collector sets for caller-supplied registries, held weakly so that each set
+# goes away with its registry. Keying by id(registry) is not safe: a new registry
+# can reuse a dead one's id and would get the dead one's collectors.
+_CUSTOM_COLLECTORS: weakref.WeakKeyDictionary[Any, SimpleNamespace] = (
+    weakref.WeakKeyDictionary())
 
 
 def _build_collectors(prom: Any, registry: Any) -> SimpleNamespace:
@@ -94,6 +99,10 @@ def _build_collectors(prom: Any, registry: Any) -> SimpleNamespace:
                        ["backend", "status"], **reg),
         tasks=_metric(prom.Counter, "ate_env_fleet_tasks_total", "Tasks processed",
                       ["strategy", "status"], **reg),
+        release_failures=_metric(
+            prom.Counter, "ate_env_fleet_release_failures_total",
+            "Environment releases (deletes) that failed; the environment may have leaked",
+            ["backend"], **reg),
         warm_replicas=_metric(prom.Gauge, "ate_env_fleet_warm_replicas", "Current warm replicas",
                               ["backend"], **reg),
     )
@@ -106,25 +115,26 @@ def _ensure_metrics(registry: Any = None) -> SimpleNamespace | None:
     prometheus_client.
     """
     global _METRICS_READY, PHASE_LATENCY, TASK_LATENCY, RUN_LATENCY
-    global CLAIMS, TASKS, WARM_REPLICAS
+    global CLAIMS, TASKS, WARM_REPLICAS, RELEASE_FAILURES
     prom = _load_prom()
     if prom is None:
         log_missing_extra()
         return None
     with _METRICS_LOCK:
         if registry is not None and registry is not prom.REGISTRY:
-            key = id(registry)
-            if key not in _CUSTOM_COLLECTORS:
-                _CUSTOM_COLLECTORS[key] = _build_collectors(prom, registry)
-            return _CUSTOM_COLLECTORS[key]
+            if registry not in _CUSTOM_COLLECTORS:
+                _CUSTOM_COLLECTORS[registry] = _build_collectors(prom, registry)
+            return _CUSTOM_COLLECTORS[registry]
         if not _METRICS_READY:
             c = _build_collectors(prom, None)
             PHASE_LATENCY, TASK_LATENCY, RUN_LATENCY = c.phase_latency, c.task_latency, c.run_latency
             CLAIMS, TASKS, WARM_REPLICAS = c.claims, c.tasks, c.warm_replicas
+            RELEASE_FAILURES = c.release_failures
             _METRICS_READY = True
         return SimpleNamespace(
             phase_latency=PHASE_LATENCY, task_latency=TASK_LATENCY, run_latency=RUN_LATENCY,
-            claims=CLAIMS, tasks=TASKS, warm_replicas=WARM_REPLICAS)
+            claims=CLAIMS, tasks=TASKS, warm_replicas=WARM_REPLICAS,
+            release_failures=RELEASE_FAILURES)
 
 
 _FAMILY_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
@@ -137,9 +147,19 @@ _ARCH_MARKERS = ("x86_64.", "arm64.")
 MAX_FAMILIES = 64
 _FAMILIES: set[str] = set()
 _FAMILIES_LOCK = threading.Lock()
+#: Label values with a fixed meaning (no repo family, overflow).
+_RESERVED_FAMILIES = ("other", "unknown")
+#: Repo families that are escaped by appending ``_repo``: a reserved name
+#: followed by zero or more ``_repo``. Escaping all of them, not only the
+#: reserved names, keeps the mapping one-to-one: ``other`` -> ``other_repo``,
+#: ``other_repo`` -> ``other_repo_repo``, and so on, so no two repos share a
+#: label value and no repo shares one with a reserved value.
+_ESCAPED_FAMILY_RE = re.compile(r"^(?:other|unknown)(?:_repo)*$")
 
 
 def _bounded_family(name: str) -> str:
+    if _ESCAPED_FAMILY_RE.match(name):
+        name += "_repo"
     if name in _FAMILIES:
         return name
     with _FAMILIES_LOCK:
@@ -157,8 +177,12 @@ def repo_family(task_or_image: Any) -> str:
     Prefers ``task.metadata["repo"]`` (``django/django`` -> ``django``); else
     parses a SWE-bench image name
     (``sweb.eval.x86_64.astropy__astropy-12907:latest`` -> ``astropy``); else
-    ``"unknown"``. After :data:`MAX_FAMILIES` distinct families in this
-    process, any new family is ``"other"``. Only SWE-bench image names are
+    ``"unknown"``. A repo whose family is ``other`` or ``unknown`` is
+    labelled ``other_repo`` / ``unknown_repo``, so it cannot be mistaken for
+    the overflow or no-family value; a repo already named like an escaped
+    value (``other_repo``) gets one more ``_repo``, so labels stay unique. After :data:`MAX_FAMILIES` distinct
+    families in this process, any new family is ``"other"``; families seen
+    before keep their name. Only SWE-bench image names are
     parsed: set ``metadata["repo"]`` for non-SWE-bench datasets (e.g.
     R2E-Gym); otherwise their family is ``"unknown"``.
     """
@@ -195,14 +219,21 @@ class RunReport:
     claims: int = 0
     tasks_ok: int = 0
     tasks_err: int = 0
+    release_errors: int = 0
     warm_total: int = 0
     peak_warm: int = 0
     environment: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     ORDER = ("preflight", "plan", "ensure_template", "warm_pool", "acquire", "process",
-             "recycle", "release", "teardown")
+             "recycle", "release", "reap", "teardown")
 
     def add_phase(self, name: str, dur: float) -> None:
+        """Add one ``name`` phase of ``dur`` seconds.
+
+        Durations come from a monotonic clock; a negative value is clamped
+        to 0, so every phase keeps ``0 <= max_s <= total_s``.
+        """
+        dur = max(0.0, dur)
         c = self.phases.setdefault(name, [0, 0.0, 0.0])
         c[0] += 1
         c[1] += dur
@@ -217,6 +248,9 @@ class RunReport:
     def add_claim(self) -> None:
         self.claims += 1
 
+    def add_release_error(self) -> None:
+        self.release_errors += 1
+
     def _ordered(self) -> list[tuple[str, list[float]]]:
         names = list(self.ORDER) + [p for p in self.phases if p not in self.ORDER]
         return [(p, self.phases[p]) for p in names if p in self.phases]
@@ -230,6 +264,7 @@ class RunReport:
             "claims": self.claims,
             "tasks_ok": self.tasks_ok,
             "tasks_err": self.tasks_err,
+            "release_errors": self.release_errors,
             "warm_replicas_total": self.warm_total,
             "warm_replicas_peak": self.peak_warm,
             "environment": self.environment,
@@ -259,6 +294,9 @@ class RunReport:
         lines.append(f"  {'TOTAL':<18} {self.total_s:8.2f}s")
         lines.append(f"  claims={self.claims}  tasks={self.tasks_ok}ok/{self.tasks_err}err"
                      f"  warm_replicas total={self.warm_total} peak={self.peak_warm}")
+        if self.release_errors:
+            lines.append(f"  release_errors={self.release_errors}  (failed deletes; "
+                         "environments may have leaked)")
         return "\n".join(lines)
 
     def write(self, report_dir: str | pathlib.Path, n_tasks: int | None = None) -> pathlib.Path:
@@ -318,6 +356,7 @@ class Observer:
             self._phase_latency, self._task_latency, self._run_latency = (
                 c.phase_latency, c.task_latency, c.run_latency)
             self._claims, self._tasks, self._warm_replicas = c.claims, c.tasks, c.warm_replicas
+            self._release_failures = c.release_failures
         self.tracer = tracer_from_config(TracerConfig(
             enable_tracing=self.config.enable_tracing,
             trace_service_name=self.config.trace_service_name,
@@ -389,6 +428,12 @@ class Observer:
                 self._run_latency.labels(strategy=strategy, status=status).observe(report.total_s)
 
     def task_done(self, backend: str, family: str, status: str, seconds: float) -> None:
+        """Record one finished task that took ``seconds``.
+
+        Durations come from a monotonic clock; a negative value is clamped
+        to 0.
+        """
+        seconds = max(0.0, seconds)
         if self.metrics:
             self._task_latency.labels(strategy=self._strategy, backend=backend,
                                 family=family, status=status).observe(seconds)
@@ -403,6 +448,14 @@ class Observer:
         if self._in_run and self.report is not None and status == "ok":
             with self._lock:
                 self.report.add_claim()
+
+    def release_failed(self, backend: str) -> None:
+        """Record a release (delete) that failed; the driver logged and did not raise."""
+        if self.metrics:
+            self._release_failures.labels(backend=backend).inc()
+        if self._in_run and self.report is not None:
+            with self._lock:
+                self.report.add_release_error()
 
     # The warm-replica gauge is shared by every Observer in the process, so
     # each one moves it by its own deltas (inc/dec) instead of setting it to

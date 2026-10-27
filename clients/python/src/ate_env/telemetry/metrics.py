@@ -28,6 +28,7 @@ import contextlib
 import logging
 import threading
 import time
+import weakref
 from collections.abc import Iterator
 from typing import Any
 
@@ -88,8 +89,14 @@ def status_of(exc: BaseException) -> str:
     return "error"
 
 
-# (id(registry) or 0 for the global one, name) -> (collector, type, label names)
-_COLLECTORS: dict[tuple[int, str], tuple[Any, type, tuple[str, ...]]] = {}
+# name -> (collector, type, label names), one map per registry. The global
+# registry uses _COLLECTORS; a custom registry gets its own map, held weakly so
+# that it goes away with the registry. Keying by id(registry) is not safe: a
+# new registry can reuse a dead one's id and would get the dead one's collector.
+_Entry = tuple[Any, type, tuple[str, ...]]
+_COLLECTORS: dict[str, _Entry] = {}
+_REGISTRY_COLLECTORS: weakref.WeakKeyDictionary[Any, dict[str, _Entry]] = (
+    weakref.WeakKeyDictionary())
 
 
 def _metric(cls: Any, name: str, documentation: str, labelnames: Any = (), *,
@@ -104,9 +111,10 @@ def _metric(cls: Any, name: str, documentation: str, labelnames: Any = (), *,
     way.
     """
     labels = tuple(labelnames)
-    key = (id(registry) if registry is not None else 0, name)
     with _COLLECTOR_LOCK:
-        hit = _COLLECTORS.get(key)
+        cache = (_COLLECTORS if registry is None
+                 else _REGISTRY_COLLECTORS.setdefault(registry, {}))
+        hit = cache.get(name)
         if hit is None:
             reg_kw = {} if registry is None else {"registry": registry}
             try:
@@ -115,7 +123,7 @@ def _metric(cls: Any, name: str, documentation: str, labelnames: Any = (), *,
                 collector = _registered(name, registry)
                 if collector is None:
                     raise
-            hit = _COLLECTORS[key] = (collector, type(collector),
+            hit = cache[name] = (collector, type(collector),
                                       tuple(getattr(collector, "_labelnames", labels)))
     collector, kind, have = hit
     if not issubclass(kind, cls) or have != labels:

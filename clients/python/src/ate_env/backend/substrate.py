@@ -20,6 +20,7 @@ import os
 import threading
 import time
 import uuid
+import zlib
 from collections.abc import Mapping
 from typing import Any
 
@@ -36,6 +37,7 @@ from ..loop_runner import LoopRunner
 from ..telemetry import metrics
 from ..telemetry.tracing import (
     CLIENT_SPAN_PREFIX,
+    mark_error,
     set_attributes,
     start_span,
     tracer_from_config,
@@ -105,7 +107,10 @@ class SubstrateBackendDriver(BackendDriver):
         ready_timeout_s: float = 180.0,
         loop_runner: LoopRunner | None = None,
         tracer_config: TracerConfig | None = None,
+        connections: int = 1,
     ):
+        if not isinstance(connections, int) or connections < 1:
+            raise ValueError(f"connections must be >= 1, got {connections!r}")
         target = (
             api_endpoint
             or os.environ.get("ATE_ENV_API_TARGET")
@@ -133,6 +138,11 @@ class SubstrateBackendDriver(BackendDriver):
         else:
             self._client = None
             self._owns_client = True
+        # A caller-provided client is used for every call; the pool only
+        # applies to clients the driver creates.
+        self.connections = connections if self._owns_client else 1
+        # Extra clients 1..connections-1; index 0 is self._client.
+        self._extra_clients: list[Client] = []
 
         self._lock = threading.Lock()
         self._owned_actors: dict[str, RawSandboxInstance] = {}
@@ -146,34 +156,77 @@ class SubstrateBackendDriver(BackendDriver):
                 self._owns_loop_runner = True
             return self._loop_runner
 
+    def _new_client(self) -> Client:
+        # With more than one connection, every channel gets its own
+        # subchannel pool: otherwise gRPC shares one TCP connection between
+        # channels with the same target and arguments, and that connection's
+        # HTTP/2 stream limit caps the calls in flight.
+        options = [("grpc.use_local_subchannel_pool", 1)] if self.connections > 1 else None
+        return Client(
+            self.api_endpoint,
+            auth_token=self.auth_token,
+            tracer_config=self.tracer_config,
+            channel_options=options,
+        )
+
     @property
     def client(self) -> Client:
-        if self._client is None:
-            self._client = Client(
-                self.api_endpoint, auth_token=self.auth_token, tracer_config=self.tracer_config
-            )
-        return self._client
+        # Under the lock, so concurrent first calls (for example from
+        # _client_for with index 0) create one channel, not several.
+        with self._lock:
+            if self._client is None:
+                self._client = self._new_client()
+            return self._client
+
+    def _client_for(self, actor_id: str) -> Client:
+        """The client that carries every call for actor_id.
+
+        Actors are spread over the pool by a stable hash, so all calls for
+        one actor share a connection (and so one ate-env-api pod).
+        """
+        if self.connections == 1:
+            return self.client
+        index = zlib.crc32(actor_id.encode()) % self.connections
+        if index == 0:
+            return self.client
+        with self._lock:
+            while len(self._extra_clients) < self.connections - 1:
+                self._extra_clients.append(self._new_client())
+            return self._extra_clients[index - 1]
+
+    def _take_owned_clients(self) -> list[Client]:
+        with self._lock:
+            clients = [c for c in [self._client, *self._extra_clients] if c is not None]
+            self._client = None
+            self._extra_clients = []
+        return clients
+
+    @staticmethod
+    async def _close_clients(clients: list[Client]) -> None:
+        """Close clients concurrently; every close runs even if one fails."""
+        results = await asyncio.gather(*(c.close() for c in clients), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     def _sync(self, coro: Any) -> Any:
         return self._get_loop_runner().run(coro)
 
     async def close_async(self) -> None:
-        if self._owns_client and self._client:
-            await self._client.close()
-            self._client = None
+        if self._owns_client:
+            await self._close_clients(self._take_owned_clients())
         if self._owns_loop_runner and self._loop_runner:
             self._loop_runner.stop()
             self._loop_runner = None
 
     def close(self) -> None:
         if self._loop_runner:
-            if self._owns_client and self._client:
-                self._loop_runner.run(self._client.close())
-                self._client = None
+            if self._owns_client:
+                self._loop_runner.run(self._close_clients(self._take_owned_clients()))
             if self._owns_loop_runner:
                 self._loop_runner.stop()
                 self._loop_runner = None
-        elif self._owns_client and self._client:
+        elif self._owns_client and (self._client or self._extra_clients):
             self._sync(self.close_async())
 
     async def preflight_async(self) -> None:
@@ -314,7 +367,7 @@ class SubstrateBackendDriver(BackendDriver):
                 # Verify warm actor still exists on the server
                 try:
                     await asyncio.wait_for(
-                        self.client.get(actor_id, atespace=self.atespace),
+                        self._client_for(actor_id).get(actor_id, atespace=self.atespace),
                         timeout=min(self.ready_timeout_s, 15.0),
                     )
                 except NotFoundError:
@@ -343,7 +396,7 @@ class SubstrateBackendDriver(BackendDriver):
                 last_err: Exception | None = None
                 for attempt in range(4):
                     try:
-                        await self.client.create(
+                        await self._client_for(actor_id).create(
                             actor_id,
                             template_name=template_id,
                             atespace=self.atespace,
@@ -428,16 +481,16 @@ class SubstrateBackendDriver(BackendDriver):
             actor_id = f"warm-{uuid.uuid4().hex[:10]}"
             async with sem:
                 try:
-                    await self.client.create(
+                    await self._client_for(actor_id).create(
                         actor_id,
                         template_name=template_id,
                         atespace=self.atespace,
                         rootfs_image=rootfs_image,
                     )
                     if wait:
-                        await self.client.suspend(actor_id, atespace=self.atespace)
+                        await self._client_for(actor_id).suspend(actor_id, atespace=self.atespace)
                     else:
-                        task = asyncio.create_task(self.client.suspend(actor_id, atespace=self.atespace))
+                        task = asyncio.create_task(self._client_for(actor_id).suspend(actor_id, atespace=self.atespace))
                         self._background_tasks.add(task)
                         def _done(t: asyncio.Task[Any]) -> None:
                             self._background_tasks.discard(t)
@@ -566,7 +619,7 @@ class SubstrateBackendDriver(BackendDriver):
         async def _delete_one(actor_id: str) -> None:
             async with sem:
                 try:
-                    await self.client.delete(actor_id, atespace=self.atespace)
+                    await self._client_for(actor_id).delete(actor_id, atespace=self.atespace)
                 except Exception as e:
                     logger.warning("Failed deleting warm actor %s: %s", actor_id, e)
                 with self._lock:
@@ -582,18 +635,40 @@ class SubstrateBackendDriver(BackendDriver):
 
         Note: Recycling suspends the actor and returns it to the warm pool
         without resetting guest filesystem or processes.
+
+        A failed delete does not raise, so a cleanup error never stops a
+        trainer, but it is not hidden either: the ``ate_env_client.release``
+        span and the ``ate_env_client_release_seconds`` sample get status
+        error, the fleet observer counts it
+        (``ate_env_fleet_release_failures_total``, ``RunReport.release_errors``),
+        and the environment stays owned by this driver so the run's ``reap``
+        tries again and raises if it still cannot delete it. An environment
+        that is already gone (NotFound) counts as released.
         """
-        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.release", {"ate.actor.name": instance_id}):
-            with metrics.timed("release"):
-                await self._release_internal(instance_id, recycle)
+        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.release",
+                        {"ate.actor.name": instance_id}) as span:
+            try:
+                with metrics.timed("release"):
+                    await self._release_internal(instance_id, recycle)
+            # Exception, not BaseException: a cancellation (CancelledError)
+            # must still propagate. _release_internal catches BaseException
+            # only to keep the environment owned for reap, then re-raises.
+            except Exception as e:
+                # Only the error type reaches the trace; the message can carry
+                # bucket paths and other server details.
+                mark_error(span, f"release failed: {type(e).__name__}")
+                set_attributes(span, {"error.type": type(e).__name__})
+                self._observe("release_failed")
+                logger.warning("Failed to delete environment %s: %s", instance_id, e)
 
     async def _release_internal(self, instance_id: str, recycle: bool) -> None:
+        """Suspend into the warm pool or delete; raises when the delete fails."""
         with self._lock:
             instance = self._owned_actors.pop(instance_id, None)
 
         if recycle and instance:
             try:
-                await self.client.suspend(instance_id, atespace=self.atespace)
+                await self._client_for(instance_id).suspend(instance_id, atespace=self.atespace)
                 pool_key = (instance.template_id, instance.rootfs_image)
                 with self._lock:
                     self._warm_paused_pool.setdefault(pool_key, []).append(instance_id)
@@ -605,10 +680,17 @@ class SubstrateBackendDriver(BackendDriver):
                 logger.warning("Failed to suspend actor %s for recycle, deleting: %s", instance_id, e)
 
         try:
-            await self.client.delete(instance_id, atespace=self.atespace)
-            logger.info("Deleted environment %s", instance_id)
-        except Exception as e:
-            logger.warning("Failed to delete environment %s: %s", instance_id, e)
+            await self._client_for(instance_id).delete(instance_id, atespace=self.atespace)
+        except NotFoundError:
+            logger.info("Environment %s was already deleted", instance_id)
+            return
+        except BaseException:
+            # Keep it owned, so the run's reap retries the delete.
+            if instance is not None:
+                with self._lock:
+                    self._owned_actors.setdefault(instance_id, instance)
+            raise
+        logger.info("Deleted environment %s", instance_id)
 
     def release(self, instance_id: str, recycle: bool = False) -> None:
         self._sync(self.release_async(instance_id, recycle=recycle))
@@ -640,9 +722,11 @@ class SubstrateBackendDriver(BackendDriver):
             nonlocal reaped_count
             async with sem:
                 try:
-                    await self.client.delete(aid, atespace=self.atespace)
+                    await self._client_for(aid).delete(aid, atespace=self.atespace)
                     async with reap_lock:
                         reaped_count += 1
+                except NotFoundError:
+                    pass  # already gone (e.g. a release that timed out after the delete landed)
                 except Exception as e:
                     logger.warning("Failed deleting actor %s during reap: %s", aid, e)
                     async with reap_lock:
@@ -673,6 +757,6 @@ class SubstrateBackendDriver(BackendDriver):
             env_id=instance.instance_id,
             endpoint=ep.address if ep else instance.endpoint,
             atespace=self.atespace,
-            client=self.client,
+            client=self._client_for(instance.instance_id),
             loop_runner=self._get_loop_runner(),
         ), ep

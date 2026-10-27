@@ -31,6 +31,7 @@ import (
 
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/ate"
+	"github.com/agent-substrate/env/internal/hostcheck"
 	"github.com/agent-substrate/env/internal/mcp"
 	"github.com/agent-substrate/env/internal/portproxy"
 	"github.com/agent-substrate/env/internal/routertls"
@@ -50,6 +51,36 @@ func isLoopbackAddr(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// Files that tell a pod its namespace and cluster domain.
+const (
+	resolvConfPath   = "/etc/resolv.conf"
+	podNamespacePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+)
+
+// serviceHostNames returns the in-cluster names of the Service service: the
+// namespace and cluster domain come from the resolv.conf search list, which
+// kubelet writes for each pod; else the namespace comes from POD_NAMESPACE or
+// the ServiceAccount namespace file, without the cluster-domain name. An
+// upgrade that keeps the old Deployment arguments thus keeps these names.
+func serviceHostNames(service string, readFile func(string) ([]byte, error), getenv func(string) string) []string {
+	if service == "" {
+		return nil
+	}
+	var namespace, domain string
+	if b, err := readFile(resolvConfPath); err == nil {
+		namespace, domain = hostcheck.ClusterDNS(string(b))
+	}
+	if namespace == "" {
+		namespace = strings.TrimSpace(getenv("POD_NAMESPACE"))
+	}
+	if namespace == "" {
+		if b, err := readFile(podNamespacePath); err == nil {
+			namespace = strings.TrimSpace(string(b))
+		}
+	}
+	return hostcheck.ServiceHosts(service, namespace, domain)
+}
+
 func main() {
 	var (
 		listen            = flag.String("listen", "0.0.0.0:7777", "address to serve the API on")
@@ -67,12 +98,23 @@ func main() {
 		authTokenFile     = flag.String("auth-token-file", "", "file with a bearer token required from gRPC, MCP and port-proxy callers; re-read when the file changes")
 		wakeBudget        = flag.Duration("wake-budget", apiservice.DefaultWakeBudget, "how long a guest call or a port-proxy request waits for a suspended environment to wake before failing; cold image pulls and cross-region snapshot reads exceed the router's own parking budget")
 		wakeRunningBudget = flag.Duration("wake-running-budget", apiservice.DefaultWakeRunningBudget, "how long a guest call waits when the environment is already RUNNING but the router still answers Unavailable (guest not yet listening vs. path down)")
+		allowedHosts      = flag.String("allowed-hosts", "", "comma-separated host names that HTTP callers may send in the Host header, next to IP addresses, localhost, names under .localhost and the names of --service-name, which are always allowed; a leading *. allows the names below it. Other names get 403, which blocks DNS rebinding against the listener, the MCP endpoint and the port proxy. gRPC requests are not checked")
+		serviceName       = flag.String("service-name", "ate-env-api", "name of the Kubernetes Service in front of ate-env-api; its in-cluster names are allowed hosts (<name>, <name>.<namespace>, <name>.<namespace>.svc and <name>.<namespace>.svc.<cluster domain>, with the namespace and cluster domain read from /etc/resolv.conf, else the namespace from POD_NAMESPACE). Empty allows none of them")
+		maxStreams        = flag.Int("max-concurrent-streams", DefaultMaxConcurrentStreams, "most concurrent HTTP/2 streams (gRPC calls) one client connection may have open; calls beyond it queue in the client. Go's default is 250, which a single trainer process reaches with a few hundred sandboxes, because every exec holds a stream for the whole command and its wake")
 	)
 	flag.Parse()
 
+	serviceHosts := serviceHostNames(*serviceName, os.ReadFile, os.Getenv)
+	if len(serviceHosts) > 0 {
+		log.Printf("hostcheck: allowing the Service names %s", strings.Join(serviceHosts, ", "))
+	}
+	hosts, err := hostcheck.New(append(serviceHosts, hostcheck.ParseList(*allowedHosts)...))
+	if err != nil {
+		log.Fatalf("--allowed-hosts: %v", err)
+	}
+
 	var callerAuth *apiservice.BearerAuth
 	if *authTokenFile != "" {
-		var err error
 		callerAuth, err = apiservice.NewBearerAuthFromFile(*authTokenFile)
 		if err != nil {
 			log.Fatalf("loading --auth-token-file: %v", err)
@@ -159,11 +201,13 @@ func main() {
 		mcpHandler = callerAuth.WrapHTTP(mcpHandler)
 	}
 
+	// The Host check wraps the HTTP routes (/healthz, MCP and the port
+	// proxy), while the gRPC route on / stays unwrapped.
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /healthz", hosts.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "ok\n")
-	})
-	mux.Handle("/v1alpha/envs/{id}/mcp", mcpHandler)
+	})))
+	mux.Handle("/v1alpha/envs/{id}/mcp", hosts.Wrap(mcpHandler))
 	mux.Handle("/", grpcServer)
 
 	// Requests that name an environment port go to the port proxy before
@@ -193,20 +237,12 @@ func main() {
 			log.Fatalf("--port-proxy-trusted-origins: %v", err)
 		}
 		// Header form and path form, /v1alpha/envs/{id}/ports/{port}/...
-		handler = portproxy.Dispatch(pp, mux)
+		handler = portproxy.Dispatch(pp, mux, hosts.Wrap)
 	}
 
 	// Enable both HTTP/1.1 (for /healthz and /v1alpha/ HTTP endpoints) and
 	// unencrypted HTTP/2 (h2c, for gRPC services) on the same plaintext TCP listener.
-	var protocols http.Protocols
-	protocols.SetHTTP1(true)
-	protocols.SetUnencryptedHTTP2(true)
-
-	srv := &http.Server{
-		Addr:      *listen,
-		Handler:   handler,
-		Protocols: &protocols,
-	}
+	srv := newHTTPServer(*listen, handler, *maxStreams)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -221,4 +257,30 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server error: %v", err)
 	}
+}
+
+// DefaultMaxConcurrentStreams is the default -max-concurrent-streams. Each
+// in-flight exec holds one stream for the whole command, including the wait
+// for a suspended environment to wake, so one trainer process with a few
+// hundred sandboxes reaches Go's built-in limit of 250 and its further calls
+// queue in the client before ate-env-api sees them.
+const DefaultMaxConcurrentStreams = 4096
+
+// newHTTPServer serves handler on addr over HTTP/1.1 (for /healthz and the
+// /v1alpha/ HTTP endpoints) and unencrypted HTTP/2 (h2c, for the gRPC
+// services) on one plaintext listener, allowing maxStreams concurrent HTTP/2
+// streams per client connection (Go's default when maxStreams <= 0).
+func newHTTPServer(addr string, handler http.Handler, maxStreams int) *http.Server {
+	var protocols http.Protocols
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
+	srv := &http.Server{
+		Addr:      addr,
+		Handler:   handler,
+		Protocols: &protocols,
+	}
+	if maxStreams > 0 {
+		srv.HTTP2 = &http.HTTP2Config{MaxConcurrentStreams: maxStreams}
+	}
+	return srv
 }

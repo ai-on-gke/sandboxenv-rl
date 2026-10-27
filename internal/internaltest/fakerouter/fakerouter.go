@@ -39,6 +39,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/agent-substrate/env/internal/ate"
 )
@@ -53,6 +54,13 @@ type Router struct {
 	// text for a CRASHED actor or 404 "actor <ref> not found"; code 0 lets
 	// the request through. It applies before Running.
 	Deny func(id string) (code int, body string)
+	// EnvoyTimeout, when set, makes a request inside a tunnel to an actor
+	// that is not running wait like the real router's resume: it is served
+	// if the actor runs within EnvoyTimeout, else it gets Envoy's own 504
+	// with an empty body (the ext_proc message timeout, 10 s by default in
+	// Substrate v0.6.0). Unset, such a request gets 503 "actor <ref>
+	// unavailable" at once.
+	EnvoyTimeout time.Duration
 	// RefuseConnect, when set, answers the CONNECT itself when it returns a
 	// non-zero code. The real router does that only at the Envoy level
 	// (overload, drain), never for an actor state.
@@ -211,7 +219,12 @@ func (r *Router) serveTunneled(w http.ResponseWriter, req *http.Request, ref, id
 		routerError(w, http.StatusNotFound, "actor "+ref+" not found")
 		return
 	}
-	if r.Running != nil && !r.Running(id) {
+	if r.Running != nil && !r.Running(id) && !r.waitRunning(req, id) {
+		if r.EnvoyTimeout > 0 {
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusGatewayTimeout)
+			return
+		}
 		routerError(w, http.StatusServiceUnavailable, "actor "+ref+" unavailable")
 		return
 	}
@@ -220,6 +233,26 @@ func (r *Router) serveTunneled(w http.ResponseWriter, req *http.Request, ref, id
 		return
 	}
 	h.ServeHTTP(w, req)
+}
+
+// waitRunning holds req up to EnvoyTimeout for the actor to run, and reports
+// whether it does. Without EnvoyTimeout it does not wait.
+func (r *Router) waitRunning(req *http.Request, id string) bool {
+	if r.EnvoyTimeout <= 0 {
+		return false
+	}
+	deadline := time.Now().Add(r.EnvoyTimeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-req.Context().Done():
+			return false
+		case <-time.After(10 * time.Millisecond):
+		}
+		if r.Running(id) {
+			return true
+		}
+	}
+	return false
 }
 
 // known reports whether any handler is registered for the actor.

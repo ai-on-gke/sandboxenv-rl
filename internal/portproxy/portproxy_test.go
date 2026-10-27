@@ -258,7 +258,7 @@ func TestPassesRouterRefusals(t *testing.T) {
 // Substrate v0.6.0's router refuses a CONNECT only at the Envoy level (for
 // example overload), never for an actor state. Such a 503 is retried within
 // the wake budget instead of passed on at once.
-func TestRetriesWhileTheEnvironmentWakes(t *testing.T) {
+func TestRetriesARefusedConnect(t *testing.T) {
 	s := newSetup(t)
 	s.router.RegisterPort("waking", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "awake") }))
 	var mu sync.Mutex
@@ -602,6 +602,184 @@ func TestCallerLeavingDuringStateReadLogsNothing(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "reading the state") {
 		t.Errorf("logged a state read for a caller that left:\n%s", buf.String())
+	}
+}
+
+// A wake that outlasts Envoy's ext_proc timeout gets Envoy's empty 504 while
+// the wake goes on. For an actor that is still waking the proxy answers 503
+// with Retry-After and X-Env-State, so the client knows to retry.
+func TestWakeTimeoutWhileWaking(t *testing.T) {
+	for _, tc := range []struct {
+		state ateapipb.ActorState
+		name  string
+	}{
+		{ateapipb.ActorState_ACTOR_STATE_RESUMING, "RESUMING"},
+		{ateapipb.ActorState_ACTOR_STATE_SUSPENDED, "SUSPENDED"},
+	} {
+		s := newSetup(t)
+		s.router.RegisterPort("waking", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		s.router.Running = func(string) bool { return false }
+		s.router.EnvoyTimeout = 200 * time.Millisecond
+		srv, reads := stateProxy(t, s, func(int) (ateapipb.ActorState, error) { return tc.state, nil })
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+		for k, v := range target("waking", 8000) {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") != "1" ||
+			resp.Header.Get(portproxy.EnvStateHeader) != tc.name || !strings.Contains(string(b), "still waking; retry") {
+			t.Errorf("%s: got %d Retry-After=%q %s=%q %q, want 503, 1, %s and \"still waking; retry\"", tc.name, resp.StatusCode,
+				resp.Header.Get("Retry-After"), portproxy.EnvStateHeader, resp.Header.Get(portproxy.EnvStateHeader), b, tc.name)
+		}
+		if n := reads(); n != 1 {
+			t.Errorf("%s: %d state reads, want 1", tc.name, n)
+		}
+	}
+}
+
+// A wake that ends inside the router's hold is served, with no state read.
+func TestWakeInsideTheHoldIsServed(t *testing.T) {
+	s := newSetup(t)
+	s.router.RegisterPort("waking", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "awake") }))
+	start := time.Now()
+	s.router.Running = func(string) bool { return time.Since(start) > 300*time.Millisecond }
+	s.router.EnvoyTimeout = 2 * time.Second
+	srv, reads := stateProxy(t, s, func(int) (ateapipb.ActorState, error) { return ateapipb.ActorState_ACTOR_STATE_RESUMING, nil })
+	if code, body, _ := get(t, srv.URL, target("waking", 8000)); code != http.StatusOK || body != "awake" {
+		t.Errorf("got %d %q, want the daemon's answer", code, body)
+	}
+	if n := reads(); n != 0 {
+		t.Errorf("%d state reads, want 0", n)
+	}
+}
+
+// The timeout path also reaches a crashed actor.
+func TestWakeTimeoutForCrashedEnvironment(t *testing.T) {
+	s := newSetup(t)
+	s.router.RegisterPort("broken", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	s.router.Running = func(string) bool { return false }
+	s.router.EnvoyTimeout = 200 * time.Millisecond
+	srv, _ := stateProxy(t, s, func(int) (ateapipb.ActorState, error) { return ateapipb.ActorState_ACTOR_STATE_CRASHED, nil })
+	code, header, _, _ := getWithHeader(t, srv.URL, target("broken", 8000), portproxy.EnvStateHeader)
+	if code != http.StatusGone || header != "CRASHED" {
+		t.Errorf("got %d %s=%q, want 410 CRASHED", code, portproxy.EnvStateHeader, header)
+	}
+}
+
+// A running actor's daemon can answer 504 or 500 itself: that passes
+// unchanged. An empty one costs a state read; one with a body does not.
+func TestDaemonTimeoutsPassUnchanged(t *testing.T) {
+	s := newSetup(t)
+	var answer atomic.Value
+	answer.Store([2]string{"504", ""})
+	s.router.RegisterPort("env1", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a := answer.Load().([2]string)
+		code, _ := strconv.Atoi(a[0])
+		w.Header().Set("Content-Length", strconv.Itoa(len(a[1])))
+		w.WriteHeader(code)
+		io.WriteString(w, a[1])
+	}))
+	srv, reads := stateProxy(t, s, func(int) (ateapipb.ActorState, error) { return ateapipb.ActorState_ACTOR_STATE_RUNNING, nil })
+	for _, a := range [][2]string{{"504", ""}, {"500", ""}, {"504", "upstream app timed out"}, {"500", "boom"}} {
+		answer.Store(a)
+		code, header, body, _ := getWithHeader(t, srv.URL, target("env1", 8000), portproxy.EnvStateHeader)
+		if strconv.Itoa(code) != a[0] || body != a[1] || header != "" {
+			t.Errorf("daemon %s %q: got %d %s=%q %q, want it unchanged", a[0], a[1], code, portproxy.EnvStateHeader, header, body)
+		}
+	}
+	if n := reads(); n != 1 {
+		t.Errorf("%d state reads, want 1 (the empty answers, cached)", n)
+	}
+}
+
+// A HEAD request has no body to match; status, content type and the state
+// decide, so a crashed environment gets 410 also for HEAD.
+func TestHeadToCrashedEnvironment(t *testing.T) {
+	s := newSetup(t)
+	s.router.RegisterPort("broken", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	s.router.Deny = func(string) (int, string) { return 503, routerBody("broken", "CRASHED") }
+	srv, _ := stateProxy(t, s, func(int) (ateapipb.ActorState, error) { return ateapipb.ActorState_ACTOR_STATE_CRASHED, nil })
+	req, _ := http.NewRequest(http.MethodHead, srv.URL+"/", nil)
+	for k, v := range target("broken", 8000) {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusGone || resp.Header.Get(portproxy.EnvStateHeader) != "CRASHED" {
+		t.Errorf("HEAD: got %d %s=%q, want 410 CRASHED", resp.StatusCode, portproxy.EnvStateHeader, resp.Header.Get(portproxy.EnvStateHeader))
+	}
+}
+
+// A daemon's text/plain 503 without a Content-Length is not read for the
+// router's text: its headers reach the caller at once while it streams.
+func TestStreamedDaemonErrorPassesWithoutDelay(t *testing.T) {
+	s := newSetup(t)
+	s.router.RegisterPort("env1", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		io.WriteString(w, "a")
+		w.(http.Flusher).Flush()
+		time.Sleep(1500 * time.Millisecond)
+		io.WriteString(w, "b")
+	}))
+	srv, reads := stateProxy(t, s, func(int) (ateapipb.ActorState, error) { return ateapipb.ActorState_ACTOR_STATE_RUNNING, nil })
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+	for k, v := range target("env1", 8000) {
+		req.Header.Set(k, v)
+	}
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	headers := time.Since(start)
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || string(b) != "ab" {
+		t.Errorf("got %d %q, want the daemon's 503 \"ab\"", resp.StatusCode, b)
+	}
+	if headers > time.Second {
+		t.Errorf("headers after %s, want at once while the daemon streams", headers)
+	}
+	if n := reads(); n != 0 {
+		t.Errorf("%d state reads, want 0", n)
+	}
+}
+
+// A state read that panics fails like any failed read: the answer passes
+// unchanged, and the next answer for the environment does not wait on a read
+// left in flight.
+func TestPanickingStateReadDoesNotHang(t *testing.T) {
+	var buf safeBuffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	s := newSetup(t)
+	s.router.RegisterPort("broken", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	s.router.Deny = func(string) (int, string) { return 503, routerBody("broken", "CRASHED") }
+	srv, _ := stateProxy(t, s, func(int) (ateapipb.ActorState, error) { panic("control plane client bug") })
+	client := &http.Client{Timeout: 3 * time.Second}
+	for i := range 2 {
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+		for k, v := range target("broken", 8000) {
+			req.Header.Set(k, v)
+		}
+		start := time.Now()
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request %d: %v", i+1, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable || time.Since(start) > time.Second {
+			t.Errorf("request %d: got %d after %s, want the router's 503 at once", i+1, resp.StatusCode, time.Since(start))
+		}
 	}
 }
 

@@ -122,7 +122,10 @@ and `bash`, 26 MB compressed for amd64) is the smallest common image that meets 
 floor; any image that meets the floor works. An environment created without `image=` runs in this
 base image. A template derived for a task image replaces only the image: the guest volume, the layer
 and the sidecar stay. A base registered earlier without `--rootfs-image` keeps a crashed golden
-actor: delete it and its `<base>-<12 hex digits>` templates, then register it again.
+actor: delete it and register it again with the same session key. Its `<base>-<12 hex digits>`
+templates can stay, because a template derived from the new base is identical to one derived from
+the old base. Delete them only to make Substrate bake their golden snapshots again, or when the
+session key changes, because each derived template copies the key.
 
 ## 4. Use `AteEnvWorkspace`
 

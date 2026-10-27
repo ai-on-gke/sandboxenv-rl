@@ -66,6 +66,12 @@ python-test:
 nemo-gym-test:
 	cd integrations/nemo-gym && python3 -m pytest
 
+# Run the Harbor provider tests (requires an environment with the client and
+# the provider's test extra installed: pip install clients/python -e
+# 'integrations/harbor[test]'; the trial test also needs a docker daemon).
+harbor-test:
+	cd integrations/harbor && python3 -m pytest
+
 images:
 	@echo "Building and pushing container images to $(ATE_ENV_IMAGE_REPO)..."
 	@guest_img=$$(KO_DOCKER_REPO=$(ATE_ENV_IMAGE_REPO)/ate-env-guest ko build --bare ./cmd/ate-env-guest | tail -n 1); \

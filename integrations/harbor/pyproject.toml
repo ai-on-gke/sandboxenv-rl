@@ -1,0 +1,55 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ate-env-harbor"
+version = "0.1.0"
+description = "Harbor environment provider on Agent Substrate environments (ate-env)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"  # what harbor requires
+# ate-env-client is this repo's Python client (clients/python); it is not on
+# PyPI yet, so install it from the checkout first: pip install ./clients/python
+# harbor releases often; it is pinned to one minor and bumped deliberately,
+# with tests/test_trial.py (Harbor's own trial runner on this provider) as
+# the gate.
+dependencies = [
+  "ate-env-client>=0.1.0",
+  "harbor>=0.25,<0.26",
+  "dockerfile-parse>=2.0.1",  # harbor's Dockerfile WORKDIR parser imports it lazily
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=1.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+ate-env-client = { path = "../../clients/python", editable = true }
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+# The same rules as clients/python.
+select = ["E4", "E7", "E9", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

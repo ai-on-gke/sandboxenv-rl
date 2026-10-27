@@ -73,6 +73,7 @@ The focus moves from a general environment service to RL training and evaluation
 | Integration | Framework | What it does |
 |---|---|---|
 | [`integrations/nemo-gym`](integrations/nemo-gym/README.md) | [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) | Sandbox provider `substrate`, registered through the `nemo_gym.sandbox_providers` entry point, with no change to NeMo Gym. `endpoint()` reaches a daemon inside the sandbox through the port proxy. |
+| [`integrations/harbor`](integrations/harbor/README.md) | [Harbor](https://github.com/harbor-framework/harbor) | `AteEnvEnvironment`, a Harbor environment provider: `harbor run ... -e ate_env_harbor:AteEnvEnvironment` runs each trial in an ate-env environment from a digest-pinned task image, with no change to Harbor. |
 
 ## Benchmarks
 

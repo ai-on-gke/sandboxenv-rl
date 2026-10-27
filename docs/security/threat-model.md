@@ -135,6 +135,22 @@ the spans go nowhere.
 | Data on the wire | With tracing on, each gRPC call on a channel that the client creates carries the W3C `traceparent` and `tracestate`, never baggage. `ate-env-api` does not use them and does not forward them. | — |
 | The export connection | The `OTEL_EXPORTER_OTLP_*` environment variables configure the endpoint, its TLS and its credentials. | An endpoint without TLS sends the spans in clear text. |
 
+## Harbor integration
+
+`integrations/harbor` is a Harbor environment provider: `harbor run` creates one ate-env
+environment per trial, runs the agent's and the verifier's commands through the guest, and moves
+files through the file API. It runs in the operator's Harbor process, next to the agents' model
+keys, as a client of the existing gRPC listener; nothing new listens and `ate-env-api` gains no
+privilege.
+
+| Item | Current state | Gap |
+|---|---|---|
+| Caller token | Read from `SUBSTRATE_ENV_AUTH_TOKEN` or the `api_token` kwarg and sent as gRPC metadata. The provider does not log it and does not write it to `trial_dir/ate_env.json`. | Harbor writes the environment kwargs into each trial's `result.json`, thus a token passed with `--ek api_token=` lands on disk with the results. The provider warns when it sees the kwarg; the README says to set the variable. |
+| Registry credentials | `build=local` uses the operator's docker login, `build=cloud-build` the operator's gcloud account; the provider reads neither. Images are pushed as `<registry>/<task>:<environment_id>`. | The worker nodes need read access to that registry; granting it is an operator step outside this repository. |
+| Task images | A dataset's task images run as actors, pinned by digest, the way any rootfs image does; the provider does not inspect them, and the actor's isolation is the boundary. | Egress follows the Substrate defaults (known gap 8), and most tasks and installed agents download packages at run time. |
+| Commands as root | Harbor's verifier removes its reward files and `chmod`s its script as `root`. On an image that runs as root that is the image's own user, and the command runs as is. On another image the provider uses `sudo -n`, or `su` from root, only when the image offers it; otherwise the call fails and says why. | — |
+| Dependencies | `harbor`, pinned to one minor, and `dockerfile-parse`, in `integrations/harbor` only; neither is a dependency of the client, the CLI or `ate-env-api`. | Not covered by Dependabot (the local path source, as for `integrations/nemo-gym`); bumped by hand with the trial test as the gate. |
+
 ## Compatibility of the API
 
 A protobuf message with fields that the server does not know is valid proto3: the server keeps the
@@ -148,7 +164,7 @@ error. This is a compatibility risk, not a boundary of this threat model.
 |---|---|---|
 | Images | A template mounts the guest into a rootfs image only when the guest is pinned by digest. `.ko.yaml` pins the guest base image by digest. The README asks for the worker image by digest. | — |
 | Releases | `.github/workflows/release.yaml` signs the images with cosign keyless signing (GitHub Actions OIDC). Its actions are pinned by commit SHA. | This repository has published no release yet. |
-| Dependencies | Dependabot covers Go modules (`/`), Python (`/clients/python`, its extras included) and GitHub Actions. `integrations/nemo-gym` gets `ate-env-client` from this checkout through a local path source (`tool.uv.sources`), which Dependabot cannot resolve; its other dependency, `grpcio`, is also a dependency of `clients/python`. | — |
+| Dependencies | Dependabot covers Go modules (`/`), Python (`/clients/python`, its extras included) and GitHub Actions. `integrations/nemo-gym` gets `ate-env-client` from this checkout through a local path source (`tool.uv.sources`), which Dependabot cannot resolve; its other dependency, `grpcio`, is also a dependency of `clients/python`. `integrations/harbor` gets `ate-env-client` the same way; its `harbor` dependency is pinned to one minor and bumped by hand (see Harbor integration). | — |
 | Integrations and examples | The code in `integrations/` is maintained. | The code in `examples/` is not supported: it gets no security fixes and no compatibility promise. |
 
 ## Known gaps

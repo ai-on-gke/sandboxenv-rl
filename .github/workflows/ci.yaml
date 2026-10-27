@@ -72,3 +72,12 @@ jobs:
       # prometheus_client installed.
       - run: python -m pip install -e 'clients/python[dev,tracing,metrics]'
       - run: python -m pytest clients/python/tests -q
+      - name: Install uni-agent (pinned, without its verl submodule) and the Substrate integration
+        run: |
+          git clone --quiet --filter=blob:none https://github.com/verl-project/uni-agent.git /tmp/uni-agent
+          git -C /tmp/uni-agent checkout --quiet 174b040
+          python -m pip install --no-deps /tmp/uni-agent
+          python -m pip install pydantic pyyaml httpx jsonschema openai
+          python -m pip install -e 'integrations/uni-agent[test]'
+      - run: ruff check integrations/uni-agent
+      - run: python -m pytest integrations/uni-agent/tests -q

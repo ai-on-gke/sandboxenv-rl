@@ -5,6 +5,7 @@ unmodified task image (glibc 2.31 or newer) and connects the OpenHands SDK to it
 `AteEnvWorkspace` is an OpenHands `RemoteWorkspace` that mirrors OpenHands' own
 `AgentSandboxWorkspace` (`openhands-workspace[agent-sandbox]`, kubernetes-sigs/agent-sandbox):
 code written against that workspace moves to Agent Substrate by changing the constructor.
+A program written against agent-sandbox-rl's fleet moves by changing its imports (section 8).
 
 ```python
 from ate_env_openhands import AteEnvWorkspace
@@ -34,7 +35,7 @@ How it fits together:
 
 | path | what it is |
 |---|---|
-| [`src/ate_env_openhands/`](src/ate_env_openhands) | `AteEnvWorkspace`, `port_url` |
+| [`src/ate_env_openhands/`](src/ate_env_openhands) | `AteEnvWorkspace`, `port_url`, the fleet and R2E-Gym adapters, `agent_sandbox_rl` |
 | [`layer/`](layer) | the runtime layer: Dockerfile, hash-locked dependencies, `lock.sh` |
 | [`../../examples/openhands`](../../examples/openhands) | the examples: OpenHands' agent-sandbox example 17, CodeAct, trajectory execution, a plain-HTTP demo |
 | [`tests/`](tests) | unit and integration tests: a fake ate-env-api and port proxy in front of a real agent-server |
@@ -181,10 +182,9 @@ From `AgentSandboxWorkspace`:
      conversation = Conversation(agent=agent, workspace=workspace)
 ```
 
-Not mapped yet: `shutdown_after_seconds` (ate-env has no environment TTL), `labels`,
-`pod_labels` and `pod_annotations` (environments have no labels), and agent-sandbox-rl's fleet
-adapters (`make_handle_workspace`, `make_fleet_workspace`) and R2E-Gym adapter, which follow in
-later changes.
+Not mapped: `shutdown_after_seconds` (ate-env has no environment TTL), `labels`,
+`pod_labels` and `pod_annotations` (environments have no labels). agent-sandbox-rl's fleet
+adapters, its R2E-Gym adapter and its fleet API are in sections 6, 7 and 8.
 
 ## 5. Examples
 
@@ -267,6 +267,65 @@ its checkout (`pip install -e path/to/R2E-Gym`); the module imports without it a
 `RuntimeError` on first use. R2E-Gym's runtime loads a kubeconfig for this backend; the adapter
 stubs that during construction, so no Kubernetes access is needed.
 
+## 8. agent-sandbox-rl programs: change the imports
+
+`ate_env_openhands.agent_sandbox_rl` has agent-sandbox-rl's fleet API (`ClusterConfig`,
+`FleetConfig`, `ResourceSpec`, `TemplateSpec`, `ObservabilityConfig`, `SandboxFleet`, `Task`, and
+`adapters.openhands`) on top of `ate_env`. A program written for agent-sandbox-rl, such as
+agent-sandbox's `examples/agent-sandbox-rl/examples/run_openhands_fleet.py`, runs on ate-env when
+its imports change and nothing else:
+
+```diff
+-from agent_sandbox_rl import (
++from ate_env_openhands.agent_sandbox_rl import (
+     ClusterConfig, FleetConfig, ResourceSpec, SandboxFleet, Task, TemplateSpec,
+ )
+-from agent_sandbox_rl.adapters.openhands import make_handle_workspace
++from ate_env_openhands.agent_sandbox_rl.adapters.openhands import make_handle_workspace
+```
+
+The program's configuration has no ate-env address, token or base template. They come from the
+environment:
+
+| variable | what | default |
+|---|---|---|
+| `SUBSTRATE_ENV_API` | ate-env-api address (the `ate-env` CLI reads it too) | `127.0.0.1:7777` |
+| `SUBSTRATE_ENV_AUTH_TOKEN` | ate-env-api's bearer token (the `ate-env` CLI reads it too) | none |
+| `SUBSTRATE_ENV_TEMPLATE` | the base template, for OpenHands the one from section 3 | `default-template` |
+| `SUBSTRATE_ENV_ATESPACE` | the atespace when `ClusterConfig.namespace` is `"default"` | `ate-env` |
+
+`ClusterConfig(endpoint=..., auth_token=...)` and `TemplateSpec(name=...)` set the same values in
+code; they exist only here, not in agent-sandbox-rl.
+
+| agent-sandbox-rl | on ate-env |
+|---|---|
+| `ClusterConfig.namespace` | the atespace (`"default"`: see the table above) |
+| `max_concurrent`, `window_size`, `run_id` | the same `ate_env.FleetConfig` fields |
+| `max_warmpool_size` | `max_warmpool_replicas` |
+| `ready_timeout` | `acquire_timeout_s` and `ready_timeout_s` |
+| `observability` | `ate_env.ObservabilityConfig` (metrics, tracing, service name) |
+| `run(fn, strategy, concurrency, epochs=)` | `ate_env.SandboxFleet.run` with the same strategy, once for each epoch |
+| `handle.cluster_name` | the name of the `ClusterConfig` |
+| `make_handle_workspace`, `make_fleet_workspace` | section 6; the token comes from the fleet |
+
+- Ignored, with one INFO log that names each field set to a value other than its default: the
+  pod fields of `TemplateSpec` (`resources`, `keepalive_command`, `runtime_class`,
+  `node_selector`, `image_pull_*`, `colocate_replicas`, `extra_pod_spec`), because the base
+  template fixes the command, resources and placement when it is registered; the Kubernetes
+  fields of `ClusterConfig` (`kubeconfig`, `context`, `in_cluster`, `node_selector`,
+  `runtime_class`, `image_pull_secret`, `weight`, `max_replicas`); and the Kubernetes mechanics
+  of `FleetConfig` (`placement`, `warm_per_task`, `warm_create_budget`, `overcommit_factor`,
+  `max_live_sandboxes`, the breaker, teardown hooks, pool and template names, run-namespace
+  settings, `labels`, disk-aware sizing). A session key in `extra_pod_spec` has no effect: the
+  agent-server takes the base template's key.
+- Refused with `ValueError`: more than one cluster (one fleet talks to one ate-env-api; run one
+  fleet for each), `adopt_existing=True` and `run_isolation` other than `"none"`.
+- Refused with `NotImplementedError`: `run(keep_warm=True)`, `run(recycle=True)` and
+  `run(reset=...)`. Each task gets a new environment, and the fleet deletes it on release.
+  `max_reuses`, `reset_timeout`, `use_session` and `scale_on_hold` only tune that reuse and have
+  no effect.
+- Handles have no Kubernetes fields (`claim_name`, `pod_name`, `hostname`, `pod_ip`).
+
 ## Versions
 
 The workspace talks to the agent-server's REST and WebSocket API through the OpenHands SDK, and that
@@ -293,6 +352,11 @@ a create that lands after its timeout, refused create, health timeout, wrong ses
 (a failed attach or validation error deletes nothing, a copy never deletes), the token at the proxy,
 attach, pause and resume, exit ordering, files, the shared loop (`close_all`, the call timeout, a
 fork), and a `RemoteConversation` whose event WebSocket goes through the proxy.
+
+`test_agent_sandbox_rl.py` covers the section 8 mapping, and runs an agent-sandbox-rl program with
+only its imports changed through a Substrate fleet against the same fakes, with the token required.
+To run agent-sandbox's own `run_openhands_fleet.py` the same way, set `AGENT_SANDBOX_RL_EXAMPLE` to
+its path; the test checks that the import lines are the only diff.
 
 ## Verified
 

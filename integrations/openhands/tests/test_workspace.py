@@ -398,6 +398,17 @@ def test_health_state_checks_are_spaced(no_finalizer, stack, tmp_path, wait, rea
     assert state.gets == reads, f"{state.gets} state reads in a {wait} s wait, want {reads} (one each 5 s)"
 
 
+def test_a_stalled_existence_check_cannot_hold_the_wait(no_finalizer, stack, tmp_path):
+    api_url, state = stack
+    state.refuse = (404, "no such page")  # a 404 with no X-Env-State: the wait asks whether the env exists
+    state.get_delay = 40.0  # a control plane that does not answer
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match="did not answer /health"):
+        make(api_url, state, tmp_path, health_check_timeout=3)
+    assert time.monotonic() - t0 < 10, "each read ends by the wait's deadline, not after 30 s"
+    assert state.gets >= 1
+
+
 def test_resume_reads_the_state_behind_a_proxy_without_the_rewrite(stack, tmp_path):
     api_url, state = stack
     with make(api_url, state, tmp_path) as ws:

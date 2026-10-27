@@ -89,6 +89,13 @@ STATE_CHECK_INTERVAL = 5.0
 STATE_READ_TIMEOUT = 5.0
 
 
+def _read_timeout(deadline: float) -> float:
+    """Deadline of a state read in the health wait: STATE_READ_TIMEOUT, or the
+    time left in the wait if less, at least 1 s, so a stalled control plane
+    cannot hold the wait past its end."""
+    return max(1.0, min(STATE_READ_TIMEOUT, deadline - time.monotonic()))
+
+
 def _base_url(url: str) -> str:
     url = url.rstrip("/")
     return url if "://" in url else f"http://{url}"
@@ -415,14 +422,12 @@ class AteEnvWorkspace(RemoteWorkspace):
                         f"({last}); api_token must be ate-env-api's bearer token")
                 if code == 400:
                     raise ValueError(f"the port proxy rejected {url} ({last})")
-                if code == 404 and not self._exists():
+                if code == 404 and not self._exists(_read_timeout(deadline)):
                     raise RuntimeError(f"environment {self.atespace}/{self.env_id} no longer "
                                        f"exists ({last})")
             if time.monotonic() >= next_state_check:
                 next_state_check = time.monotonic() + STATE_CHECK_INTERVAL
-                # A stalled control plane must not hold the wait past its end.
-                read_timeout = max(1.0, min(STATE_READ_TIMEOUT, deadline - time.monotonic()))
-                self._raise_if_state_is_final(last, read_timeout)
+                self._raise_if_state_is_final(last, _read_timeout(deadline))
             time.sleep(min(1.0, max(deadline - time.monotonic(), 0)))
         raise RuntimeError(f"agent-server in {self.atespace}/{self.env_id} did not answer "
                            f"/health within {timeout}s; last: {last}")
@@ -464,10 +469,10 @@ class AteEnvWorkspace(RemoteWorkspace):
         if info.status == EnvironmentStatus.DELETING:
             raise RuntimeError(f"{where} is being deleted (state DELETING; last: {last})")
 
-    def _exists(self) -> bool:
+    def _exists(self, timeout: float = CALL_TIMEOUT) -> bool:
         """Whether the environment still exists; True when that is unknown."""
         try:
-            self._call(self._ate().get(self.env_id, atespace=self.atespace))
+            self._call(self._ate().get(self.env_id, atespace=self.atespace), timeout=timeout)
         except NotFoundError:
             return False
         except Exception:

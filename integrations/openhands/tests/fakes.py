@@ -59,6 +59,7 @@ class FakeAteEnv:
     unhealthy_polls: int = 0  # answer this many /health requests with 503 first
     new_status: int | None = None  # status of a created environment; RUNNING when unset
     gets: int = 0  # GetEnvironment calls
+    get_delay: float = 0.0  # GetEnvironment answers this many seconds late
     api_token: str | None = None  # the proxy requires this bearer when set
     # answer every proxy request with this: (status, body) or (status, body, headers)
     refuse: tuple[int, str] | tuple[int, str, dict[str, str]] | None = None
@@ -116,6 +117,8 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
 
     async def GetEnvironment(self, request, context):
         self.state.gets += 1
+        if self.state.get_delay:
+            await asyncio.sleep(self.state.get_delay)
         if request.id not in self.state.envs:
             await context.abort(grpc.StatusCode.NOT_FOUND, "no such env")
         return env_pb2.GetEnvironmentResponse(environment=self.state.env_pb(request.id))

@@ -81,3 +81,24 @@ async def test_user_guide_section_2_async_rollouts():
             res = await sb.exec_async(["python3", "-c", "import calc; assert calc.add(2, 3) == 5"])
             assert res.ok
     await fleet.teardown()
+
+
+def test_run_strategy_overrides_the_configured_one_for_that_run():
+    tasks = [Task(id=f"task-{i}", image="image-0") for i in range(3)]
+    fleet = SandboxFleet(FleetConfig(backend="mock", strategy="sliding"))
+    fleet.load_tasks(tasks)
+
+    results = fleet.run(dummy_process_fn, concurrency=2, strategy="naive")
+
+    assert [f"task-{i}" in r for i, r in enumerate(results)] == [True] * 3
+    assert fleet.report.strategy == "naive"
+    assert fleet.config.strategy == "sliding"
+    fleet.run(dummy_process_fn, concurrency=2)
+    assert fleet.report.strategy == "sliding"
+
+
+def test_run_rejects_an_unknown_strategy_override():
+    fleet = SandboxFleet(FleetConfig(backend="mock"))
+    fleet.load_tasks([Task(id="t", image="image-0")])
+    with pytest.raises(ValueError, match="Unknown strategy: warp"):
+        fleet.run(dummy_process_fn, strategy="warp")

@@ -388,13 +388,14 @@ def test_health_reads_the_state_behind_a_proxy_without_the_rewrite(no_finalizer,
     assert state.deletes == [state.creates[0]["id"]]
 
 
-def test_health_state_checks_are_spaced(no_finalizer, stack, tmp_path):
+@pytest.mark.parametrize("wait,reads", [(4, 1), (7, 2)])
+def test_health_state_checks_are_spaced(no_finalizer, stack, tmp_path, wait, reads):
     api_url, state = stack
     state.refuse = ROUTER_503  # the environment itself stays RUNNING
     with pytest.raises(RuntimeError, match="did not answer /health"):
-        make(api_url, state, tmp_path, health_check_timeout=4)
+        make(api_url, state, tmp_path, health_check_timeout=wait)
     assert state.refusals >= 3
-    assert state.gets <= 1, f"{state.gets} state reads in a 4 s wait, want at most one each 5 s"
+    assert state.gets == reads, f"{state.gets} state reads in a {wait} s wait, want {reads} (one each 5 s)"
 
 
 def test_resume_reads_the_state_behind_a_proxy_without_the_rewrite(stack, tmp_path):

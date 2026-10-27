@@ -85,6 +85,8 @@ ENV_STATE_HEADER = "X-Env-State"
 # state over gRPC, so that a crashed environment stops the wait even when the
 # port proxy passes the router's 503 unchanged.
 STATE_CHECK_INTERVAL = 5.0
+# Deadline of that read, or the time left in the wait if less (at least 1 s).
+STATE_READ_TIMEOUT = 5.0
 
 
 def _base_url(url: str) -> str:
@@ -389,9 +391,11 @@ class AteEnvWorkspace(RemoteWorkspace):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            # One attempt can wait for the rest of the budget: the proxy holds
-            # a request while the environment wakes (its --wake-budget), and a
-            # shorter client timeout would cut a cold start and restart it.
+            # One attempt can wait for the rest of the budget: the Substrate
+            # router holds a request while the environment wakes, up to about
+            # 10 s, then answers 504 (or 503 with X-Env-State through a port
+            # proxy with the state check), which the loop retries. A shorter
+            # client timeout would only cut that hold short.
             budget = max(remaining, 1.0)
             try:
                 resp = httpx.get(url, headers=headers,
@@ -416,7 +420,9 @@ class AteEnvWorkspace(RemoteWorkspace):
                                        f"exists ({last})")
             if time.monotonic() >= next_state_check:
                 next_state_check = time.monotonic() + STATE_CHECK_INTERVAL
-                self._raise_if_state_is_final(last)
+                # A stalled control plane must not hold the wait past its end.
+                read_timeout = max(1.0, min(STATE_READ_TIMEOUT, deadline - time.monotonic()))
+                self._raise_if_state_is_final(last, read_timeout)
             time.sleep(min(1.0, max(deadline - time.monotonic(), 0)))
         raise RuntimeError(f"agent-server in {self.atespace}/{self.env_id} did not answer "
                            f"/health within {timeout}s; last: {last}")
@@ -437,7 +443,7 @@ class AteEnvWorkspace(RemoteWorkspace):
         if state == "DELETING":
             raise RuntimeError(f"{where} is being deleted ({last})")
 
-    def _raise_if_state_is_final(self, last: str) -> None:
+    def _raise_if_state_is_final(self, last: str, timeout: float) -> None:
         """Raise when GetEnvironment says the environment will not wake.
 
         An error other than NotFound says nothing about the environment; the
@@ -445,7 +451,7 @@ class AteEnvWorkspace(RemoteWorkspace):
         """
         where = f"environment {self.atespace}/{self.env_id}"
         try:
-            info = self._call(self._ate().get(self.env_id, atespace=self.atespace))
+            info = self._call(self._ate().get(self.env_id, atespace=self.atespace), timeout=timeout)
         except NotFoundError:
             raise RuntimeError(f"{where} no longer exists ({last})") from None
         except Exception as exc:

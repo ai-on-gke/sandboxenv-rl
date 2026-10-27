@@ -297,6 +297,31 @@ def test_failed_copy_surfaces_the_tar_error(fake_r2egym, tmp_path):
         env.runtime.copy_to_container(str(src), "/tmp/x.patch")
 
 
+def test_copy_timeout_says_so_and_removes_the_staged_tar(fake_r2egym, tmp_path):
+    # A timeout kills the shell before its own rm -f runs. The error must name
+    # the timeout, not "exit None", and a separate exec must remove the tar.
+    handle = _Handle()
+    env = adapter.make_fleet_repo_env(handle)
+    src = tmp_path / "x.patch"
+    src.write_text("diff\n")
+    handle.replies["-xmf"] = _ExecResult(None, timed_out=True)
+    with pytest.raises(RuntimeError, match=r"-> /tmp/x\.patch timed out after 120 s"):
+        env.runtime.copy_to_container(str(src), "/tmp/x.patch")
+    (staged, _), = handle.files.items()
+    assert handle.execs[-1][0] == f"rm -f {staged}"
+    # A failed cleanup must not hide the timeout.
+    scripted_exec = handle.exec
+
+    def exec_with_failing_cleanup(command, **kwargs):
+        if command.startswith("rm -f "):
+            raise ConnectionError("guest gone")
+        return scripted_exec(command, **kwargs)
+
+    handle.exec = exec_with_failing_cleanup
+    with pytest.raises(RuntimeError, match="timed out after 120 s"):
+        env.runtime.copy_to_container(str(src), "/tmp/x.patch")
+
+
 def test_bind_failure_raises(fake_r2egym):
     handle = _Handle(sandbox_id="")  # an empty id cannot be what the hook bound
     handle.sandbox_id = None
@@ -342,10 +367,10 @@ def test_classes_are_built_once_under_concurrency(fake_r2egym):
     assert adapter.AteEnvRuntime is results[0][0] and adapter.AteEnvRepoEnv is results[0][1]
 
 
-
 def test_run_uses_the_r2e_path_and_docker_environment(fake_r2egym):
-    # F-AC4-2: commands run with R2E-Gym's PATH (the testbed venv first), as
-    # its docker and kubernetes backends set it, plus docker_kwargs["environment"].
+    # F-AC4-2: commands run with R2E-Gym's PATH (the testbed venv first) plus
+    # docker_kwargs["environment"], which overrides PATH, as R2E-Gym's
+    # kubernetes backends do.
     handle = _Handle()
     env = adapter.make_fleet_repo_env(handle)
     env.runtime.run("python --version")
@@ -356,3 +381,19 @@ def test_run_uses_the_r2e_path_and_docker_environment(fake_r2egym):
     rt = adapter._build_classes()[0](handle, environment={"PIP_NO_INDEX": 1})
     rt.run("pip list")
     assert handle.envs[-1] == {"PATH": "/custom/bin:/usr/bin", "PIP_NO_INDEX": "1"}
+
+
+def test_docker_environment_can_be_a_list_of_key_value_strings(fake_r2egym):
+    # The Docker SDK takes environment as a dict or as ["KEY=VALUE", ...].
+    handle = _Handle()
+    runtime_cls = adapter._build_classes()[0]
+    rt = runtime_cls(handle, environment=["PIP_NO_INDEX=1", "PATH=/opt/bin:/usr/bin", "OPTS=a=b"])
+    rt.run("pip list")
+    assert handle.envs[-1] == {"PATH": "/opt/bin:/usr/bin", "PIP_NO_INDEX": "1", "OPTS": "a=b"}
+    rt = runtime_cls(handle, environment={"PATH": "/opt/bin"})
+    rt.run("pip list")
+    assert handle.envs[-1] == {"PATH": "/opt/bin"}
+    with pytest.raises(TypeError, match="KEY=VALUE"):
+        runtime_cls(handle, environment=["NO_EQUALS_SIGN"])
+    with pytest.raises(TypeError, match="dict or a list"):
+        runtime_cls(handle, environment="A=1")

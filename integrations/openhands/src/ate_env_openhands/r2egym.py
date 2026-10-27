@@ -138,6 +138,32 @@ def _install_bypass(docker_mod: Any) -> None:
         })
 
 
+# Bound on one copy into the sandbox (write the tar, then extract it).
+_COPY_TIMEOUT_S = 120
+
+
+def _environment_dict(environment: Any) -> dict[str, str]:
+    """docker_kwargs["environment"] as a dict, like the Docker SDK accepts it.
+
+    The SDK takes a mapping or a list of ``"KEY=VALUE"`` strings. Anything
+    else, or a list item without ``=``, raises ``TypeError``.
+    """
+    if isinstance(environment, dict):
+        return {str(k): str(v) for k, v in environment.items()}
+    if isinstance(environment, (list, tuple)):
+        out: dict[str, str] = {}
+        for item in environment:
+            if not isinstance(item, str) or "=" not in item:
+                raise TypeError(f'docker_kwargs["environment"] items must be "KEY=VALUE" strings, got {item!r}')
+            key, value = item.split("=", 1)
+            out[key] = value
+        return out
+    raise TypeError(
+        f'docker_kwargs["environment"] must be a dict or a list of "KEY=VALUE" strings, '
+        f"got {type(environment).__name__}"
+    )
+
+
 @contextlib.contextmanager
 def _bypassing_kubernetes() -> Iterator[None]:
     """On this thread only, the kubernetes names answer with no-ops."""
@@ -176,6 +202,9 @@ def _build_classes() -> tuple[type, type]:
             # half-built runtime is worse than an exception.
             if getattr(self, "container", None) is None or self.container_name != handle.sandbox_id:
                 raise RuntimeError(f"failed to bind environment {handle.sandbox_id!r} into the R2E-Gym runtime")
+            # Check docker_kwargs["environment"] now: inside run() a bad value
+            # would come back as a command error, not as an exception.
+            self._exec_env()
 
         # --- the four kubernetes-sandbox hooks ------------------------------
         def _start_kubernetes_sandbox(self) -> None:
@@ -191,10 +220,13 @@ def _build_classes() -> tuple[type, type]:
             self.logger.debug("teardown is a no-op: the fleet releases environment %s", self.container_name)
 
         def _exec_env(self) -> dict[str, str]:
-            # What R2E-Gym's kubernetes backend puts in the pod env: its PATH,
-            # overridden by docker_kwargs["environment"].
+            # R2E-Gym's PATH, overridden by docker_kwargs["environment"]. This
+            # follows R2E-Gym's kubernetes backends (docker.py:250, :1258),
+            # because these hooks replace exactly that backend; its docker
+            # backend instead passes PATH=DOCKER_PATH on each exec_run
+            # (docker.py:741), thus there DOCKER_PATH always wins.
             extra = (getattr(self, "docker_kwargs", None) or {}).get("environment") or {}
-            return {"PATH": docker_path, **{k: str(v) for k, v in extra.items()}}
+            return {"PATH": docker_path, **_environment_dict(extra)}
 
         def _run_kubernetes(self, code, timeout=cmd_timeout, args="", workdir=""):
             command = f"{code} {args}".strip() if args else code
@@ -230,8 +262,15 @@ def _build_classes() -> tuple[type, type]:
                 f"mkdir -p {shlex.quote(dest_dir)} && tar --no-same-owner -xmf {shlex.quote(staged)} "
                 f"-C {shlex.quote(dest_dir)}; rc=$?; rm -f {shlex.quote(staged)}; exit $rc"
             )
-            res = self._handle.exec(cmd, timeout_s=120, check=False)
-            if res.timed_out or res.exit_code != 0:
+            res = self._handle.exec(cmd, timeout_s=_COPY_TIMEOUT_S, check=False)
+            if res.timed_out:
+                # The guest killed the shell before its rm -f ran.
+                with contextlib.suppress(Exception):
+                    self._handle.exec(f"rm -f {shlex.quote(staged)}", timeout_s=30, check=False)
+                raise RuntimeError(
+                    f"copy {src_path} -> {dest_path} timed out after {_COPY_TIMEOUT_S} s"
+                )
+            if res.exit_code != 0:
                 detail = (res.stderr or "").strip() or (res.stdout or "").strip()
                 raise RuntimeError(
                     f"copy {src_path} -> {dest_path} failed (exit {res.exit_code}): {detail}"

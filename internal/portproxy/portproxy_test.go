@@ -20,9 +20,11 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -330,6 +332,13 @@ func stateProxy(t *testing.T, s *setup, state func(n int) (ateapipb.ActorState, 
 
 func get(t *testing.T, base string, headers map[string]string) (int, string, time.Duration) {
 	t.Helper()
+	code, _, body, took := getWithHeader(t, base, headers, "")
+	return code, body, took
+}
+
+// getWithHeader is get that also returns the answer's header named want.
+func getWithHeader(t *testing.T, base string, headers map[string]string, want string) (int, string, string, time.Duration) {
+	t.Helper()
 	req, _ := http.NewRequest(http.MethodGet, base+"/", nil)
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -341,7 +350,64 @@ func get(t *testing.T, base string, headers map[string]string) (int, string, tim
 	}
 	b, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	return resp.StatusCode, string(b), time.Since(start)
+	return resp.StatusCode, resp.Header.Get(want), string(b), time.Since(start)
+}
+
+// A state read that fails for another reason than NotFound keeps the
+// retries and is logged once, not once for each 503.
+func TestFailedStateReadIsLoggedOnce(t *testing.T) {
+	var buf safeBuffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	s := newSetup(t)
+	s.router.RegisterPort("asleep", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	s.router.Running = func(string) bool { return false }
+	var mu sync.Mutex
+	reads := 0
+	p := mustNew(t, portproxy.Options{
+		ConnectAddr: s.routerAddr, DefaultAtespace: "ate-env", HandshakeTimeout: 5 * time.Second,
+		WakeBudget: time.Second,
+		ActorState: func(context.Context, string, string) (ateapipb.ActorState, error) {
+			mu.Lock()
+			reads++
+			mu.Unlock()
+			return 0, status.Error(codes.PermissionDenied, "no access")
+		},
+	})
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+	for range 2 {
+		if code, _, _ := get(t, srv.URL, target("asleep", 8000)); code != http.StatusServiceUnavailable {
+			t.Errorf("got %d, want 503 once the budget is spent", code)
+		}
+	}
+	mu.Lock()
+	n := reads
+	mu.Unlock()
+	if n < 4 {
+		t.Errorf("state read %d times in two 1 s loops, want one for each 503", n)
+	}
+	if got := strings.Count(buf.String(), "reading the state of environment ate-env/asleep failed"); got != 1 {
+		t.Errorf("logged the failed state read %d times, want 1:\n%s", got, buf.String())
+	}
+}
+
+type safeBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *safeBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *safeBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
 
 // The router answers 503 for a crashed, deleting or deleted actor as for a
@@ -353,19 +419,20 @@ func TestEnvironmentThatWillNotWakeFailsFast(t *testing.T) {
 		state  ateapipb.ActorState
 		err    error
 		status int
+		header string
 		body   string
 	}{
-		{"crashed", ateapipb.ActorState_ACTOR_STATE_CRASHED, nil, http.StatusBadGateway, "actor state CRASHED"},
-		{"deleting", ateapipb.ActorState_ACTOR_STATE_DELETING, nil, http.StatusNotFound, "actor state DELETING"},
-		{"deleted", 0, status.Error(codes.NotFound, "environment not found"), http.StatusNotFound, "was not found"},
+		{"crashed", ateapipb.ActorState_ACTOR_STATE_CRASHED, nil, http.StatusGone, "CRASHED", "actor state CRASHED"},
+		{"deleting", ateapipb.ActorState_ACTOR_STATE_DELETING, nil, http.StatusNotFound, "DELETING", "actor state DELETING"},
+		{"deleted", 0, status.Error(codes.NotFound, "environment not found"), http.StatusNotFound, "", "was not found"},
 	} {
 		s := newSetup(t)
 		s.router.RegisterPort("broken", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 		s.router.Running = func(string) bool { return false }
 		srv, _ := stateProxy(t, s, func(int) (ateapipb.ActorState, error) { return tc.state, tc.err })
-		code, body, took := get(t, srv.URL, target("broken", 8000))
-		if code != tc.status || !strings.Contains(body, tc.body) {
-			t.Errorf("%s: got %d %q, want %d naming %q", tc.name, code, body, tc.status, tc.body)
+		code, header, body, took := getWithHeader(t, srv.URL, target("broken", 8000), portproxy.EnvStateHeader)
+		if code != tc.status || header != tc.header || !strings.Contains(body, tc.body) {
+			t.Errorf("%s: got %d %s=%q %q, want %d %q naming %q", tc.name, code, portproxy.EnvStateHeader, header, body, tc.status, tc.header, tc.body)
 		}
 		if took > time.Second {
 			t.Errorf("%s: answered after %s, want at once (under 1s), not after the wake budget", tc.name, took)

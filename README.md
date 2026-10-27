@@ -523,8 +523,9 @@ the API's listener. A plain HTTP request that carries `X-Env-Id` and `X-Env-Port
 `X-Env-Atespace` outside `ate-env`) is forwarded through the Substrate router to that port, whatever
 its path; the API strips the three headers. The router resumes a suspended environment first,
 and the proxy waits for the wake up to `--wake-budget` (the same wait as a guest call) before it
-answers 503. An environment that will not wake fails at once: 502 for a crashed one, 404 for one
-that is deleted or being deleted.
+answers 503. An environment that will not wake fails at once: 410 Gone with `X-Env-State: CRASHED`
+for a crashed one, 404 for one that is deleted, and 404 with `X-Env-State: DELETING` for one that is
+being deleted. A client stops on 410, because only a new environment helps.
 
 ```bash
 curl -H 'X-Env-Id: dev1' -H 'X-Env-Port: 6000' localhost:7777/health

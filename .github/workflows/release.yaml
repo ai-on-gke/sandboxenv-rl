@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Publishes a release: the ate-env-api and ate-env-guest images to GitHub
-# Container Registry, pinned by digest and signed, and the ate-env CLI with
-# those digests baked in as its defaults, so a release binary deploys without
-# naming any image of this repo. Runs on a v* tag, or by hand for an existing
-# tag (to republish). See docs/release.md.
+# Publishes a release: the ate-env-api and ate-env-guest images and the
+# OpenHands runtime layer to GitHub Container Registry, pinned by digest and
+# signed, and the ate-env CLI with the two ate-env digests baked in as its
+# defaults, so a release binary deploys without naming any image of this repo.
+# Runs on a v* tag, or by hand for an existing tag (to republish). See
+# docs/release.md.
 #
 # Actions are pinned by commit SHA (the version is in the trailing comment),
 # expressions reach shell only through env, and the Go module cache is off:
@@ -89,17 +90,63 @@ jobs:
           echo "ate-env-api:   ${api}"
           echo "ate-env-guest: ${guest}"
 
+      # The OpenHands runtime layer (integrations/openhands/layer) is a Dockerfile
+      # build, not a Go binary, thus buildx builds it. QEMU runs its linux/arm64
+      # stages on the amd64 runner; the binfmt image is pinned by digest.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build and push the OpenHands layer
+        id: layer
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The tag carries the agent-server version the layer is locked to; the
+          # build checks that the installed agent-server, sdk and tools match it.
+          version=$(sed -n 's/^openhands-agent-server==\([0-9][0-9.]*\)$/\1/p' integrations/openhands/layer/requirements.in)
+          if [[ -z "${version}" ]]; then
+            echo "no openhands-agent-server==<version> line in integrations/openhands/layer/requirements.in" >&2
+            exit 1
+          fi
+          echo "${GH_TOKEN}" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+          # --provenance=false: a plain image index, like the ko images; the cosign
+          # signature below records where the image comes from.
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg "AGENT_SERVER_VERSION=${version}" \
+            --provenance=false \
+            --tag "${IMAGE_PREFIX}/oh-agent-server-layer:${version}-${TAG}" \
+            --metadata-file layer-metadata.json \
+            --push \
+            integrations/openhands/layer
+          digest=$(jq -r '."containerimage.digest"' layer-metadata.json)
+          if [[ "${digest}" != sha256:* ]]; then
+            echo "no image digest in the buildx metadata: ${digest}" >&2
+            exit 1
+          fi
+          layer="${IMAGE_PREFIX}/oh-agent-server-layer@${digest}"
+          echo "layer=${layer}" >> "$GITHUB_OUTPUT"
+          echo "oh-agent-server-layer: ${layer}"
+
       - name: Sign the images (keyless, bound to this workflow's identity)
         env:
           API_IMAGE: ${{ steps.images.outputs.api }}
           GUEST_IMAGE: ${{ steps.images.outputs.guest }}
-        run: cosign sign --yes "$API_IMAGE" "$GUEST_IMAGE"
+          LAYER_IMAGE: ${{ steps.layer.outputs.layer }}
+        run: cosign sign --yes "$API_IMAGE" "$GUEST_IMAGE" "$LAYER_IMAGE"
 
       - name: Build the CLI with the image digests as defaults
         env:
           TAG: ${{ steps.tag.outputs.tag }}
           API_IMAGE: ${{ steps.images.outputs.api }}
           GUEST_IMAGE: ${{ steps.images.outputs.guest }}
+          LAYER_IMAGE: ${{ steps.layer.outputs.layer }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -113,6 +160,7 @@ jobs:
           {
             echo "ate-env-api=${API_IMAGE}"
             echo "ate-env-guest=${GUEST_IMAGE}"
+            echo "oh-agent-server-layer=${LAYER_IMAGE}"
           } > "dist/images_${TAG}.txt"
           (cd dist && sha256sum ./* > "SHA256SUMS_${TAG}.txt")
           ls -l dist
@@ -123,6 +171,7 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
           API_IMAGE: ${{ steps.images.outputs.api }}
           GUEST_IMAGE: ${{ steps.images.outputs.guest }}
+          LAYER_IMAGE: ${{ steps.layer.outputs.layer }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -143,8 +192,10 @@ jobs:
             echo
             echo "- \`${API_IMAGE}\`"
             echo "- \`${GUEST_IMAGE}\`"
+            echo "- \`${LAYER_IMAGE}\`"
             echo
-            echo "The \`ate-env\` binaries attached to this release default \`manifest --api-image\` and \`manifest template --guest-image\` to these digests."
+            echo "The \`ate-env\` binaries attached to this release default \`manifest --api-image\` and \`manifest template --guest-image\` to the first two digests."
+            echo "The third is the OpenHands runtime layer, for \`ate-env manifest template --layer oh=<digest>=/opt/oh\` (see \`integrations/openhands/README.md\`)."
             echo
             echo '```bash'
             echo "cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"

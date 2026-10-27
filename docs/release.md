@@ -8,12 +8,15 @@ publishes everything a user needs from this repo:
 |---|---|---|
 | `ate-env-api` image | `ghcr.io/ai-on-gke/sandboxenv-rl/ate-env-api` | by digest, from the release notes or `images_<tag>.txt` |
 | `ate-env-guest` image | `ghcr.io/ai-on-gke/sandboxenv-rl/ate-env-guest` | by digest, same places |
+| OpenHands runtime layer | `ghcr.io/ai-on-gke/sandboxenv-rl/oh-agent-server-layer` | by digest, same places; see [The OpenHands layer](#the-openhands-layer) |
 | `ate-env` CLI | release assets `ate-env_<tag>_<os>_<arch>` for linux and darwin, amd64 and arm64 | download, `chmod +x` |
 | checksums | `SHA256SUMS_<tag>.txt` | `sha256sum -c` |
 
-Images are multi-platform (linux/amd64, linux/arm64), tagged with the release
-tag and `latest`, and signed with cosign keyless signing bound to this
-repository's GitHub Actions identity.
+Images are multi-platform (linux/amd64, linux/arm64) and signed with cosign
+keyless signing bound to this repository's GitHub Actions identity. The two
+ate-env images are tagged with the release tag and `latest`; the OpenHands layer
+is tagged `<agent-server version>-<release tag>`, for example `1.55.0-v0.2.0`,
+and has no `latest`.
 
 ## What a release binary knows
 
@@ -33,6 +36,30 @@ and pushes it and prints the digest-pinned ref. Use the digest: a registry's
 `:latest` is whatever was built last, and a stale worker image makes workers
 register with no capacity, so no actor finds room.
 
+## The OpenHands layer
+
+The release also publishes the runtime layer that
+[`integrations/openhands`](../integrations/openhands/README.md) mounts into task
+images at `/opt/oh`: the OpenHands agent-server with its own Python. It is built
+from [`integrations/openhands/layer`](../integrations/openhands/layer) with
+`docker buildx` for linux/amd64 and linux/arm64; QEMU runs the arm64 stages on
+the amd64 runner. Its dependencies are hash-locked and its base images are pinned
+by digest, and the build fails when the installed agent-server, sdk and tools
+are not the version in `layer/requirements.in`. That version is the first part
+of the tag. The image index carries no provenance attestation, like the ko
+images; the cosign signature records where it comes from.
+
+Use the digest from the release notes or `images_<tag>.txt` in the base
+template:
+
+```bash
+ate-env manifest template --template oh-agent-server \
+  --layer oh=ghcr.io/ai-on-gke/sandboxenv-rl/oh-agent-server-layer@sha256:<digest>=/opt/oh ...
+```
+
+The client package `ate-env-openhands` pins `openhands-sdk` to the same version
+as the layer's agent-server; use the layer and the package from the same release.
+
 ## Pin by digest
 
 Always deploy images by digest, never by tag. Substrate requires it for
@@ -48,6 +75,9 @@ cosign verify \
   --certificate-identity-regexp '^https://github.com/ai-on-gke/sandboxenv-rl/\.github/workflows/release\.yaml@refs/tags/' \
   ghcr.io/ai-on-gke/sandboxenv-rl/ate-env-guest@sha256:<digest>
 ```
+
+The same command verifies `ate-env-api` and `oh-agent-server-layer`; change
+only the image reference.
 
 A valid signature proves the image was built by this repository's `release`
 workflow from a tag: the identity is the workflow file at a `refs/tags/` ref,
@@ -66,9 +96,9 @@ git push origin v0.1.0
 ```
 
 The workflow creates the GitHub release with generated notes, builds and pushes
-the images, signs them, builds the CLI for four platforms, uploads the assets,
-and appends an `## Images` section with the digests and the verify command to
-the notes. To republish an existing tag (a failed run, a workflow fix), start
+the two ate-env images and the OpenHands layer, signs all three, builds the CLI
+for four platforms, uploads the assets, and appends an `## Images` section with
+the digests and the verify command to the notes. To republish an existing tag (a failed run, a workflow fix), start
 the workflow by hand from the Actions tab with the tag as input; it replaces the
 assets and the images section rather than duplicating them. A republish
 produces new digests, since the images are rebuilt.
@@ -80,9 +110,9 @@ workflow's `GITHUB_TOKEN`, under the repository. Once:
 
 1. Allow GitHub Actions to create packages for the organization (organization
    settings, Packages).
-2. After the first release, open each package (`ate-env-api`, `ate-env-guest`)
-   and confirm it is public and linked to this repository, so anonymous pulls
-   and the repository's permissions apply.
+2. After the first release, open each package (`ate-env-api`, `ate-env-guest`,
+   `oh-agent-server-layer`) and confirm it is public and linked to this
+   repository, so anonymous pulls and the repository's permissions apply.
 
 ## Reproducibility notes
 
@@ -91,6 +121,9 @@ workflow's `GITHUB_TOKEN`, under the repository. Once:
   a shell for `shell()`; for rootfs-image templates only the static binary is
   used. Bump the pin deliberately and mention it in the release notes.
 - The API image uses ko's default distroless base.
+- The OpenHands layer pins its base images by digest in its Dockerfile and its
+  Python dependencies by hash in `layer/requirements.txt`. The QEMU binfmt
+  image the release job installs is pinned by digest in `release.yaml`.
 - The actions both workflows use are pinned by commit SHA, with the version in
   a trailing comment; the organization's workflow security scan (zizmor)
   requires it. To bump one, resolve the new tag's commit (`git ls-remote --tags

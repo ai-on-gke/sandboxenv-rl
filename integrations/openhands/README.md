@@ -36,7 +36,7 @@ How it fits together:
 |---|---|
 | [`src/ate_env_openhands/`](src/ate_env_openhands) | `AteEnvWorkspace`, `port_url` |
 | [`layer/`](layer) | the runtime layer: Dockerfile, hash-locked dependencies, `lock.sh` |
-| [`../../examples/openhands`](../../examples/openhands) | the examples: OpenHands' agent-sandbox example 17, CodeAct, trajectory execution, a plain-HTTP demo |
+| [`../../examples/openhands`](../../examples/openhands) | the examples: OpenHands' agent-sandbox example 17, CodeAct, trajectory execution, a plain-HTTP demo, a fleet rollout |
 | [`tests/`](tests) | unit and integration tests: a fake ate-env-api and port proxy in front of a real agent-server |
 
 ## 1. Install
@@ -127,6 +127,7 @@ caller.
 | `template` | required to create | base template with the agent-server layer | `warmpool` |
 | `image` | the template's image | task image, `repo@sha256:…` | none (fixed in the SandboxTemplate) |
 | `atespace` | `ate-env` | atespace of the environment | `namespace` |
+| `template_atespace` | the server default | atespace of `template` | none |
 | `api_url` | `127.0.0.1:7777` | ate-env-api, host:port or URL | `host` in `direct` mode |
 | `proxy_url` | `api_url` | port proxy base URL, when it differs | none |
 | `api_token` | none | ate-env-api's bearer token: on gRPC calls, and in `X-Env-Authorization` on proxy requests, which ate-env-api removes before it forwards them | none |
@@ -199,7 +200,7 @@ the repository's other examples:
 | [`demo.sh`](../../examples/openhands/demo.sh) | registers the base template and drives the agent-server over plain HTTP |
 | [`fleet_rollout.py`](../../examples/openhands/fleet_rollout.py) | an agent-sandbox-rl style rollout: `fleet.run` with `make_handle_workspace` |
 
-## 6. Fleet adapters: the Tunix shape
+## 6. Fleet adapters
 
 `ate_env_openhands.fleet` has the two helpers of `agent_sandbox_rl.adapters.openhands`, with the
 same names and ownership: the **fleet** (`ate_env.SandboxFleet`) acquires and releases sandboxes;
@@ -239,9 +240,9 @@ results = fleet.run(rollout)
 
 ## 7. R2E-Gym adapter
 
-`ate_env_openhands.r2egym` is `agent_sandbox_rl.adapters.r2egym` for ate-env: R2E-Gym's `RepoEnv`
-on a sandbox the fleet acquired, so Tunix's `r2egym` and `sweagent` scaffolds change only their
-imports. No agent-server is involved: the runtime's exec and file copy go through the handle.
+`ate_env_openhands.r2egym` has the names of `agent_sandbox_rl.adapters.r2egym`, for ate-env:
+R2E-Gym's `RepoEnv` on a sandbox the fleet acquired. No agent-server is involved: the runtime's
+exec and file copy go through the handle.
 
 ```python
 from ate_env_openhands.r2egym import fresh_eval_env, make_fleet_repo_env, r2egym_command_files
@@ -295,8 +296,8 @@ fork), and a `RemoteConversation` whose event WebSocket goes through the proxy.
 
 ## Verified
 
-GKE with gVisor workers, Substrate from 2026-10-12, ate-env-api with the port proxy, agent-server
-1.55.0 from this layer, 2026-10-15:
+GKE with gVisor workers, Substrate main from 2026-10-12 (build v0.4.0-83), ate-env-api with the
+port proxy, agent-server 1.55.0 from this layer, 2026-10-15:
 
 | image | base | agent-server answering after create |
 |---|---|---|
@@ -327,6 +328,9 @@ GKE with gVisor workers, Substrate from 2026-10-12, ate-env-api with the port pr
   `run_trajectory.py` ran `hello.json` and recorded a failed step in `--out`; `codeact_agent.py
   --scripted` finished and its conversation was gone afterwards. The amd64 build is not yet verified.
 
+These runs came before the Substrate v0.6.0 requirement in section 3 and before the later changes
+to this package. They do not test those changes.
+
 ## Limits
 
 - `api_token` needs an ate-env-api whose port proxy checks `X-Env-Authorization` and removes it
@@ -340,15 +344,14 @@ GKE with gVisor workers, Substrate from 2026-10-12, ate-env-api with the port pr
 - With a live `RemoteConversation`, `pause()` does not keep the environment suspended: the suspend
   breaks the event WebSocket, the SDK reconnects after about a second, and the proxy wakes the
   environment for that request. Thus a paused environment with a live conversation is a running
-  actor, and it costs a worker. Close the conversation before `pause()` (see `pause()` above). The
-  follow-up is in the OpenHands SDK: hold or close the event stream across a pause.
+  actor, and it costs a worker. Close the conversation before `pause()` (see `pause()` above).
 
 - One API key per template, and in practice one per atespace: the key is in the template's container
   environment. Each viewer of the atespace can read it with `GetActorTemplate`, and each template
   derived per task image copies it. Substrate's `EnvVar` has a name and a value only: logs redact
   the value, reads do not, and a template cannot refer to a secret. Use a dedicated atespace for
-  these environments. The follow-up is a request to Substrate: a template field that uses its
-  credential-provider path to inject the key out of band.
+  these environments. Refer to the OpenHands agent-server in the
+  [threat model](../../docs/security/threat-model.md#the-openhands-agent-server).
 - The agent-server runs as the image's user and keeps its state under that user's home. The first
   environment on a node pulls the layer.
 - A daemon reached through ate-env-api must listen on all interfaces, not 127.0.0.1: the router

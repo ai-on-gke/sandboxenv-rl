@@ -80,6 +80,14 @@ type Config struct {
 	// which is the cost this shape measures. Requires ParkDelete. Zero keeps
 	// one fleet across the steps.
 	ImagesPerStep int
+	// ParkEach, in steps mode, parks each environment as soon as its step
+	// ends instead of parking the fleet after the whole step, so at most
+	// Width environments are awake at once and the fleet can be larger than
+	// the running slots: the shape of a trainer that releases a sandbox at
+	// the end of its episode. The step barrier then includes the parking and
+	// there is no park event. Requires ParkSuspend or ParkDelete, and not
+	// ImagesPerStep, which retires its environments anyway.
+	ParkEach bool
 
 	// CreateTimeout bounds one create call; StepTimeout is the default for a
 	// run step without its own timeout.
@@ -132,6 +140,7 @@ var LoaderLabelKeys = []string{
 	"mode", "width", "images", "trajectory", "tasks_per_image", "rollouts", "steps", "park",
 	"create_timeout", "step_timeout", "wake_budget", "wake_backoff",
 	"dataset", "connections", "base_template", "exclude_file", "instances", "seed", "images_per_step",
+	"park_each",
 }
 
 // labels describes the run for its run event.
@@ -158,6 +167,9 @@ func (c *Config) labels() map[string]string {
 		l["park"] = string(c.Park)
 		if c.ImagesPerStep > 0 {
 			l["images_per_step"] = strconv.Itoa(c.ImagesPerStep)
+		}
+		if c.ParkEach {
+			l["park_each"] = "true"
 		}
 	}
 	for k, v := range c.Invocation {
@@ -224,6 +236,12 @@ func (c *Config) validate() error {
 		}
 		if c.ImagesPerStep > len(c.Instances) {
 			return fmt.Errorf("images per step (%d) is more than the %d instances; a window must not repeat an instance within one step", c.ImagesPerStep, len(c.Instances))
+		}
+		if c.ParkEach && c.Park == ParkNone {
+			return errors.New("park each needs park mode suspend or delete")
+		}
+		if c.ParkEach && c.ImagesPerStep > 0 {
+			return errors.New("park each keeps one fleet across the steps; it cannot be combined with images per step")
 		}
 	default:
 		return fmt.Errorf("unknown mode %q", c.Mode)
@@ -596,12 +614,18 @@ func (r *runner) runWindows(ctx context.Context) {
 }
 
 func (r *runner) runSteps(ctx context.Context, envs []*environment) {
-	forEach(ctx, len(envs), r.cfg.Width, func(i int) { r.create(ctx, envs[i], 0) })
-	r.log.Info("fleet created", slog.Int("environments", len(envs)), slog.Int("failed", r.countFailed(envs)))
+	if !r.cfg.ParkEach {
+		forEach(ctx, len(envs), r.cfg.Width, func(i int) { r.create(ctx, envs[i], 0) })
+		r.log.Info("fleet created", slog.Int("environments", len(envs)), slog.Int("failed", r.countFailed(envs)))
+	}
 
 	for step := 1; step <= r.cfg.Steps; step++ {
 		if ctx.Err() != nil {
 			break
+		}
+		if r.cfg.ParkEach {
+			r.stepParkEach(ctx, envs, step)
+			continue
 		}
 		if step > 1 && r.cfg.Park == ParkDelete {
 			forEach(ctx, len(envs), r.cfg.Width, func(i int) {
@@ -654,6 +678,46 @@ func (r *runner) runSteps(ctx context.Context, envs []*environment) {
 			r.remove(cleanup, envs[i], r.cfg.Steps)
 		}
 	})
+}
+
+// stepParkEach runs one step with each environment created on its first
+// step (or every step under a delete park), replayed, and parked as soon as
+// its replay ends, Width at a time. The barrier covers the parking, so no
+// park event is recorded; the suspend and delete events carry the cost.
+// The last step parks too, since the fleet need not fit awake; the run's
+// cleanup deletes what a suspend park left.
+func (r *runner) stepParkEach(ctx context.Context, envs []*environment, step int) {
+	barrier := time.Now()
+	forEach(ctx, len(envs), r.cfg.Width, func(i int) {
+		e := envs[i]
+		if e.failed {
+			return
+		}
+		if step == 1 {
+			if !r.create(ctx, e, 0) {
+				return
+			}
+		} else if r.cfg.Park == ParkDelete {
+			if !r.create(ctx, e, step) {
+				return
+			}
+		}
+		r.replay(ctx, e, step)
+		if e.failed || ctx.Err() != nil {
+			return
+		}
+		switch r.cfg.Park {
+		case ParkSuspend:
+			r.suspend(ctx, e, step)
+		case ParkDelete:
+			r.remove(ctx, e, step)
+		}
+	})
+	live := len(envs) - r.countFailed(envs)
+	r.rec.Record(Event{RunID: r.cfg.RunID, Event: EventBarrier, Step: step, DurMS: ms(time.Since(barrier)),
+		OK: ctx.Err() == nil, Count: live})
+	r.log.Info("step done", slog.Int("step", step), slog.Duration("barrier", time.Since(barrier)),
+		slog.Int("live", live), slog.Int("failed", r.failed), slog.Int("rewarded", r.rewarded))
 }
 
 func (r *runner) countFailed(envs []*environment) int {

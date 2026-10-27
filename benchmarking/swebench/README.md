@@ -22,6 +22,7 @@ in numbers.
 |---|---|---|
 | eval (SWE-bench Verified evaluation) | `-mode eval -images 500 -tasks-per-image 6 -width 500` | 500 in flight. Each task: create from the image, replay the trajectory, record the reward, delete. With the offline exclusion list the 500 become 445 images and 2,670 tasks; the loader prints the reduced count. |
 | steps (training loop) | `-mode steps -images 500 -rollouts 2 -steps 8 -park suspend` | 1,000 environments created once. Each step replays the trajectory on all of them, waits for the last (the barrier), then parks the fleet. `-park` is `suspend`, `delete` or `none`. |
+| steps, parked one by one (fleet larger than the slots) | `-mode steps -images 500 -rollouts 16 -steps 8 -park suspend -width 64 -park-each` | 8,000 environments, created on their first step. Each environment is parked as soon as its own step ends instead of after the whole fleet's, so at most 64 are awake at once and the fleet can be many times the running slots: the shape of a trainer that releases a sandbox at the end of its episode, and the way to measure how many parked environments a node can hold. The barrier includes the parking and there is no `park` event. |
 | steps with a window (pools per step) | `-mode steps -images-per-step 32 -rollouts 16 -steps 6 -park delete` | Each step takes the next 32 images (wrapping around the dataset), creates 16 fresh environments per image, 512 in all, runs the step behind a barrier, and retires them. Nothing survives a step, so every task pays the cold path, and a new image is a new derived template and a golden bake on first use: the shape of a trainer that creates and retires pools every step. Run several loaders at once, one run id each, for several jobs on one cluster. |
 
 The trajectory is YAML (`internal/benchmarking/swebench/trajectories/`,
@@ -51,7 +52,7 @@ API server included, which is what a trainer sees):
 | `task` | one replay end to end, ok and reward |
 | `suspend`, `delete` | the calls |
 | `step_barrier` | steps mode: first task start to last task end in a training step |
-| `park` | steps mode: parking the whole fleet |
+| `park` | steps mode: parking the whole fleet; absent with `-park-each`, where the barrier includes the parking |
 | `run` | the whole run |
 
 `swebench-loader report RUN.jsonl -json summary.json` prints count, failed,

@@ -70,3 +70,45 @@ def test_the_warm_pool_sentinel_is_reserved():
     # it, and reap() deletes those for any run.
     with pytest.raises(ValidationError, match="reserved"):
         FleetConfig(run_id=WARM_POOL_RUN_ID)
+
+
+async def test_warm_pool_environments_carry_the_fleet_run_id(fake_stack):
+    # Review of #124: setup() and warm_images() did not pass the fleet's run
+    # id, so the Substrate driver tagged the warm actors "warm-pool".
+    import asyncio
+
+    client, _fakes = fake_stack
+    cfg = FleetConfig(backend="substrate", endpoint=client.endpoint, template="tmpl",
+                      max_warmpool_replicas=2, run_id="job-42")
+    img_a = "docker.io/library/python@sha256:" + "a" * 64
+    img_b = "docker.io/library/python@sha256:" + "b" * 64
+
+    def _drive():
+        fleet = SandboxFleet(cfg)
+        try:
+            fleet.load_tasks([Task(id="t1", image=img_a), Task(id="t2", image=img_a)])
+            fleet.setup()
+            fleet.warm_images([img_b], replicas=1)
+            owned = fleet.backend._owned_actors
+            assert len(owned) == 3
+            assert {inst.run_id for inst in owned.values()} == {"job-42"}
+        finally:
+            fleet.close()
+
+    await asyncio.to_thread(_drive)
+
+
+async def test_async_warm_pool_environments_carry_the_fleet_run_id(fake_stack):
+    client, _fakes = fake_stack
+    cfg = FleetConfig(backend="substrate", endpoint=client.endpoint, template="tmpl",
+                      max_warmpool_replicas=2, run_id="job-42")
+    img = "docker.io/library/python@sha256:" + "c" * 64
+    fleet = AsyncSandboxFleet(cfg)
+    try:
+        await fleet.setup([Task(id="t1", image=img), Task(id="t2", image=img)])
+        owned = fleet.backend._owned_actors
+        assert len(owned) == 2
+        assert {inst.run_id for inst in owned.values()} == {"job-42"}
+    finally:
+        await fleet.teardown()
+        fleet.close()

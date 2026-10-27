@@ -29,8 +29,8 @@ ALLOWED_STRATEGIES = {"none", "naive", "sliding", "pipelined"}
 ALLOWED_DATA_PLANES = {"ate_env"}
 
 # Run id the Substrate backend gives warm-pool actors created without a run
-# id; reap() deletes them for any run. Reserved, so a job's claimed
-# environments never share an id with the warm pool.
+# id (a direct warm_pool() call; fleets pass theirs). Reserved, so a job's
+# environments never share an id with those.
 WARM_POOL_RUN_ID = "warm-pool"
 
 

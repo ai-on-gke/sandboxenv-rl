@@ -56,8 +56,10 @@ func render(w io.Writer) {
 # ate-env-api metrics
 
 ate-env-api serves these Prometheus families at `+"`/metrics`"+` on the listener
-`+"`--metrics-listen-addr`"+` names (default `+"`:9090`"+`; empty disables it). They live
-on a private registry: no Go runtime or process collectors. Labels carry a
+`+"`--metrics-listen-addr`"+` names. The listener is off by default (the flag is
+empty); `+"`ate-env manifest --metrics-port`"+` turns it on. It has no authentication
+and no Host check, so bind it where only trusted scrapers reach it. The
+families live on a private registry: no Go runtime or process collectors. Labels carry a
 bounded vocabulary only; environment ids, actor ids, run ids, paths and image
 references never appear in a label.
 

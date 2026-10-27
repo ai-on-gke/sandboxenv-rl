@@ -17,9 +17,7 @@ package telemetry
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -34,46 +32,6 @@ import (
 // Propagator is the only propagator the servers install: W3C Trace Context,
 // without Baggage, so no caller-chosen key/value pairs ride along.
 var Propagator propagation.TextMapPropagator = propagation.TraceContext{}
-
-type otelInstrumenter struct {
-	tracer trace.Tracer
-}
-
-// newOTelInstrumenter returns an Instrumenter whose spans come from tp, with
-// the instrumentation scope named after serviceName ('-' replaced by '_').
-func newOTelInstrumenter(tp trace.TracerProvider, serviceName string) Instrumenter {
-	return &otelInstrumenter{tracer: tp.Tracer(strings.ReplaceAll(serviceName, "-", "_"))}
-}
-
-func (o *otelInstrumenter) StartSpan(ctx context.Context, name string, attrs map[string]string) (context.Context, func()) {
-	var opts []trace.SpanStartOption
-	if len(attrs) > 0 {
-		opts = append(opts, trace.WithAttributes(stringAttrs(attrs)...))
-	}
-	ctx, span := o.tracer.Start(ctx, name, opts...)
-	return ctx, func() { span.End() }
-}
-
-func (o *otelInstrumenter) AddEvent(ctx context.Context, name string, attrs map[string]string) {
-	trace.SpanFromContext(ctx).AddEvent(name, trace.WithAttributes(stringAttrs(attrs)...))
-}
-
-func (o *otelInstrumenter) IsRecording(ctx context.Context) bool {
-	return trace.SpanFromContext(ctx).IsRecording()
-}
-
-func (o *otelInstrumenter) TraceContext(ctx context.Context) string {
-	carrier := propagation.MapCarrier{}
-	Propagator.Inject(ctx, carrier)
-	if len(carrier) == 0 {
-		return ""
-	}
-	data, err := json.Marshal(map[string]string(carrier))
-	if err != nil {
-		return ""
-	}
-	return string(data)
-}
 
 // Untraced returns ctx with a remote parent span context that is not
 // sampled, so calls made with it are dropped by the default ParentBased
@@ -93,17 +51,9 @@ func Untraced(ctx context.Context) context.Context {
 	}))
 }
 
-func stringAttrs(attrs map[string]string) []attribute.KeyValue {
-	kv := make([]attribute.KeyValue, 0, len(attrs))
-	for k, v := range attrs {
-		kv = append(kv, attribute.String(k, v))
-	}
-	return kv
-}
-
 // SetupOTel installs a global OpenTelemetry tracer provider that exports
-// spans over OTLP/gRPC and returns an Instrumenter on it, plus a function
-// that flushes and shuts the provider down.
+// spans over OTLP/gRPC and returns a function that flushes and shuts the
+// provider down.
 //
 // The exporter is configured by the standard environment variables, chiefly
 // OTEL_EXPORTER_OTLP_ENDPOINT (default localhost:4317) and
@@ -111,16 +61,16 @@ func stringAttrs(attrs map[string]string) []attribute.KeyValue {
 // resource carries service.name = serviceName. The global propagator is set
 // to W3C Trace Context only (no Baggage), which is what the otelgrpc stats
 // handlers read and write.
-func SetupOTel(ctx context.Context, serviceName string) (Instrumenter, func(), error) {
+func SetupOTel(ctx context.Context, serviceName string) (func(), error) {
 	exporter, err := otlptracegrpc.New(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("telemetry: creating OTLP trace exporter: %w", err)
+		return nil, fmt.Errorf("telemetry: creating OTLP trace exporter: %w", err)
 	}
 	res, err := resource.Merge(resource.Default(),
 		resource.NewSchemaless(attribute.String("service.name", serviceName)))
 	if err != nil {
 		_ = exporter.Shutdown(ctx)
-		return nil, nil, fmt.Errorf("telemetry: building resource: %w", err)
+		return nil, fmt.Errorf("telemetry: building resource: %w", err)
 	}
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
@@ -134,5 +84,5 @@ func SetupOTel(ctx context.Context, serviceName string) (Instrumenter, func(), e
 		defer cancel()
 		_ = tp.Shutdown(sctx)
 	}
-	return newOTelInstrumenter(tp, serviceName), shutdown, nil
+	return shutdown, nil
 }

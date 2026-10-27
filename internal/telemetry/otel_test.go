@@ -16,7 +16,6 @@ package telemetry
 
 import (
 	"context"
-	"encoding/json"
 	"net"
 	"sort"
 	"strings"
@@ -35,64 +34,9 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
-func TestNoOp(t *testing.T) {
-	inst := NewNoOp()
-	ctx := context.Background()
-	got, end := inst.StartSpan(ctx, "op", map[string]string{"k": "v"})
-	end()
-	if got != ctx {
-		t.Error("NoOp StartSpan returned a new context")
-	}
-	inst.AddEvent(ctx, "ev", nil)
-	if inst.IsRecording(ctx) {
-		t.Error("NoOp IsRecording = true")
-	}
-	if tc := inst.TraceContext(ctx); tc != "" {
-		t.Errorf("NoOp TraceContext = %q, want empty", tc)
-	}
-}
-
 func newRecorder() (*tracetest.SpanRecorder, *sdktrace.TracerProvider) {
 	rec := tracetest.NewSpanRecorder()
 	return rec, sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
-}
-
-func TestOTelInstrumenter(t *testing.T) {
-	rec, tp := newRecorder()
-	inst := newOTelInstrumenter(tp, "ate-env-api")
-	ctx, end := inst.StartSpan(context.Background(), "parent", map[string]string{"ate.atespace": "ate-env"})
-	if !inst.IsRecording(ctx) {
-		t.Error("IsRecording = false inside a sampled span")
-	}
-	inst.AddEvent(ctx, "woke", map[string]string{"outcome": "woke"})
-
-	var carrier map[string]string
-	if err := json.Unmarshal([]byte(inst.TraceContext(ctx)), &carrier); err != nil {
-		t.Fatalf("TraceContext is not JSON: %v", err)
-	}
-	sc := trace.SpanContextFromContext(ctx)
-	if !strings.Contains(carrier["traceparent"], sc.TraceID().String()) || !strings.Contains(carrier["traceparent"], sc.SpanID().String()) {
-		t.Errorf("traceparent %q does not name span %s/%s", carrier["traceparent"], sc.TraceID(), sc.SpanID())
-	}
-	if _, ok := carrier["baggage"]; ok {
-		t.Error("carrier holds baggage; the propagator must be W3C Trace Context only")
-	}
-	end()
-
-	spans := rec.Ended()
-	if len(spans) != 1 {
-		t.Fatalf("got %d spans, want 1", len(spans))
-	}
-	s := spans[0]
-	if s.Name() != "parent" || s.InstrumentationScope().Name != "ate_env_api" {
-		t.Errorf("span %q scope %q, want parent in scope ate_env_api", s.Name(), s.InstrumentationScope().Name)
-	}
-	if len(s.Attributes()) != 1 || string(s.Attributes()[0].Key) != "ate.atespace" {
-		t.Errorf("attributes = %v", s.Attributes())
-	}
-	if len(s.Events()) != 1 || s.Events()[0].Name != "woke" {
-		t.Errorf("events = %v", s.Events())
-	}
 }
 
 func TestPropagatorIsTraceContextOnly(t *testing.T) {
@@ -114,7 +58,7 @@ func TestSetupOTel(t *testing.T) {
 		otel.SetTextMapPropagator(prevProp)
 	})
 
-	inst, shutdown, err := SetupOTel(context.Background(), "ate-env-api")
+	shutdown, err := SetupOTel(context.Background(), "ate-env-api")
 	if err != nil {
 		t.Fatalf("SetupOTel: %v", err)
 	}
@@ -128,9 +72,9 @@ func TestSetupOTel(t *testing.T) {
 	}
 	// The span is left open: an ended span would make shutdown try to export
 	// it to the unreachable endpoint until its timeout.
-	ctx, _ := inst.StartSpan(context.Background(), "op", nil)
-	if !inst.IsRecording(ctx) {
-		t.Error("span from SetupOTel's instrumenter is not recording")
+	_, span := otel.Tracer("test").Start(context.Background(), "op")
+	if !span.IsRecording() {
+		t.Error("span from SetupOTel's global provider is not recording")
 	}
 	shutdown()
 }

@@ -724,6 +724,14 @@ func (s *Server) trackCreate(atespace, id string, start time.Time) {
 	s.pending[atespace+"/"+id] = pendingCreate{atespace: atespace, start: start}
 }
 
+// ObserveFirstContact ends create_to_ready (status ok) for an environment
+// whose port the port proxy reached: like a guest RPC through ensureAwake,
+// a CONNECT the router accepts means the environment answers. It does
+// nothing for an environment that is not pending, or without Metrics.
+func (s *Server) ObserveFirstContact(atespace, id string) {
+	s.finishCreate(atespace, id, telemetry.ReadyStatusOK)
+}
+
 // finishCreate observes create_to_ready with readyStatus for a pending
 // environment, once; later calls for the same environment do nothing.
 func (s *Server) finishCreate(atespace, id, readyStatus string) {
@@ -755,7 +763,7 @@ func environmentState(st *ateapipb.ActorStatus) string {
 // by environment state. It is the source of ate_env_api_environments: the
 // control plane is the truth, so the gauge survives restarts and agrees
 // across replicas, at the cost of one ListActors per atespace per scrape
-// (cached for 15 s by the collector). The atespaces are listed concurrently,
+// (cached by the collector for --metrics-environments-ttl, default 60 s). The atespaces are listed concurrently,
 // at most environmentListConcurrency at a time.
 func (s *Server) EnvironmentCounts(ctx context.Context) ([]telemetry.EnvironmentCount, error) {
 	s.readyMu.Lock()

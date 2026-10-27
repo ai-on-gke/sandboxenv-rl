@@ -26,6 +26,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -363,5 +364,79 @@ func TestHandlerServesExpositionFormat(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), "# TYPE ate_env_api_build_info gauge") {
 		t.Errorf("exposition lacks build_info:\n%s", body)
+	}
+}
+
+// The source is read outside the collector's lock: while one scrape waits on
+// a slow read, a concurrent scrape is served the last answer at once instead
+// of waiting, and only one read is in flight.
+func TestEnvironmentsCollectorReadsOutsideTheLock(t *testing.T) {
+	m := NewMetrics()
+	m.SetEnvironmentsCacheTTL(time.Nanosecond) // every scrape is due for a read
+	var calls atomic.Int32
+	block := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	m.SetEnvironmentSource(func(context.Context) ([]EnvironmentCount, error) {
+		if calls.Add(1) > 1 {
+			entered <- struct{}{}
+			<-block
+		}
+		return []EnvironmentCount{{Atespace: "ate-env", State: "running", Count: int(calls.Load())}}, nil
+	})
+	if _, err := m.Registry().Gather(); err != nil { // first read, fast
+		t.Fatal(err)
+	}
+	slow := make(chan error, 1)
+	go func() { _, err := m.Registry().Gather(); slow <- err }()
+	<-entered // the second read is in flight and blocked
+
+	done := make(chan float64, 1)
+	go func() {
+		mfs, _ := m.Registry().Gather()
+		for _, mf := range mfs {
+			if mf.GetName() == MetricEnvironments {
+				done <- mf.GetMetric()[0].GetGauge().GetValue()
+				return
+			}
+		}
+		done <- -1
+	}()
+	select {
+	case got := <-done:
+		if got != 1 {
+			t.Errorf("concurrent scrape served %v, want the last answer 1", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent scrape waited for the in-flight read")
+	}
+	close(block)
+	if err := <-slow; err != nil {
+		t.Fatal(err)
+	}
+	if n := calls.Load(); n != 2 {
+		t.Errorf("source called %d times, want 2 (no read for the concurrent scrape)", n)
+	}
+}
+
+func TestEnvironmentsCacheTTL(t *testing.T) {
+	m := NewMetrics()
+	var calls atomic.Int32
+	m.SetEnvironmentSource(func(context.Context) ([]EnvironmentCount, error) {
+		calls.Add(1)
+		return nil, nil
+	})
+	for range 3 {
+		_, _ = m.Registry().Gather()
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("default TTL (%s): source called %d times in three quick scrapes, want 1", DefaultEnvironmentsCacheTTL, n)
+	}
+	m.SetEnvironmentsCacheTTL(time.Nanosecond)
+	_, _ = m.Registry().Gather()
+	if n := calls.Load(); n != 2 {
+		t.Errorf("after SetEnvironmentsCacheTTL(1ns): source called %d times, want 2", n)
+	}
+	if DefaultEnvironmentsCacheTTL < 60*time.Second {
+		t.Errorf("DefaultEnvironmentsCacheTTL = %s, want at least 60s (longer than a usual scrape interval)", DefaultEnvironmentsCacheTTL)
 	}
 }

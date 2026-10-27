@@ -118,8 +118,8 @@ type manifestConfig struct {
 	// OTEL_EXPORTER_OTLP_INSECURE for its exporter. metricsPort, when not
 	// zero, renders --metrics-listen-addr=:<port> and exposes the port as
 	// "metrics" on the container and the Service, with prometheus.io scrape
-	// annotations on the pod; zero leaves the server's default listener
-	// unexposed.
+	// annotations on the pod; zero leaves metrics off (the server's
+	// listener is off unless --metrics-listen-addr is set).
 	enableTracing bool
 	otlpEndpoint  string
 	otlpInsecure  bool
@@ -361,7 +361,7 @@ the "template" subcommand: ate-env manifest template`,
 	cmd.Flags().BoolVar(&mCfg.enableTracing, "enable-tracing", false, "run ate-env-api with --enable-tracing, exporting OpenTelemetry traces over OTLP/gRPC")
 	cmd.Flags().StringVar(&mCfg.otlpEndpoint, "otlp-endpoint", "", "OTLP/gRPC collector endpoint for ate-env-api's traces, set as OTEL_EXPORTER_OTLP_ENDPOINT, e.g. http://otel-collector.observability:4317")
 	cmd.Flags().BoolVar(&mCfg.otlpInsecure, "otlp-insecure", false, "set OTEL_EXPORTER_OTLP_INSECURE=true: talk to the collector in plaintext")
-	cmd.Flags().Int32Var(&mCfg.metricsPort, "metrics-port", 0, "port ate-env-api serves Prometheus metrics on (--metrics-listen-addr), exposed on the container and the Service as \"metrics\" with prometheus.io scrape annotations; 0 leaves metrics unexposed")
+	cmd.Flags().Int32Var(&mCfg.metricsPort, "metrics-port", 0, "port ate-env-api serves Prometheus metrics on (--metrics-listen-addr), exposed on the container and the Service as \"metrics\" with prometheus.io scrape annotations; 0 leaves metrics off. The metrics listener has no authentication and no Host check")
 
 	cmd.AddCommand(newManifestTemplateCommand())
 	cmd.AddCommand(newManifestAccessPolicyCommand())

@@ -104,7 +104,7 @@ var Definitions = []Definition{
 	{
 		Name: MetricCreateToReadySeconds,
 		Type: TypeHistogram,
-		Help: "Seconds from an environment's creation request to its guest answering the first request routed through this replica. " +
+		Help: "Seconds from an environment's creation request to its guest answering the first request routed through this replica (a guest RPC, or a port-proxy CONNECT the router accepts). " +
 			"The start is the client's x-ate-env-requested-at header on CreateEnvironment when present, else the receipt of the call. " +
 			"status is ok (guest answered), error (CreateEnvironment failed), crashed (crashed before answering) or deleted (deleted before answering).",
 		Labels:  []string{"atespace", "status"},
@@ -121,7 +121,7 @@ var Definitions = []Definition{
 	{
 		Name: MetricEnvironments,
 		Type: TypeGauge,
-		Help: "Environments by atespace and state, read from the Substrate control plane (ListActors) at scrape time, cached for 15 s. " +
+		Help: "Environments by atespace and state, read from the Substrate control plane (ListActors) at scrape time, cached for --metrics-environments-ttl (default 60 s). " +
 			"Every ate-env-api replica reports the same totals; aggregate with max, not sum.",
 		Labels: []string{"atespace", "state"},
 	},
@@ -173,13 +173,15 @@ type EnvironmentCount struct {
 }
 
 // EnvironmentSource returns the current environment counts. It is called at
-// most once per environmentsCacheTTL, on scrape.
+// most once per cache TTL (SetEnvironmentsCacheTTL), on scrape.
 type EnvironmentSource func(ctx context.Context) ([]EnvironmentCount, error)
 
-const (
-	environmentsCacheTTL = 15 * time.Second
-	environmentsTimeout  = 5 * time.Second
-)
+// DefaultEnvironmentsCacheTTL is how long ate_env_api_environments serves a
+// read before the next scrape reads the source again. It is longer than a
+// usual scrape interval, so most scrapes are served from the cache.
+const DefaultEnvironmentsCacheTTL = 60 * time.Second
+
+const environmentsTimeout = 5 * time.Second
 
 // Metrics holds the ate-env-api collectors on a private registry. A nil
 // *Metrics is valid and records nothing, so callers need no checks when
@@ -297,6 +299,17 @@ func (m *Metrics) SetEnvironmentSource(src EnvironmentSource) {
 	m.environments.fetched = time.Time{}
 }
 
+// SetEnvironmentsCacheTTL sets how long ate_env_api_environments serves a
+// read of its source; zero or less means DefaultEnvironmentsCacheTTL.
+func (m *Metrics) SetEnvironmentsCacheTTL(ttl time.Duration) {
+	if m == nil {
+		return
+	}
+	m.environments.mu.Lock()
+	defer m.environments.mu.Unlock()
+	m.environments.ttl = ttl
+}
+
 func (m *Metrics) observeRequest(method string, err error, d time.Duration) {
 	if m == nil {
 		return
@@ -329,45 +342,70 @@ func (m *Metrics) StreamServerInterceptor() grpc.StreamServerInterceptor {
 }
 
 // environmentsCollector reads environment counts from its source on
-// scrape, at most once per environmentsCacheTTL, and serves the last good
-// answer in between. A failed read keeps the previous answer and is logged.
+// scrape, at most once per TTL, and serves the last good answer in between.
+// A failed read keeps the previous answer and is logged. The read runs
+// outside the lock, and only one scrape reads at a time: concurrent scrapes
+// serve the last answer instead of waiting for the read.
 type environmentsCollector struct {
 	desc *prometheus.Desc
 
-	mu      sync.Mutex
-	source  EnvironmentSource
-	fetched time.Time
-	counts  []EnvironmentCount
+	mu         sync.Mutex
+	source     EnvironmentSource
+	ttl        time.Duration
+	fetched    time.Time
+	refreshing bool
+	counts     []EnvironmentCount
 }
 
 func (c *environmentsCollector) Describe(ch chan<- *prometheus.Desc) { ch <- c.desc }
 
 func (c *environmentsCollector) Collect(ch chan<- prometheus.Metric) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.source == nil {
-		return
+	src := c.source
+	ttl := c.ttl
+	if ttl <= 0 {
+		ttl = DefaultEnvironmentsCacheTTL
 	}
-	if time.Since(c.fetched) >= environmentsCacheTTL {
-		// Untraced: a scrape every few seconds must not start a root trace
-		// per control-plane read.
-		ctx, cancel := context.WithTimeout(Untraced(context.Background()), environmentsTimeout)
-		counts, err := c.source(ctx)
-		cancel()
-		if err != nil {
-			log.Printf("metrics: reading environment counts: %v", err)
-		} else {
-			sort.Slice(counts, func(i, j int) bool {
-				if counts[i].Atespace != counts[j].Atespace {
-					return counts[i].Atespace < counts[j].Atespace
-				}
-				return counts[i].State < counts[j].State
-			})
-			c.counts = counts
-		}
-		c.fetched = time.Now()
+	refresh := src != nil && !c.refreshing && time.Since(c.fetched) >= ttl
+	if refresh {
+		c.refreshing = true
 	}
-	for _, e := range c.counts {
+	c.mu.Unlock()
+
+	if refresh {
+		c.refresh(src)
+	}
+
+	c.mu.Lock()
+	counts := c.counts
+	c.mu.Unlock()
+	for _, e := range counts {
 		ch <- prometheus.MustNewConstMetric(c.desc, prometheus.GaugeValue, float64(e.Count), e.Atespace, e.State)
 	}
+}
+
+// refresh reads src without holding the lock, then swaps in the answer.
+func (c *environmentsCollector) refresh(src EnvironmentSource) {
+	// Untraced: a scrape every few seconds must not start a root trace per
+	// control-plane read.
+	ctx, cancel := context.WithTimeout(Untraced(context.Background()), environmentsTimeout)
+	counts, err := src(ctx)
+	cancel()
+	if err != nil {
+		log.Printf("metrics: reading environment counts: %v", err)
+	} else {
+		sort.Slice(counts, func(i, j int) bool {
+			if counts[i].Atespace != counts[j].Atespace {
+				return counts[i].Atespace < counts[j].Atespace
+			}
+			return counts[i].State < counts[j].State
+		})
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err == nil {
+		c.counts = counts
+	}
+	c.fetched = time.Now()
+	c.refreshing = false
 }

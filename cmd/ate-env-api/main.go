@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -26,6 +27,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -108,9 +110,21 @@ func main() {
 		serviceName       = flag.String("service-name", "ate-env-api", "name of the Kubernetes Service in front of ate-env-api; its in-cluster names are allowed hosts (<name>, <name>.<namespace>, <name>.<namespace>.svc and <name>.<namespace>.svc.<cluster domain>, with the namespace and cluster domain read from /etc/resolv.conf, else the namespace from POD_NAMESPACE). Empty allows none of them")
 		maxStreams        = flag.Int("max-concurrent-streams", DefaultMaxConcurrentStreams, "most concurrent HTTP/2 streams (gRPC calls) one client connection may have open; calls beyond it queue in the client. Go's default is 250, which a single trainer process reaches with a few hundred sandboxes, because every exec holds a stream for the whole command and its wake")
 		enableTracing     = flag.Bool("enable-tracing", false, "export OpenTelemetry traces over OTLP/gRPC, configured by OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_EXPORTER_OTLP_INSECURE; incoming W3C trace context is continued and passed on to ateapi and the guests")
-		metricsAddr       = flag.String("metrics-listen-addr", ":9090", "address to serve Prometheus metrics on, at /metrics, on a listener of its own; empty disables metrics")
+		metricsAddr       = flag.String("metrics-listen-addr", "", "address to serve Prometheus metrics on, at /metrics, on a listener of its own, e.g. :9090; empty (the default) disables metrics. The listener has no authentication and no Host check: it serves request counts by method and code, atespace names with environment counts by state, and the build version to anyone who can reach it, so bind it where only trusted scrapers can")
+		environmentsTTL   = flag.Duration("metrics-environments-ttl", telemetry.DefaultEnvironmentsCacheTTL, "how long ate_env_api_environments serves one read of the control plane (a ListActors per atespace) before a scrape reads it again")
 	)
 	flag.Parse()
+
+	// exitErr, when set, ends the process with status 1 after every other
+	// deferred function (OTel shutdown, client and service Close) has run:
+	// this defer is registered first, so it runs last.
+	var exitErr error
+	var serveErr atomic.Pointer[error]
+	defer func() {
+		if exitErr != nil {
+			log.Fatal(exitErr)
+		}
+	}()
 
 	serviceHosts := serviceHostNames(*serviceName, os.ReadFile, os.Getenv)
 	if len(serviceHosts) > 0 {
@@ -131,7 +145,7 @@ func main() {
 		log.Printf("WARNING: listening on %s without --auth-token-file; all gRPC, MCP and port-proxy callers are unauthenticated", *listen)
 	}
 	if *enableTracing {
-		_, shutdown, err := telemetry.SetupOTel(context.Background(), otelServiceName)
+		shutdown, err := telemetry.SetupOTel(context.Background(), otelServiceName)
 		if err != nil {
 			log.Fatalf("--enable-tracing: %v", err)
 		}
@@ -141,6 +155,7 @@ func main() {
 	var metrics *telemetry.Metrics
 	if *metricsAddr != "" {
 		metrics = telemetry.NewMetrics()
+		metrics.SetEnvironmentsCacheTTL(*environmentsTTL)
 	}
 
 	// With a client certificate the router is reached on its TLS listeners,
@@ -221,19 +236,19 @@ func main() {
 	}
 
 	var metricsSrv *http.Server
+	var metricsErr <-chan error
 	if metrics != nil {
 		metrics.InitMethods(grpcServer.GetServiceInfo())
 		metrics.InitAtespace(ate.DefaultAtespace)
 		metrics.SetEnvironmentSource(apisvc.EnvironmentCounts)
-		metricsMux := http.NewServeMux()
-		metricsMux.Handle("GET /metrics", metrics.Handler())
-		metricsSrv = &http.Server{Addr: *metricsAddr, Handler: metricsMux}
-		go func() {
-			log.Printf("metrics listening on %s", *metricsAddr)
-			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Fatalf("metrics server error: %v", err)
-			}
-		}()
+		// A bind failure returns through main, so the deferred OTel
+		// shutdown and apisvc.Close still run.
+		metricsSrv, metricsErr, err = serveMetrics(*metricsAddr, metrics.Handler())
+		if err != nil {
+			exitErr = err
+			return
+		}
+		log.Printf("metrics listening on %s (no authentication, no Host check)", metricsSrv.Addr)
 	}
 
 	// The Host check wraps the HTTP routes (/healthz, MCP and the port
@@ -267,6 +282,10 @@ func main() {
 		if callerAuth != nil {
 			ppOpts.Authenticate = callerAuth.Check
 		}
+		if metrics != nil {
+			// A first contact through the port proxy ends create_to_ready too.
+			ppOpts.OnConnected = apisvc.ObserveFirstContact
+		}
 		pp, err := portproxy.New(ppOpts)
 		if err != nil {
 			log.Fatalf("--port-proxy-trusted-origins: %v", err)
@@ -282,6 +301,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// A metrics server that stops with an error stops the API server too.
+	// main returns after that, so the deferred functions run, and exits
+	// non-zero through exitErr.
+	if metricsErr != nil {
+		go func() {
+			if err, ok := <-metricsErr; ok {
+				serveErr.Store(&err)
+				stop()
+			}
+		}()
+	}
+
 	go func() {
 		<-ctx.Done()
 		grpcServer.GracefulStop()
@@ -293,8 +324,38 @@ func main() {
 
 	log.Printf("ate-env-api %s listening on %s (ateapi %s, atenet %s, atenet CONNECT %q, router TLS %v)", apisvc.Info.Version, *listen, *ateapi, *atenet, *atenetConn, routerTLS != nil)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("server error: %v", err)
+		exitErr = fmt.Errorf("server error: %w", err)
+		return
 	}
+	if err := serveErr.Load(); err != nil {
+		exitErr = *err
+	}
+}
+
+// metricsReadHeaderTimeout bounds how long the metrics listener waits for a
+// request's headers, so idle or slow connections do not pile up.
+const metricsReadHeaderTimeout = 5 * time.Second
+
+// serveMetrics binds addr and serves handler at /metrics on it, on a server
+// of its own with no authentication and no Host check. A bind failure is
+// returned at once. An error that stops the server later is sent on the
+// returned channel, which is closed when the server stops.
+func serveMetrics(addr string, handler http.Handler) (*http.Server, <-chan error, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("metrics listener %s: %w", addr, err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", handler)
+	srv := &http.Server{Addr: ln.Addr().String(), Handler: mux, ReadHeaderTimeout: metricsReadHeaderTimeout}
+	errc := make(chan error, 1)
+	go func() {
+		defer close(errc)
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errc <- fmt.Errorf("metrics server error: %w", err)
+		}
+	}()
+	return srv, errc, nil
 }
 
 // grpcServerOptions returns the interceptor chain of the API's gRPC server.

@@ -491,3 +491,30 @@ func TestEnvironmentsScrapeIsUntraced(t *testing.T) {
 		t.Error("a traced CreateEnvironment recorded no server span")
 	}
 }
+
+// A first contact through the port proxy (ObserveFirstContact, which
+// ate-env-api wires to portproxy.Options.OnConnected) ends create_to_ready
+// with status ok, once: the later guest RPC does not observe it again.
+func TestCreateToReadyEndsOnPortProxyContact(t *testing.T) {
+	te := newTelemetryEnv(t, false)
+	if _, err := te.envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "proxied"}); err != nil {
+		t.Fatal(err)
+	}
+	te.srv.ObserveFirstContact(apiservice.DefaultAtespace, "proxied")
+	ok := map[string]string{"status": telemetry.ReadyStatusOK}
+	if n, _ := histogram(t, te.metrics, telemetry.MetricCreateToReadySeconds, ok); n != 1 {
+		t.Fatalf("create_to_ready{ok} after the proxied contact = %d samples, want 1", n)
+	}
+	envCtx := serveGuest(t, te, "proxied", nil)
+	if _, err := te.procClient.StartProcess(envCtx, &ateenvv1alpha.StartProcessRequest{Command: []string{"true"}}); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := histogram(t, te.metrics, telemetry.MetricCreateToReadySeconds, ok); n != 1 {
+		t.Errorf("create_to_ready{ok} after a later guest RPC = %d samples, want still 1", n)
+	}
+	// An environment that is not pending is ignored.
+	te.srv.ObserveFirstContact(apiservice.DefaultAtespace, "never-created")
+	if n, _ := histogram(t, te.metrics, telemetry.MetricCreateToReadySeconds, ok); n != 1 {
+		t.Errorf("create_to_ready{ok} after an unknown contact = %d samples, want still 1", n)
+	}
+}

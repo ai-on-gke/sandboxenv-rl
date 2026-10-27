@@ -3,8 +3,10 @@
 # ate-env-api metrics
 
 ate-env-api serves these Prometheus families at `/metrics` on the listener
-`--metrics-listen-addr` names (default `:9090`; empty disables it). They live
-on a private registry: no Go runtime or process collectors. Labels carry a
+`--metrics-listen-addr` names. The listener is off by default (the flag is
+empty); `ate-env manifest --metrics-port` turns it on. It has no authentication
+and no Host check, so bind it where only trusted scrapers reach it. The
+families live on a private registry: no Go runtime or process collectors. Labels carry a
 bounded vocabulary only; environment ids, actor ids, run ids, paths and image
 references never appear in a label.
 
@@ -15,9 +17,9 @@ Histograms are in seconds with one bucket set:
 |---|---|---|---|
 | `ate_env_api_requests_total` | counter | `method`, `code` | gRPC requests handled, by full method name (/package.Service/Method) and status code. |
 | `ate_env_api_request_duration_seconds` | histogram | `method`, `code` | gRPC request latency in seconds, from the server receiving the call to the handler returning (streams: until the stream ends), by full method name and status code. |
-| `ate_env_api_create_to_ready_seconds` | histogram | `atespace`, `status` | Seconds from an environment's creation request to its guest answering the first request routed through this replica. The start is the client's x-ate-env-requested-at header on CreateEnvironment when present, else the receipt of the call. status is ok (guest answered), error (CreateEnvironment failed), crashed (crashed before answering) or deleted (deleted before answering). |
+| `ate_env_api_create_to_ready_seconds` | histogram | `atespace`, `status` | Seconds from an environment's creation request to its guest answering the first request routed through this replica (a guest RPC, or a port-proxy CONNECT the router accepts). The start is the client's x-ate-env-requested-at header on CreateEnvironment when present, else the receipt of the call. status is ok (guest answered), error (CreateEnvironment failed), crashed (crashed before answering) or deleted (deleted before answering). |
 | `ate_env_api_wake_wait_seconds` | histogram | `outcome` | Seconds a proxied guest call (process or file RPC) spent waiting for a suspended or still-starting environment to answer, observed only when the first probe found the guest unreachable. outcome is woke, timeout (wake or running budget spent) or error (crashed, deleted, control-plane error or caller gone). |
-| `ate_env_api_environments` | gauge | `atespace`, `state` | Environments by atespace and state, read from the Substrate control plane (ListActors) at scrape time, cached for 15 s. Every ate-env-api replica reports the same totals; aggregate with max, not sum. |
+| `ate_env_api_environments` | gauge | `atespace`, `state` | Environments by atespace and state, read from the Substrate control plane (ListActors) at scrape time, cached for --metrics-environments-ttl (default 60 s). Every ate-env-api replica reports the same totals; aggregate with max, not sum. |
 | `ate_env_api_build_info` | gauge | `version`, `commit` | Always 1; the labels carry the ate-env-api build's module version and VCS commit. |
 
 Clients may send `x-ate-env-requested-at` (RFC 3339 with nanoseconds) as gRPC

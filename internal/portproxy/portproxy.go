@@ -437,21 +437,57 @@ func (e *routerError) Error() string {
 // callerKey holds the context of the request a dial is for (see rewrite).
 type callerKey struct{}
 
+// routerParkMargin is how long past the wake budget the dial context lasts,
+// beyond one retry interval: the attempt after the last wait can start at
+// the end of the budget, and the router holds (parks) a CONNECT for a
+// resuming actor before it answers, up to its --parked-request-budget, 5 s by
+// default in Substrate v0.6.0 (DefaultParkedRequestBudget,
+// cmd/atenet/internal/router/ingress/parking.go:29). The proxy does not know
+// the router's flag, thus twice the default. A variable for the tests.
+var routerParkMargin = 10 * time.Second
+
 // dialContext returns the context for one dial and its cancel. Since Go 1.23
 // http.Transport dials with context.WithoutCancel of the request context, so
 // that a finished dial can serve another request; a wake loop would then
 // keep sending CONNECTs for up to WakeBudget after its caller left. The
 // returned context ends when the request ends, and at the latest one retry
-// interval after WakeBudget, the most the attempt after the last wait needs.
-// The CONNECT attempts and anything else the loop does with it stop then.
+// interval plus routerParkMargin after WakeBudget, so the last attempt gets
+// its answer from a router that parks it. The CONNECT attempts and anything
+// else the loop does with it stop then; dial reports that end as a spent
+// wake budget (see stopped).
 func (p *Proxy) dialContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(ctx, p.opts.WakeBudget+wakeRetryMaxBackoff)
+	ctx, cancel := context.WithTimeout(ctx, p.opts.WakeBudget+wakeRetryMaxBackoff+routerParkMargin)
 	caller, ok := ctx.Value(callerKey{}).(context.Context)
 	if !ok {
 		return ctx, cancel
 	}
 	stopAfter := context.AfterFunc(caller, cancel)
 	return ctx, func() { stopAfter(); cancel() }
+}
+
+// notWoken returns the error for a spent wake budget, last being the final
+// attempt's: a router 503, which handleError answers with 503. Logged here:
+// handleError keeps router 503s out of the log, and a spent wake budget is
+// the one 503 an operator wants to see, as the close of the "waiting" line
+// from the first attempt.
+func (p *Proxy) notWoken(atespace, id string, attempts int, last error) error {
+	var re *routerError
+	if !errors.As(last, &re) {
+		last = errors.Join(&routerError{status: http.StatusServiceUnavailable, msg: "the wake budget ended during the attempt"}, last)
+	}
+	err := fmt.Errorf("environment %s/%s did not wake within %s (%d attempts): %w", atespace, id, p.opts.WakeBudget, attempts, last)
+	log.Printf("port proxy: %v", err)
+	return err
+}
+
+// stopped returns the error for a dial whose context ended: the caller left,
+// which needs no answer and no log line, or the dial deadline passed, which
+// is a spent wake budget and gets the same 503.
+func (p *Proxy) stopped(ctx context.Context, atespace, id string, attempts int, last error) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return p.notWoken(atespace, id, attempts, last)
+	}
+	return ctx.Err()
 }
 
 // dial opens a CONNECT tunnel to the environment port encoded in addr (see
@@ -471,25 +507,26 @@ func (p *Proxy) dial(ctx context.Context, _, addr string) (net.Conn, error) {
 	backoff := wakeRetryInitialBackoff
 	for attempt := 1; ; attempt++ {
 		conn, err := p.connect(ctx, id, atespace, portStr)
+		if err != nil && ctx.Err() != nil {
+			return nil, p.stopped(ctx, atespace, id, attempt, err)
+		}
 		var re *routerError
 		if !errors.As(err, &re) || re.status != http.StatusServiceUnavailable {
 			return conn, err
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			// Logged here: handleError keeps router 503s out of the log, and
-			// a spent wake budget is the one 503 an operator wants to see,
-			// as the close of the "waiting" line from the first attempt.
-			err = fmt.Errorf("environment %s/%s did not wake within %s (%d attempts): %w", atespace, id, p.opts.WakeBudget, attempt, err)
-			log.Printf("port proxy: %v", err)
-			return nil, err
+			return nil, p.notWoken(atespace, id, attempt, err)
+		}
+		if ctx.Err() != nil {
+			return nil, p.stopped(ctx, atespace, id, attempt, err)
 		}
 		if attempt == 1 {
 			log.Printf("port proxy: waiting for environment %s/%s to wake (wake budget %s)", atespace, id, p.opts.WakeBudget)
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, p.stopped(ctx, atespace, id, attempt, err)
 		case <-time.After(min(backoff, remaining)):
 		}
 		backoff = min(backoff*2, wakeRetryMaxBackoff)

@@ -509,6 +509,15 @@ class AteEnvWorkspace(RemoteWorkspace):
         except Exception:
             pass  # never raise from __del__
 
+    async def _delete_quietly(self) -> None:
+        """Delete the environment on the loop; log, never raise."""
+        try:
+            await asyncio.wait_for(self._ate().delete(self.env_id, atespace=self.atespace), CALL_TIMEOUT)
+        except NotFoundError:
+            pass
+        except Exception as exc:
+            logger.warning("Error deleting environment %s/%s: %s", self.atespace, self.env_id, exc)
+
     def cleanup(self) -> None:
         """Drop HTTP state and delete the environment when owned (idempotent).
 
@@ -526,6 +535,14 @@ class AteEnvWorkspace(RemoteWorkspace):
         if not delete:
             return
         self._deleted = True
+        if _runtime.on_loop_thread():
+            # cleanup() (through __del__, or a callback) on the loop thread:
+            # waiting here would block the loop that runs the delete. Schedule
+            # it and return; the loop finishes it.
+            logger.warning("Deleting environment %s/%s from the loop thread: scheduled without waiting",
+                           self.atespace, self.env_id)
+            _runtime.submit(self._delete_quietly())
+            return
         try:
             logger.info("Deleting environment %s/%s", self.atespace, self.env_id)
             self._call(self._ate().delete(self.env_id, atespace=self.atespace))

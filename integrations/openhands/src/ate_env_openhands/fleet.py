@@ -106,6 +106,14 @@ class FleetWorkspace(AteEnvWorkspace):
 
     _release: Any = PrivateAttr(default=None)
 
+    def model_copy(self, *, update: dict[str, Any] | None = None, deep: bool = False):  # type: ignore[override]
+        """Copy the configuration. Pydantic copies private attributes too, so
+        the copy would share ``_release``; only the workspace that acquired the
+        handle releases it."""
+        copy = super().model_copy(update=update, deep=deep)
+        copy._release = None
+        return copy
+
     def cleanup(self) -> None:
         """Drop HTTP state, then release the handle to the fleet, once."""
         try:

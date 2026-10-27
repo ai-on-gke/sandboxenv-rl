@@ -118,6 +118,19 @@ def test_fleet_workspace_acquires_and_releases_on_exit(stack, tmp_path):
     assert fleet.released == [env_id]
 
 
+def test_a_copy_of_a_fleet_workspace_never_releases(stack, tmp_path):
+    api_url, state = stack
+    fleet = _RegisteringFleet(state)
+    ws = make_fleet_workspace(fleet, TASK, **kw(api_url, state, tmp_path))
+    env_id = ws.env_id
+    copy = ws.model_copy()
+    assert isinstance(copy, FleetWorkspace) and copy._release is None
+    copy.cleanup()
+    assert fleet.released == [] and env_id in state.envs
+    ws.cleanup()
+    assert fleet.released == [env_id]
+
+
 def test_fleet_workspace_releases_when_the_start_fails(stack, tmp_path):
     api_url, state = stack
     fleet = _RegisteringFleet(state)

@@ -238,6 +238,28 @@ def test_pause_suspends_and_resume_wakes(stack, tmp_path):
         assert ws.execute_command(f"cat {marker}", timeout=30).stdout.strip() == "kept"
 
 
+def test_cleanup_on_the_loop_thread_schedules_the_delete(stack, tmp_path):
+    """__del__ can run on the loop thread (cyclic GC there); a blocking delete
+    would wait for the loop that has to run it."""
+    from ate_env_openhands import _runtime
+
+    api_url, state = stack
+    ws = make(api_url, state, tmp_path)
+    env_id = ws.env_id
+
+    async def on_loop():
+        ws.cleanup()  # returns at once instead of waiting on itself
+        return _runtime.on_loop_thread()
+
+    assert _runtime.run(on_loop(), timeout=30) is True
+    deadline = time.time() + 30
+    while state.deletes != [env_id] and time.time() < deadline:
+        time.sleep(0.05)
+    assert state.deletes == [env_id]
+    ws.cleanup()  # idempotent
+    assert state.deletes == [env_id]
+
+
 def test_exit_cleans_up_even_when_the_parent_exit_raises(stack, tmp_path, monkeypatch):
     api_url, state = stack
     ws = make(api_url, state, tmp_path)

@@ -50,12 +50,31 @@ def _get_runner() -> LoopRunner:
         return _runner
 
 
+def on_loop_thread() -> bool:
+    """True when the caller runs on the shared loop's thread, where a blocking
+    ``run`` would wait for itself."""
+    runner = _runner
+    return runner is not None and runner.on_loop_thread()
+
+
+def submit[T](coro: Coroutine[Any, Any, T]) -> concurrent.futures.Future[T]:
+    """Schedule a coroutine on the shared loop without waiting for it."""
+    return _get_runner().submit(coro)
+
+
 def run[T](coro: Coroutine[Any, Any, T], timeout: float | None = None) -> T:
     """Run a coroutine on the shared loop and block for its result.
 
     With ``timeout``, raise ``TimeoutError`` and cancel the coroutine when it
-    does not finish in time.
+    does not finish in time. Raises ``RuntimeError`` on the loop thread
+    itself, where waiting would deadlock.
     """
+    if on_loop_thread():
+        coro.close()
+        raise RuntimeError(
+            "ate-env call made from the shared loop thread; it would deadlock. "
+            "Use _runtime.submit() and do not wait for the result."
+        )
     future = _get_runner().submit(coro)
     try:
         return future.result(timeout=timeout)

@@ -87,6 +87,24 @@ def test_close_all_closes_the_clients_and_stops_the_loop(own_runtime, monkeypatc
     assert _runtime.run(asyncio.sleep(0, result="again")) == "again", "a new loop starts on use"
 
 
+def test_run_refuses_the_loop_thread_and_submit_does_not(own_runtime):
+    seen: dict[str, object] = {}
+
+    async def on_loop():
+        seen["on_loop_thread"] = _runtime.on_loop_thread()
+        try:
+            _runtime.run(asyncio.sleep(0))
+        except RuntimeError as e:
+            seen["error"] = str(e)
+        seen["future"] = _runtime.submit(asyncio.sleep(0, result="later"))
+
+    assert not _runtime.on_loop_thread()
+    _runtime.run(on_loop(), timeout=5)
+    assert seen["on_loop_thread"] is True
+    assert "loop thread" in str(seen["error"])
+    assert seen["future"].result(timeout=5) == "later"  # scheduled, finished by the loop
+
+
 def test_run_times_out_and_cancels():
     started = asyncio.Event()
     cancelled: list[bool] = []

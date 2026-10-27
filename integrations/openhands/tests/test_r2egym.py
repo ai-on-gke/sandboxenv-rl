@@ -180,8 +180,38 @@ def test_bind_without_kubernetes_and_no_op_teardown(fake_r2egym):
     assert handle.execs[0][0] == "echo setup"  # setup_env ran through the handle
     env.close()  # no release, no delete: the fleet owns the environment
     assert rt.container is handle
-    # Module attributes are back after construction.
-    assert isinstance(fake_r2egym.config, _Boom) and isinstance(fake_r2egym.client, _Boom)
+    # Outside a runtime's construction the real kubernetes names answer again.
+    with pytest.raises(AssertionError, match="load_kube_config"):
+        fake_r2egym.config.load_kube_config()
+    with pytest.raises(AssertionError, match="CoreV1Api"):
+        fake_r2egym.client.CoreV1Api()
+
+
+def test_kubernetes_bypass_is_thread_local_and_holds_no_lock(fake_r2egym):
+    """While one thread builds a runtime, another thread still reaches the real
+    kubernetes names, and the build lock is free: rollouts set up in parallel."""
+    seen: dict[str, object] = {}
+    real_init = fake_r2egym.DockerRuntime.__init__
+
+    def probing_init(self, *args, **kwargs):
+        def probe():
+            try:
+                fake_r2egym.config.load_kube_config()
+                seen["other_thread"] = "bypassed"
+            except AssertionError:
+                seen["other_thread"] = "real"
+            seen["lock_free"] = adapter._BUILD_LOCK.acquire(blocking=False)
+            if seen["lock_free"]:
+                adapter._BUILD_LOCK.release()
+
+        t = threading.Thread(target=probe)
+        t.start()
+        t.join()
+        return real_init(self, *args, **kwargs)
+
+    fake_r2egym.DockerRuntime.__init__ = probing_init
+    adapter.make_fleet_repo_env(_Handle())
+    assert seen == {"other_thread": "real", "lock_free": True}
 
 
 def test_run_maps_exit_codes_timeouts_and_errors(fake_r2egym):

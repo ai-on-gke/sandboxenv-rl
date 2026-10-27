@@ -56,9 +56,7 @@ import tarfile
 import threading
 import uuid
 from collections.abc import Iterator
-from types import SimpleNamespace
 from typing import Any
-from unittest import mock
 
 logger = logging.getLogger("ate_env_openhands.r2egym")
 
@@ -88,18 +86,50 @@ def _dataset_row(handle: Any) -> dict:
     return ds
 
 
-@contextlib.contextmanager
-def _without_kubernetes(docker_mod: Any) -> Iterator[None]:
+_bypass = threading.local()
+
+
+class _Bypassable:
+    """Stands in for the kubernetes ``config`` and ``client`` names of R2E-Gym's
+    docker module. It delegates to the real object, except on a thread that is
+    building an ``AteEnvRuntime``: there the names in ``stubs`` answer instead.
+    Installed once; other threads and other runtimes see the real objects."""
+
+    def __init__(self, wrapped: Any, stubs: dict[str, Any]) -> None:
+        self._wrapped = wrapped
+        self._stubs = stubs
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._stubs and getattr(_bypass, "active", False):
+            return self._stubs[name]
+        return getattr(self._wrapped, name)
+
+
+def _install_bypass(docker_mod: Any) -> None:
     """R2E-Gym's runtime loads a kubeconfig and builds a CoreV1Api for the
     kubernetes-sandbox backend. Neither exists where ate-env runs, and the
-    hooks below never use them, so both are stubbed while the base class
-    initialises. Serialised, because it patches module attributes."""
-    with _BUILD_LOCK:
-        config = SimpleNamespace(load_incluster_config=lambda: None, load_kube_config=lambda: None)
-        client = SimpleNamespace(CoreV1Api=lambda *a, **k: None)
-        with mock.patch.object(docker_mod, "config", config, create=True), \
-                mock.patch.object(docker_mod, "client", client, create=True):
-            yield
+    hooks below never use them. Wrap both names once (idempotent); the stubs
+    answer only on a thread inside ``_bypassing_kubernetes``."""
+    if not isinstance(getattr(docker_mod, "config", None), _Bypassable):
+        docker_mod.config = _Bypassable(getattr(docker_mod, "config", None), {
+            "load_incluster_config": lambda *a, **k: None,
+            "load_kube_config": lambda *a, **k: None,
+        })
+    if not isinstance(getattr(docker_mod, "client", None), _Bypassable):
+        docker_mod.client = _Bypassable(getattr(docker_mod, "client", None), {
+            "CoreV1Api": lambda *a, **k: None,
+        })
+
+
+@contextlib.contextmanager
+def _bypassing_kubernetes() -> Iterator[None]:
+    """On this thread only, the kubernetes names answer with no-ops."""
+    previous = getattr(_bypass, "active", False)
+    _bypass.active = True
+    try:
+        yield
+    finally:
+        _bypass.active = previous
 
 
 def _build_classes() -> tuple[type, type]:
@@ -108,6 +138,8 @@ def _build_classes() -> tuple[type, type]:
     if _CLASSES is not None:
         return _CLASSES
     docker_mod, RepoEnv = _import_r2egym()
+    with _BUILD_LOCK:
+        _install_bypass(docker_mod)
     DockerRuntime = docker_mod.DockerRuntime
     cmd_timeout = getattr(docker_mod, "CMD_TIMEOUT", 90)
 
@@ -117,7 +149,7 @@ def _build_classes() -> tuple[type, type]:
         def __init__(self, handle: Any, *, command=("/bin/bash", "-l"), logger=None, **docker_kwargs):
             self._handle = handle
             ds = _dataset_row(handle)
-            with _without_kubernetes(docker_mod):
+            with _bypassing_kubernetes():
                 super().__init__(
                     ds=ds, docker_image=handle.task.image, command=list(command),
                     logger=logger, backend="kubernetes-sandbox", **docker_kwargs,

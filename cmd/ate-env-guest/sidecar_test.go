@@ -193,21 +193,39 @@ func slowSidecar(t *testing.T, d time.Duration, count *atomic.Int32) string {
 }
 
 // One /readyz call must answer inside the probe's 250 ms request limit
-// however many sidecar readiness URLs the template has.
+// however many sidecar readiness URLs the template has. Fast sidecars are
+// ready inside the one wait; checked one after another, as before, 30 of
+// them would take at least 300 ms.
 func TestReadyGateWaitsOnceForAllURLs(t *testing.T) {
-	for _, d := range []time.Duration{90 * time.Millisecond, 300 * time.Millisecond} {
+	const callLimit = 240 * time.Millisecond // the probe's 250 ms, less timer slack
+	for _, tc := range []struct {
+		n         int
+		d         time.Duration
+		wantReady bool
+	}{
+		{30, 10 * time.Millisecond, true},  // ready inside the 100 ms wait
+		{3, 300 * time.Millisecond, false}, // only the bound on the call time
+	} {
+		// Keep each connection idle until the servers close it. With the
+		// default two idle connections per host the client would close the
+		// rest itself, and many runs of this test would use up the local
+		// ports in TIME_WAIT. Cleanups run last first: the servers close
+		// before the transport.
+		tr := &http.Transport{MaxIdleConnsPerHost: tc.n}
+		t.Cleanup(tr.CloseIdleConnections)
 		var urls []string
-		for range 3 {
-			urls = append(urls, slowSidecar(t, d, nil))
+		for range tc.n {
+			urls = append(urls, slowSidecar(t, tc.d, nil))
 		}
 		g := newReadyGate(urls)
+		g.client = &http.Client{Transport: tr}
 		start := time.Now()
 		ok, why := g.Ready(context.Background())
-		if took := time.Since(start); took > 200*time.Millisecond {
-			t.Errorf("3 sidecars of %s: Ready took %s, want about %s (one wait for all URLs)", d, took, sidecarReadyWait)
+		if took := time.Since(start); took > callLimit {
+			t.Errorf("%d sidecars of %s: Ready took %s, want at most %s (one wait for all URLs)", tc.n, tc.d, took, callLimit)
 		}
-		if want := d < sidecarReadyWait; ok != want {
-			t.Errorf("3 sidecars of %s: Ready = %v, %q; want %v", d, ok, why, want)
+		if ok != tc.wantReady {
+			t.Errorf("%d sidecars of %s: Ready = %v, %q; want %v", tc.n, tc.d, ok, why, tc.wantReady)
 		}
 	}
 }

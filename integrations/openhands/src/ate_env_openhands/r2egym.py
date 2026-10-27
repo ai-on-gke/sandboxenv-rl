@@ -67,6 +67,23 @@ _BUILD_LOCK = threading.Lock()
 _ANSI = re.compile(r"\x1b\[[0-9;]*m|\r")
 
 
+# R2E-Gym's PATH for commands in a task image (r2egym.agenthub.runtime.docker
+# DOCKER_PATH): the testbed venv first. Its docker backend passes it on each exec
+# and its kubernetes backend sets it in the pod env; used when the installed
+# R2E-Gym does not export the constant.
+_R2E_DOCKER_PATH = (
+    "/root/.venv/bin:/root/.local/bin:/root/.cargo/bin:"
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+)
+
+
+def _as_root(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    """Archive members owned by root, as a copy into a container expects."""
+    info.uid = info.gid = 0
+    info.uname = info.gname = "root"
+    return info
+
+
 def _import_r2egym():
     try:
         from r2egym.agenthub.environment.env import EnvArgs, RepoEnv  # noqa: F401
@@ -142,6 +159,7 @@ def _build_classes() -> tuple[type, type]:
         _install_bypass(docker_mod)
     DockerRuntime = docker_mod.DockerRuntime
     cmd_timeout = getattr(docker_mod, "CMD_TIMEOUT", 90)
+    docker_path = getattr(docker_mod, "DOCKER_PATH", _R2E_DOCKER_PATH)
 
     class AteEnvRuntime(DockerRuntime):
         """A ``DockerRuntime`` bound to an ate-env environment the fleet acquired."""
@@ -172,10 +190,21 @@ def _build_classes() -> tuple[type, type]:
         def _stop_kubernetes_sandbox(self) -> None:
             self.logger.debug("teardown is a no-op: the fleet releases environment %s", self.container_name)
 
+        def _exec_env(self) -> dict[str, str]:
+            # What R2E-Gym's kubernetes backend puts in the pod env: its PATH,
+            # overridden by docker_kwargs["environment"].
+            extra = (getattr(self, "docker_kwargs", None) or {}).get("environment") or {}
+            return {"PATH": docker_path, **{k: str(v) for k, v in extra.items()}}
+
         def _run_kubernetes(self, code, timeout=cmd_timeout, args="", workdir=""):
             command = f"{code} {args}".strip() if args else code
             try:
-                res = self._handle.exec(command, cwd=workdir or "", timeout_s=timeout)
+                # check=False: a non-zero exit or a timeout is a result here,
+                # mapped below as R2E-Gym's backends map it; only transport
+                # failures raise.
+                res = self._handle.exec(
+                    command, cwd=workdir or "", env=self._exec_env(), timeout_s=timeout, check=False
+                )
             except Exception as e:  # transport: unreachable sandbox, gRPC error
                 self.logger.error("exec in environment failed: %r", e)
                 return f"Error executing command in environment: {e!r}", "-1"
@@ -191,18 +220,21 @@ def _build_classes() -> tuple[type, type]:
         def _copy_to_container_kubernetes(self, src_path, dest_path) -> None:
             dest_dir = os.path.dirname(dest_path) or "/"
             buf = io.BytesIO()
+            # Members are owned by root, and the extract does not restore owners:
+            # a sandbox root cannot chown to the host uid (tar exits 2).
             with tarfile.open(fileobj=buf, mode="w") as tar:
-                tar.add(src_path, arcname=os.path.basename(dest_path))
+                tar.add(src_path, arcname=os.path.basename(dest_path), filter=_as_root)
             staged = f"/tmp/ate-env-copy-{uuid.uuid4().hex[:12]}.tar"
             self._handle.write_file(staged, buf.getvalue())
             cmd = (
-                f"mkdir -p {shlex.quote(dest_dir)} && tar xmf {shlex.quote(staged)} "
+                f"mkdir -p {shlex.quote(dest_dir)} && tar --no-same-owner -xmf {shlex.quote(staged)} "
                 f"-C {shlex.quote(dest_dir)}; rc=$?; rm -f {shlex.quote(staged)}; exit $rc"
             )
-            res = self._handle.exec(cmd, timeout_s=120)
-            if res.exit_code != 0:
+            res = self._handle.exec(cmd, timeout_s=120, check=False)
+            if res.timed_out or res.exit_code != 0:
+                detail = (res.stderr or "").strip() or (res.stdout or "").strip()
                 raise RuntimeError(
-                    f"copy {src_path} -> {dest_path} failed (exit {res.exit_code}): {res.stderr or res.stdout}"
+                    f"copy {src_path} -> {dest_path} failed (exit {res.exit_code}): {detail}"
                 )
 
     class AteEnvRepoEnv(RepoEnv):

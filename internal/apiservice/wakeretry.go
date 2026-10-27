@@ -96,7 +96,7 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 			return status.Errorf(codes.FailedPrecondition, "the atenet router rejected ate-env-api's client certificate%s: %v; %s",
 				identityNote(s.RouterIdentity), err, routertls.RejectionAdvice)
 		}
-		state, serr := s.ActorState(ctx, atespace, id)
+		state, serr := s.actorState(ctx, atespace, id)
 		if serr != nil {
 			return serr
 		}
@@ -139,11 +139,16 @@ func identityNote(id string) string {
 	return " (" + id + ")"
 }
 
-// ActorState reads the actor's state from the control plane. A deleted
-// environment surfaces here as NotFound (through toGRPCError), which is the
-// right answer to a caller still holding its handle. The port proxy uses it
-// too (portproxy.Options.ActorState).
+// ActorState is the state read ensureAwake uses, for the port proxy
+// (portproxy.Options.ActorState): a deleted environment is NotFound.
 func (s *Server) ActorState(ctx context.Context, atespace, id string) (ateapipb.ActorState, error) {
+	return s.actorState(ctx, atespace, id)
+}
+
+// actorState reads the actor's state from the control plane. A deleted
+// environment surfaces here as NotFound (through toGRPCError), which is the
+// right answer to a caller still holding its handle.
+func (s *Server) actorState(ctx context.Context, atespace, id string) (ateapipb.ActorState, error) {
 	actor, err := s.client.Get(ctx, atespace, id)
 	if err != nil {
 		return ateapipb.ActorState_ACTOR_STATE_UNSPECIFIED, toGRPCError(err)

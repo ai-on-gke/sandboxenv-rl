@@ -52,9 +52,13 @@ class SandboxFleet:
         self.config = config or FleetConfig()
         self.run_id = self.config.run_id or uuid.uuid4().hex[:12]
         self._tasks: list[Task] = []
+        self._task_ids: set[str] = set()
         self._image_to_template: dict[str, tuple[str, str | None]] = {}
         self._plan: FleetPlan | None = None
         self._lock = threading.Lock()
+        # Serializes plan recomputation, so concurrent add_tasks calls leave
+        # the plan of the last call, which saw every task added before it.
+        self._plan_lock = threading.Lock()
 
         # Telemetry. Either FleetConfig.tracing or observability.enable_tracing
         # turns on tracing for the whole fleet under one service name, so
@@ -150,10 +154,87 @@ class SandboxFleet:
 
     @property
     def tasks(self) -> list[Task]:
-        return self._tasks
+        """A snapshot of the fleet's tasks.
+
+        A copy, so a ``run()`` (or any caller) that iterates it is not
+        affected by ``add_tasks`` calls made meanwhile: tasks added during a
+        ``run()`` are not run by that run.
+        """
+        with self._lock:
+            return list(self._tasks)
 
     def load_tasks(self, tasks: list[Any]) -> None:
-        """Load tasks into the fleet (supports list of Task or dicts)."""
+        """Load tasks into the fleet (supports list of Task or dicts).
+
+        Replaces the tasks loaded before; ``add_tasks`` appends instead. If
+        ``plan()`` has run, the plan is recomputed for the new tasks.
+
+        Raises ValueError, and keeps the tasks loaded before, if a task id
+        repeats within ``tasks``: like ``add_tasks``, ``acquire`` by id must
+        resolve to one task.
+        """
+        normalized = self._normalize_tasks(tasks)
+        repeated = self._repeated_ids(normalized)
+        if repeated:
+            raise ValueError(f"Task ids repeated: {repeated}")
+        with self._lock:
+            self._tasks = normalized
+            self._task_ids = {t.id for t in normalized}
+        self._replan_if_planned()
+        logger.info("Fleet loaded %d tasks (%d unique images)",
+                    len(normalized), len(self.image_counts()))
+
+    def add_tasks(self, tasks: list[Any]) -> list[Task]:
+        """Append tasks to the fleet and extend the plan with their images.
+
+        For a job whose task list grows while it runs: a worker that is handed
+        an episode the orchestrator did not plan, or a trainer that streams
+        batches from a prompt source. Takes the same items as ``load_tasks``
+        and returns them as ``Task`` objects. If ``plan()`` has run, the plan
+        is recomputed so ``plan.for_image()`` covers the new images; nothing
+        is warmed, call ``warm_images`` for that. A ``run()`` in progress
+        does not run the added tasks. Safe to call from several threads.
+
+        Raises ValueError, and adds nothing, if a task id is already in the
+        fleet or repeats within ``tasks``: ``acquire`` by id must resolve to
+        one task.
+        """
+        new = self._normalize_tasks(tasks)
+        if not new:
+            return new
+        ids = [t.id for t in new]
+        with self._lock:
+            dupes = sorted(set(self._repeated_ids(new)) | (set(ids) & self._task_ids))
+            if dupes:
+                raise ValueError(f"Task ids already in the fleet or repeated: {dupes}")
+            self._tasks.extend(new)
+            self._task_ids.update(ids)
+            total = len(self._tasks)
+        self._replan_if_planned()
+        logger.debug("Fleet added %d tasks (%d total)", len(new), total)
+        return new
+
+    @staticmethod
+    def _repeated_ids(tasks: list[Task]) -> list[str]:
+        counts = collections.Counter(t.id for t in tasks)
+        return sorted(i for i, n in counts.items() if n > 1)
+
+    def _replan_if_planned(self) -> None:
+        """Recompute the plan if ``plan()`` has run, after a task change.
+
+        The decision reads ``_plan`` under ``_plan_lock``, which is the lock
+        that writes it: a ``plan()`` that took its snapshot of the tasks
+        before the change finishes first, and then this recomputes it with
+        the change. ``_lock`` is not held here, so the lock order is the one
+        of ``plan()`` (``_plan_lock``, then ``_lock`` inside
+        ``image_counts``).
+        """
+        with self._plan_lock:
+            if self._plan is not None:
+                self._plan_entries_locked()
+
+    @staticmethod
+    def _normalize_tasks(tasks: list[Any]) -> list[Task]:
         normalized: list[Task] = []
         for t in tasks:
             if isinstance(t, Task):
@@ -167,14 +248,14 @@ class SandboxFleet:
                 ))
             else:
                 raise ValueError(f"Unsupported task item type: {type(t)}")
-        self._tasks = normalized
-        logger.info("Fleet loaded %d tasks (%d unique images)",
-                    len(self._tasks), len(self.image_counts()))
+        return normalized
 
     def image_counts(self) -> dict[str, int]:
         """Return task count per unique image."""
         counts: dict[str, int] = collections.defaultdict(int)
-        for t in self._tasks:
+        with self._lock:
+            tasks = list(self._tasks)
+        for t in tasks:
             counts[t.image] += 1
         return dict(counts)
 
@@ -189,6 +270,10 @@ class SandboxFleet:
             return self._plan_entries()
 
     def _plan_entries(self) -> FleetPlan:
+        with self._plan_lock:
+            return self._plan_entries_locked()
+
+    def _plan_entries_locked(self) -> FleetPlan:
         entries: list[PlanEntry] = []
         counts = self.image_counts()
         for img, task_count in counts.items():
@@ -260,7 +345,7 @@ class SandboxFleet:
     ) -> SandboxHandle:
         task_obj: Task
         if isinstance(task, str):
-            found = next((t for t in self._tasks if t.id == task), None)
+            found = next((t for t in self.tasks if t.id == task), None)
             if found:
                 task_obj = found
             else:

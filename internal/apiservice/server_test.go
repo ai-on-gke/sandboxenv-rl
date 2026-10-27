@@ -21,8 +21,10 @@ import (
 	"io"
 	"math"
 	"net"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/agent-substrate/env/guest"
 	"github.com/agent-substrate/env/internal/apiservice"
@@ -37,6 +39,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type testEnv struct {
@@ -698,12 +701,16 @@ func TestCreateFromImageUsesNamedBaseAndAtespace(t *testing.T) {
 	}
 }
 
-const testDerivedTemplate = "default-template-0123456789ab"
+const (
+	testDerivedTemplate = "default-template-0123456789ab"
+	testGoldenError     = "GoldenActorCrashed: golden actor crashed before its snapshot was taken"
+)
 
 // seedDerivedTemplate registers the template that ensureImageTemplate derives
-// for testRootfsImage from default-template, with uid "seeded" and the given
-// golden snapshot status.
-func seedDerivedTemplate(t *testing.T, control *fakecontrol.Server, golden *ateapipb.GoldenSnapshotStatus) {
+// for testRootfsImage from default-template, with uid "seeded", the given
+// golden snapshot status, and an update time failedAgo in the past (none
+// when zero).
+func seedDerivedTemplate(t *testing.T, control *fakecontrol.Server, golden *ateapipb.GoldenSnapshotStatus, failedAgo time.Duration) {
 	t.Helper()
 	seedGuestTemplate(control, "ate-env", "default-template")
 	derived, err := apiservice.DeriveImageTemplate(control.Template("ate-env", "default-template"), testDerivedTemplate, testRootfsImage)
@@ -711,26 +718,51 @@ func seedDerivedTemplate(t *testing.T, control *fakecontrol.Server, golden *atea
 		t.Fatal(err)
 	}
 	derived.Metadata.Uid = "seeded"
+	if failedAgo != 0 {
+		derived.Metadata.UpdateTime = timestamppb.New(time.Now().Add(-failedAgo))
+	}
 	derived.Status = &ateapipb.ActorTemplateStatus{GoldenSnapshotStatus: golden}
 	control.AddTemplate(derived)
 }
 
-// A derived template whose golden snapshot failed is deleted and created
-// again under the same name; a baking or ready one is used as is.
+func failedGolden() *ateapipb.GoldenSnapshotStatus {
+	return &ateapipb.GoldenSnapshotStatus{ErrorMessage: testGoldenError}
+}
+
+// createOnDerived creates environment id on the derived template by name, as
+// an environment created before the golden snapshot failed.
+func createOnDerived(t *testing.T, envClient ateenvv1alpha.EnvironmentServiceClient, id string) {
+	t.Helper()
+	if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{
+		Id: id, Template: &ateenvv1alpha.Template{Name: testDerivedTemplate},
+	}); err != nil {
+		t.Fatalf("CreateEnvironment %s on the derived template: %v", id, err)
+	}
+}
+
+// A derived template whose golden snapshot failed more than the backoff ago,
+// and that no actor uses, is deleted and created again under the same name.
+// A recent failure, a baking template and a ready one are used as is.
 func TestCreateFromImageRecreatesFailedTemplate(t *testing.T) {
 	cases := []struct {
-		name     string
-		golden   *ateapipb.GoldenSnapshotStatus
-		recreate bool
+		name      string
+		golden    *ateapipb.GoldenSnapshotStatus
+		failedAgo time.Duration
+		recreate  bool
 	}{
-		{"failed", &ateapipb.GoldenSnapshotStatus{ErrorMessage: "GoldenActorCrashed: golden actor crashed before its snapshot was taken"}, true},
-		{"baking", nil, false},
-		{"ready", &ateapipb.GoldenSnapshotStatus{GoldenTag: &ateapipb.ObjectRef{Atespace: "ate-env", Name: "golden"}}, false},
+		{"failed", failedGolden(), time.Hour, true},
+		{"failed inside the backoff", failedGolden(), time.Minute, false},
+		{"baking", nil, time.Hour, false},
+		{"ready", &ateapipb.GoldenSnapshotStatus{GoldenTag: &ateapipb.ObjectRef{Atespace: "ate-env", Name: "golden"}}, time.Hour, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			envClient, control := newTestEnv(t)
-			seedDerivedTemplate(t, control, tc.golden)
+			seedDerivedTemplate(t, control, tc.golden, tc.failedAgo)
+			// The golden actor, named after the template uid, does not count
+			// as a user of the template.
+			createOnDerived(t, envClient, "seeded")
+			control.RequireTemplate = true
 
 			resp, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "img", RootfsImage: testRootfsImage})
 			if err != nil {
@@ -746,8 +778,8 @@ func TestCreateFromImageRecreatesFailedTemplate(t *testing.T) {
 			if recreated := tmpl.GetMetadata().GetUid() != "seeded"; recreated != tc.recreate {
 				t.Errorf("derived template recreated = %v (uid %q), want %v", recreated, tmpl.GetMetadata().GetUid(), tc.recreate)
 			}
-			if msg := tmpl.GetStatus().GetGoldenSnapshotStatus().GetErrorMessage(); msg != "" {
-				t.Errorf("derived template still failed: %q", msg)
+			if tc.recreate && tmpl.GetStatus().GetGoldenSnapshotStatus().GetErrorMessage() != "" {
+				t.Errorf("recreated template still failed")
 			}
 			if tmpl.GetContainers()[0].GetImage() != testRootfsImage {
 				t.Errorf("derived container image = %q, want %q", tmpl.GetContainers()[0].GetImage(), testRootfsImage)
@@ -760,11 +792,34 @@ func TestCreateFromImageRecreatesFailedTemplate(t *testing.T) {
 	}
 }
 
-// Concurrent creates that all see the failed template recreate it once and
-// all succeed.
+// A failed template that an environment uses is kept: a recreate would give
+// it a new uid, and the suspended environment would resume without its
+// rootfs. Creates on it still succeed.
+func TestCreateFromImageKeepsFailedTemplateInUse(t *testing.T) {
+	envClient, control := newTestEnv(t)
+	seedDerivedTemplate(t, control, failedGolden(), time.Hour)
+	createOnDerived(t, envClient, "old-env")
+	control.SetState("old-env", ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+
+	for _, id := range []string{"img1", "img2"} {
+		if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: id, RootfsImage: testRootfsImage}); err != nil {
+			t.Fatalf("CreateEnvironment %s: %v", id, err)
+		}
+	}
+	if uid := control.Template("ate-env", testDerivedTemplate).GetMetadata().GetUid(); uid != "seeded" {
+		t.Errorf("derived template uid = %q, want the kept %q", uid, "seeded")
+	}
+	if deletes, _ := control.TemplateCalls(); deletes != 0 {
+		t.Errorf("DeleteActorTemplate calls = %d, want 0", deletes)
+	}
+}
+
+// Concurrent creates that all see the failed template recreate it once, and
+// no create runs while no template exists.
 func TestCreateFromImageRecreatesFailedTemplateConcurrently(t *testing.T) {
 	envClient, control := newTestEnv(t)
-	seedDerivedTemplate(t, control, &ateapipb.GoldenSnapshotStatus{ErrorMessage: "GoldenActorCrashed: golden actor crashed before its snapshot was taken"})
+	seedDerivedTemplate(t, control, failedGolden(), time.Hour)
+	control.RequireTemplate = true
 
 	const n = 16
 	var wg sync.WaitGroup
@@ -788,8 +843,54 @@ func TestCreateFromImageRecreatesFailedTemplateConcurrently(t *testing.T) {
 	if tmpl == nil || tmpl.GetMetadata().GetUid() == "seeded" || tmpl.GetStatus().GetGoldenSnapshotStatus().GetErrorMessage() != "" {
 		t.Fatalf("derived template after concurrent creates = %v, want a recreated template without an error", tmpl)
 	}
-	if n := control.TemplateCount(); n != 2 {
-		t.Errorf("template count = %d, want 2 (base + one derived)", n)
+	if deletes, creates := control.TemplateCalls(); deletes != 1 || creates != 1 {
+		t.Errorf("DeleteActorTemplate calls = %d, CreateActorTemplate calls = %d; want 1 and 1", deletes, creates)
+	}
+}
+
+// While the template reconciler (or another delete) holds the template's
+// lease, Substrate answers the delete with Aborted and the failed template
+// stays. The create waits for the replacement instead of using the template
+// that is about to go away.
+func TestCreateFromImageRecreateWaitsForTemplateLease(t *testing.T) {
+	envClient, control := newTestEnv(t)
+	seedDerivedTemplate(t, control, failedGolden(), time.Hour)
+	control.RequireTemplate = true
+	release := control.HoldTemplateLease("ate-env", testDerivedTemplate)
+	time.AfterFunc(500*time.Millisecond, release)
+
+	if _, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "img", RootfsImage: testRootfsImage}); err != nil {
+		t.Fatalf("CreateEnvironment: %v", err)
+	}
+	if uid := control.Template("ate-env", testDerivedTemplate).GetMetadata().GetUid(); uid == "seeded" {
+		t.Errorf("derived template uid = %q, want a recreated template", uid)
+	}
+	if deletes, _ := control.TemplateCalls(); deletes < 2 {
+		t.Errorf("DeleteActorTemplate calls = %d, want a retry after Aborted", deletes)
+	}
+}
+
+// A delete that fails for another reason fails the create with Unavailable,
+// with the template name and a truncated golden error.
+func TestCreateFromImageRecreateDeleteFails(t *testing.T) {
+	envClient, control := newTestEnv(t)
+	long := testGoldenError + ": " + strings.Repeat("x", 4000)
+	seedDerivedTemplate(t, control, &ateapipb.GoldenSnapshotStatus{ErrorMessage: long}, time.Hour)
+	control.DeleteTemplateErr = status.Error(codes.Internal, "database unavailable")
+
+	_, err := envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "img", RootfsImage: testRootfsImage})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("CreateEnvironment: code %v (%v), want Unavailable", status.Code(err), err)
+	}
+	msg := status.Convert(err).Message()
+	if !strings.Contains(msg, testDerivedTemplate) || !strings.Contains(msg, "GoldenActorCrashed") {
+		t.Errorf("message %q must name the template and the golden error", msg)
+	}
+	if len(msg) > 1024 {
+		t.Errorf("message has %d bytes, want the golden error truncated", len(msg))
+	}
+	if control.Template("ate-env", testDerivedTemplate) == nil {
+		t.Error("derived template is gone after a failed delete")
 	}
 }
 

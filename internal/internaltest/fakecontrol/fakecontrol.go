@@ -52,6 +52,17 @@ type Server struct {
 	DenyCreateAtespace bool
 	templates          map[string]*ateapipb.ActorTemplate
 	templateSeq        int
+	// RequireTemplate makes CreateActor fail with FailedPrecondition when
+	// the actor's template does not exist, as Substrate does.
+	RequireTemplate bool
+	// DeleteTemplateErr, when set, is the error of each DeleteActorTemplate.
+	DeleteTemplateErr error
+	// templateLeases are the templates whose lease a test holds, as the
+	// template reconciler or a running delete does.
+	templateLeases map[string]bool
+	// templateDeletes and templateCreates count the DeleteActorTemplate
+	// and CreateActorTemplate calls.
+	templateDeletes, templateCreates int
 	// SuspendModes records the durability mode of each SuspendActor call.
 	SuspendModes []ateapipb.DurabilityMode
 }
@@ -101,9 +112,35 @@ func (s *Server) GetActorTemplate(ctx context.Context, req *ateapipb.GetActorTem
 	return proto.Clone(t).(*ateapipb.ActorTemplate), nil
 }
 
+// HoldTemplateLease holds the lease of a template until release is called:
+// meanwhile DeleteActorTemplate on it fails with Aborted, as in Substrate
+// while the template reconciler or another delete holds it.
+func (s *Server) HoldTemplateLease(atespace, name string) (release func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.templateLeases == nil {
+		s.templateLeases = make(map[string]bool)
+	}
+	s.templateLeases[key(atespace, name)] = true
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		delete(s.templateLeases, key(atespace, name))
+	}
+}
+
+// TemplateCalls returns how many DeleteActorTemplate and CreateActorTemplate
+// calls the fake got.
+func (s *Server) TemplateCalls() (deletes, creates int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.templateDeletes, s.templateCreates
+}
+
 func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.templateCreates++
 	t := req.GetActorTemplate()
 	md := t.GetMetadata()
 	if md.GetName() == "" {
@@ -138,8 +175,15 @@ func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateAc
 func (s *Server) DeleteActorTemplate(ctx context.Context, req *ateapipb.DeleteActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.templateDeletes++
+	if s.DeleteTemplateErr != nil {
+		return nil, s.DeleteTemplateErr
+	}
 	ref := req.GetActorTemplate()
 	k := key(ref.GetAtespace(), ref.GetName())
+	if s.templateLeases[k] {
+		return nil, status.Errorf(codes.Aborted, "another operation is in progress for this ActorTemplate %s", ref.GetName())
+	}
 	t, ok := s.templates[k]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "ActorTemplate %s not found", ref.GetName())
@@ -265,6 +309,9 @@ func (s *Server) CreateActor(ctx context.Context, req *ateapipb.CreateActorReque
 	k := key(actor.GetMetadata().GetAtespace(), name)
 	if _, ok := s.actors[k]; ok {
 		return nil, status.Errorf(codes.AlreadyExists, "actor %q already exists", name)
+	}
+	if ref := actor.GetActorTemplate(); s.RequireTemplate && s.templates[key(ref.GetAtespace(), ref.GetName())] == nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "actor template not found; ObjectRef: %s/%s", ref.GetAtespace(), ref.GetName())
 	}
 	a := clone(actor)
 	a.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING}

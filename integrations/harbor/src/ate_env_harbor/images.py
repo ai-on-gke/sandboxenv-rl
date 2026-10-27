@@ -32,14 +32,34 @@ import logging
 import re
 import shutil
 import tempfile
-from collections import defaultdict
 from pathlib import Path
 
 from harbor.environments.definition import should_use_prebuilt_docker_image
 
 BUILD_MODES = ("local", "cloud-build", "none")
 _DIGEST_REF = re.compile(r"@sha256:[0-9a-f]{64}$")
-_REPO_CHARS = re.compile(r"[^a-z0-9._/-]+")
+_REPO_CHARS = re.compile(r"[^a-z0-9._-]+")
+
+# Per process, not per ImageResolver: Harbor builds one environment per trial,
+# and a job at -n 50 on one Dockerfile task must build its tag once. The cache
+# is keyed by the docker binary and the reference; the locks also by the event
+# loop, because an asyncio.Lock binds to the loop that first uses it.
+_digest_cache: dict[tuple[str, str], str] = {}
+_locks: dict[tuple[int, str, str], asyncio.Lock] = {}
+
+
+def reset_cache() -> None:
+    """Forget resolved digests and locks (tests isolate themselves with it)."""
+    _digest_cache.clear()
+    _locks.clear()
+
+
+def _lock_for(binary: str, ref: str) -> asyncio.Lock:
+    key = (id(asyncio.get_running_loop()), binary, ref)
+    lock = _locks.get(key)
+    if lock is None:
+        lock = _locks[key] = asyncio.Lock()
+    return lock
 
 
 class ImageError(RuntimeError):
@@ -60,10 +80,13 @@ def repository_of(ref: str) -> str:
 
 
 def repository_name(environment_name: str) -> str:
-    """A registry path component for a Harbor environment name."""
-    name = _REPO_CHARS.sub("-", environment_name.lower()).strip("./-")
-    name = re.sub(r"-{2,}", "-", name)
-    return name or "task"
+    """A registry path for a Harbor environment name: lowercase components without edge separators."""
+    parts = []
+    for component in environment_name.lower().split("/"):
+        component = re.sub(r"-{2,}", "-", _REPO_CHARS.sub("-", component)).strip("-.")
+        if component:
+            parts.append(component)
+    return "/".join(parts) or "task"
 
 
 async def run_command(
@@ -81,9 +104,13 @@ async def run_command(
         raise ImageError(f"{argv[0]} is not installed or not on PATH") from e
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout)
-    except TimeoutError:
+    except (TimeoutError, asyncio.CancelledError) as e:
+        # Harbor cancels start() at its build timeout; the build must not go
+        # on (and push) after the trial gave up on it.
         proc.kill()
         await proc.wait()
+        if isinstance(e, asyncio.CancelledError):
+            raise
         raise ImageError(f"{' '.join(argv[:3])} did not finish within {timeout:g}s") from None
     return proc.returncode or 0, out.decode(errors="replace"), err.decode(errors="replace")
 
@@ -109,8 +136,6 @@ class ImageResolver:
         self.docker = docker
         self.gcloud = gcloud
         self.logger = logger or logging.getLogger(__name__)
-        self._digests: dict[str, str] = {}
-        self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     def tag_for(self, environment_name: str, environment_id: str) -> str:
         if not self.registry:
@@ -151,27 +176,29 @@ class ImageResolver:
                 "--update-config`, or pass --ek build=local or --ek build=cloud-build"
             )
         tag = self.tag_for(environment_name, environment_id)
-        async with self._locks[tag]:
+        key = (self.docker, tag)
+        async with _lock_for(self.docker, tag):
             if not force_build:
-                cached = self._digests.get(tag)
+                cached = _digest_cache.get(key)
                 if cached is not None:
                     return cached
                 existing = await self._inspect_digest(tag)
                 if existing is not None:
                     self.logger.debug("image %s exists, not rebuilding", tag)
-                    self._digests[tag] = existing
+                    _digest_cache[key] = existing
                     return existing
             if self.build == "local":
                 ref = await self._build_local(environment_dir, tag, build_timeout_sec)
             else:
                 ref = await self._build_cloud(environment_dir, tag, build_timeout_sec)
-            self._digests[tag] = ref
+            _digest_cache[key] = ref
             return ref
 
     async def resolve_tag(self, ref: str) -> str:
         """``repo@sha256:...`` for a tag, through the registry, cached per process."""
-        async with self._locks[ref]:
-            cached = self._digests.get(ref)
+        key = (self.docker, ref)
+        async with _lock_for(self.docker, ref):
+            cached = _digest_cache.get(key)
             if cached is not None:
                 return cached
             if shutil.which(self.docker) is None:
@@ -183,7 +210,7 @@ class ImageResolver:
             resolved = await self._inspect_digest(ref)
             if resolved is None:
                 raise ImageError(f"cannot resolve {ref!r} to a digest; does the image exist?")
-            self._digests[ref] = resolved
+            _digest_cache[key] = resolved
             return resolved
 
     async def _inspect_digest(self, ref: str) -> str | None:

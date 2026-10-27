@@ -33,6 +33,7 @@ Each setting is a constructor kwarg and an `--ek key=value` flag (repeatable).
 | `build` | `local` | `local` (docker buildx), `cloud-build` (gcloud builds submit) or `none` (prebuilt `docker_image` only) |
 | `platform` | `linux/amd64` | Build platform; the worker nodes' architecture |
 | `create_timeout_sec` | `600` | Create plus the first guest answer |
+| `exec_timeout_sec` | `86400` | Bound on a command Harbor runs without a timeout, such as the verifier's test command; the guest's own default would be one hour |
 | `workdir` | none | Working directory when neither the task nor the Dockerfile sets one |
 | `scratch_dir` | `/tmp` | Where tar archives are staged inside the environment |
 | `docker_bin`, `gcloud_bin` | `docker`, `gcloud` | The executables used for images |
@@ -95,17 +96,19 @@ applied) select the base:
    template, image digest, session and context ids; never the token).
 2. `exec`: `sh -c <command>` through the guest, with the working directory
    from the call, the task, the Dockerfile's `WORKDIR` or the kwarg, in that
-   order. At `timeout_sec` the guest kills the process group and the exit code
-   is 137. A `user` that is the image's own user runs as is (root on a root
-   image, the common case and what the verifier asks for); another user runs
-   through `sudo -n`, or `su` when the image runs as root; otherwise the call
-   fails and says so.
+   order. At `timeout_sec` (or `exec_timeout_sec` when Harbor passes none) the
+   guest kills the process group and the exit code is 137. A `user` that is the
+   image's own user runs as is (root on a root image, the common case and what
+   the verifier asks for); another user runs through `sudo -n`, or `su` when the
+   image runs as root, with the command's environment inlined because sudo
+   resets it; otherwise the call fails and says so.
 3. Files: `upload_file` keeps the mode and creates the parent directory;
    `upload_dir` and `download_dir` stage a tar archive under `scratch_dir`,
    which keeps modes, symlinks and empty directories.
 4. `stop(delete=True)` deletes the environment. `--no-delete` suspends it
    instead: it costs no worker, keeps its filesystem in the snapshot and wakes
-   on the next call; the log names the `ate-env <id> shell` command to inspect it.
+   on the next call; the log names the `ate-env <id> shell '<command>'` form
+   to inspect it.
 
 ## Limits
 

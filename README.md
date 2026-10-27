@@ -522,14 +522,17 @@ the guest ([docs/rootfs-images/RUNTIMES.md](docs/rootfs-images/RUNTIMES.md)), is
 the API's listener. A plain HTTP request that carries `X-Env-Id` and `X-Env-Port` (and
 `X-Env-Atespace` outside `ate-env`) is forwarded through the Substrate router to that port, whatever
 its path; the API strips the three headers. The router accepts the tunnel and resumes a suspended
-environment for the request, which it holds while the environment wakes, up to its own limits (in
-Substrate v0.6.0, `--parked-request-budget`, 5 s by default, for a resume it retries). A longer wake
-ends with the router's error, 503 for example, and the client retries. `--wake-budget` applies
-only when the router refuses the tunnel itself, for example when it is overloaded. For a router
-error, the proxy reads the environment's state: a crashed environment gets 410 Gone with
-`X-Env-State: CRASHED`, one that is being deleted gets 404 with `X-Env-State: DELETING`, and one
-that is deleted gets 404. A client stops on 410, because only a new environment helps. The
-daemon's own answers, its 503 and 404 included, pass unchanged.
+environment for the request, which it holds while the environment wakes, up to about 10 s in
+Substrate v0.6.0 (its `--parked-request-budget`, 5 s by default, plus 5 s). A longer wake, usually
+only the first wake of an environment on a new image (15 to 31 s measured; a resume after a suspend
+takes 1 to 2 s), gets 503 with `Retry-After: 1` and `X-Env-State: RESUMING` or `SUSPENDED`, and the
+wake goes on: the client must retry, or wait for a health check before other requests.
+`--wake-budget` bounds guest gRPC calls, and the port proxy only when the router refuses the tunnel
+itself, for example when it is overloaded. For the router's errors, the proxy reads the
+environment's state: a crashed environment gets 410 Gone with `X-Env-State: CRASHED`, after the
+router's 5 s hold; one that is being deleted gets 404 with `X-Env-State: DELETING`; one that is
+deleted gets 404. A client stops on 410, because only a new environment helps. The daemon's own
+answers, its 503, 404 and 504 included, pass unchanged.
 
 ```bash
 curl -H 'X-Env-Id: dev1' -H 'X-Env-Port: 6000' localhost:7777/health

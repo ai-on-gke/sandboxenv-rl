@@ -61,6 +61,31 @@ with a column per run: p50/p95 per event, and per step the live environments,
 tasks, failures, barrier, park and wake p50/p95. `-json` then writes the
 summaries as an array. Files go before the flags.
 
+Every run event carries labels: the loader's own (mode, width, images,
+trajectory, dataset, the shape flags, connections, base template, exclude
+file, instances and the timeouts) plus any `run -label KEY=VALUE`, which is
+where the Substrate commit, the cluster and the arm go. A `-label` with a key
+the loader records itself is refused, so the same-workload check below cannot
+be overridden. The report prints
+them under its header, and the comparison shows one row per label key, so a
+column's provenance is in the table. `report -arm pull=p1.jsonl,p2.jsonl
+-arm stream=s1.jsonl,s2.jsonl` gives one column per arm, in flag order. Two
+rules pool an arm's reps: counts add up (tasks, failed, rewarded, a step's
+live environments, and the `n` of every event row, whose percentiles are
+computed over the merged raw events, never over per-run percentiles), and
+durations take the median across the reps (a step's barrier and park, and
+the run), the mean of the two middle values for an even count. A `reps` row
+says how many runs each column pools, and the JSON lists their run ids. The
+reps of an arm must be complete runs of one workload: each with a run event
+and the loader's labels, no run id twice or in two arms, and the loader's
+own labels equal (`exclude_file` and `instances` compare by name or count
+plus a digest of their ids); a `-label` value that differs across them shows
+every value `|`-joined, so a column that mixes commits says so. An operator
+label named like a built-in row (`tasks`, say) prints as `label.tasks`. A
+path in `-arm` may not contain a comma. `report RUN.jsonl
+-top 10` lists the ten slowest successful first commands and the ten slowest
+successful wakes by environment, for finding the straggler.
+
 ## How many actors, and on which clusters
 
 Every environment the loader creates is one Substrate actor. Three flags
@@ -238,12 +263,16 @@ manifest fetch, snapshot download, image unpack, the worker's restore, and
 the total. The actor's name is the environment's name, so the report pairs
 each record with the `ttfi` or `wake` event of that environment whose window
 (the event's end minus its duration, up to its end) contains the record's
-time: a record inside a `ttfi` window is a cold start, one inside a `wake`
+time: a record inside a `ttfi` window is a first start, one inside a `wake`
 window is a wake. The table gives p50/p95/max per phase plus an `outside`
 row, the event's span minus atelet's total, which is ateapi, the scheduler,
-the router and the command itself. Failed restores are counted and left out
-of the percentiles; restores whose event failed are counted and left out of
-`outside`. Records before the run's first event or after its last (a rerun
+the router and the command itself. The report does not call a restore cold
+or warm: atelet's `oci_unpack` phase times the bundle preparation, which runs
+on every restore whether or not the node had the layers, so the record
+carries no cache signal; the cache samples above give the run's misses until
+atelet records the image cache outcome per restore. Failed restores are
+counted and left out of the percentiles; restores whose event failed are
+counted and left out of `outside`. Records before the run's first event or after its last (a rerun
 with the same run id), for actors the run never created, or inside no window
 (a restore after an eviction or a failed suspend) are counted, not paired.
 The records come from the kubelet's container logs, which rotate, so harvest
@@ -274,6 +303,10 @@ benchmark of its own.
 
 ## Record with every run
 
-Substrate and env commits, cluster shape (machine type, node count, sandbox
-class), bucket region, the dataset manifest's digest, and the loader flags.
-The report alone is not reproducible without them.
+Substrate and env commits, cluster shape (machine type, node count, disk,
+sandbox class), bucket region, the dataset manifest's digest, and the loader
+flags. Pass them as `run -label` values so they travel with the events file. The
+loader records its own flags itself: mode, width, images, trajectory,
+dataset, tasks per image or rollouts, steps and park, connections, base
+template, exclude file, instances, and the create, step, wake-budget and
+wake-backoff timeouts. The report alone is not reproducible without them.

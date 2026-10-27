@@ -179,6 +179,12 @@ class FleetConfig:
     max_concurrent: int = 64
     max_warmpool_replicas: int = 4
     window_size: int | None = None
+    # gRPC connections to ate-env-api. Each HTTP/2 connection carries a
+    # bounded number of concurrent calls (the server's MaxConcurrentStreams,
+    # 250 on a Go server without an HTTP/2 config), and a Service spreads
+    # connections, not calls, over the ate-env-api pods. None picks
+    # ceil(max_concurrent / 200).
+    connections: int | None = None
 
     # Hardware & placement (reserved for template placement and future scheduler extensions)
     worker_family: str | None = "c2"
@@ -226,6 +232,11 @@ class FleetConfig:
 
         if self.window_size is not None and (not isinstance(self.window_size, int) or self.window_size < 1):
             raise ValidationError(f"window_size must be >= 1, got {self.window_size}")
+
+        if self.connections is not None and (
+            not isinstance(self.connections, int) or isinstance(self.connections, bool) or self.connections < 1
+        ):
+            raise ValidationError(f"connections must be >= 1, got {self.connections}")
 
         object.__setattr__(self, "node_selector", dict(self.node_selector))
         object.__setattr__(self, "tolerations", list(self.tolerations))

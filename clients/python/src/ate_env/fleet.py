@@ -97,6 +97,7 @@ class SandboxFleet:
                 acquire_timeout_s=self.config.acquire_timeout_s,
                 ready_timeout_s=self.config.ready_timeout_s,
                 tracer_config=self._tracer_config,
+                connections=self.config.connections or -(-self.config.max_concurrent // 200),
             )
         else:
             raise NotImplementedError(f"Backend '{self.config.backend}' is not yet supported or requires extras")

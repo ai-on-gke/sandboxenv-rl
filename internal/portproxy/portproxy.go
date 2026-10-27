@@ -222,20 +222,28 @@ func Wants(r *http.Request) bool {
 }
 
 // Dispatch returns a handler that sends header-form requests to p.ServeHTTP,
-// path-form requests to p.ServePath, and all others to next. The path form is
-// matched here rather than on a ServeMux, so the daemon gets the path exactly
-// as sent: a mux would redirect a missing trailing slash, "//" and "..", and
-// WebSocket clients do not follow redirects.
-func Dispatch(p *Proxy, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case Wants(r):
-			p.ServeHTTP(w, r)
-		case isPathForm(r.URL.EscapedPath()):
+// path-form requests to p.ServePath, and all others to next. Any mw wrappers
+// wrap the proxy routes without wrapping next. The path form is matched here
+// rather than on a ServeMux, so the daemon gets the path exactly as sent: a
+// mux would redirect a missing trailing slash, "//" and "..", and WebSocket
+// clients do not follow redirects.
+func Dispatch(p *Proxy, next http.Handler, mw ...func(http.Handler) http.Handler) http.Handler {
+	var proxy http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isPathForm(r.URL.EscapedPath()) {
 			p.ServePath(w, r)
-		default:
-			next.ServeHTTP(w, r)
+			return
 		}
+		p.ServeHTTP(w, r)
+	})
+	for _, m := range mw {
+		proxy = m(proxy)
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if Wants(r) || isPathForm(r.URL.EscapedPath()) {
+			proxy.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 

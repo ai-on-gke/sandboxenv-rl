@@ -418,11 +418,12 @@ class AteEnvWorkspace(RemoteWorkspace):
 
         A ``RemoteConversation`` keeps the host it opened with, thus only a
         conversation opened or reattached after this call uses the new
-        capability. No-op without ``api_token``.
+        capability for its event WebSocket. The HTTP client stays open: REST
+        requests do not use the capability, thus a live conversation can still
+        send messages. No-op without ``api_token``.
         """
         if self.api_token:
             self._set_host()
-            self.reset_client()
 
     @property
     def _rest_host(self) -> str:

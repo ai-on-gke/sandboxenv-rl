@@ -347,7 +347,9 @@ GKE with gVisor workers, Substrate from 2026-10-12, ate-env-api with the port pr
 - A conversation keeps the capability it opened with. Its event WebSocket gets 401 when it
   reconnects after `ws_capability_ttl`, or after a token rotation. `resume()` and
   `renew_ws_capability()` put a new capability in the host; reattach the conversation after them
-  (`Conversation(agent=..., workspace=..., conversation_id=...)`). The capability needs an
+  (`Conversation(agent=..., workspace=..., conversation_id=...)`) so its event WebSocket uses it.
+  `renew_ws_capability()` keeps the HTTP client open, thus a live conversation can still send
+  messages. The capability needs an
   ate-env-api whose port proxy checks port capabilities; an older one answers the event WebSocket
   401.
 - With a live `RemoteConversation`, `pause()` does not keep the environment suspended: the suspend

@@ -435,6 +435,25 @@ def test_resume_renews_the_capability(stack, tmp_path, monkeypatch):
     assert _websocket_upgrades(state)
 
 
+def test_renewing_the_capability_keeps_a_live_conversation_working(stack, tmp_path,
+                                                                  monkeypatch):
+    """renew_ws_capability() changes only host's user info, which REST requests do not
+    use, thus a live conversation keeps its HTTP client and can still send messages."""
+    monkeypatch.setenv("OPENHANDS_REMOTE_WS_READY_TIMEOUT", "5")
+    api_url, state = stack
+    state.api_token = "api-secret"
+    with make(api_url, state, tmp_path, api_token="api-secret") as ws:
+        conversation = _open_conversation(ws)
+        try:
+            before = _capability_of(ws)
+            time.sleep(1.1)  # a new expiry second gives a new capability
+            ws.renew_ws_capability()
+            assert _capability_of(ws) != before
+            conversation.send_message("still connected")
+        finally:
+            conversation.close()
+
+
 def test_capabilities_are_masked_in_logs(stack, tmp_path, caplog, monkeypatch):
     """httpx logs show no capability (REST URLs have none), and the websockets
     handshake log masks the Basic header."""

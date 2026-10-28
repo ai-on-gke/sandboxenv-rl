@@ -30,7 +30,7 @@ The focus moves from a general environment service to RL training and evaluation
 | Fleet SDK | `SandboxFleet` and `AsyncSandboxFleet` in [`clients/python`](clients/python/README.md): acquire sandboxes for tasks by image, run tasks with the `naive`, `sliding` or `pipelined` strategy, pre-warm images, release and recycle. |
 | Any task image | `rootfs_image` runs a digest-pinned image unmodified: `ate-env-api` derives an ActorTemplate per image and mounts the guest into it as an image volume. Runtime layers and sidecars add a second runtime to any image ([docs/rootfs-images](docs/rootfs-images/README.md)). |
 | Daemons inside an environment | A port proxy on `ate-env-api` reaches any port in an environment by header or by path, WebSockets included ([details](#reaching-a-service-inside-an-environment)). |
-| Framework integrations | A [NeMo Gym](integrations/nemo-gym/README.md) sandbox provider and a [GRPO](examples/grpo/README.md) training loop on TRL. |
+| Framework integrations | A [NeMo Gym](integrations/nemo-gym/README.md) sandbox provider, a [uni-agent](integrations/uni-agent/README.md) sandbox provider with an R2E-Gym task graded by hidden tests in the same environment, and a [GRPO](examples/grpo/README.md) training loop on TRL. |
 | Benchmarks | A [SWE-bench Verified loader](benchmarking/swebench/README.md) that drives real task images the way an RL job does, and the [design](internal/benchmarking/DESIGN.md) of the benchmark system. |
 | Platform | Built against Substrate `v0.6.0` (actor limits are integer millicores and bytes): the WorkerPool chooses the sandbox, each template selects its pool by label, suspends are durable, and `ate-env-api` runs as its own identity under Substrate authorization. The guest runs as a PID 1 init that reaps orphans, and it allocates PTYs. The control plane must run v0.6.0 or later: the release renumbered proto fields env reads and writes, so an older control plane cannot serve this build. `ate-env-api` reaches actors through the router's TLS listeners with its pod identity certificate (`ate-env manifest --api-router-tls`, on by default), so the install must list `spiffe://cluster.local/ns/ate-env/sa/ate-env-api` in the router's ingress allow-list. |
 
@@ -57,7 +57,7 @@ The focus moves from a general environment service to RL training and evaluation
 | [`integrations/`](#integrations) | Framework integrations. |
 | [`examples/`](#examples) | Runnable examples. |
 | [`benchmarking/`](benchmarking/swebench/README.md), [`cmd/benchmarking`](cmd/benchmarking), [`internal/benchmarking`](internal/benchmarking/DESIGN.md) | The SWE-bench loader, its scripts and the benchmark design. |
-| [`docs/`](docs) | Rootfs images and runtime layers, and how releases are cut. |
+| [`docs/`](docs) | Rootfs images and runtime layers, the [metrics reference](docs/metrics.md), the [threat model](docs/security/threat-model.md), and how releases are cut. |
 
 ## Examples
 
@@ -67,12 +67,14 @@ The focus moves from a general environment service to RL training and evaluation
 | [`examples/runtime-layers`](examples/runtime-layers/README.md) | An unmodified rootfs image with a second runtime injected as a layer and supervised as a sidecar. |
 | [`examples/mcp`](examples/mcp/main.go) | Go: connect to an environment's MCP endpoint, list the tools and call them. |
 | [`examples/guest-daemon`](examples/guest-daemon/README.md) | Go: run the guest gRPC services standalone, without a cluster. |
+| [`examples/Qwen3.5-35B-A3B-verl`](examples/Qwen3.5-35B-A3B-verl/README.md) | Agentic GRPO on real SWE tasks: verl `separate_async` with a Megatron trainer and vLLM rollouts on separate nodes, a uni-agent ReAct agent whose tools and hidden-test grading run in environments. Two 8-GPU nodes. |
 
 ## Integrations
 
 | Integration | Framework | What it does |
 |---|---|---|
 | [`integrations/nemo-gym`](integrations/nemo-gym/README.md) | [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) | Sandbox provider `substrate`, registered through the `nemo_gym.sandbox_providers` entry point, with no change to NeMo Gym. `endpoint()` reaches a daemon inside the sandbox through the port proxy. |
+| [`integrations/uni-agent`](integrations/uni-agent/README.md) | [uni-agent](https://github.com/verl-project/uni-agent) | Sandbox provider `ate_env` plus an `r2e_gym` task that hides the tests, lets the agent work, then grades in the same environment; dataset and image tooling for R2E-Gym, SWE-reBench and SWE-bench rows. Used by `examples/Qwen3.5-35B-A3B-verl`. |
 
 ## Benchmarks
 
@@ -82,6 +84,12 @@ and `steps` mode creates a fleet once and parks it between training steps. Image
 compare image pull, image streaming and other loaders on the same images. The report breaks down
 what each phase cost.
 [`internal/benchmarking/DESIGN.md`](internal/benchmarking/DESIGN.md) specifies the benchmark system.
+
+## Support
+
+The components, the clients, the integrations and the `ateenv.v1alpha` API are supported;
+`examples/` and `internal/examples/` are not. [docs/support.md](docs/support.md) says what
+supported means for each path.
 
 ## Get started
 
@@ -259,6 +267,20 @@ parking budget) and, once the control plane reports the environment RUNNING, up 
 `--wake-running-budget` (default 20s). Both are flags of the `ate-env-api` binary; `ate-env manifest`
 does not set them, thus add them to the Deployment's arguments to change them.
 
+`ate-env-api` can export traces and serve Prometheus metrics; both are off by default:
+
+- `--enable-tracing` exports OpenTelemetry traces over OTLP/gRPC, configured by
+  `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_INSECURE`. The server continues the W3C
+  `traceparent` / `tracestate` that a caller sends and passes it on to ateapi and the guests as is.
+  `ate-env manifest --enable-tracing --otlp-endpoint <url> [--otlp-insecure]` sets these.
+- `--metrics-listen-addr` (for example `:9090`) serves the families in
+  [docs/metrics.md](docs/metrics.md) at `/metrics` on a listener of its own.
+  `--metrics-environments-ttl` (default 1m) bounds how often a scrape lists the environments.
+  `ate-env manifest --metrics-port <port>` sets the flag and exposes the port on the container and
+  the Service, with `prometheus.io` scrape annotations; 0 (the default) leaves metrics off. The
+  metrics listener has no authentication and no `Host` check: anyone who reaches it reads request
+  counts, atespace names with environment counts, and the build version.
+
 `ate-env-api` requires a bearer token from each caller: `ate-env manifest` mounts the Secret that
 `--auth-token-secret` names (default `ate-env-api-token`, key `token`) and sets `-auth-token-file`.
 The pod does not start until the Secret exists. Read the token back for clients with
@@ -385,6 +407,10 @@ $ ate-env suspend dev1
 $ ate-env delete dev1
 ```
 
+Subcommand names (`create`, `delete`, `suspend`, `manifest`, `server-info`, `help`, `completion`) are
+reserved: `ate-env create` rejects them as environment IDs, because `ate-env <id> ...` cannot reach
+such an environment.
+
 `ate-env` provides help text:
 
 ```bash
@@ -405,6 +431,7 @@ Available Commands:
   delete      Delete an environment
   help        Help about any command
   manifest    Generate Kubernetes manifests to deploy the system
+  server-info Show the ate-env-api server's version and features
   suspend     Suspend an environment
 
 Flags:
@@ -442,11 +469,16 @@ Flags:
       --api-image string            digest-pinned ate-env-api image for the API service (required: this ate-env was built from source; release binaries default to the image published with the release, see docs/release.md)
       --api-port int32              port the ate-env-api service listens on (default 7777)
       --api-replicas int32          number of API service replicas (default 1)
+      --api-router-tls              mount the pod identity certificate and the servicedns trust bundle into ate-env-api and dial the atenet router's TLS listeners, the only ones Substrate serves since v0.6.0; the API's SPIFFE ID must then be in the router's --ingress-allowed-spiffe-ids. Off, the API dials the plaintext addresses, which only the test fakes serve (default true)
       --ateom-image string          alias for --worker-image, kept from before Substrate renamed ateom to ateworker
       --auth-token-secret string    Kubernetes Secret (key 'token') mounted into ate-env-api; its value is the bearer token ate-env-api requires from callers. Create it with 'ate-env manifest auth-secret' (default "ate-env-api-token")
+      --enable-tracing              run ate-env-api with --enable-tracing, exporting OpenTelemetry traces over OTLP/gRPC
   -h, --help                        help for manifest
       --insecure-no-auth            deploy ate-env-api without a caller token: anyone who can reach its Service can create environments, run commands in them and reach their ports
+      --metrics-port int32          port ate-env-api serves Prometheus metrics on (--metrics-listen-addr), exposed on the container and the Service as "metrics" with prometheus.io scrape annotations; 0 leaves metrics off. The metrics listener has no authentication and no Host check
       --namespace string            Kubernetes namespace to deploy into (default "ate-env")
+      --otlp-endpoint string        OTLP/gRPC collector endpoint for ate-env-api's traces, set as OTEL_EXPORTER_OTLP_ENDPOINT, e.g. http://otel-collector.observability:4317
+      --otlp-insecure               set OTEL_EXPORTER_OTLP_INSECURE=true: talk to the collector in plaintext
       --replicas int32              number of pre-warmed worker pods (default 5)
       --template string             ActorTemplate name (default "default-template")
       --worker-image string         digest-pinned worker image for the worker pool, e.g. ateworker-gvisor built from the Substrate repo
@@ -457,8 +489,30 @@ Use "ate-env manifest [command] --help" for more information about a command.
 
 ## API
 
-The `ate-env-api` service exposes gRPC APIs for environment
-lifecycle and in-actor operations, as well as HTTP endpoints for MCP.
+The `ate-env-api` service exposes gRPC APIs for environment lifecycle and in-actor operations, as
+well as HTTP endpoints for MCP.
+
+The gRPC services reject a request that carries a field the server does not know, at any depth,
+with `InvalidArgument`: a client built from another version or fork of this API fails instead of
+being served as if the field were absent. An `InvalidArgument` whose message says "carries field
+numbers" thus means that the client and the server come from different builds, not that the
+request is wrong: treat it as a configuration error and do not retry. The guest applies the same
+check to the requests that `ate-env-api` forwards to it. Limits:
+
+- The check covers requests only. In the other direction, an older client accepts a newer
+  server's response field, or a new value of `Environment.state`, and ignores it. That is proto3's
+  normal behavior.
+- Build the SWE-bench loader and `ate-env-api` from one commit. A loader flag that sets a request
+  field the server does not know fails every create with "carries field numbers".
+- A renumbered field is not caught. When both sides know field N with different meanings, nothing
+  is unknown.
+- A guest baked into a golden snapshot keeps the build it had. Guests from before this check accept
+  unknown fields and ignore them, and `ate-env-api` cannot detect an old guest. After an upgrade,
+  register the base templates again and delete the `<base>-<12 hex digits>` templates derived from
+  them, so that their golden snapshots bake with the current guest.
+- In a client stream (`WriteFile`, `WriteProcessInput`), a rejected later message ends the call,
+  but what the guest already did with the earlier messages stays: a file can be partly written. A
+  rejected first message does not wake a suspended environment.
 
 ### EnvironmentService
 
@@ -470,6 +524,7 @@ Manages the lifecycle of isolated execution environments (defined in [`proto/ate
 | `GetEnvironment` | Retrieves environment details and status |
 | `SuspendEnvironment` | Suspends and checkpoints the environment to snapshot storage |
 | `DeleteEnvironment` | Deletes the environment permanently |
+| `GetServerInfo` | Reports the server implementation (`sandboxenv-rl`), its version, the version of the `go.ate.dev/substrate` module it was built against, and its optional features (`rootfs_image`, `pty`, and `port_proxy` when enabled); answered by `ate-env-api` itself. The Substrate version is a build fact, not the version of the control plane the server talks to; Substrate has no RPC that reports that. `ate-env server-info --json` prints the four fields as one JSON object |
 
 ### ProcessService
 

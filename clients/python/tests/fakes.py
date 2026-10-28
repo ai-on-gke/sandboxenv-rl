@@ -92,6 +92,14 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
         del self.environments[(request.atespace or "ate-env", request.id)]
         return env_pb2.DeleteEnvironmentResponse()
 
+    async def GetServerInfo(self, request, context):
+        return env_pb2.GetServerInfoResponse(
+            server="sandboxenv-rl",
+            version="v0.0.0-fake",
+            substrate_version="unknown",
+            features=["rootfs_image", "pty"],
+        )
+
     async def _lookup(self, request, context):
         key = (request.atespace or "ate-env", request.id)
         environment = self.environments.get(key)

@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -34,6 +35,7 @@ import (
 	"github.com/agent-substrate/env/internal/internaltest/fakecontrol"
 	"github.com/agent-substrate/env/internal/internaltest/fakerouter"
 	"github.com/agent-substrate/env/internal/mcp"
+	"github.com/agent-substrate/env/internal/unknownfields"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
@@ -84,7 +86,12 @@ func newFixture(t *testing.T) *fixture {
 	service := apiservice.New(directClient, routerAddr, "")
 	t.Cleanup(service.Close)
 
-	grpcServer := grpc.NewServer()
+	// The interceptors ate-env-api runs, so each call the SDK makes is checked
+	// for fields the server does not know.
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(unknownfields.UnaryServerInterceptor()),
+		grpc.ChainStreamInterceptor(unknownfields.StreamServerInterceptor()),
+	)
 	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, service)
 	ateenvv1alpha.RegisterProcessServiceServer(grpcServer, service)
 	ateenvv1alpha.RegisterFileSystemServiceServer(grpcServer, service)
@@ -173,6 +180,25 @@ func TestDelete(t *testing.T) {
 
 	if err := sb.Delete(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestClientServerInfo(t *testing.T) {
+	f := newFixture(t)
+	info, err := f.client.ServerInfo(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.GetServer() != apiservice.ServerName {
+		t.Errorf("server = %q, want %q", info.GetServer(), apiservice.ServerName)
+	}
+	if info.GetVersion() != "dev" {
+		t.Errorf("version = %q, want \"dev\" for a server without a build version", info.GetVersion())
+	}
+	for _, want := range []string{apiservice.FeatureRootfsImage, apiservice.FeaturePTY} {
+		if !slices.Contains(info.GetFeatures(), want) {
+			t.Errorf("features = %v, want %q", info.GetFeatures(), want)
+		}
 	}
 }
 
@@ -544,11 +570,11 @@ func TestClientAuthToken(t *testing.T) {
 		grpc.ChainUnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 			record(ctx, info.FullMethod)
 			return handler(ctx, req)
-		}, auth.UnaryInterceptor()),
+		}, auth.UnaryInterceptor(), unknownfields.UnaryServerInterceptor()),
 		grpc.ChainStreamInterceptor(func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 			record(ss.Context(), info.FullMethod)
 			return handler(srv, ss)
-		}, auth.StreamInterceptor()),
+		}, auth.StreamInterceptor(), unknownfields.StreamServerInterceptor()),
 	)
 	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, service)
 	ateenvv1alpha.RegisterProcessServiceServer(grpcServer, service)
@@ -571,6 +597,9 @@ func TestClientAuthToken(t *testing.T) {
 
 	if _, err := unauthClient.Create(t.Context(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "sb-auth"}); status.Code(err) != codes.Unauthenticated {
 		t.Fatalf("unauthenticated Create: got %v, want Unauthenticated", err)
+	}
+	if _, err := unauthClient.ServerInfo(t.Context()); status.Code(err) != codes.Unauthenticated {
+		t.Fatalf("unauthenticated ServerInfo: got %v, want Unauthenticated", err)
 	}
 
 	exercise := func(t *testing.T, client *env.Client, id string) {

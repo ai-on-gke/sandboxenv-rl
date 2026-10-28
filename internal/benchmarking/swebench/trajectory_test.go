@@ -34,6 +34,8 @@ func TestBuiltinTrajectoriesLoadAndRender(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", n, err)
 		}
+		// The knob without a default; the others take theirs.
+		tr.Vars = map[string]string{"READ_FILE": "/testbed/setup.py"}
 		r, err := tr.Render(in)
 		if err != nil {
 			t.Fatalf("%s render: %v", n, err)
@@ -192,7 +194,7 @@ func TestGrades(t *testing.T) {
 	if !def.Grades() {
 		t.Fatal("the default trajectory grades")
 	}
-	for _, n := range []string{"workload-file-read", "workload-compile", "workload-read-all"} {
+	for _, n := range []string{"workload-file-read-one", "workload-file-read", "workload-compile", "workload-read-all"} {
 		tr, err := LoadTrajectory(n)
 		if err != nil {
 			t.Fatalf("%s: %v", n, err)
@@ -213,5 +215,107 @@ func TestGrades(t *testing.T) {
 	}
 	if plain.Grades() {
 		t.Fatal("a trajectory that uses only the patch does not grade")
+	}
+}
+
+func TestVarTemplateFunc(t *testing.T) {
+	tr, err := ParseTrajectory([]byte(`
+name: vars
+steps:
+  - {name: a, run: "cat {{var \"READ_FILE\" \"/default.py\"}} && echo {{var \"COUNT\" \"200\"}}", reward: true}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := Instance{InstanceID: "x", Image: "reg/img@" + goodDigest}
+	got, err := tr.Render(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Steps[0].Run != "cat '/default.py' && echo '200'" {
+		t.Fatalf("defaults: %q", got.Steps[0].Run)
+	}
+	used, err := tr.VarsUsed(in)
+	if err != nil || used["READ_FILE"] != "/default.py" || used["COUNT"] != "200" || len(used) != 2 {
+		t.Fatalf("VarsUsed = %v, %v", used, err)
+	}
+	// A value is one shell word whatever it holds: a quote cannot end it.
+	tr.Vars = map[string]string{"READ_FILE": "/testbed/it's.py; rm -rf /"}
+	got, err = tr.Render(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Steps[0].Run != `cat '/testbed/it'\''s.py; rm -rf /' && echo '200'` {
+		t.Fatalf("set value: %q", got.Steps[0].Run)
+	}
+	if used, err := tr.VarsUsed(in); err != nil || used["READ_FILE"] != "/testbed/it's.py; rm -rf /" {
+		t.Fatalf("VarsUsed after -set = %v, %v: want the set value, unquoted", used, err)
+	}
+	twoDefaults, err := ParseTrajectory([]byte(`
+name: twodefaults
+steps:
+  - {name: a, run: "echo {{var \"X\" \"1\" \"2\"}}", reward: true}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := twoDefaults.Render(in); err == nil || !strings.Contains(err.Error(), "one default at most") {
+		t.Fatalf("two defaults must fail to render: %v", err)
+	}
+	noDefault, err := ParseTrajectory([]byte(`
+name: nodefault
+steps:
+  - {name: a, run: "cat {{var \"MUST\"}}", reward: true}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := noDefault.Render(in); err == nil || !strings.Contains(err.Error(), "MUST") {
+		t.Fatalf("a variable without a value or a default must fail to render: %v", err)
+	}
+	noDefault.Vars = map[string]string{"MUST": "/x"}
+	got, err = noDefault.Render(in)
+	if err != nil || got.Steps[0].Run != "cat '/x'" {
+		t.Fatalf("set without default: %v, %v", got, err)
+	}
+}
+
+// TrajectoryAssets names the files a trajectory's write steps need next to
+// it, and refuses a name with a directory, as LoadTrajectory does.
+func TestTrajectoryAssets(t *testing.T) {
+	names, err := TrajectoryAssets("trajectories/swebench-gold.yaml")
+	if err != nil || strings.Join(names, ",") != "swebench-grade.py" {
+		t.Fatalf("gold assets = %v, %v", names, err)
+	}
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	two := write("two.yaml", `
+name: two
+steps:
+  - {name: a, write: {path: /tmp/a, file: b.txt}}
+  - name: b
+    write:
+      path: /tmp/b
+      file: a.txt
+  - {name: c, write: {path: /tmp/c, file: a.txt}}
+  - {name: d, run: "echo file: not-an-asset", reward: true}
+`)
+	if names, err := TrajectoryAssets(two); err != nil || strings.Join(names, ",") != "a.txt,b.txt" {
+		t.Fatalf("assets = %v, %v; want a.txt,b.txt once each, flow style included, run text ignored", names, err)
+	}
+	sub := write("sub.yaml", `
+name: sub
+steps:
+  - {name: a, write: {path: /tmp/a, file: sub/x.txt}}
+  - {name: b, run: "true", reward: true}
+`)
+	if _, err := TrajectoryAssets(sub); err == nil || !strings.Contains(err.Error(), "plain file name") {
+		t.Fatalf("a directory in write.file must be refused: %v", err)
 	}
 }

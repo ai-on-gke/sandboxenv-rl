@@ -149,6 +149,11 @@ type Options struct {
 	// proxy forwards to; a request that names another gets 403, after
 	// Authenticate. Empty means any atespace the router serves.
 	Atespaces []string
+	// OnConnected, when set, is called with the environment's atespace and
+	// id each time the router accepts a CONNECT to one of its ports, after
+	// any wait for a wake. ate-env-api uses it to end create_to_ready when a
+	// port is an environment's first contact.
+	OnConnected func(atespace, id string)
 }
 
 // Proxy is an http.Handler that forwards each request to the environment port
@@ -480,6 +485,9 @@ func (p *Proxy) dial(ctx context.Context, _, addr string) (net.Conn, error) {
 	backoff := wakeRetryInitialBackoff
 	for attempt := 1; ; attempt++ {
 		conn, err := p.connect(ctx, id, atespace, portStr)
+		if err == nil && p.opts.OnConnected != nil {
+			p.opts.OnConnected(atespace, id)
+		}
 		var re *routerError
 		if !errors.As(err, &re) || re.status != http.StatusServiceUnavailable {
 			return conn, err

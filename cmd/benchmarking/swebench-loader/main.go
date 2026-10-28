@@ -24,7 +24,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -933,15 +932,11 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 			valOpts.CheckFailedCreates = true
 		}
 		if *schedPath != "" {
-			rawSched, sErr := os.ReadFile(*schedPath)
+			sched, sErr := swebench.ReadSchedule(*schedPath)
 			if sErr != nil {
-				return fmt.Errorf("read schedule %q: %w", *schedPath, sErr)
+				return sErr
 			}
-			sched, sErr := schema.DecodeJSONStrict[schema.Schedule](bytes.NewReader(rawSched))
-			if sErr != nil {
-				return fmt.Errorf("decode schedule %q: %w", *schedPath, sErr)
-			}
-			valOpts.Schedule = &sched
+			valOpts.Schedule = sched
 		}
 		validity := swebench.Validate(rep, valOpts)
 		if !validity.Valid {
@@ -950,36 +945,8 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 	}
 
 	rep.WriteText(stdout)
-	if *mdOut != "" {
-		var mdBuf bytes.Buffer
-		rep.WriteMarkdown(&mdBuf)
-		if err := os.WriteFile(*mdOut, mdBuf.Bytes(), 0o644); err != nil {
-			return err
-		}
-	}
-	if *unresolved != "" {
-		uf, err := os.Create(*unresolved)
-		if err != nil {
-			return err
-		}
-		rep.WriteExclusions(uf, *unresNote)
-		if err := uf.Close(); err != nil {
-			return err
-		}
-	}
-	if *statsOut != "" {
-		if err := swebench.WriteStatsJSONL(*statsOut, rep, rep.RunID, *testName, *tag); err != nil {
-			return err
-		}
-	}
-	if *jsonOut != "" {
-		b, err := json.MarshalIndent(rep, "", "  ")
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(*jsonOut, b, 0o644); err != nil {
-			return err
-		}
+	if err := swebench.WriteReportFiles(rep, *jsonOut, *mdOut, *unresolved, *unresNote, *statsOut, *testName, *tag); err != nil {
+		return err
 	}
 	return valErr
 }
@@ -996,28 +963,11 @@ func leadingFiles(args []string) (files, rest []string) {
 }
 
 func summarizeFile(path string) (*swebench.Report, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return swebench.Summarize(f)
+	return swebench.SummarizeFile(path)
 }
 
 func loadOrSummarizeFile(path string) (*swebench.Report, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) > 0 && trimmed[0] == '{' && !bytes.Contains(trimmed, []byte("\n{")) {
-		var rep swebench.Report
-		if err := json.Unmarshal(trimmed, &rep); err == nil && (len(rep.Stats) > 0 || rep.Tasks > 0 || len(rep.Jobs) > 0) {
-			swebench.NormalizeLegacyReport(&rep)
-			return &rep, nil
-		}
-	}
-	return swebench.Summarize(bytes.NewReader(raw))
+	return swebench.LoadOrSummarizeReport(path)
 }
 func readEventsFile(path string) ([]swebench.Event, error) {
 	f, err := os.Open(path)

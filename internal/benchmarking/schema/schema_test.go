@@ -21,17 +21,24 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"sigs.k8s.io/yaml"
 )
 
 func TestEmbeddedSchemasResolve(t *testing.T) {
 	schemas := []string{
+		"scenario.schema.json",
 		"schedule.schema.json",
 		"placement.schema.json",
 		"event.schema.json",
 		"run_window.schema.json",
+		"measurements.schema.json",
+		"node_cache.schema.json",
+		"restore_sample.schema.json",
 		"report.schema.json",
 		"stats_row.schema.json",
 		"system_description.schema.json",
@@ -47,6 +54,32 @@ func TestEmbeddedSchemasResolve(t *testing.T) {
 }
 
 func TestFixturesValidateAndRoundTrip(t *testing.T) {
+	t.Run("scenario.yaml", func(t *testing.T) {
+		rawYAML := mustRead(t, "testdata/scenario.yaml")
+		jsonBytes, err := yaml.YAMLToJSON(rawYAML)
+		if err != nil {
+			t.Fatalf("yaml.YAMLToJSON: %v", err)
+		}
+		if err := ValidateAgainstJSONSchema("scenario.schema.json", jsonBytes); err != nil {
+			t.Fatalf("schema validate: %v", err)
+		}
+		v, err := DecodeYAMLStrict[Scenario](rawYAML)
+		if err != nil {
+			t.Fatalf("DecodeYAMLStrict: %v", err)
+		}
+		marshaledYAML, err := yaml.Marshal(v)
+		if err != nil {
+			t.Fatalf("yaml.Marshal: %v", err)
+		}
+		rt, err := DecodeYAMLStrict[Scenario](marshaledYAML)
+		if err != nil {
+			t.Fatalf("round-trip DecodeYAMLStrict: %v", err)
+		}
+		if !reflect.DeepEqual(v, rt) {
+			t.Fatalf("Scenario round-trip mismatch:\ngot:  %+v\nwant: %+v", rt, v)
+		}
+	})
+
 	t.Run("schedule.json", func(t *testing.T) {
 		raw := mustRead(t, "testdata/schedule.json")
 		if err := ValidateAgainstJSONSchema("schedule.schema.json", raw); err != nil {
@@ -98,6 +131,47 @@ func TestFixturesValidateAndRoundTrip(t *testing.T) {
 			t.Fatalf("DecodeJSONStrict: %v", err)
 		}
 		roundTripJSON(t, "run_window.schema.json", v)
+	})
+
+	t.Run("measurements.json", func(t *testing.T) {
+		raw := mustRead(t, "testdata/measurements.json")
+		if err := ValidateAgainstJSONSchema("measurements.schema.json", raw); err != nil {
+			t.Fatalf("schema validate: %v", err)
+		}
+		v, err := DecodeJSONStrict[Measurements](bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("DecodeJSONStrict: %v", err)
+		}
+		roundTripJSON(t, "measurements.schema.json", v)
+	})
+
+	t.Run("cache_before.json", func(t *testing.T) {
+		raw := mustRead(t, "testdata/cache_before.json")
+		if err := ValidateAgainstJSONSchema("node_cache.schema.json", raw); err != nil {
+			t.Fatalf("schema validate: %v", err)
+		}
+		v, err := DecodeJSONStrict[NodeCacheArtifact](bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("DecodeJSONStrict: %v", err)
+		}
+		roundTripJSON(t, "node_cache.schema.json", v)
+	})
+
+	t.Run("restore_timings.jsonl", func(t *testing.T) {
+		raw := mustRead(t, "testdata/restore_timings.jsonl")
+		if err := ValidateJSONLAgainstJSONSchema("restore_sample.schema.json", bytes.NewReader(raw)); err != nil {
+			t.Fatalf("schema validate jsonl: %v", err)
+		}
+		items, err := DecodeJSONLStrict[RestoreSample](bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("DecodeJSONLStrict: %v", err)
+		}
+		if len(items) != 2 {
+			t.Fatalf("len(items) = %d, want 2", len(items))
+		}
+		for _, item := range items {
+			roundTripJSON(t, "restore_sample.schema.json", item)
+		}
 	})
 
 	t.Run("report.json", func(t *testing.T) {
@@ -378,6 +452,26 @@ func TestValidationRules(t *testing.T) {
 		}
 		if err := ev.Validate(); err == nil {
 			t.Fatal("expected error for invalid trace op")
+		}
+	})
+
+	t.Run("JobSpec and PrometheusSeries invariants", func(t *testing.T) {
+		simSteps := JobSpec{
+			Name:       "sim-steps",
+			Kind:       "simulated",
+			LoaderMode: "steps",
+			Dataset:    "d.jsonl",
+			Trajectory: "t.yaml",
+			Steps:      0,
+		}
+		if err := simSteps.Validate(); err == nil {
+			t.Fatal("expected simulated steps job with steps=0 to fail validation")
+		}
+		if _, err := DecodeJSONStrict[PrometheusSeries](strings.NewReader(`{"name":"m1","status":"ok"}`)); err == nil {
+			t.Fatal("expected PrometheusSeries with status=ok and no value to fail")
+		}
+		if _, err := DecodeJSONStrict[PrometheusSeries](strings.NewReader(`{"name":"m1","status":"error","err":"connection refused"}`)); err != nil {
+			t.Fatalf("expected PrometheusSeries with status=error and err message to pass, got: %v", err)
 		}
 	})
 }

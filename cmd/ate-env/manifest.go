@@ -25,8 +25,8 @@ import (
 	"github.com/agent-substrate/env/internal/hostcheck"
 	"github.com/agent-substrate/env/internal/routertls"
 	"github.com/spf13/cobra"
-	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
-	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	appsv1 "k8s.io/api/apps/v1"
@@ -610,10 +610,10 @@ func buildNamespace(cfg manifestConfig) *corev1.Namespace {
 	}
 }
 
-func buildWorkerPool(cfg manifestConfig) *atev1alpha1.WorkerPool {
-	return &atev1alpha1.WorkerPool{
+func buildWorkerPool(cfg manifestConfig) *atev1.WorkerPool {
+	return &atev1.WorkerPool{
 		TypeMeta: metav1.TypeMeta{
-			APIVersion: atev1alpha1.GroupVersion.String(),
+			APIVersion: atev1.GroupVersion.String(),
 			Kind:       "WorkerPool",
 		},
 		ObjectMeta: metav1.ObjectMeta{
@@ -622,7 +622,7 @@ func buildWorkerPool(cfg manifestConfig) *atev1alpha1.WorkerPool {
 			// Copied to the pool's workers; templates select the pool by it.
 			Labels: map[string]string{workerPoolLabel: cfg.workerPool},
 		},
-		Spec: atev1alpha1.WorkerPoolSpec{
+		Spec: atev1.WorkerPoolSpec{
 			Replicas:    cfg.replicas,
 			WorkerImage: cfg.workerImage,
 			// The CRD requires exactly one sandbox class per pool. Since
@@ -630,9 +630,9 @@ func buildWorkerPool(cfg manifestConfig) *atev1alpha1.WorkerPool {
 			// ActorTemplate names none, and an actor restores onto a worker of
 			// its snapshot's class. The configRef is the SandboxConfig the
 			// workers run.
-			SandboxClasses: []atev1alpha1.WorkerPoolSandboxClass{{
-				Name:      atev1alpha1.SandboxClassGvisor,
-				ConfigRef: &atev1alpha1.SandboxConfigReference{Name: sandboxConfigName},
+			SandboxClasses: []atev1.WorkerPoolSandboxClass{{
+				Name:      atev1.SandboxClassGvisor,
+				ConfigRef: &atev1.SandboxConfigReference{Name: sandboxConfigName},
 			}},
 		},
 	}

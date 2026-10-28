@@ -17,13 +17,19 @@
 # template --layer nemo=<image>=/opt/nemo), the guest starts either server as
 # a sidecar; the task image contributes only the kernel and its filesystem.
 # Recipe: python-build-standalone plus hash-pinned wheels installed with uv,
-# wheels only. linux/amd64 and linux/arm64.
+# wheels only; NeMo Skills' server fetched from its repository at a pinned
+# commit and checked by sha256, like the interpreter. linux/amd64 and
+# linux/arm64.
 FROM curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6 AS fetch
 ARG TARGETARCH
 ARG PBS_RELEASE=20261013
 ARG PYTHON_VERSION=3.12.15
 ARG PBS_SHA256_AMD64=5d546fc004fc2435fa142eb8f42ed8de5eb4725963dc22f7e6671014a80eb560
 ARG PBS_SHA256_ARM64=34a43010cc05982d8b5debbad7d09f7b1200117ebf018f7acfd656895e408205
+# NVIDIA/NeMo-Skills nemo_skills/code_execution/local_sandbox/local_sandbox_server.py
+# (third_party/nemo-skills/README.md). Bump both together.
+ARG NEMO_SKILLS_COMMIT=bcf059af55c20a89f797724598f9908d126153e6
+ARG NEMO_SKILLS_SERVER_SHA256=c79197dc02e33b63b58b30783e3cfe0076e8edf6ceb409835b5d0762756b621d
 SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
 RUN case "${TARGETARCH}" in \
       amd64) arch=x86_64; sum="${PBS_SHA256_AMD64}" ;; \
@@ -34,7 +40,10 @@ RUN case "${TARGETARCH}" in \
     curl -fsSLo "/tmp/${f}" "https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_RELEASE}/${f}"; \
     echo "${sum}  /tmp/${f}" | sha256sum -c -; \
     mkdir -p /tmp/nemo; \
-    tar -xzf "/tmp/${f}" -C /tmp/nemo
+    tar -xzf "/tmp/${f}" -C /tmp/nemo; \
+    curl -fsSLo /tmp/local_sandbox_server.py \
+      "https://raw.githubusercontent.com/NVIDIA/NeMo-Skills/${NEMO_SKILLS_COMMIT}/nemo_skills/code_execution/local_sandbox/local_sandbox_server.py"; \
+    echo "${NEMO_SKILLS_SERVER_SHA256}  /tmp/local_sandbox_server.py" | sha256sum -c -
 
 FROM ghcr.io/astral-sh/uv:0.11.18@sha256:78bc42400d77b0678ba95765305c826652ed5431f399257271dda681d0318f03 AS uv
 
@@ -54,10 +63,11 @@ RUN case "${TARGETARCH}" in \
       --python /opt/nemo/python/bin/python3 --python-platform "${platform}" --python-version 3.12 \
       --target /opt/nemo/python/lib/python3.12/site-packages \
       --only-binary :all: -r /tmp/lock/requirements.txt
-# The entry points and the vendored servers live in site-packages, so
+# The entry points and the two servers live in site-packages, so
 # python3 -m nemo_runtime.<server> works wherever the layer is mounted.
 COPY nemo_runtime/ /opt/nemo/python/lib/python3.12/site-packages/nemo_runtime/
 COPY third_party/ /opt/nemo/python/lib/python3.12/site-packages/nemo_runtime/third_party/
+COPY --from=fetch /tmp/local_sandbox_server.py /opt/nemo/python/lib/python3.12/site-packages/nemo_runtime/third_party/nemo-skills/
 RUN /opt/nemo/python/bin/python3 -c "import flask, psutil, IPython, traitlets; import nemo_runtime.sandbox_server, nemo_runtime.exec_server; nemo_runtime.sandbox_server.load_app()" \
  && find /opt/nemo/python -name __pycache__ -prune -exec rm -rf {} + \
  && /opt/nemo/python/bin/python3 -m compileall -q -j 0 --invalidation-mode unchecked-hash /opt/nemo/python/lib

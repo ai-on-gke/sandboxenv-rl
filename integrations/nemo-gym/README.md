@@ -234,7 +234,7 @@ image contributes nothing but its kernel and filesystem:
 
 | server | command (as a guest sidecar) | protocol | from |
 |---|---|---|---|
-| NeMo Skills local sandbox server | `/opt/nemo/python/bin/python3 -m nemo_runtime.sandbox_server --host 0.0.0.0 --port 6000` | `POST /execute` (`generated_code`, `language` = `ipython`/`python`/`shell`/`lean4`, `timeout`, `std_input`), IPython sessions by `X-Session-ID`, `GET /health` | `nemo_skills/code_execution/local_sandbox/local_sandbox_server.py`, vendored verbatim ([provenance](layer/third_party/nemo-skills/README.md)) |
+| NeMo Skills local sandbox server | `/opt/nemo/python/bin/python3 -m nemo_runtime.sandbox_server --host 0.0.0.0 --port 6000` | `POST /execute` (`generated_code`, `language` = `ipython`/`python`/`shell`/`lean4`, `timeout`, `std_input`), IPython sessions by `X-Session-ID`, `GET /health` | `nemo_skills/code_execution/local_sandbox/local_sandbox_server.py`, fetched when the layer is built, pinned by commit and sha256 ([provenance](layer/third_party/nemo-skills/README.md)) |
 | NeMo Gym exec server | `/opt/nemo/python/bin/python3 -m nemo_runtime.exec_server --host 0.0.0.0 --port 19542` | `POST /exec` (`cmd`, `timeout`), `POST /upload`, `GET /download?path=`, `GET /health` | the `EXEC_SERVER_SCRIPT` of `nemo_gym/sandbox/providers/ecs_fargate/engine.py`, vendored verbatim ([provenance](layer/third_party/nemo-gym/README.md)) |
 
 Both execute whatever they are sent, with the task image's user and filesystem, and neither
@@ -341,7 +341,7 @@ Limits:
   endpoint fail with 502.
 - **The API token is the only check in front of the daemon.** Both NeMo servers run what they are
   sent and check no credential of their own: NeMo Skills' `LocalSandbox` client and Gym's exec
-  client cannot send one, and the vendored servers stay unchanged. The sandbox is the trust
+  client cannot send one, and the upstream servers stay unchanged. The sandbox is the trust
   boundary, as with NeMo Skills' own sandbox container and the ECS provider's exec server. With
   `-auth-token-file` on ate-env-api (`ate-env manifest --auth-token-secret`), each `endpoint()`
   request must carry the token in `X-Env-Authorization`; the provider sends it when it has a token

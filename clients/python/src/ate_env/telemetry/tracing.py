@@ -39,6 +39,7 @@ import asyncio
 import atexit
 import collections
 import contextlib
+import contextvars
 import logging
 import os
 import re
@@ -50,6 +51,13 @@ from typing import TYPE_CHECKING, Any
 import grpc
 import grpc.aio
 
+from .trace_recorder import (
+    TraceTapTracer,
+    get_default_trace_processor,
+    is_trace_mode,
+    should_auto_enable_tracing,
+)
+
 if TYPE_CHECKING:
     from ..config import TracerConfig
 
@@ -59,6 +67,12 @@ logger = logging.getLogger("ate_env.telemetry.tracing")
 # TracerConfig service name is the OTel resource ``service.name``; it does not
 # rename spans, so fleet and client spans keep one vocabulary.
 CLIENT_SPAN_PREFIX = "ate_env_client"
+
+# Task-local context variable for propagating fleet concurrency slot-wait
+# latency into backend driver acquire operations.
+current_slot_wait_s: contextvars.ContextVar[float] = contextvars.ContextVar(
+    "ate_env_slot_wait_s", default=0.0
+)
 
 _MISSING_EXTRA_MSG = (
     "OpenTelemetry not installed; tracing disabled. "
@@ -411,6 +425,9 @@ def mark_error(span: Any, description: str) -> None:
     """
     if span is None:
         return
+    if hasattr(span, "record_error"):
+        with contextlib.suppress(Exception):
+            span.record_error(description)
     otel = _load_otel()
     if otel is None:
         return
@@ -446,12 +463,21 @@ class TracerManager:
 
 def create_tracer_manager(config: TracerConfig) -> tuple[TracerManager | None, Any | None]:
     """Build a TracerManager from config; ``(None, None)`` when disabled or OTel absent."""
-    if config is None or not config.enable_tracing:
+    auto_trace = should_auto_enable_tracing(config)
+    if (config is None or not config.enable_tracing) and not auto_trace:
         return None, None
+    svc_name = config.trace_service_name if config is not None else "ate-env-client"
     if _load_otel() is None:
-        _log_missing_extra()
+        if is_trace_mode() and _OTEL is not False:
+            return None, TraceTapTracer(None, get_default_trace_processor())
+        if config is not None and config.enable_tracing:
+            _log_missing_extra()
+        if is_trace_mode():
+            return None, TraceTapTracer(None, get_default_trace_processor())
         return None, None
-    manager = TracerManager(service_name=config.trace_service_name)
+    manager = TracerManager(service_name=svc_name)
+    if auto_trace:
+        return manager, TraceTapTracer(manager.tracer, get_default_trace_processor())
     return manager, manager.tracer
 
 
@@ -461,9 +487,12 @@ def tracer_from_config(config: TracerConfig | None) -> Any | None:
     The tracer never installs a global provider; see initialize_tracer for
     where its spans go.
     """
-    if config is None or not config.enable_tracing:
+    auto_trace = should_auto_enable_tracing(config)
+    if (config is None or not config.enable_tracing) and not auto_trace:
         return None
-    initialize_tracer(config.trace_service_name)
+    svc_name = config.trace_service_name if config is not None else "ate-env-client"
+    if _load_otel() is not None:
+        initialize_tracer(svc_name)
     return create_tracer_manager(config)[1]
 
 

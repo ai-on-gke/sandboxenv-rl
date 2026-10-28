@@ -19,9 +19,11 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEmbeddedSchemasResolve(t *testing.T) {
@@ -33,6 +35,7 @@ func TestEmbeddedSchemasResolve(t *testing.T) {
 		"report.schema.json",
 		"stats_row.schema.json",
 		"system_description.schema.json",
+		"trace_event.schema.json",
 	}
 	for _, name := range schemas {
 		t.Run(name, func(t *testing.T) {
@@ -136,6 +139,23 @@ func TestFixturesValidateAndRoundTrip(t *testing.T) {
 			t.Fatalf("DecodeJSONStrict: %v", err)
 		}
 		roundTripJSON(t, "system_description.schema.json", v)
+	})
+
+	t.Run("trace_event.jsonl", func(t *testing.T) {
+		raw := mustRead(t, "testdata/trace_event.jsonl")
+		if err := ValidateJSONLAgainstJSONSchema("trace_event.schema.json", bytes.NewReader(raw)); err != nil {
+			t.Fatalf("schema validate jsonl: %v", err)
+		}
+		items, err := DecodeJSONLStrict[TraceEvent](bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("DecodeJSONLStrict: %v", err)
+		}
+		if len(items) != 4 {
+			t.Fatalf("len(items) = %d, want 4", len(items))
+		}
+		for _, item := range items {
+			roundTripJSON(t, "trace_event.schema.json", item)
+		}
 	})
 }
 
@@ -344,6 +364,53 @@ func TestValidationRules(t *testing.T) {
 		}
 		if err := row.Validate(); err == nil {
 			t.Fatal("expected error for NaN measurement")
+		}
+	})
+
+	t.Run("TraceEvent invalid op", func(t *testing.T) {
+		ev := TraceEvent{
+			SchemaVersion: SchemaVersion,
+			TS:            time.Now().UTC(),
+			Env:           "sb-1",
+			Op:            "bogus_op",
+			DurMS:         10,
+			OK:            true,
+		}
+		if err := ev.Validate(); err == nil {
+			t.Fatal("expected error for invalid trace op")
+		}
+	})
+}
+
+func TestPythonSchemaValidatorCLI(t *testing.T) {
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not found on PATH")
+	}
+
+	t.Run("valid trace_event.jsonl", func(t *testing.T) {
+		cmd := exec.Command(py, "validate_schema.py", "--schema", "trace_event", "--jsonl", "testdata/trace_event.jsonl")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("validate_schema.py failed on valid trace_event.jsonl: %v\n%s", err, string(out))
+		}
+	})
+
+	t.Run("valid schedule.json", func(t *testing.T) {
+		cmd := exec.Command(py, "validate_schema.py", "--schema", "schedule", "testdata/schedule.json")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("validate_schema.py failed on valid schedule.json: %v\n%s", err, string(out))
+		}
+	})
+
+	t.Run("rejects unknown field", func(t *testing.T) {
+		tmp := t.TempDir()
+		badPath := filepath.Join(tmp, "bad.jsonl")
+		if err := os.WriteFile(badPath, []byte(`{"schema_version":"v1","ts":"2026-10-22T01:20:01Z","env":"sb-1","op":"create","dur_ms":10,"ok":true,"bogus":1}`+"\n"), 0o644); err != nil {
+			t.Fatalf("write bad.jsonl: %v", err)
+		}
+		cmd := exec.Command(py, "validate_schema.py", "--schema", "trace_event", "--jsonl", badPath)
+		if out, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("expected validate_schema.py to fail on unknown field, got success:\n%s", string(out))
 		}
 	})
 }

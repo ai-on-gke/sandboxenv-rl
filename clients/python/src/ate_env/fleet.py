@@ -33,6 +33,13 @@ from .observability import Observer, RunReport, repo_family
 from .runtime.base import RuntimeGuestHook
 from .sizing import plan_replicas
 from .strategies import STRATEGIES
+from .telemetry.trace_recorder import (
+    is_trace_mode,
+    record_trace_event,
+    register_env_meta,
+    should_auto_enable_tracing,
+    task_context,
+)
 from .types import (
     DataPlaneEndpoint,
     FleetPlan,
@@ -81,8 +88,6 @@ class SandboxFleet:
         self._image_to_template: dict[str, tuple[str, str | None]] = {}
         self._plan: FleetPlan | None = None
         self._lock = threading.Lock()
-        # Sandboxes acquired per task image, warm or cold (acquired_count).
-        self._acquired: collections.Counter[str] = collections.Counter()
         # Serializes plan recomputation, so concurrent add_tasks calls leave
         # the plan of the last call, which saw every task added before it.
         self._plan_lock = threading.Lock()
@@ -91,20 +96,32 @@ class SandboxFleet:
         # turns on tracing for the whole fleet under one service name, so
         # ate_env_fleet.* spans parent ate_env_client.* spans in one trace.
         obs_cfg = self.config.observability
-        tracing_on = self.config.tracing.enable_tracing or obs_cfg.enable_tracing
-        service = (obs_cfg.trace_service_name if obs_cfg.enable_tracing
-                   else self.config.tracing.trace_service_name)
-        if (obs_cfg.enable_tracing and self.config.tracing.enable_tracing
-                and self.config.tracing.trace_service_name != service):
+        tracing_on = (
+            self.config.tracing.enable_tracing
+            or obs_cfg.enable_tracing
+            or should_auto_enable_tracing(self.config.tracing)
+        )
+        service = (
+            obs_cfg.trace_service_name
+            if obs_cfg.enable_tracing
+            else self.config.tracing.trace_service_name
+        )
+        if (
+            obs_cfg.enable_tracing
+            and self.config.tracing.enable_tracing
+            and self.config.tracing.trace_service_name != service
+        ):
             logger.debug(
                 "Both tracing switches are on: service name %r from "
                 "ObservabilityConfig.trace_service_name replaces %r from "
-                "TracerConfig.trace_service_name", service,
-                self.config.tracing.trace_service_name)
+                "TracerConfig.trace_service_name",
+                service,
+                self.config.tracing.trace_service_name,
+            )
         self._tracer_config = TracerConfig(enable_tracing=tracing_on, trace_service_name=service)
-        self._obs = Observer(dataclasses.replace(
-            obs_cfg, enable_tracing=tracing_on, trace_service_name=service
-        ))
+        self._obs = Observer(
+            dataclasses.replace(obs_cfg, enable_tracing=tracing_on, trace_service_name=service)
+        )
         # The Observer was built from the same switch and service name, so its
         # tracer (None when tracing is off) is the fleet's; no second tracer.
         self._tracer = self._obs.tracer
@@ -123,7 +140,9 @@ class SandboxFleet:
                 worker_family=self.config.worker_family or "c2",
                 auth_token=token.get_secret_value() if token else None,
                 image_templates=self.config.image_templates,
-                default_template=self.config.template if self.config.template is not None else "default-template",
+                default_template=(
+                    self.config.template if self.config.template is not None else "default-template"
+                ),
                 labels=self.config.labels,
                 acquire_timeout_s=self.config.acquire_timeout_s,
                 ready_timeout_s=self.config.ready_timeout_s,
@@ -131,7 +150,9 @@ class SandboxFleet:
                 connections=self.config.connections or -(-self.config.max_concurrent // 200),
             )
         else:
-            raise NotImplementedError(f"Backend '{self.config.backend}' is not yet supported or requires extras")
+            raise NotImplementedError(
+                f"Backend '{self.config.backend}' is not yet supported or requires extras"
+            )
 
         name = getattr(self.backend, "backend_name", None)
         self.backend_label = name if name in ALLOWED_BACKENDS else self.config.backend
@@ -142,7 +163,9 @@ class SandboxFleet:
             logger.warning(
                 "Backend driver %r already belongs to another fleet; its claim and "
                 "warm-replica events now go to this fleet's report and series. "
-                "Use one driver per fleet.", type(self.backend).__name__)
+                "Use one driver per fleet.",
+                type(self.backend).__name__,
+            )
         try:
             self.backend.observer = self._obs
         except AttributeError:  # a driver that refuses new attributes
@@ -437,26 +460,6 @@ class SandboxFleet:
             template_id, rootfs_image = entry
             self.backend.unwarm_pool(template_id, rootfs_image=rootfs_image)
 
-    def acquired_count(self, image: str) -> int:
-        """Sandboxes this fleet has acquired for ``image`` so far, warm or cold.
-
-        A monotonic counter: callers take differences between two reads.
-        """
-        with self._lock:
-            return self._acquired[image]
-
-    def _count_acquire(self, image: str) -> None:
-        with self._lock:
-            self._acquired[image] += 1
-
-    def pool_size(self, image: str) -> int | None:
-        """Idle warm replicas for ``image``; None when the driver cannot tell."""
-        entry = self._image_to_template.get(image)
-        if entry is None:
-            return 0
-        template_id, rootfs_image = entry
-        return self.backend.pool_size(template_id, rootfs_image=rootfs_image)
-
     def acquire(
         self,
         task: Task | str | Sequence[Task | str],
@@ -497,10 +500,28 @@ class SandboxFleet:
             template_id, rootfs_image = self._ensure_template_for_image(task_obj.image)
 
         to_s = timeout_s or self.config.acquire_timeout_s
-        raw_inst = self.backend.acquire(
-            template_id, self.run_id, timeout_s=to_s, rootfs_image=rootfs_image
+        with task_context(
+            run_id=self.run_id, instance=task_obj.id, image=task_obj.image
+        ):
+            raw_inst = self.backend.acquire(
+                template_id, self.run_id, timeout_s=to_s, rootfs_image=rootfs_image
+            )
+        register_env_meta(
+            raw_inst.instance_id,
+            instance=task_obj.id,
+            image=task_obj.image,
+            run_id=self.run_id,
         )
-        self._count_acquire(task_obj.image)
+        if self.backend_label == "mock" and is_trace_mode():
+            record_trace_event(
+                "create",
+                env=raw_inst.instance_id,
+                dur_ms=0.0,
+                ok=True,
+                run=self.run_id,
+                instance=task_obj.id,
+                image=task_obj.image,
+            )
 
         try:
             runtime, data_plane = self._build_runtime(raw_inst)
@@ -515,6 +536,7 @@ class SandboxFleet:
                 )
             raise
 
+        claim_source = str(raw_inst.metadata.get("claim_source", "direct"))
         return SandboxHandle(
             sandbox_id=raw_inst.instance_id,
             endpoint=data_plane.address if data_plane else raw_inst.endpoint,
@@ -525,6 +547,7 @@ class SandboxFleet:
             data_plane=data_plane,
             default_timeout_s=self.config.step_timeout_s,
             tracer=self._tracer,
+            claim_source=claim_source,
         )
 
     def _build_runtime(
@@ -552,14 +575,38 @@ class SandboxFleet:
     def release(self, handle: SandboxHandle | Sequence[SandboxHandle]) -> None:
         """Release sandbox instance(s) back to backend and close runtime(s)."""
         for h in handle if isinstance(handle, (list, tuple)) else (handle,):
-            with self._obs.phase("release", backend=self.backend_label, family=repo_family(h.task)):
+            with self._obs.phase(
+                "release", backend=self.backend_label, family=repo_family(h.task)
+            ):
                 h.release()
+                if self.backend_label == "mock" and is_trace_mode():
+                    record_trace_event(
+                        "delete",
+                        env=h.sandbox_id,
+                        dur_ms=0.0,
+                        ok=True,
+                        run=self.run_id,
+                        instance=h.task.id if h.task else None,
+                        image=h.task.image if h.task else None,
+                    )
 
     def recycle(self, handle: SandboxHandle | Sequence[SandboxHandle]) -> None:
         """Return sandbox instance(s) to the warm pool (see SandboxHandle.recycle)."""
         for h in handle if isinstance(handle, (list, tuple)) else (handle,):
-            with self._obs.phase("recycle", backend=self.backend_label, family=repo_family(h.task)):
+            with self._obs.phase(
+                "recycle", backend=self.backend_label, family=repo_family(h.task)
+            ):
                 h.recycle()
+                if self.backend_label == "mock" and is_trace_mode():
+                    record_trace_event(
+                        "suspend",
+                        env=h.sandbox_id,
+                        dur_ms=0.0,
+                        ok=True,
+                        run=self.run_id,
+                        instance=h.task.id if h.task else None,
+                        image=h.task.image if h.task else None,
+                    )
 
     def teardown(self) -> None:
         """Teardown all resources provisioned by this fleet's run_id."""
@@ -569,8 +616,11 @@ class SandboxFleet:
         finally:
             self._obs.warm_reset()
 
-    def run(self, process_fn: Callable[[Task, SandboxHandle], Any],
-            concurrency: int | None = None) -> list[Any]:
+    def run(
+        self,
+        process_fn: Callable[[Task, SandboxHandle], Any],
+        concurrency: int | None = None,
+    ) -> list[Any]:
         """Execute all tasks using the configured strategy.
 
         The run's RunReport is available as ``fleet.report`` afterwards;
@@ -604,8 +654,9 @@ class SandboxFleet:
         with self._lock:
             if image in self._image_to_template:
                 return self._image_to_template[image]
-            with self._obs.phase("ensure_template", backend=self.backend_label,
-                                 family=repo_family(image)):
+            with self._obs.phase(
+                "ensure_template", backend=self.backend_label, family=repo_family(image)
+            ):
                 res: tuple[str, str | None]
                 if image in self.config.image_templates:
                     res = (self.config.image_templates[image], None)

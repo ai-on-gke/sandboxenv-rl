@@ -1,0 +1,4 @@
+{"schema_version":"v1","ts":"2026-10-22T01:20:01.050Z","run":"trace-01","job":"job-0","step":0,"env":"sb-001","instance":"django__django-11099","image":"sweb.eval.x86_64.django__django-11099:latest","op":"create","dur_ms":642.1,"ok":true}
+{"schema_version":"v1","ts":"2026-10-22T01:20:01.180Z","run":"trace-01","job":"job-0","step":0,"env":"sb-001","instance":"django__django-11099","op":"write_file","path":"/workspace/patch.diff","bytes":1420,"dur_ms":18.4,"ok":true}
+{"schema_version":"v1","ts":"2026-10-22T01:20:02.940Z","run":"trace-01","job":"job-0","step":0,"env":"sb-001","instance":"django__django-11099","op":"exec","command":["pytest","-q"],"dur_ms":1750.2,"exit":0,"ok":true}
+{"schema_version":"v1","ts":"2026-10-22T01:20:03.110Z","run":"trace-01","job":"job-0","step":0,"env":"sb-001","instance":"django__django-11099","op":"suspend","dur_ms":165.0,"ok":true}

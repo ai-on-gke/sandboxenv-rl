@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1060,5 +1061,49 @@ func TestSecondRequestSurvivesTheFirstOnesCancel(t *testing.T) {
 	r := <-second
 	if r.err != nil || r.code != http.StatusOK || r.body != "awake" {
 		t.Errorf("second request: %d %q %v, want 200 \"awake\" after the wake", r.code, r.body, r.err)
+	}
+}
+
+// OnConnected fires once per accepted CONNECT, after the wake, with the
+// environment's atespace and id; refused CONNECTs do not fire it.
+func TestOnConnectedFiresAfterTheWake(t *testing.T) {
+	rr := &recordingRouter{Router: fakerouter.New()}
+	srv := httptest.NewServer(rr)
+	t.Cleanup(srv.Close)
+	var mu sync.Mutex
+	var got []string
+	p := mustNew(t, portproxy.Options{
+		ConnectAddr:      strings.TrimPrefix(srv.URL, "http://"),
+		DefaultAtespace:  "ate-env",
+		HandshakeTimeout: 5 * time.Second,
+		WakeBudget:       2 * time.Second,
+		OnConnected: func(atespace, id string) {
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, atespace+"/"+id)
+		},
+	})
+	proxy := httptest.NewServer(p)
+	t.Cleanup(proxy.Close)
+	s := &setup{router: rr, proxy: proxy}
+
+	s.router.RegisterPort("waking", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "awake") }))
+	refusals := 0
+	s.router.Running = func(id string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if refusals < 2 {
+			refusals++
+			return false
+		}
+		return true
+	}
+	if resp, _ := s.do(t, http.MethodGet, "/", "", target("waking", 8000)); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200 after the wake", resp.StatusCode)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"ate-env/waking"}; !slices.Equal(got, want) {
+		t.Errorf("OnConnected calls = %v, want %v (once, after two refused CONNECTs)", got, want)
 	}
 }

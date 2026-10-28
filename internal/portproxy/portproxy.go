@@ -141,6 +141,11 @@ type Options struct {
 	// daemon: the proxy drops EnvAuthorizationHeader, and drops Authorization
 	// when it carried the credential.
 	Authenticate func(credential string) error
+	// OnConnected, when set, is called with the environment's atespace and
+	// id each time the router accepts a CONNECT to one of its ports, after
+	// any wait for a wake. ate-env-api uses it to end create_to_ready when a
+	// port is an environment's first contact.
+	OnConnected func(atespace, id string)
 }
 
 // Proxy is an http.Handler that forwards each request to the environment port
@@ -509,6 +514,9 @@ func (p *Proxy) dial(ctx context.Context, _, addr string) (net.Conn, error) {
 		conn, err := p.connect(ctx, id, atespace, portStr)
 		if err != nil && ctx.Err() != nil {
 			return nil, p.stopped(ctx, atespace, id, attempt, err)
+		}
+		if err == nil && p.opts.OnConnected != nil {
+			p.opts.OnConnected(atespace, id)
 		}
 		var re *routerError
 		if !errors.As(err, &re) || re.status != http.StatusServiceUnavailable {

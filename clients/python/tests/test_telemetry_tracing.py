@@ -807,11 +807,22 @@ async def test_client_rpc_spans_are_client_kind_with_rpc_attributes(spans):
         (span,) = by_name[f"ate_env_client.{op}"]
         assert span.kind == SpanKind.CLIENT, op
         attrs = dict(span.attributes)
-        assert attrs["rpc.system"] == "grpc", op
-        assert attrs["rpc.service"] == "ateenv.v1alpha.EnvironmentService", op
-        assert attrs["rpc.method"] == method, op
+        assert attrs["rpc.system.name"] == "grpc", op
+        assert attrs["rpc.method"] == f"ateenv.v1alpha.EnvironmentService/{method}", op
+        # The pre-otelgrpc-0.72 keys are gone.
+        assert "rpc.system" not in attrs and "rpc.service" not in attrs, op
         assert attrs["server.address"] == "127.0.0.1", op
         assert attrs["server.port"] == port, op
+
+
+def test_rpc_attrs_use_otelgrpc_keys():
+    attrs = tracing.rpc_attrs("ateenv.v1alpha.EnvironmentService", "GetEnvironment", "127.0.0.1:7777")
+    assert attrs == {
+        "rpc.system.name": "grpc",
+        "rpc.method": "ateenv.v1alpha.EnvironmentService/GetEnvironment",
+        "server.address": "127.0.0.1",
+        "server.port": 7777,
+    }
 
 
 def test_rpc_attrs_parse_targets():
@@ -869,8 +880,7 @@ _ALLOWED_ATTRIBUTE_KEYS = {
     "ate_env.file.size",
     "ate_env.replicas",
     "ate_env.rootfs_image",
-    "rpc.system",
-    "rpc.service",
+    "rpc.system.name",
     "rpc.method",
     "server.address",
     "server.port",

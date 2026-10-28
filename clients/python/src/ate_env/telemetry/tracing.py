@@ -288,10 +288,15 @@ def start_span(
 def rpc_attrs(service: str, method: str, target: str | None) -> dict[str, Any]:
     """OTel semantic-convention attributes of one gRPC call.
 
-    service is the fully qualified gRPC service (``ateenv.v1alpha.X``) and
-    target the ``host:port`` of the channel (None for a caller-owned channel).
+    The keys are the ones that otelgrpc (0.72 and later) puts on its gRPC
+    spans, and so on the ate-env-api server spans and the Go client's spans:
+    ``rpc.system.name`` and ``rpc.method`` with the full method name
+    (``ateenv.v1alpha.EnvironmentService/CreateEnvironment``); there is no
+    ``rpc.service``. service is the fully qualified gRPC service
+    (``ateenv.v1alpha.X``), method the method name, and target the
+    ``host:port`` of the channel (None for a caller-owned channel).
     """
-    attrs: dict[str, Any] = {"rpc.system": "grpc", "rpc.service": service, "rpc.method": method}
+    attrs: dict[str, Any] = {"rpc.system.name": "grpc", "rpc.method": f"{service}/{method}"}
     if target:
         host, sep, port = target.rpartition(":")
         if sep and port.isdigit() and host:

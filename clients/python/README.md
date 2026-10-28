@@ -551,8 +551,10 @@ traces and lifecycle records without a mapping. Client-only fields use the
 | `ate_env.replicas` | warm pool size | `warm_pool` |
 | `ate_env.rootfs_image` | image reference without its tag | `create_environment` |
 
-`Client` spans also carry `rpc.system`, `rpc.service`, `rpc.method`,
-`server.address` and `server.port`, and have kind `CLIENT`.
+`Client` spans also carry `rpc.system.name` (`grpc`), `rpc.method` (the full
+gRPC method, for example `ateenv.v1alpha.EnvironmentService/CreateEnvironment`),
+`server.address` and `server.port`, and have kind `CLIENT`. These are the keys
+that otelgrpc puts on the `ate-env-api` server spans and the Go client's spans.
 
 **Time to first command (TTFC).** `acquire` ends when the create call
 returns. The wake and readiness wait happen inside the first command, so the

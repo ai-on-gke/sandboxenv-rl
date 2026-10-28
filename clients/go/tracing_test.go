@@ -30,7 +30,7 @@ import (
 	"github.com/agent-substrate/env/internal/internaltest/fakecontrol"
 	"github.com/agent-substrate/env/internal/internaltest/fakerouter"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
-	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -402,6 +402,9 @@ func TestTracingSpanKinds(t *testing.T) {
 // empty values are not recorded; an image tag is dropped; ServerInfo is
 // traced as get_server_info.
 func TestTracingCallerConnSpansMatchPythonClient(t *testing.T) {
+	// The default rpc.* convention, whatever OTEL_SEMCONV_STABILITY_OPT_IN
+	// the test process has.
+	env.SetRPCSemconvModeForTest(t, "new")
 	f := newTracingFixture(t)
 	f.serveGuest(t, "parity")
 	conn, err := grpc.NewClient(f.addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -442,8 +445,14 @@ func TestTracingCallerConnSpansMatchPythonClient(t *testing.T) {
 		if s.SpanKind() != trace.SpanKindClient {
 			t.Errorf("%s kind = %s, want client", op, s.SpanKind())
 		}
-		if a["rpc.system"].AsString() != "grpc" || a["rpc.service"].AsString() != "ateenv.v1alpha.EnvironmentService" || a["rpc.method"].AsString() != method {
+		if a["rpc.system.name"].AsString() != "grpc" || a["rpc.method"].AsString() != "ateenv.v1alpha.EnvironmentService/"+method {
 			t.Errorf("%s rpc.* = %v", op, a)
+		}
+		if _, ok := a["rpc.system"]; ok {
+			t.Errorf("%s has the old rpc.system in the default mode", op)
+		}
+		if _, ok := a["rpc.service"]; ok {
+			t.Errorf("%s has the old rpc.service in the default mode", op)
 		}
 		if a["server.address"].AsString() != host || fmt.Sprint(a["server.port"].AsInt64()) != port {
 			t.Errorf("%s server.* = %v, want %s", op, a, f.addr)

@@ -483,6 +483,15 @@ func copyPTY(ptmx *os.File, dst io.Writer, done chan<- struct{}) {
 func (t *Tracker) reap(state *ProcessState, cmd *exec.Cmd, stdoutFile, stderrFile *os.File) {
 	_ = cmd.Wait() // Wait also closes the stdin pipe, if any.
 	finishedAt := time.Now()
+	// Stop the timeout as soon as the process is reaped. A timer that fires
+	// during the PTY drain and the spool sync below would SIGKILL the
+	// process group after the process ended, and set timedOut, which turns
+	// a process that another signal killed into a "timeout" exit class.
+	// state.timer is set before this goroutine starts, so reading it here
+	// needs no lock.
+	if state.timer != nil {
+		state.timer.Stop()
+	}
 
 	if state.ptyDone != nil {
 		select {
@@ -509,9 +518,6 @@ func (t *Tracker) reap(state *ProcessState, cmd *exec.Cmd, stdoutFile, stderrFil
 	_ = stderrFile.Close()
 
 	state.mu.Lock()
-	if state.timer != nil {
-		state.timer.Stop()
-	}
 	state.FinishedAt = finishedAt
 	state.State = ateenvv1alpha.ProcessState_PROCESS_STATE_EXITED
 	state.ExitCode, state.Signal = exitStatus(cmd.ProcessState)

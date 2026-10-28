@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -141,8 +142,8 @@ func (t clientTracer) start(ctx context.Context, op string, attrs ...attribute.K
 // this one, so this span is INTERNAL: two nested CLIENT spans would make
 // trace backends draw the client-to-server edge twice. On a caller-supplied
 // GRPCConn (t.inject) there is no otelgrpc span, so this span is the RPC's
-// CLIENT span and carries rpc.system, rpc.service, rpc.method,
-// server.address and server.port, as the Python client's spans do.
+// CLIENT span and carries the rpc.* keys of rpcAttrs, server.address and
+// server.port, as the Python client's spans do.
 func (t clientTracer) startRPC(ctx context.Context, op, method string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
 	if !t.inject {
 		return t.open(ctx, op, trace.SpanKindInternal, attrs)
@@ -185,16 +186,63 @@ func nonEmpty(attrs []attribute.KeyValue) []attribute.KeyValue {
 	return out
 }
 
+// The rpc.* convention rpcAttrs follows, as otelgrpc selects it.
+const (
+	semconvNew = "new" // rpc.system.name and the full rpc.method (default)
+	semconvOld = "old" // rpc.system, rpc.service and the short rpc.method
+	semconvDup = "dup" // both sets; rpc.method is the full name
+)
+
+// parseRPCSemconvMode reads OTEL_SEMCONV_STABILITY_OPT_IN as otelgrpc
+// v0.72.0's parseSemconvMode does, and as the Python client's
+// _rpc_semconv_mode does: a comma-separated list, each item trimmed; the
+// first item that is rpc/dup or rpc/old decides, and anything else means new.
+func parseRPCSemconvMode(value string) string {
+	for item := range strings.SplitSeq(value, ",") {
+		switch strings.TrimSpace(item) {
+		case "rpc/dup":
+			return semconvDup
+		case "rpc/old":
+			return semconvOld
+		}
+	}
+	return semconvNew
+}
+
+// rpcSemconvMode is read once, as otelgrpc reads it once per handler.
+var rpcSemconvMode = parseRPCSemconvMode(os.Getenv("OTEL_SEMCONV_STABILITY_OPT_IN"))
+
 // rpcAttrs are the OTel semantic-convention attributes of one gRPC call,
-// with the same keys and values as the Python client's rpc_attrs. target
-// is the connection's target: "host:port", optionally behind gRPC's dns:///
-// or passthrough:/// scheme; another form (such as unix:///path) is
-// recorded whole as server.address.
+// with the same keys and values as the Python client's rpc_attrs and as
+// otelgrpc v0.72.0's client spans: by default rpc.system.name and
+// rpc.method with the full "<service>/<method>"; with
+// OTEL_SEMCONV_STABILITY_OPT_IN=rpc/old the older rpc.system, rpc.service
+// and the short rpc.method; with rpc/dup both sets, with the full
+// rpc.method, the value otelgrpc keeps. target is the connection's target:
+// "host:port", optionally behind gRPC's dns:/// or passthrough:/// scheme;
+// another form (such as unix:///path) is recorded whole as server.address.
 func rpcAttrs(service, method, target string) []attribute.KeyValue {
-	attrs := []attribute.KeyValue{
-		attribute.String("rpc.system", "grpc"),
-		attribute.String("rpc.service", service),
-		attribute.String("rpc.method", method),
+	fullMethod := service + "/" + method
+	var attrs []attribute.KeyValue
+	switch rpcSemconvMode {
+	case semconvOld:
+		attrs = []attribute.KeyValue{
+			attribute.String("rpc.system", "grpc"),
+			attribute.String("rpc.service", service),
+			attribute.String("rpc.method", method),
+		}
+	case semconvDup:
+		attrs = []attribute.KeyValue{
+			attribute.String("rpc.system", "grpc"),
+			attribute.String("rpc.service", service),
+			attribute.String("rpc.system.name", "grpc"),
+			attribute.String("rpc.method", fullMethod),
+		}
+	default:
+		attrs = []attribute.KeyValue{
+			attribute.String("rpc.system.name", "grpc"),
+			attribute.String("rpc.method", fullMethod),
+		}
 	}
 	for _, scheme := range []string{"dns:///", "passthrough:///"} {
 		target = strings.TrimPrefix(target, scheme)

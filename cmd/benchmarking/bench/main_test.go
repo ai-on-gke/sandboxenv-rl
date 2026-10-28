@@ -276,6 +276,88 @@ jobs:
 	}
 }
 
+func TestBenchRunMultiJobScenario(t *testing.T) {
+	dir := t.TempDir()
+	scenPath := filepath.Join(dir, "multi-job.yaml")
+	scenYAML := `schema_version: v1
+name: multi-job-smoke
+footing: warm
+seed: 42
+sut:
+  backend: substrate
+  access: ate-env-api
+  endpoint: localhost:7777
+jobs:
+  - name: job-closed
+    kind: simulated
+    mode: closed-loop
+    steps: 2
+    batch_size: 2
+    concurrency: 2
+    park_policy: snapshot
+    instances: 2
+  - name: job-open
+    kind: simulated
+    mode: open-loop
+    start_offset_ms: 5
+    concurrency: 2
+    arrival_rate: 40.0
+    duration_sec: 0.05
+    instances: 2
+`
+	if err := os.WriteFile(scenPath, []byte(scenYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runDir := filepath.Join(dir, "run-out")
+	var out, errBuf bytes.Buffer
+	if code := execute([]string{"run", "-scenario", scenPath, "-dest", runDir}, &out, &errBuf); code != 0 {
+		t.Fatalf("bench run failed (code=%d): %s", code, errBuf.String())
+	}
+	for _, rel := range []string{"schedule.json", "events.jsonl", "report.json", "measurements.json", "system_description.json"} {
+		if _, err := os.Stat(filepath.Join(runDir, rel)); err != nil {
+			t.Fatalf("missing artifact %s: %v", rel, err)
+		}
+	}
+	out.Reset()
+	errBuf.Reset()
+	if code := execute([]string{"validate", "-report", filepath.Join(runDir, "report.json"), "-schedule", filepath.Join(runDir, "schedule.json"), "-footing", "warm"}, &out, &errBuf); code != 0 {
+		t.Fatalf("bench validate failed (code=%d): %s", code, errBuf.String())
+	}
+
+	// Test scoped reporting (`-scopes user-sandbox`) and `-plugin-metric` on `bench report`
+	scopedDir := filepath.Join(dir, "scoped-report")
+	if err := os.MkdirAll(scopedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scopedDir, "verl-head.log"), []byte("(TaskRunner pid=1) step:1 - timing_s/step:12.0 - timing_s/gen:8.0 - critic/score/mean:0.5\ncustom_debug_latency_ms=42.5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scopedDir, "trace.jsonl"), []byte(`{"ts":"2026-04-20T18:00:00Z","run":"rlb-s","job":"verl-job","op":"create","env":"sb-1","instance":"inst-1","dur_ms":110,"ok":true}`+"\n"+`{"ts":"2026-04-20T18:00:01Z","run":"rlb-s","job":"verl-job","op":"exec","env":"sb-1","instance":"inst-1","dur_ms":210,"ok":true,"exit":0}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errBuf.Reset()
+	if code := execute([]string{
+		"report",
+		"-dest", scopedDir,
+		"-scopes", "user-sandbox",
+		"-plugin-metric", "custom_debug_latency_ms=verl-head.log:custom_debug_latency_ms=(?P<value>[0-9.]+)",
+	}, &out, &errBuf); code != 0 {
+		t.Fatalf("bench report -scopes user-sandbox failed (code=%d): %s", code, errBuf.String())
+	}
+	mdBytes, err := os.ReadFile(filepath.Join(scopedDir, "report.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mdStr := string(mdBytes)
+	if !strings.Contains(mdStr, "## 1. Published Baseline") || !strings.Contains(mdStr, "custom_debug_latency_ms") {
+		t.Fatalf("expected Published Baseline and custom_debug_latency_ms in report.md, got:\n%s", mdStr)
+	}
+	if strings.Contains(mdStr, "## 4. Convergence Info") {
+		t.Fatalf("expected RL Convergence Info section to be omitted when -scopes=user-sandbox, got:\n%s", mdStr)
+	}
+}
+
 type fakeLifecycleKubeRunner struct {
 	replicas int
 }

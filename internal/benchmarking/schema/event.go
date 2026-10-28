@@ -26,11 +26,13 @@ import (
 type AcquisitionSource string
 
 const (
-	SourceWarmPool      AcquisitionSource = "warm_pool"
-	SourceColdCreate    AcquisitionSource = "cold_create"
-	SourceGoldenRestore AcquisitionSource = "golden_restore"
-	SourceFork          AcquisitionSource = "fork"
-	SourceResume        AcquisitionSource = "resume"
+	SourceWarmPool       AcquisitionSource = "warm_pool"
+	SourceColdCreate     AcquisitionSource = "cold_create"
+	SourceColdStart      AcquisitionSource = "cold_start"
+	SourceGoldenRestore  AcquisitionSource = "golden_restore"
+	SourceFork           AcquisitionSource = "fork"
+	SourceResume         AcquisitionSource = "resume"
+	SourceSnapshotResume AcquisitionSource = "snapshot_resume"
 )
 
 // Event is the unified JSONL event record emitted by swebench-loader,
@@ -116,7 +118,7 @@ func (e *Event) Validate() error {
 		return fmt.Errorf("event: bytes must be >= 0, got %d", e.Bytes)
 	}
 	switch e.Source {
-	case "", SourceWarmPool, SourceColdCreate, SourceGoldenRestore, SourceFork, SourceResume:
+	case "", SourceWarmPool, SourceColdCreate, SourceColdStart, SourceGoldenRestore, SourceFork, SourceResume, SourceSnapshotResume:
 	default:
 		return fmt.Errorf("event: invalid source %q", e.Source)
 	}

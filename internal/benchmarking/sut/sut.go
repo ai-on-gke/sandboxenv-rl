@@ -342,6 +342,8 @@ func BuildSystemDescription(spec schema.SUTSpec, cluster, k8sVersion, gitSHA, da
 		KubernetesVersion: k8sVersion,
 		NodePools:         poolsCopy,
 		RuntimeClass:      spec.RuntimeClass,
+		MaxActivePods:     spec.MaxActivePods,
+		PoolSizePerImage:  spec.PoolSizePerImg,
 		APIImage:          spec.ExtraArgs["api_image"],
 		GuestImage:        spec.ExtraArgs["guest_image"],
 		GitSHA:            gitSHA,

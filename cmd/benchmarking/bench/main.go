@@ -24,12 +24,17 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/agent-substrate/env/internal/benchmarking/job"
 	"github.com/agent-substrate/env/internal/benchmarking/measure"
 	"github.com/agent-substrate/env/internal/benchmarking/schema"
 	"github.com/agent-substrate/env/internal/benchmarking/sut"
@@ -63,6 +68,12 @@ func execute(args []string, stdout, stderr io.Writer) int {
 		err = reapCmd(args[1:], stdout, stderr)
 	case "report":
 		err = reportCmd(args[1:], stdout, stderr)
+	case "validate":
+		err = validateCmd(args[1:], stdout, stderr)
+	case "compare":
+		err = compareCmd(args[1:], stdout, stderr)
+	case "run":
+		err = runScenarioCmd(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		printUsage(stderr)
 		return 0
@@ -78,7 +89,7 @@ func execute(args []string, stdout, stderr io.Writer) int {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "usage: bench <resolve|render|prewarm|spinup|spindown|measure|reap|report> [flags]")
+	fmt.Fprintln(w, "usage: bench <resolve|render|prewarm|spinup|spindown|measure|reap|report|validate|compare|run> [flags]")
 }
 
 func resolveCmd(args []string, stdout, stderr io.Writer) error {
@@ -739,8 +750,7 @@ func reapCmd(args []string, stdout, stderr io.Writer) error {
 
 type benchArtifactReport struct {
 	*swebench.Report
-	Measurements      *schema.Measurements      `json:"measurements,omitempty"`
-	SystemDescription *schema.SystemDescription `json:"system_description,omitempty"`
+	Measurements *schema.Measurements `json:"measurements,omitempty"`
 }
 
 func reportCmd(args []string, stdout, stderr io.Writer) error {
@@ -757,6 +767,10 @@ func reportCmd(args []string, stdout, stderr io.Writer) error {
 	jsonOut := fs.String("json", "", "Write the summary as JSON to this path.")
 	unresolvedOut := fs.String("unresolved", "", "Write unresolved instances to this path in -exclude-file format.")
 	unresolvedNote := fs.String("unresolved-note", "Instances graded unresolved", "First comment line of the -unresolved file.")
+	scopesFlag := fs.String("scopes", "", "Comma-separated telemetry scopes to include (rl,user-sandbox,substrate,k8s or all; default all).")
+	scenarioPath := fs.String("scenario", "", "Optional Scenario YAML path to load telemetry.scopes and telemetry.plugins.")
+	var pluginMetrics stringSliceFlag
+	fs.Var(&pluginMetrics, "plugin-metric", "Ad-hoc log/JSONL regex metric extractor in name=glob:regex format (repeatable).")
 	if err := fs.Parse(flagArgs); err != nil {
 		return err
 	}
@@ -764,8 +778,34 @@ func reportCmd(args []string, stdout, stderr io.Writer) error {
 	if path == "" && fs.NArg() > 0 {
 		path = fs.Arg(0)
 	}
+	telSpec, err := loadTelemetrySpecFromScenario(*scenarioPath)
+	if err != nil {
+		return err
+	}
+	var scopeInputs []string
+	if *scopesFlag != "" {
+		scopeInputs = append(scopeInputs, *scopesFlag)
+	} else if telSpec != nil {
+		for _, s := range telSpec.Scopes {
+			scopeInputs = append(scopeInputs, string(s))
+		}
+	}
+	activeScopes, err := schema.ParseTelemetryScopes(scopeInputs...)
+	if err != nil {
+		return err
+	}
+	cliPlugins, err := parseCLIPlugins(nil, nil, pluginMetrics, nil)
+	if err != nil {
+		return err
+	}
+	var plugins []schema.TelemetryPluginSpec
+	if telSpec != nil {
+		plugins = append(plugins, telSpec.Plugins...)
+	}
+	plugins = append(plugins, cliPlugins...)
+
 	if *destDir != "" {
-		return reportFromArtifactDir(*destDir, *jsonOut, stdout)
+		return reportFromArtifactDir(*destDir, *jsonOut, activeScopes, plugins, stdout)
 	}
 	if path == "" {
 		return fmt.Errorf("report needs a JSONL file or -dest DIR")
@@ -774,11 +814,22 @@ func reportCmd(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if *scopesFlag != "" || (telSpec != nil && len(telSpec.Scopes) > 0) {
+		rep.Scopes = activeScopes
+	}
 	rep.WriteText(stdout)
 	return swebench.WriteReportFiles(rep, *jsonOut, "", *unresolvedOut, *unresolvedNote, "", "", "")
 }
 
-func reportFromArtifactDir(destDir, jsonOut string, stdout io.Writer) error {
+func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.TelemetryScope, plugins []schema.TelemetryPluginSpec, stdout io.Writer) error {
+	ingRes, err := job.IngestArtifactDir(job.IngestContext{
+		DestDir: destDir,
+		Scopes:  activeScopes,
+		Plugins: plugins,
+	})
+	if err != nil {
+		return err
+	}
 	matches, err := filepath.Glob(filepath.Join(destDir, "events", "*.jsonl"))
 	if err != nil {
 		return err
@@ -799,23 +850,75 @@ func reportFromArtifactDir(destDir, jsonOut string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	rep.Scopes = activeScopes
+	if ingRes != nil && len(ingRes.CustomMetrics) > 0 {
+		if rep.CustomMetrics == nil {
+			rep.CustomMetrics = make(map[string]schema.MetricSummary, len(ingRes.CustomMetrics))
+		}
+		for k, v := range ingRes.CustomMetrics {
+			rep.CustomMetrics[k] = v
+		}
+	}
 	rep.WriteText(stdout)
 
 	outRep := benchArtifactReport{Report: rep}
-	if rawMeas, err := os.ReadFile(filepath.Join(destDir, "measurements.json")); err == nil {
+	measPath := filepath.Join(destDir, "measurements.json")
+	if rawMeas, err := os.ReadFile(measPath); err == nil {
 		meas, derr := schema.DecodeJSONStrict[schema.Measurements](bytes.NewReader(rawMeas))
 		if derr != nil {
 			return fmt.Errorf("invalid measurements.json: %w", derr)
 		}
+		if rollUpSnapshotsIntoMeasurements(destDir, &meas) || len(meas.PromMetrics) == 0 {
+			meas.PromMetrics = buildPromSeriesFromSnapshotsOrSummary(destDir, &meas)
+		}
+		_ = measure.WriteMeasurements(measPath, &meas)
 		outRep.Measurements = &meas
+		if len(meas.CustomMetrics) > 0 {
+			if rep.CustomMetrics == nil {
+				rep.CustomMetrics = make(map[string]schema.MetricSummary, len(meas.CustomMetrics))
+			}
+			for k, v := range meas.CustomMetrics {
+				if _, exists := rep.CustomMetrics[k]; !exists {
+					rep.CustomMetrics[k] = v
+				}
+			}
+		}
 	}
-	if rawSys, err := os.ReadFile(filepath.Join(destDir, "system_description.json")); err == nil {
+	for _, pair := range [][2]string{
+		{filepath.Join(destDir, "cache_before.prom"), filepath.Join(destDir, "cache_after.prom")},
+		{filepath.Join(destDir, "cache_before.json"), filepath.Join(destDir, "cache_after.json")},
+	} {
+		cb, errB := swebench.LoadNodeCacheSnapshot(pair[0])
+		ca, errA := swebench.LoadNodeCacheSnapshot(pair[1])
+		if errB == nil && errA == nil {
+			if d := cb.Delta(ca); d.Hits+d.Misses > 0 {
+				rep.Cache = &d
+				rep.PopulateCacheMissesPerFirstCmd()
+			}
+			break
+		}
+	}
+	var sysDescPtr *schema.SystemDescription
+	sysPath := filepath.Join(destDir, "system_description.json")
+	if rawSys, err := os.ReadFile(sysPath); err == nil {
 		sysDesc, derr := schema.DecodeJSONStrict[schema.SystemDescription](bytes.NewReader(rawSys))
 		if derr != nil {
 			return fmt.Errorf("invalid system_description.json: %w", derr)
 		}
-		outRep.SystemDescription = &sysDesc
+		sysDescPtr = &sysDesc
 	}
+	if sysDescPtr != nil {
+		enrichSystemDescriptionFromArtifactDir(destDir, sysDescPtr, rep, outRep.Measurements)
+	}
+	rep.AttachClusterTelemetry(sysDescPtr, outRep.Measurements)
+	swebench.NormalizeLegacyReport(rep)
+	if sysDescPtr != nil {
+		_ = sut.WriteSystemDescription(sysPath, *sysDescPtr)
+	}
+
+	var mdBuf bytes.Buffer
+	rep.WriteMarkdown(&mdBuf)
+	_ = os.WriteFile(filepath.Join(destDir, "report.md"), mdBuf.Bytes(), 0o644)
 
 	targetJSON := jsonOut
 	if targetJSON == "" {
@@ -826,4 +929,439 @@ func reportFromArtifactDir(destDir, jsonOut string, stdout io.Writer) error {
 		return err
 	}
 	return os.WriteFile(targetJSON, append(b, '\n'), 0o644)
+}
+
+var (
+	sdkRefRe        = regexp.MustCompile(`sandboxenv-rl\.git@([0-9a-fA-F]{7,40})`)
+	hfDatasetRe     = regexp.MustCompile(`repo_id="([^"]+)"\s*,\s*repo_type="dataset"`)
+	uniAgentDsRe    = regexp.MustCompile(`(?m)^(r2e_gym_easy|r2e_gym|swe_rebench|swe_bench):\s*loaded\s+(\d+),\s*excluded\s+\d+,\s*wrote\s+(\d+)\s+rows\s+to\s+([^\s]+)\s+\((\d+)\s+distinct\s+images`)
+	trainFilesRe    = regexp.MustCompile(`data\.train_files=([^\s]+)`)
+	filterLenRe     = regexp.MustCompile(`filter dataset len:\s*(\d+)`)
+	datasetLenRe    = regexp.MustCompile(`dataset len:\s*(\d+)`)
+	trainBatchSzRe  = regexp.MustCompile(`(?:data\.train_batch_size=|'train_batch_size'\s*:\s*)([1-9]\d*)`)
+	ppoMiniBatchRe  = regexp.MustCompile(`(?:actor_rollout_ref\.actor\.ppo_mini_batch_size=|'ppo_mini_batch_size'\s*:\s*)(\d+)`)
+	rolloutNRe      = regexp.MustCompile(`(?:actor_rollout_ref\.rollout\.n=|'rollout_n'\s*:\s*)(\d+)`)
+	totalTrainStpRe = regexp.MustCompile(`(?:trainer\.total_training_steps|total_train_steps|'total_training_steps')\s*[:=]?\s*([1-9]\d*)`)
+	maxSessionsRe   = regexp.MustCompile(`(?:max_concurrent_sessions=|'max_concurrent_sessions'\s*:\s*)(\d+)`)
+	warmupBatchesRe = regexp.MustCompile(`(?:num_warmup_batches=|'num_warmup_batches'\s*:\s*)(\d+)`)
+)
+
+func enrichSystemDescriptionFromArtifactDir(destDir string, sys *schema.SystemDescription, rep *swebench.Report, meas *schema.Measurements) {
+	if sys == nil {
+		return
+	}
+	// 1. Check schedule.json if present in destDir.
+	if rawSched, err := os.ReadFile(filepath.Join(destDir, "schedule.json")); err == nil {
+		if sched, derr := schema.DecodeJSONStrict[schema.Schedule](bytes.NewReader(rawSched)); derr == nil && len(sched.Jobs) > 0 {
+			j0 := sched.Jobs[0]
+			instSet := make(map[string]bool)
+			imgSet := make(map[string]bool)
+			var firstImg string
+			for _, st := range j0.Steps {
+				for _, t := range st.Tasks {
+					if t.InstanceID != "" {
+						instSet[t.InstanceID] = true
+					}
+					if t.Image != "" {
+						if firstImg == "" {
+							firstImg = t.Image
+						}
+						imgSet[t.Image] = true
+					}
+				}
+			}
+			if sys.GuestImage == "" && firstImg != "" {
+				sys.GuestImage = firstImg
+			}
+			if sys.DatasetRevision == "" {
+				if rep != nil && rep.RunTags != nil && rep.RunTags["dataset"] != "" {
+					sys.DatasetRevision = rep.RunTags["dataset"]
+				} else if sched.ScenarioName != "" {
+					sys.DatasetRevision = fmt.Sprintf("%s (seed=%d, %d instances)", sched.ScenarioName, sched.Seed, len(instSet))
+				}
+			}
+			stepsCount := len(j0.Steps)
+			var tasksPerStep, groupSize, trajPerStep int
+			if stepsCount > 0 {
+				step1 := j0.Steps[0]
+				trajPerStep = len(step1.Tasks)
+				step1Inst := make(map[string]int)
+				maxRollout := 0
+				for _, t := range step1.Tasks {
+					step1Inst[t.InstanceID]++
+					if t.Rollout+1 > maxRollout {
+						maxRollout = t.Rollout + 1
+					}
+				}
+				tasksPerStep = len(step1Inst)
+				if maxRollout > 1 {
+					groupSize = maxRollout
+				} else if tasksPerStep > 0 {
+					groupSize = trajPerStep / tasksPerStep
+				}
+				if groupSize <= 0 {
+					groupSize = 1
+				}
+			}
+			maxConc := trajPerStep
+			if rep != nil && rep.StandingPoolSize > maxConc {
+				maxConc = rep.StandingPoolSize
+			}
+			sys.Load = &schema.LoadParams{
+				Tasks:               len(instSet),
+				GroupSize:           groupSize,
+				Steps:               stepsCount,
+				TasksPerStep:        tasksPerStep,
+				TrajectoriesPerStep: groupSize * tasksPerStep,
+				Repeat:              1,
+				MaxConcurrent:       maxConc,
+				DistinctImages:      len(imgSet),
+			}
+		}
+	}
+
+	// 2. Check verl-head.log / train.log if present in destDir.
+	for _, logName := range []string{"verl-head.log", "train.log"} {
+		rawLog, err := os.ReadFile(filepath.Join(destDir, logName))
+		if err != nil || len(rawLog) == 0 {
+			continue
+		}
+		text := string(rawLog)
+		if m := sdkRefRe.FindStringSubmatch(text); len(m) == 2 {
+			if sys.SDKVersion == "" {
+				sys.SDKVersion = m[1]
+			}
+			if sys.GitSHA == "" {
+				sys.GitSHA = m[1]
+			}
+		}
+		var dsName string
+		var datasetTasks, tasksPerStep, groupSize, stepsCount, distinctImgs, maxConc int
+		if m := uniAgentDsRe.FindStringSubmatch(text); len(m) == 6 {
+			src := m[1]
+			if src == "r2e_gym_easy" {
+				dsName = fmt.Sprintf("hfilaretov/Benchmark-R2E-Gym-Easy (%s)", m[4])
+			} else {
+				dsName = fmt.Sprintf("%s (%s)", src, m[4])
+			}
+			datasetTasks, _ = strconv.Atoi(m[3])
+			distinctImgs, _ = strconv.Atoi(m[5])
+		} else {
+			if m := hfDatasetRe.FindStringSubmatch(text); len(m) == 2 {
+				dsName = m[1]
+			}
+			if m := trainFilesRe.FindStringSubmatch(text); len(m) == 2 {
+				if dsName != "" {
+					dsName = fmt.Sprintf("%s (%s)", dsName, m[1])
+				} else {
+					dsName = m[1]
+				}
+			}
+		}
+		if sys.DatasetRevision == "" && dsName != "" {
+			sys.DatasetRevision = dsName
+		}
+
+		if datasetTasks <= 0 {
+			if m := filterLenRe.FindStringSubmatch(text); len(m) == 2 {
+				datasetTasks, _ = strconv.Atoi(m[1])
+			} else if m := datasetLenRe.FindStringSubmatch(text); len(m) == 2 {
+				datasetTasks, _ = strconv.Atoi(m[1])
+			}
+		}
+		if m := trainBatchSzRe.FindStringSubmatch(text); len(m) == 2 {
+			tasksPerStep, _ = strconv.Atoi(m[1])
+		} else if m := ppoMiniBatchRe.FindStringSubmatch(text); len(m) == 2 {
+			tasksPerStep, _ = strconv.Atoi(m[1])
+		}
+		if m := rolloutNRe.FindStringSubmatch(text); len(m) == 2 {
+			groupSize, _ = strconv.Atoi(m[1])
+		}
+		if m := totalTrainStpRe.FindStringSubmatch(text); len(m) == 2 {
+			stepsCount, _ = strconv.Atoi(m[1])
+		}
+		if m := maxSessionsRe.FindStringSubmatch(text); len(m) == 2 {
+			maxConc, _ = strconv.Atoi(m[1])
+		}
+		if stepsCount <= 0 && rep != nil && len(rep.Steps) > 0 {
+			stepsCount = len(rep.Steps)
+		}
+		if datasetTasks <= 0 && rep != nil {
+			datasetTasks = rep.DistinctInstances
+		}
+		if groupSize <= 0 {
+			groupSize = 1
+		}
+		if tasksPerStep <= 0 && rep != nil && len(rep.RolloutBreakdown) > 0 {
+			tasksPerStep = rep.RolloutBreakdown[0].Tasks
+		}
+		if maxConc <= 0 && meas != nil && meas.ServerSummary != nil {
+			if as, ok := meas.ServerSummary["active_sandboxes"]; ok && as.P50 > 0 {
+				maxConc = int(as.P50)
+			}
+		}
+		if maxConc <= 0 && rep != nil && rep.DistinctEnvs > 0 {
+			maxConc = rep.DistinctEnvs
+		}
+		if distinctImgs <= 0 {
+			distinctImgs = 1
+			if rep != nil && len(rep.DistinctImages) > 0 {
+				distinctImgs = len(rep.DistinctImages)
+			}
+		}
+		if tasksPerStep > 0 || stepsCount > 0 {
+			sys.Load = &schema.LoadParams{
+				Tasks:               datasetTasks,
+				GroupSize:           groupSize,
+				Steps:               stepsCount,
+				TasksPerStep:        tasksPerStep,
+				TrajectoriesPerStep: groupSize * tasksPerStep,
+				Repeat:              1,
+				MaxConcurrent:       maxConc,
+				DistinctImages:      distinctImgs,
+			}
+		}
+		if m := warmupBatchesRe.FindStringSubmatch(text); len(m) == 2 {
+			if wb, werr := strconv.Atoi(m[1]); werr == nil && wb >= 0 {
+				if sys.LifecyclePolicy == nil {
+					sys.LifecyclePolicy = &schema.SandboxLifecyclePolicy{}
+				}
+				sys.LifecyclePolicy.TrainerWarmupBatches = wb
+			}
+		}
+		break
+	}
+
+	// 3. Populate GitSHA / SDKVersion from git rev-parse HEAD if still empty.
+	if sys.GitSHA == "" || sys.SDKVersion == "" {
+		if out, err := exec.Command("git", "rev-parse", "HEAD").Output(); err == nil {
+			sha := strings.TrimSpace(string(out))
+			if sha != "" {
+				if sys.GitSHA == "" {
+					sys.GitSHA = sha
+				}
+				if sys.SDKVersion == "" {
+					sys.SDKVersion = sha
+				}
+			}
+		}
+	}
+	if sys.OSKernel == "" && sys.KubernetesVersion != "" {
+		sys.OSKernel = "Container-Optimized OS from Google (Linux 6.6+)"
+	}
+	if sys.StorageDriverAndFS == "" && sys.KubernetesVersion != "" {
+		sys.StorageDriverAndFS = "overlayfs / ext4 (containerd)"
+	}
+}
+
+func nearestRankPct(sorted []float64, p float64) float64 {
+	return swebench.NearestRankPct(sorted, p)
+}
+
+func roundStatVal(v float64) float64 {
+	return swebench.RoundStatVal(v)
+}
+
+func rollUpSnapshotsIntoMeasurements(destDir string, meas *schema.Measurements) bool {
+	if meas == nil {
+		return false
+	}
+	snapFiles, _ := filepath.Glob(filepath.Join(destDir, "measurements_snapshots", "*.json"))
+	sort.Strings(snapFiles)
+	if len(snapFiles) == 0 {
+		return false
+	}
+	type snapAccum struct {
+		unit       string
+		allSingle  bool
+		totalCount int
+		totalSum   float64
+		mins       []float64
+		p50s       []float64
+		p90s       []float64
+		p95s       []float64
+		p99s       []float64
+		maxs       []float64
+	}
+	accums := make(map[string]*snapAccum)
+	for _, sf := range snapFiles {
+		raw, err := os.ReadFile(sf)
+		if err != nil {
+			continue
+		}
+		var snap schema.Measurements
+		if err := json.Unmarshal(raw, &snap); err != nil || len(snap.ServerSummary) == 0 {
+			continue
+		}
+		for k, ms := range snap.ServerSummary {
+			if ms.Count <= 0 {
+				continue
+			}
+			ac, ok := accums[k]
+			if !ok {
+				ac = &snapAccum{unit: ms.Unit, allSingle: true}
+				accums[k] = ac
+			}
+			if ac.unit == "" && ms.Unit != "" {
+				ac.unit = ms.Unit
+			}
+			if ms.Count > 1 {
+				ac.allSingle = false
+			}
+			ac.totalCount += ms.Count
+			if ms.Sum != 0 {
+				ac.totalSum += ms.Sum
+			} else {
+				ac.totalSum += ms.P50 * float64(ms.Count)
+			}
+			ac.mins = append(ac.mins, ms.Min)
+			ac.p50s = append(ac.p50s, ms.P50)
+			p90 := ms.P90
+			if p90 == 0 && ms.P50 > 0 {
+				p90 = ms.P50
+			}
+			p95 := ms.P95
+			if p95 == 0 {
+				p95 = p90
+			}
+			p99 := ms.P99
+			if p99 == 0 {
+				p99 = p95
+			}
+			mx := ms.Max
+			if mx == 0 {
+				mx = p99
+			}
+			ac.p90s = append(ac.p90s, p90)
+			ac.p95s = append(ac.p95s, p95)
+			ac.p99s = append(ac.p99s, p99)
+			ac.maxs = append(ac.maxs, mx)
+		}
+	}
+	if len(accums) == 0 {
+		return false
+	}
+	if meas.ServerSummary == nil {
+		meas.ServerSummary = make(map[string]schema.MetricSummary, len(accums))
+	}
+	for k, ac := range accums {
+		if len(ac.p50s) == 0 {
+			continue
+		}
+		sort.Float64s(ac.mins)
+		sort.Float64s(ac.p50s)
+		sort.Float64s(ac.p90s)
+		sort.Float64s(ac.p95s)
+		sort.Float64s(ac.p99s)
+		sort.Float64s(ac.maxs)
+		if ac.allSingle {
+			var sum float64
+			for _, v := range ac.p50s {
+				sum += v
+			}
+			meas.ServerSummary[k] = schema.MetricSummary{
+				Count: len(ac.p50s),
+				Sum:   roundStatVal(sum),
+				Min:   roundStatVal(ac.p50s[0]),
+				P50:   roundStatVal(nearestRankPct(ac.p50s, 0.50)),
+				P90:   roundStatVal(nearestRankPct(ac.p50s, 0.90)),
+				P95:   roundStatVal(nearestRankPct(ac.p50s, 0.95)),
+				P99:   roundStatVal(nearestRankPct(ac.p50s, 0.99)),
+				Max:   roundStatVal(ac.p50s[len(ac.p50s)-1]),
+				Unit:  ac.unit,
+			}
+		} else {
+			gMin := ac.mins[0]
+			gMax := ac.maxs[len(ac.maxs)-1]
+			p50 := nearestRankPct(ac.p50s, 0.50)
+			p90 := math.Max(p50, nearestRankPct(ac.p90s, 0.90))
+			p95 := math.Max(p90, nearestRankPct(ac.p95s, 0.95))
+			p99 := math.Max(p95, nearestRankPct(ac.p99s, 0.99))
+			if p99 > gMax {
+				p99 = gMax
+			}
+			meas.ServerSummary[k] = schema.MetricSummary{
+				Count: ac.totalCount,
+				Sum:   roundStatVal(ac.totalSum),
+				Min:   roundStatVal(gMin),
+				P50:   roundStatVal(p50),
+				P90:   roundStatVal(p90),
+				P95:   roundStatVal(p95),
+				P99:   roundStatVal(p99),
+				Max:   roundStatVal(gMax),
+				Unit:  ac.unit,
+			}
+		}
+	}
+	return true
+}
+
+func buildPromSeriesFromSnapshotsOrSummary(destDir string, meas *schema.Measurements) []schema.PrometheusSeries {
+	if meas == nil {
+		return nil
+	}
+	seriesByMetric := make(map[string]*schema.PrometheusSeries)
+	var metricOrder []string
+
+	snapFiles, _ := filepath.Glob(filepath.Join(destDir, "measurements_snapshots", "*.json"))
+	sort.Strings(snapFiles)
+	for _, sf := range snapFiles {
+		raw, err := os.ReadFile(sf)
+		if err != nil {
+			continue
+		}
+		var snap schema.Measurements
+		if err := json.Unmarshal(raw, &snap); err != nil || len(snap.ServerSummary) == 0 {
+			continue
+		}
+		for k, ms := range snap.ServerSummary {
+			ps, exists := seriesByMetric[k]
+			if !exists {
+				val := ms.P50
+				ps = &schema.PrometheusSeries{
+					Name:   k,
+					Labels: map[string]string{"unit": ms.Unit},
+					Status: "ok",
+					Value:  &val,
+				}
+				seriesByMetric[k] = ps
+				metricOrder = append(metricOrder, k)
+			}
+			val := ms.P50
+			ps.Value = &val
+			ps.Values = append(ps.Values, val)
+		}
+	}
+
+	for k, ms := range meas.ServerSummary {
+		ps, exists := seriesByMetric[k]
+		if !exists {
+			val := ms.P50
+			ps = &schema.PrometheusSeries{
+				Name:   k,
+				Labels: map[string]string{"unit": ms.Unit},
+				Status: "ok",
+				Value:  &val,
+				Values: []float64{val},
+			}
+			seriesByMetric[k] = ps
+			metricOrder = append(metricOrder, k)
+		}
+	}
+	for _, existing := range meas.PromMetrics {
+		cp := existing
+		ps, exists := seriesByMetric[cp.Name]
+		if !exists {
+			seriesByMetric[cp.Name] = &cp
+			metricOrder = append(metricOrder, cp.Name)
+		} else if len(cp.Values) > len(ps.Values) {
+			seriesByMetric[cp.Name] = &cp
+		}
+	}
+	sort.Strings(metricOrder)
+	var out []schema.PrometheusSeries
+	for _, k := range metricOrder {
+		out = append(out, *seriesByMetric[k])
+	}
+	return out
 }

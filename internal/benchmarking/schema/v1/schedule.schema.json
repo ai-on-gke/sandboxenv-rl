@@ -8,6 +8,7 @@
   "properties": {
     "schema_version": { "type": "string", "enum": ["v1"] },
     "scenario_name": { "type": "string", "minLength": 1 },
+    "scenario": { "type": "string" },
     "seed": { "type": "integer" },
     "jobs": {
       "type": "array",
@@ -57,6 +58,7 @@
       "additionalProperties": false,
       "required": ["instance_id", "image"],
       "properties": {
+        "task_id": { "type": "string" },
         "instance_id": { "type": "string", "minLength": 1 },
         "image": { "type": "string", "minLength": 1 },
         "trajectory": { "type": "string" },

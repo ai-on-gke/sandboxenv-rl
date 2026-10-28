@@ -37,6 +37,9 @@
     "snapshot": { "type": "string" },
     "node": { "type": "string" },
     "bytes": { "type": "integer", "minimum": 0 },
+    "size_mb": { "type": "number", "minimum": 0 },
+    "deleted_count": { "type": "integer", "minimum": 0 },
+    "orphan_count": { "type": "integer", "minimum": 0 },
     "cache_hit": { "type": "boolean" },
     "labels": {
       "type": "object",

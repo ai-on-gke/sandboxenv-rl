@@ -24,6 +24,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -51,31 +52,36 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
+	os.Exit(runMain(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func runMain(args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		usage(stderr)
+		return 2
 	}
 	var err error
-	switch os.Args[1] {
+	switch args[0] {
 	case "run":
-		err = runCmd(os.Args[2:])
+		err = runCmd(args[1:])
 	case "resolve":
-		err = resolveCmd(os.Args[2:])
-	case "report":
-		err = reportCmd(os.Args[2:], os.Stdout)
+		err = resolveCmd(args[1:])
+	case "report", "compare":
+		err = reportCmdWithIO(args[1:], stdout, stderr)
 	case "trajectory-assets":
-		err = assetsCmd(os.Args[2:], os.Stdout)
+		err = assetsCmd(args[1:], stdout)
 	case "-h", "--help", "help":
-		usage()
-		return
+		usage(stderr)
+		return 0
 	default:
-		usage()
-		os.Exit(2)
+		usage(stderr)
+		return 2
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
 	}
+	return 0
 }
 
 // authTokenEnv names the environment variable that holds the bearer token,
@@ -221,8 +227,8 @@ func idsDigest(ids []string) string {
 	return hex.EncodeToString(sum[:4])
 }
 
-func usage() {
-	fmt.Fprintln(os.Stderr, "usage: swebench-loader run [flags] | swebench-loader resolve [flags] | swebench-loader report FILE... [-json OUT] | swebench-loader trajectory-assets FILE")
+func usage(w io.Writer) {
+	fmt.Fprintln(w, "usage: swebench-loader run [flags] | swebench-loader resolve [flags] | swebench-loader report FILE... [-json OUT] | swebench-loader trajectory-assets FILE")
 }
 
 // assetsCmd prints the files a trajectory's write steps name, one per line,
@@ -319,6 +325,14 @@ func runCmd(args []string) (retErr error) {
 		wakeBackoff   = fs.Duration("wake-backoff", swebench.DefaultWakeBackoff, "Initial pause between wake retries; doubles up to five times this.")
 		runID         = fs.String("run-id", "", "Run id, prefix of every environment name: lowercase letters, digits and '-', at most 20 characters; default swe-<unix time>.")
 		out           = fs.String("out", "", "JSONL events file; default <run-id>.jsonl in the working directory.")
+		eventsDir     = fs.String("events-dir", "", "Optional base directory for per-worker event shards (events/<worker>.jsonl).")
+		worker        = fs.String("worker", "", "Optional worker shard name stamped on emitted events.")
+		jobName       = fs.String("job", "", "Optional job name stamped on emitted events.")
+		runWindow     = fs.String("run-window", "", "Optional path to write run_window.json.")
+		statsOut      = fs.String("stats-out", "", "Optional path to write flat stats.jsonl rows after the run.")
+		testName      = fs.String("test-name", "", "Optional test_name for run_window.json and stats.jsonl.")
+		tag           = fs.String("tag", "", "Optional tag for run_window.json and stats.jsonl.")
+		validate      = fs.Bool("validate", false, "Evaluate Validity Rules 1-7 after the run and fail if invalid.")
 		keep          = fs.Bool("keep", false, "Leave the environments in place when the run ends.")
 		dryRun        = fs.Bool("dry-run", false, "Load and render everything, print the plan and exit without touching the API.")
 		authTokenFile = fs.String("auth-token-file", "", "File that holds the bearer token for ate-env-api; surrounding whitespace is ignored. Without it, SUBSTRATE_ENV_AUTH_TOKEN is used when set.")
@@ -340,7 +354,13 @@ func runCmd(args []string) (retErr error) {
 	if *runID == "" {
 		*runID = fmt.Sprintf("swe-%d", time.Now().Unix())
 	}
-	if *out == "" {
+	if *eventsDir != "" {
+		wName := *worker
+		if wName == "" {
+			wName = "worker-0"
+		}
+		*out = swebench.ShardEventPath(*eventsDir, wName)
+	} else if *out == "" {
 		*out = *runID + ".jsonl"
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
@@ -465,27 +485,46 @@ func runCmd(args []string) (retErr error) {
 		backend = eb
 	}
 
-	f, err := os.Create(*out)
-	if err != nil {
-		return err
+	var rec *swebench.Recorder
+	var f *os.File
+	if *eventsDir != "" {
+		rec, err = swebench.NewShardRecorder(*eventsDir, *runID, *worker)
+		if err != nil {
+			return err
+		}
+	} else {
+		f, err = os.Create(*out)
+		if err != nil {
+			return err
+		}
+		rec = swebench.NewRecorder(f)
+		if *worker != "" {
+			rec.SetWorker(*worker)
+		}
 	}
-	rec := swebench.NewRecorder(f)
+	if *jobName != "" {
+		rec.SetJob(*jobName)
+	}
 	// Events lost to a write error, or a file that does not flush, must fail
 	// the run rather than produce a report with holes.
 	defer func() {
 		if rerr := rec.Close(); rerr != nil && retErr == nil {
 			retErr = fmt.Errorf("writing events to %s: %w", *out, rerr)
 		}
-		if cerr := f.Close(); cerr != nil && retErr == nil {
-			retErr = fmt.Errorf("closing %s: %w", *out, cerr)
+		if f != nil {
+			if cerr := f.Close(); cerr != nil && retErr == nil {
+				retErr = fmt.Errorf("closing %s: %w", *out, cerr)
+			}
 		}
 	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	startTS := time.Now().UTC()
 	sum, err := swebench.Run(ctx, swebench.Config{
 		RunID:         *runID,
+		Dataset:       *dataset,
 		Backend:       backend,
 		Instances:     selected,
 		Trajectory:    traj,
@@ -513,6 +552,45 @@ func runCmd(args []string) (retErr error) {
 		Labels:        labels,
 		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids, effective),
 	})
+	endTS := time.Now().UTC()
+	_ = rec.Flush()
+
+	if *runWindow != "" {
+		tName := *testName
+		if tName == "" {
+			tName = "swebench-" + *mode
+		}
+		rw := schema.RunWindow{
+			SchemaVersion: schema.SchemaVersion,
+			RunID:         *runID,
+			TestName:      tName,
+			Tag:           *tag,
+			StartTS:       startTS.Format(time.RFC3339Nano),
+			EndTS:         endTS.Format(time.RFC3339Nano),
+			SUTEndpoint:   *endpoint,
+		}
+		if wErr := swebench.WriteRunWindow(*runWindow, rw); wErr != nil {
+			return wErr
+		}
+	}
+
+	if *statsOut != "" || *validate {
+		rep, sErr := swebench.SummarizeFile(*out)
+		if sErr == nil {
+			if *statsOut != "" {
+				if wErr := swebench.WriteStatsJSONL(*statsOut, rep, *runID, *testName, *tag); wErr != nil {
+					return wErr
+				}
+			}
+			if *validate {
+				v := swebench.Validate(rep, swebench.ValidateOptions{})
+				if !v.Valid {
+					return fmt.Errorf("report validation failed: %s", strings.Join(v.Reasons, "; "))
+				}
+			}
+		}
+	}
+
 	if sum != nil {
 		log.Info("run finished", slog.Int("tasks", sum.Tasks), slog.Int("failed", sum.Failed),
 			slog.Int("rewarded", sum.Rewarded), slog.Duration("duration", sum.Duration))
@@ -527,21 +605,47 @@ func runCmd(args []string) (retErr error) {
 }
 
 func reportCmd(args []string, ws ...io.Writer) error {
-	var w io.Writer = os.Stdout
+	var stdout io.Writer = os.Stdout
 	if len(ws) > 0 && ws[0] != nil {
-		w = ws[0]
+		stdout = ws[0]
 	}
+	return reportCmdWithIO(args, stdout, os.Stderr)
+}
+
+func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 	files, rest := leadingFiles(args)
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	var arms armFlags
 	fs.Var(&arms, "arm", "NAME=FILE[,FILE...], repeatable: one column per arm, in flag order, its percentiles computed over the merged raw events of its files, the reps of one cluster or build, which must be complete runs of one workload (same loader labels, distinct run ids, a run in one arm only). A path may not contain a comma. No positional files with -arm.")
-	top := fs.Int("top", 0, "List the N slowest successful first commands and wakes by environment. One file only.")
-	jsonOut := fs.String("json", "", "Also write the summary as JSON to this path (an array when several files are given).")
-	unresolvedOut := fs.String("unresolved", "", "Write the unresolved instances to this path in -exclude-file format; one file only.")
-	unresolvedNote := fs.String("unresolved-note", "Instances graded unresolved", "First comment line of the -unresolved file.")
-	cacheBefore := fs.String("cache-before", "", "Node cache sample taken before the run (benchmarking/swebench/sample-node-cache.sh); with -cache-after, the report adds the run's cache misses. One file only.")
-	cacheAfter := fs.String("cache-after", "", "Node cache sample taken after the run.")
-	restoreLog := fs.String("restore-log", "", "atelet restore records for the run (benchmarking/swebench/harvest-restore-timings.sh); the report adds the restore phases per environment. One file only.")
+	var (
+		top            = fs.Int("top", 0, "List the N slowest successful first commands and wakes by environment. One file only.")
+		in             = fs.String("in", "", "Input events.jsonl file (alternative to positional FILE).")
+		eventsGlob     = fs.String("events-glob", "", "Glob pattern for multi-worker event shards (e.g. 'events/*.jsonl').")
+		jsonOut        = fs.String("json", "", "Also write the summary as JSON to this path (an array when several files are given).")
+		out            = fs.String("out", "", "Alias for -json: write the summary as JSON to this path.")
+		mdOut          = fs.String("md", "", "Optional path to write Markdown report (including ## Validity).")
+		unresolved     = fs.String("unresolved", "", "Write the unresolved instances to this path in -exclude-file format; one file only.")
+		unresNote      = fs.String("unresolved-note", "Instances graded unresolved", "First comment line of the -unresolved file.")
+		cacheBefore    = fs.String("cache-before", "", "Node cache sample taken before the run (benchmarking/swebench/sample-node-cache.sh); with -cache-after, the report adds the run's cache misses. One file only.")
+		cacheAfter     = fs.String("cache-after", "", "Node cache sample taken after the run.")
+		restoreLog     = fs.String("restore-log", "", "atelet restore records for the run (benchmarking/swebench/harvest-restore-timings.sh); the report adds the restore phases per environment. One file only.")
+		restoreTimings = fs.String("restore-timings", "", "Alias for -restore-log: restore records for the run.")
+		runWindow      = fs.String("run-window", "", "Optional path to run_window.json to validate and attach to the report.")
+		statsOut       = fs.String("stats-out", "", "Optional path to write flat stats.jsonl rows.")
+		testName       = fs.String("test-name", "", "Optional test_name for stats.jsonl (default: swebench-<mode>).")
+		tag            = fs.String("tag", "", "Optional tag for stats.jsonl.")
+		validate       = fs.Bool("validate", false, "Evaluate Validity Rules 1-7 and exit non-zero on failure.")
+		footing        = fs.String("footing", "", "Expected footing for Validity Rule 1 (warm | cold).")
+		minReward      = fs.Float64("min-reward-rate", 0, "Minimum reward rate for Validity Rule 2.")
+		minTasks       = fs.Int("min-tasks", 0, "Minimum task count for Validity Rule 3.")
+		maxFailCr      = fs.Float64("max-failed-create-ratio", -1, "Maximum failed create ratio for Validity Rule 4.")
+		schedPath      = fs.String("schedule", "", "Optional schedule.json path for Validity Rule 5.")
+		traceMode      = fs.Bool("trace-mode", false, "Mark scenario as having a trace-mode job (Validity Rule 6).")
+		orphanCount    = fs.Int("orphan-count", 0, "Remaining orphan count after reap (Validity Rule 7).")
+		compareFlag    = fs.String("compare", "", "Comma-separated events.jsonl or report.json files to compare against.")
+		thresholds     = fs.String("thresholds", "", "Optional thresholds.yaml path for regression gating.")
+	)
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
@@ -553,43 +657,123 @@ func reportCmd(args []string, ws ...io.Writer) error {
 	if *top < 0 {
 		return fmt.Errorf("-top wants 0 or more, got %d", *top)
 	}
+	if *out != "" && *jsonOut == "" {
+		*jsonOut = *out
+	}
+	if *restoreTimings != "" && *restoreLog == "" {
+		*restoreLog = *restoreTimings
+	}
 	if len(arms) > 0 {
-		if len(files) > 0 {
+		if len(files) > 0 || *in != "" {
 			return fmt.Errorf("with -arm, give every events file inside an -arm value")
 		}
-		if *unresolvedOut != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" || *top > 0 {
+		if *unresolved != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" || *top > 0 {
 			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log and -top take one events file, not -arm")
 		}
-		return reportArms(arms, *jsonOut, w)
+		return reportArms(arms, *jsonOut, stdout)
 	}
-	if len(files) == 0 {
+	if *in != "" {
+		files = append(files, *in)
+	}
+
+	var compareFiles []string
+	if *compareFlag != "" {
+		for _, p := range strings.Split(*compareFlag, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				compareFiles = append(compareFiles, p)
+			}
+		}
+	}
+
+	if len(files) == 0 && *eventsGlob == "" && len(compareFiles) == 0 {
 		return fmt.Errorf("report needs at least one JSONL file, or -arm")
 	}
-	reps := make([]*swebench.Report, 0, len(files))
+
+	var rw *schema.RunWindow
+	if *runWindow != "" {
+		loadedRW, err := swebench.ReadRunWindow(*runWindow)
+		if err != nil {
+			return err
+		}
+		rw = loadedRW
+	}
+
+	var reps []*swebench.Report
+	var labels []string
 	var events []swebench.Event // of the single file, for the restore join
+
+	if *eventsGlob != "" {
+		rep, err := swebench.SummarizeGlob(*eventsGlob)
+		if err != nil {
+			return err
+		}
+		reps = append(reps, rep)
+		labels = append(labels, *eventsGlob)
+	}
+
 	for _, path := range files {
-		if (*restoreLog != "" || *top > 0) && len(files) == 1 {
+		if (*restoreLog != "" || *top > 0) && len(files) == 1 && *eventsGlob == "" && len(compareFiles) == 0 {
 			evs, err := readEventsFile(path)
 			if err != nil {
 				return fmt.Errorf("%s: %w", path, err)
 			}
 			events = evs
 			reps = append(reps, swebench.Build(evs))
+			labels = append(labels, path)
 			continue
 		}
-		rep, err := summarizeFile(path)
+		rep, err := loadOrSummarizeFile(path)
 		if err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
 		reps = append(reps, rep)
+		labels = append(labels, path)
 	}
+
+	// If -compare was provided along with a single primary report (-in / -events-glob / single file)
+	// and len(compareFiles) == 1, treat compareFiles[0] as baseline and the primary report as candidate.
+	if len(compareFiles) > 0 {
+		var compReps []*swebench.Report
+		for _, p := range compareFiles {
+			r, err := loadOrSummarizeFile(p)
+			if err != nil {
+				return fmt.Errorf("%s: %w", p, err)
+			}
+			compReps = append(compReps, r)
+		}
+		if len(reps) == 1 && len(compReps) == 1 {
+			reps = []*swebench.Report{compReps[0], reps[0]}
+			labels = []string{compareFiles[0], labels[0]}
+		} else {
+			reps = append(reps, compReps...)
+			labels = append(labels, compareFiles...)
+		}
+	}
+
 	if len(reps) > 1 {
 		// Several runs: one table, a column per run, for the same workload on
 		// different clusters or builds.
-		if *unresolvedOut != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" || *top > 0 {
+		if *unresolved != "" || (*cacheBefore != "" && !*validate) || (*cacheAfter != "" && !*validate) || *restoreLog != "" || *top > 0 {
 			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log and -top take one events file")
 		}
-		swebench.WriteComparison(w, reps, files)
+		swebench.WriteComparison(stdout, reps, labels)
+		if *thresholds != "" {
+			th, err := swebench.LoadThresholds(*thresholds)
+			if err != nil {
+				return err
+			}
+			res := swebench.Compare(reps[0], reps[len(reps)-1], th)
+			fmt.Fprintln(stdout)
+			fmt.Fprint(stdout, swebench.FormatComparisonMarkdown(res))
+			if *mdOut != "" {
+				if err := os.WriteFile(*mdOut, []byte(swebench.FormatComparisonMarkdown(res)), 0o644); err != nil {
+					return err
+				}
+			}
+			if !res.Passed {
+				return fmt.Errorf("threshold regression detected: %s", strings.Join(res.Regressions, "; "))
+			}
+		}
 		if *jsonOut != "" {
 			b, err := json.MarshalIndent(reps, "", "  ")
 			if err != nil {
@@ -599,21 +783,30 @@ func reportCmd(args []string, ws ...io.Writer) error {
 		}
 		return nil
 	}
+
 	rep := reps[0]
+	if rw != nil {
+		rep.RunWindow = rw
+		if rep.RunID == "" {
+			rep.RunID = rw.RunID
+		}
+	}
 	if (*cacheBefore == "") != (*cacheAfter == "") {
 		return fmt.Errorf("-cache-before and -cache-after go together")
 	}
 	if *cacheBefore != "" {
-		before, err := loadCacheSample(*cacheBefore)
-		if err != nil {
-			return err
+		before, errB := loadCacheSample(*cacheBefore)
+		after, errA := loadCacheSample(*cacheAfter)
+		if errB == nil && errA == nil {
+			d := before.Delta(after)
+			rep.Cache = &d
+			rep.PopulateCacheMissesPerFirstCmd()
+		} else if !*validate {
+			if errB != nil {
+				return errB
+			}
+			return errA
 		}
-		after, err := loadCacheSample(*cacheAfter)
-		if err != nil {
-			return err
-		}
-		d := before.Delta(after)
-		rep.Cache = &d
 	}
 	if *restoreLog != "" {
 		f, err := os.Open(*restoreLog)
@@ -630,14 +823,60 @@ func reportCmd(args []string, ws ...io.Writer) error {
 	if *top > 0 {
 		rep.Slowest = swebench.Slowest(events, *top)
 	}
-	rep.WriteText(w)
-	if *unresolvedOut != "" {
-		uf, err := os.Create(*unresolvedOut)
+
+	var valErr error
+	if *validate {
+		valOpts := swebench.ValidateOptions{
+			Footing:         *footing,
+			MinRewardRate:   *minReward,
+			CheckRewardRate: *minReward > 0,
+			MinTasks:        *minTasks,
+			HasTraceJob:     *traceMode,
+			OrphanCount:     *orphanCount,
+			CacheBeforePath: *cacheBefore,
+			CacheAfterPath:  *cacheAfter,
+		}
+		if *maxFailCr >= 0 {
+			valOpts.MaxFailedCreateRatio = *maxFailCr
+			valOpts.CheckFailedCreates = true
+		}
+		if *schedPath != "" {
+			rawSched, sErr := os.ReadFile(*schedPath)
+			if sErr != nil {
+				return fmt.Errorf("read schedule %q: %w", *schedPath, sErr)
+			}
+			sched, sErr := schema.DecodeJSONStrict[schema.Schedule](bytes.NewReader(rawSched))
+			if sErr != nil {
+				return fmt.Errorf("decode schedule %q: %w", *schedPath, sErr)
+			}
+			valOpts.Schedule = &sched
+		}
+		validity := swebench.Validate(rep, valOpts)
+		if !validity.Valid {
+			valErr = fmt.Errorf("report validation failed: %s", strings.Join(validity.Reasons, "; "))
+		}
+	}
+
+	rep.WriteText(stdout)
+	if *mdOut != "" {
+		var mdBuf bytes.Buffer
+		rep.WriteMarkdown(&mdBuf)
+		if err := os.WriteFile(*mdOut, mdBuf.Bytes(), 0o644); err != nil {
+			return err
+		}
+	}
+	if *unresolved != "" {
+		uf, err := os.Create(*unresolved)
 		if err != nil {
 			return err
 		}
-		rep.WriteExclusions(uf, *unresolvedNote)
+		rep.WriteExclusions(uf, *unresNote)
 		if err := uf.Close(); err != nil {
+			return err
+		}
+	}
+	if *statsOut != "" {
+		if err := swebench.WriteStatsJSONL(*statsOut, rep, rep.RunID, *testName, *tag); err != nil {
 			return err
 		}
 	}
@@ -646,9 +885,11 @@ func reportCmd(args []string, ws ...io.Writer) error {
 		if err != nil {
 			return err
 		}
-		return os.WriteFile(*jsonOut, b, 0o644)
+		if err := os.WriteFile(*jsonOut, b, 0o644); err != nil {
+			return err
+		}
 	}
-	return nil
+	return valErr
 }
 
 // leadingFiles splits report's arguments into the events files, which come
@@ -671,6 +912,21 @@ func summarizeFile(path string) (*swebench.Report, error) {
 	return swebench.Summarize(f)
 }
 
+func loadOrSummarizeFile(path string) (*swebench.Report, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '{' && !bytes.Contains(trimmed, []byte("\n{")) {
+		var rep swebench.Report
+		if err := json.Unmarshal(trimmed, &rep); err == nil && (len(rep.Stats) > 0 || rep.Tasks > 0 || len(rep.Jobs) > 0) {
+			swebench.NormalizeLegacyReport(&rep)
+			return &rep, nil
+		}
+	}
+	return swebench.Summarize(bytes.NewReader(raw))
+}
 func readEventsFile(path string) ([]swebench.Event, error) {
 	f, err := os.Open(path)
 	if err != nil {

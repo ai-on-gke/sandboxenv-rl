@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-on-gke.github.io/sandboxenv-rl/schema/v1/system_description.schema.json",
+  "title": "SystemDescription",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "cluster"],
+  "properties": {
+    "schema_version": { "type": "string", "enum": ["v1"] },
+    "cluster": { "type": "string", "minLength": 1 },
+    "backend": { "type": "string", "enum": ["substrate", "agent-sandbox"] },
+    "access": { "type": "string", "enum": ["sdk", "ate-env-api", "direct"] },
+    "kubernetes_version": { "type": "string" },
+    "os_kernel": { "type": "string" },
+    "storage_driver_and_fs": { "type": "string" },
+    "sdk_version": { "type": "string" },
+    "substrate_version": { "type": "string" },
+    "grader_version": { "type": "string" },
+    "dataset_revision": { "type": "string" },
+    "swebench_harness_version": { "type": "string" },
+    "exclusion_list_revision": { "type": "string" },
+    "node_pools": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "machine_types": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/NodePoolInfo" }
+    },
+    "zone_topology": { "type": "string" },
+    "bucket_region": { "type": "string" },
+    "runtime_class": { "type": "string" },
+    "sandbox_footprint": { "$ref": "#/$defs/SandboxFootprint" },
+    "max_active_pods": { "type": "integer", "minimum": 0 },
+    "pool_size_per_image": { "type": "integer", "minimum": 0 },
+    "worker_pod_count": { "type": "integer", "minimum": 0 },
+    "worker_actor_capacity": { "type": "integer", "minimum": 0 },
+    "max_concurrent_sandboxes_cap": { "type": "integer", "minimum": 0 },
+    "api_image": { "type": "string" },
+    "guest_image": { "type": "string" },
+    "git_sha": { "type": "string" },
+    "dataset_digest": { "type": "string" },
+    "scenario_hash": { "type": "string" },
+    "overlays": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/OverlayRef" }
+    },
+    "load": { "$ref": "#/$defs/LoadParams" },
+    "lifecycle_policy": { "type": "object" }
+  },
+  "$defs": {
+    "NodePoolInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["machine_type", "count"],
+      "properties": {
+        "machine_type": { "type": "string", "minLength": 1 },
+        "count": { "type": "integer", "minimum": 0 },
+        "zone": { "type": "string" }
+      }
+    },
+    "SandboxFootprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu", "memory_gib"],
+      "properties": {
+        "cpu": { "type": "number", "minimum": 0 },
+        "memory_gib": { "type": "number", "minimum": 0 },
+        "disk_gib": { "type": "number", "minimum": 0 }
+      }
+    },
+    "OverlayRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "hash": { "type": "string" },
+        "sut_overrides": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "LoadParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tasks": { "type": "integer", "minimum": 0 },
+        "group_size": { "type": "integer", "minimum": 0 },
+        "steps": { "type": "integer", "minimum": 0 },
+        "tasks_per_step": { "type": "integer", "minimum": 0 },
+        "trajectories_per_step": { "type": "integer", "minimum": 0 },
+        "repeat": { "type": "integer", "minimum": 0 },
+        "max_concurrent": { "type": "integer", "minimum": 0 },
+        "distinct_images": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

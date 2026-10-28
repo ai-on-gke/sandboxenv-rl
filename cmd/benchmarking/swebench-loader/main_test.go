@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/env/internal/benchmarking/schema"
 	"github.com/agent-substrate/env/internal/benchmarking/swebench"
 )
 
@@ -412,3 +413,131 @@ func TestAssetsCmd(t *testing.T) {
 		t.Fatal("trajectory-assets without a file must fail")
 	}
 }
+
+func TestCLIReportFlagsValidateCompareAndStats(t *testing.T) {
+	dir := t.TempDir()
+	rewardOne := 1
+	ts := time.Date(2026, 10, 22, 1, 20, 1, 0, time.UTC)
+
+	rec0, err := swebench.NewShardRecorder(dir, "cli-run-1", "worker-0")
+	if err != nil {
+		t.Fatalf("NewShardRecorder 0: %v", err)
+	}
+	rec0.Record(swebench.Event{Time: ts, Event: swebench.EventPrewarm, DurMS: 100, OK: true})
+	rec0.Record(swebench.Event{Time: ts, Event: swebench.EventCreate, Step: 1, Task: 0, DurMS: 50, OK: true})
+	rec0.Record(swebench.Event{Time: ts, Event: swebench.EventTTFI, Step: 1, Task: 0, DurMS: 200, OK: true})
+	rec0.Record(swebench.Event{Time: ts, Event: swebench.EventTask, Step: 1, Task: 0, DurMS: 1000, OK: true, Reward: &rewardOne})
+	_ = rec0.Close()
+
+	rec1, err := swebench.NewShardRecorder(dir, "cli-run-1", "worker-1")
+	if err != nil {
+		t.Fatalf("NewShardRecorder 1: %v", err)
+	}
+	rec1.Record(swebench.Event{Time: ts.Add(time.Second), Event: swebench.EventCreate, Step: 1, Task: 1, DurMS: 70, OK: true})
+	rec1.Record(swebench.Event{Time: ts.Add(time.Second), Event: swebench.EventTTFI, Step: 1, Task: 1, DurMS: 400, OK: true})
+	rec1.Record(swebench.Event{Time: ts.Add(time.Second), Event: swebench.EventTask, Step: 1, Task: 1, DurMS: 1400, OK: true, Reward: &rewardOne})
+	rec1.Record(swebench.Event{Time: ts.Add(2 * time.Second), Event: swebench.EventReap, DurMS: 40, OK: true, Metrics: map[string]float64{"orphan_count": 0}})
+	_ = rec1.Close()
+
+	rwPath := filepath.Join(dir, "run_window.json")
+	if err := swebench.WriteRunWindow(rwPath, schema.RunWindow{
+		RunID:    "cli-run-1",
+		TestName: "swebench-cli",
+		Tag:      "cand",
+		StartTS:  "2026-10-22T01:20:00Z",
+		EndTS:    "2026-10-22T01:20:10Z",
+	}); err != nil {
+		t.Fatalf("WriteRunWindow: %v", err)
+	}
+
+	outReportPath := filepath.Join(dir, "report.json")
+	mdPath := filepath.Join(dir, "report.md")
+	statsPath := filepath.Join(dir, "stats.jsonl")
+	globPattern := filepath.Join(dir, "events", "*.jsonl")
+
+	var stdout, stderr bytes.Buffer
+	code := runMain([]string{
+		"report",
+		"-events-glob", globPattern,
+		"-run-window", rwPath,
+		"-out", outReportPath,
+		"-md", mdPath,
+		"-stats-out", statsOutPath(statsPath),
+		"-validate",
+		"-footing", "warm",
+		"-min-reward-rate", "0.9",
+		"-min-tasks", "2",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %s)", code, stderr.String())
+	}
+
+	rawStats, err := os.ReadFile(statsPath)
+	if err != nil {
+		t.Fatalf("read stats.jsonl: %v", err)
+	}
+	if err := schema.ValidateJSONLAgainstJSONSchema("stats_row.schema.json", bytes.NewReader(rawStats)); err != nil {
+		t.Fatalf("stats.jsonl failed schema validation: %v", err)
+	}
+
+	// Verify -validate exits non-zero when rule fails (e.g., min-tasks=10).
+	stdout.Reset()
+	stderr.Reset()
+	code = runMain([]string{
+		"report",
+		"-events-glob", globPattern,
+		"-validate",
+		"-min-tasks", "10",
+	}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("expected non-zero exit code when -validate fails")
+	}
+
+	// Verify -compare with -thresholds pass and fail exit codes.
+	threshPassPath := filepath.Join(dir, "thresholds-pass.yaml")
+	if err := os.WriteFile(threshPassPath, []byte("max_latency_regression_pct: 50.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = runMain([]string{
+		"report",
+		"-in", outReportPath,
+		"-compare", outReportPath,
+		"-thresholds", threshPassPath,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected compare pass (exit 0), got %d (stderr: %s)", code, stderr.String())
+	}
+
+	// Create a baseline report with lower TTFI so candidate exceeds a 5% threshold.
+	baseReportPath := filepath.Join(dir, "base-report.json")
+	if err := os.WriteFile(baseReportPath, []byte(`{
+  "run": "base-run",
+  "tasks": 2,
+  "rewarded": 2,
+  "reward_rate": 1.0,
+  "stats": [
+    {"event": "ttfi", "count": 2, "p50_ms": 100.0, "p90_ms": 150.0, "p95_ms": 150.0, "max_ms": 150.0}
+  ]
+}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	threshFailPath := filepath.Join(dir, "thresholds-fail.yaml")
+	if err := os.WriteFile(threshFailPath, []byte("max_p50_regression_pct:\n  ttfi: 5.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = runMain([]string{
+		"report",
+		"-in", outReportPath,
+		"-compare", baseReportPath,
+		"-thresholds", threshFailPath,
+	}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("expected non-zero exit code when -thresholds detects regression")
+	}
+}
+
+func statsOutPath(p string) string { return p }

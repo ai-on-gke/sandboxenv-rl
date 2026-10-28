@@ -22,6 +22,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/agent-substrate/env/internal/benchmarking/schema"
 )
 
 func TestPercentile(t *testing.T) {
@@ -594,5 +596,88 @@ func TestSlowest(t *testing.T) {
 	rep.WriteText(&text)
 	if flat := strings.Join(strings.Fields(text.String()), " "); !strings.Contains(flat, "slowest first commands and wakes: event env instance step ms attempts ttfi e2 i2 0 30 2") {
 		t.Fatalf("slowest table:\n%s", text.String())
+	}
+}
+
+func TestBuildInterferenceSummaryMultiJob(t *testing.T) {
+	t0 := time.Date(2026, 10, 21, 10, 0, 0, 0, time.UTC)
+	events := []Event{
+		{Time: t0.Add(100 * time.Millisecond), RunID: "r", Job: "job-a", Event: EventCreate, DurMS: 50, OK: true, Source: "warm_pool"},
+		{Time: t0.Add(200 * time.Millisecond), RunID: "r", Job: "job-a", Event: EventTask, Step: 1, DurMS: 100, OK: true, Reward: intp(1)},
+		{Time: t0.Add(500 * time.Millisecond), RunID: "r", Job: "job-a", Event: EventBarrier, Step: 1, DurMS: 500, OK: true, Count: 1},
+		{Time: t0.Add(150 * time.Millisecond), RunID: "r", Job: "job-b", Event: EventCreate, DurMS: 60, OK: true, Source: "cold_start"},
+		{Time: t0.Add(250 * time.Millisecond), RunID: "r", Job: "job-b", Event: EventTask, Step: 1, DurMS: 120, OK: true, Reward: intp(1)},
+		{Time: t0.Add(450 * time.Millisecond), RunID: "r", Job: "job-b", Event: EventBarrier, Step: 1, DurMS: 400, OK: true, Count: 1},
+	}
+	rep := Build(events)
+	if rep.Interference == nil {
+		t.Fatal("expected non-nil Interference summary for overlapping multi-job steps")
+	}
+	if rep.Interference.OverlapWindowCount == 0 {
+		t.Fatalf("expected OverlapWindowCount > 0, got %+v", rep.Interference)
+	}
+	if rep.AcquisitionSources["warm_pool"] != 1 || rep.AcquisitionSources["cold_start"] != 1 {
+		t.Fatalf("unexpected AcquisitionSources: %+v", rep.AcquisitionSources)
+	}
+}
+
+func TestActiveVsPausedSandboxesAndConcurrencyCap(t *testing.T) {
+	t0 := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	events := []Event{
+		{Time: t0.Add(10 * time.Millisecond), RunID: "warm", Event: EventCreate, Env: "e1", Step: 1, DurMS: 50, OK: true},
+		{Time: t0.Add(20 * time.Millisecond), RunID: "warm", Event: EventCreate, Env: "e2", Step: 1, DurMS: 60, OK: true},
+		{Time: t0.Add(100 * time.Millisecond), RunID: "warm", Event: EventTask, Env: "e1", Step: 1, DurMS: 80, OK: true, Reward: intp(1)},
+		{Time: t0.Add(110 * time.Millisecond), RunID: "warm", Event: EventTask, Env: "e2", Step: 1, DurMS: 90, OK: true, Reward: intp(1)},
+		{Time: t0.Add(120 * time.Millisecond), RunID: "warm", Event: EventBarrier, Step: 1, DurMS: 120, OK: true, Count: 2, StandingPoolSize: 2},
+		{Time: t0.Add(140 * time.Millisecond), RunID: "warm", Event: EventSuspend, Env: "e1", Step: 1, DurMS: 20, OK: true, SizeMB: 128},
+		{Time: t0.Add(150 * time.Millisecond), RunID: "warm", Event: EventSuspend, Env: "e2", Step: 1, DurMS: 25, OK: true, SizeMB: 132},
+		{Time: t0.Add(160 * time.Millisecond), RunID: "warm", Event: EventPark, Name: "suspend-sync", Step: 1, DurMS: 30, OK: true, StandingPoolSize: 2},
+		{Time: t0.Add(200 * time.Millisecond), RunID: "warm", Event: EventWake, Env: "e1", Step: 2, DurMS: 15, OK: true},
+		{Time: t0.Add(210 * time.Millisecond), RunID: "warm", Event: EventTask, Env: "e1", Step: 2, DurMS: 70, OK: true, Reward: intp(1)},
+		{Time: t0.Add(220 * time.Millisecond), RunID: "warm", Event: EventBarrier, Step: 2, DurMS: 80, OK: true, Count: 1, StandingPoolSize: 2},
+		{Time: t0.Add(250 * time.Millisecond), RunID: "warm", Event: EventRun, Name: "steps", DurMS: 250, OK: true, StandingPoolSize: 2},
+	}
+	rep := Build(events)
+	if rep.PeakActiveSandboxes != 2 || rep.PeakParkedSandboxes != 2 {
+		t.Fatalf("unexpected peak active/paused sandboxes: active=%d paused=%d", rep.PeakActiveSandboxes, rep.PeakParkedSandboxes)
+	}
+	sys := &schema.SystemDescription{
+		SchemaVersion: schema.SchemaVersion,
+		Cluster:       "test-cluster",
+		SandboxFootprint: &schema.SandboxFootprint{
+			CPU:       2,
+			MemoryGiB: 6,
+		},
+	}
+	meas := &schema.Measurements{
+		SchemaVersion: schema.SchemaVersion,
+		ServerSummary: map[string]schema.MetricSummary{
+			"active_sandboxes":        {Count: 1, P50: 1},
+			"parked_sandboxes":        {Count: 1, P50: 1},
+			"total_sandboxes":         {Count: 1, P50: 2},
+			"worker_node_count":       {Count: 1, P50: 10},
+			"worker_allocatable_vcpu": {Count: 1, P50: 318.5},
+			"worker_allocatable_gib":  {Count: 1, P50: 1172.29},
+		},
+	}
+	rep.AttachClusterTelemetry(sys, meas)
+	if rep.HardwareCost == nil {
+		t.Fatal("expected non-nil HardwareCost")
+	}
+	if rep.HardwareCost.ActiveSandboxes != 1 || rep.HardwareCost.PausedSandboxes != 1 || rep.HardwareCost.ParkedSandboxes != 1 || rep.HardwareCost.TotalSandboxes != 2 {
+		t.Fatalf("unexpected active/paused/total sandboxes: %+v", rep.HardwareCost)
+	}
+	if rep.HardwareCost.PeakActiveSandboxes != 2 || rep.HardwareCost.PeakParkedSandboxes != 2 {
+		t.Fatalf("unexpected peak active/paused in HardwareCost: %+v", rep.HardwareCost)
+	}
+	// 10 nodes * min(floor(31.85/2)=15, floor(117.229/6)=19) = 150 concurrent sandboxes cap.
+	if rep.HardwareCost.MaxConcurrentSandboxesCap != 150 || sys.MaxConcurrentSandboxesCap != 150 {
+		t.Fatalf("unexpected MaxConcurrentSandboxesCap: hc=%d sys=%d, want 150", rep.HardwareCost.MaxConcurrentSandboxesCap, sys.MaxConcurrentSandboxesCap)
+	}
+	if len(rep.Steps) != 2 || rep.Steps[0].ActiveSandboxes != 2 || rep.Steps[0].PausedSandboxes != 2 {
+		t.Fatalf("unexpected step[0] active/paused sandboxes: %+v", rep.Steps)
+	}
+	if rep.LifecyclePolicy == nil || rep.LifecyclePolicy.Mode != "warm_pool" || rep.LifecyclePolicy.ParkMode != "suspend-sync" || rep.LifecyclePolicy.PerStepWarming != "wake_on_demand" {
+		t.Fatalf("unexpected LifecyclePolicy for warm run: %+v", rep.LifecyclePolicy)
 	}
 }

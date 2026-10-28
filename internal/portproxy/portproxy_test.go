@@ -16,11 +16,13 @@ package portproxy_test
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -29,7 +31,9 @@ import (
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/internaltest/fakerouter"
+	"github.com/agent-substrate/env/internal/internaltest/testcerts"
 	"github.com/agent-substrate/env/internal/portproxy"
+	"github.com/agent-substrate/env/internal/routertls"
 )
 
 // recordingRouter wraps the fake router and records each CONNECT's actor
@@ -778,5 +782,145 @@ func TestStripsEnvAuthorizationWithoutAuthenticate(t *testing.T) {
 	}
 	if v := seen.Header.Get("Authorization"); v != "Bearer daemon-key" {
 		t.Errorf("daemon saw Authorization %q, want it untouched", v)
+	}
+}
+
+// The router's CONNECT listener is TLS-only since Substrate v0.6.0: the proxy
+// presents the pod identity certificate and verifies the router.
+func TestConnectOverTLS(t *testing.T) {
+	ca := testcerts.NewAuthority(t, "test podcert")
+	rr := fakerouter.New()
+	addr, stop := rr.ServeTLS(&tls.Config{
+		Certificates: []tls.Certificate{ca.Server(t, "atenet-router.ate-system.svc")},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    ca.Pool(),
+	})
+	t.Cleanup(stop)
+	rr.RegisterPort("env1", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "hello over tls")
+	}))
+	dir := t.TempDir()
+	cfg, err := routertls.Options{
+		CredentialBundleFile: testcerts.WriteFile(t, dir, "bundle.pem", ca.ClientBundle(t, routertls.SPIFFEID("ate-env", "ate-env-api"))),
+		TrustBundleFile:      testcerts.WriteFile(t, dir, "trust.pem", ca.PEM),
+		ServerName:           "atenet-router.ate-system.svc",
+	}.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := mustNew(t, portproxy.Options{ConnectAddr: addr, TLS: cfg, DefaultAtespace: "ate-env", HandshakeTimeout: 5 * time.Second})
+	proxy := httptest.NewServer(portproxy.Dispatch(p, http.NotFoundHandler()))
+	t.Cleanup(proxy.Close)
+
+	resp, err := http.Get(proxy.URL + "/v1alpha/envs/env1/ports/8000/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "hello over tls" {
+		t.Fatalf("got %d %q", resp.StatusCode, body)
+	}
+
+	// Without TLS the proxy sends a plaintext CONNECT to the TLS listener,
+	// which Go's TLS server answers with HTTP 400; the proxy maps that to
+	// 502, not a hang.
+	plain := mustNew(t, portproxy.Options{ConnectAddr: addr, DefaultAtespace: "ate-env", HandshakeTimeout: 5 * time.Second})
+	proxy2 := httptest.NewServer(portproxy.Dispatch(plain, http.NotFoundHandler()))
+	t.Cleanup(proxy2.Close)
+	resp, err = http.Get(proxy2.URL + "/v1alpha/envs/env1/ports/8000/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode < 500 {
+		t.Fatalf("plaintext to a TLS router: got %d, want a 5xx", resp.StatusCode)
+	}
+}
+
+// A router whose allow-list lacks the API's identity turns the certificate
+// away after the handshake; the proxy answers 502 and names the setting.
+func TestConnectRejectedCertificate(t *testing.T) {
+	ca := testcerts.NewAuthority(t, "test podcert")
+	rr := fakerouter.New()
+	addr, stop := rr.ServeTLS(&tls.Config{
+		Certificates:          []tls.Certificate{ca.Server(t, "atenet-router.ate-system.svc")},
+		ClientAuth:            tls.RequireAndVerifyClientCert,
+		ClientCAs:             ca.Pool(),
+		VerifyPeerCertificate: testcerts.Allow(routertls.SPIFFEID("ate-env", "someone-else")),
+	})
+	t.Cleanup(stop)
+	rr.RegisterPort("env1", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "unreachable")
+	}))
+	dir := t.TempDir()
+	cfg, err := routertls.Options{
+		CredentialBundleFile: testcerts.WriteFile(t, dir, "bundle.pem", ca.ClientBundle(t, routertls.SPIFFEID("ate-env", "ate-env-api"))),
+		TrustBundleFile:      testcerts.WriteFile(t, dir, "trust.pem", ca.PEM),
+		ServerName:           "atenet-router.ate-system.svc",
+	}.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := mustNew(t, portproxy.Options{ConnectAddr: addr, TLS: cfg, DefaultAtespace: "ate-env", HandshakeTimeout: 5 * time.Second, WakeBudget: 30 * time.Second})
+	proxy := httptest.NewServer(portproxy.Dispatch(p, http.NotFoundHandler()))
+	t.Cleanup(proxy.Close)
+
+	start := time.Now()
+	resp, err := http.Get(proxy.URL + "/v1alpha/envs/env1/ports/8000/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(string(body), "ATE_INGRESS_ALLOWED_SPIFFE_IDS") {
+		t.Fatalf("got %d %q, want 502 naming the allow-list setting", resp.StatusCode, body)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("took %s; the wake budget must not apply to a rejected certificate", elapsed)
+	}
+}
+
+// OnConnected fires once per accepted CONNECT, after the wake, with the
+// environment's atespace and id; refused CONNECTs do not fire it.
+func TestOnConnectedFiresAfterTheWake(t *testing.T) {
+	rr := &recordingRouter{Router: fakerouter.New()}
+	srv := httptest.NewServer(rr)
+	t.Cleanup(srv.Close)
+	var mu sync.Mutex
+	var got []string
+	p := mustNew(t, portproxy.Options{
+		ConnectAddr:      strings.TrimPrefix(srv.URL, "http://"),
+		DefaultAtespace:  "ate-env",
+		HandshakeTimeout: 5 * time.Second,
+		WakeBudget:       2 * time.Second,
+		OnConnected: func(atespace, id string) {
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, atespace+"/"+id)
+		},
+	})
+	proxy := httptest.NewServer(p)
+	t.Cleanup(proxy.Close)
+	s := &setup{router: rr, proxy: proxy}
+
+	s.router.RegisterPort("waking", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "awake") }))
+	refusals := 0
+	s.router.Running = func(id string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if refusals < 2 {
+			refusals++
+			return false
+		}
+		return true
+	}
+	if resp, _ := s.do(t, http.MethodGet, "/", "", target("waking", 8000)); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d, want 200 after the wake", resp.StatusCode)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"ate-env/waking"}; !slices.Equal(got, want) {
+		t.Errorf("OnConnected calls = %v, want %v (once, after two refused CONNECTs)", got, want)
 	}
 }

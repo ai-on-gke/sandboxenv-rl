@@ -42,6 +42,7 @@ const (
 	EnvironmentService_GetEnvironment_FullMethodName     = "/ateenv.v1alpha.EnvironmentService/GetEnvironment"
 	EnvironmentService_SuspendEnvironment_FullMethodName = "/ateenv.v1alpha.EnvironmentService/SuspendEnvironment"
 	EnvironmentService_DeleteEnvironment_FullMethodName  = "/ateenv.v1alpha.EnvironmentService/DeleteEnvironment"
+	EnvironmentService_GetServerInfo_FullMethodName      = "/ateenv.v1alpha.EnvironmentService/GetServerInfo"
 )
 
 // EnvironmentServiceClient is the client API for EnvironmentService service.
@@ -58,6 +59,10 @@ type EnvironmentServiceClient interface {
 	SuspendEnvironment(ctx context.Context, in *SuspendEnvironmentRequest, opts ...grpc.CallOption) (*SuspendEnvironmentResponse, error)
 	// DeleteEnvironment permanently removes an environment and its associated resources.
 	DeleteEnvironment(ctx context.Context, in *DeleteEnvironmentRequest, opts ...grpc.CallOption) (*DeleteEnvironmentResponse, error)
+	// GetServerInfo reports which server implementation answers, its version, and
+	// the optional features it serves, so a client can check them before it
+	// depends on them.
+	GetServerInfo(ctx context.Context, in *GetServerInfoRequest, opts ...grpc.CallOption) (*GetServerInfoResponse, error)
 }
 
 type environmentServiceClient struct {
@@ -108,6 +113,16 @@ func (c *environmentServiceClient) DeleteEnvironment(ctx context.Context, in *De
 	return out, nil
 }
 
+func (c *environmentServiceClient) GetServerInfo(ctx context.Context, in *GetServerInfoRequest, opts ...grpc.CallOption) (*GetServerInfoResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetServerInfoResponse)
+	err := c.cc.Invoke(ctx, EnvironmentService_GetServerInfo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // EnvironmentServiceServer is the server API for EnvironmentService service.
 // All implementations must embed UnimplementedEnvironmentServiceServer
 // for forward compatibility.
@@ -122,6 +137,10 @@ type EnvironmentServiceServer interface {
 	SuspendEnvironment(context.Context, *SuspendEnvironmentRequest) (*SuspendEnvironmentResponse, error)
 	// DeleteEnvironment permanently removes an environment and its associated resources.
 	DeleteEnvironment(context.Context, *DeleteEnvironmentRequest) (*DeleteEnvironmentResponse, error)
+	// GetServerInfo reports which server implementation answers, its version, and
+	// the optional features it serves, so a client can check them before it
+	// depends on them.
+	GetServerInfo(context.Context, *GetServerInfoRequest) (*GetServerInfoResponse, error)
 	mustEmbedUnimplementedEnvironmentServiceServer()
 }
 
@@ -143,6 +162,9 @@ func (UnimplementedEnvironmentServiceServer) SuspendEnvironment(context.Context,
 }
 func (UnimplementedEnvironmentServiceServer) DeleteEnvironment(context.Context, *DeleteEnvironmentRequest) (*DeleteEnvironmentResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DeleteEnvironment not implemented")
+}
+func (UnimplementedEnvironmentServiceServer) GetServerInfo(context.Context, *GetServerInfoRequest) (*GetServerInfoResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetServerInfo not implemented")
 }
 func (UnimplementedEnvironmentServiceServer) mustEmbedUnimplementedEnvironmentServiceServer() {}
 func (UnimplementedEnvironmentServiceServer) testEmbeddedByValue()                            {}
@@ -237,6 +259,24 @@ func _EnvironmentService_DeleteEnvironment_Handler(srv interface{}, ctx context.
 	return interceptor(ctx, in, info, handler)
 }
 
+func _EnvironmentService_GetServerInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetServerInfoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EnvironmentServiceServer).GetServerInfo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EnvironmentService_GetServerInfo_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EnvironmentServiceServer).GetServerInfo(ctx, req.(*GetServerInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // EnvironmentService_ServiceDesc is the grpc.ServiceDesc for EnvironmentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -259,6 +299,10 @@ var EnvironmentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DeleteEnvironment",
 			Handler:    _EnvironmentService_DeleteEnvironment_Handler,
+		},
+		{
+			MethodName: "GetServerInfo",
+			Handler:    _EnvironmentService_GetServerInfo_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

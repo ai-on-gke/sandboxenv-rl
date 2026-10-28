@@ -16,10 +16,12 @@ package main
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/agent-substrate/env/internal/apiservice"
+	"github.com/agent-substrate/env/internal/hostcheck"
 	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	appsv1 "k8s.io/api/apps/v1"
@@ -185,25 +187,44 @@ func TestBuildActorTemplate(t *testing.T) {
 	if probe.GetHttpGet() == nil || probe.GetHttpGet().GetPath() != "/readyz" || probe.GetHttpGet().GetPort() != 80 {
 		t.Errorf("wakeupProbe = %+v, want HTTP GET /readyz on port 80", probe)
 	}
-	// Substrate rejects an ActorTemplate without both limits (substrate#2285).
-	if got := limits(template); got["cpu"] != defaultActorCPU || got["memory"] != defaultActorMemory || len(got) != 2 {
-		t.Errorf("resources.limits = %v, want cpu=%s memory=%s", got, defaultActorCPU, defaultActorMemory)
+	// Substrate rejects an ActorTemplate without both limits (substrate#2285);
+	// since v0.6.0 they are integers: millicores and bytes.
+	if cpu, mem := limits(template); cpu != 2000 || mem != 4<<30 {
+		t.Errorf("resources.limits = %d millicores, %d bytes; want 2000 and %d (the %s / %s defaults)", cpu, mem, 4<<30, defaultActorCPU, defaultActorMemory)
 	}
 }
 
-func limits(tmpl *ateapipb.ActorTemplate) map[string]string {
-	m := map[string]string{}
-	for _, l := range tmpl.GetResources().GetLimits() {
-		m[l.GetName()] = l.GetQuantity()
-	}
-	return m
+func limits(tmpl *ateapipb.ActorTemplate) (cpuMillicores, memoryBytes int64) {
+	l := tmpl.GetResources().GetLimits()
+	return l.GetCpuMillicores(), l.GetMemoryBytes()
 }
 
 func TestBuildActorTemplateResources(t *testing.T) {
 	cfg := testTemplateConfig()
 	cfg.cpu, cfg.memory = "500m", "1Gi"
-	if got := limits(buildActorTemplate(cfg)); got["cpu"] != "500m" || got["memory"] != "1Gi" {
-		t.Errorf("resources.limits = %v, want cpu=500m memory=1Gi", got)
+	if cpu, mem := limits(buildActorTemplate(cfg)); cpu != 500 || mem != 1<<30 {
+		t.Errorf("resources.limits = %d millicores, %d bytes; want 500 and %d", cpu, mem, 1<<30)
+	}
+}
+
+func TestResourceLimitsRoundUp(t *testing.T) {
+	for _, tc := range []struct {
+		cpu, memory string
+		millicores  int64
+		bytes       int64
+	}{
+		{"1.5", "1.5Gi", 1500, 1610612736},
+		{"999.999", "1G", 999999, 1000000000},
+		{"2", "4Gi", 2000, 4 << 30},
+		// A fraction of a millicore or of a byte rounds up to one; the
+		// flag validation keeps such values out, the conversion stays total.
+		{"100u", "0.5", 1, 1},
+	} {
+		l := resourceLimits(tc.cpu, tc.memory).GetLimits()
+		if l.GetCpuMillicores() != tc.millicores || l.GetMemoryBytes() != tc.bytes {
+			t.Errorf("resourceLimits(%q, %q) = %d millicores, %d bytes; want %d, %d",
+				tc.cpu, tc.memory, l.GetCpuMillicores(), l.GetMemoryBytes(), tc.millicores, tc.bytes)
+		}
 	}
 }
 
@@ -213,13 +234,16 @@ func TestTemplateConfigRejectsBadResources(t *testing.T) {
 		{"", "4GB!"},
 		{"0", ""},
 		{"", "-1Gi"},
-		// Substrate's bounds: cpu below 1000 cores, memory an int64 byte
-		// count, each quantity at most 32 characters.
+		// env's bounds: cpu from 1m below 1000 cores, memory from 1Mi to an
+		// int64 byte count. 512m is millibytes, the typo for 512Mi.
 		{"1000", ""},
 		{"1e3", ""},
 		{"999.9991", ""},
 		{"", "9223372036854775808"},
 		{"0.0000000000000000000000000000001", ""},
+		{"100u", ""},
+		{"", "512m"},
+		{"", "512Ki"},
 	} {
 		cfg := testTemplateConfig()
 		cfg.cpu, cfg.memory = tc.cpu, tc.memory
@@ -377,7 +401,8 @@ func TestManifestTemplateCommandExecution(t *testing.T) {
 	if !strings.Contains(out, "image: example.com/guest@sha256:aaaa") || !strings.Contains(out, "storageLocation: gs://bucket/prefix/") {
 		t.Errorf("expected guest image and storage location in output:\n%s", out)
 	}
-	for _, want := range []string{"name: cpu\n    quantity: \"4\"", "name: memory\n    quantity: 8Gi"} {
+	// --cpu 4 --memory 8Gi render as Substrate's integer limits.
+	for _, want := range []string{"cpuMillicores: \"4000\"", "memoryBytes: \"8589934592\""} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
 		}
@@ -650,6 +675,105 @@ func TestBuildAPIDeploymentNoAuthTokenSecret(t *testing.T) {
 	}
 }
 
+// By default the API deployment carries no telemetry flags, env or ports:
+// the manifest is what it was before telemetry existed.
+func TestBuildManifestsTelemetryOffByDefault(t *testing.T) {
+	objs := buildManifests(testManifestConfig())
+	deployment := objs[3].(*appsv1.Deployment)
+	c := deployment.Spec.Template.Spec.Containers[0]
+	for _, a := range c.Args {
+		if strings.Contains(a, "tracing") || strings.Contains(a, "metrics") {
+			t.Errorf("default args carry %q", a)
+		}
+	}
+	// POD_NAMESPACE is always set (for the Host check); no OTEL_* variable is.
+	for _, e := range c.Env {
+		if strings.HasPrefix(e.Name, "OTEL_") {
+			t.Errorf("default container env carries %s", e.Name)
+		}
+	}
+	if len(c.Ports) != 1 || len(deployment.Spec.Template.Annotations) != 0 {
+		t.Errorf("default container ports %v, pod annotations %v; want the API port, none", c.Ports, deployment.Spec.Template.Annotations)
+	}
+}
+
+// The telemetry flags render --enable-tracing, --metrics-listen-addr, the
+// OTLP env, a "metrics" container and Service port, and scrape annotations.
+func TestBuildManifestsTelemetry(t *testing.T) {
+	cfg := testManifestConfig()
+	cfg.enableTracing = true
+	cfg.otlpEndpoint = "http://otel-collector.ate-env-telemetry:4317"
+	cfg.otlpInsecure = true
+	cfg.metricsPort = 9090
+	objs := buildManifests(cfg)
+
+	deployment := objs[3].(*appsv1.Deployment)
+	c := deployment.Spec.Template.Spec.Containers[0]
+	args := strings.Join(c.Args, " ")
+	for _, want := range []string{"-enable-tracing", "-metrics-listen-addr=:9090", "-listen 0.0.0.0:7777"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("args %q lack %q", args, want)
+		}
+	}
+	env := map[string]string{}
+	for _, e := range c.Env {
+		env[e.Name] = e.Value
+	}
+	if env["OTEL_EXPORTER_OTLP_ENDPOINT"] != cfg.otlpEndpoint || env["OTEL_EXPORTER_OTLP_INSECURE"] != "true" {
+		t.Errorf("env = %v, want the OTLP endpoint and insecure=true", env)
+	}
+	if len(c.Ports) != 2 || c.Ports[1].Name != "metrics" || c.Ports[1].ContainerPort != 9090 {
+		t.Errorf("container ports = %+v, want the API port and metrics 9090", c.Ports)
+	}
+	ann := deployment.Spec.Template.Annotations
+	if ann["prometheus.io/scrape"] != "true" || ann["prometheus.io/port"] != "9090" || ann["prometheus.io/path"] != "/metrics" {
+		t.Errorf("pod annotations = %v, want prometheus.io scrape on 9090 /metrics", ann)
+	}
+
+	service := objs[4].(*corev1.Service)
+	if len(service.Spec.Ports) != 2 {
+		t.Fatalf("service ports = %+v, want api and metrics", service.Spec.Ports)
+	}
+	api, metrics := service.Spec.Ports[0], service.Spec.Ports[1]
+	if api.Name != "api" || api.Port != 7777 {
+		t.Errorf("service api port = %+v, want api 7777", api)
+	}
+	if metrics.Name != "metrics" || metrics.Port != 9090 || metrics.TargetPort.String() != "metrics" {
+		t.Errorf("service metrics port = %+v, want metrics 9090 -> metrics", metrics)
+	}
+}
+
+func TestManifestCommandTelemetryFlags(t *testing.T) {
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{
+		"--api-image=example.com/api@sha256:cccc",
+		"--worker-image=example.com/worker@sha256:bbbb",
+		"--enable-tracing",
+		"--otlp-endpoint=http://otel-collector.ate-env-telemetry:4317",
+		"--otlp-insecure",
+		"--metrics-port=9090",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute manifest: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"- -enable-tracing",
+		"- -metrics-listen-addr=:9090",
+		"name: OTEL_EXPORTER_OTLP_ENDPOINT",
+		"value: http://otel-collector.ate-env-telemetry:4317",
+		"name: OTEL_EXPORTER_OTLP_INSECURE",
+		"name: metrics",
+		"prometheus.io/scrape: \"true\"",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("manifest lacks %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestBuildAPIDeploymentAuthTokenSecret(t *testing.T) {
 	cfg := testManifestConfig()
 	cfg.authTokenSecret = "ate-env-caller-token"
@@ -688,5 +812,143 @@ func TestBuildAPIDeploymentAuthTokenSecret(t *testing.T) {
 	}
 	if !foundVol {
 		t.Errorf("volumes = %+v, want Secret volume for ate-env-caller-token", dep.Spec.Template.Spec.Volumes)
+	}
+}
+
+// allowedHostsArg returns the value of the -allowed-hosts argument, or "" if
+// the deployment has none.
+func allowedHostsArg(dep *appsv1.Deployment) (string, bool) {
+	for _, a := range dep.Spec.Template.Spec.Containers[0].Args {
+		if v, ok := strings.CutPrefix(a, "-allowed-hosts="); ok {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+func TestBuildAPIDeploymentAllowedHosts(t *testing.T) {
+	cfg := testManifestConfig()
+	dep := buildAPIDeployment(cfg)
+	c := dep.Spec.Template.Spec.Containers[0]
+	// ate-env-api derives the Service names itself (in the cluster's own
+	// domain); the manifest names the Service and passes the namespace.
+	if !slices.Contains(c.Args, "-service-name="+apiName) {
+		t.Errorf("args = %v, want -service-name=%s", c.Args, apiName)
+	}
+	if got, ok := allowedHostsArg(dep); ok {
+		t.Errorf("-allowed-hosts=%q rendered without --api-allowed-hosts, want none", got)
+	}
+	ns := false
+	for _, e := range c.Env {
+		if e.Name == "POD_NAMESPACE" && e.ValueFrom != nil && e.ValueFrom.FieldRef != nil && e.ValueFrom.FieldRef.FieldPath == "metadata.namespace" {
+			ns = true
+		}
+	}
+	if !ns {
+		t.Errorf("env = %+v, want POD_NAMESPACE from metadata.namespace", c.Env)
+	}
+
+	cfg.allowedHosts = []string{"lb.internal.example", "*.corp.example"}
+	got, _ := allowedHostsArg(buildAPIDeployment(cfg))
+	checker, err := hostcheck.New(hostcheck.ParseList(got))
+	if err != nil {
+		t.Fatalf("rendered -allowed-hosts=%q does not parse: %v", got, err)
+	}
+	for _, host := range []string{"lb.internal.example", "api.corp.example:7777"} {
+		if !checker.Allowed(host) {
+			t.Errorf("rendered -allowed-hosts=%q refuses %q", got, host)
+		}
+	}
+}
+
+func TestManifestCommandAPIAllowedHosts(t *testing.T) {
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{
+		"--api-image=example.com/api@sha256:cccc",
+		"--worker-image=example.com/worker@sha256:bbbb",
+		"--api-allowed-hosts=lb.internal.example,*.corp.example",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute manifest: %v", err)
+	}
+	if want := "-allowed-hosts=lb.internal.example,*.corp.example"; !strings.Contains(buf.String(), want) {
+		t.Errorf("manifest output lacks %q:\n%s", want, buf.String())
+	}
+
+	cmd = newManifestCommand()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{
+		"--api-image=example.com/api@sha256:cccc",
+		"--worker-image=example.com/worker@sha256:bbbb",
+		"--api-allowed-hosts=http://lb.internal.example:7777",
+	})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--api-allowed-hosts") {
+		t.Errorf("a URL in --api-allowed-hosts: err = %v, want an --api-allowed-hosts error", err)
+	}
+}
+
+func TestBuildAPIDeploymentRouterTLS(t *testing.T) {
+	cfg := testManifestConfig()
+	cfg.routerTLS = true
+	dep := buildAPIDeployment(cfg)
+	c := dep.Spec.Template.Spec.Containers[0]
+	args := strings.Join(c.Args, " ")
+	for _, want := range []string{"-atenet-client-cert=" + routerCredentialBundlePath, "-atenet-ca-file=" + routerTrustBundlePath} {
+		if !strings.Contains(args, want) {
+			t.Errorf("args %v lack %q", c.Args, want)
+		}
+	}
+	mounts := map[string]string{}
+	for _, m := range c.VolumeMounts {
+		mounts[m.Name] = m.MountPath
+	}
+	if mounts["podidentity"] != "/run/podidentity.podcert.ate.dev" || mounts["servicedns-ca"] != "/run/servicedns-ca" {
+		t.Errorf("mounts = %v", mounts)
+	}
+	var pod, trust bool
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Projected == nil || len(v.Projected.Sources) != 1 {
+			continue
+		}
+		src := v.Projected.Sources[0]
+		switch {
+		case v.Name == "podidentity" && src.PodCertificate != nil:
+			pc := src.PodCertificate
+			pod = pc.SignerName == "podidentity.podcert.ate.dev/identity" && pc.KeyType == "ECDSAP256" && pc.CredentialBundlePath == "credential-bundle.pem"
+		case v.Name == "servicedns-ca" && src.ClusterTrustBundle != nil:
+			tb := src.ClusterTrustBundle
+			trust = tb.SignerName != nil && *tb.SignerName == "servicedns.podcert.ate.dev/identity" && tb.Path == "trust-bundle.pem" &&
+				tb.LabelSelector != nil && tb.LabelSelector.MatchLabels["podcert.ate.dev/canarying"] == "live"
+		}
+	}
+	if !pod || !trust {
+		t.Errorf("volumes = %+v; pod certificate ok %v, trust bundle ok %v", dep.Spec.Template.Spec.Volumes, pod, trust)
+	}
+
+	cfg.routerTLS = false
+	dep = buildAPIDeployment(cfg)
+	c = dep.Spec.Template.Spec.Containers[0]
+	if strings.Contains(strings.Join(c.Args, " "), "-atenet-client-cert") {
+		t.Errorf("args %v: want no router TLS flags when off", c.Args)
+	}
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Name == "podidentity" || v.Name == "servicedns-ca" {
+			t.Errorf("volume %s present with router TLS off", v.Name)
+		}
+	}
+}
+
+func TestManifestRejectsBadMetricsPort(t *testing.T) {
+	for _, port := range []string{"--metrics-port=7777", "--metrics-port=70000", "--metrics-port=-1"} {
+		cmd := newManifestCommand()
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs([]string{"--api-image=example.com/api@sha256:cccc", "--worker-image=example.com/worker@sha256:bbbb", port})
+		if err := cmd.Execute(); err == nil {
+			t.Errorf("%s: manifest succeeded, want an error", port)
+		}
 	}
 }

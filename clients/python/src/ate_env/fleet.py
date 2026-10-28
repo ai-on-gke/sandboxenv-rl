@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import collections
+import dataclasses
 import logging
 import threading
 import uuid
@@ -24,11 +25,11 @@ from typing import Any
 from .backend.base import BackendDriver
 from .backend.mock import MockBackendDriver
 from .backend.substrate import SubstrateBackendDriver
-from .config import FleetConfig
+from .config import ALLOWED_BACKENDS, FleetConfig, TracerConfig
 from .handle import SandboxHandle
+from .observability import Observer, RunReport, repo_family
 from .runtime.base import RuntimeGuestHook
 from .strategies import STRATEGIES
-from .telemetry.tracing import tracer_from_config
 from .types import (
     DataPlaneEndpoint,
     FleetPlan,
@@ -40,6 +41,28 @@ from .types import (
 logger = logging.getLogger("ate_env.fleet")
 
 
+def _dict_task_id(item: dict[str, Any], index: int) -> str:
+    """The id of a task given as a dict: its ``task_id``, else its ``id``.
+
+    A dict with neither (or only empty values) is refused. A made-up id
+    would name the row's position, not the row: the same id would mean
+    another task in another process of the job, after a reload or after a
+    reorder, and a misspelled key would go unnoticed. ``acquire`` by id,
+    results and reports need ids that come from the data.
+    """
+    for key in ("task_id", "id"):
+        value = item.get(key)
+        if value is not None and value != "":
+            return str(value)
+    keys = ", ".join(sorted(map(str, item))[:10]) or "none"
+    raise ValueError(
+        f"Task dict at index {index} has no 'task_id' or 'id' (its keys: {keys}). "
+        "Give each task a stable id from your data: pass Task(id=..., image=...), "
+        "or add an 'id' key, for example from 'instance_id' (SWE-bench) or "
+        "'repo_name' and 'commit_hash' (R2E-Gym)."
+    )
+
+
 class SandboxFleet:
     """Unified Sandbox Fleet Orchestrator.
 
@@ -49,13 +72,38 @@ class SandboxFleet:
 
     def __init__(self, config: FleetConfig | None = None, driver: BackendDriver | None = None):
         self.config = config or FleetConfig()
-        self.run_id = uuid.uuid4().hex[:12]
+        self.run_id = self.config.run_id or uuid.uuid4().hex[:12]
         self._tasks: list[Task] = []
+        self._task_ids: set[str] = set()
         self._image_to_template: dict[str, tuple[str, str | None]] = {}
         self._plan: FleetPlan | None = None
         self._lock = threading.Lock()
-        # Tracing (FleetConfig.tracing): spans on handles and the Substrate driver.
-        self._tracer = tracer_from_config(self.config.tracing)
+        # Serializes plan recomputation, so concurrent add_tasks calls leave
+        # the plan of the last call, which saw every task added before it.
+        self._plan_lock = threading.Lock()
+
+        # Telemetry. Either FleetConfig.tracing or observability.enable_tracing
+        # turns on tracing for the whole fleet under one service name, so
+        # ate_env_fleet.* spans parent ate_env_client.* spans in one trace.
+        obs_cfg = self.config.observability
+        tracing_on = self.config.tracing.enable_tracing or obs_cfg.enable_tracing
+        service = (obs_cfg.trace_service_name if obs_cfg.enable_tracing
+                   else self.config.tracing.trace_service_name)
+        if (obs_cfg.enable_tracing and self.config.tracing.enable_tracing
+                and self.config.tracing.trace_service_name != service):
+            logger.debug(
+                "Both tracing switches are on: service name %r from "
+                "ObservabilityConfig.trace_service_name replaces %r from "
+                "TracerConfig.trace_service_name", service,
+                self.config.tracing.trace_service_name)
+        self._tracer_config = TracerConfig(enable_tracing=tracing_on, trace_service_name=service)
+        self._obs = Observer(dataclasses.replace(
+            obs_cfg, enable_tracing=tracing_on, trace_service_name=service
+        ))
+        # The Observer was built from the same switch and service name, so its
+        # tracer (None when tracing is off) is the fleet's; no second tracer.
+        self._tracer = self._obs.tracer
+        self.report: RunReport | None = None  # set by run()
 
         # Initialize Backend Driver
         if driver is not None:
@@ -74,10 +122,31 @@ class SandboxFleet:
                 labels=self.config.labels,
                 acquire_timeout_s=self.config.acquire_timeout_s,
                 ready_timeout_s=self.config.ready_timeout_s,
-                tracer_config=self.config.tracing,
+                tracer_config=self._tracer_config,
+                connections=self.config.connections or -(-self.config.max_concurrent // 200),
             )
         else:
             raise NotImplementedError(f"Backend '{self.config.backend}' is not yet supported or requires extras")
+
+        name = getattr(self.backend, "backend_name", None)
+        self.backend_label = name if name in ALLOWED_BACKENDS else self.config.backend
+        # A driver belongs to one fleet: its claim and warm events go to the
+        # observer of the fleet that set it last.
+        previous = getattr(self.backend, "observer", None)
+        if previous is not None and previous is not self._obs:
+            logger.warning(
+                "Backend driver %r already belongs to another fleet; its claim and "
+                "warm-replica events now go to this fleet's report and series. "
+                "Use one driver per fleet.", type(self.backend).__name__)
+        try:
+            self.backend.observer = self._obs
+        except AttributeError:  # a driver that refuses new attributes
+            pass
+
+    @property
+    def observer(self) -> Observer:
+        """The fleet's Observer (phases, tasks, claims, warm replicas)."""
+        return self._obs
 
     def __enter__(self) -> SandboxFleet:
         return self
@@ -107,40 +176,129 @@ class SandboxFleet:
 
     @property
     def tasks(self) -> list[Task]:
-        return self._tasks
+        """A snapshot of the fleet's tasks.
+
+        A copy, so a ``run()`` (or any caller) that iterates it is not
+        affected by ``add_tasks`` calls made meanwhile: tasks added during a
+        ``run()`` are not run by that run.
+        """
+        with self._lock:
+            return list(self._tasks)
 
     def load_tasks(self, tasks: list[Any]) -> None:
-        """Load tasks into the fleet (supports list of Task or dicts)."""
+        """Load tasks into the fleet (supports list of Task or dicts).
+
+        Replaces the tasks loaded before; ``add_tasks`` appends instead. If
+        ``plan()`` has run, the plan is recomputed for the new tasks.
+
+        A dict needs ``image`` and a non-empty ``task_id`` or ``id``; its
+        other keys go to ``Task.metadata``.
+
+        Raises ValueError, and keeps the tasks loaded before, if a task id
+        repeats within ``tasks`` or a dict has no ``task_id`` or ``id``: like
+        ``add_tasks``, ``acquire`` by id must resolve to one task.
+        """
+        normalized = self._normalize_tasks(tasks)
+        repeated = self._repeated_ids(normalized)
+        if repeated:
+            raise ValueError(f"Task ids repeated: {repeated}")
+        with self._lock:
+            self._tasks = normalized
+            self._task_ids = {t.id for t in normalized}
+        self._replan_if_planned()
+        logger.info("Fleet loaded %d tasks (%d unique images)",
+                    len(normalized), len(self.image_counts()))
+
+    def add_tasks(self, tasks: list[Any]) -> list[Task]:
+        """Append tasks to the fleet and extend the plan with their images.
+
+        For a job whose task list grows while it runs: a worker that is handed
+        an episode the orchestrator did not plan, or a trainer that streams
+        batches from a prompt source. Takes the same items as ``load_tasks``
+        and returns them as ``Task`` objects. If ``plan()`` has run, the plan
+        is recomputed so ``plan.for_image()`` covers the new images; nothing
+        is warmed, call ``warm_images`` for that. A ``run()`` in progress
+        does not run the added tasks. Safe to call from several threads.
+
+        Raises ValueError, and adds nothing, if a task id is already in the
+        fleet or repeats within ``tasks``: ``acquire`` by id must resolve to
+        one task.
+        """
+        new = self._normalize_tasks(tasks)
+        if not new:
+            return new
+        ids = [t.id for t in new]
+        with self._lock:
+            dupes = sorted(set(self._repeated_ids(new)) | (set(ids) & self._task_ids))
+            if dupes:
+                raise ValueError(f"Task ids already in the fleet or repeated: {dupes}")
+            self._tasks.extend(new)
+            self._task_ids.update(ids)
+            total = len(self._tasks)
+        self._replan_if_planned()
+        logger.debug("Fleet added %d tasks (%d total)", len(new), total)
+        return new
+
+    @staticmethod
+    def _repeated_ids(tasks: list[Task]) -> list[str]:
+        counts = collections.Counter(t.id for t in tasks)
+        return sorted(i for i, n in counts.items() if n > 1)
+
+    def _replan_if_planned(self) -> None:
+        """Recompute the plan if ``plan()`` has run, after a task change.
+
+        The decision reads ``_plan`` under ``_plan_lock``, which is the lock
+        that writes it: a ``plan()`` that took its snapshot of the tasks
+        before the change finishes first, and then this recomputes it with
+        the change. ``_lock`` is not held here, so the lock order is the one
+        of ``plan()`` (``_plan_lock``, then ``_lock`` inside
+        ``image_counts``).
+        """
+        with self._plan_lock:
+            if self._plan is not None:
+                self._plan_entries_locked()
+
+    @staticmethod
+    def _normalize_tasks(tasks: list[Any]) -> list[Task]:
         normalized: list[Task] = []
-        for t in tasks:
+        for i, t in enumerate(tasks):
             if isinstance(t, Task):
                 normalized.append(t)
             elif isinstance(t, dict):
                 normalized.append(Task(
-                    id=str(t.get("task_id") or t.get("id")),
+                    id=_dict_task_id(t, i),
                     image=t["image"],
                     metadata=t,
                     template=t.get("template"),
                 ))
             else:
                 raise ValueError(f"Unsupported task item type: {type(t)}")
-        self._tasks = normalized
-        logger.info("Fleet loaded %d tasks (%d unique images)",
-                    len(self._tasks), len(self.image_counts()))
+        return normalized
 
     def image_counts(self) -> dict[str, int]:
         """Return task count per unique image."""
         counts: dict[str, int] = collections.defaultdict(int)
-        for t in self._tasks:
+        with self._lock:
+            tasks = list(self._tasks)
+        for t in tasks:
             counts[t.image] += 1
         return dict(counts)
 
     def preflight(self) -> None:
         """Run backend connectivity, permissions, and capacity checks."""
-        self.backend.preflight()
+        with self._obs.phase("preflight", backend=self.backend_label):
+            self.backend.preflight()
 
     def plan(self) -> FleetPlan:
         """Compute provisioning sizing for all tasks."""
+        with self._obs.phase("plan", backend=self.backend_label):
+            return self._plan_entries()
+
+    def _plan_entries(self) -> FleetPlan:
+        with self._plan_lock:
+            return self._plan_entries_locked()
+
+    def _plan_entries_locked(self) -> FleetPlan:
         entries: list[PlanEntry] = []
         counts = self.image_counts()
         for img, task_count in counts.items():
@@ -165,19 +323,24 @@ class SandboxFleet:
         plan = self.plan()
         for entry in plan.entries:
             if entry.replicas > 0:
-                self.backend.warm_pool(
-                    entry.template_id,
-                    entry.replicas,
-                    wait=True,
-                    rootfs_image=getattr(entry, "rootfs_image", None),
-                )
+                with self._obs.phase("warm_pool", backend=self.backend_label,
+                                     family=repo_family(entry.image)):
+                    self.backend.warm_pool(
+                        entry.template_id,
+                        entry.replicas,
+                        wait=True,
+                        run_id=self.run_id,
+                        rootfs_image=getattr(entry, "rootfs_image", None),
+                    )
 
     def warm_images(self, images: list[str], replicas: int | None = None, wait: bool = True) -> None:
         """Warm up pools for specific images (used by windowed strategies)."""
         rep = replicas if replicas is not None else self.config.max_warmpool_replicas
         for img in images:
             template_id, rootfs_image = self._ensure_template_for_image(img)
-            self.backend.warm_pool(template_id, rep, wait=wait, rootfs_image=rootfs_image)
+            with self._obs.phase("warm_pool", backend=self.backend_label, family=repo_family(img)):
+                self.backend.warm_pool(template_id, rep, wait=wait, run_id=self.run_id,
+                                       rootfs_image=rootfs_image)
 
     def unwarm_image(self, image: str) -> None:
         """Drain warm pool for a specific image."""
@@ -207,7 +370,7 @@ class SandboxFleet:
     ) -> SandboxHandle:
         task_obj: Task
         if isinstance(task, str):
-            found = next((t for t in self._tasks if t.id == task), None)
+            found = next((t for t in self.tasks if t.id == task), None)
             if found:
                 task_obj = found
             else:
@@ -215,6 +378,10 @@ class SandboxFleet:
         else:
             task_obj = task
 
+        with self._obs.phase("acquire", backend=self.backend_label, family=repo_family(task_obj)):
+            return self._acquire_task(task_obj, timeout_s)
+
+    def _acquire_task(self, task_obj: Task, timeout_s: float | None) -> SandboxHandle:
         if task_obj.template:
             template_id = task_obj.template
             rootfs_image = None
@@ -270,39 +437,71 @@ class SandboxFleet:
             atespace=self.config.tenancy or "ate-env",
             client=client,
             loop_runner=loop_runner,
-            tracer_config=self.config.tracing,
+            tracer_config=self._tracer_config,
         ), ep
 
     def release(self, handle: SandboxHandle | Sequence[SandboxHandle]) -> None:
         """Release sandbox instance(s) back to backend and close runtime(s)."""
-        if isinstance(handle, (list, tuple)):
-            for h in handle:
+        for h in handle if isinstance(handle, (list, tuple)) else (handle,):
+            with self._obs.phase("release", backend=self.backend_label, family=repo_family(h.task)):
                 h.release()
-        else:
-            handle.release()
+
+    def recycle(self, handle: SandboxHandle | Sequence[SandboxHandle]) -> None:
+        """Return sandbox instance(s) to the warm pool (see SandboxHandle.recycle)."""
+        for h in handle if isinstance(handle, (list, tuple)) else (handle,):
+            with self._obs.phase("recycle", backend=self.backend_label, family=repo_family(h.task)):
+                h.recycle()
 
     def teardown(self) -> None:
         """Teardown all resources provisioned by this fleet's run_id."""
-        self.backend.reap(self.run_id)
+        try:
+            with self._obs.phase("teardown", backend=self.backend_label):
+                self.backend.reap(self.run_id)
+        finally:
+            self._obs.warm_reset()
 
     def run(self, process_fn: Callable[[Task, SandboxHandle], Any],
             concurrency: int | None = None) -> list[Any]:
-        """Execute all tasks using the configured strategy."""
+        """Execute all tasks using the configured strategy.
+
+        The run's RunReport is available as ``fleet.report`` afterwards;
+        ``fleet.report.summary()`` gives the table (logged only at DEBUG).
+        """
         strat_fn = STRATEGIES.get(self.config.strategy)
         if not strat_fn:
             raise ValueError(f"Unknown strategy: {self.config.strategy}")
         c = concurrency or min(self.config.max_concurrent, len(self._tasks))
-        return strat_fn(self, process_fn, max(1, c))
+        with self._obs.run(self.config.strategy, backend=self.backend_label) as report:
+            self.report = report
+            report.environment = self.describe_environment(concurrency=max(1, c))
+            results = strat_fn(self, process_fn, max(1, c))
+        logger.debug("\n%s", report.summary())
+        return results
+
+    def describe_environment(self, concurrency: int | None = None) -> dict[str, dict[str, Any]]:
+        """The run's environment block for the RunReport, keyed by backend."""
+        info: dict[str, Any] = {"atespace": self.config.tenancy, "run_id": self.run_id}
+        if self.backend_label == "substrate":
+            info["endpoint"] = getattr(self.backend, "api_endpoint", self.config.endpoint)
+        info.update({
+            "strategy": self.config.strategy,
+            "concurrency": concurrency,
+            "tasks": len(self._tasks),
+            "images": len(self.image_counts()),
+        })
+        return {self.backend_label: info}
 
     def _ensure_template_for_image(self, image: str) -> tuple[str, str | None]:
         with self._lock:
             if image in self._image_to_template:
                 return self._image_to_template[image]
-            res: tuple[str, str | None]
-            if image in self.config.image_templates:
-                res = (self.config.image_templates[image], None)
-            else:
-                base = self.config.template or "default-template"
-                res = (base, image)
-            self._image_to_template[image] = res
+            with self._obs.phase("ensure_template", backend=self.backend_label,
+                                 family=repo_family(image)):
+                res: tuple[str, str | None]
+                if image in self.config.image_templates:
+                    res = (self.config.image_templates[image], None)
+                else:
+                    base = self.config.template or "default-template"
+                    res = (base, image)
+                self._image_to_template[image] = res
             return res

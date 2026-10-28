@@ -19,9 +19,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -198,6 +201,7 @@ func TestEvalCreatesReplaysDeletes(t *testing.T) {
 	cfg := baseConfig(t, f, &out)
 	cfg.Mode = ModeEval
 	cfg.TasksPerImage = 2
+	cfg.Labels = map[string]string{"cluster": "a", "arm": "x"}
 
 	sum, err := Run(context.Background(), cfg)
 	if err != nil {
@@ -227,6 +231,15 @@ func TestEvalCreatesReplaysDeletes(t *testing.T) {
 	rep := Build(parseEvents(t, out.String()))
 	if rep.Tasks != 6 || rep.RewardRate != 1 {
 		t.Fatalf("report %+v", rep)
+	}
+	// The run event carries the loader's own labels and the operator's.
+	for k, want := range map[string]string{"cluster": "a", "arm": "x", "mode": "eval", "width": "2", "images": "3", "tasks_per_image": "2"} {
+		if rep.Labels[k] != want {
+			t.Errorf("label %s = %q, want %q (labels %v)", k, rep.Labels[k], want, rep.Labels)
+		}
+	}
+	if rep.Labels["trajectory"] == "" {
+		t.Errorf("no trajectory label: %v", rep.Labels)
 	}
 	for _, ev := range []string{EventCreate, EventTTFI, EventTask, EventDelete, EventRun} {
 		if !hasStat(rep, ev) {
@@ -655,5 +668,174 @@ func TestValidateChecksTheLongestName(t *testing.T) {
 	cfg.Mode, cfg.TasksPerImage = ModeEval, 100001 // largest index 100000
 	if err := cfg.validate(); err == nil {
 		t.Fatal("eval mode with a 6-digit replay index: want the long name refused")
+	}
+}
+
+func TestLabelsAreDeclared(t *testing.T) {
+	cfg := Config{Mode: ModeSteps, Width: 3, Trajectory: &Trajectory{Name: "t"}, Rollouts: 2, Steps: 4, Park: ParkDelete,
+		ImagesPerStep: 2, CreateTimeout: time.Minute, StepTimeout: time.Minute, WakeBudget: time.Minute, WakeBackoff: time.Second,
+		Labels: map[string]string{"commit": "abc"}, Invocation: map[string]string{"dataset": "d.jsonl"}}
+	l := cfg.labels()
+	if l["commit"] != "abc" || l["dataset"] != "d.jsonl" || l["width"] != "3" || l["rollouts"] != "2" || l["wake_budget"] != "1m0s" || l["images_per_step"] != "2" {
+		t.Fatalf("labels = %v", l)
+	}
+	for k := range l {
+		if k == "commit" {
+			continue
+		}
+		if !slices.Contains(LoaderLabelKeys, k) {
+			t.Errorf("the loader records %s but LoaderLabelKeys lacks it, so report -arm would not compare it", k)
+		}
+	}
+}
+
+// An operator label may not take a key the loader records: report -arm
+// trusts those keys to tell one workload from another.
+func TestValidateRejectsLoaderLabelKeys(t *testing.T) {
+	for _, k := range []string{"width", "dataset", "set.READ_FILES"} {
+		cfg := baseConfig(t, newFake(), nil)
+		cfg.Mode, cfg.TasksPerImage = ModeEval, 1
+		cfg.Labels = map[string]string{k: "x"}
+		if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "label "+k) {
+			t.Errorf("validate() with -label %s = %v, want it refused", k, err)
+		}
+	}
+	cfg := baseConfig(t, newFake(), nil)
+	cfg.Mode, cfg.TasksPerImage = ModeEval, 1
+	cfg.Labels = map[string]string{"commit": "abc"}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate() with an operator label: %v", err)
+	}
+}
+
+func TestMixedTrajectoriesDrawPerEnvironment(t *testing.T) {
+	run := func(seed int64) map[string]string {
+		f := newFake()
+		var out bytes.Buffer
+		cfg := baseConfig(t, f, &out)
+		cfg.Mode = ModeEval
+		cfg.TasksPerImage = 4
+		a := testTrajectory(t, "true")
+		a.Name = "alpha"
+		b := testTrajectory(t, "true")
+		b.Name = "beta"
+		cfg.Trajectories = []*Trajectory{a, b}
+		cfg.Seed = seed
+		if _, err := Run(context.Background(), cfg); err != nil {
+			t.Fatal(err)
+		}
+		byEnv := map[string]string{}
+		for _, e := range parseEvents(t, out.String()) {
+			if e.Event == EventTask {
+				byEnv[e.Env] = e.Name
+			}
+			if e.Event == EventRun && (e.Labels["trajectory"] != "alpha,beta" || e.Labels["seed"] != strconv.FormatInt(seed, 10)) {
+				t.Fatalf("run labels: %v", e.Labels)
+			}
+		}
+		return byEnv
+	}
+	first := run(7)
+	if len(first) != 12 {
+		t.Fatalf("task events: %v", first)
+	}
+	seen := map[string]int{}
+	for _, name := range first {
+		seen[name]++
+	}
+	if seen["alpha"] == 0 || seen["beta"] == 0 {
+		t.Fatalf("both trajectories must be drawn over 12 environments: %v", seen)
+	}
+	if again := run(7); fmt.Sprint(again) != fmt.Sprint(first) {
+		t.Fatalf("the same seed must give the same assignment:\n%v\n%v", first, again)
+	}
+}
+
+// A caller that sets only Trajectories gets the first as Trajectory; a nil
+// entry in the mix is refused.
+func TestValidateDefaultsTrajectoryFromTheMix(t *testing.T) {
+	cfg := baseConfig(t, newFake(), nil)
+	cfg.Mode, cfg.TasksPerImage = ModeEval, 1
+	only := cfg.Trajectory
+	cfg.Trajectory, cfg.Trajectories = nil, []*Trajectory{only}
+	if err := cfg.validate(); err != nil || cfg.Trajectory != only {
+		t.Fatalf("validate() = %v, Trajectory %p; want nil and the mix's first %p", err, cfg.Trajectory, only)
+	}
+	cfg.Trajectories = []*Trajectory{only, nil}
+	if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), "trajectory 2 of the mix is nil") {
+		t.Fatalf("validate() with a nil entry = %v", err)
+	}
+}
+
+func TestImagesPerStepTakesTheNextWindowEachStep(t *testing.T) {
+	f := newFake()
+	var out bytes.Buffer
+	cfg := baseConfig(t, f, &out)
+	cfg.Instances = instances(5) // a..e
+	cfg.Mode = ModeSteps
+	cfg.Park = ParkDelete
+	cfg.Rollouts = 1
+	cfg.Steps = 3
+	cfg.ImagesPerStep = 2
+
+	sum, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 2 images x 1 rollout x 3 steps; the third step wraps around to "a".
+	if sum.Tasks != 6 || sum.Failed != 0 || sum.Rewarded != 6 {
+		t.Fatalf("summary %+v", sum)
+	}
+	want := map[string]bool{
+		"t-repo--repo-a-0": true, "t-repo--repo-b-0": true,
+		"t-repo--repo-c-0-s2": true, "t-repo--repo-d-0-s2": true,
+		"t-repo--repo-e-0-s3": true, "t-repo--repo-a-0-s3": true,
+	}
+	if len(f.created) != len(want) {
+		t.Fatalf("created %v, want %v", f.created, want)
+	}
+	for id := range want {
+		if f.created[id] != 1 || f.deleted[id] != 1 {
+			t.Fatalf("env %s created %d deleted %d; created %v deleted %v", id, f.created[id], f.deleted[id], f.created, f.deleted)
+		}
+	}
+	events := parseEvents(t, out.String())
+	ttfi, parks, barriers := 0, 0, 0
+	for _, e := range events {
+		switch e.Event {
+		case EventTTFI:
+			ttfi++
+		case EventPark:
+			parks++
+			if e.Name != string(ParkDelete) || e.Count != 2 {
+				t.Errorf("park event %+v", e)
+			}
+		case EventBarrier:
+			barriers++
+		case EventWake:
+			t.Errorf("a window run never wakes: %+v", e)
+		case EventRun:
+			if e.Labels["images_per_step"] != "2" || e.Labels["park"] != "delete" {
+				t.Errorf("run labels %v", e.Labels)
+			}
+		}
+	}
+	// Every environment is fresh, so every task starts with a ttfi; the last
+	// window's retirement is the cleanup, not a park.
+	if ttfi != 6 || barriers != 3 || parks != 2 {
+		t.Fatalf("ttfi %d barriers %d parks %d, want 6 3 2", ttfi, barriers, parks)
+	}
+	rep := Build(events)
+	if len(rep.Steps) != 3 || rep.Steps[0].Tasks != 2 || rep.Steps[2].Live != 2 {
+		t.Fatalf("steps %+v", rep.Steps)
+	}
+
+	cfg.ImagesPerStep = 9
+	if _, err := Run(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "more than the 5 instances") {
+		t.Fatalf("a window larger than the dataset must be rejected: %v", err)
+	}
+	cfg.ImagesPerStep, cfg.Park = 2, ParkSuspend
+	if _, err := Run(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "park mode delete") {
+		t.Fatalf("a window with a suspend park must be rejected: %v", err)
 	}
 }

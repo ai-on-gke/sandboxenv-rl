@@ -6,8 +6,8 @@ publishes everything a user needs from this repo:
 
 | artifact | where | how to reference it |
 |---|---|---|
-| `ate-env-api` image | `ghcr.io/agent-substrate/env/ate-env-api` | by digest, from the release notes or `images_<tag>.txt` |
-| `ate-env-guest` image | `ghcr.io/agent-substrate/env/ate-env-guest` | by digest, same places |
+| `ate-env-api` image | `ghcr.io/ai-on-gke/sandboxenv-rl/ate-env-api` | by digest, from the release notes or `images_<tag>.txt` |
+| `ate-env-guest` image | `ghcr.io/ai-on-gke/sandboxenv-rl/ate-env-guest` | by digest, same places |
 | `ate-env` CLI | release assets `ate-env_<tag>_<os>_<arch>` for linux and darwin, amd64 and arm64 | download, `chmod +x` |
 | checksums | `SHA256SUMS_<tag>.txt` | `sha256sum -c` |
 
@@ -45,8 +45,8 @@ digests; the CLI defaults are digests.
 ```bash
 cosign verify \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity-regexp '^https://github.com/agent-substrate/env/\.github/workflows/release\.yaml@refs/tags/' \
-  ghcr.io/agent-substrate/env/ate-env-guest@sha256:<digest>
+  --certificate-identity-regexp '^https://github.com/ai-on-gke/sandboxenv-rl/\.github/workflows/release\.yaml@refs/tags/' \
+  ghcr.io/ai-on-gke/sandboxenv-rl/ate-env-guest@sha256:<digest>
 ```
 
 A valid signature proves the image was built by this repository's `release`

@@ -20,7 +20,10 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"math/rand"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -69,6 +72,14 @@ type Config struct {
 	Rollouts int
 	Steps    int
 	Park     Park
+	// ImagesPerStep, in steps mode, makes each step take the next
+	// ImagesPerStep instances of the dataset (wrapping around), create
+	// Rollouts fresh environments for each, and retire them after the step:
+	// the shape of a trainer that creates and retires pools every step. A
+	// new image is a new derived template and a golden bake on first use,
+	// which is the cost this shape measures. Requires ParkDelete. Zero keeps
+	// one fleet across the steps.
+	ImagesPerStep int
 
 	// CreateTimeout bounds one create call; StepTimeout is the default for a
 	// run step without its own timeout.
@@ -84,6 +95,78 @@ type Config struct {
 	WakeBackoff time.Duration
 	// Keep leaves the environments in place when the run ends.
 	Keep bool
+	// Labels are the operator's labels for the run event: the Substrate
+	// commit, the cluster, the arm. A key the loader records itself
+	// (LoaderLabelKeys, or the set. prefix) is refused by validate, so the
+	// same-workload check of report -arm cannot be overridden.
+	Labels map[string]string
+	// Invocation holds the loader's own labels that only its command line
+	// knows: dataset, connections, base_template, exclude_file, instances.
+	Invocation map[string]string
+	// Trajectories, when it holds more than one, is the mix: each
+	// environment gets one of them, drawn with Seed, so a run can interleave
+	// workloads the way a training step mixes task shapes. Trajectory is the
+	// first of them.
+	Trajectories []*Trajectory
+	Seed         int64
+}
+
+// trajectoryNames joins the names of the run's trajectories.
+func (c *Config) trajectoryNames() string {
+	if len(c.Trajectories) <= 1 {
+		return c.Trajectory.Name
+	}
+	names := make([]string, len(c.Trajectories))
+	for i, t := range c.Trajectories {
+		names[i] = t.Name
+	}
+	return strings.Join(names, ",")
+}
+
+// LoaderLabelKeys are the labels the loader records about its own invocation
+// on the run event: the run's shape and the settings that move its latencies
+// and failure counts. report -arm pools only reps that agree on all of them,
+// and on every -set value, recorded as set.KEY. An operator -label may not use
+// one of them, nor the set. prefix.
+var LoaderLabelKeys = []string{
+	"mode", "width", "images", "trajectory", "tasks_per_image", "rollouts", "steps", "park",
+	"create_timeout", "step_timeout", "wake_budget", "wake_backoff",
+	"dataset", "connections", "base_template", "exclude_file", "instances", "seed", "images_per_step",
+}
+
+// labels describes the run for its run event.
+func (c *Config) labels() map[string]string {
+	l := map[string]string{
+		"mode":           string(c.Mode),
+		"width":          strconv.Itoa(c.Width),
+		"images":         strconv.Itoa(len(c.Instances)),
+		"trajectory":     c.trajectoryNames(),
+		"create_timeout": c.CreateTimeout.String(),
+		"step_timeout":   c.StepTimeout.String(),
+		"wake_budget":    c.WakeBudget.String(),
+		"wake_backoff":   c.WakeBackoff.String(),
+	}
+	if len(c.Trajectories) > 1 {
+		l["seed"] = strconv.FormatInt(c.Seed, 10)
+	}
+	switch c.Mode {
+	case ModeEval:
+		l["tasks_per_image"] = strconv.Itoa(c.TasksPerImage)
+	case ModeSteps:
+		l["rollouts"] = strconv.Itoa(c.Rollouts)
+		l["steps"] = strconv.Itoa(c.Steps)
+		l["park"] = string(c.Park)
+		if c.ImagesPerStep > 0 {
+			l["images_per_step"] = strconv.Itoa(c.ImagesPerStep)
+		}
+	}
+	for k, v := range c.Invocation {
+		l[k] = v
+	}
+	for k, v := range c.Labels {
+		l[k] = v
+	}
+	return l
 }
 
 // Summary is what a run produced, for the exit status and the log.
@@ -106,10 +189,18 @@ func (c *Config) validate() error {
 		return errors.New("backend is required")
 	case len(c.Instances) == 0:
 		return errors.New("no instances")
-	case c.Trajectory == nil:
+	case c.Trajectory == nil && len(c.Trajectories) == 0:
 		return errors.New("trajectory is required")
 	case c.Width < 1:
 		return errors.New("width must be >= 1")
+	}
+	for i, t := range c.Trajectories {
+		if t == nil {
+			return fmt.Errorf("trajectory %d of the mix is nil", i+1)
+		}
+	}
+	if c.Trajectory == nil {
+		c.Trajectory = c.Trajectories[0]
 	}
 	switch c.Mode {
 	case ModeEval:
@@ -125,12 +216,29 @@ func (c *Config) validate() error {
 		default:
 			return fmt.Errorf("unknown park mode %q", c.Park)
 		}
+		if c.ImagesPerStep < 0 {
+			return errors.New("images per step must be >= 0")
+		}
+		if c.ImagesPerStep > 0 && c.Park != ParkDelete {
+			return errors.New("images per step retires each step's environments; it needs park mode delete")
+		}
+		if c.ImagesPerStep > len(c.Instances) {
+			return fmt.Errorf("images per step (%d) is more than the %d instances; a window must not repeat an instance within one step", c.ImagesPerStep, len(c.Instances))
+		}
 	default:
 		return fmt.Errorf("unknown mode %q", c.Mode)
+	}
+	if c.ImagesPerStep > 0 && c.Mode != ModeSteps {
+		return errors.New("images per step applies to steps mode")
 	}
 	if n := c.longestName(); len(n) > maxNameLen {
 		return fmt.Errorf("environment name %q has %d characters, more than Substrate's %d; "+
 			"use a shorter run id, fewer rollouts or tasks per image, or fewer steps", n, len(n), maxNameLen)
+	}
+	for k := range c.Labels {
+		if slices.Contains(LoaderLabelKeys, k) || strings.HasPrefix(k, "set.") {
+			return fmt.Errorf("label %s: the loader records that key itself, and report -arm trusts it; choose another name", k)
+		}
 	}
 	return nil
 }
@@ -142,7 +250,7 @@ func (c *Config) longestName() string {
 	k, suffix := c.TasksPerImage-1, ""
 	if c.Mode == ModeSteps {
 		k = c.Rollouts - 1
-		if c.Park == ParkDelete && c.Steps > 1 {
+		if (c.Park == ParkDelete || c.ImagesPerStep > 0) && c.Steps > 1 {
 			suffix = fmt.Sprintf("-s%d", c.Steps)
 		}
 	}
@@ -252,28 +360,67 @@ func Run(ctx context.Context, cfg Config) (*Summary, error) {
 	case ModeEval:
 		r.runEval(ctx, envs)
 	case ModeSteps:
-		r.runSteps(ctx, envs)
+		if cfg.ImagesPerStep > 0 {
+			r.runWindows(ctx)
+		} else {
+			r.runSteps(ctx, envs)
+		}
 	}
 	dur := time.Since(start)
 	s := &Summary{Tasks: r.tasks, Failed: r.failed, Rewarded: r.rewarded, Duration: dur}
 	r.rec.Record(Event{RunID: cfg.RunID, Event: EventRun, Name: string(cfg.Mode), DurMS: ms(dur),
-		OK: s.Failed == 0, Count: s.Tasks})
+		OK: s.Failed == 0, Count: s.Tasks, Labels: cfg.labels()})
 	return s, ctx.Err()
 }
 
 // plan renders the trajectory per instance and names every environment.
 func (r *runner) plan() ([]*environment, error) {
+	if r.cfg.Mode == ModeSteps && r.cfg.ImagesPerStep > 0 {
+		// Windows are planned step by step; see planWindow. Rendering every
+		// trajectory here still validates the templates up front.
+		for _, in := range r.cfg.Instances {
+			for _, t := range r.trajectories() {
+				if _, err := t.Render(in); err != nil {
+					return nil, err
+				}
+			}
+		}
+		return nil, nil
+	}
 	fanout := r.cfg.TasksPerImage
 	if r.cfg.Mode == ModeSteps {
 		fanout = r.cfg.Rollouts
 	}
 	envs := make([]*environment, 0, len(r.cfg.Instances)*fanout)
+	// With a mix, each environment draws its trajectory from a seeded
+	// source, so the same seed gives the same assignment on every rep.
+	var pick *rand.Rand
+	if len(r.cfg.Trajectories) > 1 {
+		pick = rand.New(rand.NewSource(r.cfg.Seed))
+	}
+	// One render per trajectory and instance, shared by that instance's
+	// environments; a replay never writes to it.
+	rendered := map[*Trajectory]map[string]*Trajectory{}
 	for _, in := range r.cfg.Instances {
-		traj, err := r.cfg.Trajectory.Render(in)
-		if err != nil {
-			return nil, err
-		}
 		for k := 0; k < fanout; k++ {
+			source := r.cfg.Trajectory
+			if pick != nil {
+				source = r.cfg.Trajectories[pick.Intn(len(r.cfg.Trajectories))]
+			}
+			byInstance := rendered[source]
+			if byInstance == nil {
+				byInstance = map[string]*Trajectory{}
+				rendered[source] = byInstance
+			}
+			traj := byInstance[in.InstanceID]
+			if traj == nil {
+				t, err := source.Render(in)
+				if err != nil {
+					return nil, err
+				}
+				traj = t
+				byInstance[in.InstanceID] = traj
+			}
 			id := EnvID(r.cfg.RunID, in.InstanceID, k)
 			envs = append(envs, &environment{
 				id:   id,
@@ -362,6 +509,92 @@ func (r *runner) runEval(ctx context.Context, envs []*environment) {
 // runSteps is the training shape: the fleet is created once, every step
 // replays the trajectory on all of it behind a barrier, and the fleet is
 // parked between steps.
+// trajectories is the run's trajectory list: the mix when there is one,
+// else the single Trajectory.
+func (r *runner) trajectories() []*Trajectory {
+	if len(r.cfg.Trajectories) > 1 {
+		return r.cfg.Trajectories
+	}
+	return []*Trajectory{r.cfg.Trajectory}
+}
+
+// planWindow names the environments of one step in window mode: the next
+// ImagesPerStep instances after the previous step's, wrapping around the
+// dataset, with Rollouts environments each. Names carry the step from step
+// 2 on, as a delete park's do, so an instance that comes around again gets
+// a fresh name while the previous one may still be deleting.
+func (r *runner) planWindow(step int, pick *rand.Rand) ([]*environment, error) {
+	n := len(r.cfg.Instances)
+	envs := make([]*environment, 0, r.cfg.ImagesPerStep*r.cfg.Rollouts)
+	for i := 0; i < r.cfg.ImagesPerStep; i++ {
+		in := r.cfg.Instances[((step-1)*r.cfg.ImagesPerStep+i)%n]
+		for k := 0; k < r.cfg.Rollouts; k++ {
+			source := r.cfg.Trajectory
+			if pick != nil {
+				source = r.cfg.Trajectories[pick.Intn(len(r.cfg.Trajectories))]
+			}
+			traj, err := source.Render(in)
+			if err != nil {
+				return nil, err
+			}
+			id := EnvID(r.cfg.RunID, in.InstanceID, k)
+			envs = append(envs, &environment{id: id, base: id, inst: in, task: k, traj: traj})
+		}
+	}
+	return envs, nil
+}
+
+// runWindows drives steps mode with a new window of images each step: create
+// the step's environments, replay the trajectory on all of them behind a
+// barrier, then retire them, recorded as a delete park. Nothing is kept
+// across steps, so the whole cost of a step is the cold path plus the work.
+func (r *runner) runWindows(ctx context.Context) {
+	var pick *rand.Rand
+	if len(r.cfg.Trajectories) > 1 {
+		pick = rand.New(rand.NewSource(r.cfg.Seed))
+	}
+	for step := 1; step <= r.cfg.Steps; step++ {
+		if ctx.Err() != nil {
+			break
+		}
+		envs, err := r.planWindow(step, pick)
+		if err != nil {
+			r.log.Error("plan window", slog.Int("step", step), slog.String("err", err.Error()))
+			return
+		}
+		forEach(ctx, len(envs), r.cfg.Width, func(i int) { r.create(ctx, envs[i], step) })
+		barrier := time.Now()
+		forEach(ctx, len(envs), r.cfg.Width, func(i int) {
+			if !envs[i].failed {
+				r.replay(ctx, envs[i], step)
+			}
+		})
+		live := len(envs) - r.countFailed(envs)
+		r.rec.Record(Event{RunID: r.cfg.RunID, Event: EventBarrier, Step: step, DurMS: ms(time.Since(barrier)),
+			OK: ctx.Err() == nil, Count: live})
+		r.log.Info("step done", slog.Int("step", step), slog.Int("images", r.cfg.ImagesPerStep),
+			slog.Duration("barrier", time.Since(barrier)), slog.Int("live", live), slog.Int("failed", r.failed), slog.Int("rewarded", r.rewarded))
+
+		// Retire the window. The last step's retirement is the run's cleanup
+		// and runs on a context that survives a cancelled run.
+		rctx, stop := ctx, func() {}
+		if step == r.cfg.Steps || ctx.Err() != nil {
+			rctx, stop = context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		}
+		parkStart := time.Now()
+		forEach(rctx, len(envs), r.cfg.Width, func(i int) {
+			if envs[i].sb != nil {
+				r.remove(rctx, envs[i], step)
+			}
+		})
+		stop() // the cleanup context ends with its step, not with the run
+		if step < r.cfg.Steps && ctx.Err() == nil {
+			r.rec.Record(Event{RunID: r.cfg.RunID, Event: EventPark, Name: string(ParkDelete), Step: step,
+				DurMS: ms(time.Since(parkStart)), OK: true, Count: live})
+		}
+	}
+}
+
 func (r *runner) runSteps(ctx context.Context, envs []*environment) {
 	forEach(ctx, len(envs), r.cfg.Width, func(i int) { r.create(ctx, envs[i], 0) })
 	r.log.Info("fleet created", slog.Int("environments", len(envs)), slog.Int("failed", r.countFailed(envs)))
@@ -651,6 +884,10 @@ func (r *runner) remove(ctx context.Context, e *environment, step int) {
 func (r *runner) event(kind string, e *environment, step int, d time.Duration, err error) Event {
 	ev := Event{RunID: r.cfg.RunID, Event: kind, Env: e.id, Instance: e.inst.InstanceID,
 		Step: step, Task: e.task, DurMS: ms(d), OK: err == nil}
+	if kind == EventTask {
+		// Which trajectory the task replayed; one run can mix several.
+		ev.Name = e.traj.Name
+	}
 	if err != nil {
 		ev.Err = err.Error()
 	}

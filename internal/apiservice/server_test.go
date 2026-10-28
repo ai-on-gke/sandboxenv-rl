@@ -16,6 +16,7 @@ package apiservice_test
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"math"
 	"net"
@@ -26,6 +27,7 @@ import (
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/internaltest/fakecontrol"
 	"github.com/agent-substrate/env/internal/internaltest/fakerouter"
+	"github.com/agent-substrate/env/internal/unknownfields"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
@@ -53,6 +55,13 @@ func newTestEnv(t *testing.T) (ateenvv1alpha.EnvironmentServiceClient, *fakecont
 
 func newFullTestEnv(t *testing.T) *testEnv {
 	t.Helper()
+	return newFullTestEnvTLS(t, nil, nil)
+}
+
+// newFullTestEnvTLS serves the fake router over TLS with serverTLS and gives
+// the API clientTLS for it; nil for both is the plaintext router.
+func newFullTestEnvTLS(t *testing.T, serverTLS, clientTLS *tls.Config) *testEnv {
+	t.Helper()
 
 	control := fakecontrol.New()
 	controlAddr, stopControl, err := control.Serve()
@@ -65,13 +74,20 @@ func newFullTestEnv(t *testing.T) *testEnv {
 	router.Running = func(id string) bool {
 		return control.Status(id) == ateapipb.ActorState_ACTOR_STATE_RUNNING
 	}
-	routerAddr, stopRouter := router.Serve()
+	var routerAddr string
+	var stopRouter func()
+	if serverTLS != nil {
+		routerAddr, stopRouter = router.ServeTLS(serverTLS)
+	} else {
+		routerAddr, stopRouter = router.Serve()
+	}
 	t.Cleanup(stopRouter)
 
 	client, err := ate.New(ate.Options{
 		ControlAddr: controlAddr,
 		RouterAddr:  routerAddr,
 		SkipVerify:  true,
+		RouterTLS:   clientTLS,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -79,9 +95,13 @@ func newFullTestEnv(t *testing.T) *testEnv {
 	t.Cleanup(func() { client.Close() })
 
 	srv := apiservice.New(client, routerAddr, "")
+	srv.RouterTLS = clientTLS
 	t.Cleanup(srv.Close)
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(unknownfields.UnaryServerInterceptor()),
+		grpc.ChainStreamInterceptor(unknownfields.StreamServerInterceptor()),
+	)
 	ateenvv1alpha.RegisterEnvironmentServiceServer(grpcServer, srv)
 	ateenvv1alpha.RegisterProcessServiceServer(grpcServer, srv)
 	ateenvv1alpha.RegisterFileSystemServiceServer(grpcServer, srv)

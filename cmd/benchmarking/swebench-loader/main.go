@@ -19,17 +19,29 @@
 //	swebench-loader run    -dataset manifest.jsonl -mode steps -images 500 -rollouts 2 -steps 8 -park suspend -out run.jsonl
 //	swebench-loader report run.jsonl [-json summary.json]
 //	swebench-loader report a.jsonl b.jsonl   (one table, a column per run)
+//	swebench-loader report -arm pull=p1.jsonl,p2.jsonl -arm stream=s1.jsonl,s2.jsonl   (a column per arm, reps merged)
 //	swebench-loader report run.jsonl -cache-before before.txt -cache-after after.txt -restore-log restores.jsonl
 package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"maps"
+	"net/url"
 	"os"
 	"os/signal"
+	"path"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -47,7 +59,9 @@ func main() {
 	case "run":
 		err = runCmd(os.Args[2:])
 	case "report":
-		err = reportCmd(os.Args[2:])
+		err = reportCmd(os.Args[2:], os.Stdout)
+	case "trajectory-assets":
+		err = assetsCmd(os.Args[2:], os.Stdout)
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -84,8 +98,140 @@ func resolveAuthToken(file string, getenv func(string) string) (string, error) {
 	return token, nil
 }
 
+// labelFlags collects repeated KEY=VALUE flags (-label and -set on run).
+type labelFlags map[string]string
+
+func (l labelFlags) String() string {
+	keys := make([]string, 0, len(l))
+	for k := range l {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+l[k])
+	}
+	return strings.Join(parts, ",")
+}
+
+func (l labelFlags) Set(v string) error {
+	k, val, ok := strings.Cut(v, "=")
+	if !ok || k == "" {
+		return fmt.Errorf("want KEY=VALUE, got %q", v)
+	}
+	if strings.ContainsAny(v, "\t\n") {
+		return fmt.Errorf("%q: no tabs or newlines, they break the report's table", v)
+	}
+	if _, dup := l[k]; dup {
+		return fmt.Errorf("%s is given twice", k)
+	}
+	l[k] = val
+	return nil
+}
+
+// arm is one -arm value: a column of the comparison and the files pooled
+// into it.
+type arm struct {
+	name  string
+	files []string
+}
+
+// armFlags collects repeated -arm NAME=FILE[,FILE...] flags in command-line
+// order, so the baseline given first is the first column.
+type armFlags []arm
+
+func (a *armFlags) String() string {
+	parts := make([]string, 0, len(*a))
+	for _, x := range *a {
+		parts = append(parts, x.name+"="+strings.Join(x.files, ","))
+	}
+	return strings.Join(parts, " ")
+}
+
+func (a *armFlags) Set(v string) error {
+	name, list, ok := strings.Cut(v, "=")
+	if !ok || name == "" || strings.TrimSpace(list) == "" {
+		return fmt.Errorf("want NAME=FILE[,FILE...], got %q", v)
+	}
+	for _, x := range *a {
+		if x.name == name {
+			return fmt.Errorf("arm %s is given twice", name)
+		}
+	}
+	var files []string
+	for _, f := range strings.Split(list, ",") {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			return fmt.Errorf("arm %s: empty file name in %q", name, list)
+		}
+		if slices.Contains(files, f) {
+			return fmt.Errorf("arm %s: %s is given twice", name, f)
+		}
+		files = append(files, f)
+	}
+	*a = append(*a, arm{name, files})
+	return nil
+}
+
+// datasetLabel is the dataset's file name. For an https URL that is the last
+// path element without the query, so a signed URL's signature stays out of
+// the events file, which operators share.
+func datasetLabel(dataset string) string {
+	if u, err := url.Parse(dataset); err == nil && u.Scheme != "" && u.Host != "" {
+		return path.Base(u.Path)
+	}
+	return filepath.Base(dataset)
+}
+
+// ownLabels are the loader's labels that only the command line knows (the
+// rest come from Config.labels); every key is in swebench.LoaderLabelKeys or
+// is a var's effective value under set.KEY. The exclude file and the
+// instance list are named by their file name or count plus a digest of their
+// ids, so two lists of one length differ.
+func ownLabels(dataset string, connections int, baseTemplate, excludeFile string, exclude, instances []string, vars map[string]string) map[string]string {
+	l := map[string]string{
+		"dataset":       datasetLabel(dataset),
+		"connections":   strconv.Itoa(connections),
+		"base_template": baseTemplate,
+	}
+	for k, v := range vars {
+		l["set."+k] = v
+	}
+	if excludeFile != "" {
+		l["exclude_file"] = filepath.Base(excludeFile) + "@" + idsDigest(exclude)
+	}
+	if len(instances) > 0 {
+		l["instances"] = strconv.Itoa(len(instances)) + "@" + idsDigest(instances)
+	}
+	return l
+}
+
+// idsDigest is the first eight hex digits of the SHA-256 of the sorted ids.
+func idsDigest(ids []string) string {
+	sorted := slices.Clone(ids)
+	slices.Sort(sorted)
+	sum := sha256.Sum256([]byte(strings.Join(sorted, "\n")))
+	return hex.EncodeToString(sum[:4])
+}
+
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: swebench-loader run [flags] | swebench-loader report FILE... [-json OUT]")
+	fmt.Fprintln(os.Stderr, "usage: swebench-loader run [flags] | swebench-loader report FILE... [-json OUT] | swebench-loader trajectory-assets FILE")
+}
+
+// assetsCmd prints the files a trajectory's write steps name, one per line,
+// for run-in-cluster.sh to bake next to it.
+func assetsCmd(args []string, w io.Writer) error {
+	if len(args) != 1 {
+		return errors.New("usage: swebench-loader trajectory-assets FILE")
+	}
+	names, err := swebench.TrajectoryAssets(args[0])
+	if err != nil {
+		return err
+	}
+	for _, n := range names {
+		fmt.Fprintln(w, n)
+	}
+	return nil
 }
 
 func runCmd(args []string) (retErr error) {
@@ -99,13 +245,15 @@ func runCmd(args []string) (retErr error) {
 		images        = fs.Int("images", 0, "Use the first N instances of the dataset; 0 means all.")
 		instances     = fs.String("instances", "", "Comma-separated instance ids to use instead of the first N.")
 		excludeFile   = fs.String("exclude-file", "", "File of instance ids to leave out, one per line; text after the id is a comment.")
-		trajectory    = fs.String("trajectory", swebench.DefaultTrajectory, fmt.Sprintf("Trajectory file or built-in name (%s).", strings.Join(swebench.Names(), ", ")))
+		trajectory    = fs.String("trajectory", swebench.DefaultTrajectory, fmt.Sprintf("Trajectory file or built-in name (%s); a comma-separated list mixes them, one per environment, drawn with -seed.", strings.Join(swebench.Names(), ", ")))
+		seed          = fs.Int64("seed", 1, "Seed for the trajectory mix, so reps assign the same trajectory to the same environment.")
 		mode          = fs.String("mode", string(swebench.ModeEval), "eval (images x tasks-per-image, each create/replay/delete) or steps (images x rollouts kept across steps).")
 		width         = fs.Int("width", 50, "Most tasks in flight at once.")
 		tasksPerImage = fs.Int("tasks-per-image", 1, "eval: replays per image.")
 		rollouts      = fs.Int("rollouts", 2, "steps: environments per image.")
 		steps         = fs.Int("steps", 8, "steps: training steps.")
 		park          = fs.String("park", string(swebench.ParkSuspend), "steps: what happens between steps: suspend, delete or none.")
+		imagesPerStep = fs.Int("images-per-step", 0, "steps: each step takes the next N images (wrapping around the dataset) with fresh environments, retired after the step: the create-and-retire-pools-per-step shape; needs -park delete. 0 keeps one fleet across the steps.")
 		createTimeout = fs.Duration("create-timeout", 5*time.Minute, "Deadline for one create call.")
 		stepTimeout   = fs.Duration("step-timeout", 10*time.Minute, "Default deadline for a run step without its own timeout.")
 		wakeBudget    = fs.Duration("wake-budget", 3*time.Minute, "How long a task's first command is retried while the environment is still waking or its image is still being baked.")
@@ -115,7 +263,11 @@ func runCmd(args []string) (retErr error) {
 		keep          = fs.Bool("keep", false, "Leave the environments in place when the run ends.")
 		dryRun        = fs.Bool("dry-run", false, "Load and render everything, print the plan and exit without touching the API.")
 		authTokenFile = fs.String("auth-token-file", "", "File that holds the bearer token for ate-env-api; surrounding whitespace is ignored. Without it, SUBSTRATE_ENV_AUTH_TOKEN is used when set.")
+		labels        = labelFlags{}
+		vars          = labelFlags{}
 	)
+	fs.Var(vars, "set", "KEY=VALUE for the trajectories' var function, repeatable, e.g. READ_FILE=/testbed/setup.py or COMPILE_DIR=/testbed; a workload's defaults are in its file. A key no trajectory reads is an error; each value is recorded as a set.KEY label.")
+	fs.Var(labels, "label", "KEY=VALUE recorded on the run event, repeatable: the Substrate commit, the cluster, the arm. The loader records its own flags itself (mode, width, images, trajectory, dataset, the shape flags, connections, base-template, exclude-file, instances and the timeouts); a -label with one of those keys is refused, so report -arm can trust them.")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -155,28 +307,65 @@ func runCmd(args []string) (retErr error) {
 	if *images > 0 && len(selected) < *images && len(ids) == 0 {
 		fmt.Fprintf(os.Stderr, "note: %d instances requested, %d available after the exclude list\n", *images, len(selected))
 	}
-	traj, err := swebench.LoadTrajectory(*trajectory)
-	if err != nil {
-		return err
-	}
-	if traj.Grades() {
-		if err := swebench.RequireGrading(selected); err != nil {
+	var trajs []*swebench.Trajectory
+	for _, source := range strings.Split(*trajectory, ",") {
+		if source = strings.TrimSpace(source); source == "" {
+			continue
+		}
+		t, err := swebench.LoadTrajectory(source)
+		if err != nil {
 			return err
 		}
+		t.Vars = vars
+		if t.Grades() {
+			if err := swebench.RequireGrading(selected); err != nil {
+				return err
+			}
+		}
+		for _, in := range selected {
+			if _, err := t.Render(in); err != nil {
+				return err
+			}
+		}
+		trajs = append(trajs, t)
 	}
-	for _, in := range selected {
-		if _, err := traj.Render(in); err != nil {
-			return err
+	if len(trajs) == 0 {
+		return fmt.Errorf("-trajectory names no trajectory")
+	}
+	// The value each var resolved to, defaults included, goes on the run
+	// event as a set.KEY label, so a run on the defaults and a run that
+	// spelled the same values out pool together. A -set key no trajectory
+	// reads is a typo, or a knob of another workload; with a default in
+	// place it would pass unnoticed.
+	effective := map[string]string{}
+	if len(selected) > 0 {
+		for _, t := range trajs {
+			u, err := t.VarsUsed(selected[0])
+			if err != nil {
+				return err
+			}
+			maps.Copy(effective, u)
 		}
 	}
+	for _, k := range slices.Sorted(maps.Keys(vars)) {
+		if _, ok := effective[k]; !ok {
+			return fmt.Errorf("-set %s: no trajectory reads it (they read: %s)", k, strings.Join(slices.Sorted(maps.Keys(effective)), ", "))
+		}
+	}
+	traj := trajs[0]
 
 	fanout := *tasksPerImage
 	if swebench.Mode(*mode) == swebench.ModeSteps {
 		fanout = *rollouts
 	}
+	environments := len(selected) * fanout
+	if *imagesPerStep > 0 {
+		environments = *imagesPerStep * fanout // per step
+	}
 	log.Info("plan", slog.String("run", *runID), slog.String("mode", *mode), slog.Int("images", len(selected)),
-		slog.Int("environments", len(selected)*fanout), slog.Int("width", *width), slog.Int("steps", *steps),
-		slog.String("park", *park), slog.String("trajectory", traj.Name), slog.String("out", *out))
+		slog.Int("images_per_step", *imagesPerStep),
+		slog.Int("environments", environments), slog.Int("width", *width), slog.Int("steps", *steps),
+		slog.String("park", *park), slog.String("trajectory", *trajectory), slog.String("out", *out))
 	if *dryRun {
 		return nil
 	}
@@ -211,6 +400,8 @@ func runCmd(args []string) (retErr error) {
 		Backend:       backend,
 		Instances:     selected,
 		Trajectory:    traj,
+		Trajectories:  trajs,
+		Seed:          *seed,
 		Recorder:      rec,
 		Logger:        log,
 		Mode:          swebench.Mode(*mode),
@@ -219,11 +410,14 @@ func runCmd(args []string) (retErr error) {
 		Rollouts:      *rollouts,
 		Steps:         *steps,
 		Park:          swebench.Park(*park),
+		ImagesPerStep: *imagesPerStep,
 		CreateTimeout: *createTimeout,
 		StepTimeout:   *stepTimeout,
 		WakeBudget:    *wakeBudget,
 		WakeBackoff:   *wakeBackoff,
 		Keep:          *keep,
+		Labels:        labels,
+		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids, effective),
 	})
 	if sum != nil {
 		log.Info("run finished", slog.Int("tasks", sum.Tasks), slog.Int("failed", sum.Failed),
@@ -238,12 +432,12 @@ func runCmd(args []string) (retErr error) {
 	return nil
 }
 
-func reportCmd(args []string) error {
+func reportCmd(args []string, w io.Writer) error {
 	files, rest := leadingFiles(args)
-	if len(files) == 0 {
-		return fmt.Errorf("report needs at least one JSONL file")
-	}
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	var arms armFlags
+	fs.Var(&arms, "arm", "NAME=FILE[,FILE...], repeatable: one column per arm, in flag order, its percentiles computed over the merged raw events of its files, the reps of one cluster or build, which must be complete runs of one workload (same loader labels, distinct run ids, a run in one arm only). A path may not contain a comma. No positional files with -arm.")
+	top := fs.Int("top", 0, "List the N slowest successful first commands and wakes by environment. One file only.")
 	jsonOut := fs.String("json", "", "Also write the summary as JSON to this path (an array when several files are given).")
 	unresolvedOut := fs.String("unresolved", "", "Write the unresolved instances to this path in -exclude-file format; one file only.")
 	unresolvedNote := fs.String("unresolved-note", "Instances graded unresolved", "First comment line of the -unresolved file.")
@@ -258,6 +452,21 @@ func reportCmd(args []string) error {
 		// dropped without a word.
 		return fmt.Errorf("unexpected arguments after the flags: %s; put every events file before the flags", strings.Join(fs.Args(), " "))
 	}
+	if *top < 0 {
+		return fmt.Errorf("-top wants 0 or more, got %d", *top)
+	}
+	if len(arms) > 0 {
+		if len(files) > 0 {
+			return fmt.Errorf("with -arm, give every events file inside an -arm value")
+		}
+		if *unresolvedOut != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" || *top > 0 {
+			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log and -top take one events file, not -arm")
+		}
+		return reportArms(arms, *jsonOut, w)
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("report needs at least one JSONL file, or -arm")
+	}
 	reps := make([]*swebench.Report, 0, len(files))
 	var events []swebench.Event // of the single file, for the restore join
 	for _, path := range files {
@@ -271,10 +480,10 @@ func reportCmd(args []string) error {
 	if len(reps) > 1 {
 		// Several runs: one table, a column per run, for the same workload on
 		// different clusters or builds.
-		if *unresolvedOut != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" {
-			return fmt.Errorf("-unresolved, -cache-before, -cache-after and -restore-log take one events file")
+		if *unresolvedOut != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" || *top > 0 {
+			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log and -top take one events file")
 		}
-		swebench.WriteComparison(os.Stdout, reps, files)
+		swebench.WriteComparison(w, reps, files)
 		if *jsonOut != "" {
 			b, err := json.MarshalIndent(reps, "", "  ")
 			if err != nil {
@@ -312,7 +521,10 @@ func reportCmd(args []string) error {
 		}
 		rep.Restores = swebench.JoinRestores(events, timings)
 	}
-	rep.WriteText(os.Stdout)
+	if *top > 0 {
+		rep.Slowest = swebench.Slowest(events, *top)
+	}
+	rep.WriteText(w)
 	if *unresolvedOut != "" {
 		uf, err := os.Create(*unresolvedOut)
 		if err != nil {
@@ -364,4 +576,45 @@ func loadCacheSample(path string) (*swebench.NodeCacheSample, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return s, nil
+}
+
+// reportArms prints one column per arm, each pooled over its files, so three
+// reps of one cluster become one set of exact percentiles rather than three
+// columns to read by eye.
+func reportArms(arms armFlags, jsonOut string, w io.Writer) error {
+	names := make([]string, 0, len(arms))
+	reps := make([]*swebench.Report, 0, len(arms))
+	owner := map[string]string{} // run id -> the arm that has it
+	for _, a := range arms {
+		runs := make([][]swebench.Event, 0, len(a.files))
+		for _, file := range a.files {
+			evs, err := readEventsFile(file)
+			if err != nil {
+				return fmt.Errorf("arm %s: %s: %w", a.name, file, err)
+			}
+			runs = append(runs, evs)
+		}
+		rep, err := swebench.Pool(runs)
+		if err != nil {
+			return fmt.Errorf("arm %s: %w", a.name, err)
+		}
+		for _, id := range rep.Runs {
+			if other, dup := owner[id]; dup {
+				return fmt.Errorf("run %s is in arms %s and %s; a run belongs to one arm", id, other, a.name)
+			}
+			owner[id] = a.name
+		}
+		rep.RunID = a.name
+		names = append(names, a.name)
+		reps = append(reps, rep)
+	}
+	swebench.WriteComparison(w, reps, names)
+	if jsonOut != "" {
+		b, err := json.MarshalIndent(reps, "", "  ")
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(jsonOut, b, 0o644)
+	}
+	return nil
 }

@@ -30,9 +30,9 @@ The focus moves from a general environment service to RL training and evaluation
 | Fleet SDK | `SandboxFleet` and `AsyncSandboxFleet` in [`clients/python`](clients/python/README.md): acquire sandboxes for tasks by image, run tasks with the `naive`, `sliding` or `pipelined` strategy, pre-warm images, release and recycle. |
 | Any task image | `rootfs_image` runs a digest-pinned image unmodified: `ate-env-api` derives an ActorTemplate per image and mounts the guest into it as an image volume. Runtime layers and sidecars add a second runtime to any image ([docs/rootfs-images](docs/rootfs-images/README.md)). |
 | Daemons inside an environment | A port proxy on `ate-env-api` reaches any port in an environment by header or by path, WebSockets included ([details](#reaching-a-service-inside-an-environment)). |
-| Framework integrations | A [NeMo Gym](integrations/nemo-gym/README.md) sandbox provider and a [GRPO](examples/grpo/README.md) training loop on TRL. |
+| Framework integrations | A [NeMo Gym](integrations/nemo-gym/README.md) sandbox provider, a [uni-agent](integrations/uni-agent/README.md) sandbox provider with an R2E-Gym task graded by hidden tests in the same environment, and a [GRPO](examples/grpo/README.md) training loop on TRL. |
 | Benchmarks | A [SWE-bench Verified loader](benchmarking/swebench/README.md) that drives real task images the way an RL job does, and the [design](internal/benchmarking/DESIGN.md) of the benchmark system. |
-| Platform | Built against Substrate `ddb46651`: the WorkerPool chooses the sandbox, each template selects its pool by label, suspends are durable, and `ate-env-api` runs as its own identity under Substrate authorization. The guest runs as a PID 1 init that reaps orphans, and it allocates PTYs. |
+| Platform | Built against Substrate `v0.6.0` (actor limits are integer millicores and bytes): the WorkerPool chooses the sandbox, each template selects its pool by label, suspends are durable, and `ate-env-api` runs as its own identity under Substrate authorization. The guest runs as a PID 1 init that reaps orphans, and it allocates PTYs. The control plane must run v0.6.0 or later: the release renumbered proto fields env reads and writes, so an older control plane cannot serve this build. `ate-env-api` reaches actors through the router's TLS listeners with its pod identity certificate (`ate-env manifest --api-router-tls`, on by default), so the install must list `spiffe://cluster.local/ns/ate-env/sa/ate-env-api` in the router's ingress allow-list. |
 
 ## Architecture
 
@@ -57,7 +57,7 @@ The focus moves from a general environment service to RL training and evaluation
 | [`integrations/`](#integrations) | Framework integrations. |
 | [`examples/`](#examples) | Runnable examples. |
 | [`benchmarking/`](benchmarking/swebench/README.md), [`cmd/benchmarking`](cmd/benchmarking), [`internal/benchmarking`](internal/benchmarking/DESIGN.md) | The SWE-bench loader, its scripts and the benchmark design. |
-| [`docs/`](docs) | Rootfs images and runtime layers, and how releases are cut. |
+| [`docs/`](docs) | Rootfs images and runtime layers, the [metrics reference](docs/metrics.md), the [threat model](docs/security/threat-model.md), and how releases are cut. |
 
 ## Examples
 
@@ -67,12 +67,14 @@ The focus moves from a general environment service to RL training and evaluation
 | [`examples/runtime-layers`](examples/runtime-layers/README.md) | An unmodified rootfs image with a second runtime injected as a layer and supervised as a sidecar. |
 | [`examples/mcp`](examples/mcp/main.go) | Go: connect to an environment's MCP endpoint, list the tools and call them. |
 | [`examples/guest-daemon`](examples/guest-daemon/README.md) | Go: run the guest gRPC services standalone, without a cluster. |
+| [`examples/Qwen3.5-35B-A3B-verl`](examples/Qwen3.5-35B-A3B-verl/README.md) | Agentic GRPO on real SWE tasks: verl `separate_async` with a Megatron trainer and vLLM rollouts on separate nodes, a uni-agent ReAct agent whose tools and hidden-test grading run in environments. Two 8-GPU nodes. |
 
 ## Integrations
 
 | Integration | Framework | What it does |
 |---|---|---|
 | [`integrations/nemo-gym`](integrations/nemo-gym/README.md) | [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) | Sandbox provider `substrate`, registered through the `nemo_gym.sandbox_providers` entry point, with no change to NeMo Gym. `endpoint()` reaches a daemon inside the sandbox through the port proxy, and [`layer/`](integrations/nemo-gym/layer) is that daemon for NeMo: NeMo Skills' sandbox server and NeMo Gym's exec server injected into any task image. |
+| [`integrations/uni-agent`](integrations/uni-agent/README.md) | [uni-agent](https://github.com/verl-project/uni-agent) | Sandbox provider `ate_env` plus an `r2e_gym` task that hides the tests, lets the agent work, then grades in the same environment; dataset and image tooling for R2E-Gym, SWE-reBench and SWE-bench rows. Used by `examples/Qwen3.5-35B-A3B-verl`. |
 
 ## Benchmarks
 
@@ -83,10 +85,15 @@ compare image pull, image streaming and other loaders on the same images. The re
 what each phase cost.
 [`internal/benchmarking/DESIGN.md`](internal/benchmarking/DESIGN.md) specifies the benchmark system.
 
+## Support
+
+The components, the clients, the integrations and the `ateenv.v1alpha` API are supported;
+`examples/` and `internal/examples/` are not. [docs/support.md](docs/support.md) says what
+supported means for each path.
+
 ## Get started
 
-You need a cluster with Agent Substrate at or after
-[`0443aec3`](https://github.com/agent-substrate/substrate/commit/0443aec3), a snapshots bucket,
+You need a cluster with Agent Substrate v0.6.0 or later, a snapshots bucket,
 `kubectl` with `kubectl-ate`, Go, [ko](https://ko.build), and Python 3.10 or later for the SDK. This
 repo publishes no release binaries or images yet, thus build them:
 
@@ -135,13 +142,13 @@ Then pick an [example](#examples) or an [integration](#integrations).
 
 Prerequisites: a cluster with [Agent Substrate](https://github.com/agent-substrate/substrate)
 installed and a snapshots bucket. ate-env is built against Substrate
-[`ddb46651`](https://github.com/agent-substrate/substrate/commit/ddb46651) (2026-10-18, Go module
-`go.ate.dev/substrate`). The cluster needs Substrate at or after
-[`0443aec3`](https://github.com/agent-substrate/substrate/commit/0443aec3) (2026-10-17): from that
-commit the WorkerPool alone chooses the sandbox (`spec.sandboxClasses`), the ActorTemplate names
-none, and Substrate rejects a template that still sends `sandboxConfig`, while an older Substrate
-requires one. With an older Substrate, use ate-env from before the Substrate bump (merge commit
-`a21ead9`). Because the template no
+[`v0.6.0`](https://github.com/agent-substrate/substrate/releases/tag/v0.6.0) (Go module
+`go.ate.dev/substrate`), and the control plane must run v0.6.0 or later: the release renumbered
+the wire fields of Actor, ActorStatus, ActorTemplate, SnapshotConfig and Volume, so this build
+cannot create or read actors on an older control plane, and its templates carry limits as integer
+millicores and bytes. Upgrade the control plane and the ate-env images together; with an older
+Substrate, use ate-env from before the v0.6.0 bump. The WorkerPool alone chooses the sandbox
+(`spec.sandboxClasses`) and the ActorTemplate names none. Because the template no
 longer names a class, an actor booting without a snapshot can land on any pool whose labels its
 template's `workerSelector` matches, and on any pool at all without a selector. `ate-env` labels its
 WorkerPool `ate-env/workerpool: <pool>` and each template selects that label, thus actors stay on
@@ -190,6 +197,41 @@ An atespace has one access policy. If `ate-env` already has one, add the binding
 `kubectl ate update access-policy`. Repeat both commands for each other atespace you create
 environments in.
 
+Since Substrate v0.6.0 the atenet router serves only TLS listeners and admits
+only clients whose SPIFFE ID is on its allow-list. The manifest mounts the pod
+identity certificate and the servicedns trust bundle into `ate-env-api` for
+that (`--api-router-tls`, on by default), as the `podCertificate` and
+`clusterTrustBundle` projected volumes. GKE 1.37 and later serve both by
+default. A 1.36 cluster must be created with
+`--enable-kubernetes-unstable-apis=certificates.k8s.io/v1beta1/podcertificaterequests,certificates.k8s.io/v1beta1/clustertrustbundles`
+and its node pools created after that, or the mount fails with
+`MountVolume.SetUp failed: unimplemented`; Substrate's `setup-gcp create
+cluster` does both, and its
+[README](https://github.com/agent-substrate/substrate/blob/v0.6.0/tools/setup-gcp/README.md)
+has the details. Versions below 1.36 are not supported. The API's identity
+is `spiffe://cluster.local/ns/<namespace>/sa/ate-env-api`, and `ate-env
+manifest` prints the exact ID. Add it to the Substrate install's allow-list,
+one comma-separated value that becomes the router's whole
+`--ingress-allowed-spiffe-ids`, so keep the IDs already on it, and rerun the
+deploy for a running install:
+
+```bash
+# In the Substrate checkout.
+ATE_INGRESS_ALLOWED_SPIFFE_IDS=spiffe://cluster.local/ns/ate-env/sa/ate-env-api,<existing IDs> \
+  go run ./cmd/ate-setup deploy ate-system
+```
+
+Editing the `atenet-router` Deployment's `--ingress-allowed-spiffe-ids`
+argument does the same by hand. ate-setup requires the list for its default
+Envoy ingress dataplane, which enforces it. Without the ID, or when the
+router does not trust the podidentity signer, the router rejects the API's
+certificate: guest calls fail at once with `FailedPrecondition` naming the ID
+and what to check, the port proxy answers 502 with the same cause, and the
+API logs the ID it presents at startup. `--api-router-tls=false` leaves the
+API on the router's plaintext addresses, which no Substrate release serves
+since v0.6.0, the first this build pairs with; it exists for the test fakes,
+and the API warns at startup when it runs that way.
+
 Deploy the namespace, worker pool, ServiceAccount and API service:
 
 ```bash
@@ -212,6 +254,20 @@ kubectl get pods -n ate-env
 parking budget) and, once the control plane reports the environment RUNNING, up to
 `--wake-running-budget` (default 20s). Both are flags of the `ate-env-api` binary; `ate-env manifest`
 does not set them, thus add them to the Deployment's arguments to change them.
+
+`ate-env-api` can export traces and serve Prometheus metrics; both are off by default:
+
+- `--enable-tracing` exports OpenTelemetry traces over OTLP/gRPC, configured by
+  `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_INSECURE`. The server continues the W3C
+  `traceparent` / `tracestate` that a caller sends and passes it on to ateapi and the guests as is.
+  `ate-env manifest --enable-tracing --otlp-endpoint <url> [--otlp-insecure]` sets these.
+- `--metrics-listen-addr` (for example `:9090`) serves the families in
+  [docs/metrics.md](docs/metrics.md) at `/metrics` on a listener of its own.
+  `--metrics-environments-ttl` (default 1m) bounds how often a scrape lists the environments.
+  `ate-env manifest --metrics-port <port>` sets the flag and exposes the port on the container and
+  the Service, with `prometheus.io` scrape annotations; 0 (the default) leaves metrics off. The
+  metrics listener has no authentication and no `Host` check: anyone who reaches it reads request
+  counts, atespace names with environment counts, and the build version.
 
 By default `ate-env manifest` deploys `ate-env-api` without caller authentication for use over
 `kubectl port-forward`. Before exposing `ate-env-api` beyond loopback (e.g. through an internal
@@ -334,6 +390,10 @@ $ ate-env suspend dev1
 $ ate-env delete dev1
 ```
 
+Subcommand names (`create`, `delete`, `suspend`, `manifest`, `server-info`, `help`, `completion`) are
+reserved: `ate-env create` rejects them as environment IDs, because `ate-env <id> ...` cannot reach
+such an environment.
+
 `ate-env` provides help text:
 
 ```bash
@@ -354,6 +414,7 @@ Available Commands:
   delete      Delete an environment
   help        Help about any command
   manifest    Generate Kubernetes manifests to deploy the system
+  server-info Show the ate-env-api server's version and features
   suspend     Suspend an environment
 
 Flags:
@@ -380,24 +441,53 @@ Available Commands:
   template      Generate Substrate ActorTemplate manifest
 
 Flags:
-      --api-image string      digest-pinned ate-env-api image for the API service (required: this ate-env was built from source; release binaries default to the image published with the release, see docs/release.md)
-      --api-port int32        port the ate-env-api service listens on (default 7777)
-      --api-replicas int32    number of API service replicas (default 1)
-      --ateom-image string    alias for --worker-image, kept from before Substrate renamed ateom to ateworker
-  -h, --help                  help for manifest
-      --namespace string      Kubernetes namespace to deploy into (default "ate-env")
-      --replicas int32        number of pre-warmed worker pods (default 5)
-      --template string       ActorTemplate name (default "default-template")
-      --worker-image string   digest-pinned worker image for the worker pool, e.g. ateworker-gvisor built from the Substrate repo
-      --workerpool string     WorkerPool name (defaults to <template>-workerpool)
+      --api-allowed-hosts strings   extra host names that HTTP clients may use to reach ate-env-api, e.g. an internal load balancer name (a leading *. allows the names below it); the Service's in-cluster names, in the cluster's own DNS domain, IP addresses and localhost are always allowed
+      --api-image string            digest-pinned ate-env-api image for the API service (required: this ate-env was built from source; release binaries default to the image published with the release, see docs/release.md)
+      --api-port int32              port the ate-env-api service listens on (default 7777)
+      --api-replicas int32          number of API service replicas (default 1)
+      --api-router-tls              mount the pod identity certificate and the servicedns trust bundle into ate-env-api and dial the atenet router's TLS listeners, the only ones Substrate serves since v0.6.0; the API's SPIFFE ID must then be in the router's --ingress-allowed-spiffe-ids. Off, the API dials the plaintext addresses, which only the test fakes serve (default true)
+      --ateom-image string          alias for --worker-image, kept from before Substrate renamed ateom to ateworker
+      --auth-token-secret string    Kubernetes Secret name (with key 'token') to mount into ate-env-api and require as a caller bearer token
+      --enable-tracing              run ate-env-api with --enable-tracing, exporting OpenTelemetry traces over OTLP/gRPC
+  -h, --help                        help for manifest
+      --metrics-port int32          port ate-env-api serves Prometheus metrics on (--metrics-listen-addr), exposed on the container and the Service as "metrics" with prometheus.io scrape annotations; 0 leaves metrics off. The metrics listener has no authentication and no Host check
+      --namespace string            Kubernetes namespace to deploy into (default "ate-env")
+      --otlp-endpoint string        OTLP/gRPC collector endpoint for ate-env-api's traces, set as OTEL_EXPORTER_OTLP_ENDPOINT, e.g. http://otel-collector.observability:4317
+      --otlp-insecure               set OTEL_EXPORTER_OTLP_INSECURE=true: talk to the collector in plaintext
+      --replicas int32              number of pre-warmed worker pods (default 5)
+      --template string             ActorTemplate name (default "default-template")
+      --worker-image string         digest-pinned worker image for the worker pool, e.g. ateworker-gvisor built from the Substrate repo
+      --workerpool string           WorkerPool name (defaults to <template>-workerpool)
 
 Use "ate-env manifest [command] --help" for more information about a command.
 ```
 
 ## API
 
-The `ate-env-api` service exposes gRPC APIs for environment
-lifecycle and in-actor operations, as well as HTTP endpoints for MCP.
+The `ate-env-api` service exposes gRPC APIs for environment lifecycle and in-actor operations, as
+well as HTTP endpoints for MCP.
+
+The gRPC services reject a request that carries a field the server does not know, at any depth,
+with `InvalidArgument`: a client built from another version or fork of this API fails instead of
+being served as if the field were absent. An `InvalidArgument` whose message says "carries field
+numbers" thus means that the client and the server come from different builds, not that the
+request is wrong: treat it as a configuration error and do not retry. The guest applies the same
+check to the requests that `ate-env-api` forwards to it. Limits:
+
+- The check covers requests only. In the other direction, an older client accepts a newer
+  server's response field, or a new value of `Environment.state`, and ignores it. That is proto3's
+  normal behavior.
+- Build the SWE-bench loader and `ate-env-api` from one commit. A loader flag that sets a request
+  field the server does not know fails every create with "carries field numbers".
+- A renumbered field is not caught. When both sides know field N with different meanings, nothing
+  is unknown.
+- A guest baked into a golden snapshot keeps the build it had. Guests from before this check accept
+  unknown fields and ignore them, and `ate-env-api` cannot detect an old guest. After an upgrade,
+  register the base templates again and delete the `<base>-<12 hex digits>` templates derived from
+  them, so that their golden snapshots bake with the current guest.
+- In a client stream (`WriteFile`, `WriteProcessInput`), a rejected later message ends the call,
+  but what the guest already did with the earlier messages stays: a file can be partly written. A
+  rejected first message does not wake a suspended environment.
 
 ### EnvironmentService
 
@@ -409,6 +499,7 @@ Manages the lifecycle of isolated execution environments (defined in [`proto/ate
 | `GetEnvironment` | Retrieves environment details and status |
 | `SuspendEnvironment` | Suspends and checkpoints the environment to snapshot storage |
 | `DeleteEnvironment` | Deletes the environment permanently |
+| `GetServerInfo` | Reports the server implementation (`sandboxenv-rl`), its version, the version of the `go.ate.dev/substrate` module it was built against, and its optional features (`rootfs_image`, `pty`, and `port_proxy` when enabled); answered by `ate-env-api` itself. The Substrate version is a build fact, not the version of the control plane the server talks to; Substrate has no RPC that reports that. `ate-env server-info --json` prints the four fields as one JSON object |
 
 ### ProcessService
 
@@ -483,13 +574,33 @@ port-forward`. A page served by the forwarded daemon itself is same-origin and p
 behind one listener share that origin, thus a page from one daemon can call another.
 `--port-proxy-trusted-origins` adds origins, such as a UI on its own host. The header form needs no
 check: a browser sends custom headers to another origin only after a CORS preflight, which the API
-never approves. DNS rebinding, where a page on an attacker's name resolves to the forwarded
-listener, is not blocked yet; it needs a check of the `Host` header across the whole listener, the
-MCP endpoint included.
+never approves.
+
+**DNS rebinding.** A page on an attacker's name can make that name resolve to the listener, for
+example to a `kubectl port-forward` on 127.0.0.1, and then read the answers as its own origin. The
+listener refuses that: a request whose `Host` is not an IP address, `localhost`, a name under
+`.localhost`, a name of the API Service or a name in `--allowed-hosts` gets 403. The check covers
+each HTTP route, the MCP endpoint and both forms of the port proxy, over HTTP/1.x and HTTP/2 alike,
+thus also behind a front proxy that speaks h2c to the listener. Only gRPC is not checked: HTTP/2
+requests with an `application/grpc` content type, which gRPC clients send to many different
+authorities. The check is a browser defense, not authentication: a client that sets its own `Host`
+passes, and the bearer token is the control for such callers, gRPC included.
+
+The API Service's names are `ate-env-api`, `ate-env-api.<namespace>`, `ate-env-api.<namespace>.svc`
+and `ate-env-api.<namespace>.svc.<cluster domain>`. `ate-env-api` derives them itself from
+`--service-name`, with the namespace and the cluster's own DNS domain from the pod's
+`/etc/resolv.conf` (else the namespace from `POD_NAMESPACE`), thus an upgrade that changes only the
+image keeps them. Add other names, such as an internal load balancer, with `--api-allowed-hosts` on
+`ate-env manifest`.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--atenet-connect` | `atenet-router.ate-system.svc.cluster.local:8081` | The router's CONNECT listener. An empty value turns the forwarding off. |
+| `--allowed-hosts` | none | Comma-separated host names that HTTP callers may send in `Host`, next to IP addresses, `localhost`, names under `.localhost` and the names of `--service-name`, which are always allowed. A leading `*.` allows the names below it. Needed for a name such as an internal load balancer: `ate-env manifest --api-allowed-hosts` renders it. |
+| `--service-name` | `ate-env-api` | The Kubernetes Service in front of `ate-env-api`; its in-cluster names are allowed hosts. Empty allows none of them. |
+| `--atenet-connect` | `atenet-router.ate-system.svc.cluster.local:8081`, or `:8444` with `--atenet-client-cert` | The router's CONNECT listener. An empty value turns the forwarding off. |
+| `--atenet-client-cert` | none | PEM credential bundle presented to the router's TLS listeners: the pod identity bundle the kubelet projects. With it, `--atenet` and `--atenet-connect` default to the TLS ports (443 and 8444), which are the only ones Substrate v0.6.0 serves. Re-read at every handshake. |
+| `--atenet-ca-file` | none | PEM trust bundle that signs the router's serving certificate, the servicedns bundle. Required with `--atenet-client-cert`; re-read at every handshake. |
+| `--atenet-server-name` | `atenet-router.ate-system.svc` | Name the router's serving certificate must carry. |
 | `--port-proxy-trusted-origins` | none | Comma-separated browser origins allowed to use the path form. |
 | `--port-proxy-response-header-timeout` | `0`, no limit | Bound on the wait for a daemon's response headers. Without it, the caller's deadline ends the wait. |
 
@@ -557,6 +668,11 @@ curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
        }
      }'
 ```
+
+## Security
+
+The trust boundaries and their known gaps are in [docs/security/threat-model.md](docs/security/threat-model.md).
+To report a vulnerability, follow [SECURITY.md](SECURITY.md).
 
 ## Cleanup
 

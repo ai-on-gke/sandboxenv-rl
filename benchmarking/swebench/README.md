@@ -22,6 +22,7 @@ in numbers.
 |---|---|---|
 | eval (SWE-bench Verified evaluation) | `-mode eval -images 500 -tasks-per-image 6 -width 500` | 500 in flight. Each task: create from the image, replay the trajectory, record the reward, delete. With the offline exclusion list the 500 become 445 images and 2,670 tasks; the loader prints the reduced count. |
 | steps (training loop) | `-mode steps -images 500 -rollouts 2 -steps 8 -park suspend` | 1,000 environments created once. Each step replays the trajectory on all of them, waits for the last (the barrier), then parks the fleet. `-park` is `suspend`, `delete` or `none`. |
+| steps with a window (pools per step) | `-mode steps -images-per-step 32 -rollouts 16 -steps 6 -park delete` | Each step takes the next 32 images (wrapping around the dataset), creates 16 fresh environments per image, 512 in all, runs the step behind a barrier, and retires them. Nothing survives a step, so every task pays the cold path, and a new image is a new derived template and a golden bake on first use: the shape of a trainer that creates and retires pools every step. Run several loaders at once, one run id each, for several jobs on one cluster. |
 
 The trajectory is YAML (`internal/benchmarking/swebench/trajectories/`,
 or `-trajectory FILE`). The built-in `swebench-gold` does what a SWE agent
@@ -60,6 +61,31 @@ between runs. Given several files, `report a.jsonl b.jsonl` prints one table
 with a column per run: p50/p95 per event, and per step the live environments,
 tasks, failures, barrier, park and wake p50/p95. `-json` then writes the
 summaries as an array. Files go before the flags.
+
+Every run event carries labels: the loader's own (mode, width, images,
+trajectory, dataset, the shape flags, connections, base template, exclude
+file, instances and the timeouts) plus any `run -label KEY=VALUE`, which is
+where the Substrate commit, the cluster and the arm go. A `-label` with a key
+the loader records itself is refused, so the same-workload check below cannot
+be overridden. The report prints
+them under its header, and the comparison shows one row per label key, so a
+column's provenance is in the table. `report -arm pull=p1.jsonl,p2.jsonl
+-arm stream=s1.jsonl,s2.jsonl` gives one column per arm, in flag order. Two
+rules pool an arm's reps: counts add up (tasks, failed, rewarded, a step's
+live environments, and the `n` of every event row, whose percentiles are
+computed over the merged raw events, never over per-run percentiles), and
+durations take the median across the reps (a step's barrier and park, and
+the run), the mean of the two middle values for an even count. A `reps` row
+says how many runs each column pools, and the JSON lists their run ids. The
+reps of an arm must be complete runs of one workload: each with a run event
+and the loader's labels, no run id twice or in two arms, and the loader's
+own labels equal (`exclude_file` and `instances` compare by name or count
+plus a digest of their ids); a `-label` value that differs across them shows
+every value `|`-joined, so a column that mixes commits says so. An operator
+label named like a built-in row (`tasks`, say) prints as `label.tasks`. A
+path in `-arm` may not contain a comma. `report RUN.jsonl
+-top 10` lists the ten slowest successful first commands and the ten slowest
+successful wakes by environment, for finding the straggler.
 
 ## How many actors, and on which clusters
 
@@ -164,8 +190,9 @@ KO_DOCKER_REPO=gcr.io/PROJECT/repo benchmarking/swebench/run-in-cluster.sh swe-e
   -mode eval -images 500 -tasks-per-image 6 -width 500 -connections 8
 ```
 
-The script bakes the dataset and the exclusion list into the loader image,
-runs a Job next to ate-env-api, follows the full loader log (step failures
+The script bakes the dataset, the exclusion list and any `-trajectory` file
+you pass (with the files its `write` steps name, so a grader script travels
+with its trajectory, and nothing else from its directory) into the loader image, runs a Job next to ate-env-api, follows the full loader log (step failures
 included), copies the events file back to the current directory, prints the
 report and deletes the Job. `CONTEXT=<kubectl context>` selects the cluster;
 the same command with a different context and run id is how two clusters are
@@ -188,6 +215,28 @@ material, so the manifest can be image-only:
 benchmarking/swebench/make-dataset.py --images-file images.txt --out images.jsonl
 swebench-loader run -dataset images.jsonl -trajectory workload-read-all -images 200 -width 200 -run-id pull-baseline
 ```
+
+The workloads take their knobs from `run -set KEY=VALUE`, through the
+trajectories' `var` function, and each file states its defaults, which fit a
+SWE-bench image. A value lands in the command as one quoted shell word. Each
+`-set` is recorded as a `set.KEY` label, which the reps of an arm must agree
+on, and a key that no trajectory reads is an error:
+
+| Workload | Knobs | Default | What it reads |
+|---|---|---|---|
+| `workload-file-read-one` | `READ_FILE` | `/testbed/.git/HEAD` (tiny; set a real file to measure a read) | one file |
+| `workload-file-read` | `READ_ROOT`, `READ_FILES` | `/`, `200` | a sample of Python files |
+| `workload-compile` | `PYTHON`, `COMPILE_DIR` | `python3`, `/testbed` | every Python file under the directory, compiled with the image's own Python |
+| `workload-read-all` | `READ_ROOT` | `/` | every regular file, the worst case for lazy loading |
+
+The reading steps print the bytes read, which the reward step's output tail
+keeps in the events file, and fail when nothing was read or a read reported
+an error, so a wrong path or a lazy-loading fault scores 0, not 1. `-trajectory workload-file-read-one,workload-compile,workload-read-all`
+mixes them: each environment draws one, with `-seed` fixing the draw so every
+rep gives the same environment the same workload; the task event's `name` is
+the trajectory it replayed. In steps mode the first step's work runs after the
+create and every later step's after a wake, which is the boot-then-resume
+shape of the profiling scripts these workloads were ported from.
 
 `images.txt` holds one reference per line, a tag or `repo@sha256:...`; tags
 are resolved with `crane`. The instance id is the image name, the tag if one
@@ -238,12 +287,16 @@ manifest fetch, snapshot download, image unpack, the worker's restore, and
 the total. The actor's name is the environment's name, so the report pairs
 each record with the `ttfi` or `wake` event of that environment whose window
 (the event's end minus its duration, up to its end) contains the record's
-time: a record inside a `ttfi` window is a cold start, one inside a `wake`
+time: a record inside a `ttfi` window is a first start, one inside a `wake`
 window is a wake. The table gives p50/p95/max per phase plus an `outside`
 row, the event's span minus atelet's total, which is ateapi, the scheduler,
-the router and the command itself. Failed restores are counted and left out
-of the percentiles; restores whose event failed are counted and left out of
-`outside`. Records before the run's first event or after its last (a rerun
+the router and the command itself. The report does not call a restore cold
+or warm: atelet's `oci_unpack` phase times the bundle preparation, which runs
+on every restore whether or not the node had the layers, so the record
+carries no cache signal; the cache samples above give the run's misses until
+atelet records the image cache outcome per restore. Failed restores are
+counted and left out of the percentiles; restores whose event failed are
+counted and left out of `outside`. Records before the run's first event or after its last (a rerun
 with the same run id), for actors the run never created, or inside no window
 (a restore after an eviction or a failed suspend) are counted, not paired.
 The records come from the kubelet's container logs, which rotate, so harvest
@@ -274,6 +327,10 @@ benchmark of its own.
 
 ## Record with every run
 
-Substrate and env commits, cluster shape (machine type, node count, sandbox
-class), bucket region, the dataset manifest's digest, and the loader flags.
-The report alone is not reproducible without them.
+Substrate and env commits, cluster shape (machine type, node count, disk,
+sandbox class), bucket region, the dataset manifest's digest, and the loader
+flags. Pass them as `run -label` values so they travel with the events file. The
+loader records its own flags itself: mode, width, images, trajectory,
+dataset, tasks per image or rollouts, steps and park, connections, base
+template, exclude file, instances, and the create, step, wake-budget and
+wake-backoff timeouts. The report alone is not reproducible without them.

@@ -73,6 +73,7 @@ actor boots. Retry until it serves (see the how-to below).
 | `Client.get()` / `Env.info()` | `EnvironmentService.GetEnvironment` | ate-env-api → control plane |
 | `Client.suspend()` / `Env.suspend()` | `EnvironmentService.SuspendEnvironment` | ate-env-api → control plane |
 | `Client.delete()` / `Env.delete()` | `EnvironmentService.DeleteEnvironment` | ate-env-api → control plane |
+| `Client.server_info()` | `EnvironmentService.GetServerInfo` | answered by ate-env-api |
 | `Client.env()` | *(no RPC — returns a handle)* | — |
 | `Env.start_process()` | `ProcessService.StartProcess` | proxied to guest |
 | `Env.process()` | *(no RPC — returns a handle)* | — |
@@ -312,6 +313,29 @@ except NotFoundError:
     data = None
 ```
 
+### Share one run id across a job's processes
+
+Each `SandboxFleet` gets a random `run_id`. A training or eval job usually has
+several processes (an orchestrator that plans and warms, workers that claim and
+step), so give them all the job's id:
+
+```python
+cfg = FleetConfig(run_id=os.environ["JOB_PREFIX"])   # a DNS-1123 label
+fleet = SandboxFleet(cfg)                             # same run_id in every process
+```
+
+Handles (`handle.run_id`), the warm-pool environments that `setup()` and
+`warm_images()` create, `ate_env.run_id` on spans, and the run report's
+`environment` block then all carry the job's id. `"warm-pool"` is reserved: it
+is the run id of warm environments created by calling a driver's
+`warm_pool()` without one.
+
+The run id stays in the client. It is not sent to ate-env-api, and environment
+names (`sb-…`, `warm-…`) don't contain it. So `teardown()` still releases only
+the environments that this process created and tracks. An orchestrator can't
+reap a crashed worker's environments by run id. Reaping across processes needs
+server-side labels and listing in ate-env-api, which don't exist yet.
+
 ### Concurrency
 
 One `Client` multiplexes any number of concurrent operations over a
@@ -326,26 +350,148 @@ results = await asyncio.gather(
 )
 ```
 
-### Trace calls with OpenTelemetry (optional)
+### Grow the task list while the job runs
 
-The client can emit OpenTelemetry spans and send the W3C trace context to
-`ate-env-api`. This lets you see whether time goes to the client, the API
-server or Substrate. Tracing is off by default and needs the `tracing` extra:
+`load_tasks()` replaces the fleet's tasks. A worker that is handed an episode
+nobody planned, or a trainer that streams batches from a prompt source, calls
+`add_tasks()` instead: it appends, returns the new `Task` objects and, once
+`plan()` has run, extends the plan with their images. It warms nothing, and
+a `run()` already in progress does not run the added tasks (`fleet.tasks` is
+a snapshot). Task ids must be new: `add_tasks` raises `ValueError` and adds
+nothing if an id is already in the fleet or repeats within the call.
+`load_tasks()` follows the same rule within its list: it raises `ValueError`
+and keeps the tasks loaded before if an id repeats. It also recomputes an
+existing plan.
 
-```bash
-pip install "./clients/python[tracing]"
-```
-
-Turn it on with `TracerConfig`, either on a `Client` or with
-`FleetConfig.tracing` for a fleet:
+Both take `Task` objects or dicts. A dict needs `image` and a non-empty
+`task_id` or `id`; a dict without one raises `ValueError`. The fleet does not
+make up ids, because `acquire()`, results and reports need ids that name the
+row in your data. Map dataset rows first:
 
 ```python
-from ate_env import Client, FleetConfig, SandboxFleet, TracerConfig
+fleet.load_tasks([{"id": r["instance_id"], "image": r["image"]} for r in rows])   # SWE-bench JSONL
+fleet.load_tasks([Task(id=f"{r['repo_name']}@{r['commit_hash'][:12]}", image=r["docker_image"])
+                  for r in rows])                                                    # R2E-Gym
 
-client = Client("localhost:7777", tracer_config=TracerConfig(enable_tracing=True))
+new = fleet.add_tasks(next_batch)                    # Task objects or dicts
+fleet.warm_images(sorted({t.image for t in new}), wait=False)
+```
 
-fleet = SandboxFleet(FleetConfig(tracing=TracerConfig(enable_tracing=True)))
-# A plain dict also works: FleetConfig(tracing={"enable_tracing": True})
+### Observability
+
+Three layers, all off the hot path when disabled. The base install has
+no telemetry dependency; the optional layers need extras:
+
+```bash
+pip install './clients/python[tracing,metrics]'
+```
+
+**Run report** (always on, no dependency). After `fleet.run(...)`,
+`fleet.report` is a `RunReport` with per-phase count, total and max
+(`preflight`, `plan`, `ensure_template`, `warm_pool`, `acquire`,
+`process`, `recycle`, `release`, `teardown`), claims, task outcomes and
+warm replicas:
+
+```python
+fleet = SandboxFleet(FleetConfig(backend="mock", strategy="naive"))
+fleet.load_tasks(tasks)
+fleet.run(process_fn)
+print(fleet.report.summary())          # table, same shape as agent-sandbox-rl (run() logs it only at DEBUG)
+fleet.report.to_dict()                 # JSON-ready
+fleet.report.write(os.environ["REPORT_DIR"])   # <strategy>_<n>tasks_<stamp>.txt/.json
+```
+
+`release_errors` counts releases whose delete failed. `release()` logs the
+failure and does not raise, so cleanup never stops a trainer, but it is
+recorded: the `ate_env_client.release` span and the
+`ate_env_client_release_seconds` sample get status `error`, the fleet counts
+it in `ate_env_fleet_release_failures_total`, and the environment stays owned
+by the driver, so `teardown()` (the run's reap) tries the delete again and
+raises `InfrastructureError` if it still fails. An environment that is
+already gone (NotFound) counts as released.
+
+`write` never overwrites a report: when the name is taken (another report in
+the same second, for example from a Ray worker that shares the directory), it
+appends `-1`, `-2`, ... Runs on one fleet do not overlap: a second `run()`
+while one is in progress raises `RuntimeError`.
+
+`AsyncSandboxFleet.run` also fills `fleet.report`, but only with the phases
+inside `run()`: `acquire`, `process`, `release` (and `ensure_template` on the
+first use of an image). With `async with fleet:`, `setup()` and `teardown()`
+run outside `run()`, so their `preflight`, `plan`, `warm_pool` and `teardown`
+phases go to the Prometheus series and spans but not to the report. The sync
+`SandboxFleet.run` does setup and teardown inside the run, so its report has
+every phase.
+
+**Prometheus** (`metrics` extra; `ObservabilityConfig.enable_metrics`).
+The default, `None`, records the series whenever `prometheus_client` is
+importable, whether from the `metrics` extra or another package (Ray
+installs it, so inside a Ray trainer the series are on unless you set
+`enable_metrics=False`), and otherwise logs one INFO message; `True` asks
+for them, so a missing `prometheus_client` logs a WARNING; `False` turns
+them off. The `ate_env_client_*` switch is process-global and one-way: once
+any fleet in the process enables metrics, the client histograms keep
+recording, even for a later fleet with `enable_metrics=False`. The fleet records
+`ate_env_fleet_phase_latency_seconds`, `ate_env_fleet_task_latency_seconds`,
+`ate_env_fleet_run_latency_seconds`, `ate_env_fleet_claims_total`,
+`ate_env_fleet_tasks_total`, `ate_env_fleet_warm_replicas` and
+`ate_env_fleet_release_failures_total`, and the client
+records `ate_env_client_{acquire,exec,suspend,warm_claim,release}_seconds`
+(`warm_claim` is the time to validate a warm claim; the resume itself
+happens on the first guest request, so it lands in the first `exec`).
+Collectors register on the first metrics-enabled `Observer`, never at
+import. Labels are limited to `phase`, `backend` (`substrate` or `mock`),
+`family` (the task's repo family, see `ate_env.observability.repo_family`),
+`strategy` and `status` (`ok`, `error`, or `cancelled` for a cancelled or
+interrupted block); environment ids, run ids, commands, paths and image
+tags never become labels. `family` has at most
+`ate_env.observability.MAX_FAMILIES` (64) values per process: the first 64
+repo families keep their name and later ones are reported as `other`, so a
+dataset with thousands of repos does not grow the series without limit.
+A repo whose family is `other` or `unknown` is labelled `other_repo` or
+`unknown_repo`, so it is never confused with the overflow or no-family value.
+A repo already named like an escaped value gets one more suffix
+(`other_repo` -> `other_repo_repo`), so two repos never share a label.
+`repo_family` takes `metadata["repo"]` or parses a SWE-bench image name: set
+`metadata["repo"]` for non-SWE-bench datasets (e.g. R2E-Gym); otherwise
+their family is `unknown`.
+
+The warm-replica gauge adds up across fleets in one process: each fleet
+moves it by its own changes. A backend driver belongs to one fleet; a second
+fleet on the same driver takes over its claim and warm events and logs a
+warning.
+
+Expose the series with:
+
+```python
+from ate_env.observability import serve_metrics
+serve_metrics(9095, addr="127.0.0.1")  # /metrics on the default registry, local only
+```
+
+`serve_metrics` listens on all interfaces (`0.0.0.0`) unless you pass
+`addr`; a scraper in the cluster needs that, but on a laptop or a
+host-network pod it exposes `/metrics` to the network. A busy port raises
+`OSError` (`EADDRINUSE`), for example when two Ray workers on one node both
+call `serve_metrics(9095)`: give each process its own port. Pass
+`registry=` (a `prometheus_client.CollectorRegistry`) to `serve_metrics` and
+to `Observer` to keep the `ate_env_fleet_*` series off the global registry.
+
+**Tracing** (`tracing` extra; off by default). The client emits
+OpenTelemetry spans and sends the W3C trace context to `ate-env-api`, so
+you can see whether time goes to the client, the API server or Substrate.
+Either fleet switch turns on tracing for the whole fleet, under one
+service name:
+
+```python
+from ate_env import Client, FleetConfig, ObservabilityConfig, TracerConfig
+
+FleetConfig(observability=ObservabilityConfig(enable_tracing=True))   # service "ate-env-fleet"
+FleetConfig(tracing=TracerConfig(enable_tracing=True))                # service "ate-env-client"
+# Both on: ObservabilityConfig.trace_service_name wins ("ate-env-fleet" here).
+FleetConfig(tracing=TracerConfig(enable_tracing=True, trace_service_name="trainer"),
+            observability=ObservabilityConfig(enable_tracing=True))
+FleetConfig(tracing={"enable_tracing": True})                         # a plain dict also works
+Client("localhost:7777", tracer_config=TracerConfig(enable_tracing=True))  # client only
 ```
 
 `TracerConfig` fields:
@@ -353,9 +499,23 @@ fleet = SandboxFleet(FleetConfig(tracing=TracerConfig(enable_tracing=True)))
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `enable_tracing` | `False` | Emit spans and propagate the trace context. |
-| `trace_service_name` | `"ate-env-client"` | OTel resource `service.name` of the client's own OTLP provider (case 2 below). Spans are always named `ate_env_client.<op>`. |
+| `trace_service_name` | `"ate-env-client"` | OTel resource `service.name` of the client's own OTLP provider (case 2 below). Spans are always named `ate_env_client.<op>`. In a fleet with `ObservabilityConfig.enable_tracing` also on, `ObservabilityConfig.trace_service_name` takes precedence (logged at DEBUG). |
 
-When tracing is on:
+One `fleet.run(...)` is one trace:
+
+```
+ate_env_fleet.run
+  ate_env_fleet.acquire
+    ate_env_client.acquire
+      ate_env_client.create_environment
+  ate_env_fleet.process
+    ate_env_client.exec
+  ate_env_fleet.release
+    ate_env_client.release
+      ate_env_client.delete_environment
+  ate_env_fleet.teardown
+    ate_env_client.reap
+```
 
 - **Spans.** `Client`, `SandboxHandle` and the Substrate backend emit
   `ate_env_client.<op>` spans, for example `create_environment`, `acquire`,
@@ -365,8 +525,10 @@ When tracing is on:
   image tags. A command that fails with `check=True` marks its `exec` span
   as an error.
 - **Propagation.** Every gRPC call on a channel the client creates carries
-  `traceparent` / `tracestate`. Baggage is never sent. A channel you pass
-  with `Client(channel=...)` is left as is.
+  the W3C `traceparent` / `tracestate` (never baggage), so `ate-env-api`
+  can continue the trace. A caller-owned `Client(channel=...)` gets spans
+  but not the header: add `ate_env.telemetry.TraceContextInterceptor`
+  subclasses to your channel yourself.
 - **Nesting.** Client spans nest under the caller's current span, including
   across the fleet's worker threads and background event loop.
 

@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import collections
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
@@ -28,6 +28,7 @@ from ._gen.ateenv.v1alpha import env_pb2, env_pb2_grpc, guest_pb2_grpc
 from .config import TracerConfig
 from .env import Env
 from .errors import map_rpc_error
+from .telemetry import metrics
 from .telemetry.tracing import (
     CLIENT_SPAN_PREFIX,
     _trace_interceptors,
@@ -36,7 +37,12 @@ from .telemetry.tracing import (
     start_span,
     tracer_from_config,
 )
-from .types import EnvironmentInfo, _environment_info_from_pb
+from .types import (
+    EnvironmentInfo,
+    ServerInfo,
+    _environment_info_from_pb,
+    _server_info_from_pb,
+)
 
 __all__ = ["Client", "DEFAULT_ATESPACE"]
 
@@ -140,12 +146,18 @@ class Client:
         channel: grpc.aio.Channel | None = None,
         auth_token: str | None = None,
         tracer_config: TracerConfig | None = None,
+        channel_options: Sequence[tuple[str, Any]] | None = None,
     ):
         """Create a client for the ate-env-api service at endpoint.
 
         endpoint accepts a host:port or an http(s):// URL, matching the Go
         client. Pass channel to supply a caller-owned grpc.aio.Channel
         instead; the client then never closes it.
+
+        channel_options are gRPC channel arguments for a channel the client
+        creates (for example ``("grpc.use_local_subchannel_pool", 1)`` to
+        give the channel its own TCP connection). They are ignored when
+        channel is given.
 
         tracer_config enables OpenTelemetry spans (``ate_env_client.<op>``)
         and, on a channel the client owns, the W3C trace context in the
@@ -169,7 +181,9 @@ class Client:
                 # After auth, so the trace context rides on the final metadata.
                 interceptors += _trace_interceptors()
             self._channel = grpc.aio.insecure_channel(
-                _normalize_target(endpoint), interceptors=interceptors or None
+                _normalize_target(endpoint),
+                options=list(channel_options) if channel_options else None,
+                interceptors=interceptors or None,
             )
             self._owns_channel = True
         self._environments = env_pb2_grpc.EnvironmentServiceStub(self._channel)
@@ -258,7 +272,11 @@ class Client:
     async def suspend(self, id: str, *, atespace: str = DEFAULT_ATESPACE) -> None:
         """Checkpoint and stop the environment."""
         req = env_pb2.SuspendEnvironmentRequest(id=id, atespace=atespace)
-        with self._rpc_span("suspend_environment", "SuspendEnvironment", lambda: {"ate.actor.name": id, "ate.atespace": atespace}):
+        with (
+            self._rpc_span("suspend_environment", "SuspendEnvironment",
+                           lambda: {"ate.actor.name": id, "ate.atespace": atespace}),
+            metrics.timed("suspend"),
+        ):
             try:
                 await self._environments.SuspendEnvironment(req, metadata=self._auth_metadata())
             except grpc.RpcError as e:
@@ -272,6 +290,21 @@ class Client:
                 await self._environments.DeleteEnvironment(req, metadata=self._auth_metadata())
             except grpc.RpcError as e:
                 raise map_rpc_error(e) from e
+
+    async def server_info(self) -> ServerInfo:
+        """Return the server's implementation, version and optional features.
+
+        A server that predates GetServerInfo raises RpcError with code
+        UNIMPLEMENTED.
+        """
+        with self._rpc_span("get_server_info", "GetServerInfo", dict):
+            try:
+                resp = await self._environments.GetServerInfo(
+                    env_pb2.GetServerInfoRequest(), metadata=self._auth_metadata()
+                )
+            except grpc.RpcError as e:
+                raise map_rpc_error(e) from e
+        return _server_info_from_pb(resp)
 
     def env(self, id: str, *, atespace: str = DEFAULT_ATESPACE) -> Env:
         """Return a handle to an environment without checking that it exists."""

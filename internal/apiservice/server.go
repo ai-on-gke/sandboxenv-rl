@@ -23,9 +23,11 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/agent-substrate/env/internal/ate"
+	"github.com/agent-substrate/env/internal/telemetry"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
@@ -73,6 +75,15 @@ type Server struct {
 	// RouterIdentity is the SPIFFE ID of the certificate RouterTLS presents,
 	// named in the error when the router rejects it.
 	RouterIdentity string
+
+	// Metrics, when set, receives the create_to_ready and wake_wait
+	// observations and tracks the atespaces ate_env_api_environments
+	// reports (see EnvironmentCounts). Nil records nothing.
+	Metrics *telemetry.Metrics
+
+	readyMu   sync.Mutex
+	pending   map[string]pendingCreate // atespace/id -> creation start, until the guest first answers
+	atespaces map[string]bool          // atespaces environments were created in, for EnvironmentCounts
 }
 
 // New creates a new Server.
@@ -123,9 +134,13 @@ func (s *Server) Close() {}
 // the base template does not exist in the atespace, or when the derived name
 // is already held by a template running a different image. Other control
 // plane failures are mapped by toGRPCError.
-func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (*ateenvv1alpha.CreateEnvironmentResponse, error) {
+func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (resp *ateenvv1alpha.CreateEnvironmentResponse, retErr error) {
 	if req.GetId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "id is required")
+	}
+	var start time.Time
+	if s.Metrics != nil {
+		start = requestedAt(ctx, time.Now())
 	}
 	tmpl := req.GetTemplate()
 	templateName := tmpl.GetName()
@@ -138,6 +153,15 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 	}
 	if atespace == "" {
 		atespace = DefaultAtespace
+	}
+	if s.Metrics != nil {
+		defer func() {
+			if retErr != nil {
+				s.Metrics.ObserveCreateToReady(atespace, telemetry.ReadyStatusError, time.Since(start))
+				return
+			}
+			s.trackCreate(atespace, req.GetId(), start)
+		}()
 	}
 
 	if image := req.GetRootfsImage(); image != "" {
@@ -265,6 +289,7 @@ func (s *Server) DeleteEnvironment(ctx context.Context, req *ateenvv1alpha.Delet
 	if err := s.client.Delete(ctx, atespace, req.GetId()); err != nil {
 		return nil, toGRPCError(err)
 	}
+	s.finishCreate(atespace, req.GetId(), telemetry.ReadyStatusDeleted)
 
 	return &ateenvv1alpha.DeleteEnvironmentResponse{}, nil
 }
@@ -509,8 +534,7 @@ func (s *Server) guestConn(ctx context.Context, atespace, id string) (*grpc.Clie
 		atespace = DefaultAtespace
 	}
 	targetActor := atespace + "/" + id
-	conn, err := grpc.NewClient(
-		s.routerAddr,
+	dialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(s.routerCredentials()),
 		grpc.WithChainUnaryInterceptor(func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 			ctx = metadata.AppendToOutgoingContext(ctx, ate.TargetActorHeader, targetActor)
@@ -520,7 +544,14 @@ func (s *Server) guestConn(ctx context.Context, atespace, id string) (*grpc.Clie
 			ctx = metadata.AppendToOutgoingContext(ctx, ate.TargetActorHeader, targetActor)
 			return streamer(ctx, desc, cc, method, opts...)
 		}),
-	)
+	}
+	// With tracing on, the wake probe and the proxied call carry the
+	// caller's trace context (ctx holds the server span), so a resume the
+	// probe triggers in the router shows up in the caller's trace.
+	if s.client != nil && s.client.TracingEnabled() {
+		dialOpts = append(dialOpts, ate.Options{EnableTracing: true}.TracingDialOptions()...)
+	}
+	conn, err := grpc.NewClient(s.routerAddr, dialOpts...)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "dialing guest router for %s/%s: %v", atespace, id, err)
 	}
@@ -612,4 +643,195 @@ func nextMessage[Req any](stream interface{ Recv() (*Req, error) }) (*Req, error
 		return nil, nil
 	}
 	return req, err
+}
+
+// ============================================================================
+// --- TELEMETRY ---
+// ============================================================================
+
+// pendingCreate is an environment created through this replica whose guest
+// has not answered yet.
+type pendingCreate struct {
+	atespace string
+	start    time.Time
+}
+
+// Bounds on the create_to_ready bookkeeping. An environment that is created
+// and never used, deleted or crashed through this replica (another replica
+// served its calls, or the client went away) would otherwise stay pending
+// forever. Entries older than pendingTTL are dropped unobserved when the map
+// is full; maxAtespaces caps the atespace label of ate_env_api_environments.
+const (
+	maxPending   = 10000
+	pendingTTL   = time.Hour
+	maxAtespaces = 64
+)
+
+// environmentListConcurrency bounds the ListActors calls EnvironmentCounts
+// has in flight, so a scrape over up to maxAtespaces atespaces finishes
+// within the collector's timeout without flooding the control plane.
+const environmentListConcurrency = 8
+
+// requestedAt returns the start of create_to_ready for a CreateEnvironment
+// call received at now: the client's x-ate-env-requested-at when it is a
+// valid RFC 3339 time no later than now, else now. A time in the future
+// (client clock ahead) falls back to now rather than producing a negative
+// or shortened duration.
+func requestedAt(ctx context.Context, now time.Time) time.Time {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return now
+	}
+	vals := md.Get(telemetry.RequestedAtHeader)
+	if len(vals) == 0 {
+		return now
+	}
+	t, err := time.Parse(time.RFC3339Nano, vals[0])
+	if err != nil || t.After(now) {
+		return now
+	}
+	return t
+}
+
+// trackCreate starts the create_to_ready clock of a created environment.
+func (s *Server) trackCreate(atespace, id string, start time.Time) {
+	if s.Metrics == nil {
+		return
+	}
+	s.readyMu.Lock()
+	defer s.readyMu.Unlock()
+	if s.pending == nil {
+		s.pending = make(map[string]pendingCreate)
+	}
+	if s.atespaces == nil {
+		s.atespaces = map[string]bool{DefaultAtespace: true}
+	}
+	if !s.atespaces[atespace] && len(s.atespaces) < maxAtespaces {
+		s.atespaces[atespace] = true
+		s.Metrics.InitAtespace(atespace)
+	}
+	if len(s.pending) >= maxPending {
+		cutoff := time.Now().Add(-pendingTTL)
+		for k, p := range s.pending {
+			if p.start.Before(cutoff) {
+				delete(s.pending, k)
+			}
+		}
+		if len(s.pending) >= maxPending {
+			return
+		}
+	}
+	s.pending[atespace+"/"+id] = pendingCreate{atespace: atespace, start: start}
+}
+
+// ObserveFirstContact ends create_to_ready (status ok) for an environment
+// whose port the port proxy reached: like a guest RPC through ensureAwake,
+// a CONNECT the router accepts means the environment answers. It does
+// nothing for an environment that is not pending, or without Metrics.
+func (s *Server) ObserveFirstContact(atespace, id string) {
+	s.finishCreate(atespace, id, telemetry.ReadyStatusOK)
+}
+
+// finishCreate observes create_to_ready with readyStatus for a pending
+// environment, once; later calls for the same environment do nothing.
+func (s *Server) finishCreate(atespace, id, readyStatus string) {
+	if s.Metrics == nil {
+		return
+	}
+	key := atespace + "/" + id
+	s.readyMu.Lock()
+	p, ok := s.pending[key]
+	if ok {
+		delete(s.pending, key)
+	}
+	s.readyMu.Unlock()
+	if ok {
+		s.Metrics.ObserveCreateToReady(p.atespace, readyStatus, time.Since(p.start))
+	}
+}
+
+// environmentStates are the state label values of ate_env_api_environments,
+// reported as zero when no environment is in them so the series stay put.
+var environmentStates = []string{"unspecified", "resuming", "running", "suspending", "suspended", "crashed", "deleting"}
+
+func environmentState(st *ateapipb.ActorStatus) string {
+	return strings.ToLower(strings.TrimPrefix(ActorStatusToEnvStatus(st).String(), "ENVIRONMENT_STATUS_"))
+}
+
+// EnvironmentCounts lists the actors of every atespace this replica has
+// created environments in, DefaultAtespace always included, and counts them
+// by environment state. It is the source of ate_env_api_environments: the
+// control plane is the truth, so the gauge survives restarts and agrees
+// across replicas, at the cost of one ListActors per atespace per scrape
+// (cached by the collector for --metrics-environments-ttl, default 60 s). The atespaces are listed concurrently,
+// at most environmentListConcurrency at a time.
+func (s *Server) EnvironmentCounts(ctx context.Context) ([]telemetry.EnvironmentCount, error) {
+	s.readyMu.Lock()
+	spaces := []string{DefaultAtespace}
+	for a := range s.atespaces {
+		if a != DefaultAtespace {
+			spaces = append(spaces, a)
+		}
+	}
+	s.readyMu.Unlock()
+	return countEnvironments(ctx, spaces, environmentListConcurrency, s.client.List)
+}
+
+// countEnvironments lists the actors of each atespace in spaces with list,
+// running at most limit calls at once, and counts them by environment
+// state. The first error cancels the calls still running and is returned.
+func countEnvironments(ctx context.Context, spaces []string, limit int,
+	list func(ctx context.Context, atespace string) ([]*ateapipb.Actor, error)) ([]telemetry.EnvironmentCount, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make([][]*ateapipb.Actor, len(spaces))
+	var (
+		wg       sync.WaitGroup
+		errOnce  sync.Once
+		firstErr error
+	)
+	sem := make(chan struct{}, max(limit, 1))
+	for i, a := range spaces {
+		sem <- struct{}{}
+		if ctx.Err() != nil {
+			<-sem
+			break
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			actors, err := list(ctx, a)
+			if err != nil {
+				errOnce.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				return
+			}
+			results[i] = actors
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make([]telemetry.EnvironmentCount, 0, len(spaces)*len(environmentStates))
+	for i, a := range spaces {
+		counts := make(map[string]int, len(environmentStates))
+		for _, st := range environmentStates {
+			counts[st] = 0
+		}
+		for _, actor := range results[i] {
+			counts[environmentState(actor.GetStatus())]++
+		}
+		for st, n := range counts {
+			out = append(out, telemetry.EnvironmentCount{Atespace: a, State: st, Count: n})
+		}
+	}
+	return out, nil
 }

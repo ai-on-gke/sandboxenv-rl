@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/env/internal/routertls"
+	"github.com/agent-substrate/env/internal/telemetry"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
@@ -70,7 +71,25 @@ const (
 // state is read once per attempt, and the backoff caps attempts at roughly
 // one per two seconds, so a full four-minute wait costs about 120
 // control-plane reads.
-func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespace, id string) error {
+//
+// With Metrics set, a wait (a first probe that found the guest unreachable)
+// is observed in ate_env_api_wake_wait_seconds with its outcome, and the
+// guest's first answer after CreateEnvironment ends create_to_ready.
+func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespace, id string) (retErr error) {
+	start := time.Now()
+	waited, outcome := false, telemetry.WakeOutcomeError
+	defer func() {
+		if s.Metrics == nil {
+			return
+		}
+		if retErr == nil {
+			s.finishCreate(atespace, id, telemetry.ReadyStatusOK)
+			outcome = telemetry.WakeOutcomeWoke
+		}
+		if waited {
+			s.Metrics.ObserveWakeWait(outcome, time.Since(start))
+		}
+	}()
 	budget := s.WakeBudget
 	if budget <= 0 {
 		budget = DefaultWakeBudget
@@ -79,7 +98,6 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 	if runningBudget <= 0 {
 		runningBudget = DefaultWakeRunningBudget
 	}
-	start := time.Now()
 	var runningSince time.Time // first attempt that saw the actor RUNNING
 	probe := ateenvv1alpha.NewProcessServiceClient(conn)
 	backoff := wakeRetryInitialBackoff
@@ -96,11 +114,13 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 			return status.Errorf(codes.FailedPrecondition, "the atenet router rejected ate-env-api's client certificate%s: %v; %s",
 				identityNote(s.RouterIdentity), err, routertls.RejectionAdvice)
 		}
+		waited = true
 		state, serr := s.actorState(ctx, atespace, id)
 		if serr != nil {
 			return serr
 		}
 		if state == ateapipb.ActorState_ACTOR_STATE_CRASHED {
+			s.finishCreate(atespace, id, telemetry.ReadyStatusCrashed)
 			return status.Errorf(codes.FailedPrecondition, "environment %s/%s crashed while waking: %v", atespace, id, err)
 		}
 		if state == ateapipb.ActorState_ACTOR_STATE_DELETING {
@@ -121,6 +141,7 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 			remaining, allowed, which = overall, budget, "wake budget"
 		}
 		if remaining <= 0 {
+			outcome = telemetry.WakeOutcomeTimeout
 			return status.Errorf(codes.Unavailable, "environment %s/%s did not answer within the %s of %s while %s (%d attempts): %v",
 				atespace, id, which, allowed, shortState(state), attempt, err)
 		}

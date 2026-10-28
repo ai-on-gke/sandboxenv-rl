@@ -14,12 +14,16 @@
 
 # Image-delivery workload: read every file in the image, the worst case for
 # lazy image loading (everything a stream would defer is needed). Probe first,
-# see workload-file-read.
+# and the same failure rules, see workload-file-read.
 name: workload-read-all
 steps:
   - name: probe
     run: "true"
   - name: read_all
-    run: find / -xdev -type f -print0 2>/dev/null | xargs -0 -r cat > /dev/null
+    run: >-
+      find {{var "READ_ROOT" "/"}} -xdev -type f ! -name '.read-all.*' -print0 2>/dev/null > /tmp/.read-all.lst &&
+      test -s /tmp/.read-all.lst &&
+      n=$(xargs -0 -r cat -- < /tmp/.read-all.lst 2>/tmp/.read-all.err | wc -c) &&
+      test "$n" -gt 0 && test ! -s /tmp/.read-all.err && echo "$n"
     timeout: 30m
     reward: true

@@ -78,7 +78,7 @@ func TestGRPCServerOptionsAuthenticateBeforeUnknownFieldCheck(t *testing.T) {
 		{"auth off, unknown field", nil, "", true, codes.InvalidArgument},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := grpc.NewServer(grpcServerOptions(tc.auth)...)
+			srv := grpc.NewServer(grpcServerOptions(tc.auth, nil, false)...)
 			ateenvv1alpha.RegisterEnvironmentServiceServer(srv, stubEnvironments{})
 			lis, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {

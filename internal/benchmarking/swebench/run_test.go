@@ -670,7 +670,14 @@ func TestConfigValidation(t *testing.T) {
 		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 0; c.Steps = 1 },
 		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 1; c.Steps = 1; c.Park = "bogus" },
 		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 1; c.Steps = 1; c.Park = ParkNone; c.ParkEach = true },
-		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 1; c.Steps = 1; c.Park = ParkDelete; c.ParkEach = true; c.ImagesPerStep = 1 },
+		func(c *Config) {
+			c.Mode = ModeSteps
+			c.Rollouts = 1
+			c.Steps = 1
+			c.Park = ParkDelete
+			c.ParkEach = true
+			c.ImagesPerStep = 1
+		},
 	}
 	for i, mutate := range bad {
 		c := good

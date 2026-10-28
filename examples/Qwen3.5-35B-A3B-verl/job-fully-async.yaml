@@ -1,0 +1,138 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Two whole GPU nodes: a Ray head pod (runs the verl driver, the uni-agent gateways and
+# task runners) and a Ray worker pod. Required pod anti-affinity keeps them on different
+# hosts; verl's trainer pool and rollout pool are each sized to a full node, so the
+# Megatron trainer lands on one machine and the vLLM rollout engines on the other.
+# deploy.sh fills the two placeholders below from GPU_POOL (node selector) and GPU_TOLERATIONS
+# (extra tolerations); the placeholder names must not appear in this comment.
+apiVersion: v1
+kind: Service
+metadata: {name: verl-qwen3p5-35b-swe-head, namespace: default}
+spec:
+  clusterIP: None
+  selector: {app: verl-qwen3p5-35b-swe, role: head}
+  ports:
+  - {name: gcs, port: 6379}
+---
+apiVersion: batch/v1
+kind: Job
+metadata: {name: verl-qwen3p5-35b-swe, namespace: default}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata: {labels: {app: verl-qwen3p5-35b-swe, role: head}}
+    spec:
+      restartPolicy: Never
+      nodeSelector: {__GPU_NODE_SELECTOR__}
+      tolerations:
+      - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      __GPU_EXTRA_TOLERATIONS__
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: kubernetes.io/hostname
+            labelSelector: {matchLabels: {app: verl-qwen3p5-35b-swe}}
+      containers:
+      - name: head
+        image: verlai/verl:vllm024.dev2
+        command: ["/bin/bash", "-c", "bash /workspace/cfg/run_fully_async.sh"]
+        ports: [{containerPort: 6379}]
+        env:
+        - {name: ROLE, value: "head"}
+        - {name: NNODES, value: "2"}
+        - {name: NODE_WAIT_S, value: "3600"}
+        - {name: MODEL_ID, value: "Qwen/Qwen3.5-35B-A3B"}
+        - {name: HF_TOKEN, valueFrom: {secretKeyRef: {name: verl-qwen3p5-35b-swe-hf-token, key: token, optional: true}}}
+        - {name: SUBSTRATE_ENV_AUTH_TOKEN, valueFrom: {secretKeyRef: {name: verl-qwen3p5-35b-swe-substrate-token, key: token, optional: true}}}
+        # dataset (uni_agent_substrate.datasets): source + slice; images.json comes from the ConfigMap
+        - {name: TRAIN_SOURCE, value: "r2e_gym_easy"}
+        - {name: TRAIN_SPLIT, value: "train"}
+        - {name: TRAIN_INSTANCES, value: "64"}
+        - {name: VAL_TASKS, value: "20"}
+        # separate_async sizing: TRAIN_BATCH == SYNC_STEP * MINI_BATCH; SESSIONS x 2 CPU/6Gi must fit the sandbox pool
+        - {name: TRAIN_BATCH, value: "16"}
+        - {name: ROLLOUT_N, value: "8"}
+        - {name: MINI_BATCH, value: "8"}
+        - {name: SYNC_STEP, value: "2"}
+        - {name: SESSIONS, value: "24"}
+        - {name: GATEWAYS, value: "2"}
+        - {name: AGENT_WORKERS, value: "2"}
+        - {name: TOTAL_STEPS, value: "2"}
+        - {name: PROMPT_LENGTH, value: "8192"}
+        - {name: RESPONSE_LENGTH, value: "32768"}
+        - {name: TRAIN_CP, value: "1"}                # 2 if the 40k-token step runs out of GPU memory
+        - {name: ROLLOUT_TP, value: "2"}              # 8 GPUs / ROLLOUT_TP vLLM replicas
+        - {name: ATE_ENV_ENDPOINT, value: "ate-env-api.ate-env.svc:7777"}
+        - {name: ATE_TEMPLATE, value: "swe-2c6g"}
+        resources:
+          requests: {cpu: "48", memory: "700Gi", nvidia.com/gpu: 8, ephemeral-storage: "300Gi"}
+          limits:   {memory: "1200Gi", nvidia.com/gpu: 8}
+        volumeMounts:
+        - {name: cfg, mountPath: /workspace/cfg}
+        - {name: work, mountPath: /workspace}
+        - {name: dshm, mountPath: /dev/shm}
+      volumes:
+      - name: cfg
+        configMap: {name: verl-qwen3p5-35b-swe, defaultMode: 0755}
+      - name: work
+        emptyDir: {}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 128Gi}
+---
+apiVersion: batch/v1
+kind: Job
+metadata: {name: verl-qwen3p5-35b-swe-worker, namespace: default}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata: {labels: {app: verl-qwen3p5-35b-swe, role: worker}}
+    spec:
+      restartPolicy: Never
+      nodeSelector: {__GPU_NODE_SELECTOR__}
+      tolerations:
+      - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      __GPU_EXTRA_TOLERATIONS__
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: kubernetes.io/hostname
+            labelSelector: {matchLabels: {app: verl-qwen3p5-35b-swe}}
+      containers:
+      - name: worker
+        image: verlai/verl:vllm024.dev2
+        command: ["/bin/bash", "-c", "bash /workspace/cfg/run_fully_async.sh"]
+        env:
+        - {name: ROLE, value: "worker"}
+        - {name: RAY_HEAD_HOST, value: "verl-qwen3p5-35b-swe-head.default.svc"}
+        - {name: MODEL_ID, value: "Qwen/Qwen3.5-35B-A3B"}
+        - {name: HF_TOKEN, valueFrom: {secretKeyRef: {name: verl-qwen3p5-35b-swe-hf-token, key: token, optional: true}}}
+        - {name: SUBSTRATE_ENV_AUTH_TOKEN, valueFrom: {secretKeyRef: {name: verl-qwen3p5-35b-swe-substrate-token, key: token, optional: true}}}
+        resources:
+          requests: {cpu: "48", memory: "700Gi", nvidia.com/gpu: 8, ephemeral-storage: "300Gi"}
+          limits:   {memory: "1200Gi", nvidia.com/gpu: 8}
+        volumeMounts:
+        - {name: cfg, mountPath: /workspace/cfg}
+        - {name: work, mountPath: /workspace}
+        - {name: dshm, mountPath: /dev/shm}
+      volumes:
+      - name: cfg
+        configMap: {name: verl-qwen3p5-35b-swe, defaultMode: 0755}
+      - name: work
+        emptyDir: {}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 128Gi}

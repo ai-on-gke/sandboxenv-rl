@@ -354,7 +354,12 @@ func resolveCmd(args []string) error {
 func runCmd(args []string) (retErr error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	var (
-		endpoint      = fs.String("endpoint", "localhost:7777", "ate-env API address (host:port).")
+		backendFlag   = fs.String("backend", "substrate", "Backend driver: substrate | agent-sandbox.")
+		accessFlag    = fs.String("access", "ate-env-api", "Access path: ate-env-api | direct | sdk.")
+		endpoint      = fs.String("endpoint", "localhost:7777", "ate-env API or Agent Sandbox gateway address (host:port or URL).")
+		controlAddr   = fs.String("control-addr", "", "Direct Substrate control plane address (defaults to -endpoint when -access=direct).")
+		routerAddr    = fs.String("router-addr", "", "Direct Substrate atenet router address (when -access=direct).")
+		warmPool      = fs.String("warm-pool", "", "SandboxWarmPool name (when -backend=agent-sandbox).")
 		connections   = fs.Int("connections", 4, "gRPC connections to the API, handed out round-robin per environment; a Service balances per connection, so use at least the number of API replicas.")
 		atespace      = fs.String("atespace", "ate-env", "Atespace the environments are created in.")
 		baseTemplate  = fs.String("base-template", "default-template", "Base ActorTemplate the per-image templates derive from (ate-env manifest template).")
@@ -418,6 +423,9 @@ func runCmd(args []string) (retErr error) {
 	}
 	if *dataset == "" {
 		return fmt.Errorf("-dataset is required")
+	}
+	if err := swebench.ValidateBackendDriverFlags(*backendFlag, *accessFlag); err != nil {
+		return err
 	}
 	authToken, err := resolveAuthToken(*authTokenFile, os.Getenv)
 	if err != nil {
@@ -549,12 +557,23 @@ func runCmd(args []string) (retErr error) {
 	if testBackendOverride != nil {
 		backend = testBackendOverride
 	} else {
-		eb, err := swebench.NewEnvBackend(*endpoint, *atespace, *baseTemplate, *connections, authToken)
+		drv, closer, err := swebench.NewBackendDriver(swebench.BackendDriverOptions{
+			Backend:      *backendFlag,
+			Access:       *accessFlag,
+			Endpoint:     *endpoint,
+			ControlAddr:  *controlAddr,
+			RouterAddr:   *routerAddr,
+			Atespace:     *atespace,
+			BaseTemplate: *baseTemplate,
+			WarmPool:     *warmPool,
+			Connections:  *connections,
+			AuthToken:    authToken,
+		})
 		if err != nil {
 			return err
 		}
-		defer eb.Close()
-		backend = eb
+		defer closer.Close()
+		backend = drv
 	}
 
 	var rec *swebench.Recorder

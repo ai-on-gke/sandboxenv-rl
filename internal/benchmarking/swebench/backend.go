@@ -57,6 +57,17 @@ type Backend interface {
 	Delete(ctx context.Context, id string) error
 }
 
+// EnvBackendOption configures an EnvBackend.
+type EnvBackendOption func(*EnvBackend)
+
+// WithPollBounds overrides the initial and maximum process-polling intervals.
+func WithPollBounds(minPoll, maxPoll time.Duration) EnvBackendOption {
+	return func(b *EnvBackend) {
+		b.minPoll = minPoll
+		b.maxPoll = maxPoll
+	}
+}
+
 // EnvBackend is the Backend over the ate-env API through the Go SDK.
 //
 // It holds several connections and hands them out round-robin per
@@ -64,10 +75,11 @@ type Backend interface {
 // connection would put every task on one API replica, and gRPC caps the
 // concurrent streams on a connection.
 type EnvBackend struct {
-	clients      []*env.Client
-	next         atomic.Uint64
-	atespace     string
-	baseTemplate string
+	clients          []*env.Client
+	next             atomic.Uint64
+	atespace         string
+	baseTemplate     string
+	minPoll, maxPoll time.Duration
 }
 
 // NewEnvBackend dials the ate-env API over connections connections (at
@@ -75,11 +87,14 @@ type EnvBackend struct {
 // the task image as rootfs; the API derives and bakes one template per
 // distinct image on first use. A non-empty authToken is sent as the bearer
 // token on each call, for an ate-env-api that runs with -auth-token-file.
-func NewEnvBackend(endpoint, atespace, baseTemplate string, connections int, authToken string) (*EnvBackend, error) {
+func NewEnvBackend(endpoint, atespace, baseTemplate string, connections int, authToken string, opts ...EnvBackendOption) (*EnvBackend, error) {
 	if connections < 1 {
 		connections = 1
 	}
 	b := &EnvBackend{atespace: atespace, baseTemplate: baseTemplate}
+	for _, opt := range opts {
+		opt(b)
+	}
 	for i := 0; i < connections; i++ {
 		c, err := env.NewClient(env.ClientOptions{Endpoint: endpoint, AuthToken: authToken})
 		if err != nil {
@@ -124,22 +139,20 @@ func (b *EnvBackend) Create(ctx context.Context, id, image string) (Sandbox, err
 	if err != nil {
 		return nil, fmt.Errorf("create %s: %w", id, err)
 	}
-	return envSandbox{e: e}, nil
+	return envSandbox{e: e, minPoll: b.minPoll, maxPoll: b.maxPoll}, nil
 }
 
 type envSandbox struct {
-	e *env.Env
+	e                *env.Env
+	minPoll, maxPoll time.Duration
 }
 
-// Polling bounds for a running process: short at first so quick commands
-// return quickly, backing off so a long test run does not hammer the API.
-// Variables so tests can shorten them.
-var (
-	pollMin = 50 * time.Millisecond
-	pollMax = 2 * time.Second
-)
-
 const (
+	// Default polling bounds for a running process: short at first so quick
+	// commands return quickly, backing off so a long test run does not hammer
+	// the API.
+	defaultPollMin = 50 * time.Millisecond
+	defaultPollMax = 2 * time.Second
 	// pollRetries is how many consecutive transient poll errors are
 	// tolerated before the step fails; a wake or an API pod restart costs a
 	// few.
@@ -181,7 +194,14 @@ func (s envSandbox) Run(ctx context.Context, command string, timeout time.Durati
 		}
 	}()
 
-	wait := pollMin
+	pMin, pMax := s.minPoll, s.maxPoll
+	if pMin <= 0 {
+		pMin = defaultPollMin
+	}
+	if pMax <= 0 {
+		pMax = defaultPollMax
+	}
+	wait := pMin
 	failures := 0
 	for {
 		select {
@@ -205,8 +225,8 @@ func (s envSandbox) Run(ctx context.Context, command string, timeout time.Durati
 		default:
 			return Result{}, perr
 		}
-		if wait < pollMax {
-			wait = min(wait*2, pollMax)
+		if wait < pMax {
+			wait = min(wait*2, pMax)
 		}
 	}
 }

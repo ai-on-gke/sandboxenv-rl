@@ -763,10 +763,32 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 			if res.ExitCode == 0 {
 				*reward = 1
 			}
+			out := res.Stdout + res.Stderr
+			if a := AdapterFor(e.inst.Kind); a != nil {
+				if ig, ok := a.(InstanceGrader); ok {
+					if parsedReward, detail, gerr := ig.GradeInstance(e.inst, res); gerr == nil {
+						if parsedReward != nil {
+							reward = parsedReward
+						}
+						if detail != "" {
+							ev.Detail = detail
+						}
+					}
+				} else if a.Grader() != nil {
+					if parsedReward, detail, gerr := a.Grader().Parse([]byte(out)); gerr == nil {
+						if parsedReward != nil {
+							reward = parsedReward
+						}
+						if detail != "" {
+							ev.Detail = detail
+						}
+					}
+				}
+			}
 			ev.Reward = reward
 			// The grader's verdict is the last line of a reward step's
 			// output; keep enough of it for the report to read it back.
-			ev.Tail = tail(res.Stdout+res.Stderr, 4000)
+			ev.Tail = tail(out, 4000)
 		case s.ExpectExit != nil && res.ExitCode != *s.ExpectExit:
 			ok = false
 			ev.OK = false

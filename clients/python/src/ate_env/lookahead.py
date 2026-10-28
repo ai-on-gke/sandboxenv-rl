@@ -27,16 +27,19 @@ pool sized for exactly the batches in flight::
     warmer.finish(0)                      # kept for keep_finished more finishes
     warmer.close()
 
-Requested replicas per image are the sum of its counts over live steps and the
-last ``keep_finished`` finished steps, capped at ``cap`` (default
-``max_warmpool_replicas``). Each ``add`` / ``finish`` applies the change
-since the previous request.
+Each step's demand is ``{image: claims}``. An image's target is the sum of the
+*remaining* demand of live steps and of the last ``keep_finished`` finished
+steps, capped at ``cap`` (default ``max_warmpool_replicas``), and is applied
+to the pool as an absolute idle count.
 
 Substrate has no controller that refills a pool after a claim: every claim
-takes a paused actor out of the pool for good. So a change of ``d`` requested
-replicas is applied to the pool's *current* idle size, ``max(0, idle + d)``,
-rather than as an absolute target, which would re-warm replicas the current
-batch already claimed. The target never exceeds the new request.
+takes a paused actor out of the pool for good. So before each change the
+warmer looks at how far the pool's idle count fell below what it left behind
+last time, counts that as claims, and takes them off the steps' remaining
+demand, oldest step first. A replica that was claimed is then neither warmed
+again (an absolute target on the original demand would do that) nor
+subtracted again when its step finishes (a relative change would drain the
+replicas of steps that are still live).
 """
 
 from __future__ import annotations
@@ -59,10 +62,10 @@ class WarmReport:
     """What one ``add`` / ``finish`` / ``close`` changed.
 
     Attributes:
-        changes: image -> (previous request, new request), for the images
-            whose request was applied.
+        changes: image -> (previous target, new target), for the images
+            whose target was applied.
         errors: image -> the exception that kept its change from applying.
-            The image keeps its previous request, so the next call retries it.
+            The image keeps its previous target, so the next call retries it.
     """
 
     changes: dict[str, tuple[int, int]] = field(default_factory=dict)
@@ -99,17 +102,28 @@ class LookaheadWarmer:
         self.keep_finished = keep_finished
         self.cap = self._fleet.config.max_warmpool_replicas if cap is None else cap
         self.fail_fast = fail_fast
+        # Remaining (not yet claimed) demand per step, {image: replicas}.
         self._live: dict[int, dict[str, int]] = {}
         self._finished: collections.deque[tuple[int, dict[str, int]]] = collections.deque()
-        self._requested: dict[str, int] = {}
+        # Idle replicas per image this warmer last asked for, and the idle
+        # count it saw right after (None: the driver cannot tell).
+        self._target: dict[str, int] = {}
+        self._expected_idle: dict[str, int | None] = {}
         self._lock = threading.Lock()
         self._closed = False
 
     @property
     def requested(self) -> dict[str, int]:
-        """Replicas currently requested per image (images at 0 omitted)."""
+        """Idle replicas currently targeted per image (images at 0 omitted)."""
         with self._lock:
-            return dict(self._requested)
+            return dict(self._target)
+
+    def remaining(self) -> dict[int, dict[str, int]]:
+        """Unclaimed demand per live or kept step, as last observed."""
+        with self._lock:
+            out = {step: dict(d) for step, d in self._finished}
+            out.update({step: dict(d) for step, d in self._live.items()})
+            return out
 
     def add(self, step: int, counts: Mapping[str, int], *, wait: bool = False) -> WarmReport:
         """Register step ``step``'s demand, ``{image: claims}``, and apply it.
@@ -128,6 +142,7 @@ class LookaheadWarmer:
             self._check_open()
             if step in self._live or any(s == step for s, _ in self._finished):
                 raise ValueError(f"step {step} was already added")
+            self._observe_claims_locked()
             self._live[step] = demand
             return self._apply_locked(wait)
 
@@ -137,6 +152,7 @@ class LookaheadWarmer:
             self._check_open()
             if step not in self._live:
                 raise ValueError(f"step {step} is not live")
+            self._observe_claims_locked()
             demand = self._live.pop(step)
             if self.keep_finished:
                 self._finished.append((step, demand))
@@ -169,53 +185,87 @@ class LookaheadWarmer:
         if self._closed:
             raise RuntimeError("LookaheadWarmer is closed")
 
+    def _steps_oldest_first_locked(self) -> list[tuple[int, dict[str, int]]]:
+        steps = list(self._finished) + list(self._live.items())
+        return sorted(steps, key=lambda item: item[0])
+
+    def _observe_claims_locked(self) -> None:
+        """Take replicas claimed since the last call off the steps' demand.
+
+        Claims are what the idle count lost relative to what this warmer
+        left behind. They are attributed to the oldest steps first, which is
+        how a trainer consumes them: earlier steps' rollouts are the ones in
+        flight. A pool that grew (a recycled actor) shows no claims.
+        """
+        for img, expected in list(self._expected_idle.items()):
+            if expected is None:
+                continue
+            idle = self._fleet.pool_size(img)
+            if idle is None:
+                continue
+            self._expected_idle[img] = idle
+            claimed = expected - idle
+            if claimed <= 0:
+                continue
+            for _step, demand in self._steps_oldest_first_locked():
+                if claimed == 0:
+                    break
+                take = min(claimed, demand.get(img, 0))
+                if take:
+                    demand[img] -= take
+                    if not demand[img]:
+                        del demand[img]
+                    claimed -= take
+
     def _desired_locked(self) -> dict[str, int]:
         total: collections.Counter[str] = collections.Counter()
-        for demand in self._live.values():
-            total.update(demand)
-        for _step, demand in self._finished:
+        for _step, demand in self._steps_oldest_first_locked():
             total.update(demand)
         return {img: min(n, self.cap) for img, n in total.items() if n > 0}
 
     def _apply_locked(self, wait: bool, raise_errors: bool = True) -> WarmReport:
         desired = self._desired_locked()
-        todo = {
-            img: (self._requested.get(img, 0), desired.get(img, 0))
-            for img in set(desired) | set(self._requested)
-            if self._requested.get(img, 0) != desired.get(img, 0)
-        }
+        todo: dict[str, tuple[int, int]] = {}
+        for img in set(desired) | set(self._target):
+            old, new = self._target.get(img, 0), desired.get(img, 0)
+            idle = self._expected_idle.get(img)
+            # A changed target, or idle replicas beyond it (recycled actors).
+            if old != new or (idle is not None and idle > new):
+                todo[img] = (old, new)
         report = WarmReport()
         if not todo:
             return report
 
-        def _apply_one(img: str, old: int, new: int) -> None:
+        def _apply_one(img: str, new: int) -> None:
             if new == 0:
                 self._fleet.unwarm_image(img)
-                return
-            idle = self._fleet.pool_size(img)
-            if idle is None:  # the driver cannot tell: assume what we asked for
-                idle = old
-            target = min(max(0, idle + (new - old)), new)
-            self._fleet.set_pool_replicas(img, target, wait=wait)
+            else:
+                self._fleet.set_pool_replicas(img, new, wait=wait)
 
         workers = min(self._fleet.config.warm_parallelism, len(todo))
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ate-env-lookahead") as ex:
             futures = {
-                img: ex.submit(contextvars.copy_context().run, _apply_one, img, old, new)
-                for img, (old, new) in todo.items()
+                img: ex.submit(contextvars.copy_context().run, _apply_one, img, new)
+                for img, (_old, new) in todo.items()
             }
             for img, fut in futures.items():
                 err = fut.exception()
+                old, new = todo[img]
+                # Whatever happened, the next call measures claims against
+                # the idle count as it is now, not as it was meant to be.
+                self._expected_idle[img] = self._fleet.pool_size(img)
                 if err is None:
-                    report.changes[img] = todo[img]
-                    if todo[img][1]:
-                        self._requested[img] = todo[img][1]
+                    if old != new:
+                        report.changes[img] = (old, new)
+                    if new:
+                        self._target[img] = new
                     else:
-                        self._requested.pop(img, None)
+                        self._target.pop(img, None)
+                        self._expected_idle.pop(img, None)
                 else:
                     report.errors[img] = err
                     logger.warning("Lookahead warm of %s (%d -> %d) failed: %s",
-                                   img, todo[img][0], todo[img][1], err)
+                                   img, old, new, err)
         if report.errors and self.fail_fast and raise_errors:
             raise next(iter(report.errors.values()))
         return report

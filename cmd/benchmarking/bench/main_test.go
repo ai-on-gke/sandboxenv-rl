@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/ate"
@@ -468,5 +469,173 @@ func TestBenchSpinUpAndSpinDownWorkerPool(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "events", "substrate_lifecycle.jsonl")); err != nil {
 		t.Fatalf("missing events/substrate_lifecycle.jsonl: %v", err)
+	}
+}
+
+type fakeUploadRunner struct {
+	calls [][2]string
+}
+
+func (f *fakeUploadRunner) UploadDir(_ context.Context, srcDir, destGCSURI string) ([]byte, error) {
+	f.calls = append(f.calls, [2]string{srcDir, destGCSURI})
+	return []byte("uploaded\n"), nil
+}
+
+func TestBenchValidateBundleAndUpload(t *testing.T) {
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed")
+	if err := os.MkdirAll(filepath.Join(bundleDir, "overlay"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed raw trace, verl log, K8s manifests, node cache snapshots, and restore timings for a Mode 2 warm cluster RL run.
+	if err := os.WriteFile(filepath.Join(bundleDir, "verl-head.log"), []byte("(TaskRunner pid=1) step:1 - timing_s/step:12.0 - timing_s/gen:8.0 - critic/score/mean:0.5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "configmap.yaml"), []byte("apiVersion: v1\nkind: ConfigMap\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "job.yaml"), []byte("apiVersion: batch/v1\nkind: Job\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := measure.WriteNodeCacheSamples(filepath.Join(bundleDir, "cache_before.json"), []schema.NodeCacheSample{{Node: "n1", Hits: 2, Misses: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := measure.WriteNodeCacheSamples(filepath.Join(bundleDir, "cache_after.json"), []schema.NodeCacheSample{{Node: "n1", Hits: 10, Misses: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	traceContent := strings.Join([]string{
+		`{"ts":"2026-10-28T18:00:00Z","run":"rlb-m2","job":"verl-job","op":"wake","env":"sb-1","instance":"inst-1","dur_ms":245,"ok":true}`,
+		`{"ts":"2026-10-28T18:00:01Z","run":"rlb-m2","job":"verl-job","op":"exec","env":"sb-1","instance":"inst-1","dur_ms":210,"ok":true,"exit":0}`,
+		`{"ts":"2026-10-28T18:00:02Z","run":"rlb-m2","job":"verl-job","op":"suspend","env":"sb-1","instance":"inst-1","dur_ms":650,"ok":true}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(bundleDir, "trace.jsonl"), []byte(traceContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "restore_timings.jsonl"), []byte(`{"env":"sb-1","total_ms":245.0,"cache_hit":true}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed overlay files + overlay.json provenance manifest.
+	if err := os.WriteFile(filepath.Join(bundleDir, "overlay", "README.md"), []byte("# Mode 2 Overlay\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "overlay", "mode0_to_mode2.patch"), []byte("--- a/run.sh\n+++ b/run.sh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	overlayManifest := `{
+  "schema_version": "v1",
+  "name": "mode2-prewarm-suspend-restore",
+  "hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "base_recipe_path": "examples/Qwen3.5-35B-A3B-verl",
+  "base_recipe_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "base_recipe_commit": "2eccd89617ff704bb74b9ca356a24548987dd380",
+  "patch_file": "overlay/mode0_to_mode2.patch"
+}`
+	if err := os.WriteFile(filepath.Join(bundleDir, "overlay", "overlay.json"), []byte(overlayManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed measurements.json and system_description.json.
+	meas := schema.Measurements{
+		SchemaVersion: schema.SchemaVersion,
+		RunID:         "rlb-m2",
+		CollectedAt:   time.Date(2026, 10, 28, 18, 5, 0, 0, time.UTC),
+		ServerSummary: map[string]schema.MetricSummary{"sandbox_restore_ms": {Count: 1, Sum: 245, Min: 245, Max: 245, P50: 245, P90: 245, P95: 245, P99: 245, Unit: "ms"}},
+	}
+	measBytes, err := json.MarshalIndent(meas, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "measurements.json"), measBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sysDesc := schema.SystemDescription{
+		SchemaVersion:             schema.SchemaVersion,
+		Cluster:                   "rl-bench-cluster",
+		Backend:                   "substrate",
+		Access:                    "ate-env-api",
+		MaxConcurrentSandboxesCap: 128,
+		Load: &schema.LoadParams{
+			MaxConcurrent:       128,
+			TrajectoriesPerStep: 128,
+		},
+		LifecyclePolicy: &schema.SandboxLifecyclePolicy{
+			Mode:           "prewarmed",
+			ParkMode:       "suspend",
+			PrewarmAtStart: true,
+			PrewarmCount:   64,
+		},
+	}
+	sysBytes, err := json.MarshalIndent(sysDesc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "system_description.json"), sysBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run `bench report -dest` to generate report.json, report.md, run_window.json, and ingest overlay/overlay.json into system_description.json.
+	var out, errBuf bytes.Buffer
+	if code := execute([]string{"report", "-dest", bundleDir}, &out, &errBuf); code != 0 {
+		t.Fatalf("bench report failed (code=%d): %s", code, errBuf.String())
+	}
+
+	// Validate the bundle with `bench validate -dest`.
+	out.Reset()
+	errBuf.Reset()
+	if code := execute([]string{"validate", "-dest", bundleDir}, &out, &errBuf); code != 0 {
+		t.Fatalf("bench validate -dest failed (code=%d): %s\nstdout: %s", code, errBuf.String(), out.String())
+	}
+	if !strings.Contains(out.String(), `"valid": true`) {
+		t.Fatalf("expected '\"valid\": true' in stdout, got: %s", out.String())
+	}
+
+	// Verify that missing base_recipe_hash in overlay/overlay.json causes validation to fail.
+	badManifest := strings.ReplaceAll(overlayManifest, `"base_recipe_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",`, `"base_recipe_hash": "",`)
+	if err := os.WriteFile(filepath.Join(bundleDir, "overlay", "overlay.json"), []byte(badManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errBuf.Reset()
+	if code := execute([]string{"validate", "-dest", bundleDir}, &out, &errBuf); code == 0 {
+		t.Fatal("expected bench validate -dest to fail when overlay/overlay.json is missing base_recipe_hash")
+	}
+	// Restore valid overlay.json.
+	if err := os.WriteFile(filepath.Join(bundleDir, "overlay", "overlay.json"), []byte(overlayManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Test `bench upload`: must fail when -bucket is omitted (no hardcoded bucket).
+	out.Reset()
+	errBuf.Reset()
+	if code := execute([]string{"upload", "-dest", bundleDir}, &out, &errBuf); code == 0 {
+		t.Fatal("expected bench upload without -bucket to fail")
+	}
+
+	// Test `bench upload` with invalid folder name fails.
+	out.Reset()
+	errBuf.Reset()
+	if code := execute([]string{"upload", "-dest", bundleDir, "-bucket", "gs://example-bench-bucket", "-folder", "BadFolderName"}, &out, &errBuf); code == 0 {
+		t.Fatal("expected bench upload with invalid -folder name to fail")
+	}
+
+	// Test `bench upload` with valid -bucket and mock runner succeeds.
+	fakeUp := &fakeUploadRunner{}
+	prevUp := uploadRunner
+	uploadRunner = fakeUp
+	t.Cleanup(func() { uploadRunner = prevUp })
+
+	out.Reset()
+	errBuf.Reset()
+	if code := execute([]string{"upload", "-dest", bundleDir, "-bucket", "gs://example-bench-bucket"}, &out, &errBuf); code != 0 {
+		t.Fatalf("bench upload failed (code=%d): %s", code, errBuf.String())
+	}
+	if len(fakeUp.calls) != 1 {
+		t.Fatalf("expected 1 UploadDir call, got %d", len(fakeUp.calls))
+	}
+	wantTarget := "gs://example-bench-bucket/2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed/"
+	if fakeUp.calls[0][1] != wantTarget {
+		t.Fatalf("expected upload target %q, got %q", wantTarget, fakeUp.calls[0][1])
 	}
 }

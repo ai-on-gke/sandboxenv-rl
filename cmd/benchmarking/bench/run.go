@@ -15,7 +15,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -190,7 +193,19 @@ func executeScenarioRun(
 	}
 	sysDesc := sut.BuildSystemDescription(runScen.SUT, cluster, "v1.31", "HEAD", "verified", nil)
 	if overlayName != "" {
-		sysDesc.Overlays = []schema.OverlayRef{{Name: overlayName}}
+		scenBytes, _ := json.Marshal(scen)
+		scenSum := sha256.Sum256(scenBytes)
+		ovSum := sha256.Sum256([]byte(overlayName))
+		basePath := scen.Name
+		if basePath == "" {
+			basePath = "scenario.yaml"
+		}
+		sysDesc.Overlays = []schema.OverlayRef{{
+			Name:           overlayName,
+			Hash:           "sha256:" + hex.EncodeToString(ovSum[:8]),
+			BaseRecipePath: basePath,
+			BaseRecipeHash: "sha256:" + hex.EncodeToString(scenSum[:8]),
+		}}
 	}
 	if err := sut.WriteSystemDescription(filepath.Join(outDir, "system_description.json"), sysDesc); err != nil {
 		return nil, err
@@ -240,15 +255,53 @@ func executeScenarioRun(
 		}
 	}
 
-	// 5. Summarize and validate report.json.
+	// 5. Summarize and validate report.json, enrich system_description.json, and write report.md + run_window.json.
 	rep, err := swebench.BuildReport(eventsPath)
 	if err != nil {
 		return nil, err
 	}
+	enrichSystemDescriptionFromArtifactDir(outDir, &sysDesc, rep, meas)
+	if sysDesc.MaxConcurrentSandboxesCap <= 0 {
+		if sysDesc.MaxActivePods > 0 {
+			sysDesc.MaxConcurrentSandboxesCap = sysDesc.MaxActivePods
+		} else if sysDesc.Load != nil && sysDesc.Load.MaxConcurrent > 0 {
+			sysDesc.MaxConcurrentSandboxesCap = sysDesc.Load.MaxConcurrent
+		} else {
+			sysDesc.MaxConcurrentSandboxesCap = 16
+		}
+	}
+	if sysDesc.LifecyclePolicy == nil {
+		mode := "ephemeral"
+		parkMode := "ephemeral"
+		prewarm := false
+		if runScen.Footing == "warm" {
+			mode = "prewarmed"
+			parkMode = "suspend"
+			prewarm = true
+		}
+		sysDesc.LifecyclePolicy = &schema.SandboxLifecyclePolicy{
+			Mode:           mode,
+			ParkMode:       parkMode,
+			PrewarmAtStart: prewarm,
+		}
+	}
+	if err := sut.WriteSystemDescription(filepath.Join(outDir, "system_description.json"), sysDesc); err != nil {
+		return nil, err
+	}
+	rep.AttachClusterTelemetry(&sysDesc, meas)
 	swebench.Validate(rep, swebench.ValidateOptions{
 		Footing:  runScen.Footing,
 		Schedule: sched,
 	})
+
+	var mdBuf bytes.Buffer
+	rep.WriteMarkdown(&mdBuf)
+	if err := os.WriteFile(filepath.Join(outDir, "report.md"), mdBuf.Bytes(), 0o644); err != nil {
+		return nil, err
+	}
+	if err := ensureRunWindowFile(outDir, runID, cluster, time.Time{}, time.Time{}); err != nil {
+		return nil, err
+	}
 
 	repBytes, err := json.MarshalIndent(rep, "", "  ")
 	if err != nil {
@@ -263,24 +316,39 @@ func executeScenarioRun(
 func validateCmd(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	reportPath := fs.String("report", "", "Path to report.json.")
-	eventsPath := fs.String("events", "", "Optional path to events.jsonl.")
-	schedulePath := fs.String("schedule", "", "Optional path to schedule.json.")
+	destDir := fs.String("dest", "", "Path to benchmark artifact directory ($ARTIFACT_DIR) for full bundle validation.")
+	folderName := fs.String("folder", "", "Optional 4-part GCS folder name (<YYYY-MM-DD>_<model>_<dataset>_<nickname>) to validate.")
+	reportPath := fs.String("report", "", "Path to report.json (single-file mode when -dest is omitted).")
+	eventsPath := fs.String("events", "", "Optional path to events.jsonl (single-file mode).")
+	schedulePath := fs.String("schedule", "", "Optional path to schedule.json (single-file mode).")
 	footing := fs.String("footing", "", "Declared footing (warm or cold).")
 	minTasks := fs.Int("min-tasks", 0, "Minimum required tasks.")
 	minRewardRate := fs.Float64("min-reward-rate", 0, "Minimum required reward rate.")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *reportPath == "" && *eventsPath == "" {
-		return fmt.Errorf("either -report or -events is required")
-	}
-	_, v, err := swebench.ValidateReportOrEvents(*reportPath, *eventsPath, *schedulePath, swebench.ValidateOptions{
+	opts := swebench.ValidateOptions{
 		Footing:         *footing,
 		MinTasks:        *minTasks,
 		MinRewardRate:   *minRewardRate,
 		CheckRewardRate: *minRewardRate > 0,
-	})
+	}
+	if strings.TrimSpace(*destDir) != "" {
+		bRes, err := ValidateArtifactBundle(*destDir, opts, *folderName)
+		if err != nil {
+			return err
+		}
+		data, _ := json.MarshalIndent(bRes, "", "  ")
+		fmt.Fprintln(stdout, string(data))
+		if !bRes.Valid {
+			return fmt.Errorf("bundle validation failed: %s", strings.Join(bRes.Reasons, "; "))
+		}
+		return nil
+	}
+	if *reportPath == "" && *eventsPath == "" {
+		return fmt.Errorf("either -dest, -report, or -events is required")
+	}
+	_, v, err := swebench.ValidateReportOrEvents(*reportPath, *eventsPath, *schedulePath, opts)
 	if err != nil {
 		return err
 	}

@@ -367,9 +367,10 @@ func runCmd(args []string) (retErr error) {
 		instances     = fs.String("instances", "", "Comma-separated instance ids to use instead of the first N.")
 		excludeFile   = fs.String("exclude-file", "", "File of instance ids to leave out, one per line; text after the id is a comment.")
 		trajectory    = fs.String("trajectory", swebench.DefaultTrajectory, fmt.Sprintf("Trajectory file or built-in name (%s); a comma-separated list mixes them, one per environment, drawn with -seed.", strings.Join(swebench.Names(), ", ")))
-		seed          = fs.Int64("seed", 1, "Seed for the trajectory mix, so reps assign the same trajectory to the same environment.")
-		mode          = fs.String("mode", string(swebench.ModeEval), "eval (images x tasks-per-image, each create/replay/delete) or steps (images x rollouts kept across steps).")
+		seed          = fs.Int64("seed", 1, "Seed for the trajectory mix and schedule/open-loop RNG, so reps assign the same trajectory to the same environment.")
+		mode          = fs.String("mode", string(swebench.ModeEval), "eval, steps, or open-loop (Poisson arrivals at -arrival-rate).")
 		width         = fs.Int("width", 50, "Most tasks in flight at once.")
+		arrivalRate   = fs.Float64("arrival-rate", 0, "open-loop: Poisson task arrival rate in tasks/sec.")
 		tasksPerImage = fs.Int("tasks-per-image", 1, "eval: replays per image.")
 		rollouts      = fs.Int("rollouts", 2, "steps: environments per image.")
 		steps         = fs.Int("steps", 8, "steps: training steps.")
@@ -624,6 +625,7 @@ func runCmd(args []string) (retErr error) {
 		Logger:        log,
 		Mode:          swebench.Mode(*mode),
 		Width:         *width,
+		ArrivalRate:   *arrivalRate,
 		TasksPerImage: *tasksPerImage,
 		Rollouts:      *rollouts,
 		Steps:         *steps,

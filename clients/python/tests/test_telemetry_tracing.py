@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
 import textwrap
@@ -787,9 +788,11 @@ def test_nests_user_span_parents_the_run(spans):
 # --- span kind and cancellation ------------------------------------------ #
 
 
-async def test_client_rpc_spans_are_client_kind_with_rpc_attributes(spans):
+async def test_client_rpc_spans_are_client_kind_with_rpc_attributes(spans, monkeypatch):
     from opentelemetry.trace import SpanKind
 
+    # The default convention, whatever OTEL_SEMCONV_STABILITY_OPT_IN the test runner has.
+    monkeypatch.setattr(tracing, "_RPC_SEMCONV_MODE", tracing._SEMCONV_NEW)
     server, port = await _start_fake_server()
     try:
         client = Client(f"http://127.0.0.1:{port}", tracer_config=TracerConfig(enable_tracing=True))
@@ -810,11 +813,94 @@ async def test_client_rpc_spans_are_client_kind_with_rpc_attributes(spans):
         (span,) = by_name[f"ate_env_client.{op}"]
         assert span.kind == SpanKind.CLIENT, op
         attrs = dict(span.attributes)
-        assert attrs["rpc.system"] == "grpc", op
-        assert attrs["rpc.service"] == "ateenv.v1alpha.EnvironmentService", op
-        assert attrs["rpc.method"] == method, op
+        assert attrs["rpc.system.name"] == "grpc", op
+        assert attrs["rpc.method"] == f"ateenv.v1alpha.EnvironmentService/{method}", op
+        # The pre-otelgrpc-0.72 keys are gone.
+        assert "rpc.system" not in attrs and "rpc.service" not in attrs, op
         assert attrs["server.address"] == "127.0.0.1", op
         assert attrs["server.port"] == port, op
+
+
+def test_rpc_attrs_use_otelgrpc_keys(monkeypatch):
+    monkeypatch.setattr(tracing, "_RPC_SEMCONV_MODE", tracing._SEMCONV_NEW)
+    attrs = tracing.rpc_attrs("ateenv.v1alpha.EnvironmentService", "GetEnvironment", "127.0.0.1:7777")
+    assert attrs == {
+        "rpc.system.name": "grpc",
+        "rpc.method": "ateenv.v1alpha.EnvironmentService/GetEnvironment",
+        "server.address": "127.0.0.1",
+        "server.port": 7777,
+    }
+
+
+@pytest.mark.parametrize(
+    ("value", "mode"),
+    [
+        (None, "new"),
+        ("", "new"),
+        ("http", "new"),
+        ("rpc", "new"),
+        ("rpc/old", "old"),
+        ("rpc/dup", "dup"),
+        (" rpc/dup ", "dup"),
+        ("http, rpc/old", "old"),
+        ("http,rpc/dup", "dup"),
+        # The first rpc/* item decides, as in otelgrpc's parseSemconvMode.
+        ("rpc/old,rpc/dup", "old"),
+        ("rpc/dup,rpc/old", "dup"),
+        ("RPC/OLD", "new"),
+    ],
+)
+def test_rpc_semconv_mode_parses_like_otelgrpc(value, mode):
+    assert tracing._rpc_semconv_mode(value) == mode
+
+
+@pytest.mark.parametrize(
+    ("mode", "want"),
+    [
+        (
+            "new",
+            {"rpc.system.name": "grpc", "rpc.method": "ateenv.v1alpha.EnvironmentService/GetEnvironment"},
+        ),
+        (
+            "old",
+            {
+                "rpc.system": "grpc",
+                "rpc.service": "ateenv.v1alpha.EnvironmentService",
+                "rpc.method": "GetEnvironment",
+            },
+        ),
+        (
+            # Both sets; rpc.method is the full name, the value otelgrpc keeps.
+            "dup",
+            {
+                "rpc.system": "grpc",
+                "rpc.service": "ateenv.v1alpha.EnvironmentService",
+                "rpc.system.name": "grpc",
+                "rpc.method": "ateenv.v1alpha.EnvironmentService/GetEnvironment",
+            },
+        ),
+    ],
+)
+def test_rpc_attrs_follow_the_semconv_mode(monkeypatch, mode, want):
+    monkeypatch.setattr(tracing, "_RPC_SEMCONV_MODE", mode)
+    attrs = tracing.rpc_attrs("ateenv.v1alpha.EnvironmentService", "GetEnvironment", "127.0.0.1:7777")
+    assert attrs == {**want, "server.address": "127.0.0.1", "server.port": 7777}
+
+
+def test_rpc_semconv_mode_is_read_from_the_environment_at_import():
+    code = (
+        "from ate_env.telemetry import tracing; "
+        "print(sorted(tracing.rpc_attrs('s.S', 'M', None)))"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "OTEL_SEMCONV_STABILITY_OPT_IN"}
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**env, "OTEL_SEMCONV_STABILITY_OPT_IN": "rpc/old"},
+    )
+    assert out.stdout.strip() == "['rpc.method', 'rpc.service', 'rpc.system']"
 
 
 def test_rpc_attrs_parse_targets():
@@ -872,8 +958,7 @@ _ALLOWED_ATTRIBUTE_KEYS = {
     "ate_env.file.size",
     "ate_env.replicas",
     "ate_env.rootfs_image",
-    "rpc.system",
-    "rpc.service",
+    "rpc.system.name",
     "rpc.method",
     "server.address",
     "server.port",
@@ -887,7 +972,10 @@ def _process_two_commands(task, handle):
     return handle.exec("echo second").exit_code
 
 
-def test_span_attributes_use_substrate_and_ate_env_keys(spans, threaded_fake_server):
+def test_span_attributes_use_substrate_and_ate_env_keys(spans, threaded_fake_server, monkeypatch):
+    # The allowed keys below are the default convention's, whatever
+    # OTEL_SEMCONV_STABILITY_OPT_IN the test runner has.
+    monkeypatch.setattr(tracing, "_RPC_SEMCONV_MODE", tracing._SEMCONV_NEW)
     tasks = [Task(id=f"t{i}", image=IMAGE) for i in range(2)]
     with SandboxFleet(_substrate_cfg(threaded_fake_server, max_concurrent=2)) as fleet:
         fleet.load_tasks(tasks)

@@ -285,13 +285,58 @@ def start_span(
             raise
 
 
+# Which rpc.* keys rpc_attrs emits: "new" (the default), "old" or "dup" (both).
+_SEMCONV_NEW, _SEMCONV_OLD, _SEMCONV_DUP = "new", "old", "dup"
+
+
+def _rpc_semconv_mode(value: str | None) -> str:
+    """The rpc.* convention that OTEL_SEMCONV_STABILITY_OPT_IN selects.
+
+    Parsed as otelgrpc 0.72 parses it (``parseSemconvMode``), so the Python
+    client and the otelgrpc spans of ate-env-api and the Go client use the
+    same keys: a comma-separated list, each item trimmed; the first item that
+    is ``rpc/dup`` or ``rpc/old`` decides, and anything else means new.
+    """
+    for item in (value or "").split(","):
+        item = item.strip()
+        if item == "rpc/dup":
+            return _SEMCONV_DUP
+        if item == "rpc/old":
+            return _SEMCONV_OLD
+    return _SEMCONV_NEW
+
+
+# Read once at import, as otelgrpc reads it once when its handler is built.
+_RPC_SEMCONV_MODE = _rpc_semconv_mode(os.environ.get("OTEL_SEMCONV_STABILITY_OPT_IN"))
+
+
 def rpc_attrs(service: str, method: str, target: str | None) -> dict[str, Any]:
     """OTel semantic-convention attributes of one gRPC call.
 
-    service is the fully qualified gRPC service (``ateenv.v1alpha.X``) and
-    target the ``host:port`` of the channel (None for a caller-owned channel).
+    The rpc.* keys follow otelgrpc (0.72 and later), and so the ate-env-api
+    server spans and the Go client's spans, including its
+    OTEL_SEMCONV_STABILITY_OPT_IN switch:
+
+    - unset (new): ``rpc.system.name`` and ``rpc.method`` with the full method
+      name (``ateenv.v1alpha.EnvironmentService/CreateEnvironment``); no
+      ``rpc.service``.
+    - ``rpc/old``: ``rpc.system``, ``rpc.service`` and ``rpc.method`` with the
+      method name alone (``CreateEnvironment``).
+    - ``rpc/dup``: the keys of both; ``rpc.method`` is the full name, as in
+      otelgrpc, where the new value wins.
+
+    service is the fully qualified gRPC service (``ateenv.v1alpha.X``), method
+    the method name, and target the ``host:port`` of the channel (None for a
+    caller-owned channel).
     """
-    attrs: dict[str, Any] = {"rpc.system": "grpc", "rpc.service": service, "rpc.method": method}
+    full_method = f"{service}/{method}"
+    attrs: dict[str, Any]
+    if _RPC_SEMCONV_MODE == _SEMCONV_OLD:
+        attrs = {"rpc.system": "grpc", "rpc.service": service, "rpc.method": method}
+    elif _RPC_SEMCONV_MODE == _SEMCONV_DUP:
+        attrs = {"rpc.system": "grpc", "rpc.service": service, "rpc.system.name": "grpc", "rpc.method": full_method}
+    else:
+        attrs = {"rpc.system.name": "grpc", "rpc.method": full_method}
     if target:
         host, sep, port = target.rpartition(":")
         if sep and port.isdigit() and host:

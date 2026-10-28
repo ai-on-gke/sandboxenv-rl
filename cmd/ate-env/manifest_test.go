@@ -22,8 +22,8 @@ import (
 
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/hostcheck"
-	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
-	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/yaml"
@@ -99,7 +99,10 @@ func TestBuildManifests(t *testing.T) {
 		t.Errorf("namespace label %s = %q, want \"true\" (ate-system admits API clients by it)", apiAccessLabel, got)
 	}
 
-	pool := objs[1].(*atev1alpha1.WorkerPool)
+	pool := objs[1].(*atev1.WorkerPool)
+	if pool.APIVersion != "ate.dev/v1" {
+		t.Errorf("workerpool apiVersion = %q, want ate.dev/v1", pool.APIVersion)
+	}
 	if pool.Namespace != cfg.namespace || pool.Name != "default-template-workerpool" {
 		t.Errorf("workerpool = %s/%s, want %s/default-template-workerpool", pool.Namespace, pool.Name, cfg.namespace)
 	}
@@ -128,7 +131,7 @@ func TestBuildManifests(t *testing.T) {
 		t.Fatalf("workerpool sandboxClasses = %+v, want exactly one", pool.Spec.SandboxClasses)
 	}
 	sc := pool.Spec.SandboxClasses[0]
-	if sc.Name != atev1alpha1.SandboxClassGvisor || sc.ConfigRef == nil || sc.ConfigRef.Name != sandboxConfigName {
+	if sc.Name != atev1.SandboxClassGvisor || sc.ConfigRef == nil || sc.ConfigRef.Name != sandboxConfigName {
 		t.Errorf("workerpool sandboxClasses[0] = %+v, want gvisor with configRef %q", sc, sandboxConfigName)
 	}
 	sa := objs[2].(*corev1.ServiceAccount)

@@ -157,7 +157,7 @@ _POOLS: dict[tuple, _EnvPool] = {}
 
 def _pool(endpoint: str, max_envs: int, rootfs_image: str | None, prefix: str) -> _EnvPool:
     loop = asyncio.get_running_loop()
-    key = (endpoint, max_envs, rootfs_image or "", prefix, id(loop))
+    key = (endpoint, max_envs, rootfs_image or "", prefix, loop)
     if key not in _POOLS:
         _POOLS[key] = _EnvPool(endpoint, max_envs, rootfs_image, prefix)
     return _POOLS[key]

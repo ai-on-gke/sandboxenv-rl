@@ -324,6 +324,31 @@ jobs:
 		t.Fatalf("bench validate failed (code=%d): %s", code, errBuf.String())
 	}
 
+	// Test A/B overlay comparison (`bench run -overlay pool-off,pool-on`)
+	abDir := filepath.Join(dir, "ab-out")
+	out.Reset()
+	errBuf.Reset()
+	if code := execute([]string{"run", "-scenario", scenPath, "-overlay", "pool-off,pool-on", "-dest", abDir}, &out, &errBuf); code != 0 {
+		t.Fatalf("bench run -overlay pool-off,pool-on failed (code=%d): %s", code, errBuf.String())
+	}
+	for _, rel := range []string{
+		"pool-off/schedule.json",
+		"pool-off/events.jsonl",
+		"pool-off/report.json",
+		"pool-on/schedule.json",
+		"pool-on/events.jsonl",
+		"pool-on/report.json",
+		"comparison.json",
+		"comparison.md",
+	} {
+		if _, err := os.Stat(filepath.Join(abDir, rel)); err != nil {
+			t.Fatalf("missing overlay artifact %s: %v", rel, err)
+		}
+	}
+	if !strings.Contains(out.String(), "Overlay Comparison") {
+		t.Fatalf("expected Overlay Comparison in stdout, got:\n%s", out.String())
+	}
+
 	// Test scoped reporting (`-scopes user-sandbox`) and `-plugin-metric` on `bench report`
 	scopedDir := filepath.Join(dir, "scoped-report")
 	if err := os.MkdirAll(scopedDir, 0o755); err != nil {
@@ -404,7 +429,7 @@ func TestBenchSpinUpAndSpinDownWorkerPool(t *testing.T) {
 
 	dir := t.TempDir()
 	var out, errBuf bytes.Buffer
-	if code := execute([]string{"spinup", "-namespace", "ate-env", "-workerpool", "default-template-workerpool", "-replicas", "2", "-run-id", "wp-test", "-dest", dir}, &out, &errBuf); code != 0 {
+	if code := execute([]string{"spinup", "-atespace", "ate-env", "-workerpool", "default-template-workerpool", "-replicas", "2", "-run-id", "wp-test", "-dest", dir}, &out, &errBuf); code != 0 {
 		t.Fatalf("bench spinup failed (code=%d): %s", code, errBuf.String())
 	}
 	if !strings.Contains(out.String(), "spun up workerpool/default-template-workerpool in ate-env (replicas=2") {
@@ -413,7 +438,7 @@ func TestBenchSpinUpAndSpinDownWorkerPool(t *testing.T) {
 
 	out.Reset()
 	errBuf.Reset()
-	if code := execute([]string{"spindown", "-namespace", "ate-env", "-workerpool", "default-template-workerpool", "-run-id", "wp-test", "-dest", dir}, &out, &errBuf); code != 0 {
+	if code := execute([]string{"spindown", "-atespace", "ate-env", "-workerpool", "default-template-workerpool", "-run-id", "wp-test", "-dest", dir}, &out, &errBuf); code != 0 {
 		t.Fatalf("bench spindown failed (code=%d): %s", code, errBuf.String())
 	}
 	if !strings.Contains(out.String(), "spun down workerpool/default-template-workerpool in ate-env") {

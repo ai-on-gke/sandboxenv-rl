@@ -685,7 +685,9 @@ func (r *runner) runSteps(ctx context.Context, envs []*environment) {
 // its replay ends, Width at a time. The barrier covers the parking, so no
 // park event is recorded; the suspend and delete events carry the cost.
 // The last step parks too, since the fleet need not fit awake; the run's
-// cleanup deletes what a suspend park left.
+// cleanup deletes what a suspend park left. An environment whose step failed
+// leaves the run and is deleted at once, so it does not hold a slot until
+// the cleanup.
 func (r *runner) stepParkEach(ctx context.Context, envs []*environment, step int) {
 	barrier := time.Now()
 	forEach(ctx, len(envs), r.cfg.Width, func(i int) {
@@ -703,7 +705,11 @@ func (r *runner) stepParkEach(ctx context.Context, envs []*environment, step int
 			}
 		}
 		r.replay(ctx, e, step)
-		if e.failed || ctx.Err() != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		if e.failed {
+			r.remove(ctx, e, step)
 			return
 		}
 		switch r.cfg.Park {

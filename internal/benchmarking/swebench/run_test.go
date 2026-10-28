@@ -488,6 +488,36 @@ func TestStepsParkEachBoundsAwakeEnvironments(t *testing.T) {
 	}
 }
 
+func TestStepsParkEachDeletesFailedEnvironmentsAtOnce(t *testing.T) {
+	f := newFake()
+	f.unavailable = 1000 // every first command fails until the wake budget runs out
+	var out bytes.Buffer
+	cfg := baseConfig(t, f, &out)
+	cfg.Mode = ModeSteps
+	cfg.Rollouts = 3
+	cfg.Steps = 2
+	cfg.Park = ParkSuspend
+	cfg.ParkEach = true
+	cfg.WakeBudget = 5 * time.Millisecond
+	cfg.WakeBackoff = 2 * time.Millisecond
+
+	sum, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Failed != 9 {
+		t.Fatalf("summary %+v, want all 9 failed", sum)
+	}
+	if m := f.maxAwake.Load(); m > int32(cfg.Width) {
+		t.Fatalf("%d environments awake at once, want at most the width %d: a failed environment kept its slot", m, cfg.Width)
+	}
+	for id, n := range f.created {
+		if n != 1 || f.deleted[id] != 1 || f.suspended[id] != 0 {
+			t.Fatalf("env %s created %d deleted %d suspended %d, want 1, 1 (deleted when its step failed) and 0", id, n, f.deleted[id], f.suspended[id])
+		}
+	}
+}
+
 func TestStepsDeleteParkRecreates(t *testing.T) {
 	f := newFake()
 	var out bytes.Buffer
@@ -639,6 +669,8 @@ func TestConfigValidation(t *testing.T) {
 		func(c *Config) { c.Mode = "bogus" },
 		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 0; c.Steps = 1 },
 		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 1; c.Steps = 1; c.Park = "bogus" },
+		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 1; c.Steps = 1; c.Park = ParkNone; c.ParkEach = true },
+		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 1; c.Steps = 1; c.Park = ParkDelete; c.ParkEach = true; c.ImagesPerStep = 1 },
 	}
 	for i, mutate := range bad {
 		c := good

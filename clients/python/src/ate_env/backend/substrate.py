@@ -601,6 +601,11 @@ class SubstrateBackendDriver(BackendDriver):
             self.resize_pool_async(template_id, replicas, wait=wait, rootfs_image=rootfs_image)
         )
 
+    def pool_size(self, template_id: str, rootfs_image: str | None = None) -> int | None:
+        """Paused actors waiting in the warm pool of (template_id, rootfs_image)."""
+        with self._lock:
+            return len(self._warm_paused_pool.get((template_id, rootfs_image), []))
+
     async def unwarm_pool_async(self, template_id: str, rootfs_image: str | None = None) -> None:
         """Drain and delete paused actors in the warm pool."""
         logger.info("Unwarming pool for template %s (rootfs_image=%s)...", template_id, rootfs_image)

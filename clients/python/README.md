@@ -403,6 +403,39 @@ FleetConfig(max_concurrent=64, max_warmpool_replicas=16, warm_per_task=True)
 once. A failed image does not stop the others: the first error is raised once
 every image was tried.
 
+### Follow a trainer's batch stream with `LookaheadWarmer`
+
+An RL trainer owns its step loop. It knows the next batch or two ahead, and
+with off-policy staleness it may still be claiming for a batch it dispatched
+`max_staleness` steps ago. `LookaheadWarmer` keeps each image's pool sized for
+exactly the batches in flight:
+
+```python
+from ate_env import LookaheadWarmer
+
+warmer = LookaheadWarmer(fleet, keep_finished=max_staleness)  # cap = max_warmpool_replicas
+warmer.add(0, {img: n * G for img, n in batch0}, wait=True)   # start-up barrier
+warmer.add(1, counts_of(batch1))      # warms while step 0 runs
+...                                   # dispatch, fleet.acquire(task) per episode
+warmer.add(2, counts_of(batch2))
+warmer.finish(0)                      # kept for keep_finished more finishes, then drained
+warmer.close()                        # drains every pool it asked for
+```
+
+An image's request is the sum of its counts over live steps and the last
+`keep_finished` finished steps, capped at `cap`. Each call applies only the
+change. On Substrate a claim takes a paused actor out of the pool for good,
+so a change of `d` is applied to the pool's current idle size
+(`fleet.pool_size(img)`), and replicas the batch already claimed are not warmed
+again. Images change in parallel (`warm_parallelism`). A failed image lands in
+the returned `WarmReport.errors` and is retried on the next call, or is raised
+with `fail_fast=True`. `add_async` / `finish_async` / `close_async` run off the
+event loop, and an `AsyncSandboxFleet` works too.
+
+The warmer sizes pools with `fleet.set_pool_replicas(img, n)` (shrinking deletes
+idle paused actors only) and reads them with `fleet.pool_size(img)`, the idle
+replicas of an image's pool (None when the driver cannot tell).
+
 ### Observability
 
 Three layers, all off the hot path when disabled. The base install has

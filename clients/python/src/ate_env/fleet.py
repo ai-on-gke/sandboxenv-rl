@@ -435,6 +435,14 @@ class SandboxFleet:
             template_id, rootfs_image = entry
             self.backend.unwarm_pool(template_id, rootfs_image=rootfs_image)
 
+    def pool_size(self, image: str) -> int | None:
+        """Idle warm replicas for ``image``; None when the driver cannot tell."""
+        entry = self._image_to_template.get(image)
+        if entry is None:
+            return 0
+        template_id, rootfs_image = entry
+        return self.backend.pool_size(template_id, rootfs_image=rootfs_image)
+
     def acquire(
         self,
         task: Task | str | Sequence[Task | str],

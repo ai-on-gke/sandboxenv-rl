@@ -77,6 +77,10 @@ class BackendDriver(ABC):
         to warm_pool for growth and unwarm_pool for zero."""
         raise NotImplementedError
 
+    def pool_size(self, template_id: str, rootfs_image: str | None = None) -> int | None:
+        """Idle warm replicas in the pool, or None when the driver cannot tell."""
+        return None
+
     @abstractmethod
     def acquire(
         self,

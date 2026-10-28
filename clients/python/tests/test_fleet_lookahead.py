@@ -126,10 +126,64 @@ def test_claimed_replicas_are_not_warmed_again():
         fleet.acquire(Task(id=f"t{i}", image="a"))
     assert driver.idle("a") == 1
 
-    warmer.add(1, {"a": 2})             # +2 on top of what is idle, not back to 6
+    warmer.add(1, {"a": 2})             # step 0 has 1 left + step 1 needs 2; not back to 6
     assert driver.idle("a") == 3
-    warmer.finish(0)                    # -4 drains only what is idle
+    assert warmer.remaining() == {0: {"a": 1}, 1: {"a": 2}}
+    warmer.finish(0)                    # drops step 0's 1 leftover, keeps step 1's 2
+    assert driver.idle("a") == 2
+
+
+def test_finishing_a_step_keeps_the_replicas_of_live_steps():
+    # Review repro (design doc 4.3): finish() subtracted the finished step's
+    # whole request from the idle count, so after its rollouts had claimed
+    # most of it, the next live step's replicas were deleted.
+    fleet, driver = _setup()
+    warmer = LookaheadWarmer(fleet)
+    warmer.add(0, {"a": 4})
+    for i in range(4):                  # step 0 claims everything
+        fleet.acquire(Task(id=f"t{i}", image="a"))
+    warmer.add(1, {"a": 3})
+    assert driver.idle("a") == 3
+    warmer.finish(0)
+    assert driver.idle("a") == 3
+    assert warmer.remaining() == {1: {"a": 3}}
+
+
+def test_claims_are_attributed_to_the_oldest_step_first():
+    fleet, driver = _setup()
+    warmer = LookaheadWarmer(fleet, keep_finished=1)
+    warmer.add(0, {"a": 2})
+    warmer.add(1, {"a": 2})
+    assert driver.idle("a") == 4
+    for i in range(3):
+        fleet.acquire(Task(id=f"t{i}", image="a"))
+    warmer.add(2, {"b": 1})             # observes the 3 claims: step 0 -> 0, step 1 -> 1
+    assert warmer.remaining() == {0: {}, 1: {"a": 1}, 2: {"b": 1}}
+    warmer.finish(1)                    # kept (keep_finished=1): its 1 leftover stays warm
+    assert driver.idle("a") == 1
+    warmer.finish(2)                    # step 1 leaves the kept window
     assert driver.idle("a") == 0
+    assert driver.idle("b") == 1        # step 2 is kept now
+
+
+def test_recycled_surplus_is_trimmed_to_the_target():
+    fleet, driver = _setup()
+    warmer = LookaheadWarmer(fleet)
+    warmer.add(0, {"a": 2})
+    driver.pools[(T, "a")] = 5          # e.g. sandboxes returned with recycle=True
+    warmer.add(1, {"b": 1})
+    assert driver.idle("a") == 2        # not counted as claims, trimmed to the target
+    assert warmer.remaining()[0] == {"a": 2}
+
+
+def test_a_failed_warm_is_not_mistaken_for_claims():
+    fleet, driver = _setup(driver_kw={"fail_images": ("a",)})
+    warmer = LookaheadWarmer(fleet)
+    assert set(warmer.add(0, {"a": 3}).errors) == {"a"}
+    driver.fail_images.clear()
+    warmer.add(1, {"b": 1})             # the retry still warms all 3 for step 0
+    assert driver.idle("a") == 3
+    assert warmer.remaining()[0] == {"a": 3}
 
 
 def test_errors_are_reported_and_retried_on_the_next_call():
@@ -251,11 +305,12 @@ async def test_lookahead_on_a_substrate_fleet(fake_stack):
             warmer.add(1, {img: 2})
             assert fleet.pool_size(img) == 2
             fleet.release(handles)
-            warmer.finish(0)                  # kept (keep_finished=1): nothing drained
+            warmer.finish(0)                  # kept (keep_finished=1); its demand is all claimed
             assert fleet.pool_size(img) == 2
-            warmer.finish(1)                  # step 0 leaves: -4, only 2 idle
-            assert fleet.pool_size(img) == 0
+            warmer.finish(1)                  # step 1 is kept now: its 2 stay for stale claims
+            assert fleet.pool_size(img) == 2
             warmer.close()
+            assert fleet.pool_size(img) == 0
         finally:
             fleet.close()
         assert fakes.environments.environments == {}

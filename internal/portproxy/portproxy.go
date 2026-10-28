@@ -148,6 +148,8 @@ type Options struct {
 	// Atespaces, when set, are the only atespaces whose environments the
 	// proxy forwards to; a request that names another gets 403, after
 	// Authenticate. Empty means any atespace the router serves.
+	// DefaultAtespace is not implied: list it to serve requests that name
+	// no atespace.
 	Atespaces []string
 	// OnConnected, when set, is called with the environment's atespace and
 	// id each time the router accepts a CONNECT to one of its ports, after

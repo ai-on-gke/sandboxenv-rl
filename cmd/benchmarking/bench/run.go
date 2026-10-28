@@ -15,7 +15,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -29,6 +28,7 @@ import (
 
 	"github.com/agent-substrate/env/internal/benchmarking/job"
 	"github.com/agent-substrate/env/internal/benchmarking/measure"
+	"github.com/agent-substrate/env/internal/benchmarking/overlay"
 	"github.com/agent-substrate/env/internal/benchmarking/schema"
 	"github.com/agent-substrate/env/internal/benchmarking/sut"
 	"github.com/agent-substrate/env/internal/benchmarking/swebench"
@@ -40,6 +40,7 @@ func runScenarioCmd(args []string, stdout, stderr io.Writer) error {
 	scenarioPath := fs.String("scenario", "", "Path to Scenario YAML file. Required.")
 	destDir := fs.String("dest", "", "Destination artifact directory ($ARTIFACT_DIR).")
 	outDir := fs.String("out-dir", "", "Alias for -dest: destination artifact directory.")
+	overlayFlag := fs.String("overlay", "", "Optional overlay preset name or comma-separated pair <A>,<B>.")
 	datasetPath := fs.String("dataset", "", "Optional dataset JSONL path.")
 	instancesPath := fs.String("instances", "", "Alias for -dataset: optional dataset JSONL path.")
 	runID := fs.String("run-id", "bench-run", "Run identifier.")
@@ -68,41 +69,129 @@ func runScenarioCmd(args []string, stdout, stderr io.Writer) error {
 	if dsSource == "" {
 		dsSource = *instancesPath
 	}
-	sched, err := swebench.ResolveScenarioSchedule(scen, dsSource, nil)
+	var insts []swebench.Instance
+	if dsSource != "" {
+		insts, err = swebench.LoadDataset(dsSource)
+		if err != nil {
+			return err
+		}
+	} else {
+		insts = swebench.SyntheticInstances(16, "")
+	}
+
+	sched, err := job.GenerateSchedule(&scen, insts)
 	if err != nil {
 		return err
 	}
+
+	overlays := parseOverlayFlag(*overlayFlag)
 	ctx := context.Background()
-	if _, err := executeScenarioRun(ctx, &scen, sched, *runID, *cluster, targetDir, string(schema.SourceWarmPool)); err != nil {
+	if len(overlays) <= 1 {
+		ovName := ""
+		if len(overlays) == 1 {
+			ovName = overlays[0]
+		}
+		if _, err := executeScenarioRun(ctx, &scen, sched, ovName, *runID, *cluster, targetDir); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "completed benchmark run in %s\n", targetDir)
+		return nil
+	}
+	if len(overlays) != 2 {
+		return fmt.Errorf("-overlay supports at most 2 comma-separated overlays, got %d", len(overlays))
+	}
+
+	nameA, nameB := overlays[0], overlays[1]
+	dirA := filepath.Join(targetDir, nameA)
+	dirB := filepath.Join(targetDir, nameB)
+	repA, err := executeScenarioRun(ctx, &scen, sched, nameA, *runID+"-a", *cluster, dirA)
+	if err != nil {
+		return fmt.Errorf("run overlay %s: %w", nameA, err)
+	}
+	repB, err := executeScenarioRun(ctx, &scen, sched, nameB, *runID+"-b", *cluster, dirB)
+	if err != nil {
+		return fmt.Errorf("run overlay %s: %w", nameB, err)
+	}
+
+	cmp, err := overlay.CompareOverlayPair(nameA, repA, sched, nameB, repB, sched)
+	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "completed benchmark run in %s\n", targetDir)
+	cmpJSON, err := json.MarshalIndent(cmp, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "comparison.json"), append(cmpJSON, '\n'), 0o644); err != nil {
+		return err
+	}
+	md := overlay.RenderComparisonMarkdown(cmp)
+	if err := os.WriteFile(filepath.Join(targetDir, "comparison.md"), []byte(md), 0o644); err != nil {
+		return err
+	}
+	fmt.Fprint(stdout, md)
 	return nil
+}
+
+func parseOverlayFlag(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func executeScenarioRun(
 	ctx context.Context,
 	scen *schema.Scenario,
 	sched *schema.Schedule,
+	overlayName string,
 	runID string,
 	cluster string,
 	outDir string,
-	defaultSource string,
 ) (*swebench.Report, error) {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return nil, err
 	}
 
+	runScen := *scen
+	defaultSource := string(schema.SourceWarmPool)
+	if overlayName != "" {
+		ov, err := overlay.ResolveOverlay(overlayName, scen.Overlays)
+		if err != nil {
+			return nil, err
+		}
+		if ov.PrewarmPolicy == "warm" {
+			runScen.Footing = "warm"
+		} else if ov.PrewarmPolicy == "cold" || ov.PrewarmPolicy == "none" {
+			runScen.Footing = "cold"
+		}
+		if ov.WarmPoolSize > 0 {
+			defaultSource = string(schema.SourceWarmPool)
+		} else {
+			defaultSource = string(schema.SourceColdStart)
+		}
+	}
+
 	// 1. Render SUT manifest and system_description.json.
 	prov := sut.NewProvisioner(nil)
 	if _, err := prov.Provision(ctx, sut.ProvisionOptions{
-		Spec:        scen.SUT,
+		Spec:        runScen.SUT,
 		ArtifactDir: outDir,
 		RenderOnly:  true,
 	}); err != nil {
 		return nil, err
 	}
-	sysDesc := sut.BuildSystemDescription(scen.SUT, cluster, "v1.31", "HEAD", "verified", nil)
+	sysDesc := sut.BuildSystemDescription(runScen.SUT, cluster, "v1.31", "HEAD", "verified", nil)
+	if overlayName != "" {
+		sysDesc.Overlays = []schema.OverlayRef{{Name: overlayName}}
+	}
 	if err := sut.WriteSystemDescription(filepath.Join(outDir, "system_description.json"), sysDesc); err != nil {
 		return nil, err
 	}
@@ -121,7 +210,7 @@ func executeScenarioRun(
 	// 3. Run ScenarioRunner across all jobs (writing schedule.json and events.jsonl).
 	sr := &job.ScenarioRunner{
 		RunID:    runID,
-		Scenario: scen,
+		Scenario: &runScen,
 		Schedule: sched,
 		OutDir:   outDir,
 		ClientFunc: func(_ schema.JobSpec) swebench.EnvClient {
@@ -135,7 +224,7 @@ func executeScenarioRun(
 
 	// 4. If footing == "warm", record a prewarm event so Validity Rule 1 passes.
 	eventsPath := filepath.Join(outDir, "events.jsonl")
-	if scen.Footing == "warm" {
+	if runScen.Footing == "warm" {
 		f, err := os.OpenFile(eventsPath, os.O_APPEND|os.O_WRONLY, 0o644)
 		if err == nil {
 			rec := swebench.NewRecorder(f)
@@ -157,7 +246,7 @@ func executeScenarioRun(
 		return nil, err
 	}
 	swebench.Validate(rep, swebench.ValidateOptions{
-		Footing:  scen.Footing,
+		Footing:  runScen.Footing,
 		Schedule: sched,
 	})
 
@@ -183,45 +272,18 @@ func validateCmd(args []string, stdout, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	var rep *swebench.Report
-	if *reportPath != "" {
-		raw, err := os.ReadFile(*reportPath)
-		if err != nil {
-			return err
-		}
-		rep = &swebench.Report{}
-		if err := json.Unmarshal(raw, rep); err != nil {
-			return err
-		}
-	} else if *eventsPath != "" {
-		var err error
-		rep, err = swebench.BuildReport(*eventsPath)
-		if err != nil {
-			return err
-		}
-	} else {
+	if *reportPath == "" && *eventsPath == "" {
 		return fmt.Errorf("either -report or -events is required")
 	}
-
-	var sched *schema.Schedule
-	if *schedulePath != "" {
-		raw, err := os.ReadFile(*schedulePath)
-		if err != nil {
-			return err
-		}
-		s, err := schema.DecodeJSONStrict[schema.Schedule](bytes.NewReader(raw))
-		if err != nil {
-			return err
-		}
-		sched = &s
-	}
-	v := swebench.Validate(rep, swebench.ValidateOptions{
+	_, v, err := swebench.ValidateReportOrEvents(*reportPath, *eventsPath, *schedulePath, swebench.ValidateOptions{
 		Footing:         *footing,
 		MinTasks:        *minTasks,
 		MinRewardRate:   *minRewardRate,
 		CheckRewardRate: *minRewardRate > 0,
-		Schedule:        sched,
 	})
+	if err != nil {
+		return err
+	}
 	data, _ := json.MarshalIndent(v, "", "  ")
 	fmt.Fprintln(stdout, string(data))
 	if !v.Valid {
@@ -242,30 +304,10 @@ func compareCmd(args []string, stdout, stderr io.Writer) error {
 	if *basePath == "" || *candPath == "" {
 		return fmt.Errorf("-baseline and -candidate are required")
 	}
-	rawBase, err := os.ReadFile(*basePath)
+	res, err := swebench.CompareReportFiles(*basePath, *candPath, *thresholdsPath)
 	if err != nil {
 		return err
 	}
-	var baseRep swebench.Report
-	if err := json.Unmarshal(rawBase, &baseRep); err != nil {
-		return err
-	}
-	rawCand, err := os.ReadFile(*candPath)
-	if err != nil {
-		return err
-	}
-	var candRep swebench.Report
-	if err := json.Unmarshal(rawCand, &candRep); err != nil {
-		return err
-	}
-	var th swebench.Thresholds
-	if *thresholdsPath != "" {
-		th, err = swebench.LoadThresholds(*thresholdsPath)
-		if err != nil {
-			return err
-		}
-	}
-	res := swebench.Compare(&baseRep, &candRep, th)
 	fmt.Fprint(stdout, swebench.FormatComparisonMarkdown(res))
 	if !res.Passed {
 		return fmt.Errorf("comparison failed thresholds: %s", strings.Join(res.Regressions, "; "))

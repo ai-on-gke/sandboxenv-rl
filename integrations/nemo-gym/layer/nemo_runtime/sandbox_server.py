@@ -15,31 +15,34 @@
 """Serve NeMo Skills' local sandbox server (POST /execute, GET /health) from
 the layer: ``python3 -m nemo_runtime.sandbox_server --host 0.0.0.0 --port 6000``.
 
-The vendored module is loaded from third_party/nemo-skills so it stays
-byte-identical to upstream; this wrapper only chooses the bind address (Flask's
-default is 127.0.0.1, which the router cannot reach) and the port."""
+The upstream module is fetched into third_party/nemo-skills when the layer is
+built (see the Dockerfile: pinned by commit and sha256) and imported unchanged.
+This wrapper chooses the bind address (Flask's default is 127.0.0.1, which the
+router cannot reach), the port, and how IPython session workers start."""
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import logging
+import multiprocessing
 import os
 import sys
 from pathlib import Path
 
-_SERVER = Path(__file__).resolve().parent / "third_party" / "nemo-skills" / "local_sandbox_server.py"
+_THIRD_PARTY = Path(__file__).resolve().parent / "third_party" / "nemo-skills"
 
 
 def load_app():
-    """Import the vendored Flask application under its upstream module name."""
-    spec = importlib.util.spec_from_file_location("local_sandbox_server", _SERVER)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load {_SERVER}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["local_sandbox_server"] = module
-    spec.loader.exec_module(module)
-    return module.app
+    """Import the upstream Flask application under its own module name.
+
+    Its directory goes first on sys.path, so ``local_sandbox_server`` is
+    importable by name: a session worker started with the spawn method
+    imports it again in a fresh interpreter (see main)."""
+    if str(_THIRD_PARTY) not in sys.path:
+        sys.path.insert(0, str(_THIRD_PARTY))
+    import local_sandbox_server  # noqa: PLC0415 - importable only from here on
+
+    return local_sandbox_server.app
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -55,13 +58,17 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["PATH"] = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin") + os.pathsep + layer_bin
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     app = load_app()
-    # One process, many threads: each IPython session already runs in its own
-    # child process, and the guest restarts this server if it exits. Upstream
-    # serves this app under uWSGI; here the Flask server is threaded, thus a
-    # new session forks (multiprocessing) a process that has other threads.
-    # Python 3.12 warns about this: a lock that another thread holds at fork
-    # time stays held in the child, and that child can hang. The vendored
-    # server's timeout then kills the child; only that session is lost.
+    # Upstream serves this app under uWSGI, several single-threaded worker
+    # processes, so a new IPython session forks from a process with no other
+    # thread in it. Here one process serves many threads, because a long
+    # /execute must not block /health, which the guest probes; a fork from a
+    # threaded process inherits a lock another thread held at that moment,
+    # and the child can hang on it (Python 3.12 warns about exactly this). So
+    # session workers start with spawn: a fresh interpreter imports
+    # local_sandbox_server by name (sys.path travels to the child) and runs
+    # shell_worker. The session's process then lives as long as before; the
+    # cost is one interpreter start per new session.
+    multiprocessing.set_start_method("spawn")
     app.run(host=args.host, port=args.port, threaded=True, use_reloader=False)
     return 0
 

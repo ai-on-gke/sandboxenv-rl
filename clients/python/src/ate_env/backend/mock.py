@@ -85,6 +85,10 @@ class MockBackendDriver(BackendDriver):
         if rootfs_image is not None:
             self.warm_pools.pop((template_id, rootfs_image), None)
 
+    def pool_size(self, template_id: str, rootfs_image: str | None = None) -> int | None:
+        key = template_id if rootfs_image is None else (template_id, rootfs_image)
+        return self.warm_pools.get(key, 0)
+
     def acquire(
         self,
         template_id: str,

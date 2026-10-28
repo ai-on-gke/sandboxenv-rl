@@ -247,6 +247,10 @@ class AsyncSandboxFleet:
                     self.backend.unwarm_pool, template_id, rootfs_image=rootfs_image
                 )
 
+    def pool_size(self, image: str) -> int | None:
+        """Idle warm replicas for ``image`` (see ``SandboxFleet.pool_size``)."""
+        return self._fleet.pool_size(image)
+
     async def acquire(self, task: Task | str, timeout_s: float | None = None) -> SandboxHandle:
         """Asynchronously acquire a single sandbox."""
         task_obj: Task

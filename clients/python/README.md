@@ -555,6 +555,10 @@ traces and lifecycle records without a mapping. Client-only fields use the
 gRPC method, for example `ateenv.v1alpha.EnvironmentService/CreateEnvironment`),
 `server.address` and `server.port`, and have kind `CLIENT`. These are the keys
 that otelgrpc puts on the `ate-env-api` server spans and the Go client's spans.
+Like otelgrpc, the client reads `OTEL_SEMCONV_STABILITY_OPT_IN` once at import:
+`rpc/old` gives the older `rpc.system`, `rpc.service` and the short
+`rpc.method` (`CreateEnvironment`), and `rpc/dup` gives both sets, with the full
+`rpc.method`. Set it to the same value for the client and for `ate-env-api`.
 
 **Time to first command (TTFC).** `acquire` ends when the create call
 returns. The wake and readiness wait happen inside the first command, so the

@@ -324,9 +324,17 @@ cfg = FleetConfig(run_id=os.environ["JOB_PREFIX"])   # a DNS-1123 label
 fleet = SandboxFleet(cfg)                             # same run_id in every process
 ```
 
-Handles (`handle.run_id`), the run report's `environment` block and
-`teardown()` then all carry the job's id. Each process still releases only the
-environments it created.
+Handles (`handle.run_id`), the warm-pool environments that `setup()` and
+`warm_images()` create, `ate_env.run_id` on spans, and the run report's
+`environment` block then all carry the job's id. `"warm-pool"` is reserved: it
+is the run id of warm environments created by calling a driver's
+`warm_pool()` without one.
+
+The run id stays in the client. It is not sent to ate-env-api, and environment
+names (`sb-…`, `warm-…`) don't contain it. So `teardown()` still releases only
+the environments that this process created and tracks. An orchestrator can't
+reap a crashed worker's environments by run id. Reaping across processes needs
+server-side labels and listing in ate-env-api, which don't exist yet.
 
 ### Concurrency
 
@@ -340,6 +348,33 @@ results = await asyncio.gather(
     env.shell("make lint"),
     other_env.shell("make build"),
 )
+```
+
+### Grow the task list while the job runs
+
+`load_tasks()` replaces the fleet's tasks. A worker that is handed an episode
+nobody planned, or a trainer that streams batches from a prompt source, calls
+`add_tasks()` instead: it appends, returns the new `Task` objects and, once
+`plan()` has run, extends the plan with their images. It warms nothing, and
+a `run()` already in progress does not run the added tasks (`fleet.tasks` is
+a snapshot). Task ids must be new: `add_tasks` raises `ValueError` and adds
+nothing if an id is already in the fleet or repeats within the call.
+`load_tasks()` follows the same rule within its list: it raises `ValueError`
+and keeps the tasks loaded before if an id repeats. It also recomputes an
+existing plan.
+
+Both take `Task` objects or dicts. A dict needs `image` and a non-empty
+`task_id` or `id`; a dict without one raises `ValueError`. The fleet does not
+make up ids, because `acquire()`, results and reports need ids that name the
+row in your data. Map dataset rows first:
+
+```python
+fleet.load_tasks([{"id": r["instance_id"], "image": r["image"]} for r in rows])   # SWE-bench JSONL
+fleet.load_tasks([Task(id=f"{r['repo_name']}@{r['commit_hash'][:12]}", image=r["docker_image"])
+                  for r in rows])                                                    # R2E-Gym
+
+new = fleet.add_tasks(next_batch)                    # Task objects or dicts
+fleet.warm_images(sorted({t.image for t in new}), wait=False)
 ```
 
 ### Observability

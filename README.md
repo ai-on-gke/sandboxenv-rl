@@ -291,8 +291,10 @@ the Go SDK, `Client(..., auth_token=...)` or `FleetConfig(auth_token=...)` in th
 `Authorization: Bearer <token>` on MCP HTTP requests and port-proxy requests
 ([Reaching a service inside an environment](#reaching-a-service-inside-an-environment)). To
 rotate the token, replace the Secret's value; `ate-env-api` reads it again once the kubelet updates
-the mounted file. `--insecure-no-auth` deploys `ate-env-api` without the token, in which case
-anyone who can reach its Service can create environments and run commands in them.
+the mounted file, within about a minute. One token is valid at a time: from that moment, callers
+that still send the old one get 401, thus update the clients together with the Secret.
+`--insecure-no-auth` deploys `ate-env-api` without the token, in which case anyone who can reach
+its Service can create environments and run commands in them.
 The clients connect without TLS, thus the token travels in clear text. Past the cluster boundary,
 for example through an internal LoadBalancer, put TLS termination or a mesh with mTLS in front of
 `ate-env-api`.
@@ -465,24 +467,25 @@ Available Commands:
   template      Generate Substrate ActorTemplate manifest
 
 Flags:
-      --api-allowed-hosts strings   extra host names that HTTP clients may use to reach ate-env-api, e.g. an internal load balancer name (a leading *. allows the names below it); the Service's in-cluster names, in the cluster's own DNS domain, IP addresses and localhost are always allowed
-      --api-image string            digest-pinned ate-env-api image for the API service (required: this ate-env was built from source; release binaries default to the image published with the release, see docs/release.md)
-      --api-port int32              port the ate-env-api service listens on (default 7777)
-      --api-replicas int32          number of API service replicas (default 1)
-      --api-router-tls              mount the pod identity certificate and the servicedns trust bundle into ate-env-api and dial the atenet router's TLS listeners, the only ones Substrate serves since v0.6.0; the API's SPIFFE ID must then be in the router's --ingress-allowed-spiffe-ids. Off, the API dials the plaintext addresses, which only the test fakes serve (default true)
-      --ateom-image string          alias for --worker-image, kept from before Substrate renamed ateom to ateworker
-      --auth-token-secret string    Kubernetes Secret (key 'token') mounted into ate-env-api; its value is the bearer token ate-env-api requires from callers. Create it with 'ate-env manifest auth-secret' (default "ate-env-api-token")
-      --enable-tracing              run ate-env-api with --enable-tracing, exporting OpenTelemetry traces over OTLP/gRPC
-  -h, --help                        help for manifest
-      --insecure-no-auth            deploy ate-env-api without a caller token: anyone who can reach its Service can create environments, run commands in them and reach their ports
-      --metrics-port int32          port ate-env-api serves Prometheus metrics on (--metrics-listen-addr), exposed on the container and the Service as "metrics" with prometheus.io scrape annotations; 0 leaves metrics off. The metrics listener has no authentication and no Host check
-      --namespace string            Kubernetes namespace to deploy into (default "ate-env")
-      --otlp-endpoint string        OTLP/gRPC collector endpoint for ate-env-api's traces, set as OTEL_EXPORTER_OTLP_ENDPOINT, e.g. http://otel-collector.observability:4317
-      --otlp-insecure               set OTEL_EXPORTER_OTLP_INSECURE=true: talk to the collector in plaintext
-      --replicas int32              number of pre-warmed worker pods (default 5)
-      --template string             ActorTemplate name (default "default-template")
-      --worker-image string         digest-pinned worker image for the worker pool, e.g. ateworker-gvisor built from the Substrate repo
-      --workerpool string           WorkerPool name (defaults to <template>-workerpool)
+      --api-allowed-hosts strings     extra host names that HTTP clients may use to reach ate-env-api, e.g. an internal load balancer name (a leading *. allows the names below it); the Service's in-cluster names, in the cluster's own DNS domain, IP addresses and localhost are always allowed
+      --api-image string              digest-pinned ate-env-api image for the API service (required: this ate-env was built from source; release binaries default to the image published with the release, see docs/release.md)
+      --api-port int32                port the ate-env-api service listens on (default 7777)
+      --api-replicas int32            number of API service replicas (default 1)
+      --api-router-tls                mount the pod identity certificate and the servicedns trust bundle into ate-env-api and dial the atenet router's TLS listeners, the only ones Substrate serves since v0.6.0; the API's SPIFFE ID must then be in the router's --ingress-allowed-spiffe-ids. Off, the API dials the plaintext addresses, which only the test fakes serve (default true)
+      --ateom-image string            alias for --worker-image, kept from before Substrate renamed ateom to ateworker
+      --auth-token-secret string      Kubernetes Secret (key 'token') mounted into ate-env-api; its value is the bearer token ate-env-api requires from callers. Create it with 'ate-env manifest auth-secret' (default "ate-env-api-token")
+      --enable-tracing                run ate-env-api with --enable-tracing, exporting OpenTelemetry traces over OTLP/gRPC
+  -h, --help                          help for manifest
+      --insecure-no-auth              deploy ate-env-api without a caller token: anyone who can reach its Service can create environments, run commands in them and reach their ports
+      --metrics-port int32            port ate-env-api serves Prometheus metrics on (--metrics-listen-addr), exposed on the container and the Service as "metrics" with prometheus.io scrape annotations; 0 leaves metrics off. The metrics listener has no authentication and no Host check
+      --namespace string              Kubernetes namespace to deploy into (default "ate-env")
+      --otlp-endpoint string          OTLP/gRPC collector endpoint for ate-env-api's traces, set as OTEL_EXPORTER_OTLP_ENDPOINT, e.g. http://otel-collector.observability:4317
+      --otlp-insecure                 set OTEL_EXPORTER_OTLP_INSECURE=true: talk to the collector in plaintext
+      --port-proxy-atespaces string   comma-separated atespaces whose environments ate-env-api's port proxy forwards to, or * for any (defaults to ate-env)
+      --replicas int32                number of pre-warmed worker pods (default 5)
+      --template string               ActorTemplate name (default "default-template")
+      --worker-image string           digest-pinned worker image for the worker pool, e.g. ateworker-gvisor built from the Substrate repo
+      --workerpool string             WorkerPool name (defaults to <template>-workerpool)
 
 Use "ate-env manifest [command] --help" for more information about a command.
 ```

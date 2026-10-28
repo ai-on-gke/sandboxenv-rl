@@ -20,6 +20,8 @@ import uuid
 from typing import Any
 
 from ..errors import SandboxStartError
+from ..telemetry import metrics
+from ..telemetry.trace_recorder import current_slot_wait_s, is_measure_mode
 from ..types import EnvironmentSpec, RawSandboxInstance
 from .base import BackendDriver
 
@@ -74,12 +76,29 @@ class MockBackendDriver(BackendDriver):
         timeout_s: float = 180.0,
         rootfs_image: str | None = None,
     ) -> RawSandboxInstance:
+        start = time.monotonic()
+        slot_wait_s = current_slot_wait_s.get() or 0.0
         if self.fail_acquire:
             self._observe("claim", "error")
+            metrics.observe_subphase("slot_wait", slot_wait_s, status="error", source="mock")
+            metrics.observe_subphase(
+                "wire_claim", time.monotonic() - start, status="error", source="mock"
+            )
+            if is_measure_mode():
+                metrics.observe("acquire", time.monotonic() - start, status="error")
             raise SandboxStartError("Mock acquire failed: capacity exhausted")
 
+        warm_count = self.warm_pools.get(
+            (template_id, rootfs_image) if rootfs_image is not None else template_id,
+            self.warm_pools.get(template_id, 0),
+        )
+        claim_source = "warm_pool" if warm_count > 0 else "mock"
         inst_id = f"mock-sb-{uuid.uuid4().hex[:8]}"
-        metadata = {"created_at": time.time(), "template": template_id}
+        metadata: dict[str, Any] = {
+            "created_at": time.time(),
+            "template": template_id,
+            "claim_source": claim_source,
+        }
         if rootfs_image is not None:
             metadata["rootfs_image"] = rootfs_image
         inst = RawSandboxInstance(
@@ -92,12 +111,20 @@ class MockBackendDriver(BackendDriver):
         )
         self.instances[inst_id] = inst
         self._observe("claim", "ok")
+        dur = time.monotonic() - start
+        metrics.observe_subphase("slot_wait", slot_wait_s, status="ok", source=claim_source)
+        metrics.observe_subphase("wire_claim", dur, status="ok", source=claim_source)
+        if is_measure_mode():
+            metrics.observe("acquire", dur, status="ok")
         return inst
 
     def release(self, instance_id: str, recycle: bool = False) -> None:
+        start = time.monotonic()
         if instance_id in self.instances:
             if not recycle:
                 del self.instances[instance_id]
+        if is_measure_mode():
+            metrics.observe("release", time.monotonic() - start, status="ok")
 
     def reap(self, run_id: str) -> int:
         self.reaped_runs.add(run_id)
@@ -110,4 +137,5 @@ class MockBackendDriver(BackendDriver):
         self, instance: RawSandboxInstance, data_plane: str = "mock"
     ) -> tuple[Any, Any | None]:
         from ..runtime.mock import MockRuntimeHook
+
         return MockRuntimeHook(), None

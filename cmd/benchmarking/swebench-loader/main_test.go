@@ -540,4 +540,49 @@ func TestCLIReportFlagsValidateCompareAndStats(t *testing.T) {
 	}
 }
 
+func TestCLIConvertTraceSubcommandAndFlag(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.jsonl")
+	const digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	traceLines := strings.Join([]string{
+		`{"schema_version":"v1","ts":"2026-10-22T12:00:00.005Z","job":"grpo","step":1,"env":"sb-1","instance":"inst-1","image":"reg/img@` + digest + `","op":"create","dur_ms":5,"ok":true}`,
+		`{"schema_version":"v1","ts":"2026-10-22T12:00:00.015Z","job":"grpo","step":1,"env":"sb-1","instance":"inst-1","op":"write_file","path":"/workspace/p.diff","bytes":32,"dur_ms":5,"ok":true}`,
+		`{"schema_version":"v1","ts":"2026-10-22T12:00:00.045Z","job":"grpo","step":1,"env":"sb-1","instance":"inst-1","op":"exec","command":["pytest","-q"],"dur_ms":10,"exit":0,"ok":true}`,
+		`{"schema_version":"v1","ts":"2026-10-22T12:00:00.050Z","job":"grpo","step":1,"env":"sb-1","instance":"inst-1","op":"delete","dur_ms":5,"ok":true}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(tracePath, []byte(traceLines), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	outDir1 := filepath.Join(dir, "out-subcmd")
+	var stdout, stderr bytes.Buffer
+	if code := runMain([]string{"convert-trace", "-in", tracePath, "-out", outDir1, "-scenario", "cli-trace"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("convert-trace subcommand failed (exit %d): %s", code, stderr.String())
+	}
+	sched, err := swebench.ReadSchedule(filepath.Join(outDir1, "schedule.json"))
+	if err != nil {
+		t.Fatalf("ReadSchedule(outDir1): %v", err)
+	}
+	if sched.ScenarioName != "cli-trace" || len(sched.Jobs) != 1 || len(sched.Jobs[0].Steps) != 1 {
+		t.Fatalf("unexpected converted schedule: %+v", sched)
+	}
+	traj, err := swebench.LoadTrajectory(filepath.Join(outDir1, "trajectory.yaml"))
+	if err != nil {
+		t.Fatalf("LoadTrajectory(outDir1): %v", err)
+	}
+	if len(traj.Steps) != 2 {
+		t.Fatalf("expected 2 steps in converted trajectory, got %+v", traj.Steps)
+	}
+
+	outDir2 := filepath.Join(dir, "out-flag")
+	stdout.Reset()
+	stderr.Reset()
+	if code := runMain([]string{"run", "-convert-trace", tracePath, "-trace-out", outDir2}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run -convert-trace failed (exit %d): %s", code, stderr.String())
+	}
+	if _, err := swebench.ReadSchedule(filepath.Join(outDir2, "schedule.json")); err != nil {
+		t.Fatalf("ReadSchedule(outDir2): %v", err)
+	}
+}
+
 func statsOutPath(p string) string { return p }

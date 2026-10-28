@@ -29,6 +29,13 @@ from .config import TracerConfig
 from .env import Env
 from .errors import map_rpc_error
 from .telemetry import metrics
+from .telemetry.trace_recorder import (
+    annotate_span,
+    current_warm_claim,
+    in_driver_span,
+    is_measure_mode,
+    register_env_meta,
+)
 from .telemetry.tracing import (
     CLIENT_SPAN_PREFIX,
     _trace_interceptors,
@@ -220,6 +227,12 @@ class Client:
         if self._owns_channel:
             await self._channel.close()
 
+    async def __aenter__(self) -> Client:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.close()
+
     async def create(
         self,
         id: str,
@@ -241,19 +254,41 @@ class Client:
         image volume. The derived template is created on first use and reused
         for later environments on the same image; info() reports its name.
         """
-        req = env_pb2.CreateEnvironmentRequest(id=id, atespace=atespace, rootfs_image=rootfs_image or "")
+        req = env_pb2.CreateEnvironmentRequest(
+            id=id, atespace=atespace, rootfs_image=rootfs_image or ""
+        )
         if template_name or template_atespace:
             req.template.name = template_name or ""
             req.template.atespace = template_atespace or ""
-        with self._rpc_span("create_environment", "CreateEnvironment", lambda: {
-            "ate.actor.name": id,
-            "ate.atespace": atespace,
-            "ate.template.name": template_name,
-            "ate.template.atespace": template_atespace,
-            "ate_env.rootfs_image": image_ref_attr(rootfs_image),
-        }):
+        with self._rpc_span(
+            "create_environment",
+            "CreateEnvironment",
+            lambda: {
+                "ate.actor.name": id,
+                "ate.atespace": atespace,
+                "ate.template.name": template_name,
+                "ate.template.atespace": template_atespace,
+                "ate_env.rootfs_image": image_ref_attr(rootfs_image),
+            },
+        ) as span:
+            if span is not None:
+                annotate_span(
+                    span,
+                    op="create",
+                    env=id,
+                    image=rootfs_image or template_name,
+                )
+                register_env_meta(id, image=rootfs_image or template_name)
             try:
-                resp = await self._environments.CreateEnvironment(req, metadata=self._auth_metadata())
+                if is_measure_mode() and not in_driver_span.get():
+                    with metrics.timed("acquire"):
+                        resp = await self._environments.CreateEnvironment(
+                            req, metadata=self._auth_metadata()
+                        )
+                else:
+                    resp = await self._environments.CreateEnvironment(
+                        req, metadata=self._auth_metadata()
+                    )
             except grpc.RpcError as e:
                 raise map_rpc_error(e) from e
         created = resp.environment
@@ -262,9 +297,27 @@ class Client:
     async def get(self, id: str, *, atespace: str = DEFAULT_ATESPACE) -> EnvironmentInfo:
         """Retrieve the status and configuration of an environment."""
         req = env_pb2.GetEnvironmentRequest(id=id, atespace=atespace)
-        with self._rpc_span("get_environment", "GetEnvironment", lambda: {"ate.actor.name": id, "ate.atespace": atespace}):
+        with self._rpc_span(
+            "get_environment",
+            "GetEnvironment",
+            lambda: {"ate.actor.name": id, "ate.atespace": atespace},
+        ) as span:
+            if span is not None:
+                annotate_span(
+                    span,
+                    op="wake" if current_warm_claim.get() else "get",
+                    env=id,
+                )
             try:
-                resp = await self._environments.GetEnvironment(req, metadata=self._auth_metadata())
+                if is_measure_mode() and not in_driver_span.get():
+                    with metrics.timed("warm_claim"):
+                        resp = await self._environments.GetEnvironment(
+                            req, metadata=self._auth_metadata()
+                        )
+                else:
+                    resp = await self._environments.GetEnvironment(
+                        req, metadata=self._auth_metadata()
+                    )
             except grpc.RpcError as e:
                 raise map_rpc_error(e) from e
         return _environment_info_from_pb(resp.environment)
@@ -273,10 +326,15 @@ class Client:
         """Checkpoint and stop the environment."""
         req = env_pb2.SuspendEnvironmentRequest(id=id, atespace=atespace)
         with (
-            self._rpc_span("suspend_environment", "SuspendEnvironment",
-                           lambda: {"ate.actor.name": id, "ate.atespace": atespace}),
+            self._rpc_span(
+                "suspend_environment",
+                "SuspendEnvironment",
+                lambda: {"ate.actor.name": id, "ate.atespace": atespace},
+            ) as span,
             metrics.timed("suspend"),
         ):
+            if span is not None:
+                annotate_span(span, op="suspend", env=id)
             try:
                 await self._environments.SuspendEnvironment(req, metadata=self._auth_metadata())
             except grpc.RpcError as e:
@@ -285,9 +343,23 @@ class Client:
     async def delete(self, id: str, *, atespace: str = DEFAULT_ATESPACE) -> None:
         """Remove the environment permanently."""
         req = env_pb2.DeleteEnvironmentRequest(id=id, atespace=atespace)
-        with self._rpc_span("delete_environment", "DeleteEnvironment", lambda: {"ate.actor.name": id, "ate.atespace": atespace}):
+        with self._rpc_span(
+            "delete_environment",
+            "DeleteEnvironment",
+            lambda: {"ate.actor.name": id, "ate.atespace": atespace},
+        ) as span:
+            if span is not None:
+                annotate_span(span, op="delete", env=id)
             try:
-                await self._environments.DeleteEnvironment(req, metadata=self._auth_metadata())
+                if is_measure_mode() and not in_driver_span.get():
+                    with metrics.timed("release"):
+                        await self._environments.DeleteEnvironment(
+                            req, metadata=self._auth_metadata()
+                        )
+                else:
+                    await self._environments.DeleteEnvironment(
+                        req, metadata=self._auth_metadata()
+                    )
             except grpc.RpcError as e:
                 raise map_rpc_error(e) from e
 

@@ -49,6 +49,7 @@ import (
 
 	"github.com/agent-substrate/env/internal/benchmarking/schema"
 	"github.com/agent-substrate/env/internal/benchmarking/swebench"
+	"github.com/agent-substrate/env/internal/benchmarking/trace"
 )
 
 func main() {
@@ -66,6 +67,8 @@ func runMain(args []string, stdout, stderr io.Writer) int {
 		err = runCmd(args[1:])
 	case "resolve":
 		err = resolveCmd(args[1:])
+	case "convert-trace":
+		err = convertTraceCmd(args[1:])
 	case "report", "compare":
 		err = reportCmdWithIO(args[1:], stdout, stderr)
 	case "trajectory-assets":
@@ -74,6 +77,10 @@ func runMain(args []string, stdout, stderr io.Writer) int {
 		usage(stderr)
 		return 0
 	default:
+		if strings.HasPrefix(args[0], "-convert-trace") || strings.HasPrefix(args[0], "--convert-trace") {
+			err = runCmd(args)
+			break
+		}
 		usage(stderr)
 		return 2
 	}
@@ -228,7 +235,7 @@ func idsDigest(ids []string) string {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage: swebench-loader run [flags] | swebench-loader resolve [flags] | swebench-loader report FILE... [-json OUT] | swebench-loader trajectory-assets FILE")
+	fmt.Fprintln(w, "usage: swebench-loader run [flags] | swebench-loader resolve [flags] | swebench-loader convert-trace [flags] | swebench-loader report FILE... [-json OUT] | swebench-loader trajectory-assets FILE")
 }
 
 // assetsCmd prints the files a trajectory's write steps name, one per line,
@@ -245,6 +252,57 @@ func assetsCmd(args []string, w io.Writer) error {
 		fmt.Fprintln(w, n)
 	}
 	return nil
+}
+
+func convertTraceCmd(args []string) error {
+	files, rest := leadingFiles(args)
+	fs := flag.NewFlagSet("convert-trace", flag.ContinueOnError)
+	var (
+		in           = fs.String("in", "", "Input trace.jsonl path (or pass as first positional argument).")
+		traceFlag    = fs.String("convert-trace", "", "Alias for -in: input trace.jsonl path.")
+		outDir       = fs.String("out", "", "Output directory for schedule.json, placement.json, trajectory.yaml, and instances.jsonl.")
+		traceOutFlag = fs.String("trace-out", "", "Alias for -out: output directory for converted trace artifacts.")
+		scenarioName = fs.String("scenario", "", "Scenario name for converted schedule.json.")
+		defaultJob   = fs.String("job", "", "Default job name when trace events omit job.")
+		defaultImage = fs.String("default-image", "", "Default pinned digest image when trace events omit image.")
+	)
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	tracePath := *in
+	if tracePath == "" {
+		tracePath = *traceFlag
+	}
+	if tracePath == "" && len(files) > 0 {
+		tracePath = files[0]
+	}
+	if tracePath == "" && fs.NArg() > 0 {
+		tracePath = fs.Arg(0)
+	}
+	if tracePath == "" {
+		return fmt.Errorf("-in (or positional trace.jsonl) is required")
+	}
+	targetDir := *outDir
+	if targetDir == "" {
+		targetDir = *traceOutFlag
+	}
+	if targetDir == "" {
+		return fmt.Errorf("-out (or -trace-out) directory is required")
+	}
+	f, err := os.Open(tracePath)
+	if err != nil {
+		return fmt.Errorf("open trace %s: %w", tracePath, err)
+	}
+	defer f.Close()
+	conv, err := trace.ConvertTrace(f, trace.ConvertOptions{
+		ScenarioName: *scenarioName,
+		DefaultJob:   *defaultJob,
+		DefaultImage: *defaultImage,
+	})
+	if err != nil {
+		return err
+	}
+	return trace.WriteConvertedArtifacts(targetDir, conv)
 }
 
 func resolveCmd(args []string) error {
@@ -333,6 +391,8 @@ func runCmd(args []string) (retErr error) {
 		testName      = fs.String("test-name", "", "Optional test_name for run_window.json and stats.jsonl.")
 		tag           = fs.String("tag", "", "Optional tag for run_window.json and stats.jsonl.")
 		validate      = fs.Bool("validate", false, "Evaluate Validity Rules 1-7 after the run and fail if invalid.")
+		convertTrace  = fs.String("convert-trace", "", "Convert a trace.jsonl file into schedule.json and trajectory.yaml before running (or exit if -dataset is omitted).")
+		traceOut      = fs.String("trace-out", "", "Output directory for -convert-trace artifacts.")
 		keep          = fs.Bool("keep", false, "Leave the environments in place when the run ends.")
 		dryRun        = fs.Bool("dry-run", false, "Load and render everything, print the plan and exit without touching the API.")
 		authTokenFile = fs.String("auth-token-file", "", "File that holds the bearer token for ate-env-api; surrounding whitespace is ignored. Without it, SUBSTRATE_ENV_AUTH_TOKEN is used when set.")
@@ -343,6 +403,18 @@ func runCmd(args []string) (retErr error) {
 	fs.Var(labels, "label", "KEY=VALUE recorded on the run event, repeatable: the Substrate commit, the cluster, the arm. The loader records its own flags itself (mode, width, images, trajectory, dataset, the shape flags, connections, base-template, exclude-file, instances and the timeouts); a -label with one of those keys is refused, so report -arm can trust them.")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *convertTrace != "" {
+		targetDir := *traceOut
+		if targetDir == "" {
+			return fmt.Errorf("-trace-out is required with -convert-trace")
+		}
+		if err := convertTraceCmd([]string{"-in", *convertTrace, "-out", targetDir, "-job", *jobName}); err != nil {
+			return err
+		}
+		if *dataset == "" {
+			return nil
+		}
 	}
 	if *dataset == "" {
 		return fmt.Errorf("-dataset is required")

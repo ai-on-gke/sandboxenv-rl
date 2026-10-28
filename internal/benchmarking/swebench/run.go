@@ -1005,10 +1005,14 @@ func (r *runner) runScheduledSteps(ctx context.Context) error {
 				}
 			}
 
-			if r.cfg.StepPause > 0 {
+			stepPause := r.cfg.StepPause
+			if stepPause <= 0 && st.StepPauseMS > 0 {
+				stepPause = time.Duration(st.StepPauseMS * float64(time.Millisecond))
+			}
+			if stepPause > 0 {
 				select {
 				case <-ctx.Done():
-				case <-time.After(r.cfg.StepPause):
+				case <-time.After(stepPause):
 				}
 			}
 

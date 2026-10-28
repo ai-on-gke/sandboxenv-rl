@@ -342,6 +342,34 @@ class SandboxFleet:
                 self.backend.warm_pool(template_id, rep, wait=wait, run_id=self.run_id,
                                        rootfs_image=rootfs_image)
 
+    def warm_image(self, image: str, replicas: int | None = None, wait: bool = True) -> None:
+        """Warm one image's pool (agent-sandbox-rl's ``warm_image``)."""
+        self.warm_images([image], replicas=replicas, wait=wait)
+
+    def set_pool_replicas(self, image: str, replicas: int, wait: bool = True) -> None:
+        """Size one image's warm pool to exactly ``replicas`` idle sandboxes,
+        up or down, without dropping it (agent-sandbox-rl's
+        ``set_pool_replicas``). Claimed sandboxes are not counted and never
+        touched, so a caller can keep ``held + warm == K`` per image as it
+        acquires. A backend without ``resize_pool`` grows through
+        ``warm_pool`` and drains through ``unwarm_pool`` when ``replicas`` is 0.
+        """
+        replicas = max(0, int(replicas))
+        template_id, rootfs_image = self._ensure_template_for_image(image)
+        with self._obs.phase("warm_pool", backend=self.backend_label, family=repo_family(image)):
+            try:
+                self.backend.resize_pool(template_id, replicas, wait=wait, rootfs_image=rootfs_image)
+            except NotImplementedError:
+                if replicas == 0:
+                    self.backend.unwarm_pool(template_id, rootfs_image=rootfs_image)
+                else:
+                    logger.warning(
+                        "backend %s has no resize_pool: set_pool_replicas(%s, %d) can grow the "
+                        "pool but cannot shrink it below its current size",
+                        self.backend_label, image, replicas,
+                    )
+                    self.backend.warm_pool(template_id, replicas, wait=wait, rootfs_image=rootfs_image)
+
     def unwarm_image(self, image: str) -> None:
         """Drain warm pool for a specific image."""
         entry = self._image_to_template.get(image)

@@ -291,6 +291,27 @@ func CompareReports(base, cand *Report, th Thresholds) ComparisonResult {
 	return Compare(base, cand, th)
 }
 
+// CompareReportFiles loads baseline and candidate reports (from JSON or JSONL) and optional
+// thresholds from thresholdsPath, and runs Compare.
+func CompareReportFiles(basePath, candPath, thresholdsPath string) (ComparisonResult, error) {
+	baseRep, err := LoadOrSummarizeReport(basePath)
+	if err != nil {
+		return ComparisonResult{}, fmt.Errorf("load baseline %q: %w", basePath, err)
+	}
+	candRep, err := LoadOrSummarizeReport(candPath)
+	if err != nil {
+		return ComparisonResult{}, fmt.Errorf("load candidate %q: %w", candPath, err)
+	}
+	var th Thresholds
+	if thresholdsPath != "" {
+		th, err = LoadThresholds(thresholdsPath)
+		if err != nil {
+			return ComparisonResult{}, err
+		}
+	}
+	return Compare(baseRep, candRep, th), nil
+}
+
 // FormatComparisonMarkdown renders a side-by-side Markdown diff table for res.
 func FormatComparisonMarkdown(res ComparisonResult) string {
 	var b strings.Builder

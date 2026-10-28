@@ -3441,6 +3441,138 @@ func round1(v float64) float64 { return math.Round(v*10) / 10 }
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
 func round4(v float64) float64 { return math.Round(v*10000) / 10000 }
 
+// Round1 rounds v to 1 decimal place.
+func Round1(v float64) float64 { return round1(v) }
+
+// Round2 rounds v to 2 decimal places.
+func Round2(v float64) float64 { return round2(v) }
+
+// Round4 rounds v to 4 decimal places.
+func Round4(v float64) float64 { return round4(v) }
+
+// RoundStatVal rounds v to 4 decimal places when |v| < 10 and 2 decimal places otherwise.
+func RoundStatVal(v float64) float64 {
+	if math.Abs(v) < 10 {
+		return round4(v)
+	}
+	return round2(v)
+}
+
+// NearestRankPct returns the nearest-rank percentile p in [0, 1] of sorted.
+func NearestRankPct(sorted []float64, p float64) float64 {
+	return percentile(sorted, p)
+}
+
+// SingleScalarSummary constructs a MetricSummary for a single scalar value.
+func SingleScalarSummary(val float64, unit string) schema.MetricSummary {
+	return schema.MetricSummary{
+		Count: 1,
+		Sum:   val,
+		Min:   val,
+		P50:   val,
+		P90:   val,
+		P95:   val,
+		P99:   val,
+		Max:   val,
+		Unit:  unit,
+	}
+}
+
+// SummarizeMetricSlice computes a nearest-rank MetricSummary rounded to 2 decimal places.
+func SummarizeMetricSlice(xs []float64, unit string) schema.MetricSummary {
+	if len(xs) == 0 {
+		return schema.MetricSummary{Unit: unit}
+	}
+	cp := append([]float64(nil), xs...)
+	sort.Float64s(cp)
+	var sum float64
+	for _, v := range cp {
+		sum += v
+	}
+	return schema.MetricSummary{
+		Count: len(cp),
+		Sum:   round2(sum),
+		Min:   round2(cp[0]),
+		P50:   round2(percentile(cp, 0.50)),
+		P90:   round2(percentile(cp, 0.90)),
+		P95:   round2(percentile(cp, 0.95)),
+		P99:   round2(percentile(cp, 0.99)),
+		Max:   round2(cp[len(cp)-1]),
+		Unit:  unit,
+	}
+}
+
+// ParsePromLineValue extracts the numeric value from a Prometheus text-format sample line.
+func ParsePromLineValue(line string) (float64, bool) {
+	rb := strings.LastIndexByte(line, '}')
+	tail := line
+	if rb >= 0 {
+		tail = line[rb+1:]
+	} else if sp := strings.IndexAny(line, " \t"); sp >= 0 {
+		tail = line[sp+1:]
+	}
+	v, err := lastNumber(tail)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// LoadOrSummarizeReport loads a pre-rendered report.json (normalizing legacy fields)
+// or summarizes a JSONL event stream from path.
+func LoadOrSummarizeReport(path string) (*Report, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '{' && !bytes.Contains(trimmed, []byte("\n{")) {
+		var rep Report
+		if err := json.Unmarshal(trimmed, &rep); err == nil && (len(rep.Stats) > 0 || rep.Tasks > 0 || len(rep.Jobs) > 0) {
+			NormalizeLegacyReport(&rep)
+			return &rep, nil
+		}
+	}
+	return Summarize(bytes.NewReader(raw))
+}
+
+// WriteReportFiles writes the requested Markdown, unresolved exclusion, flat stats.jsonl,
+// and JSON report files for rep.
+func WriteReportFiles(rep *Report, jsonOut, mdOut, unresolvedOut, unresolvedNote, statsOut, testName, tag string) error {
+	if mdOut != "" {
+		var mdBuf bytes.Buffer
+		rep.WriteMarkdown(&mdBuf)
+		if err := os.WriteFile(mdOut, mdBuf.Bytes(), 0o644); err != nil {
+			return err
+		}
+	}
+	if unresolvedOut != "" {
+		uf, err := os.Create(unresolvedOut)
+		if err != nil {
+			return err
+		}
+		rep.WriteExclusions(uf, unresolvedNote)
+		if err := uf.Close(); err != nil {
+			return err
+		}
+	}
+	if statsOut != "" {
+		if err := WriteStatsJSONL(statsOut, rep, rep.RunID, testName, tag); err != nil {
+			return err
+		}
+	}
+	if jsonOut != "" {
+		b, err := json.MarshalIndent(rep, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(jsonOut, append(b, '\n'), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // WriteComparison prints several runs side by side, one column per run: the
 // header figures, then every event in the order it first appears, then the
 // per-step figures when a run has steps. It is the table for the same
@@ -3656,7 +3788,7 @@ func ParseNodeCacheSample(r io.Reader) (*NodeCacheSample, error) {
 			}
 			outcome := ""
 			for _, kv := range strings.Split(rest[len(cacheRequestsSeries):rb], ",") {
-				if k, v, ok := strings.Cut(strings.TrimSpace(kv), "="); ok && k == "ate_imagecache_outcome" {
+				if k, v, ok := strings.Cut(strings.TrimSpace(kv), "="); ok && (k == "ate_imagecache_outcome" || k == "outcome") {
 					outcome = strings.Trim(v, `"`)
 				}
 			}
@@ -3863,40 +3995,11 @@ func ParseRestoreTimings(r io.Reader) (map[string][]RestoreTiming, error) {
 		}
 		if rec["msg"] != "Restore timing breakdown" {
 			// Also accept schema.RestoreSample JSONL records (total_ms + actor/pod).
-			if totMS, ok := rec["total_ms"].(float64); ok && totMS > 0 {
-				rt := RestoreTiming{Phases: map[string]float64{"total": totMS / 1000.0}}
-				for _, pair := range []struct {
-					jsonKey string
-					phase   string
-				}{
-					{"volume_mount_ms", "volume_mount"},
-					{"manifest_fetch_ms", "manifest_fetch"},
-					{"sandbox_assets_ms", "sandbox_assets"},
-					{"download_ms", "download"},
-					{"oci_unpack_ms", "oci_unpack"},
-					{"worker_restore_ms", "worker_restore"},
-					{"persist_ms", "persist"},
-					{"pod_schedule_ms", "pod_schedule"},
-					{"pod_init_ms", "pod_init"},
-					{"pod_container_start_ms", "pod_container_start"},
-				} {
-					if v, ok := rec[pair.jsonKey].(float64); ok {
-						rt.Phases[pair.phase] = v / 1000.0
-					}
+			var sample schema.RestoreSample
+			if err := json.Unmarshal(text, &sample); err == nil {
+				if rt, ok := RestoreTimingFromSample(sample, rec); ok {
+					out[rt.Actor] = append(out[rt.Actor], rt)
 				}
-				rt.Actor, _ = rec["actor"].(string)
-				if rt.Actor == "" {
-					rt.Actor, _ = rec["pod"].(string)
-				}
-				if rt.Actor == "" {
-					continue
-				}
-				if ts, ok := rec["ts"].(string); ok && ts != "" {
-					rt.Time, _ = time.Parse(time.RFC3339Nano, ts)
-				} else if ts, ok := rec["time"].(string); ok && ts != "" {
-					rt.Time, _ = time.Parse(time.RFC3339Nano, ts)
-				}
-				out[rt.Actor] = append(out[rt.Actor], rt)
 			}
 			continue
 		}
@@ -3932,6 +4035,76 @@ func ParseRestoreTimings(r io.Reader) (map[string][]RestoreTiming, error) {
 		sort.SliceStable(rs, func(i, j int) bool { return rs[i].Time.Before(rs[j].Time) })
 	}
 	return out, nil
+}
+
+// RestoreTimingFromSample converts a schema.RestoreSample (plus optional extra phase fields in rawRec)
+// into a RestoreTiming record with seconds per phase.
+func RestoreTimingFromSample(s schema.RestoreSample, rawRec map[string]any) (RestoreTiming, bool) {
+	if s.TotalMS <= 0 {
+		return RestoreTiming{}, false
+	}
+	actor := s.Env
+	if actor == "" && rawRec != nil {
+		actor, _ = rawRec["actor"].(string)
+		if actor == "" {
+			actor, _ = rawRec["pod"].(string)
+		}
+	}
+	if actor == "" {
+		return RestoreTiming{}, false
+	}
+	rt := RestoreTiming{
+		Actor:    actor,
+		Fidelity: s.Kind,
+		Phases: map[string]float64{
+			"total": s.TotalMS / 1000.0,
+		},
+	}
+	if s.ManifestFetchMS > 0 || hasKey(rawRec, "manifest_fetch_ms") {
+		rt.Phases["manifest_fetch"] = s.ManifestFetchMS / 1000.0
+	}
+	if s.DownloadMS > 0 || hasKey(rawRec, "download_ms") {
+		rt.Phases["download"] = s.DownloadMS / 1000.0
+	}
+	if s.OCIUnpackMS > 0 || hasKey(rawRec, "oci_unpack_ms") {
+		rt.Phases["oci_unpack"] = s.OCIUnpackMS / 1000.0
+	}
+	if s.WorkerRestoreMS > 0 || hasKey(rawRec, "worker_restore_ms") {
+		rt.Phases["worker_restore"] = s.WorkerRestoreMS / 1000.0
+	}
+	if s.PersistMS > 0 || hasKey(rawRec, "persist_ms") {
+		rt.Phases["persist"] = s.PersistMS / 1000.0
+	}
+	for _, pair := range []struct {
+		jsonKey string
+		phase   string
+	}{
+		{"volume_mount_ms", "volume_mount"},
+		{"sandbox_assets_ms", "sandbox_assets"},
+		{"pod_schedule_ms", "pod_schedule"},
+		{"pod_init_ms", "pod_init"},
+		{"pod_container_start_ms", "pod_container_start"},
+	} {
+		if v, ok := rawRec[pair.jsonKey].(float64); ok {
+			rt.Phases[pair.phase] = v / 1000.0
+		}
+	}
+	if s.TS != nil {
+		rt.Time = *s.TS
+	} else if ts, ok := rawRec["ts"].(string); ok && ts != "" {
+		rt.Time, _ = time.Parse(time.RFC3339Nano, ts)
+	} else if ts, ok := rawRec["time"].(string); ok && ts != "" {
+		rt.Time, _ = time.Parse(time.RFC3339Nano, ts)
+	}
+	return rt, true
+}
+
+func hasKey(m map[string]any, k string) bool {
+	if m == nil {
+		return false
+	}
+	_, ok := m[k]
+	return ok
 }
 
 // PhaseStat is one restore phase over the environments of a run.

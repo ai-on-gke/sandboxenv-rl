@@ -17,6 +17,7 @@ package job
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -60,8 +61,25 @@ func (r *RealJobDriver) runVeRLManifest(
 			"--from-file=run_fully_async.sh=" + filepath.Join(dir, "run_fully_async.sh"),
 			"--dry-run=client", "-o", "yaml",
 		}
-		if _, err := execRunner.Run(ctx, "kubectl", env, cmArgs...); err != nil {
+		cmYAML, err := execRunner.Run(ctx, "kubectl", env, cmArgs...)
+		if err != nil {
 			return nil, fmt.Errorf("prepare configmap %s: %w", VeRLConfigMapName, err)
+		}
+		cmFile, err := os.CreateTemp("", VeRLConfigMapName+"-*.yaml")
+		if err != nil {
+			return nil, fmt.Errorf("create temp configmap %s: %w", VeRLConfigMapName, err)
+		}
+		cmPath := cmFile.Name()
+		defer os.Remove(cmPath)
+		if _, err := cmFile.Write(cmYAML); err != nil {
+			_ = cmFile.Close()
+			return nil, fmt.Errorf("write temp configmap %s: %w", VeRLConfigMapName, err)
+		}
+		if err := cmFile.Close(); err != nil {
+			return nil, fmt.Errorf("close temp configmap %s: %w", VeRLConfigMapName, err)
+		}
+		if _, err := execRunner.Run(ctx, "kubectl", env, "-n", ns, "apply", "-f", cmPath); err != nil {
+			return nil, fmt.Errorf("apply configmap %s: %w", VeRLConfigMapName, err)
 		}
 		if _, err := execRunner.Run(ctx, "kubectl", env, "-n", ns, "apply", "-f", manifest); err != nil {
 			return nil, fmt.Errorf("kubectl apply %s: %w", manifest, err)

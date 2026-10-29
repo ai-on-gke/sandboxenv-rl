@@ -32,6 +32,12 @@ class EnvironmentStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     ENVIRONMENT_STATUS_PAUSED: _ClassVar[EnvironmentStatus]
     ENVIRONMENT_STATUS_CRASHED: _ClassVar[EnvironmentStatus]
     ENVIRONMENT_STATUS_DELETING: _ClassVar[EnvironmentStatus]
+
+class SuspendMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    SUSPEND_MODE_UNSPECIFIED: _ClassVar[SuspendMode]
+    SUSPEND_MODE_DURABLE: _ClassVar[SuspendMode]
+    SUSPEND_MODE_LOCAL: _ClassVar[SuspendMode]
 ENVIRONMENT_STATUS_UNSPECIFIED: EnvironmentStatus
 ENVIRONMENT_STATUS_RESUMING: EnvironmentStatus
 ENVIRONMENT_STATUS_RUNNING: EnvironmentStatus
@@ -41,6 +47,9 @@ ENVIRONMENT_STATUS_PAUSING: EnvironmentStatus
 ENVIRONMENT_STATUS_PAUSED: EnvironmentStatus
 ENVIRONMENT_STATUS_CRASHED: EnvironmentStatus
 ENVIRONMENT_STATUS_DELETING: EnvironmentStatus
+SUSPEND_MODE_UNSPECIFIED: SuspendMode
+SUSPEND_MODE_DURABLE: SuspendMode
+SUSPEND_MODE_LOCAL: SuspendMode
 
 class Template(_message.Message):
     __slots__ = ("name", "atespace")
@@ -95,12 +104,14 @@ class GetEnvironmentResponse(_message.Message):
     def __init__(self, environment: _Optional[_Union[Environment, _Mapping]] = ...) -> None: ...
 
 class SuspendEnvironmentRequest(_message.Message):
-    __slots__ = ("id", "atespace")
+    __slots__ = ("id", "atespace", "mode")
     ID_FIELD_NUMBER: _ClassVar[int]
     ATESPACE_FIELD_NUMBER: _ClassVar[int]
+    MODE_FIELD_NUMBER: _ClassVar[int]
     id: str
     atespace: str
-    def __init__(self, id: _Optional[str] = ..., atespace: _Optional[str] = ...) -> None: ...
+    mode: SuspendMode
+    def __init__(self, id: _Optional[str] = ..., atespace: _Optional[str] = ..., mode: _Optional[_Union[SuspendMode, str]] = ...) -> None: ...
 
 class SuspendEnvironmentResponse(_message.Message):
     __slots__ = ()

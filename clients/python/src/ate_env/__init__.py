@@ -82,6 +82,7 @@ from .types import (
     ServerInfo,
     ShellResult,
     Signal,
+    SuspendMode,
     Task,
     Template,
 )
@@ -126,6 +127,7 @@ __all__ = [
     # Types
     "EnvironmentInfo",
     "EnvironmentStatus",
+    "SuspendMode",
     "ProcessInfo",
     "ProcessOutput",
     "ProcessState",

@@ -269,7 +269,16 @@ func (s *Server) SuspendEnvironment(ctx context.Context, req *ateenvv1alpha.Susp
 		atespace = DefaultAtespace
 	}
 
-	if err := s.client.Suspend(ctx, atespace, req.GetId()); err != nil {
+	var err error
+	switch req.GetMode() {
+	case ateenvv1alpha.SuspendMode_SUSPEND_MODE_UNSPECIFIED, ateenvv1alpha.SuspendMode_SUSPEND_MODE_DURABLE:
+		err = s.client.Suspend(ctx, atespace, req.GetId())
+	case ateenvv1alpha.SuspendMode_SUSPEND_MODE_LOCAL:
+		err = s.client.SuspendLocal(ctx, atespace, req.GetId())
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "mode %d is not a SuspendMode", req.GetMode())
+	}
+	if err != nil {
 		return nil, toGRPCError(err)
 	}
 
@@ -606,10 +615,16 @@ func ActorStatusToEnvStatus(st *ateapipb.ActorStatus) ateenvv1alpha.EnvironmentS
 	case ateapipb.ActorState_ACTOR_STATE_SUSPENDING:
 		return ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDING
 	case ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
-		// Since substrate#2620 a paused actor is SUSPENDED too, with a
-		// node-local latest snapshot; Substrate has no PAUSED or PAUSING
-		// state. ate-env never pauses, so ENVIRONMENT_STATUS_PAUSED and
-		// _PAUSING are no longer produced.
+		// Since substrate#2620 a paused actor is SUSPENDED too; Substrate has
+		// no PAUSED or PAUSING state. The latest snapshot tells the two
+		// apart: a local suspend (SUSPEND_MODE_LOCAL) leaves it on a node
+		// with its upload pending, and the actor resumes on that node only.
+		// Once the upload lands the environment is SUSPENDED like any other.
+		// ENVIRONMENT_STATUS_PAUSING is never produced: Substrate reports
+		// SUSPENDING for both modes.
+		if localOnly(latestSnapshot(st)) {
+			return ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_PAUSED
+		}
 		return ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDED
 	case ateapipb.ActorState_ACTOR_STATE_CRASHED:
 		return ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_CRASHED
@@ -618,6 +633,25 @@ func ActorStatusToEnvStatus(st *ateapipb.ActorStatus) ateenvv1alpha.EnvironmentS
 	default:
 		return ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_UNSPECIFIED
 	}
+}
+
+// latestSnapshot returns the actor's snapshot with the highest generation, or
+// nil when it has none.
+func latestSnapshot(st *ateapipb.ActorStatus) *ateapipb.Snapshot {
+	var latest *ateapipb.Snapshot
+	for _, snap := range st.GetSnapshots() {
+		if latest == nil || snap.GetGeneration() > latest.GetGeneration() {
+			latest = snap
+		}
+	}
+	return latest
+}
+
+// localOnly reports whether snap exists on a node and not yet in object
+// storage: what a local suspend leaves until its background upload lands.
+func localOnly(snap *ateapipb.Snapshot) bool {
+	return snap.GetLocality() != "" &&
+		snap.GetDurableSnapshot().GetState() != ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED
 }
 
 func toGRPCError(err error) error {

@@ -299,6 +299,56 @@ func TestSuspendEnvironment(t *testing.T) {
 	if getResp.GetEnvironment().GetStatus() != ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDED {
 		t.Errorf("got status %v, want SUSPENDED", getResp.GetEnvironment().GetStatus())
 	}
+	// No mode on the request is a durable suspend, what ate-env always did.
+	if got := control.SuspendModes; len(got) != 1 || got[0] != ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS {
+		t.Errorf("suspend modes = %v, want one SYNCHRONOUS", got)
+	}
+}
+
+func TestSuspendEnvironmentLocal(t *testing.T) {
+	client, control := newTestEnv(t)
+	ctx := context.Background()
+
+	if _, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "env-local"}); err != nil {
+		t.Fatalf("CreateEnvironment failed: %v", err)
+	}
+	envStatus := func() ateenvv1alpha.EnvironmentStatus {
+		t.Helper()
+		resp, err := client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "env-local"})
+		if err != nil {
+			t.Fatalf("GetEnvironment failed: %v", err)
+		}
+		return resp.GetEnvironment().GetStatus()
+	}
+
+	_, err := client.SuspendEnvironment(ctx, &ateenvv1alpha.SuspendEnvironmentRequest{
+		Id:   "env-local",
+		Mode: ateenvv1alpha.SuspendMode_SUSPEND_MODE_LOCAL,
+	})
+	if err != nil {
+		t.Fatalf("SuspendEnvironment(local) failed: %v", err)
+	}
+	if got := control.SuspendModes; len(got) != 1 || got[0] != ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS {
+		t.Fatalf("suspend modes = %v, want one ASYNCHRONOUS", got)
+	}
+	// PAUSED while the snapshot is on the node only, SUSPENDED once the
+	// background upload lands.
+	if got := envStatus(); got != ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_PAUSED {
+		t.Errorf("status after a local suspend = %v, want PAUSED", got)
+	}
+	control.CompleteUpload("env-local")
+	if got := envStatus(); got != ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDED {
+		t.Errorf("status after the upload landed = %v, want SUSPENDED", got)
+	}
+
+	// A mode the server does not know is refused, not treated as durable.
+	_, err = client.SuspendEnvironment(ctx, &ateenvv1alpha.SuspendEnvironmentRequest{
+		Id:   "env-local",
+		Mode: ateenvv1alpha.SuspendMode(7),
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("unknown mode: got %v, want InvalidArgument", err)
+	}
 }
 
 func TestDeleteEnvironment(t *testing.T) {

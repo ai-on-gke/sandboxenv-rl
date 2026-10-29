@@ -199,13 +199,32 @@ func (c *Client) Get(ctx context.Context, atespace, id string) (_ *ateenvv1alpha
 	return resp.GetEnvironment(), nil
 }
 
-// Suspend checkpoints and stops the environment using the gRPC EnvironmentService.
-func (c *Client) Suspend(ctx context.Context, atespace, id string) (err error) {
+// Suspend checkpoints and stops the environment using the gRPC
+// EnvironmentService. It returns once the snapshot is in object storage, so
+// the environment survives the loss of its node. The request carries no mode,
+// so it works against an ate-env-api that predates SuspendEnvironment's mode.
+func (c *Client) Suspend(ctx context.Context, atespace, id string) error {
+	return c.suspend(ctx, atespace, id, ateenvv1alpha.SuspendMode_SUSPEND_MODE_UNSPECIFIED)
+}
+
+// SuspendLocal checkpoints and stops the environment and returns once the
+// snapshot is on the worker's node; the upload to object storage goes on in
+// the background. Until it lands the environment resumes on that node only,
+// reports PAUSED, and a node lost before then takes the snapshot with it. One
+// park-and-resume cycle is cheaper than with Suspend. An ate-env-api that
+// predates the mode refuses the call with InvalidArgument; check
+// ServerInfo's features for "suspend_mode" first.
+func (c *Client) SuspendLocal(ctx context.Context, atespace, id string) error {
+	return c.suspend(ctx, atespace, id, ateenvv1alpha.SuspendMode_SUSPEND_MODE_LOCAL)
+}
+
+func (c *Client) suspend(ctx context.Context, atespace, id string, mode ateenvv1alpha.SuspendMode) (err error) {
 	ctx, span := c.tracer.startRPC(ctx, opSuspendEnvironment, "SuspendEnvironment", AttrActorName.String(id), AttrAtespace.String(atespace))
 	defer func() { endSpan(span, err) }()
 	req := &ateenvv1alpha.SuspendEnvironmentRequest{
 		Id:       id,
 		Atespace: atespace,
+		Mode:     mode,
 	}
 	_, err = c.grpc.SuspendEnvironment(c.withAuth(ctx), req)
 	if err != nil {

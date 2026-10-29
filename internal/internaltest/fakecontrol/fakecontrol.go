@@ -51,6 +51,20 @@ type Server struct {
 	// Substrate does for an identity allowed to use but not create atespaces.
 	DenyCreateAtespace bool
 	templates          map[string]*ateapipb.ActorTemplate
+	templateSeq        int
+	// RequireTemplate makes CreateActor fail with FailedPrecondition when
+	// the actor's template does not exist, as Substrate does.
+	RequireTemplate bool
+	// DeleteTemplateErr, when set, is the error of each DeleteActorTemplate.
+	DeleteTemplateErr error
+	// templateLeases are the templates whose lease a test holds, as the
+	// template reconciler or a running delete does.
+	templateLeases map[string]bool
+	// templateDeletes and templateCreates count the DeleteActorTemplate
+	// and CreateActorTemplate calls.
+	templateDeletes, templateCreates int
+	// listCalls counts the ListActors calls.
+	listCalls int
 	// SuspendModes records the durability mode of each SuspendActor call.
 	SuspendModes []ateapipb.DurabilityMode
 }
@@ -100,9 +114,52 @@ func (s *Server) GetActorTemplate(ctx context.Context, req *ateapipb.GetActorTem
 	return proto.Clone(t).(*ateapipb.ActorTemplate), nil
 }
 
+// HoldTemplateLease holds the lease of a template until release is called:
+// meanwhile DeleteActorTemplate on it fails with Aborted, as in Substrate
+// while the template reconciler or another delete holds it.
+func (s *Server) HoldTemplateLease(atespace, name string) (release func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.templateLeases == nil {
+		s.templateLeases = make(map[string]bool)
+	}
+	s.templateLeases[key(atespace, name)] = true
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		delete(s.templateLeases, key(atespace, name))
+	}
+}
+
+// ListCalls returns how many ListActors calls the fake got.
+func (s *Server) ListCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listCalls
+}
+
+// MutateActor applies f to the stored actor with the given name, for tests
+// that need a status the fake's lifecycle does not produce.
+func (s *Server) MutateActor(name string, f func(*ateapipb.Actor)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if a := s.find(name); a != nil {
+		f(a)
+	}
+}
+
+// TemplateCalls returns how many DeleteActorTemplate and CreateActorTemplate
+// calls the fake got.
+func (s *Server) TemplateCalls() (deletes, creates int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.templateDeletes, s.templateCreates
+}
+
 func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.templateCreates++
 	t := req.GetActorTemplate()
 	md := t.GetMetadata()
 	if md.GetName() == "" {
@@ -125,10 +182,39 @@ func (s *Server) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateAc
 		}
 	}
 	stored := proto.Clone(t).(*ateapipb.ActorTemplate)
-	stored.Metadata.Uid = "tmpl-" + md.GetName()
+	s.templateSeq++
+	stored.Metadata.Uid = fmt.Sprintf("tmpl-%s-%d", md.GetName(), s.templateSeq)
 	stored.Metadata.Version = 1
 	s.templates[k] = stored
 	return proto.Clone(stored).(*ateapipb.ActorTemplate), nil
+}
+
+// DeleteActorTemplate deletes a template, with Substrate's uid and version
+// preconditions: a mismatch is Aborted.
+func (s *Server) DeleteActorTemplate(ctx context.Context, req *ateapipb.DeleteActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.templateDeletes++
+	if s.DeleteTemplateErr != nil {
+		return nil, s.DeleteTemplateErr
+	}
+	ref := req.GetActorTemplate()
+	k := key(ref.GetAtespace(), ref.GetName())
+	if s.templateLeases[k] {
+		return nil, status.Errorf(codes.Aborted, "another operation is in progress for this ActorTemplate %s", ref.GetName())
+	}
+	t, ok := s.templates[k]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "ActorTemplate %s not found", ref.GetName())
+	}
+	if uid := req.GetOptions().GetUid(); uid != "" && uid != t.GetMetadata().GetUid() {
+		return nil, status.Errorf(codes.Aborted, "ActorTemplate %s does not have uid %s", ref.GetName(), uid)
+	}
+	if v := req.GetOptions().GetVersion(); v != 0 && v != t.GetMetadata().GetVersion() {
+		return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
+	}
+	delete(s.templates, k)
+	return proto.Clone(t).(*ateapipb.ActorTemplate), nil
 }
 
 // Serve starts the fake on a random localhost port and returns its
@@ -243,6 +329,9 @@ func (s *Server) CreateActor(ctx context.Context, req *ateapipb.CreateActorReque
 	if _, ok := s.actors[k]; ok {
 		return nil, status.Errorf(codes.AlreadyExists, "actor %q already exists", name)
 	}
+	if ref := actor.GetActorTemplate(); s.RequireTemplate && s.templates[key(ref.GetAtespace(), ref.GetName())] == nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "actor template not found; ObjectRef: %s/%s", ref.GetAtespace(), ref.GetName())
+	}
 	a := clone(actor)
 	a.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING}
 	s.actors[k] = a
@@ -323,6 +412,7 @@ func (s *Server) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorReque
 func (s *Server) ListActors(ctx context.Context, req *ateapipb.ListActorsRequest) (*ateapipb.ListActorsResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.listCalls++
 	resp := &ateapipb.ListActorsResponse{}
 	for _, a := range s.actors {
 		if req.GetAtespace() != "" && a.GetMetadata().GetAtespace() != req.GetAtespace() {

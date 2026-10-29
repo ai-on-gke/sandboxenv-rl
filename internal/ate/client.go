@@ -449,6 +449,21 @@ func (c *Client) CreateActorTemplate(ctx context.Context, tmpl *ateapipb.ActorTe
 	return created, nil
 }
 
+// DeleteActorTemplate deletes the ActorTemplate name in atespace, but only
+// while it still has uid: a template that a concurrent caller created
+// under the same name since is kept, and Substrate answers Aborted. A
+// missing template is ErrNotFound.
+func (c *Client) DeleteActorTemplate(ctx context.Context, atespace, name, uid string) error {
+	req := &ateapipb.DeleteActorTemplateRequest{
+		ActorTemplate: c.ref(atespace, name),
+		Options:       &ateapipb.DeleteOptions{Uid: uid},
+	}
+	if _, err := c.control.DeleteActorTemplate(ctx, req); err != nil {
+		return fmt.Errorf("ate: deleting template %q: %w", name, wrapGRPCError(err))
+	}
+	return nil
+}
+
 func (c *Client) ref(atespace, id string) *ateapipb.ObjectRef {
 	if atespace == "" {
 		atespace = DefaultAtespace

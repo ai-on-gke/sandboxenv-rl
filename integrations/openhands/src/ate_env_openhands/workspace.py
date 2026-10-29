@@ -197,6 +197,8 @@ class AteEnvWorkspace(RemoteWorkspace):
     )
     api_token: str | None = Field(
         default=None,
+        repr=False,
+        exclude=True,
         description="Bearer token for ate-env-api (its -auth-token-file). Sent on gRPC "
         "calls, and on port-proxy requests in X-Env-Authorization, which ate-env-api "
         "checks and removes before it forwards a request. The conversation event "

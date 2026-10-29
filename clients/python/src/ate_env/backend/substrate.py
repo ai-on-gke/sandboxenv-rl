@@ -25,7 +25,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from ..client import DEFAULT_ATESPACE, Client
-from ..config import TracerConfig
+from ..config import WARM_POOL_RUN_ID, TracerConfig
 from ..errors import (
     FailedPreconditionError,
     InfrastructureError,
@@ -475,7 +475,7 @@ class SubstrateBackendDriver(BackendDriver):
             return
 
         sem = asyncio.Semaphore(16)
-        effective_run_id = run_id or "warm-pool"
+        effective_run_id = run_id or WARM_POOL_RUN_ID
 
         async def _warm_one() -> str | None:
             actor_id = f"warm-{uuid.uuid4().hex[:10]}"
@@ -712,7 +712,7 @@ class SubstrateBackendDriver(BackendDriver):
 
             to_reap = [
                 aid for aid, inst in self._owned_actors.items()
-                if inst.run_id == run_id or aid in warm_actors or inst.run_id == "warm-pool"
+                if inst.run_id == run_id or aid in warm_actors or inst.run_id == WARM_POOL_RUN_ID
             ]
             to_reap = list(dict.fromkeys(to_reap + warm_actors))
 

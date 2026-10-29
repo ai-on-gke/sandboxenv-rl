@@ -17,16 +17,21 @@ package swebench
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/agent-substrate/env/internal/benchmarking/schema"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Event names. Every timed operation of a run is one of these.
@@ -122,6 +127,14 @@ type Event struct {
 const recorderBufferSize = 64 * 1024
 
 // Recorder writes events as buffered JSON lines. It is safe for concurrent use.
+//
+// With a tracer (WithTracer), every event is also one span. An
+// event is written when its operation finishes, with the finish time and the
+// duration, so the span is recorded after the fact: it starts at Time minus
+// DurMS and ends at Time. The span is named after Event.Event (a fixed
+// vocabulary, never an id), carries run, env, instance, step and task as
+// attributes, and has status Ok when the event is ok and Error otherwise.
+// The JSONL is the same with or without a tracer.
 type Recorder struct {
 	mu     sync.Mutex
 	bw     *bufio.Writer
@@ -132,15 +145,47 @@ type Recorder struct {
 	worker string
 	n      int
 	err    error
+
+	tracer trace.Tracer // nil: no spans
+	parent context.Context
 }
 
-// NewRecorder writes to w through a 64 KiB buffer; a nil w discards events.
-func NewRecorder(w io.Writer) *Recorder {
-	if w == nil {
-		return &Recorder{enc: json.NewEncoder(io.Discard)}
+// RecorderOption configures a Recorder.
+type RecorderOption func(*Recorder)
+
+// WithTracer makes the Recorder record one span per event on tracer. The
+// default is no tracer, which records none.
+func WithTracer(tracer trace.Tracer) RecorderOption {
+	return func(r *Recorder) {
+		r.tracer = tracer
 	}
-	bw := bufio.NewWriterSize(w, recorderBufferSize)
-	return &Recorder{bw: bw, enc: json.NewEncoder(bw)}
+}
+
+// WithParent makes the event spans children of the span in ctx, so a whole
+// run lands in one trace. The default is a span-less context: every event
+// span is a root.
+func WithParent(ctx context.Context) RecorderOption {
+	return func(r *Recorder) {
+		if ctx != nil {
+			r.parent = ctx
+		}
+	}
+}
+
+// NewRecorder writes to w through a 64 KiB buffer; a nil w discards events
+// (spans are still recorded with WithTracer).
+func NewRecorder(w io.Writer, opts ...RecorderOption) *Recorder {
+	r := &Recorder{parent: context.Background()}
+	if w == nil {
+		r.enc = json.NewEncoder(io.Discard)
+	} else {
+		r.bw = bufio.NewWriterSize(w, recorderBufferSize)
+		r.enc = json.NewEncoder(r.bw)
+	}
+	for _, o := range opts {
+		o(r)
+	}
+	return r
 }
 
 // NewFileRecorder creates path (and parent directories if needed) and returns a
@@ -206,6 +251,21 @@ func (r *Recorder) SetWorker(worker string) {
 	r.mu.Unlock()
 }
 
+// SetTracer makes the Recorder record one span per event on tracer, as children
+// of the span in parent (nil: every event span is a root), like WithTracer and
+// WithParent for a Recorder built by NewFileRecorder or NewShardRecorder.
+func (r *Recorder) SetTracer(tracer trace.Tracer, parent context.Context) {
+	if r == nil {
+		return
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	r.mu.Lock()
+	r.tracer, r.parent = tracer, parent
+	r.mu.Unlock()
+}
+
 // SetJob configures a default Job identifier stamped onto recorded events.
 func (r *Recorder) SetJob(job string) {
 	if r == nil {
@@ -223,7 +283,6 @@ func (r *Recorder) Record(e Event) {
 		e.Time = time.Now().UTC()
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if e.RunID == "" && r.runID != "" {
 		e.RunID = r.runID
 	}
@@ -242,6 +301,54 @@ func (r *Recorder) Record(e Event) {
 		}
 	}
 	r.n++
+	tracer, parent := r.tracer, r.parent
+	r.mu.Unlock()
+	if tracer != nil {
+		spanFor(tracer, parent, e)
+	}
+}
+
+// spanFor records e on tracer as a child of the span in parent, as a span that
+// ran for DurMS up to e.Time.
+func spanFor(tracer trace.Tracer, parent context.Context, e Event) {
+	end := e.Time
+	start := end.Add(-time.Duration(e.DurMS * float64(time.Millisecond)))
+	attrs := []attribute.KeyValue{attribute.String("run", e.RunID)}
+	set := func(k, v string) {
+		if v != "" {
+			attrs = append(attrs, attribute.String(k, v))
+		}
+	}
+	set("job", e.Job)
+	set("worker", e.Worker)
+	set("env", e.Env)
+	set("instance", e.Instance)
+	set("step", strconv.Itoa(e.Step))
+	set("task", strconv.Itoa(e.Task))
+	set("name", e.Name)
+	if e.Attempts > 0 {
+		set("attempts", strconv.Itoa(e.Attempts))
+	}
+	if e.Count > 0 {
+		set("count", strconv.Itoa(e.Count))
+	}
+	if e.Exit != nil {
+		set("exit", strconv.Itoa(*e.Exit))
+	}
+	if e.Reward != nil {
+		set("reward", strconv.Itoa(*e.Reward))
+	}
+	_, span := tracer.Start(parent, e.Event, trace.WithTimestamp(start), trace.WithAttributes(attrs...))
+	if e.OK {
+		span.SetStatus(codes.Ok, "")
+	} else {
+		msg := e.Err
+		if msg == "" {
+			msg = "not ok"
+		}
+		span.SetStatus(codes.Error, msg)
+	}
+	span.End(trace.WithTimestamp(end))
 }
 
 // Emit is an alias for Record.

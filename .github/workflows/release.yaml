@@ -121,14 +121,16 @@ jobs:
           # --provenance=false: a plain image index, like the ko images; the cosign
           # signature below records where the image comes from. push-by-digest:
           # the index is pushed without a tag; "Tag the OpenHands layer" adds it.
+          # The metadata file goes to RUNNER_TEMP: an untracked file in the
+          # checkout makes Go stamp the ko images with vcs.modified=true.
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
             --build-arg "AGENT_SERVER_VERSION=${version}" \
             --provenance=false \
             --output "type=image,name=${IMAGE_PREFIX}/oh-agent-server-layer,push-by-digest=true,name-canonical=true,push=true" \
-            --metadata-file layer-metadata.json \
+            --metadata-file "${RUNNER_TEMP}/layer-metadata.json" \
             integrations/openhands/layer
-          digest=$(jq -r '."containerimage.digest"' layer-metadata.json)
+          digest=$(jq -r '."containerimage.digest"' "${RUNNER_TEMP}/layer-metadata.json")
           if [[ "${digest}" != sha256:* ]]; then
             echo "no image digest in the buildx metadata: ${digest}" >&2
             exit 1

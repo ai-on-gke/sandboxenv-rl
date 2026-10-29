@@ -1,0 +1,52 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uni-agent-substrate"
+version = "0.1.0"
+description = "uni-agent sandbox provider and SWE tasks backed by Agent Substrate environments (via ate-env-api)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+dependencies = [
+  "ate-env-client",   # clients/python of this repository (pip install ./clients/python)
+  "pydantic>=2",
+  # uni-agent itself is not on PyPI: install git+https://github.com/verl-project/uni-agent@174b040
+  # with --no-deps first (see README); it is deliberately not declared here.
+]
+
+[project.optional-dependencies]
+datasets = ["datasets", "pyarrow", "huggingface_hub"]
+test = ["pytest>=8", "pytest-asyncio>=0.23", "grpcio>=1.84", "protobuf>=7.35"]
+
+[project.scripts]
+uni-agent-substrate-datasets = "uni_agent_substrate.datasets:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]  # same set as clients/python
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

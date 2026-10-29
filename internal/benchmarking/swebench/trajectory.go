@@ -23,6 +23,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"text/template"
@@ -120,6 +121,9 @@ type Trajectory struct {
 	// cannot be applied twice).
 	Reset []Step `json:"reset,omitempty"`
 	Steps []Step `json:"steps"`
+	// Vars are the operator's -set KEY=VALUE values, read by the var
+	// template function; not part of the YAML.
+	Vars map[string]string `json:"-"`
 }
 
 // Names lists the built-in trajectories.
@@ -171,7 +175,7 @@ func parseWithAssets(data []byte, read func(name string) ([]byte, error)) (*Traj
 			if w == nil || w.File == "" {
 				continue
 			}
-			if strings.Contains(w.File, "/") || strings.Contains(w.File, "..") {
+			if !plainFileName(w.File) {
 				return nil, fmt.Errorf("trajectory %s step %s: write.file must be a plain file name", t.Name, steps[i].Name)
 			}
 			b, err := read(w.File)
@@ -184,6 +188,42 @@ func parseWithAssets(data []byte, read func(name string) ([]byte, error)) (*Traj
 		}
 	}
 	return t, nil
+}
+
+// plainFileName reports whether name is a bare file name: no directory, no
+// "..", which is all a write.file may name.
+func plainFileName(name string) bool {
+	return name != "" && !strings.Contains(name, "/") && !strings.Contains(name, "..")
+}
+
+// TrajectoryAssets returns the files the write steps of the trajectory at
+// path name, each once, sorted: what must travel next to the file when it is
+// copied somewhere else (run-in-cluster.sh bakes them into the loader image).
+// The names are checked the way LoadTrajectory checks them.
+func TrajectoryAssets(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	t, err := ParseTrajectory(data)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, steps := range [][]Step{t.Setup, t.Reset, t.Steps} {
+		for i := range steps {
+			w := steps[i].Write
+			if w == nil || w.File == "" {
+				continue
+			}
+			if !plainFileName(w.File) {
+				return nil, fmt.Errorf("trajectory %s step %s: write.file must be a plain file name", t.Name, steps[i].Name)
+			}
+			names = append(names, w.File)
+		}
+	}
+	slices.Sort(names)
+	return slices.Compact(names), nil
 }
 
 // ParseTrajectory decodes and validates a YAML trajectory.
@@ -292,32 +332,48 @@ func (t *Trajectory) HasReward() bool {
 // Render evaluates every template in the trajectory against in and returns
 // the concrete copy to replay. The original is not modified.
 func (t *Trajectory) Render(in Instance) (*Trajectory, error) {
-	out := &Trajectory{Name: t.Name}
+	return t.render(in, nil)
+}
+
+// VarsUsed renders t for in and returns the value each var call read, the
+// -set value or the default: the loader records them as the run's set.KEY
+// labels and refuses a -set key that no trajectory reads.
+func (t *Trajectory) VarsUsed(in Instance) (map[string]string, error) {
+	used := map[string]string{}
+	if _, err := t.render(in, used); err != nil {
+		return nil, err
+	}
+	return used, nil
+}
+
+func (t *Trajectory) render(in Instance, used map[string]string) (*Trajectory, error) {
+	out := &Trajectory{Name: t.Name, Vars: t.Vars}
+	funcs := templateFuncs(t.Vars, used)
 	var err error
-	if out.Setup, err = renderSteps(t.Name, t.Setup, in); err != nil {
+	if out.Setup, err = renderSteps(t.Name, t.Setup, in, funcs); err != nil {
 		return nil, err
 	}
-	if out.Reset, err = renderSteps(t.Name, t.Reset, in); err != nil {
+	if out.Reset, err = renderSteps(t.Name, t.Reset, in, funcs); err != nil {
 		return nil, err
 	}
-	if out.Steps, err = renderSteps(t.Name, t.Steps, in); err != nil {
+	if out.Steps, err = renderSteps(t.Name, t.Steps, in, funcs); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func renderSteps(tname string, steps []Step, in Instance) ([]Step, error) {
+func renderSteps(tname string, steps []Step, in Instance, funcs template.FuncMap) ([]Step, error) {
 	out := make([]Step, len(steps))
 	for i, s := range steps {
 		r := s
 		var err error
-		if r.Run, err = renderText(s.Run, in); err != nil {
+		if r.Run, err = renderText(s.Run, in, funcs); err != nil {
 			return nil, fmt.Errorf("trajectory %s step %s run: %w", tname, s.Name, err)
 		}
 		if s.Write != nil {
 			w := *s.Write
 			if !w.raw {
-				if w.Content, err = renderText(s.Write.Content, in); err != nil {
+				if w.Content, err = renderText(s.Write.Content, in, funcs); err != nil {
 					return nil, fmt.Errorf("trajectory %s step %s write: %w", tname, s.Name, err)
 				}
 			}
@@ -328,20 +384,50 @@ func renderSteps(tname string, steps []Step, in Instance) ([]Step, error) {
 	return out, nil
 }
 
-// templateFuncs are available in step templates. json renders a value as
-// JSON, for handing an instance's fields to a script in the sandbox.
-var templateFuncs = template.FuncMap{
-	"json": func(v any) (string, error) {
-		b, err := json.Marshal(v)
-		return string(b), err
-	},
+// templateFuncs returns the functions available in step templates. json
+// renders a value as JSON, for handing an instance's fields to a script in
+// the sandbox. var reads an operator value (-set KEY=VALUE): the value when
+// set, else the default given as the second argument, else an error, so a
+// workload names its knobs and their defaults in one place. The value comes
+// back as one single-quoted shell word, so a step writes {{var "X"}} bare and
+// a value with quotes or spaces cannot change the command. used, when not
+// nil, collects the value each name resolved to.
+func templateFuncs(vars map[string]string, used map[string]string) template.FuncMap {
+	return template.FuncMap{
+		"json": func(v any) (string, error) {
+			b, err := json.Marshal(v)
+			return string(b), err
+		},
+		"var": func(name string, def ...string) (string, error) {
+			if len(def) > 1 {
+				return "", fmt.Errorf("var %s: one default at most, got %d", name, len(def))
+			}
+			v, ok := vars[name]
+			if !ok && len(def) > 0 {
+				v, ok = def[0], true
+			}
+			if !ok {
+				return "", fmt.Errorf("variable %s is not set and has no default; pass -set %s=VALUE", name, name)
+			}
+			if used != nil {
+				used[name] = v
+			}
+			return shellQuote(v), nil
+		},
+	}
 }
 
-func renderText(text string, in Instance) (string, error) {
+// shellQuote makes s one shell word: single-quoted, with every quote inside
+// closed, escaped and reopened.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func renderText(text string, in Instance, funcs template.FuncMap) (string, error) {
 	if !strings.Contains(text, "{{") {
 		return text, nil
 	}
-	tmpl, err := template.New("step").Option("missingkey=error").Funcs(templateFuncs).Parse(text)
+	tmpl, err := template.New("step").Option("missingkey=error").Funcs(funcs).Parse(text)
 	if err != nil {
 		return "", err
 	}

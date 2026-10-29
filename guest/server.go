@@ -19,9 +19,11 @@ package guest
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/agent-substrate/env/guest/filesystem"
 	"github.com/agent-substrate/env/guest/process"
+	"github.com/agent-substrate/env/internal/unknownfields"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
@@ -44,6 +46,12 @@ type Config struct {
 	EnableProcess bool
 	// EnableFileSystem indicates whether the FileSystemService gRPC service is enabled.
 	EnableFileSystem bool
+	// ServerOptions are added to the gRPC server, e.g. the OpenTelemetry
+	// stats handler when the guest runs with --enable-tracing.
+	ServerOptions []grpc.ServerOption
+	// OnProcessExit, if set, is called once per process after it exits with
+	// its run time and exit class (process.ExitClassZero and siblings).
+	OnProcessExit func(d time.Duration, exitClass string)
 }
 
 // DefaultConfig returns the default configuration with all services enabled.
@@ -74,7 +82,15 @@ func FormatEnabledServices(cfg Config) string {
 func NewServer(cfg Config) (*grpc.Server, func(), error) {
 	var cleanups []func()
 
-	grpcServer := grpc.NewServer()
+	// Reject requests with fields this guest does not know, as ate-env-api
+	// does: a guest baked into a golden snapshot can be older than the API
+	// that calls it, and an ignored field would change the result silently.
+	// cfg.ServerOptions (tracing) come after these interceptors.
+	opts := append([]grpc.ServerOption{
+		grpc.ChainUnaryInterceptor(unknownfields.UnaryServerInterceptor()),
+		grpc.ChainStreamInterceptor(unknownfields.StreamServerInterceptor()),
+	}, cfg.ServerOptions...)
+	grpcServer := grpc.NewServer(opts...)
 	reflection.Register(grpcServer)
 
 	if cfg.EnableProcess {
@@ -82,6 +98,7 @@ func NewServer(cfg Config) (*grpc.Server, func(), error) {
 		if cfg.Workspace != "" {
 			trackerCfg.Workspace = cfg.Workspace
 		}
+		trackerCfg.OnExit = cfg.OnProcessExit
 		tracker, err := process.NewTracker(trackerCfg)
 		if err != nil {
 			return nil, nil, fmt.Errorf("initializing process tracker: %w", err)

@@ -126,7 +126,7 @@ caller.
 |---|---|---|---|
 | `template` | required to create | base template with the agent-server layer | `warmpool` |
 | `image` | the template's image | task image, `repo@sha256:…` | none (fixed in the SandboxTemplate) |
-| `atespace` | `ate-env` | atespace of the environment | `namespace` |
+| `atespace` | `ate-env` | atespace of the environment; the port proxy must list it in `--port-proxy-atespaces` | `namespace` |
 | `template_atespace` | the server default | atespace of `template` | none |
 | `api_url` | `127.0.0.1:7777` | ate-env-api, host:port or URL | `host` in `direct` mode |
 | `proxy_url` | `api_url` | port proxy base URL, when it differs | none |
@@ -357,7 +357,9 @@ to this package. They do not test those changes.
   environment. Each viewer of the atespace can read it with `GetActorTemplate`, and each template
   derived per task image copies it. Substrate's `EnvVar` has a name and a value only: logs redact
   the value, reads do not, and a template cannot refer to a secret. Use a dedicated atespace for
-  these environments. Refer to the OpenHands agent-server in the
+  these environments, and add it to `ate-env manifest --port-proxy-atespaces` (for example
+  `--port-proxy-atespaces=ate-env,oh-envs`): the port proxy forwards only to the atespaces listed
+  there, default `ate-env`, and answers 403 for the others. Refer to the OpenHands agent-server in the
   [threat model](../../docs/security/threat-model.md#the-openhands-agent-server).
 - The agent-server runs as the image's user and keeps its state under that user's home. The first
   environment on a node pulls the layer.

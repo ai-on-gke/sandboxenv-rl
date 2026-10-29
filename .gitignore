@@ -1,5 +1,9 @@
 bin/
 dist/
+coverage/
+.coverage
+.coverage.*
+!.coveragerc
 result
 result*
 node_modules/

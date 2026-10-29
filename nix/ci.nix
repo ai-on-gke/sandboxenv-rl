@@ -54,6 +54,15 @@ let
     uniAgentEnv
     ;
 
+  diffCover = pkgs.runCommand "diff-cover" { } ''
+    mkdir -p $out/bin
+    ln -s ${
+      pythonEnvs.python.pkgs.diff-cover.overridePythonAttrs (_: {
+        doCheck = false;
+      })
+    }/bin/diff-cover $out/bin/diff-cover
+  '';
+
   ciPackages = with pkgs; [
     # Go toolchain selected from go.mod's `go` directive (see goToolchain)
     goToolchain
@@ -90,6 +99,10 @@ let
     zizmor
     git
     gnumake
+
+    # Coverage and diff-coverage tooling
+    gocover-cobertura
+    diffCover
   ];
 
   devTools = with pkgs; [
@@ -146,13 +159,19 @@ let
       cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
       ${pureEnvSetup}
 
-      echo "=== [sandboxenv-rl] Go Build, Vet, Test (-race), Format & Protos ==="
+      covdir="$(pwd)/coverage"
+      # go-daemon too: coverage-summary.py merges every counter dir it finds,
+      # and a ci-python run may have left daemon counters from an older build.
+      rm -rf "$covdir/go-unit" "$covdir/go-merged" "$covdir/go-daemon"
+      mkdir -p "$covdir/go-unit"
+
+      echo "=== [sandboxenv-rl] Go Build, Vet, Test (-race, -cover), Format & Protos ==="
       echo "--> Go build..."
       go build ./...
       echo "--> Go vet..."
       go vet ./...
-      echo "--> Go test (-race)..."
-      go test -race ./...
+      echo "--> Go test (-race, -cover)..."
+      go test -race -covermode=atomic -coverpkg=./... -coverprofile="$covdir/go.out" ./... -args -test.gocoverdir="$covdir/go-unit"
       echo "--> Format & boilerplate..."
       make verify-gofmt
       make verify-boilerplate
@@ -164,10 +183,11 @@ let
       go run ./hack/metrics-docs >"$metrics_md"
       diff -u docs/metrics.md "$metrics_md"
       rm -f "$metrics_md"
+      echo "--> Coverage summary & diff-cover..."
+      ./hack/ci/coverage-summary.py --covdir="$covdir" --merge-covdata --go --diff-cover
       echo "=== [sandboxenv-rl] Go CI checks passed ==="
     '';
   };
-
   # Shells for the integrations whose envs the default devShell doesn't
   # carry: `nix develop .#openhands` / `.#uni-agent`.
   mkPythonShell =
@@ -192,6 +212,12 @@ let
       set -euo pipefail
       cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
       ${pureEnvSetup}
+
+      covdir="$(pwd)/coverage"
+      cov_rc="$(pwd)/.coveragerc"
+      export COVERAGE_RCFILE="$cov_rc"
+      rm -rf "$covdir/py" "$covdir/go-daemon"
+      mkdir -p "$covdir/py" "$covdir/bin" "$covdir/go-daemon"
 
       echo "=== [sandboxenv-rl] Python Lint & Test Suites ==="
       # The base and uni-agent envs are built here, on first use, not as part
@@ -221,14 +247,26 @@ let
         echo "Something in the devShell probably put Python site-packages on PYTHONPATH; check \`nix develop -c sh -c 'echo \$PYTHONPATH'\`." >&2
         exit 1
       fi
+
+      echo "--> Building instrumented guest daemon..."
+      go build -cover -covermode=atomic -coverpkg=./... -o "$covdir/bin/guest-daemon-cover" ./examples/guest-daemon
       echo "--> Python pytest suites (in parallel)..."
       # Each suite writes its own log; logs print in a fixed order afterwards so
       # the output doesn't interleave. The base-env client run shares a rootdir
       # with the full one, so it skips the pytest cache to avoid racing on it.
       logs="$(mktemp -d)"
-      trap 'rm -rf "$logs"' EXIT
       names=()
       pids=()
+      cleanup_all() {
+        local p
+        for p in "''${pids[@]:-}"; do
+          if [[ -n "$p" ]]; then
+            kill "$p" 2>/dev/null || true
+          fi
+        done
+        rm -rf "$logs"
+      }
+      trap cleanup_all EXIT INT TERM
       suite() {
         local name="$1" dir="$2"
         shift 2
@@ -236,20 +274,75 @@ let
         names+=("$name")
         pids+=("$!")
       }
-      suite "clients/python (full env)" clients/python pytest -q
+
+      # shellcheck disable=SC2329
+      run_guest_daemon_suite() {
+        local port workspace daemon_pid ready
+        port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+        workspace="$(mktemp -d)"
+        mkdir -p "$workspace/logs"
+
+        # shellcheck disable=SC2329
+        cleanup_daemon() {
+          if [[ -n "''${daemon_pid:-}" ]]; then
+            kill -TERM "$daemon_pid" 2>/dev/null || true
+            wait "$daemon_pid" 2>/dev/null || true
+          fi
+          rm -rf "$workspace"
+        }
+        trap cleanup_daemon EXIT INT TERM
+
+        GOCOVERDIR="$covdir/go-daemon" "$covdir/bin/guest-daemon-cover" \
+          --listen "127.0.0.1:$port" \
+          --workspace "$workspace" \
+          --log-dir "$workspace/logs" &
+        daemon_pid=$!
+
+        ready=0
+        for _ in $(seq 1 50); do
+          if python3 -c "import socket; s=socket.create_connection(('127.0.0.1', $port), timeout=0.1); s.close()" 2>/dev/null; then
+            ready=1
+            break
+          fi
+          sleep 0.1
+        done
+
+        if [[ "$ready" -ne 1 ]]; then
+          echo "guest daemon failed to start on 127.0.0.1:$port" >&2
+          exit 1
+        fi
+
+        ATE_ENV_GUEST_TARGET="127.0.0.1:$port" \
+        COVERAGE_FILE="$covdir/py/.coverage.guest-daemon" \
+        coverage run --rcfile="$cov_rc" -m pytest clients/python/tests/e2e/test_guest_daemon.py -q
+
+        kill -TERM "$daemon_pid"
+        wait "$daemon_pid" 2>/dev/null || true
+        daemon_pid=""
+        rm -rf "$workspace"
+        trap - EXIT INT TERM
+      }
+
+      suite "clients/python (full env)" clients/python \
+        env COVERAGE_FILE="$covdir/py/.coverage.client" coverage run --rcfile="$cov_rc" -m pytest -q
       suite "clients/python (base env, no tracing/metrics)" clients/python \
-        "$base_env/bin/python" -m pytest -q -p no:cacheprovider
-      suite "examples/Qwen3-1.7B-verl" . pytest examples/Qwen3-1.7B-verl/tests -q
-      suite "integrations/nemo-gym" integrations/nemo-gym pytest -q
+        env COVERAGE_FILE="$covdir/py/.coverage.client-base" "$base_env/bin/python" -m coverage run --rcfile="$cov_rc" -m pytest -q -p no:cacheprovider
+      suite "examples/Qwen3-1.7B-verl" . \
+        env COVERAGE_FILE="$covdir/py/.coverage.qwen" coverage run --rcfile="$cov_rc" -m pytest examples/Qwen3-1.7B-verl/tests -q
+      suite "integrations/nemo-gym" integrations/nemo-gym \
+        env COVERAGE_FILE="$covdir/py/.coverage.nemo" coverage run --rcfile="$cov_rc" -m pytest -q
       suite "integrations/uni-agent (Python 3.12)" . \
         env PATH="$uni_agent_env/bin:$PATH" \
-        sh -c 'python -m pytest integrations/uni-agent/tests -q && ruff check integrations/uni-agent'
-      suite "swebench" . pytest internal/benchmarking/swebench/trajectories benchmarking/swebench -q
+        sh -c 'COVERAGE_FILE="'"$covdir"'/py/.coverage.uni-agent" python -m coverage run --rcfile="'"$cov_rc"'" -m pytest integrations/uni-agent/tests -q && ruff check integrations/uni-agent'
+      suite "swebench" . \
+        env COVERAGE_FILE="$covdir/py/.coverage.swebench" coverage run --rcfile="$cov_rc" -m pytest internal/benchmarking/swebench/trajectories benchmarking/swebench -q
       # The report tool runs on both envs, like the client: its end-to-end test
       # traces a fleet and needs the telemetry extras.
-      suite "benchmarking/telemetry_report (full env)" . pytest benchmarking/telemetry_report -q -p no:cacheprovider
+      suite "benchmarking/telemetry_report (full env)" . \
+        env COVERAGE_FILE="$covdir/py/.coverage.telemetry-full" coverage run --rcfile="$cov_rc" -m pytest benchmarking/telemetry_report -q -p no:cacheprovider
       suite "benchmarking/telemetry_report (base env)" . \
-        "$base_env/bin/python" -m pytest benchmarking/telemetry_report -q -p no:cacheprovider
+        env COVERAGE_FILE="$covdir/py/.coverage.telemetry-base" "$base_env/bin/python" -m coverage run --rcfile="$cov_rc" -m pytest benchmarking/telemetry_report -q -p no:cacheprovider
+      suite "clients/python (guest daemon integration)" . run_guest_daemon_suite
 
       failed=0
       for i in "''${!pids[@]}"; do
@@ -262,13 +355,55 @@ let
         echo "=== [sandboxenv-rl] Python CI checks FAILED ===" >&2
         exit 1
       fi
+
+      echo "--> Combining Python coverage..."
+      shopt -s nullglob
+      cov_files=("$covdir/py/.coverage."*)
+      if [[ ''${#cov_files[@]} -gt 0 ]]; then
+        COVERAGE_FILE="$covdir/py/.coverage" coverage combine --rcfile="$cov_rc" "''${cov_files[@]}"
+        COVERAGE_FILE="$covdir/py/.coverage" coverage xml -o "$covdir/py.xml" --rcfile="$cov_rc"
+        COVERAGE_FILE="$covdir/py/.coverage" coverage html -d "$covdir/py-html" --rcfile="$cov_rc"
+        COVERAGE_FILE="$covdir/py/.coverage" coverage json -o "$covdir/py.json" --rcfile="$cov_rc"
+      fi
+      shopt -u nullglob
+
+      echo "--> Coverage summary & diff-cover..."
+      ./hack/ci/coverage-summary.py --covdir="$covdir" --python --diff-cover
+
       echo "=== [sandboxenv-rl] Python CI checks passed ==="
+    '';
+  };
+
+  ci-coverage = pkgs.writeShellApplication {
+    name = "ci-coverage";
+    runtimeInputs = ciPackages ++ [
+      ci-go
+      ci-python
+    ];
+    text = ''
+      set -euo pipefail
+      cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+      ${pureEnvSetup}
+
+      covdir="$(pwd)/coverage"
+      echo "=============================================="
+      echo "Running sandboxenv-rl test suites with coverage"
+      echo "=============================================="
+      ci-go
+      ci-python
+      echo "=============================================="
+      echo "Generating unified test coverage report"
+      echo "=============================================="
+      ./hack/ci/coverage-summary.py --covdir="$covdir" --merge-covdata --go --python --diff-cover --print-paths
+      echo "=============================================="
+      echo "Coverage run complete!"
+      echo "=============================================="
     '';
   };
 
   ci = pkgs.writeShellApplication {
     name = "ci";
-    runtimeInputs = [
+    runtimeInputs = ciPackages ++ [
       ci-go
       ci-python
     ];
@@ -279,6 +414,10 @@ let
       echo "=============================================="
       ci-go
       ci-python
+      echo "=============================================="
+      echo "Generating unified test coverage report"
+      echo "=============================================="
+      ./hack/ci/coverage-summary.py --covdir=coverage --merge-covdata --go --python --diff-cover
       echo "=============================================="
       echo "All sandboxenv-rl local CI checks passed!"
       echo "=============================================="
@@ -336,6 +475,7 @@ in
     ci-all
     ci-go
     ci-python
+    ci-coverage
     ci-e2e
     smoke
     check-substrate-head
@@ -348,4 +488,5 @@ in
     pythonEnvBase
     uniAgentEnv
     ;
+  coverage = ci-coverage;
 }

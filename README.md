@@ -731,6 +731,9 @@ make ci-python
 make ci-openhands
 make ci-e2e
 
+# Run Go and Python test suites with coverage and generate reports (see docs/chores/coverage.md)
+make coverage
+
 # Preserve the Kind cluster after ci-e2e completes
 KEEP_CLUSTER=1 make ci-e2e
 

@@ -30,7 +30,7 @@
 #
 # When it runs:
 #   Local only. Invoked as the backend runner by Makefile targets: `make ci`, `make ci-go`,
-#   `make ci-python`, `make ci-openhands`, `make ci-e2e`, `make smoke`, `make check-pins`, and `make dev-shell`.
+#   `make ci-python`, `make coverage`, `make ci-openhands`, `make ci-e2e`, `make smoke`, `make check-pins`, and `make dev-shell`.
 #
 # How to run:
 #   - `make <target>` (preferred; auto-selects Nix or Docker via hack/ci-compat.sh)
@@ -227,6 +227,46 @@ if [[ "${RUNNER}" == "docker" ]]; then
     target_attr="${CI_SHELL#.#}"
     target_attr="${target_attr#\#}"
     DOCKER_TARGET_SHELL="path:///workspace#${target_attr}"
+  fi
+
+  is_coverage_export_cmd() {
+    case "${1:-}" in
+      ci|ci-all|ci-go|ci-python|ci-coverage|coverage) return 0 ;;
+      *) return 1 ;;
+    esac
+  }
+
+  if is_coverage_export_cmd "$@"; then
+    tar_file="$(mktemp -t sandboxenv-rl-coverage-XXXXXX.tar)"
+    # shellcheck disable=SC2329
+    cleanup_tar() {
+      rm -f "${tar_file}"
+    }
+    trap cleanup_tar EXIT INT TERM
+
+    set +e
+    docker "${DOCKER_RUN_ARGS[@]}" \
+      --entrypoint sh \
+      "${DOCKER_IMAGE}" \
+      -c '
+        nix develop "'"${DOCKER_TARGET_SHELL}"'" -c "$@" >&2
+        rc=$?
+        # Export the reports even when tests fail, like CI uploads them with
+        # `if: always()`.
+        if [ -d /workspace/coverage ]; then
+          tar -C /workspace -cf - coverage
+        fi
+        exit $rc
+      ' -- "$@" > "${tar_file}"
+    cmd_rc=$?
+    set -e
+
+    if [[ -s "${tar_file}" ]]; then
+      rm -rf "${REPO_ROOT}/coverage"
+      tar -xf "${tar_file}" -C "${REPO_ROOT}"
+    fi
+
+    exit "${cmd_rc}"
   fi
 
   if ! is_write_back_cmd "$@"; then

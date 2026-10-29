@@ -29,7 +29,7 @@ PRETTIER_VERSION := 3.8.3
 PRETTIER ?= npx --yes prettier@$(PRETTIER_VERSION)
 
 .PHONY: build build-cli install test vet clean images python-protos python-test nemo-gym-test verify-boilerplate verify-gofmt verify-protos verify-docs format-docs \
-	help ci ci-go ci-python ci-openhands ci-e2e smoke check-substrate-head check-pins update-pins protos lint-actions-locally dev-shell
+	help ci ci-go ci-python coverage ci-openhands ci-e2e smoke check-substrate-head check-pins update-pins protos lint-actions-locally dev-shell
 
 help: ## Show this help message
 	@awk 'BEGIN {FS = ":[^#]*## "} /^[a-zA-Z0-9_-]+:[^#]*## / {printf "  %-22s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -37,11 +37,14 @@ help: ## Show this help message
 ci: ## Run all local CI checks (Go and Python suites)
 	hack/ci-compat.sh ci
 
-ci-go: ## Run Go build, vet, test (-race), format, and proto checks
+ci-go: ## Run Go build, vet, test (-race, -cover), format, and proto checks
 	hack/ci-compat.sh ci-go
 
 ci-python: ## Run Python lint (ruff) and pytest test suites
 	hack/ci-compat.sh ci-python
+
+coverage: ## Run Go and Python test suites with coverage and generate reports
+	hack/ci-compat.sh ci-coverage
 
 ci-openhands: ## Run OpenHands integration test and lint suite via openhands devShell
 	hack/ci-compat.sh --shell .#openhands sh -c 'python -m pytest integrations/openhands/tests -q && ruff check integrations/openhands examples/openhands'

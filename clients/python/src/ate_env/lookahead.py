@@ -34,12 +34,12 @@ to the pool as an absolute idle count.
 
 Substrate has no controller that refills a pool after a claim: every claim
 takes a paused actor out of the pool for good. So before each change the
-warmer looks at how far the pool's idle count fell below what it left behind
-last time, counts that as claims, and takes them off the steps' remaining
-demand, oldest step first. A replica that was claimed is then neither warmed
-again (an absolute target on the original demand would do that) nor
-subtracted again when its step finishes (a relative change would drain the
-replicas of steps that are still live).
+warmer reads how many sandboxes the fleet acquired per image since its last
+call (``fleet.acquired_count``), warm or cold, and takes them off the steps'
+remaining demand, oldest step first. A rollout that was served, from the pool
+or by a cold create, is then neither warmed for again nor kept for by a
+finished step; and finishing a step drops only what its rollouts did not
+acquire, never the replicas of steps that are still live.
 """
 
 from __future__ import annotations
@@ -93,9 +93,9 @@ class LookaheadWarmer:
 
     def __init__(self, fleet: Any, *, keep_finished: int = 0, cap: int | None = None,
                  fail_fast: bool = False):
-        if not isinstance(keep_finished, int) or keep_finished < 0:
+        if not isinstance(keep_finished, int) or isinstance(keep_finished, bool) or keep_finished < 0:
             raise ValueError(f"keep_finished must be an int >= 0, got {keep_finished!r}")
-        if cap is not None and (not isinstance(cap, int) or cap < 0):
+        if cap is not None and (not isinstance(cap, int) or isinstance(cap, bool) or cap < 0):
             raise ValueError(f"cap must be an int >= 0 or None, got {cap!r}")
         # AsyncSandboxFleet wraps a SandboxFleet; the warmer drives the sync one.
         self._fleet = getattr(fleet, "_fleet", fleet)
@@ -109,6 +109,8 @@ class LookaheadWarmer:
         # count it saw right after (None: the driver cannot tell).
         self._target: dict[str, int] = {}
         self._expected_idle: dict[str, int | None] = {}
+        # fleet.acquired_count(image) at the last observation, per image in demand.
+        self._acquired_seen: dict[str, int] = {}
         self._lock = threading.Lock()
         self._closed = False
 
@@ -143,6 +145,9 @@ class LookaheadWarmer:
             if step in self._live or any(s == step for s, _ in self._finished):
                 raise ValueError(f"step {step} was already added")
             self._observe_claims_locked()
+            for img in demand:
+                # Acquires made before an image's first step are not its claims.
+                self._acquired_seen.setdefault(img, self._fleet.acquired_count(img))
             self._live[step] = demand
             return self._apply_locked(wait)
 
@@ -190,25 +195,21 @@ class LookaheadWarmer:
         return sorted(steps, key=lambda item: item[0])
 
     def _observe_claims_locked(self) -> None:
-        """Take replicas claimed since the last call off the steps' demand.
+        """Take sandboxes acquired since the last call off the steps' demand.
 
-        Claims are what the idle count lost relative to what this warmer
-        left behind. They are attributed to the oldest steps first, which is
-        how a trainer consumes them: earlier steps' rollouts are the ones in
-        flight. A pool that grew (a recycled actor) shows no claims.
+        Claims are counted by the fleet (``acquired_count``), warm or cold, so
+        rollouts served by cold creates (a pool smaller than the demand, or
+        warming that fell behind) are counted too. They are attributed to the
+        oldest steps first, which is how a trainer consumes them: earlier
+        steps' rollouts are the ones in flight. The idle count is re-read
+        only to trim a pool that grew beyond its target (recycled actors).
         """
-        for img, expected in list(self._expected_idle.items()):
-            if expected is None:
-                continue
-            idle = self._fleet.pool_size(img)
-            if idle is None:
-                continue
-            self._expected_idle[img] = idle
-            claimed = expected - idle
-            if claimed <= 0:
-                continue
+        for img, seen in list(self._acquired_seen.items()):
+            now = self._fleet.acquired_count(img)
+            self._acquired_seen[img] = now
+            claimed = now - seen
             for _step, demand in self._steps_oldest_first_locked():
-                if claimed == 0:
+                if claimed <= 0:
                     break
                 take = min(claimed, demand.get(img, 0))
                 if take:
@@ -216,6 +217,10 @@ class LookaheadWarmer:
                     if not demand[img]:
                         del demand[img]
                     claimed -= take
+        for img in list(self._expected_idle):
+            idle = self._fleet.pool_size(img)
+            if idle is not None:
+                self._expected_idle[img] = idle
 
     def _desired_locked(self) -> dict[str, int]:
         total: collections.Counter[str] = collections.Counter()

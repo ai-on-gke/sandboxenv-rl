@@ -237,6 +237,10 @@ def test_constructor_validation():
         LookaheadWarmer(fleet, keep_finished=-1)
     with pytest.raises(ValueError):
         LookaheadWarmer(fleet, cap=-1)
+    with pytest.raises(ValueError, match="keep_finished"):
+        LookaheadWarmer(fleet, keep_finished=True)
+    with pytest.raises(ValueError, match="cap"):
+        LookaheadWarmer(fleet, cap=False)
     assert LookaheadWarmer(fleet, cap=3).cap == 3
 
 
@@ -316,3 +320,55 @@ async def test_lookahead_on_a_substrate_fleet(fake_stack):
         assert fakes.environments.environments == {}
 
     await asyncio.to_thread(_drive)
+
+
+def test_cold_acquires_beyond_the_cap_count_as_claims():
+    # Review of #161: with cap < demand most rollouts are served by cold
+    # creates, which an idle-count drop cannot see; the step's demand stayed
+    # and the warmer kept warming replicas nobody would claim.
+    fleet, driver = _setup(cap=4)
+    warmer = LookaheadWarmer(fleet)
+    warmer.add(0, {"a": 10})
+    assert driver.idle("a") == 4
+    for i in range(10):                 # 4 warm claims + 6 cold creates
+        fleet.acquire(Task(id=f"t{i}", image="a"))
+    assert driver.idle("a") == 0
+    warmer.add(1, {"b": 1})             # observes all 10 acquires
+    assert warmer.remaining() == {0: {}, 1: {"b": 1}}
+    assert driver.idle("a") == 0        # was re-warmed to 4 before
+
+
+def test_a_kept_step_retains_only_what_was_not_acquired():
+    fleet, driver = _setup(cap=4)
+    warmer = LookaheadWarmer(fleet, keep_finished=1)
+    warmer.add(0, {"a": 10})
+    for i in range(9):
+        fleet.acquire(Task(id=f"t{i}", image="a"))
+    warmer.finish(0)                    # kept for one stale claim, not for 6
+    assert warmer.remaining() == {0: {"a": 1}}
+    assert driver.idle("a") == 1
+
+
+def test_acquires_before_an_images_first_step_are_not_its_claims():
+    fleet, driver = _setup()
+    for i in range(3):
+        fleet.acquire(Task(id=f"early{i}", image="a"))
+    warmer = LookaheadWarmer(fleet)
+    warmer.add(0, {"a": 2})
+    warmer.add(1, {"b": 1})
+    assert warmer.remaining()[0] == {"a": 2}
+    assert driver.idle("a") == 2
+
+
+async def test_async_acquires_are_counted():
+    driver = _PoolDriver()
+    fleet = AsyncSandboxFleet(FleetConfig(backend="mock", max_warmpool_replicas=2), driver)
+    warmer = LookaheadWarmer(fleet)
+    await warmer.add_async(0, {"a": 5})
+    for i in range(5):
+        await fleet.acquire(Task(id=f"t{i}", image="a"))
+    assert fleet.acquired_count("a") == 5
+    await warmer.add_async(1, {"b": 1})
+    assert warmer.remaining()[0] == {}
+    assert driver.idle("a") == 0
+

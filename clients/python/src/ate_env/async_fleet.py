@@ -324,10 +324,32 @@ class AsyncSandboxFleet:
     async def acquire_batch(
         self, tasks: list[Task | str], timeout_s: float | None = None
     ) -> list[SandboxHandle]:
-        """Asynchronously acquire a batch of sandboxes in parallel."""
-        return list(
-            await asyncio.gather(*(self.acquire(t, timeout_s=timeout_s) for t in tasks))
+        """Asynchronously acquire a batch of sandboxes in parallel.
+
+        All-or-nothing: if any acquisition fails, the sandboxes that were
+        acquired are released before the first error is re-raised, so a partial
+        failure never leaks sandboxes.
+        """
+        results = await asyncio.gather(
+            *(self.acquire(t, timeout_s=timeout_s) for t in tasks), return_exceptions=True
         )
+        errors = [r for r in results if isinstance(r, BaseException)]
+        if not errors:
+            return list(results)  # type: ignore[arg-type]
+        acquired = [r for r in results if isinstance(r, SandboxHandle)]
+        # Through self.release, so these releases are in the run report and
+        # the release-phase metrics like any other.
+        released = await asyncio.gather(
+            *(self.release(h) for h in acquired), return_exceptions=True
+        )
+        for h, rel in zip(acquired, released):
+            if isinstance(rel, BaseException):
+                logger.warning(
+                    "Failed to release sandbox %s after batch acquire error",
+                    h.sandbox_id,
+                    exc_info=rel,
+                )
+        raise errors[0]
 
     async def release(self, handle: SandboxHandle) -> None:
         with self.observer.phase("release", backend=self._backend_label,

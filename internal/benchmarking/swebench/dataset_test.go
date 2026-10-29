@@ -15,6 +15,8 @@
 package swebench
 
 import (
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -164,5 +166,145 @@ func TestRequireGrading(t *testing.T) {
 	noParser, _ := ParseDataset(strings.NewReader(`{"instance_id":"x","image":"reg/img@` + goodDigest + `","eval_script":"e"}` + "\n"))
 	if err := RequireGrading(noParser); err == nil || !strings.Contains(err.Error(), "log_parser") {
 		t.Fatalf("missing log_parser must fail grading requirement: %v", err)
+	}
+}
+
+type customValidateAdapter struct {
+	kind       string
+	valErr     error
+	gradingErr error
+}
+
+func (a customValidateAdapter) Kind() string                          { return a.kind }
+func (a customValidateAdapter) Validate(Instance) error               { return a.valErr }
+func (a customValidateAdapter) RequireGrading(Instance) error         { return a.gradingErr }
+func (a customValidateAdapter) TemplateData(in Instance) (any, error) { return in, nil }
+func (a customValidateAdapter) Grades(*Trajectory) bool               { return false }
+func (a customValidateAdapter) Grader() Grader                        { return nil }
+
+func TestInstanceUnmarshalKindAndMaterial(t *testing.T) {
+	// Default row omits "kind": Kind stays "", Material stays nil, and AdapterFor("") maps to DefaultKind.
+	var def Instance
+	if err := json.Unmarshal([]byte(`{"instance_id":"x","image":"reg/img@`+goodDigest+`"}`), &def); err != nil {
+		t.Fatal(err)
+	}
+	if def.Kind != "" || def.Material != nil {
+		t.Fatalf("default instance: Kind=%q Material=%s, want empty", def.Kind, string(def.Material))
+	}
+	if a := AdapterFor(def.Kind); a == nil || a.Kind() != DefaultKind {
+		t.Fatalf("AdapterFor(%q) = %v, want %q", def.Kind, a, DefaultKind)
+	}
+	// Non-default kind without explicit "material" captures raw JSON in Material.
+	rawRow := `{"instance_id":"x","image":"reg/img@` + goodDigest + `","kind":"custom-kind","extra":"val"}`
+	var customImplicit Instance
+	if err := json.Unmarshal([]byte(rawRow), &customImplicit); err != nil {
+		t.Fatal(err)
+	}
+	if customImplicit.Kind != "custom-kind" || string(customImplicit.Material) != rawRow {
+		t.Fatalf("implicit material: Kind=%q Material=%s", customImplicit.Kind, string(customImplicit.Material))
+	}
+	// Non-default kind with explicit "material" preserves only the sub-object.
+	var customExplicit Instance
+	if err := json.Unmarshal([]byte(`{"instance_id":"x","image":"reg/img@`+goodDigest+`","kind":"custom-kind","material":{"k":"v"}}`), &customExplicit); err != nil {
+		t.Fatal(err)
+	}
+	if string(customExplicit.Material) != `{"k":"v"}` {
+		t.Fatalf("explicit material = %s, want {\"k\":\"v\"}", string(customExplicit.Material))
+	}
+}
+
+func TestValidateAndRequireGradingAdapterDispatch(t *testing.T) {
+	// An unregistered kind fails both Validate (and ParseDataset) and RequireGrading.
+	unknown := Instance{InstanceID: "u", Image: "reg/img@" + goodDigest, Kind: "unregistered-kind"}
+	if err := unknown.Validate(); err == nil || !strings.Contains(err.Error(), "no dataset adapter registered") {
+		t.Fatalf("Validate on unknown kind = %v, want unregistered error", err)
+	}
+	if _, err := ParseDataset(strings.NewReader(`{"instance_id":"u","image":"reg/img@` + goodDigest + `","kind":"unregistered-kind"}` + "\n")); err == nil || !strings.Contains(err.Error(), "no dataset adapter registered") {
+		t.Fatalf("ParseDataset on unknown kind = %v, want unregistered error", err)
+	}
+	if err := RequireGrading([]Instance{unknown}); err == nil || !strings.Contains(err.Error(), "no dataset adapter registered") {
+		t.Fatalf("RequireGrading on unknown kind = %v, want unregistered error", err)
+	}
+
+	// A registered adapter's Validate and RequireGrading errors are dispatched.
+	RegisterAdapter(customValidateAdapter{
+		kind:       "custom-val",
+		valErr:     errors.New("custom validate failed"),
+		gradingErr: errors.New("custom grading failed"),
+	})
+	t.Cleanup(func() { unregisterAdapter("custom-val") })
+
+	in := Instance{InstanceID: "c", Image: "reg/img@" + goodDigest, Kind: "custom-val"}
+	if err := in.Validate(); err == nil || !strings.Contains(err.Error(), "custom validate failed") {
+		t.Fatalf("Validate dispatch = %v, want custom validate failed", err)
+	}
+	if err := RequireGrading([]Instance{in}); err == nil || !strings.Contains(err.Error(), "custom grading failed") {
+		t.Fatalf("RequireGrading dispatch = %v, want custom grading failed", err)
+	}
+}
+
+func TestCommandAdapterValidationRenderingAndGrading(t *testing.T) {
+	a := AdapterFor(CommandKind)
+	if a == nil || a.Kind() != CommandKind {
+		t.Fatalf("AdapterFor(%q) = %v, want CommandAdapter", CommandKind, a)
+	}
+
+	// Missing command fails validation.
+	badManifest := `{"kind":"command","instance_id":"cmd-missing","image":"reg/img@` + goodDigest + `"}` + "\n"
+	if _, err := ParseDataset(strings.NewReader(badManifest)); err == nil || !strings.Contains(err.Error(), "command is required") {
+		t.Fatalf("ParseDataset with missing command = %v, want command is required", err)
+	}
+
+	// Valid command manifest row parses, validates, renders DefaultTrajectory, and grades.
+	goodManifest := strings.Join([]string{
+		`{"kind":"command","instance_id":"cmd-1","image":"reg/img@` + goodDigest + `","command":"echo hello-world","setup_command":"mkdir -p /tmp/w","reset_command":"rm -rf /tmp/w/*","expected_stdout":"hello-world","expected_exit_code":0}`,
+		`{"kind":"command","instance_id":"cmd-2","image":"reg/img@` + goodDigest + `","command":"echo '{\"valid\":true,\"reward\":1,\"detail\":\"json-ok\"}'"}`,
+	}, "\n") + "\n"
+
+	instances, err := ParseDataset(strings.NewReader(goodManifest))
+	if err != nil {
+		t.Fatalf("ParseDataset command manifest: %v", err)
+	}
+	if len(instances) != 2 {
+		t.Fatalf("len(instances) = %d, want 2", len(instances))
+	}
+
+	traj, err := LoadTrajectory(CommandTrajectoryName)
+	if err != nil {
+		t.Fatalf("LoadTrajectory(%q): %v", CommandTrajectoryName, err)
+	}
+	if !a.Grades(traj) {
+		t.Fatal("CommandAdapter.Grades(command-default) = false, want true")
+	}
+	if err := RequireGrading(instances, traj); err != nil {
+		t.Fatalf("RequireGrading: %v", err)
+	}
+
+	rendered, err := traj.Render(instances[0])
+	if err != nil {
+		t.Fatalf("Render(cmd-1): %v", err)
+	}
+	if rendered.Setup[0].Run != "mkdir -p /tmp/w" || rendered.Reset[0].Run != "rm -rf /tmp/w/*" || rendered.Steps[0].Run != "echo hello-world" {
+		t.Fatalf("unexpected rendered trajectory: setup=%+v reset=%+v steps=%+v", rendered.Setup, rendered.Reset, rendered.Steps)
+	}
+
+	// Grader unit tests: JSON verdict and plain stdout matching ExpectedStdout.
+	grader := a.Grader()
+	r, detail, err := grader.Parse([]byte("some log\n" + `{"valid":true,"reward":1,"detail":"all tests pass"}` + "\nstderr warning line\n"))
+	if err != nil || r == nil || *r != 1 || detail != "all tests pass" {
+		t.Fatalf("Grader JSON pass = (%v, %q, %v)", r, detail, err)
+	}
+	r, detail, err = grader.Parse([]byte(`{"valid":false,"reward":0,"detail":"syntax error"}`))
+	if err != nil || r == nil || *r != 0 || detail != "syntax error" {
+		t.Fatalf("Grader JSON invalid = (%v, %q, %v)", r, detail, err)
+	}
+	expectGrader := CommandGrader{ExpectedStdout: "hello-world", ExpectedExitCode: 0}
+	r, detail, err = expectGrader.Parse([]byte("hello-world\n"))
+	if err != nil || r == nil || *r != 1 || detail != "stdout matched" {
+		t.Fatalf("CommandGrader stdout match = (%v, %q, %v)", r, detail, err)
+	}
+	r, detail, err = expectGrader.Parse([]byte("wrong-output\n"))
+	if err != nil || r == nil || *r != 0 || !strings.Contains(detail, "stdout mismatch") {
+		t.Fatalf("CommandGrader stdout mismatch = (%v, %q, %v)", r, detail, err)
 	}
 }

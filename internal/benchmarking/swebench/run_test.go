@@ -139,6 +139,9 @@ func (s *fakeSandbox) Run(ctx context.Context, command string, timeout time.Dura
 	if strings.HasPrefix(command, "exit ") {
 		return Result{ExitCode: int(command[5] - '0'), Stderr: "failed"}, nil
 	}
+	if strings.HasPrefix(command, "echo ") {
+		return Result{Stdout: strings.TrimPrefix(command, "echo ")}, nil
+	}
 	return Result{Stdout: "ok"}, nil
 }
 
@@ -789,6 +792,99 @@ func TestValidateChecksTheLongestName(t *testing.T) {
 	cfg.Mode, cfg.TasksPerImage = ModeEval, 100001 // largest index 100000
 	if err := cfg.validate(); err == nil {
 		t.Fatal("eval mode with a 6-digit replay index: want the long name refused")
+	}
+}
+
+type zeroRewardGrader struct{}
+
+func (zeroRewardGrader) Parse(stdout []byte) (*int, string, error) {
+	if !strings.Contains(string(stdout), "RESOLVED=0") {
+		return nil, "", errors.New("no zero-reward marker")
+	}
+	r := 0
+	return &r, "custom-zero-verdict", nil
+}
+
+type zeroRewardAdapter struct{}
+
+func (zeroRewardAdapter) Kind() string                  { return "zero-reward-test" }
+func (zeroRewardAdapter) Validate(Instance) error       { return nil }
+func (zeroRewardAdapter) RequireGrading(Instance) error { return nil }
+func (zeroRewardAdapter) TemplateData(in Instance) (any, error) {
+	return in, nil
+}
+func (zeroRewardAdapter) Grades(t *Trajectory) bool {
+	for _, steps := range [][]Step{t.Setup, t.Reset, t.Steps} {
+		for _, s := range steps {
+			if strings.Contains(s.Run, "RESOLVED=0") {
+				return true
+			}
+		}
+	}
+	return false
+}
+func (zeroRewardAdapter) Grader() Grader { return zeroRewardGrader{} }
+
+func TestGraderRewardOverridesZeroExitCode(t *testing.T) {
+	RegisterAdapter(zeroRewardAdapter{})
+	t.Cleanup(func() { unregisterAdapter("zero-reward-test") })
+	f := newFake()
+	var out bytes.Buffer
+	cfg := baseConfig(t, f, &out)
+	cfg.Mode = ModeEval
+	cfg.TasksPerImage = 1
+	inst := Instance{InstanceID: "repo__repo-a", Image: "reg/img@" + goodDigest, Kind: "zero-reward-test", Patch: "PATCH", EvalScript: "EVAL"}
+	cfg.Instances = []Instance{inst}
+	// Reward step runs "echo RESOLVED=0" (exit code 0), and the adapter's Grader returns reward=0.
+	cfg.Trajectory = testTrajectory(t, "echo RESOLVED=0")
+
+	sum, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Tasks != 1 || sum.Failed != 0 || sum.Rewarded != 0 {
+		t.Fatalf("summary = %+v, want Tasks=1 Failed=0 Rewarded=0", sum)
+	}
+	rep := Build(parseEvents(t, out.String()))
+	if rep.RewardRate != 0 || len(rep.Unresolved) != 1 || rep.Unresolved[0].Reason != "custom-zero-verdict" {
+		t.Fatalf("report = %+v, want RewardRate=0 and unresolved reason custom-zero-verdict", rep)
+	}
+}
+
+type nilGraderAdapter struct{}
+
+func (nilGraderAdapter) Kind() string                          { return "nil-grader-test" }
+func (nilGraderAdapter) Validate(Instance) error               { return nil }
+func (nilGraderAdapter) RequireGrading(Instance) error         { return nil }
+func (nilGraderAdapter) TemplateData(in Instance) (any, error) { return in, nil }
+func (nilGraderAdapter) Grades(*Trajectory) bool               { return false }
+func (nilGraderAdapter) Grader() Grader                        { return nil }
+
+func TestGraderNilFallbackUsesExitCode(t *testing.T) {
+	RegisterAdapter(nilGraderAdapter{})
+	t.Cleanup(func() { unregisterAdapter("nil-grader-test") })
+
+	for _, tc := range []struct {
+		cmd        string
+		wantReward int
+	}{
+		{cmd: "true", wantReward: 1},
+		{cmd: "exit 1", wantReward: 0},
+	} {
+		f := newFake()
+		var out bytes.Buffer
+		cfg := baseConfig(t, f, &out)
+		cfg.Mode = ModeEval
+		cfg.TasksPerImage = 1
+		cfg.Instances = []Instance{{InstanceID: "repo__repo-a", Image: "reg/img@" + goodDigest, Kind: "nil-grader-test"}}
+		cfg.Trajectory = testTrajectory(t, tc.cmd)
+		sum, err := Run(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.cmd, err)
+		}
+		if sum.Rewarded != tc.wantReward {
+			t.Fatalf("%s: Rewarded = %d, want %d", tc.cmd, sum.Rewarded, tc.wantReward)
+		}
 	}
 }
 

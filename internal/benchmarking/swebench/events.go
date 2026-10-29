@@ -15,6 +15,7 @@
 package swebench
 
 import (
+	"bufio"
 	"encoding/json"
 	"io"
 	"sync"
@@ -56,7 +57,10 @@ type Event struct {
 	OK     bool    `json:"ok"`
 	Exit   *int    `json:"exit,omitempty"`
 	Reward *int    `json:"reward,omitempty"`
-	Err    string  `json:"err,omitempty"`
+	// Detail is the dataset grader's short verdict string for a reward step
+	// (for example "f2p 1/1 p2p 3/4" or "invalid run").
+	Detail string `json:"detail,omitempty"`
+	Err    string `json:"err,omitempty"`
 	// Count is the number of tasks or environments an aggregate event covers.
 	Count int `json:"count,omitempty"`
 	// Tail is the last bytes of a failed or reward step's output.
@@ -70,24 +74,28 @@ type Event struct {
 	Labels map[string]string `json:"labels,omitempty"`
 }
 
-// Recorder writes events as JSON lines. It is safe for concurrent use.
+const recorderBufferSize = 64 * 1024
+
+// Recorder writes events as buffered JSON lines. It is safe for concurrent use.
 type Recorder struct {
 	mu  sync.Mutex
-	w   io.Writer
+	bw  *bufio.Writer
 	enc *json.Encoder
 	n   int
 	err error
 }
 
-// NewRecorder writes to w; a nil w discards events.
+// NewRecorder writes to w through a 64 KiB buffer; a nil w discards events.
 func NewRecorder(w io.Writer) *Recorder {
 	if w == nil {
-		w = io.Discard
+		return &Recorder{enc: json.NewEncoder(io.Discard)}
 	}
-	return &Recorder{w: w, enc: json.NewEncoder(w)}
+	bw := bufio.NewWriterSize(w, recorderBufferSize)
+	return &Recorder{bw: bw, enc: json.NewEncoder(bw)}
 }
 
-// Record writes one event, stamping the time if unset.
+// Record writes one event, stamping the time if unset. Coarse boundary events
+// (step_barrier, park, run) flush the underlying buffer automatically.
 func (r *Recorder) Record(e Event) {
 	if e.Time.IsZero() {
 		e.Time = time.Now()
@@ -97,7 +105,34 @@ func (r *Recorder) Record(e Event) {
 	if err := r.enc.Encode(e); err != nil && r.err == nil {
 		r.err = err
 	}
+	if r.bw != nil && (e.Event == EventBarrier || e.Event == EventPark || e.Event == EventRun) {
+		if err := r.bw.Flush(); err != nil && r.err == nil {
+			r.err = err
+		}
+	}
 	r.n++
+}
+
+// Flush flushes any buffered events to the underlying writer and returns the
+// first write or flush error.
+func (r *Recorder) Flush() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.flushLocked()
+	return r.err
+}
+
+// Close flushes buffered events and returns the first write or flush error.
+func (r *Recorder) Close() error {
+	return r.Flush()
+}
+
+func (r *Recorder) flushLocked() {
+	if r.bw != nil {
+		if err := r.bw.Flush(); err != nil && r.err == nil {
+			r.err = err
+		}
+	}
 }
 
 // Len is the number of events written so far.
@@ -107,11 +142,12 @@ func (r *Recorder) Len() int {
 	return r.n
 }
 
-// Err is the first write error, if any; a run whose events were lost must
-// not report success.
+// Err flushes any buffered events and returns the first write error, if any;
+// a run whose events were lost must not report success.
 func (r *Recorder) Err() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.flushLocked()
 	return r.err
 }
 

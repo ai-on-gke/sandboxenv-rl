@@ -79,6 +79,10 @@ func main() {
 // the same one the ate-env CLI reads.
 const authTokenEnv = "SUBSTRATE_ENV_AUTH_TOKEN"
 
+// testBackendOverride allows hermetic end-to-end CLI tests in main_test.go to
+// exercise runCmd without dialing a live gRPC server.
+var testBackendOverride swebench.Backend
+
 // resolveAuthToken returns the token from file when file is set, otherwise
 // from authTokenEnv, otherwise "" (no token sent). A file that holds only
 // whitespace is an error, because it is a misconfiguration and not a request
@@ -308,8 +312,12 @@ func runCmd(args []string) (retErr error) {
 	if *images > 0 && len(selected) < *images && len(ids) == 0 {
 		fmt.Fprintf(os.Stderr, "note: %d instances requested, %d available after the exclude list\n", *images, len(selected))
 	}
+	trajSpec := *trajectory
+	if trajSpec == swebench.DefaultTrajectory && len(selected) > 0 && selected[0].Kind == swebench.CommandKind {
+		trajSpec = swebench.CommandTrajectoryName
+	}
 	var trajs []*swebench.Trajectory
-	for _, source := range strings.Split(*trajectory, ",") {
+	for _, source := range strings.Split(trajSpec, ",") {
 		if source = strings.TrimSpace(source); source == "" {
 			continue
 		}
@@ -318,10 +326,8 @@ func runCmd(args []string) (retErr error) {
 			return err
 		}
 		t.Vars = vars
-		if t.Grades() {
-			if err := swebench.RequireGrading(selected); err != nil {
-				return err
-			}
+		if err := swebench.RequireGrading(selected, t); err != nil {
+			return err
 		}
 		for _, in := range selected {
 			if _, err := t.Render(in); err != nil {
@@ -371,11 +377,17 @@ func runCmd(args []string) (retErr error) {
 		return nil
 	}
 
-	backend, err := swebench.NewEnvBackend(*endpoint, *atespace, *baseTemplate, *connections, authToken)
-	if err != nil {
-		return err
+	var backend swebench.Backend
+	if testBackendOverride != nil {
+		backend = testBackendOverride
+	} else {
+		eb, err := swebench.NewEnvBackend(*endpoint, *atespace, *baseTemplate, *connections, authToken)
+		if err != nil {
+			return err
+		}
+		defer eb.Close()
+		backend = eb
 	}
-	defer backend.Close()
 
 	f, err := os.Create(*out)
 	if err != nil {
@@ -385,11 +397,11 @@ func runCmd(args []string) (retErr error) {
 	// Events lost to a write error, or a file that does not flush, must fail
 	// the run rather than produce a report with holes.
 	defer func() {
+		if rerr := rec.Close(); rerr != nil && retErr == nil {
+			retErr = fmt.Errorf("writing events to %s: %w", *out, rerr)
+		}
 		if cerr := f.Close(); cerr != nil && retErr == nil {
 			retErr = fmt.Errorf("closing %s: %w", *out, cerr)
-		}
-		if rerr := rec.Err(); rerr != nil && retErr == nil {
-			retErr = fmt.Errorf("writing events to %s: %w", *out, rerr)
 		}
 	}()
 
@@ -434,7 +446,11 @@ func runCmd(args []string) (retErr error) {
 	return nil
 }
 
-func reportCmd(args []string, w io.Writer) error {
+func reportCmd(args []string, ws ...io.Writer) error {
+	var w io.Writer = os.Stdout
+	if len(ws) > 0 && ws[0] != nil {
+		w = ws[0]
+	}
 	files, rest := leadingFiles(args)
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
 	var arms armFlags
@@ -472,12 +488,20 @@ func reportCmd(args []string, w io.Writer) error {
 	reps := make([]*swebench.Report, 0, len(files))
 	var events []swebench.Event // of the single file, for the restore join
 	for _, path := range files {
-		evs, err := readEventsFile(path)
+		if (*restoreLog != "" || *top > 0) && len(files) == 1 {
+			evs, err := readEventsFile(path)
+			if err != nil {
+				return fmt.Errorf("%s: %w", path, err)
+			}
+			events = evs
+			reps = append(reps, swebench.Build(evs))
+			continue
+		}
+		rep, err := summarizeFile(path)
 		if err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
-		events = evs
-		reps = append(reps, swebench.Build(evs))
+		reps = append(reps, rep)
 	}
 	if len(reps) > 1 {
 		// Several runs: one table, a column per run, for the same workload on
@@ -556,6 +580,15 @@ func leadingFiles(args []string) (files, rest []string) {
 		}
 	}
 	return args, nil
+}
+
+func summarizeFile(path string) (*swebench.Report, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return swebench.Summarize(f)
 }
 
 func readEventsFile(path string) ([]swebench.Event, error) {

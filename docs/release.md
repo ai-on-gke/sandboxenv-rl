@@ -144,7 +144,10 @@ workflow's `GITHUB_TOKEN`, under the repository. Once:
 - The OpenHands layer pins its base images by digest in its Dockerfile and its
   Python dependencies by hash in `layer/requirements.txt`. The QEMU binfmt
   image and the BuildKit image that builds and pushes the layer are pinned by
-  digest in `release.yaml`.
+  digest in `release.yaml`. Dependabot proposes updates for the Dockerfile's
+  base images, not for these two pins. To bump one, resolve the new tag's
+  digest (`crane digest <image>:<tag>`) and update the tag and the digest
+  together.
 - The actions both workflows use are pinned by commit SHA, with the version in
   a trailing comment; the organization's workflow security scan (zizmor)
   requires it. To bump one, resolve the new tag's commit (`git ls-remote --tags

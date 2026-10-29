@@ -44,8 +44,22 @@ class LoopRunner:
     def loop(self) -> asyncio.AbstractEventLoop:
         return self._loop
 
+    def on_loop_thread(self) -> bool:
+        """True when the caller runs on this runner's loop thread."""
+        return threading.current_thread() is self._thread
+
     def run(self, coro: Coroutine[Any, Any, T], timeout: float | None = None) -> T:
-        """Run a coroutine on the background event loop and block for the result."""
+        """Run a coroutine on the background event loop and block for the result.
+
+        Raises RuntimeError on the loop thread itself: blocking there would
+        wait for a loop that cannot advance (use ``submit`` and do not wait).
+        """
+        if self.on_loop_thread():
+            coro.close()
+            raise RuntimeError(
+                "LoopRunner.run called from its own loop thread; it would deadlock. "
+                "Use submit() without waiting for the result."
+            )
         return self.submit(coro).result(timeout=timeout)
 
     def submit(self, coro: Coroutine[Any, Any, T]) -> concurrent.futures.Future[T]:

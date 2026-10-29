@@ -137,13 +137,192 @@ type ErrorCount struct {
 	Count int    `json:"count"`
 }
 
-// Summarize reads JSONL events and builds the report.
+type statKey struct{ event, name string }
+
+// Builder folds a stream of events into a Report without materializing the full
+// event slice in memory.
+type Builder struct {
+	rep        Report
+	durs       map[statKey][]float64
+	failed     map[statKey]int
+	retried    map[statKey]int
+	unresolved map[string]string
+	order      []statKey
+	steps      map[int]*StepStat
+	wakes      map[int][]float64
+	barriers   map[int][]float64
+	parks      map[int][]float64
+	lives      map[int][]float64
+	runs       []float64
+	labels     labelUnion
+	errs       map[string]int
+}
+
+// NewBuilder returns a streaming report Builder.
+func NewBuilder() *Builder {
+	return &Builder{
+		durs:       map[statKey][]float64{},
+		failed:     map[statKey]int{},
+		retried:    map[statKey]int{},
+		unresolved: map[string]string{},
+		steps:      map[int]*StepStat{},
+		wakes:      map[int][]float64{},
+		barriers:   map[int][]float64{},
+		parks:      map[int][]float64{},
+		lives:      map[int][]float64{},
+		labels:     labelUnion{},
+		errs:       map[string]int{},
+	}
+}
+
+// Add folds one event into the Builder.
+func (b *Builder) Add(e Event) {
+	if b.rep.RunID == "" {
+		b.rep.RunID = e.RunID
+	}
+	k := statKey{e.Event, ""}
+	if e.Event == EventStep || e.Event == EventPark || e.Event == EventTask {
+		k.name = e.Name // a task's name is its trajectory, so a mix gets a row each
+	}
+	if _, ok := b.durs[k]; !ok {
+		b.order = append(b.order, k)
+		b.durs[k] = nil
+	}
+	if e.Attempts > 1 {
+		b.retried[k]++
+	}
+	if e.Event == EventStep && e.Reward != nil && *e.Reward == 0 {
+		if _, seen := b.unresolved[e.Instance]; !seen {
+			if e.Detail != "" {
+				b.unresolved[e.Instance] = e.Detail
+			} else {
+				b.unresolved[e.Instance] = verdict(e.Tail)
+			}
+		}
+	}
+	if e.OK {
+		b.durs[k] = append(b.durs[k], e.DurMS)
+	} else {
+		b.failed[k]++
+		if e.Err != "" {
+			b.errs[e.Err]++
+		}
+	}
+	switch e.Event {
+	case EventRun:
+		b.rep.Reps++
+		b.rep.Runs = append(b.rep.Runs, e.RunID)
+		if b.rep.Mode == "" {
+			b.rep.Mode = e.Name
+		}
+		b.runs = append(b.runs, e.DurMS)
+		b.labels.add(e.Labels)
+	case EventTask:
+		b.rep.Tasks++
+		if !e.OK {
+			b.rep.Failed++
+		}
+		if e.Reward != nil && *e.Reward == 1 {
+			b.rep.Rewarded++
+		}
+		if e.Step > 0 {
+			s := stepStat(b.steps, e.Step)
+			s.Tasks++
+			if !e.OK {
+				s.Failed++
+			}
+			if e.Reward != nil && *e.Reward == 1 {
+				s.Rewarded++
+			}
+		}
+	case EventBarrier:
+		stepStat(b.steps, e.Step)
+		b.barriers[e.Step] = append(b.barriers[e.Step], e.DurMS)
+		b.lives[e.Step] = append(b.lives[e.Step], float64(e.Count))
+	case EventPark:
+		stepStat(b.steps, e.Step)
+		b.parks[e.Step] = append(b.parks[e.Step], e.DurMS)
+	case EventWake:
+		if e.OK {
+			b.wakes[e.Step] = append(b.wakes[e.Step], e.DurMS)
+		}
+	}
+}
+
+// Finish computes exact percentiles over the accumulated durations and returns
+// the finalized Report.
+func (b *Builder) Finish() *Report {
+	rep := b.rep
+	if rep.Tasks > 0 {
+		rep.RewardRate = float64(rep.Rewarded) / float64(rep.Tasks)
+	}
+	rep.RunMS = median(b.runs)
+	rep.Labels = b.labels.merged()
+	for _, k := range b.order {
+		d := b.durs[k]
+		sort.Float64s(d)
+		rep.Stats = append(rep.Stats, Stat{
+			Event:   k.event,
+			Name:    k.name,
+			Count:   len(d) + b.failed[k],
+			Failed:  b.failed[k],
+			P50MS:   percentile(d, 0.50),
+			P95MS:   percentile(d, 0.95),
+			MaxMS:   percentile(d, 1),
+			Retried: b.retried[k],
+		})
+	}
+	for step, s := range b.steps {
+		w := b.wakes[step]
+		sort.Float64s(w)
+		cp := *s
+		cp.WakeP50MS = percentile(w, 0.5)
+		cp.WakeP95MS = percentile(w, 0.95)
+		cp.BarrierMS = median(b.barriers[step])
+		cp.ParkMS = median(b.parks[step])
+		cp.Live = 0
+		for _, n := range b.lives[step] {
+			cp.Live += int(n)
+		}
+		rep.Steps = append(rep.Steps, cp)
+	}
+	sort.Slice(rep.Steps, func(i, j int) bool { return rep.Steps[i].Step < rep.Steps[j].Step })
+	for msg, n := range b.errs {
+		rep.Errors = append(rep.Errors, ErrorCount{Err: msg, Count: n})
+	}
+	for inst, why := range b.unresolved {
+		rep.Unresolved = append(rep.Unresolved, Unresolved{Instance: inst, Reason: why})
+	}
+	sort.Slice(rep.Unresolved, func(i, j int) bool { return rep.Unresolved[i].Instance < rep.Unresolved[j].Instance })
+	sort.Slice(rep.Errors, func(i, j int) bool {
+		if rep.Errors[i].Count != rep.Errors[j].Count {
+			return rep.Errors[i].Count > rep.Errors[j].Count
+		}
+		return rep.Errors[i].Err < rep.Errors[j].Err
+	})
+	return &rep
+}
+
+// Summarize streams JSONL events from r into a Builder and returns the report.
 func Summarize(r io.Reader) (*Report, error) {
-	events, err := ReadEvents(r)
-	if err != nil {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 1<<20), 16<<20)
+	b := NewBuilder()
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var e Event
+		if err := json.Unmarshal(line, &e); err != nil {
+			return nil, fmt.Errorf("parse event: %w", err)
+		}
+		b.Add(e)
+	}
+	if err := sc.Err(); err != nil {
 		return nil, err
 	}
-	return Build(events), nil
+	return b.Finish(), nil
 }
 
 // ReadEvents reads a JSONL events file.
@@ -170,155 +349,23 @@ func ReadEvents(r io.Reader) ([]Event, error) {
 
 // Build computes the report from events in memory.
 func Build(events []Event) *Report {
-	rep := &Report{}
-	type key struct{ event, name string }
-	durs := map[key][]float64{}
-	failed := map[key]int{}
-	retried := map[key]int{}
-	unresolved := map[string]string{}
-	var order []key
-	steps := map[int]*StepStat{}
-	wakes := map[int][]float64{}
-	// Per step, one value per run: a report built over the merged events of
-	// several runs (report -arm) takes the median of durations, which is the
-	// value itself for one run, and the sum of counts, as the task counts
-	// and the event rows' n are sums. The run durations and labels pool the
-	// same way.
-	barriers := map[int][]float64{}
-	parks := map[int][]float64{}
-	lives := map[int][]float64{}
-	var runs []float64
-	labels := labelUnion{}
-	errs := map[string]int{}
-
+	b := NewBuilder()
 	for _, e := range events {
-		if rep.RunID == "" {
-			rep.RunID = e.RunID
-		}
-		k := key{e.Event, ""}
-		if e.Event == EventStep || e.Event == EventPark || e.Event == EventTask {
-			k.name = e.Name // a task's name is its trajectory, so a mix gets a row each
-		}
-		if _, ok := durs[k]; !ok {
-			order = append(order, k)
-			durs[k] = nil
-		}
-		if e.Attempts > 1 {
-			retried[k]++
-		}
-		if e.Event == EventStep && e.Reward != nil && *e.Reward == 0 {
-			if _, seen := unresolved[e.Instance]; !seen {
-				unresolved[e.Instance] = verdict(e.Tail)
-			}
-		}
-		if e.OK {
-			durs[k] = append(durs[k], e.DurMS)
-		} else {
-			failed[k]++
-			if e.Err != "" {
-				errs[e.Err]++
-			}
-		}
-		switch e.Event {
-		case EventRun:
-			rep.Reps++
-			rep.Runs = append(rep.Runs, e.RunID)
-			if rep.Mode == "" {
-				rep.Mode = e.Name
-			}
-			runs = append(runs, e.DurMS)
-			labels.add(e.Labels)
-		case EventTask:
-			rep.Tasks++
-			if !e.OK {
-				rep.Failed++
-			}
-			if e.Reward != nil && *e.Reward == 1 {
-				rep.Rewarded++
-			}
-			if e.Step > 0 {
-				s := stepStat(steps, e.Step)
-				s.Tasks++
-				if !e.OK {
-					s.Failed++
-				}
-				if e.Reward != nil && *e.Reward == 1 {
-					s.Rewarded++
-				}
-			}
-		case EventBarrier:
-			stepStat(steps, e.Step)
-			barriers[e.Step] = append(barriers[e.Step], e.DurMS)
-			lives[e.Step] = append(lives[e.Step], float64(e.Count))
-		case EventPark:
-			stepStat(steps, e.Step)
-			parks[e.Step] = append(parks[e.Step], e.DurMS)
-		case EventWake:
-			if e.OK {
-				wakes[e.Step] = append(wakes[e.Step], e.DurMS)
-			}
-		}
+		b.Add(e)
 	}
-	if rep.Tasks > 0 {
-		rep.RewardRate = float64(rep.Rewarded) / float64(rep.Tasks)
-	}
-	rep.RunMS = median(runs)
-	rep.Labels = labels.merged()
-	for _, k := range order {
-		d := durs[k]
-		sort.Float64s(d)
-		rep.Stats = append(rep.Stats, Stat{Event: k.event, Name: k.name, Count: len(d) + failed[k], Failed: failed[k],
-			P50MS: percentile(d, 0.50), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1), Retried: retried[k]})
-	}
-	for step, s := range steps {
-		w := wakes[step]
-		sort.Float64s(w)
-		s.WakeP50MS = percentile(w, 0.5)
-		s.WakeP95MS = percentile(w, 0.95)
-		s.BarrierMS = median(barriers[step])
-		s.ParkMS = median(parks[step])
-		for _, n := range lives[step] {
-			s.Live += int(n)
-		}
-		rep.Steps = append(rep.Steps, *s)
-	}
-	sort.Slice(rep.Steps, func(i, j int) bool { return rep.Steps[i].Step < rep.Steps[j].Step })
-	for msg, n := range errs {
-		rep.Errors = append(rep.Errors, ErrorCount{Err: msg, Count: n})
-	}
-	for inst, why := range unresolved {
-		rep.Unresolved = append(rep.Unresolved, Unresolved{Instance: inst, Reason: why})
-	}
-	sort.Slice(rep.Unresolved, func(i, j int) bool { return rep.Unresolved[i].Instance < rep.Unresolved[j].Instance })
-	sort.Slice(rep.Errors, func(i, j int) bool {
-		if rep.Errors[i].Count != rep.Errors[j].Count {
-			return rep.Errors[i].Count > rep.Errors[j].Count
-		}
-		return rep.Errors[i].Err < rep.Errors[j].Err
-	})
-	return rep
+	return b.Finish()
 }
 
 // verdict extracts the grader's verdict from the end of a reward step's
 // output: "invalid run", "f2p A/B p2p C/D", or "reward 0" when the output
 // does not end in the grader's JSON line.
 func verdict(tail string) string {
-	i := strings.LastIndex(tail, `{"valid"`)
-	if i < 0 {
-		return "reward 0"
+	if a := AdapterFor(DefaultKind); a != nil && a.Grader() != nil {
+		if _, detail, err := a.Grader().Parse([]byte(tail)); err == nil && detail != "" {
+			return detail
+		}
 	}
-	var g struct {
-		Valid bool   `json:"valid"`
-		F2P   string `json:"f2p"`
-		P2P   string `json:"p2p"`
-	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(tail[i:])), &g); err != nil {
-		return "reward 0"
-	}
-	if !g.Valid {
-		return "invalid run"
-	}
-	return fmt.Sprintf("f2p %s p2p %s", g.F2P, g.P2P)
+	return "reward 0"
 }
 
 // WriteExclusions writes the unresolved instances in the exclude-file format:

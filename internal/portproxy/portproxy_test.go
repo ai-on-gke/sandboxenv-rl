@@ -42,13 +42,16 @@ type recordingRouter struct {
 	*fakerouter.Router
 	mu       sync.Mutex
 	connects []string
+	hold     time.Duration // park each CONNECT this long before answering
 }
 
 func (r *recordingRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodConnect {
 		r.mu.Lock()
 		r.connects = append(r.connects, req.Header.Get(ate.TargetActorHeader)+" "+req.Host)
+		hold := r.hold
 		r.mu.Unlock()
+		time.Sleep(hold) // Substrate's router parks a CONNECT for a resuming actor
 	}
 	r.Router.ServeHTTP(w, req)
 }
@@ -980,6 +983,186 @@ func TestConnectRejectedCertificate(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("took %s; the wake budget must not apply to a rejected certificate", elapsed)
+	}
+}
+
+// http.Transport dials with a context that outlives the request. A caller
+// that gives up must still end the wake loop: no CONNECT after it left.
+func TestCancelledRequestStopsTheWakeLoop(t *testing.T) {
+	s := newSetup(t)
+	p := mustNew(t, portproxy.Options{ConnectAddr: s.routerAddr, DefaultAtespace: "ate-env", HandshakeTimeout: 5 * time.Second, WakeBudget: 30 * time.Second})
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+	s.router.RegisterPort("asleep", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	s.router.Running = func(string) bool { return false }
+
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+			for k, v := range target("asleep", 8000) {
+				req.Header.Set(k, v)
+			}
+			if resp, err := (&http.Client{Timeout: 300 * time.Millisecond}).Do(req); err == nil {
+				resp.Body.Close()
+				t.Errorf("got %d, want the client's own timeout", resp.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+	time.Sleep(100 * time.Millisecond) // a CONNECT in flight at the cancel ends
+	before := s.router.connectCount()
+	time.Sleep(3 * time.Second) // longer than the 2s maximum retry interval
+	if after := s.router.connectCount(); after != before {
+		t.Errorf("router saw %d CONNECTs after the callers left (%d before, %d after), want none", after-before, before, after)
+	}
+}
+
+// A router that accepts the connection and never answers the CONNECT holds
+// an attempt only until the dial deadline, not for the whole
+// HandshakeTimeout, and the request ends as a spent wake budget: 503.
+func TestStalledConnectEndsWithTheBudget(t *testing.T) {
+	portproxy.SetRouterParkMargin(t, 0) // the deadline is then the budget plus one retry interval
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var held []net.Conn
+	go func() {
+		for {
+			c, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		lis.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range held {
+			c.Close()
+		}
+	})
+	p := mustNew(t, portproxy.Options{ConnectAddr: lis.Addr().String(), DefaultAtespace: "ate-env", HandshakeTimeout: 20 * time.Second, WakeBudget: 300 * time.Millisecond})
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+	for k, v := range target("stalled", 8000) {
+		req.Header.Set(k, v)
+	}
+	start := time.Now()
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("request did not end within 10s with a stalled CONNECT: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("got %d, want 503 (the wake budget is spent)", resp.StatusCode)
+	}
+	if took := time.Since(start); took > 4*time.Second {
+		t.Errorf("took %s, want at most the 300ms budget plus the 2s retry interval", took)
+	}
+}
+
+// Substrate's router parks a CONNECT for a resuming actor (up to 5 s by
+// default) before it answers 503. When the wake budget ends during that
+// last parked attempt, the request still gets the 503 of a spent budget, not
+// a 504 from a cut CONNECT; and an actor that wakes during that attempt is
+// served.
+func TestParkedLastAttemptAtTheBudgetEnd(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		wakeAt time.Duration // 0: never
+		status int
+	}{
+		{"never wakes", 0, http.StatusServiceUnavailable},
+		{"wakes during the last parked attempt", 5 * time.Second, http.StatusOK},
+	} {
+		s := newSetup(t)
+		s.router.mu.Lock()
+		s.router.hold = 3 * time.Second
+		s.router.mu.Unlock()
+		p := mustNew(t, portproxy.Options{ConnectAddr: s.routerAddr, DefaultAtespace: "ate-env", HandshakeTimeout: 30 * time.Second, WakeBudget: 4 * time.Second})
+		srv := httptest.NewServer(p)
+		t.Cleanup(srv.Close)
+		s.router.RegisterPort("parked", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "awake") }))
+		start := time.Now()
+		s.router.Running = func(string) bool { return tc.wakeAt > 0 && time.Since(start) >= tc.wakeAt }
+		// Attempt 1 is parked 0-3 s and refused; attempt 2 starts at 3.2 s,
+		// inside the 4 s budget, and is parked until 6.2 s, after it.
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+		for k, v := range target("parked", 8000) {
+			req.Header.Set(k, v)
+		}
+		resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != tc.status {
+			t.Errorf("%s: got %d %q after %s, want %d", tc.name, resp.StatusCode, b, time.Since(start).Round(100*time.Millisecond), tc.status)
+		}
+	}
+}
+
+// Each request waits on its own dial: a caller that leaves stops only its
+// own, and a second request for the same port is served when the
+// environment wakes.
+func TestSecondRequestSurvivesTheFirstOnesCancel(t *testing.T) {
+	s := newSetup(t)
+	p := mustNew(t, portproxy.Options{ConnectAddr: s.routerAddr, DefaultAtespace: "ate-env", HandshakeTimeout: 5 * time.Second, WakeBudget: 30 * time.Second})
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+	s.router.RegisterPort("waking", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "awake") }))
+	var mu sync.Mutex
+	var wakeAt time.Time // zero: asleep
+	s.router.Running = func(string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return !wakeAt.IsZero() && time.Now().After(wakeAt)
+	}
+	newReq := func() *http.Request {
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+		for k, v := range target("waking", 8000) {
+			req.Header.Set(k, v)
+		}
+		return req
+	}
+	type result struct {
+		code int
+		body string
+		err  error
+	}
+	second := make(chan result, 1)
+	go func() {
+		resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(newReq())
+		if err != nil {
+			second <- result{err: err}
+			return
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		second <- result{code: resp.StatusCode, body: string(b)}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if resp, err := (&http.Client{Timeout: 300 * time.Millisecond}).Do(newReq()); err == nil {
+		resp.Body.Close()
+		t.Fatalf("first request got %d, want its own timeout", resp.StatusCode)
+	}
+	mu.Lock()
+	wakeAt = time.Now().Add(1500 * time.Millisecond) // wakes after the first caller left
+	mu.Unlock()
+	r := <-second
+	if r.err != nil || r.code != http.StatusOK || r.body != "awake" {
+		t.Errorf("second request: %d %q %v, want 200 \"awake\" after the wake", r.code, r.body, r.err)
 	}
 }
 

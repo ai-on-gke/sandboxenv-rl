@@ -44,6 +44,7 @@ on:
       - uv.lock
       - Dockerfile.ci
       - .dockerignore
+      - .coveragerc
       - .github/workflows/ci-devenv.yaml
   push:
     branches: [main]

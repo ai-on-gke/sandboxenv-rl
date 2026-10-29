@@ -216,10 +216,14 @@ class Client:
             client_kind=True,
         )
 
-    async def close(self) -> None:
-        """Release the client's resources (closes the channel if owned)."""
+    async def close(self, grace: float | None = None) -> None:
+        """Release the client's resources (closes the channel if owned).
+
+        With ``grace``, calls in progress get up to that many seconds to
+        finish; without it they are cancelled. New calls fail at once.
+        """
         if self._owns_channel:
-            await self._channel.close()
+            await self._channel.close(grace)
 
     async def create(
         self,

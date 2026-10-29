@@ -64,6 +64,23 @@ class BackendDriver(ABC):
     def unwarm_pool(self, template_id: str, rootfs_image: str | None = None) -> None:
         """Scale down warm pool for the template to 0."""
 
+    def resize_pool(
+        self,
+        template_id: str,
+        replicas: int,
+        wait: bool = True,
+        rootfs_image: str | None = None,
+    ) -> None:
+        """Set the warm pool to exactly ``replicas``: grow by provisioning, shrink
+        by deleting idle warm replicas, never touching claimed ones. Drivers
+        that cannot shrink raise NotImplementedError; the fleet then falls back
+        to warm_pool for growth and unwarm_pool for zero."""
+        raise NotImplementedError
+
+    def pool_size(self, template_id: str, rootfs_image: str | None = None) -> int | None:
+        """Idle warm replicas in the pool, or None when the driver cannot tell."""
+        return None
+
     @abstractmethod
     def acquire(
         self,

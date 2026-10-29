@@ -16,14 +16,17 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-substrate/env/internal/benchmarking/swebench"
 )
@@ -94,6 +97,114 @@ func TestReportCmdRejectsFilesAfterFlags(t *testing.T) {
 	err := reportCmd([]string{"a.jsonl", "-json", "o.json", "b.jsonl"}, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "before the flags") || !strings.Contains(err.Error(), "b.jsonl") {
 		t.Fatalf("err = %v, want the files-before-flags error naming b.jsonl", err)
+	}
+}
+
+type e2eFakeBackend struct{}
+
+func (e2eFakeBackend) Create(_ context.Context, id, _ string) (swebench.Sandbox, error) {
+	return e2eFakeSandbox{id: id}, nil
+}
+
+func (e2eFakeBackend) Delete(_ context.Context, _ string) error { return nil }
+
+type e2eFakeSandbox struct {
+	id string
+}
+
+func (s e2eFakeSandbox) Run(_ context.Context, command string, _ time.Duration) (swebench.Result, error) {
+	if strings.Contains(command, "/tmp/grade.py") {
+		return swebench.Result{
+			ExitCode: 0,
+			Stdout:   `{"valid":true,"resolved":true,"f2p":"1/1","p2p":"2/2"}` + "\n",
+		}, nil
+	}
+	if strings.HasPrefix(command, "echo ") {
+		return swebench.Result{
+			ExitCode: 0,
+			Stdout:   strings.TrimPrefix(command, "echo ") + "\n",
+		}, nil
+	}
+	return swebench.Result{ExitCode: 0, Stdout: "ok\n"}, nil
+}
+
+func (e2eFakeSandbox) WriteFile(_ context.Context, _ string, _ []byte, _ fs.FileMode) error {
+	return nil
+}
+
+func (e2eFakeSandbox) Suspend(_ context.Context) error { return nil }
+func (e2eFakeSandbox) Delete(_ context.Context) error  { return nil }
+
+func TestEndToEndSWEBenchAndCommandDatasets(t *testing.T) {
+	const digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	dir := t.TempDir()
+
+	testBackendOverride = e2eFakeBackend{}
+	t.Cleanup(func() { testBackendOverride = nil })
+
+	// 1. End-to-end SWE-bench manifest run + report.
+	sweManifest := filepath.Join(dir, "swebench.jsonl")
+	sweRows := strings.Join([]string{
+		`{"instance_id":"astropy__astropy-1","repo":"astropy/astropy","image":"reg/swe@` + digest + `","patch":"diff","eval_script":"#!/bin/sh\nexit 0","log_parser":"parse_log_pytest"}`,
+		`{"instance_id":"django__django-2","repo":"django/django","image":"reg/swe@` + digest + `","patch":"diff","eval_script":"#!/bin/sh\nexit 0","log_parser":"parse_log_django"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(sweManifest, []byte(sweRows), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sweEvents := filepath.Join(dir, "swe-events.jsonl")
+	sweSummary := filepath.Join(dir, "swe-summary.json")
+	if err := runCmd([]string{
+		"-dataset", sweManifest,
+		"-mode", "eval",
+		"-width", "2",
+		"-run-id", "swe-e2e",
+		"-out", sweEvents,
+	}); err != nil {
+		t.Fatalf("runCmd(swebench): %v", err)
+	}
+	if err := reportCmd([]string{sweEvents, "-json", sweSummary}); err != nil {
+		t.Fatalf("reportCmd(swebench): %v", err)
+	}
+	repSWE, err := summarizeFile(sweEvents)
+	if err != nil {
+		t.Fatalf("summarizeFile(sweEvents): %v", err)
+	}
+	if repSWE.Tasks != 2 || repSWE.Failed != 0 || repSWE.Rewarded != 2 || repSWE.RewardRate != 1.0 {
+		t.Fatalf("unexpected SWE-bench report: %+v", repSWE)
+	}
+
+	// 2. End-to-end Command manifest run + report.
+	cmdManifest := filepath.Join(dir, "command.jsonl")
+	cmdRows := strings.Join([]string{
+		`{"kind":"command","instance_id":"cmd-alpha","image":"reg/cmd@` + digest + `","command":"echo alpha-ok","setup_command":"mkdir -p /tmp/work","reset_command":"rm -rf /tmp/work/*","expected_stdout":"alpha-ok","expected_exit_code":0}`,
+		`{"kind":"command","instance_id":"cmd-beta","image":"reg/cmd@` + digest + `","command":"echo beta-ok","expected_stdout":"beta-ok","expected_exit_code":0}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(cmdManifest, []byte(cmdRows), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmdEvents := filepath.Join(dir, "cmd-events.jsonl")
+	cmdSummary := filepath.Join(dir, "cmd-summary.json")
+	if err := runCmd([]string{
+		"-dataset", cmdManifest,
+		"-mode", "steps",
+		"-rollouts", "1",
+		"-steps", "2",
+		"-park", "suspend",
+		"-width", "2",
+		"-run-id", "cmd-e2e",
+		"-out", cmdEvents,
+	}); err != nil {
+		t.Fatalf("runCmd(command): %v", err)
+	}
+	if err := reportCmd([]string{cmdEvents, "-json", cmdSummary}); err != nil {
+		t.Fatalf("reportCmd(command): %v", err)
+	}
+	repCmd, err := summarizeFile(cmdEvents)
+	if err != nil {
+		t.Fatalf("summarizeFile(cmdEvents): %v", err)
+	}
+	if repCmd.Tasks != 4 || repCmd.Failed != 0 || repCmd.Rewarded != 4 || repCmd.RewardRate != 1.0 {
+		t.Fatalf("unexpected Command report: %+v", repCmd)
 	}
 }
 

@@ -54,18 +54,29 @@ func (a *authFlags) register(cmd *cobra.Command, persistent bool) {
 	if persistent {
 		fs = cmd.PersistentFlags()
 	}
-	fs.StringVar(&a.token, "auth-token", envOr("SUBSTRATE_ENV_AUTH_TOKEN", ""), "bearer token for ate-env-api; the value shows in ps output and shell history, thus prefer SUBSTRATE_ENV_AUTH_TOKEN or --auth-token-file")
+	// The default stays empty: cobra prints a flag default in --help, and a
+	// default read from SUBSTRATE_ENV_AUTH_TOKEN would print the token.
+	// resolve reads the variable at run time.
+	fs.StringVar(&a.token, "auth-token", "", "bearer token for ate-env-api (default: $"+authTokenEnv+"); the value shows in ps output and shell history, thus prefer "+authTokenEnv+" or --auth-token-file")
 	fs.StringVar(&a.file, "auth-token-file", "", "file that holds the bearer token for ate-env-api; surrounding whitespace is ignored")
 }
 
+// authTokenEnv holds the caller token when neither flag is set.
+const authTokenEnv = "SUBSTRATE_ENV_AUTH_TOKEN"
+
 // resolve returns the token from --auth-token-file when it is set, otherwise
-// from --auth-token or SUBSTRATE_ENV_AUTH_TOKEN. The two flags exclude each
-// other; the file flag takes precedence over the environment variable.
+// from --auth-token, otherwise from SUBSTRATE_ENV_AUTH_TOKEN. The two flags
+// exclude each other; each flag takes precedence over the environment
+// variable.
 func (a *authFlags) resolve(cmd *cobra.Command) (string, error) {
+	tokenSet := cmd.Flags().Changed("auth-token")
 	if a.file == "" {
-		return a.token, nil
+		if tokenSet {
+			return a.token, nil
+		}
+		return os.Getenv(authTokenEnv), nil
 	}
-	if cmd.Flags().Changed("auth-token") {
+	if tokenSet {
 		return "", errors.New("--auth-token and --auth-token-file cannot be used together")
 	}
 	b, err := os.ReadFile(a.file)

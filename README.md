@@ -580,7 +580,10 @@ URL that lands in a log never shows the token. The capability must be the reques
 `Authorization` credential: a second `Authorization` field or a comma-separated value next to it
 gets 400. The API never forwards a capability, also when it does not check it. Capabilities signed
 with a token stop working when the token rotates; a token rotation is also the only way to revoke a
-leaked capability before it expires.
+leaked capability before it expires. The capability names an atespace, an id and a port, not one
+environment instance: when the caller deletes the environment and creates a new one with the same id,
+the capability opens the new environment too, until it expires. Give a capability the shortest expiry
+the client needs, and do not reuse an environment id while a capability for it can still be valid.
 
 **Browsers.** The path form refuses a state-changing request or a WebSocket handshake that a browser
 sends from a page of another origin, so a web page cannot drive a daemon through a `kubectl

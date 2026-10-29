@@ -16,14 +16,15 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/hostcheck"
-	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
-	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/yaml"
@@ -99,7 +100,10 @@ func TestBuildManifests(t *testing.T) {
 		t.Errorf("namespace label %s = %q, want \"true\" (ate-system admits API clients by it)", apiAccessLabel, got)
 	}
 
-	pool := objs[1].(*atev1alpha1.WorkerPool)
+	pool := objs[1].(*atev1.WorkerPool)
+	if pool.APIVersion != "ate.dev/v1" {
+		t.Errorf("workerpool apiVersion = %q, want ate.dev/v1", pool.APIVersion)
+	}
 	if pool.Namespace != cfg.namespace || pool.Name != "default-template-workerpool" {
 		t.Errorf("workerpool = %s/%s, want %s/default-template-workerpool", pool.Namespace, pool.Name, cfg.namespace)
 	}
@@ -128,7 +132,7 @@ func TestBuildManifests(t *testing.T) {
 		t.Fatalf("workerpool sandboxClasses = %+v, want exactly one", pool.Spec.SandboxClasses)
 	}
 	sc := pool.Spec.SandboxClasses[0]
-	if sc.Name != atev1alpha1.SandboxClassGvisor || sc.ConfigRef == nil || sc.ConfigRef.Name != sandboxConfigName {
+	if sc.Name != atev1.SandboxClassGvisor || sc.ConfigRef == nil || sc.ConfigRef.Name != sandboxConfigName {
 		t.Errorf("workerpool sandboxClasses[0] = %+v, want gvisor with configRef %q", sc, sandboxConfigName)
 	}
 	sa := objs[2].(*corev1.ServiceAccount)
@@ -675,6 +679,105 @@ func TestBuildAPIDeploymentNoAuthTokenSecret(t *testing.T) {
 	}
 }
 
+// By default the API deployment carries no telemetry flags, env or ports:
+// the manifest is what it was before telemetry existed.
+func TestBuildManifestsTelemetryOffByDefault(t *testing.T) {
+	objs := buildManifests(testManifestConfig())
+	deployment := objs[3].(*appsv1.Deployment)
+	c := deployment.Spec.Template.Spec.Containers[0]
+	for _, a := range c.Args {
+		if strings.Contains(a, "tracing") || strings.Contains(a, "metrics") {
+			t.Errorf("default args carry %q", a)
+		}
+	}
+	// POD_NAMESPACE is always set (for the Host check); no OTEL_* variable is.
+	for _, e := range c.Env {
+		if strings.HasPrefix(e.Name, "OTEL_") {
+			t.Errorf("default container env carries %s", e.Name)
+		}
+	}
+	if len(c.Ports) != 1 || len(deployment.Spec.Template.Annotations) != 0 {
+		t.Errorf("default container ports %v, pod annotations %v; want the API port, none", c.Ports, deployment.Spec.Template.Annotations)
+	}
+}
+
+// The telemetry flags render --enable-tracing, --metrics-listen-addr, the
+// OTLP env, a "metrics" container and Service port, and scrape annotations.
+func TestBuildManifestsTelemetry(t *testing.T) {
+	cfg := testManifestConfig()
+	cfg.enableTracing = true
+	cfg.otlpEndpoint = "http://otel-collector.ate-env-telemetry:4317"
+	cfg.otlpInsecure = true
+	cfg.metricsPort = 9090
+	objs := buildManifests(cfg)
+
+	deployment := objs[3].(*appsv1.Deployment)
+	c := deployment.Spec.Template.Spec.Containers[0]
+	args := strings.Join(c.Args, " ")
+	for _, want := range []string{"-enable-tracing", "-metrics-listen-addr=:9090", "-listen 0.0.0.0:7777"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("args %q lack %q", args, want)
+		}
+	}
+	env := map[string]string{}
+	for _, e := range c.Env {
+		env[e.Name] = e.Value
+	}
+	if env["OTEL_EXPORTER_OTLP_ENDPOINT"] != cfg.otlpEndpoint || env["OTEL_EXPORTER_OTLP_INSECURE"] != "true" {
+		t.Errorf("env = %v, want the OTLP endpoint and insecure=true", env)
+	}
+	if len(c.Ports) != 2 || c.Ports[1].Name != "metrics" || c.Ports[1].ContainerPort != 9090 {
+		t.Errorf("container ports = %+v, want the API port and metrics 9090", c.Ports)
+	}
+	ann := deployment.Spec.Template.Annotations
+	if ann["prometheus.io/scrape"] != "true" || ann["prometheus.io/port"] != "9090" || ann["prometheus.io/path"] != "/metrics" {
+		t.Errorf("pod annotations = %v, want prometheus.io scrape on 9090 /metrics", ann)
+	}
+
+	service := objs[4].(*corev1.Service)
+	if len(service.Spec.Ports) != 2 {
+		t.Fatalf("service ports = %+v, want api and metrics", service.Spec.Ports)
+	}
+	api, metrics := service.Spec.Ports[0], service.Spec.Ports[1]
+	if api.Name != "api" || api.Port != 7777 {
+		t.Errorf("service api port = %+v, want api 7777", api)
+	}
+	if metrics.Name != "metrics" || metrics.Port != 9090 || metrics.TargetPort.String() != "metrics" {
+		t.Errorf("service metrics port = %+v, want metrics 9090 -> metrics", metrics)
+	}
+}
+
+func TestManifestCommandTelemetryFlags(t *testing.T) {
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{
+		"--api-image=example.com/api@sha256:cccc",
+		"--worker-image=example.com/worker@sha256:bbbb",
+		"--enable-tracing",
+		"--otlp-endpoint=http://otel-collector.ate-env-telemetry:4317",
+		"--otlp-insecure",
+		"--metrics-port=9090",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute manifest: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"- -enable-tracing",
+		"- -metrics-listen-addr=:9090",
+		"name: OTEL_EXPORTER_OTLP_ENDPOINT",
+		"value: http://otel-collector.ate-env-telemetry:4317",
+		"name: OTEL_EXPORTER_OTLP_INSECURE",
+		"name: metrics",
+		"prometheus.io/scrape: \"true\"",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("manifest lacks %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestBuildAPIDeploymentAuthTokenSecret(t *testing.T) {
 	cfg := testManifestConfig()
 	cfg.authTokenSecret = "ate-env-caller-token"
@@ -713,6 +816,94 @@ func TestBuildAPIDeploymentAuthTokenSecret(t *testing.T) {
 	}
 	if !foundVol {
 		t.Errorf("volumes = %+v, want Secret volume for ate-env-caller-token", dep.Spec.Template.Spec.Volumes)
+	}
+}
+
+func envMap(c *ateapipb.Container) (map[string]string, []string) {
+	m := map[string]string{}
+	var order []string
+	for _, e := range c.GetEnv() {
+		m[e.GetName()] = e.GetValue()
+		order = append(order, e.GetName())
+	}
+	return m, order
+}
+
+func TestBuildTemplateEnv(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.env = []string{"OH_SESSION_API_KEYS_0=s3cret", "EMPTY=", "URL=http://x/?a=b"}
+	tmpl, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, order := envMap(tmpl.Containers[0])
+	if strings.Join(order, ",") != "PORT,OH_SESSION_API_KEYS_0,EMPTY,URL" {
+		t.Errorf("env order = %v, want PORT first, then the flags in order", order)
+	}
+	if got["PORT"] != "80" || got["OH_SESSION_API_KEYS_0"] != "s3cret" || got["EMPTY"] != "" || got["URL"] != "http://x/?a=b" {
+		t.Errorf("env = %v", got)
+	}
+
+	// A rootfs-image template keeps the variables: the sidecars that read them
+	// run there.
+	cfg.rootfsImage = "docker.io/library/python@sha256:" + testHex64
+	cfg.guestImage = "example.com/guest@sha256:" + testHex64
+	tmpl, err = buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := envMap(tmpl.Containers[0]); got["OH_SESSION_API_KEYS_0"] != "s3cret" {
+		t.Errorf("rootfs-image template env = %v, want the --env values", got)
+	}
+}
+
+func TestTemplateConfigRejectsBadEnv(t *testing.T) {
+	for _, env := range [][]string{
+		{"NOEQUALS"},
+		{"1BAD=x"},
+		{"BAD-NAME=x"},
+		{"=x"},
+		{"PORT=81"},
+		{"A=1", "A=2"},
+	} {
+		cfg := testTemplateConfig()
+		cfg.env = env
+		if err := cfg.validateEnv(); err == nil {
+			t.Errorf("env %q: want error, got nil", env)
+		}
+	}
+}
+
+func TestManifestTemplateCommandEnv(t *testing.T) {
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{
+		"template",
+		"--guest-image=example.com/guest@sha256:aaaa",
+		"--snapshots-bucket=gs://bucket/prefix/",
+		"--env=OH_SESSION_API_KEYS_0=k",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "name: OH_SESSION_API_KEYS_0\n    value: k") {
+		t.Errorf("output lacks the --env variable:\n%s", out)
+	}
+}
+
+func TestManifestTemplateCommandRejectsBadEnv(t *testing.T) {
+	cmd := newManifestCommand()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{
+		"template",
+		"--guest-image=example.com/guest@sha256:aaaa",
+		"--snapshots-bucket=gs://bucket/prefix/",
+		"--env=PORT=81",
+	})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--env PORT") {
+		t.Errorf("execute with --env PORT=81: want the --env error, got %v", err)
 	}
 }
 
@@ -838,6 +1029,18 @@ func TestBuildAPIDeploymentRouterTLS(t *testing.T) {
 	for _, v := range dep.Spec.Template.Spec.Volumes {
 		if v.Name == "podidentity" || v.Name == "servicedns-ca" {
 			t.Errorf("volume %s present with router TLS off", v.Name)
+		}
+	}
+}
+
+func TestManifestRejectsBadMetricsPort(t *testing.T) {
+	for _, port := range []string{"--metrics-port=7777", "--metrics-port=70000", "--metrics-port=-1"} {
+		cmd := newManifestCommand()
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs([]string{"--api-image=example.com/api@sha256:cccc", "--worker-image=example.com/worker@sha256:bbbb", port})
+		if err := cmd.Execute(); err == nil {
+			t.Errorf("%s: manifest succeeded, want an error", port)
 		}
 	}
 }

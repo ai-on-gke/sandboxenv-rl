@@ -64,8 +64,13 @@ class FakeAteEnv:
     create_but_fail: bool = False  # record the env, then fail the call
     upstreams: dict[int, str] = field(default_factory=dict)  # port -> host:port
     unhealthy_polls: int = 0  # answer this many /health requests with 503 first
+    new_status: int | None = None  # status of a created environment; RUNNING when unset
+    gets: int = 0  # GetEnvironment calls
+    get_delay: float = 0.0  # GetEnvironment answers this many seconds late
     api_token: str | None = None  # the proxy requires this bearer when set
-    refuse: tuple[int, str] | None = None  # answer every proxy request with this
+    # answer every proxy request with this: (status, body) or (status, body, headers)
+    refuse: tuple[int, str] | tuple[int, str, dict[str, str]] | None = None
+    refusals: int = 0  # proxy requests answered with refuse
     create_lands_after: float | None = None  # create succeeds this late, after the client gave up
     wakes: int = 0
     proxied: list[dict] = field(default_factory=list)
@@ -114,10 +119,14 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
             "atespace": request.atespace or DEFAULT_ATESPACE,
             "template": request.template.name or DEFAULT_TEMPLATE,
             "template_atespace": request.template.atespace or DEFAULT_ATESPACE,
-            "status": int(EnvironmentStatus.RUNNING),
+            "status": self.state.new_status if self.state.new_status is not None
+            else int(EnvironmentStatus.RUNNING),
         }
 
     async def GetEnvironment(self, request, context):
+        self.state.gets += 1
+        if self.state.get_delay:
+            await asyncio.sleep(self.state.get_delay)
         if request.id not in self.state.envs:
             await context.abort(grpc.StatusCode.NOT_FOUND, "no such env")
         return env_pb2.GetEnvironmentResponse(environment=self.state.env_pb(request.id))
@@ -190,6 +199,7 @@ def _handler(state: FakeAteEnv):
                 state.received.append({"method": self.command, "path": self.path,
                                        "headers": dict(self.headers.items())})
             if state.refuse is not None:
+                state.refusals += 1
                 self._reply(*state.refuse)
                 return None
             path, _, query = self.path.partition("?")
@@ -246,9 +256,11 @@ def _handler(state: FakeAteEnv):
                 return None
             return upstream, rest, drop
 
-        def _reply(self, code: int, text: str) -> None:
+        def _reply(self, code: int, text: str, headers: dict[str, str] | None = None) -> None:
             body = text.encode()
             self.send_response(code)
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)

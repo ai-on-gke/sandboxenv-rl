@@ -84,6 +84,18 @@ any image with glibc 2.31 or newer, configured by `--env`, is the
 (`AteEnvWorkspace`, compatible with OpenHands' `AgentSandboxWorkspace`) and the layer, with
 [`examples/openhands`](../../examples/openhands) driving it with OpenHands' own CodeAct agent.
 
+### NeMo runtime layer
+
+[`integrations/nemo-gym/layer`](../../integrations/nemo-gym/layer) is a
+complete layer of this shape: a relocatable CPython with NeMo Skills' local
+sandbox server and NeMo Gym's exec server installed, started with
+`--sidecar '/opt/nemo/python/bin/python3 -m nemo_runtime.sandbox_server --host 0.0.0.0 --port 6000'`
+and gated with `--sidecar-readyz http://127.0.0.1:6000/health`. The two NeMo
+servers check no credential of their own, because their clients cannot send
+one; the API token is their only protection. The NeMo Gym provider hands the
+port out as `endpoint()`; see
+[integrations/nemo-gym](../../integrations/nemo-gym/README.md#services-inside-the-sandbox-the-nemo-runtime-layer).
+
 ## Who can reach the second runtime
 
 - **Processes inside the environment** reach it at `127.0.0.1:<port>` right
@@ -120,11 +132,12 @@ any image with glibc 2.31 or newer, configured by `--env`, is the
 - **The runtime must listen on `0.0.0.0`.** The router reaches the port on
   the actor's address. A runtime bound to `127.0.0.1` serves only processes
   inside the environment, and requests from outside fail with 502.
-- **Nobody is authenticated on the way in.** `ate-env-api` forwards for any
-  caller that reaches its listener, to any port of any actor the router
-  serves. A runtime that executes commands or edits files must check its own
-  credential, as OpenSandbox's `execd` token and the OpenHands agent-server's
-  session key do. See the README section "Reaching a service inside an
+- **Only the API token is checked on the way in.** Without `-auth-token-file`,
+  `ate-env-api` forwards for any caller that reaches its listener; with it,
+  for any caller that has the token. Either way it reaches any port of any
+  actor the router serves. A runtime that executes commands or edits files
+  must check its own credential, as OpenSandbox's `execd` token and the
+  OpenHands agent-server's session key do. See the README section "Reaching a service inside an
   environment" for the browser checks and the flags.
 
 ## Suspend, resume and restarts

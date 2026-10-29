@@ -232,9 +232,9 @@ func TestReportArms(t *testing.T) {
 }
 
 func TestOwnLabels(t *testing.T) {
-	l := ownLabels("https://host/bucket/swebench.jsonl?X-Goog-Signature=secret", 4, "base", "lists/offline.txt", []string{"x", "y"}, []string{"a", "b"})
+	l := ownLabels("https://host/bucket/swebench.jsonl?X-Goog-Signature=secret", 4, "base", "lists/offline.txt", []string{"x", "y"}, []string{"a", "b"}, map[string]string{"READ_FILES": "10"})
 	want := map[string]string{"dataset": "swebench.jsonl", "connections": "4", "base_template": "base",
-		"exclude_file": "offline.txt@" + idsDigest([]string{"x", "y"}), "instances": "2@" + idsDigest([]string{"a", "b"})}
+		"exclude_file": "offline.txt@" + idsDigest([]string{"x", "y"}), "instances": "2@" + idsDigest([]string{"a", "b"}), "set.READ_FILES": "10"}
 	if !reflect.DeepEqual(l, want) {
 		t.Fatalf("labels = %v, want %v", l, want)
 	}
@@ -243,12 +243,22 @@ func TestOwnLabels(t *testing.T) {
 		t.Errorf("idsDigest: %s %s %s", idsDigest([]string{"a", "b"}), idsDigest([]string{"b", "a"}), idsDigest([]string{"a", "c"}))
 	}
 	for k := range l {
-		if !slices.Contains(swebench.LoaderLabelKeys, k) {
+		if !slices.Contains(swebench.LoaderLabelKeys, k) && !strings.HasPrefix(k, "set.") {
 			t.Errorf("label %s is not in LoaderLabelKeys, so report -arm would not compare it", k)
 		}
 	}
-	l = ownLabels("data/swebench.jsonl", 1, "t", "", nil, nil)
+	l = ownLabels("data/swebench.jsonl", 1, "t", "", nil, nil, nil)
 	if _, ok := l["exclude_file"]; ok || l["dataset"] != "swebench.jsonl" || len(l) != 3 {
 		t.Fatalf("labels without an exclude file or instances = %v", l)
+	}
+}
+
+func TestAssetsCmd(t *testing.T) {
+	var out bytes.Buffer
+	if err := assetsCmd([]string{"../../../internal/benchmarking/swebench/trajectories/swebench-gold.yaml"}, &out); err != nil || out.String() != "swebench-grade.py\n" {
+		t.Fatalf("trajectory-assets: %q, %v", out.String(), err)
+	}
+	if err := assetsCmd(nil, io.Discard); err == nil {
+		t.Fatal("trajectory-assets without a file must fail")
 	}
 }

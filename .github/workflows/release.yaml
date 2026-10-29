@@ -101,7 +101,12 @@ jobs:
           image: docker.io/tonistiigi/binfmt:qemu-v10.2.3-68@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
           platforms: arm64
 
+      # The docker-container builder runs BuildKit, which builds and pushes the
+      # signed layer; its image is pinned by digest, not the mutable
+      # buildx-stable-1 tag.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=docker.io/moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       - name: Build and push the OpenHands layer (by digest, no tag yet)
         id: layer

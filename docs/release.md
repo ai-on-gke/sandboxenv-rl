@@ -143,7 +143,8 @@ workflow's `GITHUB_TOKEN`, under the repository. Once:
 - The API image uses ko's default distroless base.
 - The OpenHands layer pins its base images by digest in its Dockerfile and its
   Python dependencies by hash in `layer/requirements.txt`. The QEMU binfmt
-  image the release job installs is pinned by digest in `release.yaml`.
+  image and the BuildKit image that builds and pushes the layer are pinned by
+  digest in `release.yaml`.
 - The actions both workflows use are pinned by commit SHA, with the version in
   a trailing comment; the organization's workflow security scan (zizmor)
   requires it. To bump one, resolve the new tag's commit (`git ls-remote --tags

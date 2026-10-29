@@ -324,9 +324,17 @@ cfg = FleetConfig(run_id=os.environ["JOB_PREFIX"])   # a DNS-1123 label
 fleet = SandboxFleet(cfg)                             # same run_id in every process
 ```
 
-Handles (`handle.run_id`), the run report's `environment` block and
-`teardown()` then all carry the job's id. Each process still releases only the
-environments it created.
+Handles (`handle.run_id`), the warm-pool environments that `setup()` and
+`warm_images()` create, `ate_env.run_id` on spans, and the run report's
+`environment` block then all carry the job's id. `"warm-pool"` is reserved: it
+is the run id of warm environments created by calling a driver's
+`warm_pool()` without one.
+
+The run id stays in the client. It is not sent to ate-env-api, and environment
+names (`sb-…`, `warm-…`) don't contain it. So `teardown()` still releases only
+the environments that this process created and tracks. An orchestrator can't
+reap a crashed worker's environments by run id. Reaping across processes needs
+server-side labels and listing in ate-env-api, which don't exist yet.
 
 ### Concurrency
 
@@ -340,6 +348,33 @@ results = await asyncio.gather(
     env.shell("make lint"),
     other_env.shell("make build"),
 )
+```
+
+### Grow the task list while the job runs
+
+`load_tasks()` replaces the fleet's tasks. A worker that is handed an episode
+nobody planned, or a trainer that streams batches from a prompt source, calls
+`add_tasks()` instead: it appends, returns the new `Task` objects and, once
+`plan()` has run, extends the plan with their images. It warms nothing, and
+a `run()` already in progress does not run the added tasks (`fleet.tasks` is
+a snapshot). Task ids must be new: `add_tasks` raises `ValueError` and adds
+nothing if an id is already in the fleet or repeats within the call.
+`load_tasks()` follows the same rule within its list: it raises `ValueError`
+and keeps the tasks loaded before if an id repeats. It also recomputes an
+existing plan.
+
+Both take `Task` objects or dicts. A dict needs `image` and a non-empty
+`task_id` or `id`; a dict without one raises `ValueError`. The fleet does not
+make up ids, because `acquire()`, results and reports need ids that name the
+row in your data. Map dataset rows first:
+
+```python
+fleet.load_tasks([{"id": r["instance_id"], "image": r["image"]} for r in rows])   # SWE-bench JSONL
+fleet.load_tasks([Task(id=f"{r['repo_name']}@{r['commit_hash'][:12]}", image=r["docker_image"])
+                  for r in rows])                                                    # R2E-Gym
+
+new = fleet.add_tasks(next_batch)                    # Task objects or dicts
+fleet.warm_images(sorted({t.image for t in new}), wait=False)
 ```
 
 ### Observability
@@ -505,7 +540,7 @@ traces and lifecycle records without a mapping. Client-only fields use the
 | Key | Value | On |
 | --- | --- | --- |
 | `ate.actor.name` | environment id (the Substrate actor name) | every span of one environment: `Client` spans, `acquire`, `release`, `exec`, `write_file`, `read_file` |
-| `ate.atespace` | atespace | `Client` spans |
+| `ate.atespace` | atespace | `Client` spans; `exec`, `write_file`, `read_file` when the runtime has one (Substrate) |
 | `ate.template.name` | template name | `create_environment`, `ensure_template`, `acquire`, `warm_pool` |
 | `ate.template.atespace` | template atespace, when given | `create_environment` |
 | `ate_env.run_id` | fleet run id | `exec`, `write_file`, `read_file`, `acquire`, `warm_pool`, `reap` |
@@ -516,8 +551,14 @@ traces and lifecycle records without a mapping. Client-only fields use the
 | `ate_env.replicas` | warm pool size | `warm_pool` |
 | `ate_env.rootfs_image` | image reference without its tag | `create_environment` |
 
-`Client` spans also carry `rpc.system`, `rpc.service`, `rpc.method`,
-`server.address` and `server.port`, and have kind `CLIENT`.
+`Client` spans also carry `rpc.system.name` (`grpc`), `rpc.method` (the full
+gRPC method, for example `ateenv.v1alpha.EnvironmentService/CreateEnvironment`),
+`server.address` and `server.port`, and have kind `CLIENT`. These are the keys
+that otelgrpc puts on the `ate-env-api` server spans and the Go client's spans.
+Like otelgrpc, the client reads `OTEL_SEMCONV_STABILITY_OPT_IN` once at import:
+`rpc/old` gives the older `rpc.system`, `rpc.service` and the short
+`rpc.method` (`CreateEnvironment`), and `rpc/dup` gives both sets, with the full
+`rpc.method`. Set it to the same value for the client and for `ate-env-api`.
 
 **Time to first command (TTFC).** `acquire` ends when the create call
 returns. The wake and readiness wait happen inside the first command, so the

@@ -26,6 +26,10 @@ update this document in the same pull request. The pull request template asks fo
   with a bearer token.
 - **Guest calls, MCP and the port proxy** go to the atenet router over plaintext gRPC or HTTP
   CONNECT. The router forwards them to the actor that the `ate-target-actor` header names.
+- **Telemetry**, off by default: with `--metrics-listen-addr`, `ate-env-api` serves Prometheus
+  metrics on a second plaintext listener; with `--enable-tracing`, it exports traces over OTLP and
+  passes the caller's W3C trace context on to the control plane and the guests (see
+  [Server telemetry](#server-telemetry)).
 - **ate-env-guest** runs as PID 1 in each actor. It serves processes and files on port 80, reaps
   orphaned processes, and starts the sidecars that the template names.
 - **`ate-env manifest`** deploys the namespace, the WorkerPool, and the `ate-env-api`
@@ -39,6 +43,9 @@ update this document in the same pull request. The pull request template asks fo
   `api.ate-system.svc`, that expires after `tokenExpiration` in `cmd/ate-env/manifest.go`.
 - The caller token in the Secret that `ate-env manifest --auth-token-secret` names, when it is
   configured.
+- The session key of the OpenHands agent-server (`OH_SESSION_API_KEYS_0`), in the container
+  environment of each template that `integrations/openhands` registers, and of each template that
+  `ate-env-api` derives from one.
 - ActorTemplates, golden snapshots and suspended environments in the snapshots bucket.
 - Worker capacity: the CPU, memory and actors of the WorkerPools.
 
@@ -80,7 +87,19 @@ update this document in the same pull request. The pull request template asks fo
 | Use of a guest without the API | The router runs in `ate-system`, and the guest listens only inside the actor. | The connections to the router are plaintext. The guest does not authenticate callers: a client that reaches an actor through the router can run commands as the guest user. |
 | Code in an environment attacks the node or other environments | Each actor runs in gVisor, the sandbox class of the WorkerPool. | ate-env sets no actor egress policy. Egress follows the Substrate defaults. |
 | Processes escape supervision | When the guest is PID 1, it runs as an init: it reaps orphans and forwards signals. A process timeout kills the process group. The guest refuses PTY window sizes that do not fit the 16-bit kernel fields. | — |
-| A sidecar gains extra privilege | Only a template author sets sidecars (`--sidecar`, `--sidecar-readyz`), and that author already controls the image and its command. Sidecars run inside the CPU and memory limits of the actor. | — |
+| A sidecar gains extra privilege | Only a template author sets sidecars (`--sidecar`, `--sidecar-readyz`), and that author already controls the image and its command. Sidecars run inside the CPU and memory limits of the actor. | A sidecar runs in the same container as the code in the environment. A shared credential in the environment of a sidecar, such as the OpenHands session key, is thus readable by that code. Refer to the OpenHands agent-server. |
+
+## The OpenHands agent-server
+
+`integrations/openhands` runs the OpenHands agent-server as a sidecar from a runtime layer. The
+base template sets its session key in the container environment (`ate-env manifest template --env
+OH_SESSION_API_KEYS_0=<key>`). The workspace reaches the agent-server through the port proxy.
+
+| Threat | Current mitigation | Gap |
+|---|---|---|
+| A caller reads the session key from a template | Reading a template needs viewer access to the atespace. Substrate logs redact the values of environment variables. Use a dedicated atespace for these environments, as `integrations/openhands/README.md` says. | Each caller with viewer access to the atespace reads the key with `GetActorTemplate`: reads do not redact it. Each template that `ate-env-api` derives from the base copies it. A template cannot refer to a secret. |
+| A holder of the session key drives the agent-server | With `-auth-token-file`, the port proxy also asks for the caller token. Thus the key alone does not pass the port proxy. | The agent-server checks only the session key (`check_session_api_key` in `openhands/agent_server/dependencies.py`). Without `-auth-token-file`, each network peer of `ate-env-api` that has the key controls the agent-server of each environment whose id it knows. |
+| Code in one environment drives the agent-server of another environment | Each actor runs in gVisor. The agent-server removes the key from the environment of the commands that it starts. With `-auth-token-file`, the key alone does not pass the port proxy. | All environments of one base template share one key. The key is in the environment of the guest. Each command that the guest starts through `ate-env-api` inherits that environment (`guest/process/tracker.go`): `ate-env exec`, the Go and Python clients, the fleet's `handle.exec`, and the run and copy of the R2E-Gym adapter. Such a command reads the key with `env`; it does not need `/proc`. Thus on the OpenHands base template, each R2E-Gym agent action gets the key. The guest starts the agent-server with its full environment (`cmd/ate-env-guest/sidecar.go`). The commands that the agent-server starts do not get the key: the bash tool, the commands of the CodeAct agent, and the terminal steps of `run_trajectory.py`. They run in the same container, thus they can read the key from `/proc/<pid>/environ` of the agent-server when they run as the same user. This read is not verified on a cluster. In both cases, the code needs a route to `ate-env-api` to reach the agent-server of another environment. With that route, it needs nothing more when authentication is off, and a credential that the port proxy accepts when authentication is on. |
 
 ## Snapshots and the snapshots bucket
 
@@ -132,8 +151,20 @@ the spans go nowhere.
 | Item | Current state | Gap |
 |---|---|---|
 | Data in spans | Span names and attributes: environment, atespace and template names, the image reference without its tag, the run id, the executable name (without arguments and without leading `NAME=value` assignments), the exit code, a first-command marker, and file paths and sizes. No command arguments, no file content and no token. | The trace backend learns environment names and file paths. |
-| Data on the wire | With tracing on, each gRPC call on a channel that the client creates carries the W3C `traceparent` and `tracestate`, never baggage. `ate-env-api` does not use them and does not forward them. | — |
+| Data on the wire | With tracing on, each gRPC call on a channel that the client creates carries the W3C `traceparent` and `tracestate`, never baggage. Without `--enable-tracing`, `ate-env-api` ignores them; with it, see [Server telemetry](#server-telemetry). | — |
 | The export connection | The `OTEL_EXPORTER_OTLP_*` environment variables configure the endpoint, its TLS and its credentials. | An endpoint without TLS sends the spans in clear text. |
+
+## Server telemetry
+
+`ate-env-api` serves metrics only with `--metrics-listen-addr` and traces only with
+`--enable-tracing`. `ate-env manifest` sets them with `--metrics-port` and `--enable-tracing`.
+
+| Item | Current state | Gap |
+|---|---|---|
+| The metrics listener | Off by default. When on, it serves `GET /metrics` on its own listener, with a 5 s header read timeout. It serves request counts and latencies by gRPC method and status code, `create_to_ready` and wake-wait latencies by atespace and outcome, atespace names with environment counts by state, and the build version and commit. Labels never carry environment ids, actor ids, run ids, paths, image references or tokens. Environment counts come from the control plane at most once per `--metrics-environments-ttl` (default 1m). | The listener has no authentication and no `Host` check. Anyone who reaches it (with the manifest, any pod that reaches the pod IP or the Service port) reads the atespace names and the counts. |
+| Incoming trace context | With `--enable-tracing`, the otelgrpc server handler continues the W3C `traceparent` and `tracestate` that a caller sends, and the server passes them on to ateapi and the guests as is. Only W3C Trace Context is propagated, never baggage. | The caller is not trusted: it chooses the trace id and the sampled flag, thus it can join the server's spans to its own trace or ask every hop to sample. |
+| `x-ate-env-requested-at` | A caller may send this gRPC metadata on `CreateEnvironment` to start `create_to_ready` at its own clock. A value in the future or not in RFC 3339 is ignored. | A caller can send a time in the past and lengthen its own `create_to_ready` samples. |
+| The export connection | The `OTEL_EXPORTER_OTLP_*` environment variables configure the endpoint, its TLS and its credentials. Control-plane reads for the environments gauge are not traced. | An endpoint without TLS (`--otlp-insecure`) sends the spans in clear text. |
 
 ## Compatibility of the API
 
@@ -148,7 +179,7 @@ error. This is a compatibility risk, not a boundary of this threat model.
 |---|---|---|
 | Images | A template mounts the guest into a rootfs image only when the guest is pinned by digest. `.ko.yaml` pins the guest base image by digest. The README asks for the worker image by digest. | — |
 | Releases | `.github/workflows/release.yaml` signs the images with cosign keyless signing (GitHub Actions OIDC). Its actions are pinned by commit SHA. | This repository has published no release yet. |
-| Dependencies | Dependabot covers Go modules (`/`), Python (`/clients/python`, its extras included) and GitHub Actions. `integrations/nemo-gym` gets `ate-env-client` from this checkout through a local path source (`tool.uv.sources`), which Dependabot cannot resolve; its other dependency, `grpcio`, is also a dependency of `clients/python`. | — |
+| Dependencies | `ate-env-api` links `prometheus/client_golang`, the OpenTelemetry SDK and OTLP/gRPC trace exporter, and `otelgrpc`; they run only when metrics or tracing is on. Dependabot covers Go modules (`/`), Python (`/clients/python`, its extras included) and GitHub Actions. `integrations/nemo-gym` gets `ate-env-client` from this checkout through a local path source (`tool.uv.sources`), which Dependabot cannot resolve; its other dependency, `grpcio`, is also a dependency of `clients/python`. | — |
 | Integrations and examples | The code in `integrations/` is maintained. | The code in `examples/` is not supported: it gets no security fixes and no compatibility promise. |
 
 ## Known gaps
@@ -168,3 +199,7 @@ error. This is a compatibility risk, not a boundary of this threat model.
 8. ate-env sets no actor egress policy.
 9. On-demand rootfs images accept any registry and create templates without a quota or garbage
    collection (accepted for now).
+10. The metrics listener, when it is on, has no authentication and no `Host` check, and incoming
+    trace context from callers is forwarded as is.
+11. The OpenHands session key is readable from the template by each viewer of the atespace, all
+    environments of one base template share it, and it is the only check of the agent-server.

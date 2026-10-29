@@ -15,7 +15,7 @@
 """An agent-sandbox-rl style rollout on ate-env: the fleet acquires sandboxes,
 each rollout binds an OpenHands workspace to its handle, the fleet releases.
 
-The shape Tunix's DeepSWE loop uses, with the imports changed:
+The agent-sandbox-rl rollout shape, with the imports changed:
 
     fleet = ate_env.SandboxFleet(FleetConfig(backend="substrate", ...))
     def rollout(task, handle):

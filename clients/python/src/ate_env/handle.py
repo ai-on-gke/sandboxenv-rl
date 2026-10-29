@@ -63,7 +63,13 @@ class SandboxHandle:
     _first_command_started: bool = field(default=False, init=False, repr=False, compare=False)
 
     def _span_ids(self) -> dict[str, Any]:
-        return {"ate.actor.name": self.sandbox_id, "ate_env.run_id": self.run_id or None}
+        return {
+            "ate.actor.name": self.sandbox_id,
+            # The runtime's atespace, when it has one (the Substrate runtime);
+            # the Go client records it on its exec and file spans too.
+            "ate.atespace": getattr(self.runtime, "atespace", None) or None,
+            "ate_env.run_id": self.run_id or None,
+        }
 
     def _exec_span(self, command: str | list[str]) -> Any:
         if not self.tracer:

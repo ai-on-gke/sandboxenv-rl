@@ -87,6 +87,48 @@ path in `-arm` may not contain a comma. `report RUN.jsonl
 -top 10` lists the ten slowest successful first commands and the ten slowest
 successful wakes by environment, for finding the straggler.
 
+## Cold boot, cold and warm restore, suspend and wake: which shape measures what
+
+Four costs hide behind the events, and the run shape decides which ones a
+run can see. Substrate boots an image once per cluster, when the first actor
+of that image is created: that boot is the golden bake, and its snapshot is
+what every later actor of the image restores from. The bake takes no
+warmup: every template the env API derives has a wakeup probe on the guest,
+so the golden is taken as soon as the guest answers `/readyz`, and nothing
+of the trajectory runs inside it. A restore lands on whichever node has
+room; if that node has never pulled the image, the restore pulls it first.
+
+| Cost | What it is | Where it shows | How to make a run measure it |
+|---|---|---|---|
+| Cold boot | the golden bake, the first boot of an image on a cluster | the first `ttfi` of each image when no golden exists yet; the first command is retried until the bake is done | fresh cluster, or delete the derived templates, then `-mode eval -tasks-per-image 1`; a second pass of the same command is restore only, and the difference is the bake |
+| Cold restore | restore from the golden onto a node that has not pulled the image | `ttfi` with a long `oci_unpack` phase in the restore record; a miss in the node cache delta | a fresh node pool and `-tasks-per-image 1`, so no node has seen any image |
+| Warm restore | restore from the golden onto a node that has the image | `ttfi` with `oci_unpack` near zero; a cache hit | a second pass, or `-tasks-per-image 2` and more: later creates of an image tend to land where it already is |
+| Suspend and wake | park the fleet, resume it on the next step's first command | `suspend` and `park`, then `wake`; the restore record of a wake has no download phase when the node still holds the snapshot | `-mode steps -park suspend`; eval never suspends |
+
+By shape:
+
+- `-mode eval` is create, replay, delete: cold boot on the first create per
+  image, cold or warm restore on every create, never suspend or wake.
+- `-mode steps -park suspend` is one create per environment, then suspend and
+  wake at every step boundary: the restore cost once, the wake cost per step.
+- `-mode steps -park delete`, and `-images-per-step`, recreate every step:
+  the restore cost per step, cold or warm by the node caches, never a wake.
+
+Warm-up is a property of the node caches, not of the mode. On a fixed node
+pool, the share of cold restores falls as the nodes accumulate images,
+whatever the shape: in a 50-step window run over 445 images and 40 nodes,
+the step time fell from 118 s to about 20 s by step 33. To hold a comparison
+to one state, recreate the node pool before each repetition for cold, or run
+a warm-up pass first for warm, and read the cache delta and the restore
+phases (`-cache-before`, `-cache-after`, `-restore-log`) to confirm which
+state the run was in rather than assuming it.
+
+What the loader cannot do: run the workload inside the golden bake. A golden
+that already performed a read, so that later actors restore with a warm page
+cache, is a template whose sidecar does the read before reporting ready
+(`ate-env manifest template --sidecar` and `--sidecar-readyz`), not a loader
+flag.
+
 ## How many actors, and on which clusters
 
 Every environment the loader creates is one Substrate actor. Three flags

@@ -25,7 +25,7 @@ from types import SimpleNamespace
 import grpc
 import httpx
 import pytest
-from ate_env import EnvError, NotFoundError
+from ate_env import EnvError, EnvironmentStatus, NotFoundError
 from openhands.sdk.workspace import RemoteWorkspace
 
 from ate_env_openhands import AteEnvWorkspace, port_url
@@ -422,6 +422,98 @@ def test_health_stops_at_once_on_a_rejected_port(no_finalizer, stack, tmp_path):
     _fails_fast(ValueError, "port 80 is the ate-env guest",
                 api_url=api_url, state=state, tmp_path=tmp_path, server_port=80)
     assert state.deletes == [state.creates[0]["id"]]
+
+
+# ate-env-api's port proxy answers a crashed environment with 410 Gone and
+# X-Env-State: CRASHED; waiting cannot fix it.
+CRASHED = (410, "environment ate-env/x port 8000 has crashed (actor state CRASHED); "
+                "delete it and create a new one", {"X-Env-State": "CRASHED"})
+
+
+def test_health_stops_at_once_on_a_crashed_environment(no_finalizer, stack, tmp_path):
+    api_url, state = stack
+    state.refuse = CRASHED
+    _fails_fast(RuntimeError, r"has crashed and will not recover \(HTTP 410.*delete it and create a new one",
+                api_url=api_url, state=state, tmp_path=tmp_path)
+    assert state.deletes == [state.creates[0]["id"]]
+
+
+@pytest.mark.parametrize("answer", [
+    (502, "connection refused", {"X-Env-State": "CRASHED"}),  # the header decides, any status
+    (410, "gone", {}),  # 410 alone is final too
+])
+def test_health_stops_at_once_on_any_crashed_answer(no_finalizer, stack, tmp_path, answer):
+    api_url, state = stack
+    state.refuse = answer
+    _fails_fast(RuntimeError, "has crashed", api_url=api_url, state=state, tmp_path=tmp_path)
+
+
+def test_health_stops_at_once_on_a_deleting_environment(no_finalizer, stack, tmp_path):
+    api_url, state = stack
+    state.refuse = (404, "environment is being deleted (actor state DELETING)", {"X-Env-State": "DELETING"})
+    _fails_fast(RuntimeError, "is being deleted", api_url=api_url, state=state, tmp_path=tmp_path)
+
+
+def test_resume_stops_at_once_when_the_environment_crashed(stack, tmp_path):
+    api_url, state = stack
+    with make(api_url, state, tmp_path) as ws:
+        state.refuse = CRASHED
+        t0 = time.monotonic()
+        with pytest.raises(RuntimeError, match="has crashed"):
+            ws.resume()
+        assert time.monotonic() - t0 < 5
+
+
+# What an ate-env-api without the port-proxy rewrite passes through for a
+# crashed environment: the Substrate router's 503, with no X-Env-State.
+ROUTER_503 = (503, "actor ate-env/x unavailable: AssignWorker prerequisite not met for Actor: "
+                   "ate-env/x (got: ACTOR_STATE_CRASHED, want ACTOR_STATE_SUSPENDED)")
+
+
+@pytest.mark.parametrize("status,match", [
+    (EnvironmentStatus.CRASHED, r"has crashed and will not recover \(state CRASHED.*delete it and create a new one"),
+    (EnvironmentStatus.DELETING, r"is being deleted \(state DELETING"),
+])
+def test_health_reads_the_state_behind_a_proxy_without_the_rewrite(no_finalizer, stack, tmp_path,
+                                                                   status, match):
+    api_url, state = stack
+    state.new_status = int(status)
+    state.refuse = ROUTER_503
+    _fails_fast(RuntimeError, match, api_url=api_url, state=state, tmp_path=tmp_path)
+    assert state.refusals == 1, "the state check stopped the wait after the first 503"
+    assert state.deletes == [state.creates[0]["id"]]
+
+
+@pytest.mark.parametrize("wait,reads", [(4, 1), (7, 2)])
+def test_health_state_checks_are_spaced(no_finalizer, stack, tmp_path, wait, reads):
+    api_url, state = stack
+    state.refuse = ROUTER_503  # the environment itself stays RUNNING
+    with pytest.raises(RuntimeError, match="did not answer /health"):
+        make(api_url, state, tmp_path, health_check_timeout=wait)
+    assert state.refusals >= 3
+    assert state.gets == reads, f"{state.gets} state reads in a {wait} s wait, want {reads} (one each 5 s)"
+
+
+def test_a_stalled_existence_check_cannot_hold_the_wait(no_finalizer, stack, tmp_path):
+    api_url, state = stack
+    state.refuse = (404, "no such page")  # a 404 with no X-Env-State: the wait asks whether the env exists
+    state.get_delay = 40.0  # a control plane that does not answer
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match="did not answer /health"):
+        make(api_url, state, tmp_path, health_check_timeout=3)
+    assert time.monotonic() - t0 < 10, "each read ends by the wait's deadline, not after 30 s"
+    assert state.gets >= 1
+
+
+def test_resume_reads_the_state_behind_a_proxy_without_the_rewrite(stack, tmp_path):
+    api_url, state = stack
+    with make(api_url, state, tmp_path) as ws:
+        state.envs[ws.env_id]["status"] = int(EnvironmentStatus.CRASHED)
+        state.refuse = ROUTER_503
+        t0 = time.monotonic()
+        with pytest.raises(RuntimeError, match="has crashed"):
+            ws.resume()
+        assert time.monotonic() - t0 < 5
 
 
 def test_resume_stops_at_once_when_the_environment_is_gone(stack, tmp_path):

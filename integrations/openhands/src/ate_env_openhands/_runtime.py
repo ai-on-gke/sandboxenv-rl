@@ -40,6 +40,13 @@ _runner: LoopRunner | None = None
 # the previous one) and the least recently used one beyond that is closed.
 _clients: OrderedDict[tuple[str, str | None], Client] = OrderedDict()
 MAX_CLIENTS_PER_ENDPOINT = 2
+# An evicted client can carry a call of a workspace still on its token. Its
+# channel refuses new calls at once and gives the calls in progress this long
+# to finish; the close ends as soon as they do. Longer than the workspace's
+# create and health-check timeouts (600 s by default).
+EVICTED_CLIENT_GRACE = 3600.0
+# Evicted clients whose graceful close has not finished; close_all ends them.
+_retired: set[Client] = set()
 
 
 def _get_runner() -> LoopRunner:
@@ -104,14 +111,32 @@ def client(endpoint: str, token: str | None) -> Client:
         evicted = [_clients.pop(k) for k in same[: max(len(same) - MAX_CLIENTS_PER_ENDPOINT, 0)]]
     if kept is not made:
         # Another thread made a client for this key first: close the spare
-        # channel instead of leaking it.
-        evicted.append(made)
-    for old in evicted:
+        # channel instead of leaking it. No call has used it.
         try:
-            run(old.close())
+            run(made.close())
         except Exception:
             pass  # a channel that does not close is dropped
+    for old in evicted:
+        _retire(old)
     return kept
+
+
+def _retire(old: Client) -> None:
+    """Close an evicted client without cancelling its calls, and do not wait."""
+    with _lock:
+        _retired.add(old)
+    try:
+        closing = submit(old.close(grace=EVICTED_CLIENT_GRACE))
+    except Exception:
+        with _lock:
+            _retired.discard(old)
+        return  # a channel that does not close is dropped
+
+    def forget(_: concurrent.futures.Future[None]) -> None:
+        with _lock:
+            _retired.discard(old)
+
+    closing.add_done_callback(forget)
 
 
 def close_all(timeout: float = 5.0) -> None:
@@ -122,9 +147,10 @@ def close_all(timeout: float = 5.0) -> None:
     """
     global _runner
     with _lock:
-        runner, clients = _runner, list(_clients.values())
+        runner, clients = _runner, list(_clients.values()) + list(_retired)
         _runner = None
         _clients.clear()
+        _retired.clear()
     if runner is None:
         return
     for c in clients:
@@ -142,6 +168,7 @@ def _forget_after_fork() -> None:
     _lock = threading.Lock()
     _runner = None
     _clients.clear()
+    _retired.clear()
 
 
 atexit.register(close_all)

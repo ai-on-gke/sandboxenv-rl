@@ -166,9 +166,16 @@ caller.
   `openhands-sdk` and the agent-server is logged as a warning.
 - The health wait stops at once on an answer that waiting cannot change: 401 or 403 from the proxy
   (`PermissionError`: a missing or wrong `api_token`, or a refused origin), 400 (`ValueError`: the
-  proxy refused the port or the id), and 404 when the environment no longer exists. One attempt can
-  wait for the rest of `health_check_timeout`, because the proxy holds a request while the
-  environment wakes (ate-env-api's `--wake-budget`).
+  proxy refused the port or the id), and 404 when the environment no longer exists. While it
+  retries, it also reads the environment's state over gRPC, at most once every 5 s, and stops on
+  CRASHED (`RuntimeError`: delete it and create a new one), DELETING, or a deleted environment.
+  The Substrate router holds each request while the environment wakes, up to about 10 s; a longer
+  wake gets the router's 504, or 503 with `X-Env-State` from an ate-env-api that has the port-proxy
+  state check, and the wait retries it. Thus, after `pause()`, call `resume()` before other
+  requests. A direct call while the wake takes longer than about 10 s, usually only the first wake
+  of an environment on a new image, gets that error: `execute_command` returns `exit_code -1` with
+  it in `stderr`, `file_upload` and `file_download` return `success=False`, and `RemoteConversation`
+  calls raise `httpx.HTTPStatusError` (openhands-sdk 1.55.0).
 - A 401 or 403 from the port proxy in the session-key check names `api_token`, not the session key,
   for example when the token changes after the health wait.
 - Only the workspace that created or attached the environment deletes it. A failed constructor

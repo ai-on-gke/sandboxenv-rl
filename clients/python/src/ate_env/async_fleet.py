@@ -247,6 +247,14 @@ class AsyncSandboxFleet:
                     self.backend.unwarm_pool, template_id, rootfs_image=rootfs_image
                 )
 
+    def acquired_count(self, image: str) -> int:
+        """Sandboxes acquired for ``image``, warm or cold (see ``SandboxFleet.acquired_count``)."""
+        return self._fleet.acquired_count(image)
+
+    def pool_size(self, image: str) -> int | None:
+        """Idle warm replicas for ``image`` (see ``SandboxFleet.pool_size``)."""
+        return self._fleet.pool_size(image)
+
     async def acquire(self, task: Task | str, timeout_s: float | None = None) -> SandboxHandle:
         """Asynchronously acquire a single sandbox."""
         task_obj: Task
@@ -283,6 +291,7 @@ class AsyncSandboxFleet:
                 timeout_s=to_s,
                 rootfs_image=rootfs_image,
             )
+        self._fleet._count_acquire(task_obj.image)
 
         try:
             runtime, data_plane = self._fleet._build_runtime(raw_inst)

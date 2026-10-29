@@ -81,6 +81,8 @@ class SandboxFleet:
         self._image_to_template: dict[str, tuple[str, str | None]] = {}
         self._plan: FleetPlan | None = None
         self._lock = threading.Lock()
+        # Sandboxes acquired per task image, warm or cold (acquired_count).
+        self._acquired: collections.Counter[str] = collections.Counter()
         # Serializes plan recomputation, so concurrent add_tasks calls leave
         # the plan of the last call, which saw every task added before it.
         self._plan_lock = threading.Lock()
@@ -435,6 +437,26 @@ class SandboxFleet:
             template_id, rootfs_image = entry
             self.backend.unwarm_pool(template_id, rootfs_image=rootfs_image)
 
+    def acquired_count(self, image: str) -> int:
+        """Sandboxes this fleet has acquired for ``image`` so far, warm or cold.
+
+        A monotonic counter: callers take differences between two reads.
+        """
+        with self._lock:
+            return self._acquired[image]
+
+    def _count_acquire(self, image: str) -> None:
+        with self._lock:
+            self._acquired[image] += 1
+
+    def pool_size(self, image: str) -> int | None:
+        """Idle warm replicas for ``image``; None when the driver cannot tell."""
+        entry = self._image_to_template.get(image)
+        if entry is None:
+            return 0
+        template_id, rootfs_image = entry
+        return self.backend.pool_size(template_id, rootfs_image=rootfs_image)
+
     def acquire(
         self,
         task: Task | str | Sequence[Task | str],
@@ -478,6 +500,7 @@ class SandboxFleet:
         raw_inst = self.backend.acquire(
             template_id, self.run_id, timeout_s=to_s, rootfs_image=rootfs_image
         )
+        self._count_acquire(task_obj.image)
 
         try:
             runtime, data_plane = self._build_runtime(raw_inst)

@@ -41,8 +41,8 @@ update this document in the same pull request. The pull request template asks fo
 - The contents of each environment: code, data, and the credentials that callers put in it.
 - The control-plane credential of `ate-env-api`: a projected ServiceAccount token, audience
   `api.ate-system.svc`, that expires after `tokenExpiration` in `cmd/ate-env/manifest.go`.
-- The caller token in the Secret that `ate-env manifest --auth-token-secret` names, when it is
-  configured.
+- The caller token in the Secret that `ate-env manifest` mounts: `ate-env-api-token`, or the one
+  that `--auth-token-secret` names. There is no token only with `--insecure-no-auth`.
 - The session key of the OpenHands agent-server (`OH_SESSION_API_KEYS_0`), in the container
   environment of each template that `integrations/openhands` registers, and of each template that
   `ate-env-api` derives from one.
@@ -54,7 +54,7 @@ update this document in the same pull request. The pull request template asks fo
 | Attacker | Capability |
 |---|---|
 | A network peer | Reaches the `ate-env-api` listener: a workload in the cluster, or anyone behind a port-forward or a LoadBalancer. |
-| A token holder | Has the caller token, when one is configured. Has all the powers of the API. |
+| A token holder | Has the caller token. Has all the powers of the API. |
 | Code in an environment | Runs as the guest user inside an actor: agent actions, model output, task code. Treat it as untrusted. |
 | A web page | Runs in the browser of a developer who port-forwards the API to localhost. |
 | A template author | Registers ActorTemplates with `kubectl-ate`. Trusted: chooses the image, its command, the sidecars and the resources. |
@@ -64,10 +64,10 @@ update this document in the same pull request. The pull request template asks fo
 
 | Threat | Current mitigation | Gap |
 |---|---|---|
-| Unauthenticated use of the API | `-auth-token-file` makes the gRPC API, MCP and the port proxy require `Authorization: Bearer <token>`. The port proxy also accepts the token in `X-Env-Authorization` and does not forward it. The check uses a constant-time compare. The server reads the file again when it changes. A token file that it cannot read gives the caller only `internal error`. Without a token, `ate-env-api` logs a warning when it listens on a non-loopback address. The CLI, the Go and Python clients, the SWE-bench loader, the MCP example and the NeMo Gym provider can send the token. | Authentication is off unless configured. `ate-env manifest` mounts a token only with `--auth-token-secret`. |
+| Unauthenticated use of the API | `-auth-token-file` makes the gRPC API, MCP and the port proxy require `Authorization: Bearer <token>`. The port proxy also accepts the token in `X-Env-Authorization` and does not forward it. The check uses a constant-time compare. The server reads the file again when it changes. A token file that it cannot read gives the caller only `internal error`. Without a token, `ate-env-api` logs a warning when it listens on a non-loopback address. The CLI, the Go and Python clients, the SWE-bench loader, the MCP example and the NeMo Gym provider can send the token. | `ate-env manifest` mounts the token by default, and `--insecure-no-auth` turns authentication off. The `ate-env-api` binary itself has no token unless `-auth-token-file` is set: a deployment that is not made with `ate-env manifest` must set it. |
 | Token theft on the network | The manifest Service sets no `type`, thus it is `ClusterIP`. | The listener has no TLS: the token and all data travel in clear text. The manifest ships no NetworkPolicy. |
 | One caller acts on the environments of another caller | None. | One shared token. No per-caller identity and no authorization: each token holder can use each environment. |
-| Reach beyond the environments of ate-env | Lifecycle calls use the `ate-env-api` identity, which the access policy limits to its atespaces. | Guest calls, MCP and the port proxy go to the router. The control plane is asked only while an environment wakes. Thus these paths reach any actor that the router serves, in any atespace, including actors that ate-env did not create. |
+| Reach beyond the environments of ate-env | Lifecycle calls use the `ate-env-api` identity, which the access policy limits to its atespaces. The port proxy forwards only to the atespaces that `--port-proxy-atespaces` names (default `ate-env`) and answers 403 for the others. | Guest calls and MCP go to the router. The control plane is asked only while an environment wakes. Thus these paths reach any actor that the router serves, in any atespace, including actors that ate-env did not create. With `--port-proxy-atespaces='*'`, the port proxy does the same. |
 | A web page drives the API through a port-forward (CSRF) | The port proxy path form refuses a state-changing request or a WebSocket handshake from another origin (`--port-proxy-trusted-origins` adds origins). The header form needs custom headers, and MCP needs a JSON content type: a browser sends either one to another origin only after a CORS preflight, which the API never approves. | — |
 | DNS rebinding: a page on an attacker's name resolves to the forwarded listener and becomes same-origin | None. | The listener does not check the `Host` header. The MCP handler sets `DisableLocalhostProtection: true`. |
 | The port proxy reaches the guest port | The port proxy refuses port 80, where the guest listens. | — |
@@ -184,10 +184,10 @@ error. This is a compatibility risk, not a boundary of this threat model.
 
 ## Known gaps
 
-1. Caller authentication is off by default, it uses one shared token, and the listener has no
-   TLS.
-2. Guest calls, MCP and the port proxy reach any actor that the router serves; the access policy
-   does not limit them.
+1. Caller authentication uses one shared token, and the listener has no TLS. A deployment that
+   is not made with `ate-env manifest` has no authentication unless it sets `-auth-token-file`.
+2. Guest calls and MCP reach any actor that the router serves; the access policy does not limit
+   them. The port proxy reaches the atespaces that `--port-proxy-atespaces` names.
 3. DNS rebinding is not blocked: the listener has no `Host` check, and MCP localhost protection is
    off.
 4. `ate-env-api` does not verify the TLS certificate of the control plane by default.

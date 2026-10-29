@@ -37,6 +37,14 @@ import (
 // SchemaVersion is the canonical schema version identifier for v1 artifacts.
 const SchemaVersion = "v1"
 
+// VersionV1 is an alias for SchemaVersion.
+const VersionV1 = SchemaVersion
+
+// CheckVersion verifies that v equals SchemaVersion ("v1").
+func CheckVersion(v string) error {
+	return checkSchemaVersion(v)
+}
+
 const baseSchemaURI = "https://ai-on-gke.github.io/sandboxenv-rl/schema/v1/"
 
 // SchemaFS embeds the canonical JSON Schema v1 files under v1/.
@@ -76,8 +84,12 @@ func NormalizeParkPolicy(p ParkPolicy) (ParkPolicy, error) {
 	switch p {
 	case ParkSuspendAsync, ParkSuspendSync, ParkFork, ParkDelete, ParkNone:
 		return p, nil
-	case "", ParkLegacySuspend:
+	case ParkPolicyHold:
+		return ParkNone, nil
+	case ParkPolicySnapshot, "", ParkLegacySuspend:
 		return ParkSuspendSync, nil
+	case ParkPolicyRelease:
+		return ParkDelete, nil
 	default:
 		return "", fmt.Errorf("invalid park policy %q (want %q, %q, %q, %q, %q, or legacy %q)",
 			p, ParkSuspendAsync, ParkSuspendSync, ParkFork, ParkDelete, ParkNone, ParkLegacySuspend)

@@ -43,6 +43,9 @@ const (
 	ModeEval Mode = "eval"
 	// ModeSteps keeps a fleet across training steps and parks it in between.
 	ModeSteps Mode = "steps"
+	// ModeOpenLoop dispatches tasks at a Poisson arrival rate (-arrival-rate)
+	// bounded by Width concurrency slots, recording SlotWaitMS per task.
+	ModeOpenLoop Mode = "open-loop"
 )
 
 // Park is what happens to the fleet between training steps.
@@ -104,6 +107,14 @@ type Config struct {
 	GroupSize    int
 	StepPause    time.Duration
 	Prefetch     bool
+
+	// ArrivalRate is the target Poisson arrival rate (tasks/sec) in ModeOpenLoop.
+	ArrivalRate float64
+	// Duration bounds the open-loop arrival window when set.
+	Duration     time.Duration
+	Concurrency  int
+	JobName      string
+	SnapshotLoop bool
 
 	// CreateTimeout bounds one create call; StepTimeout is the default for a
 	// run step without its own timeout.
@@ -286,6 +297,13 @@ func (c *Config) validate() error {
 		}
 		if c.ParkEach && c.ImagesPerStep > 0 {
 			return errors.New("park each keeps one fleet across the steps; it cannot be combined with images per step")
+		}
+	case ModeOpenLoop:
+		if c.TasksPerImage < 1 {
+			c.TasksPerImage = 1
+		}
+		if c.ArrivalRate <= 0 {
+			return errors.New("arrival rate must be > 0 in open-loop mode")
 		}
 	default:
 		return fmt.Errorf("unknown mode %q", c.Mode)
@@ -479,6 +497,8 @@ func Run(ctx context.Context, cfg Config) (*Summary, error) {
 		} else {
 			r.runSteps(ctx, envs)
 		}
+	case ModeOpenLoop:
+		r.runOpenLoop(ctx, envs)
 	}
 	dur := time.Since(start)
 	s := &Summary{Tasks: r.tasks, Failed: r.failed, Rewarded: r.rewarded, Duration: dur}
@@ -686,6 +706,94 @@ func (r *runner) runEval(ctx context.Context, envs []*environment) {
 				slog.Int("failed", r.failed), slog.Int("rewarded", r.rewarded))
 		}
 		r.mu.Unlock()
+	})
+}
+
+// dispatchOpenLoop dispatches fn according to a seeded Poisson arrival process
+// (rate tasks/sec) bounded by width concurrent slots, up to maxTasks (when > 0)
+// and/or deadline (when non-zero). Each invocation receives its 0-based
+// sequence index and the time (in ms) spent waiting for a concurrency slot.
+func dispatchOpenLoop(
+	ctx context.Context,
+	seed int64,
+	rate float64,
+	width int,
+	maxTasks int,
+	deadline time.Time,
+	fn func(seq int, slotWaitMS float64),
+) error {
+	if seed == 0 {
+		seed = 42
+	}
+	if width <= 0 {
+		width = 1
+	}
+	rng := rand.New(rand.NewSource(seed))
+	sem := make(chan struct{}, width)
+	var wg sync.WaitGroup
+
+	for seq := 0; maxTasks <= 0 || seq < maxTasks; seq++ {
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		if seq > 0 && rate > 0 {
+			delay := time.Duration(rng.ExpFloat64() / rate * float64(time.Second))
+			if !deadline.IsZero() && time.Now().Add(delay).After(deadline) {
+				break
+			}
+			if delay > 0 {
+				t := time.NewTimer(delay)
+				select {
+				case <-ctx.Done():
+					t.Stop()
+					wg.Wait()
+					return ctx.Err()
+				case <-t.C:
+				}
+			}
+		}
+		arrivalAt := time.Now()
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		case sem <- struct{}{}:
+		}
+		slotWaitMS := ms(time.Since(arrivalAt))
+
+		wg.Add(1)
+		go func(i int, waitMS float64) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			fn(i, waitMS)
+		}(seq, slotWaitMS)
+	}
+	wg.Wait()
+	return nil
+}
+
+// runOpenLoop dispatches tasks according to a Poisson arrival process with rate
+// ArrivalRate (tasks/sec), bounded by Width concurrent slots, and records the
+// time each arriving task waited for a concurrency slot in Event.SlotWaitMS.
+func (r *runner) runOpenLoop(ctx context.Context, envs []*environment) {
+	var deadline time.Time
+	if r.cfg.Duration > 0 {
+		deadline = time.Now().Add(r.cfg.Duration)
+	}
+	_ = dispatchOpenLoop(ctx, r.cfg.Seed, r.cfg.ArrivalRate, r.cfg.Width, len(envs), deadline, func(i int, slotWaitMS float64) {
+		env := envs[i]
+		env.slotWaitMS = slotWaitMS
+		if r.create(ctx, env, 0) {
+			r.replay(ctx, env, 0)
+		}
+		if !r.cfg.Keep {
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+			r.remove(cleanup, env, 0)
+			cancel()
+		}
 	})
 }
 
@@ -1335,6 +1443,7 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 		ok = false
 	}
 	ev := r.event(EventTask, e, step, time.Since(taskStart), nil)
+	ev.SlotWaitMS = e.slotWaitMS
 	ev.OK = ok
 	ev.Reward = reward
 	if totalThinkMS > 0 {
@@ -1519,4 +1628,429 @@ func (r *runner) countTask(e *environment, step int, ok bool, reward *int) {
 	if reward != nil && *reward == 1 {
 		r.rewarded++
 	}
+}
+
+// EnvHandle describes an acquired sandbox environment in scenario runners.
+type EnvHandle struct {
+	Name   string
+	Source string
+}
+
+// ExecResult aliases Result for scenario runners.
+type ExecResult = Result
+
+// EnvClient is the lifecycle interface used by multi-job scenario runners.
+type EnvClient interface {
+	Create(ctx context.Context, image, instanceID string) (EnvHandle, error)
+	Exec(ctx context.Context, envName, cmd string, timeout time.Duration) (ExecResult, error)
+	Delete(ctx context.Context, envName string) error
+	Snapshot(ctx context.Context, envName string) (string, error)
+	Resume(ctx context.Context, snapshot, image, instanceID string) (EnvHandle, error)
+}
+
+// Runner drives an open-loop or closed-loop workload against an EnvClient and
+// records events to Recorder.
+type Runner struct {
+	Config     Config
+	Client     EnvClient
+	Recorder   *Recorder
+	Scheduled  schema.ScheduledJob
+	ParkPolicy schema.ParkPolicy
+	SleepFunc  func(ctx context.Context, d time.Duration) error
+}
+
+// Run executes the configured open-loop or closed-loop workload against r.Client.
+func (r *Runner) Run(ctx context.Context) error {
+	if r.Client == nil {
+		return errors.New("Runner.Client is required")
+	}
+	rec := r.Recorder
+	if rec == nil {
+		rec = r.Config.Recorder
+	}
+	if rec == nil {
+		rec = NewRecorder(nil)
+	}
+	if len(r.Scheduled.Steps) > 0 && r.Config.Mode != ModeOpenLoop {
+		return r.runClosedLoop(ctx, rec)
+	}
+	return r.runOpenLoop(ctx, rec)
+}
+
+func (r *Runner) runOpenLoop(ctx context.Context, rec *Recorder) error {
+	conc := r.Config.Concurrency
+	if conc <= 0 {
+		conc = r.Config.Width
+	}
+	if conc <= 0 {
+		conc = 4
+	}
+	rate := r.Config.ArrivalRate
+	if rate <= 0 {
+		rate = 10.0
+	}
+	dur := r.Config.Duration
+	if dur <= 0 {
+		dur = 100 * time.Millisecond
+	}
+	instances := r.Config.Instances
+	if len(instances) == 0 {
+		instances = SyntheticInstances(4, "")
+	}
+
+	deadline := time.Now().Add(dur)
+	return dispatchOpenLoop(ctx, r.Config.Seed, rate, conc, 0, deadline, func(tIdx int, slotWait float64) {
+		in := instances[tIdx%len(instances)]
+		tStart := time.Now()
+		h, err := r.Client.Create(ctx, in.Image, in.InstanceID)
+		cDur := DurMS(time.Since(tStart))
+		src := h.Source
+		if src == "" {
+			src = string(schema.SourceWarmPool)
+		}
+		rec.Emit(Event{
+			RunID:    r.Config.RunID,
+			Job:      r.Config.JobName,
+			Event:    EventPhase,
+			Name:     "create",
+			Phase:    "create",
+			Source:   src,
+			Env:      h.Name,
+			Instance: in.InstanceID,
+			Image:    in.Image,
+			Task:     tIdx,
+			DurMS:    cDur,
+			OK:       err == nil,
+		})
+		if err != nil {
+			return
+		}
+		_, execErr := r.Client.Exec(ctx, h.Name, "pytest -q", 30*time.Second)
+		_ = r.Client.Delete(context.Background(), h.Name)
+		reward := 1
+		if execErr != nil {
+			reward = 0
+		}
+		rec.Emit(Event{
+			RunID:      r.Config.RunID,
+			Job:        r.Config.JobName,
+			Event:      EventTask,
+			Source:     src,
+			Env:        h.Name,
+			Instance:   in.InstanceID,
+			Image:      in.Image,
+			Task:       tIdx,
+			DurMS:      DurMS(time.Since(tStart)),
+			SlotWaitMS: slotWait,
+			OK:         execErr == nil,
+			Reward:     &reward,
+		})
+	})
+}
+
+func (r *Runner) runClosedLoop(ctx context.Context, rec *Recorder) error {
+	sleepFn := r.SleepFunc
+	if sleepFn == nil {
+		sleepFn = func(ctx context.Context, d time.Duration) error {
+			if d <= 0 {
+				return nil
+			}
+			t := time.NewTimer(d)
+			defer t.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-t.C:
+				return nil
+			}
+		}
+	}
+	concurrency := r.Config.Concurrency
+	if concurrency <= 0 {
+		concurrency = r.Config.Width
+	}
+	if concurrency <= 0 {
+		concurrency = 4
+	}
+	parkPolicy := r.Scheduled.ParkPolicy
+	if parkPolicy == "" {
+		parkPolicy = r.ParkPolicy
+	}
+	if parkPolicy == "" {
+		parkPolicy = schema.ParkPolicyHold
+	}
+	jobName := r.Config.JobName
+	if jobName == "" {
+		jobName = r.Scheduled.Job
+	}
+
+	for stepIdx, step := range r.Scheduled.Steps {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		stepStart := time.Now()
+
+		for _, img := range step.PrefetchImages {
+			rec.Emit(Event{
+				RunID:  r.Config.RunID,
+				Job:    jobName,
+				Event:  EventPhase,
+				Name:   "prefetch_hint",
+				Phase:  "prefetch_hint",
+				Image:  img,
+				Step:   step.Step,
+				DurMS:  0,
+				OK:     true,
+				Detail: "lookahead image hint",
+			})
+		}
+
+		sem := make(chan struct{}, concurrency)
+		var wg sync.WaitGroup
+		var firstErr error
+		var errMu sync.Mutex
+
+		for taskIdx, task := range step.Tasks {
+			enqueueAt := time.Now()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case sem <- struct{}{}:
+			}
+			slotWaitMS := DurMS(time.Since(enqueueAt))
+
+			wg.Add(1)
+			go func(tIdx int, st schema.ScheduledTask, waitMS float64) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				workerName := fmt.Sprintf("%s-w%d", jobName, tIdx%concurrency)
+				if err := r.runScheduledTask(ctx, rec, jobName, workerName, step.Step, tIdx, st, waitMS, parkPolicy); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+				}
+			}(taskIdx, task, slotWaitMS)
+		}
+		wg.Wait()
+		if firstErr != nil {
+			return firstErr
+		}
+
+		if step.StepPauseMS > 0 && stepIdx < len(r.Scheduled.Steps)-1 {
+			pauseStart := time.Now()
+			if err := sleepFn(ctx, time.Duration(step.StepPauseMS*float64(time.Millisecond))); err != nil {
+				return err
+			}
+			rec.Emit(Event{
+				RunID:  r.Config.RunID,
+				Job:    jobName,
+				Event:  EventPhase,
+				Name:   "step_pause",
+				Phase:  "step_pause",
+				Step:   step.Step,
+				DurMS:  DurMS(time.Since(pauseStart)),
+				OK:     true,
+				Detail: string(parkPolicy),
+			})
+		}
+
+		rec.Emit(Event{
+			RunID: r.Config.RunID,
+			Job:   jobName,
+			Event: EventStep,
+			Step:  step.Step,
+			Count: len(step.Tasks),
+			DurMS: DurMS(time.Since(stepStart)),
+			OK:    true,
+			Tags: map[string]string{
+				"park_policy": string(parkPolicy),
+			},
+		})
+	}
+	return nil
+}
+
+func (r *Runner) runScheduledTask(
+	ctx context.Context,
+	rec *Recorder,
+	jobName string,
+	worker string,
+	step int,
+	taskNum int,
+	st schema.ScheduledTask,
+	slotWaitMS float64,
+	parkPolicy schema.ParkPolicy,
+) error {
+	taskStart := time.Now()
+	t0 := time.Now()
+	handle, err := r.Client.Create(ctx, st.Image, st.InstanceID)
+	createDur := DurMS(time.Since(t0))
+	if err != nil {
+		rec.Emit(Event{
+			RunID:    r.Config.RunID,
+			Job:      jobName,
+			Worker:   worker,
+			Event:    EventPhase,
+			Name:     "create",
+			Phase:    "create",
+			Instance: st.InstanceID,
+			Image:    st.Image,
+			Step:     step,
+			Task:     taskNum,
+			DurMS:    createDur,
+			OK:       false,
+			Err:      err.Error(),
+		})
+		return err
+	}
+	source := handle.Source
+	if source == "" {
+		source = string(schema.SourceColdStart)
+	}
+	rec.Emit(Event{
+		RunID:    r.Config.RunID,
+		Job:      jobName,
+		Worker:   worker,
+		Event:    EventPhase,
+		Name:     "create",
+		Phase:    "create",
+		Source:   source,
+		Env:      handle.Name,
+		Instance: st.InstanceID,
+		Image:    st.Image,
+		Step:     step,
+		Task:     taskNum,
+		DurMS:    createDur,
+		OK:       true,
+	})
+
+	defer func() {
+		td0 := time.Now()
+		delErr := r.Client.Delete(context.Background(), handle.Name)
+		rec.Emit(Event{
+			RunID:    r.Config.RunID,
+			Job:      jobName,
+			Worker:   worker,
+			Event:    EventPhase,
+			Name:     "delete",
+			Phase:    "delete",
+			Env:      handle.Name,
+			Instance: st.InstanceID,
+			Image:    st.Image,
+			Step:     step,
+			Task:     taskNum,
+			DurMS:    DurMS(time.Since(td0)),
+			OK:       delErr == nil,
+		})
+	}()
+
+	tb0 := time.Now()
+	res, err := r.Client.Exec(ctx, handle.Name, "echo bootstrap", 30*time.Second)
+	rec.Emit(Event{
+		RunID:    r.Config.RunID,
+		Job:      jobName,
+		Worker:   worker,
+		Event:    EventPhase,
+		Name:     "bootstrap",
+		Phase:    "bootstrap",
+		Env:      handle.Name,
+		Instance: st.InstanceID,
+		Image:    st.Image,
+		Step:     step,
+		Task:     taskNum,
+		DurMS:    DurMS(time.Since(tb0)),
+		OK:       err == nil && res.ExitCode == 0,
+	})
+
+	if r.Config.SnapshotLoop || parkPolicy == schema.ParkPolicySnapshot {
+		ts0 := time.Now()
+		snap, snapErr := r.Client.Snapshot(ctx, handle.Name)
+		rec.Emit(Event{
+			RunID:    r.Config.RunID,
+			Job:      jobName,
+			Worker:   worker,
+			Event:    EventPhase,
+			Name:     "snapshot",
+			Phase:    "snapshot",
+			Env:      handle.Name,
+			Instance: st.InstanceID,
+			Image:    st.Image,
+			Step:     step,
+			Task:     taskNum,
+			DurMS:    DurMS(time.Since(ts0)),
+			OK:       snapErr == nil,
+			Snapshot: snap,
+		})
+		if snapErr == nil {
+			tr0 := time.Now()
+			resumed, resErr := r.Client.Resume(ctx, snap, st.Image, st.InstanceID)
+			hit := true
+			rec.Emit(Event{
+				RunID:    r.Config.RunID,
+				Job:      jobName,
+				Worker:   worker,
+				Event:    EventPhase,
+				Name:     "resume",
+				Phase:    "resume",
+				Source:   string(schema.SourceSnapshotResume),
+				Env:      resumed.Name,
+				Instance: st.InstanceID,
+				Image:    st.Image,
+				Step:     step,
+				Task:     taskNum,
+				DurMS:    DurMS(time.Since(tr0)),
+				OK:       resErr == nil,
+				Snapshot: snap,
+				CacheHit: &hit,
+			})
+			if resErr == nil && resumed.Name != "" && resumed.Name != handle.Name {
+				_ = r.Client.Delete(ctx, handle.Name)
+				handle = resumed
+			}
+		}
+	}
+
+	te0 := time.Now()
+	evalRes, evalErr := r.Client.Exec(ctx, handle.Name, "pytest -q", 60*time.Second)
+	evalOK := evalErr == nil && evalRes.ExitCode == 0
+	reward := 0
+	if evalOK {
+		reward = 1
+	}
+	rec.Emit(Event{
+		RunID:    r.Config.RunID,
+		Job:      jobName,
+		Worker:   worker,
+		Event:    EventPhase,
+		Name:     "eval_harness",
+		Phase:    "eval_harness",
+		Env:      handle.Name,
+		Instance: st.InstanceID,
+		Image:    st.Image,
+		Step:     step,
+		Task:     taskNum,
+		DurMS:    DurMS(time.Since(te0)),
+		OK:       evalOK,
+		Reward:   &reward,
+	})
+
+	rec.Emit(Event{
+		RunID:      r.Config.RunID,
+		Job:        jobName,
+		Worker:     worker,
+		Event:      EventTask,
+		Source:     source,
+		Env:        handle.Name,
+		Instance:   st.InstanceID,
+		Image:      st.Image,
+		Step:       step,
+		Task:       taskNum,
+		DurMS:      DurMS(time.Since(taskStart)),
+		SlotWaitMS: slotWaitMS,
+		OK:         evalOK,
+		Reward:     &reward,
+	})
+	return nil
 }

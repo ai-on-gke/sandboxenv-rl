@@ -22,7 +22,8 @@ import (
 // Schedule is the deterministic resolved per-step task schedule (schedule.json).
 type Schedule struct {
 	SchemaVersion string         `json:"schema_version"`
-	ScenarioName  string         `json:"scenario_name"`
+	ScenarioName  string         `json:"scenario_name,omitempty"`
+	Scenario      string         `json:"scenario,omitempty"`
 	Seed          int64          `json:"seed,omitempty"`
 	Jobs          []ScheduledJob `json:"jobs"`
 }
@@ -32,7 +33,7 @@ func (s Schedule) Validate() error {
 	if s.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("schedule: unsupported schema_version %q (want %q)", s.SchemaVersion, SchemaVersion)
 	}
-	if s.ScenarioName == "" {
+	if s.ScenarioName == "" && s.Scenario == "" {
 		return errors.New("schedule: scenario_name is required")
 	}
 	if len(s.Jobs) == 0 {
@@ -112,6 +113,7 @@ func (s ScheduledStep) Validate() error {
 
 // ScheduledTask specifies one task rollout within a ScheduledStep.
 type ScheduledTask struct {
+	TaskID     string `json:"task_id,omitempty"`
 	InstanceID string `json:"instance_id"`
 	Image      string `json:"image"`
 	Trajectory string `json:"trajectory,omitempty"`

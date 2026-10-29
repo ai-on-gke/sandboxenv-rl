@@ -1133,3 +1133,34 @@ func TestStepsSuspendAsyncAndForkPark(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenLoopModeRecordsSlotWaitMS(t *testing.T) {
+	f := newFake()
+	var out bytes.Buffer
+	cfg := baseConfig(t, f, &out)
+	cfg.Mode = ModeOpenLoop
+	cfg.ArrivalRate = 500
+	cfg.Duration = 40 * time.Millisecond
+	cfg.Width = 1
+	cfg.Seed = 42
+
+	sum, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Run open-loop: %v", err)
+	}
+	if sum.Tasks == 0 {
+		t.Fatal("expected at least 1 task in open-loop run")
+	}
+	var taskEvents int
+	for _, ev := range parseEvents(t, out.String()) {
+		if ev.Event == EventTask {
+			taskEvents++
+			if ev.SlotWaitMS < 0 {
+				t.Errorf("negative SlotWaitMS: %v", ev.SlotWaitMS)
+			}
+		}
+	}
+	if taskEvents == 0 {
+		t.Fatal("expected EventTask events in open-loop output")
+	}
+}

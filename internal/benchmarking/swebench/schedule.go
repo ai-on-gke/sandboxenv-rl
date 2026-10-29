@@ -272,25 +272,22 @@ func ResolveScenarioSchedule(scen schema.Scenario, defaultDataset string, datase
 	if scenName == "" {
 		scenName = "scenario"
 	}
-	var seed int64
-	if len(scen.Jobs) > 0 {
+	seed := scen.Seed
+	if seed == 0 && len(scen.Jobs) > 0 {
 		seed = scen.Jobs[0].Seed
 	}
+	if seed == 0 {
+		seed = 42
+	}
 	jobs := make([]JobScheduleSpec, 0, len(scen.Jobs))
-	for _, j := range scen.Jobs {
+	for idx, j := range scen.Jobs {
 		dsKey := j.Dataset
 		if dsKey == "" {
 			dsKey = defaultDataset
 		}
-		instances := datasets[dsKey]
-		if len(instances) == 0 {
-			instances = []Instance{{
-				InstanceID: "synthetic-0",
-				Image:      "synthetic-image:latest",
-			}}
-		}
-		if j.Images > 0 && j.Images < len(instances) {
-			instances = instances[:j.Images]
+		var instances []Instance
+		if datasets != nil {
+			instances = datasets[dsKey]
 		}
 		stepsCount := j.Steps
 		if stepsCount <= 0 {
@@ -298,15 +295,41 @@ func ResolveScenarioSchedule(scen schema.Scenario, defaultDataset string, datase
 		}
 		tasksPerStep := j.TasksPerStep
 		if tasksPerStep <= 0 {
+			tasksPerStep = j.BatchSize
+		}
+		if tasksPerStep <= 0 {
+			tasksPerStep = j.Concurrency
+		}
+		if len(instances) == 0 {
+			nInst := j.Instances
+			if nInst <= 0 {
+				nInst = tasksPerStep
+			}
+			if nInst <= 0 {
+				nInst = 1
+			}
+			instances = SyntheticInstances(nInst, j.ImagePrefix)
+		}
+		if j.Images > 0 && j.Images < len(instances) {
+			instances = instances[:j.Images]
+		}
+		if tasksPerStep <= 0 {
 			tasksPerStep = len(instances)
 		}
 		groupSize := j.GroupSize
+		if groupSize <= 0 {
+			groupSize = j.RolloutsPerTask
+		}
 		if groupSize <= 0 {
 			groupSize = 1
 		}
 		traj := j.Trajectory
 		if traj == "" {
 			traj = DefaultTrajectory
+		}
+		park := j.Park
+		if park == "" {
+			park = j.ParkPolicy
 		}
 		src := ScheduleSource(j.ScheduleMode)
 		switch src {
@@ -317,8 +340,8 @@ func ResolveScenarioSchedule(scen schema.Scenario, defaultDataset string, datase
 			src = ScheduleSourceSampled
 		}
 		jSeed := uint64(j.Seed)
-		if jSeed == 0 && seed != 0 {
-			jSeed = uint64(seed)
+		if jSeed == 0 {
+			jSeed = uint64(seed + int64(idx)*1000)
 		}
 		jobs = append(jobs, JobScheduleSpec{
 			JobID:         j.Name,
@@ -326,7 +349,7 @@ func ResolveScenarioSchedule(scen schema.Scenario, defaultDataset string, datase
 			Seed:          jSeed,
 			StartOffsetMS: j.StartOffsetMS,
 			StepPauseMS:   j.StepPauseMS,
-			ParkPolicy:    j.Park,
+			ParkPolicy:    park,
 			Trajectory:    traj,
 			Steps:         stepsCount,
 			TasksPerStep:  tasksPerStep,
@@ -382,6 +405,108 @@ func InstancesByID(instances []Instance) map[string]Instance {
 		m[in.InstanceID] = in
 	}
 	return m
+}
+
+// SyntheticInstances generates n deterministic synthetic SWE-bench instances
+// using the given image prefix when no external JSONL dataset is supplied.
+func SyntheticInstances(n int, imagePrefix string) []Instance {
+	if n <= 0 {
+		n = 1
+	}
+	if imagePrefix == "" {
+		imagePrefix = "ghcr.io/epoch-research/swe-bench.eval.x86_64."
+	}
+	out := make([]Instance, n)
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("synthetic__task-%03d", i)
+		out[i] = Instance{
+			InstanceID: id,
+			Image:      imagePrefix + id + ":latest",
+		}
+	}
+	return out
+}
+
+// ScheduleOptions configures deterministic schedule generation for a single job.
+type ScheduleOptions struct {
+	ScenarioName    string
+	JobName         string
+	Steps           int
+	BatchSize       int
+	RolloutsPerTask int
+	StepPauseMS     float64
+	LookaheadSteps  int
+	StartOffsetMS   float64
+	ParkPolicy      string
+}
+
+// ScheduleGenerator generates deterministic per-step schedules from a seed.
+type ScheduleGenerator struct {
+	seed uint64
+}
+
+// NewScheduleGenerator returns a ScheduleGenerator seeded with seed.
+func NewScheduleGenerator(seed int64) *ScheduleGenerator {
+	if seed == 0 {
+		seed = 42
+	}
+	return &ScheduleGenerator{seed: uint64(seed)}
+}
+
+// Generate builds a deterministic schema.Schedule for the given options and instances.
+func (g *ScheduleGenerator) Generate(opts ScheduleOptions, instances []Instance) *schema.Schedule {
+	scenName := opts.ScenarioName
+	if scenName == "" {
+		scenName = "scenario"
+	}
+	jobName := opts.JobName
+	if jobName == "" {
+		jobName = "job-0"
+	}
+	steps := opts.Steps
+	if steps <= 0 {
+		steps = 1
+	}
+	batch := opts.BatchSize
+	if batch <= 0 {
+		batch = len(instances)
+		if batch <= 0 {
+			batch = 1
+		}
+	}
+	rollouts := opts.RolloutsPerTask
+	if rollouts <= 0 {
+		rollouts = 1
+	}
+	if len(instances) == 0 {
+		instances = SyntheticInstances(batch, "")
+	}
+	sched, err := ResolveSchedule(ResolveScheduleOptions{
+		ScenarioName: scenName,
+		Seed:         int64(g.seed),
+		Jobs: []JobScheduleSpec{
+			{
+				JobID:         jobName,
+				Source:        ScheduleSourceSampled,
+				Seed:          g.seed,
+				StartOffsetMS: opts.StartOffsetMS,
+				StepPauseMS:   opts.StepPauseMS,
+				ParkPolicy:    schema.ParkPolicy(opts.ParkPolicy),
+				Steps:         steps,
+				TasksPerStep:  batch,
+				GroupSize:     rollouts,
+				Instances:     instances,
+			},
+		},
+	})
+	if err != nil {
+		return &schema.Schedule{
+			SchemaVersion: schema.SchemaVersion,
+			ScenarioName:  scenName,
+			Seed:          int64(g.seed),
+		}
+	}
+	return sched
 }
 
 // UniqueScheduleImages returns all unique images referenced by sched in sorted order.

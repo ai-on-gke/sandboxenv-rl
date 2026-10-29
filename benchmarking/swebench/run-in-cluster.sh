@@ -186,9 +186,27 @@ trap cleanup EXIT
 # whatever NAMESPACE the loader uses.
 harvest_part() {
   local part="${HARVEST_DIR}/part-$1"
-  NAMESPACE=ate-system SINCE="$(( 2 * HARVEST_INTERVAL_MIN ))m" "${HARVEST}" "${RUN_ID}" "${part}.tmp" >/dev/null 2>&1 || true
-  [[ -s "${part}.tmp" ]] && mv "${part}.tmp" "${part}.jsonl"
+  NAMESPACE=ate-system SINCE="$(( 2 * HARVEST_INTERVAL_MIN ))m" "${HARVEST}" "${RUN_ID}" "${part}.tmp" >&2 || true
+  if [[ -s "${part}.tmp" ]]; then
+    mv "${part}.tmp" "${part}.jsonl"
+  fi
   return 0
+}
+
+# merge_harvest writes the union of the parts to RESTORE_LOG. No part is a
+# run too short for one interval or a harvest that read nothing; the file is
+# then empty, and the run's results are copied out regardless.
+merge_harvest() {
+  local parts=()
+  shopt -s nullglob
+  parts=("${HARVEST_DIR}"/part-*.jsonl)
+  shopt -u nullglob
+  if (( ${#parts[@]} > 0 )); then
+    sort -u "${parts[@]}" > "${RESTORE_LOG}"
+  else
+    : > "${RESTORE_LOG}"
+  fi
+  echo "restore records in ${RESTORE_LOG}: $(wc -l < "${RESTORE_LOG}" | tr -d ' ')"
 }
 
 kc -n "${NS}" delete job "${JOB}" --ignore-not-found --wait=true >/dev/null
@@ -310,19 +328,20 @@ until EXIT="$(kc -n "${NS}" get pod "${POD}" -o jsonpath='{.status.containerStat
   sleep 10
 done
 echo "loader exit code ${EXIT}"
-if [[ -n "${RESTORE_LOG}" ]]; then
-  kill "${HARVEST_PID}" 2>/dev/null || true
-  wait "${HARVEST_PID}" 2>/dev/null || true
-  HARVEST_PID=""
-  harvest_part final
-  cat "${HARVEST_DIR}"/part-*.jsonl 2>/dev/null | sort -u > "${RESTORE_LOG}"
-  echo "restore records in ${RESTORE_LOG}: $(wc -l < "${RESTORE_LOG}" | tr -d ' ')"
-fi
+# The events file first: it is the run's only copy of the results, and the
+# Job is deleted when this script exits.
 if ! kc -n "${NS}" cp -c keep "${POD}:/work/${RUN_ID}.jsonl" "${OUT_DIR}/${RUN_ID}.jsonl"; then
   echo "no events file to copy; the loader exited before writing it" >&2
   exit "$(( EXIT == 0 ? 1 : EXIT ))"
 fi
 echo "events in ${OUT_DIR}/${RUN_ID}.jsonl"
+if [[ -n "${RESTORE_LOG}" ]]; then
+  kill "${HARVEST_PID}" 2>/dev/null || true
+  wait "${HARVEST_PID}" 2>/dev/null || true
+  HARVEST_PID=""
+  harvest_part final
+  merge_harvest
+fi
 REPORT_ARGS=()
 if [[ -n "${RESTORE_LOG}" ]]; then
   REPORT_ARGS=(-restore-log "${RESTORE_LOG}")

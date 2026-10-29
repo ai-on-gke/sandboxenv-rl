@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"time"
 
@@ -26,8 +27,8 @@ import (
 	"github.com/agent-substrate/env/internal/hostcheck"
 	"github.com/agent-substrate/env/internal/routertls"
 	"github.com/spf13/cobra"
-	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
-	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	appsv1 "k8s.io/api/apps/v1"
@@ -207,6 +208,10 @@ type templateConfig struct {
 	// Zero means sidecarWakeupTimeout with --sidecar-readyz and
 	// substrateWakeupTimeout without.
 	wakeupTimeout time.Duration
+	// env are extra container environment variables, each NAME=VALUE. The
+	// guest passes its environment to sidecars, so this is how a runtime
+	// layer's daemon is configured.
+	env []string
 }
 
 // wakeupTimeoutSeconds returns the probe timeout the template carries.
@@ -311,6 +316,12 @@ func (c *templateConfig) validateResources() error {
 		}
 	}
 	return nil
+}
+
+// validateEnv checks the --env flags before anything is built.
+func (c *templateConfig) validateEnv() error {
+	_, err := parseEnv(c.env)
+	return err
 }
 
 func (c *templateConfig) resolveImages() error {
@@ -475,6 +486,9 @@ It prints YAML to stdout without touching the cluster.`,
 			if err := tCfg.validateWakeupTimeout(); err != nil {
 				return err
 			}
+			if err := tCfg.validateEnv(); err != nil {
+				return err
+			}
 			tmpl, err := buildTemplate(tCfg)
 			if err != nil {
 				return err
@@ -497,6 +511,7 @@ It prints YAML to stdout without touching the cluster.`,
 	cmd.Flags().StringVar(&tCfg.cpu, "cpu", defaultActorCPU, "CPU limit of each actor, a Kubernetes quantity such as 2 or 500m, at least 1m, rendered as whole millicores (rounded up); Substrate requires one")
 	cmd.Flags().StringVar(&tCfg.memory, "memory", defaultActorMemory, "memory limit of each actor, a Kubernetes quantity such as 4Gi, at least 1Mi, rendered as whole bytes (rounded up); Substrate requires one")
 	cmd.Flags().DurationVar(&tCfg.wakeupTimeout, "wakeup-timeout", 0, fmt.Sprintf("how long Substrate polls the guest's /readyz at each actor start and resume before it fails the actor, whole seconds from 1s to %s; 0 or unset means the default: %s with --sidecar-readyz, else Substrate's %s", maxWakeupTimeout, sidecarWakeupTimeout, substrateWakeupTimeout))
+	cmd.Flags().StringArrayVar(&tCfg.env, "env", nil, "environment variable for the actor's container as NAME=VALUE (repeatable); the guest passes it to sidecars, e.g. a layer daemon's API key")
 
 	return cmd
 }
@@ -659,10 +674,10 @@ func buildNamespace(cfg manifestConfig) *corev1.Namespace {
 	}
 }
 
-func buildWorkerPool(cfg manifestConfig) *atev1alpha1.WorkerPool {
-	return &atev1alpha1.WorkerPool{
+func buildWorkerPool(cfg manifestConfig) *atev1.WorkerPool {
+	return &atev1.WorkerPool{
 		TypeMeta: metav1.TypeMeta{
-			APIVersion: atev1alpha1.GroupVersion.String(),
+			APIVersion: atev1.GroupVersion.String(),
 			Kind:       "WorkerPool",
 		},
 		ObjectMeta: metav1.ObjectMeta{
@@ -671,7 +686,7 @@ func buildWorkerPool(cfg manifestConfig) *atev1alpha1.WorkerPool {
 			// Copied to the pool's workers; templates select the pool by it.
 			Labels: map[string]string{workerPoolLabel: cfg.workerPool},
 		},
-		Spec: atev1alpha1.WorkerPoolSpec{
+		Spec: atev1.WorkerPoolSpec{
 			Replicas:    cfg.replicas,
 			WorkerImage: cfg.workerImage,
 			// The CRD requires exactly one sandbox class per pool. Since
@@ -679,9 +694,9 @@ func buildWorkerPool(cfg manifestConfig) *atev1alpha1.WorkerPool {
 			// ActorTemplate names none, and an actor restores onto a worker of
 			// its snapshot's class. The configRef is the SandboxConfig the
 			// workers run.
-			SandboxClasses: []atev1alpha1.WorkerPoolSandboxClass{{
-				Name:      atev1alpha1.SandboxClassGvisor,
-				ConfigRef: &atev1alpha1.SandboxConfigReference{Name: sandboxConfigName},
+			SandboxClasses: []atev1.WorkerPoolSandboxClass{{
+				Name:      atev1.SandboxClassGvisor,
+				ConfigRef: &atev1.SandboxConfigReference{Name: sandboxConfigName},
 			}},
 		},
 	}
@@ -757,6 +772,11 @@ func orDefault(v, def string) string {
 func buildTemplate(cfg templateConfig) (*ateapipb.ActorTemplate, error) {
 	tmpl := buildActorTemplate(cfg)
 	c := tmpl.Containers[0]
+	env, err := parseEnv(cfg.env)
+	if err != nil {
+		return nil, err
+	}
+	c.Env = append(c.Env, env...)
 	command := append([]string(nil), c.Command...)
 	if cfg.workspace != "" {
 		command = append(command, "-workspace", cfg.workspace)
@@ -967,4 +987,29 @@ func buildAPIService(cfg manifestConfig) *corev1.Service {
 			Ports:    ports,
 		},
 	}
+}
+
+// envName is a POSIX environment variable name.
+var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// parseEnv turns NAME=VALUE flags into container env vars. PORT is the guest's
+// own and cannot be overridden; a name given twice is an error.
+func parseEnv(flags []string) ([]*ateapipb.EnvVar, error) {
+	var out []*ateapipb.EnvVar
+	seen := map[string]bool{}
+	for _, f := range flags {
+		name, value, ok := strings.Cut(f, "=")
+		if !ok || !envName.MatchString(name) {
+			return nil, fmt.Errorf("--env %q: want NAME=VALUE with NAME of letters, digits and '_', not starting with a digit", f)
+		}
+		if name == "PORT" {
+			return nil, errors.New("--env PORT: PORT is the guest's listen port and is set by the template")
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("--env %s is given twice", name)
+		}
+		seen[name] = true
+		out = append(out, &ateapipb.EnvVar{Name: name, Value: value})
+	}
+	return out, nil
 }

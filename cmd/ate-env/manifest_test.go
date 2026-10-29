@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"slices"
 	"strings"
 	"testing"
@@ -24,8 +25,8 @@ import (
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/hostcheck"
 	"github.com/agent-substrate/env/internal/portproxy"
-	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
-	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/yaml"
@@ -101,7 +102,10 @@ func TestBuildManifests(t *testing.T) {
 		t.Errorf("namespace label %s = %q, want \"true\" (ate-system admits API clients by it)", apiAccessLabel, got)
 	}
 
-	pool := objs[1].(*atev1alpha1.WorkerPool)
+	pool := objs[1].(*atev1.WorkerPool)
+	if pool.APIVersion != "ate.dev/v1" {
+		t.Errorf("workerpool apiVersion = %q, want ate.dev/v1", pool.APIVersion)
+	}
 	if pool.Namespace != cfg.namespace || pool.Name != "default-template-workerpool" {
 		t.Errorf("workerpool = %s/%s, want %s/default-template-workerpool", pool.Namespace, pool.Name, cfg.namespace)
 	}
@@ -130,7 +134,7 @@ func TestBuildManifests(t *testing.T) {
 		t.Fatalf("workerpool sandboxClasses = %+v, want exactly one", pool.Spec.SandboxClasses)
 	}
 	sc := pool.Spec.SandboxClasses[0]
-	if sc.Name != atev1alpha1.SandboxClassGvisor || sc.ConfigRef == nil || sc.ConfigRef.Name != sandboxConfigName {
+	if sc.Name != atev1.SandboxClassGvisor || sc.ConfigRef == nil || sc.ConfigRef.Name != sandboxConfigName {
 		t.Errorf("workerpool sandboxClasses[0] = %+v, want gvisor with configRef %q", sc, sandboxConfigName)
 	}
 	sa := objs[2].(*corev1.ServiceAccount)
@@ -933,6 +937,94 @@ func TestBuildAPIDeploymentAuthTokenSecret(t *testing.T) {
 	}
 	if !foundVol {
 		t.Errorf("volumes = %+v, want Secret volume for ate-env-caller-token", dep.Spec.Template.Spec.Volumes)
+	}
+}
+
+func envMap(c *ateapipb.Container) (map[string]string, []string) {
+	m := map[string]string{}
+	var order []string
+	for _, e := range c.GetEnv() {
+		m[e.GetName()] = e.GetValue()
+		order = append(order, e.GetName())
+	}
+	return m, order
+}
+
+func TestBuildTemplateEnv(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.env = []string{"OH_SESSION_API_KEYS_0=s3cret", "EMPTY=", "URL=http://x/?a=b"}
+	tmpl, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, order := envMap(tmpl.Containers[0])
+	if strings.Join(order, ",") != "PORT,OH_SESSION_API_KEYS_0,EMPTY,URL" {
+		t.Errorf("env order = %v, want PORT first, then the flags in order", order)
+	}
+	if got["PORT"] != "80" || got["OH_SESSION_API_KEYS_0"] != "s3cret" || got["EMPTY"] != "" || got["URL"] != "http://x/?a=b" {
+		t.Errorf("env = %v", got)
+	}
+
+	// A rootfs-image template keeps the variables: the sidecars that read them
+	// run there.
+	cfg.rootfsImage = "docker.io/library/python@sha256:" + testHex64
+	cfg.guestImage = "example.com/guest@sha256:" + testHex64
+	tmpl, err = buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := envMap(tmpl.Containers[0]); got["OH_SESSION_API_KEYS_0"] != "s3cret" {
+		t.Errorf("rootfs-image template env = %v, want the --env values", got)
+	}
+}
+
+func TestTemplateConfigRejectsBadEnv(t *testing.T) {
+	for _, env := range [][]string{
+		{"NOEQUALS"},
+		{"1BAD=x"},
+		{"BAD-NAME=x"},
+		{"=x"},
+		{"PORT=81"},
+		{"A=1", "A=2"},
+	} {
+		cfg := testTemplateConfig()
+		cfg.env = env
+		if err := cfg.validateEnv(); err == nil {
+			t.Errorf("env %q: want error, got nil", env)
+		}
+	}
+}
+
+func TestManifestTemplateCommandEnv(t *testing.T) {
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{
+		"template",
+		"--guest-image=example.com/guest@sha256:aaaa",
+		"--snapshots-bucket=gs://bucket/prefix/",
+		"--env=OH_SESSION_API_KEYS_0=k",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "name: OH_SESSION_API_KEYS_0\n    value: k") {
+		t.Errorf("output lacks the --env variable:\n%s", out)
+	}
+}
+
+func TestManifestTemplateCommandRejectsBadEnv(t *testing.T) {
+	cmd := newManifestCommand()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{
+		"template",
+		"--guest-image=example.com/guest@sha256:aaaa",
+		"--snapshots-bucket=gs://bucket/prefix/",
+		"--env=PORT=81",
+	})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--env PORT") {
+		t.Errorf("execute with --env PORT=81: want the --env error, got %v", err)
 	}
 }
 

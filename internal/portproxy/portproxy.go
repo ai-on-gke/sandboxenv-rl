@@ -62,7 +62,7 @@ import (
 
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/routertls"
-	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )

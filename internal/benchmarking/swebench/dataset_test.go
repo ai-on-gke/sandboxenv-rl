@@ -290,7 +290,7 @@ func TestCommandAdapterValidationRenderingAndGrading(t *testing.T) {
 
 	// Grader unit tests: JSON verdict and plain stdout matching ExpectedStdout.
 	grader := a.Grader()
-	r, detail, err := grader.Parse([]byte("some log\n" + `{"valid":true,"reward":1,"detail":"all tests pass"}` + "\n"))
+	r, detail, err := grader.Parse([]byte("some log\n" + `{"valid":true,"reward":1,"detail":"all tests pass"}` + "\nstderr warning line\n"))
 	if err != nil || r == nil || *r != 1 || detail != "all tests pass" {
 		t.Fatalf("Grader JSON pass = (%v, %q, %v)", r, detail, err)
 	}

@@ -89,13 +89,17 @@ func parseCommandJSONVerdict(s string) (reward *int, detail string, ok bool) {
 		if i < 0 {
 			continue
 		}
+		line := s[i:]
+		if nl := strings.IndexByte(line, '\n'); nl >= 0 {
+			line = line[:nl]
+		}
 		var g struct {
 			Valid    *bool  `json:"valid"`
 			Reward   *int   `json:"reward"`
 			Resolved *bool  `json:"resolved"`
 			Detail   string `json:"detail"`
 		}
-		if err := json.Unmarshal([]byte(strings.TrimSpace(s[i:])), &g); err != nil {
+		if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &g); err != nil {
 			continue
 		}
 		if g.Valid == nil && g.Reward == nil && g.Resolved == nil {

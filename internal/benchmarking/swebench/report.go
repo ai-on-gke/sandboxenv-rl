@@ -3254,14 +3254,38 @@ func WriteStatsJSONL(path string, s *Report, runID, testName, tag string) error 
 		}
 	}
 	if len(s.RolloutBreakdown) > 0 {
-		rb0 := s.RolloutBreakdown[0]
-		phaseMeas["rollout_p50_ms"] = rb0.P50MS
-		phaseMeas["rollout_p100_ms"] = rb0.P100MS
-		phaseMeas["straggler_skew"] = rb0.StragglerSkew
-		phaseMeas["barrier_ms"] = rb0.BarrierMS
-		phaseMeas["llm_think_ms"] = rb0.LLMThinkMS
-		phaseMeas["env_wait_ms"] = rb0.EnvWaitMS
-		phaseMeas["env_overhead_pct"] = rb0.EnvOverheadPct
+		n := float64(len(s.RolloutBreakdown))
+		var sumP50, sumP100, sumSkew, sumBarrier, sumThink, sumWait, sumOverhead float64
+		for _, rb := range s.RolloutBreakdown {
+			sumP50 += rb.P50MS
+			sumP100 += rb.P100MS
+			sumSkew += rb.StragglerSkew
+			sumBarrier += rb.BarrierMS
+			sumThink += rb.LLMThinkMS
+			sumWait += rb.EnvWaitMS
+			sumOverhead += rb.EnvOverheadPct
+		}
+		phaseMeas["rollout_p50_ms"] = round1(sumP50 / n)
+		phaseMeas["rollout_p100_ms"] = round1(sumP100 / n)
+		phaseMeas["straggler_skew"] = round2(sumSkew / n)
+		phaseMeas["barrier_ms"] = round1(sumBarrier / n)
+		phaseMeas["llm_think_ms"] = round1(sumThink / n)
+		phaseMeas["env_wait_ms"] = round1(sumWait / n)
+		phaseMeas["env_overhead_pct"] = round2(sumOverhead / n)
+	}
+	if s.RLBreakdown != nil {
+		if s.RLBreakdown.StragglerSkewP100P50 > 0 {
+			phaseMeas["straggler_skew"] = s.RLBreakdown.StragglerSkewP100P50
+		}
+		if s.RLBreakdown.LLMThinkP50MS > 0 {
+			phaseMeas["llm_think_ms"] = s.RLBreakdown.LLMThinkP50MS
+		}
+		if s.RLBreakdown.EnvWaitP50MS > 0 {
+			phaseMeas["env_wait_ms"] = s.RLBreakdown.EnvWaitP50MS
+		}
+		if s.RLBreakdown.EnvOverheadPct > 0 {
+			phaseMeas["env_overhead_pct"] = s.RLBreakdown.EnvOverheadPct
+		}
 	}
 	rows = append(rows, schema.StatsRow{
 		SchemaVersion: schema.SchemaVersion,

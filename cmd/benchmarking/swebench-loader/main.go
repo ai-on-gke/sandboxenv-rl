@@ -254,6 +254,7 @@ func runCmd(args []string) (retErr error) {
 		steps         = fs.Int("steps", 8, "steps: training steps.")
 		park          = fs.String("park", string(swebench.ParkSuspend), "steps: what happens between steps: suspend, delete or none.")
 		imagesPerStep = fs.Int("images-per-step", 0, "steps: each step takes the next N images (wrapping around the dataset) with fresh environments, retired after the step: the create-and-retire-pools-per-step shape; needs -park delete. 0 keeps one fleet across the steps.")
+		parkEach      = fs.Bool("park-each", false, "steps: park each environment as soon as its step ends instead of after the whole fleet's step, so at most -width are awake at once and the fleet can be larger than the running slots; the barrier then includes the parking.")
 		createTimeout = fs.Duration("create-timeout", 5*time.Minute, "Deadline for one create call.")
 		stepTimeout   = fs.Duration("step-timeout", 10*time.Minute, "Default deadline for a run step without its own timeout.")
 		wakeBudget    = fs.Duration("wake-budget", 3*time.Minute, "How long a task's first command is retried while the environment is still waking or its image is still being baked.")
@@ -411,6 +412,7 @@ func runCmd(args []string) (retErr error) {
 		Steps:         *steps,
 		Park:          swebench.Park(*park),
 		ImagesPerStep: *imagesPerStep,
+		ParkEach:      *parkEach,
 		CreateTimeout: *createTimeout,
 		StepTimeout:   *stepTimeout,
 		WakeBudget:    *wakeBudget,

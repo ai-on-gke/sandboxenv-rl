@@ -126,6 +126,12 @@ def test_pause_policy_parks_and_the_next_command_wakes() -> None:
             assert await provider.status(handle) == SandboxStatus.RUNNING
             await provider.pause(handle)
             assert await provider.status(handle) == provider_mod._PAUSED
+        finally:
+            if handle is not None:
+                await provider.close(handle)
+            await provider.aclose()
+
+    asyncio.run(scenario())
 
 
 RUNTIME_TEMPLATE = os.environ.get("SUBSTRATE_E2E_RUNTIME_TEMPLATE")

@@ -453,11 +453,54 @@ type SandboxFootprint struct {
 	DiskGiB   float64 `json:"disk_gib,omitempty"`
 }
 
-// OverlayRef records an applied FeatureOverlay and its hash.
+// OverlayRef records an applied FeatureOverlay, its hash, and the location and
+// hash/commit of the baseline recipe it was built to patch on.
 type OverlayRef struct {
-	Name         string            `json:"name"`
-	Hash         string            `json:"hash,omitempty"`
-	SUTOverrides map[string]string `json:"sut_overrides,omitempty"`
+	Name             string            `json:"name"`
+	Path             string            `json:"path,omitempty"`
+	Hash             string            `json:"hash,omitempty"`
+	BaseRecipePath   string            `json:"base_recipe_path,omitempty"`
+	BaseRecipeHash   string            `json:"base_recipe_hash,omitempty"`
+	BaseRecipeCommit string            `json:"base_recipe_commit,omitempty"`
+	PatchFile        string            `json:"patch_file,omitempty"`
+	BaseFileHashes   map[string]string `json:"base_file_hashes,omitempty"`
+	SUTOverrides     map[string]string `json:"sut_overrides,omitempty"`
+}
+
+// OverlayManifest is the standalone overlay/overlay.json metadata file stored
+// inside a benchmark bundle's overlay/ directory.
+type OverlayManifest struct {
+	SchemaVersion    string            `json:"schema_version"`
+	Name             string            `json:"name"`
+	Path             string            `json:"path,omitempty"`
+	Hash             string            `json:"hash"`
+	BaseRecipePath   string            `json:"base_recipe_path"`
+	BaseRecipeHash   string            `json:"base_recipe_hash"`
+	BaseRecipeCommit string            `json:"base_recipe_commit,omitempty"`
+	PatchFile        string            `json:"patch_file,omitempty"`
+	BaseFileHashes   map[string]string `json:"base_file_hashes,omitempty"`
+	EnvOverrides     map[string]string `json:"env_overrides,omitempty"`
+	Description      string            `json:"description,omitempty"`
+}
+
+// Validate checks OverlayManifest invariants.
+func (m *OverlayManifest) Validate() error {
+	if err := checkSchemaVersion(m.SchemaVersion); err != nil {
+		return fmt.Errorf("overlay_manifest: %w", err)
+	}
+	if strings.TrimSpace(m.Name) == "" {
+		return errors.New("overlay_manifest: name is required")
+	}
+	if strings.TrimSpace(m.Hash) == "" {
+		return errors.New("overlay_manifest: hash is required")
+	}
+	if strings.TrimSpace(m.BaseRecipePath) == "" {
+		return errors.New("overlay_manifest: base_recipe_path is required")
+	}
+	if strings.TrimSpace(m.BaseRecipeHash) == "" {
+		return errors.New("overlay_manifest: base_recipe_hash is required")
+	}
+	return nil
 }
 
 // LoadParams records the effective load parameters for the run.

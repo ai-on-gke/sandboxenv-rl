@@ -66,6 +66,9 @@ type Event struct {
 	Snapshot             string             `json:"snapshot,omitempty"`
 	Node                 string             `json:"node,omitempty"`
 	Bytes                int64              `json:"bytes,omitempty"`
+	SizeMB               float64            `json:"size_mb,omitempty"`
+	DeletedCount         int                `json:"deleted_count,omitempty"`
+	OrphanCount          int                `json:"orphan_count,omitempty"`
 	CacheHit             *bool              `json:"cache_hit,omitempty"`
 	Labels               map[string]string  `json:"labels,omitempty"`
 	Tags                 map[string]string  `json:"tags,omitempty"`

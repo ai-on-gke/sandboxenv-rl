@@ -70,6 +70,8 @@ func execute(args []string, stdout, stderr io.Writer) int {
 		err = reportCmd(args[1:], stdout, stderr)
 	case "validate":
 		err = validateCmd(args[1:], stdout, stderr)
+	case "upload":
+		err = uploadCmd(args[1:], stdout, stderr)
 	case "compare":
 		err = compareCmd(args[1:], stdout, stderr)
 	case "run":
@@ -89,7 +91,7 @@ func execute(args []string, stdout, stderr io.Writer) int {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "usage: bench <resolve|render|prewarm|spinup|spindown|measure|reap|report|validate|compare|run> [flags]")
+	fmt.Fprintln(w, "usage: bench <resolve|render|prewarm|spinup|spindown|measure|reap|report|validate|upload|compare|run> [flags]")
 }
 
 func resolveCmd(args []string, stdout, stderr io.Writer) error {
@@ -920,6 +922,27 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 	rep.WriteMarkdown(&mdBuf)
 	_ = os.WriteFile(filepath.Join(destDir, "report.md"), mdBuf.Bytes(), 0o644)
 
+	runID := rep.RunID
+	if runID == "" && len(rep.Runs) > 0 {
+		runID = rep.Runs[0]
+	} else if runID == "" && outRep.Measurements != nil {
+		runID = outRep.Measurements.RunID
+	}
+	clusterName := ""
+	if sysDescPtr != nil {
+		clusterName = sysDescPtr.Cluster
+	}
+	var startT, endT time.Time
+	if outRep.Measurements != nil {
+		if outRep.Measurements.StartTS != nil {
+			startT = *outRep.Measurements.StartTS
+		}
+		if outRep.Measurements.EndTS != nil {
+			endT = *outRep.Measurements.EndTS
+		}
+	}
+	_ = ensureRunWindowFile(destDir, runID, clusterName, startT, endT)
+
 	targetJSON := jsonOut
 	if targetJSON == "" {
 		targetJSON = filepath.Join(destDir, "report.json")
@@ -1151,6 +1174,23 @@ func enrichSystemDescriptionFromArtifactDir(destDir string, sys *schema.SystemDe
 	}
 	if sys.StorageDriverAndFS == "" && sys.KubernetesVersion != "" {
 		sys.StorageDriverAndFS = "overlayfs / ext4 (containerd)"
+	}
+
+	// 4. Populate Overlays from overlay/overlay.json when present in destDir.
+	if rawOv, err := os.ReadFile(filepath.Join(destDir, "overlay", "overlay.json")); err == nil {
+		if ovMeta, derr := schema.DecodeJSONStrict[schema.OverlayManifest](bytes.NewReader(rawOv)); derr == nil {
+			sys.Overlays = []schema.OverlayRef{{
+				Name:             ovMeta.Name,
+				Path:             ovMeta.Path,
+				Hash:             ovMeta.Hash,
+				BaseRecipePath:   ovMeta.BaseRecipePath,
+				BaseRecipeHash:   ovMeta.BaseRecipeHash,
+				BaseRecipeCommit: ovMeta.BaseRecipeCommit,
+				PatchFile:        ovMeta.PatchFile,
+				BaseFileHashes:   ovMeta.BaseFileHashes,
+				SUTOverrides:     ovMeta.EnvOverrides,
+			}}
+		}
 	}
 }
 

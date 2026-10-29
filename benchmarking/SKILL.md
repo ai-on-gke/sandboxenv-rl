@@ -112,7 +112,7 @@ kill "$PF_PID" 2>/dev/null || true
 ```
 `bench spindown` scales `workerpool/default-template-workerpool` to `0`, waits until all `ateworker` pods terminate, and records `workerpool_spindown_wall_ms`, `worker_pod_terminate_ms`, and `workerpool_drained_pods` into `$ARTIFACT_DIR/measurements.json` and `$ARTIFACT_DIR/events/substrate_lifecycle.jsonl`.
 
-### Phase 5: Build & Validate the Report
+### Phase 5: Build & Validate the Report and Bundle
 ```bash
 go run ./cmd/benchmarking/bench report -dest "$ARTIFACT_DIR"
 go run ./cmd/benchmarking/bench validate -dest "$ARTIFACT_DIR"
@@ -120,7 +120,50 @@ go run ./cmd/benchmarking/bench validate -dest "$ARTIFACT_DIR"
 
 ---
 
-## 3. End-to-End Execution Protocol (Synthetic / Scenario Run)
+## 3. Feature Overlays (What They Are, How to Create Them, & What `$ARTIFACT_DIR/overlay/` Must Contain)
+
+A **Feature Overlay** is a self-contained layer of Kubernetes manifest patches, environment toggles, entrypoint hooks, and/or sandbox provider changes applied on top of a baseline RL recipe (`examples/<recipe>/`) or synthetic `scenario.yaml` to evaluate a specific lifecycle or infrastructure feature (e.g., Mode 1 `c36-cap` concurrency cap, Mode 2 `prewarmed` warm pool with `suspend`/`wake`, `snapshot-async`, etc.) **without mutating the baseline recipe in place**.
+
+### 3.1 How to Create a Feature Overlay
+1. **For Real Cluster RL Recipes (`examples/<recipe>/`)**:
+   - **Gate behavioral changes behind environment variables** (e.g. `ATE_BENCH_PARK_MODE=suspend`, `ATE_WARM_POOL_URL=http://verl-ray-head.default.svc:18999`, `PREWARM_COUNT=32`) so that when unset, the code behaves identically to Mode 0 (`ephemeral` / `on_demand`).
+   - **Express Job/ConfigMap overrides as a Kustomize overlay** (`kustomization.yaml` + `job-patch.yaml`) on top of the baseline `job.yaml`.
+2. **For Synthetic Scenarios (`benchmarking/scenarios/*.yaml`)**:
+   - Define named entries under `overlays:` in `scenario.yaml`, or pass built-in presets (`pool-off`, `pool-on`, `snapshot-sync`, `snapshot-async`, `cold-only`, `warm-pool`) via `bench run -overlay <presetA>,<presetB>`.
+
+### 3.2 What `$ARTIFACT_DIR/overlay/` Must Contain (Enforced by `bench validate -dest`)
+Whenever a cluster RL run uses a non-baseline lifecycle policy (`lifecycle_policy.mode != "ephemeral"`, `park_mode == "suspend"`, or `prewarm_at_start == true`), `$ARTIFACT_DIR/overlay/` **must** exist and include:
+1. `overlay/overlay.json` (`schema.OverlayManifest`): Structured provenance metadata recording the exact baseline recipe location and hashes that the overlay was built to patch on:
+   ```json
+   {
+     "schema_version": "v1",
+     "name": "prewarmed",
+     "hash": "sha256:<overlay-patch-sha256>",
+     "base_recipe_path": "examples/Qwen3.5-35B-A3B-verl",
+     "base_recipe_hash": "sha256:<combined-baseline-files-sha256>",
+     "base_recipe_commit": "<git-commit-sha>",
+     "patch_file": "overlay/mode0_to_mode2.patch",
+     "base_file_hashes": {
+       "examples/Qwen3.5-35B-A3B-verl/run_fully_async.sh": "sha256:...",
+       "integrations/uni-agent/src/uni_agent_substrate/provider.py": "sha256:...",
+       "integrations/uni-agent/src/uni_agent_substrate/tasks/r2e_gym/task.py": "sha256:..."
+     },
+     "env_overrides": {
+       "ATE_BENCH_PARK_MODE": "suspend",
+       "ATE_WARM_POOL_URL": "http://verl-ray-head.default.svc:18999",
+       "PREWARM_COUNT": "32"
+     }
+   }
+   ```
+   `bench report -dest "$ARTIFACT_DIR"` automatically ingests `overlay/overlay.json` into `system_description.json`'s `overlays` array, and `bench validate -dest "$ARTIFACT_DIR"` verifies that `base_recipe_path` and `base_recipe_hash` are present.
+2. `overlay/README.md`: Concise summary of the feature overlay, environment variables, and behavioral differences vs. Mode 0.
+3. `overlay/kustomization.yaml` & `overlay/job-patch.yaml`: The Kustomize patch applied to the baseline Job.
+4. `overlay/mode0_to_mode2.patch` (or `<baseline>_to_<overlay>.patch`): Unified diff (`diff -u` / `git diff`) from the baseline recipe (`examples/<recipe>/` and `integrations/`) to the overlay's runtime files.
+5. **Plain-text copies of all modified runtime scripts and Python modules** (e.g. `overlay/run_fully_async.sh`, `overlay/uni_agent_substrate/provider.py`, `overlay/uni_agent_substrate/tasks/...`): Because Kubernetes ConfigMaps often bundle Python packages into a base64 tarball (`binaryData["uni-agent-substrate.tgz"]`), extracting the modified files in plain text under `overlay/` ensures humans and agents can inspect and diff the exact behavioral changes directly in the archived benchmark.
+
+---
+
+## 4. End-to-End Execution Protocol (Synthetic / Scenario Run)
 
 For synthetic scale-ladder runs driven by `scenario.yaml`:
 ```bash
@@ -132,16 +175,35 @@ go run ./cmd/benchmarking/bench validate -dest "$ARTIFACT_DIR"
 
 ---
 
-## 4. Verification Checklist & Cloud Storage Archival
+## 5. Standardized Bundle Layout (`bench validate`) & Cloud Storage Upload (`bench upload`)
 
-Before declaring a benchmark run complete, verify in `$ARTIFACT_DIR`:
-1. `system_description.json` contains populated `load` (`max_concurrent`, `trajectories_per_step`), `max_concurrent_sandboxes_cap`, and `lifecycle_policy` (`mode`, `park_mode`, `idle_auto_park_enabled`, `prewarm_at_start`, `per_step_warming`).
-2. `report.json` contains `reap_seen: true` (`orphan_count: 0`), `hardware_cost.active_sandboxes`, `hardware_cost.paused_sandboxes`, and `convergence.curve` (for RL runs).
-3. Recommend uploading `$ARTIFACT_DIR` to the user's benchmark storage bucket using the 4-part folder naming convention:
-   ```text
-   gs://<YOUR_BENCHMARK_BUCKET>/<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>/
-   ```
-   - **LLM RL runs**: `<model-family>-<size>` = e.g. `qwen3.5-35b`, `qwen3-1.7b`; `<dataset>` = e.g. `r2e-gym-easy`, `swebench-verified`, `lighteval-math`; `<nickname>` = e.g. `baseline`, `prewarmed`, `c36-cap`.
-   - **Synthetic runs**: `<model-family>-<size>` = `synthetic-w<N>` (where `<N>` is concurrent trajectories/step); `<dataset>` = `<trajectory-type>-<7char-sha256>` of the trajectory YAML (e.g. `math-bb4dcec`); `<nickname>` = e.g. `suspend-sync`, `baseline`.
+`bench validate` and `bench upload` are intentionally separate subcommands so runs can be validated offline without uploading to GCS.
+
+### 5.1 Standardized Bundle Layout Checked by `bench validate -dest "$ARTIFACT_DIR"`
+
+| Category | Required Artifacts & Schema Checks |
+| :--- | :--- |
+| **Always Required (Every Bundle)** | <ul><li>`report.json` — valid `v1` report + passes semantic validity rules (`reap_seen: true`, `orphan_count: 0`, error rate `< 5%`).</li><li>`report.md` — non-empty rendered Markdown report.</li><li>`system_description.json` — strict `v1` schema with populated `load` (`max_concurrent > 0`, `trajectories_per_step > 0`), `max_concurrent_sandboxes_cap > 0`, and `lifecycle_policy.mode`.</li><li>`measurements.json` — strict `v1` schema.</li><li>`run_window.json` — strict `v1` schema (`start_ts`, `end_ts`, `run_id`).</li><li>`events/*.jsonl` (or `events.jsonl`) — non-empty `v1` `Event` stream.</li></ul> |
+| **Cluster RL Runs** *(when `verl-head.log` / `train.log` is present)* | <ul><li>`traces/*.jsonl` — non-empty `v1` `TraceEvent` streams from Ray workers.</li><li>`configmap.yaml` & `job.yaml` (in root or `logs/`) — exact K8s manifests executed.</li><li>`cache_before.{prom,json}` & `cache_after.{prom,json}` — node image-cache snapshots.</li></ul> |
+| **Warm / `suspend`-`restore` Runs** *(when `park_mode == "suspend"` or `footing == "warm"`)* | <ul><li>`restore_timings.jsonl` — non-empty `v1` `RestoreSample` sub-phase timings harvested from `atelet`.</li><li>`overlay/` — non-empty directory containing the plain-text feature overlay (`README.md`, Kustomize patch, `.patch` diff, and modified runtime scripts/modules).</li></ul> |
+| **Synthetic Scenario Runs** *(`bench run`)* | <ul><li>`schedule.json` — strict `v1` `Schedule`.</li><li>`sut-manifest.yaml` — rendered SUT manifest.</li></ul> |
+
+### 5.2 Validating and Uploading to GCS (`bench upload`)
+
+Pass the target GCS bucket via `-bucket` (never hardcode a bucket name in scripts or code) and use the 4-part folder naming convention `<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>`:
+```bash
+# 1. Validate bundle completeness, v1 schemas, and 4-part folder name offline:
+go run ./cmd/benchmarking/bench validate \
+  -dest "$ARTIFACT_DIR" \
+  -folder "2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed"
+
+# 2. Upload to GCS (validates the bundle first unless -skip-validate is set):
+go run ./cmd/benchmarking/bench upload \
+  -dest "$ARTIFACT_DIR" \
+  -bucket "$GCS_BENCHMARK_BUCKET" \
+  -folder "2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed"
+```
+- **LLM RL runs**: `<model-family>-<size>` = e.g. `qwen3.5-35b`, `qwen3-1.7b`; `<dataset>` = e.g. `r2e-gym-easy`, `swebench-verified`, `lighteval-math`; `<nickname>` = e.g. `baseline`, `prewarmed`, `c36-cap`.
+- **Synthetic runs**: `<model-family>-<size>` = `synthetic-w<N>` (where `<N>` is concurrent trajectories/step); `<dataset>` = `<trajectory-type>-<7char-sha256>` of the trajectory YAML (e.g. `math-bb4dcec`); `<nickname>` = e.g. `suspend-sync`, `baseline`.
 
 For scoping telemetry to specific subsystems (`-scopes rl,user-sandbox,substrate,k8s`) or adding custom feature debug metrics (`-plugin-prom`, `-plugin-log`, `-plugin-metric`, `-plugin-cmd`), see [`internal/benchmarking/TELEMETRY_GUIDE.md`](../internal/benchmarking/TELEMETRY_GUIDE.md).

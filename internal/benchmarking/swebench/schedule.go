@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"path/filepath"
 	"slices"
 
 	"github.com/agent-substrate/env/internal/benchmarking/schema"
@@ -264,6 +265,82 @@ func populatePrefetchImages(steps []schema.ScheduledStep) {
 	}
 }
 
+// ResolveScenarioSchedule resolves a deterministic v1 schema.Schedule from a
+// multi-job schema.Scenario and loaded dataset map.
+func ResolveScenarioSchedule(scen schema.Scenario, defaultDataset string, datasets map[string][]Instance) (*schema.Schedule, error) {
+	scenName := scen.Name
+	if scenName == "" {
+		scenName = "scenario"
+	}
+	var seed int64
+	if len(scen.Jobs) > 0 {
+		seed = scen.Jobs[0].Seed
+	}
+	jobs := make([]JobScheduleSpec, 0, len(scen.Jobs))
+	for _, j := range scen.Jobs {
+		dsKey := j.Dataset
+		if dsKey == "" {
+			dsKey = defaultDataset
+		}
+		instances := datasets[dsKey]
+		if len(instances) == 0 {
+			instances = []Instance{{
+				InstanceID: "synthetic-0",
+				Image:      "synthetic-image:latest",
+			}}
+		}
+		if j.Images > 0 && j.Images < len(instances) {
+			instances = instances[:j.Images]
+		}
+		stepsCount := j.Steps
+		if stepsCount <= 0 {
+			stepsCount = 1
+		}
+		tasksPerStep := j.TasksPerStep
+		if tasksPerStep <= 0 {
+			tasksPerStep = len(instances)
+		}
+		groupSize := j.GroupSize
+		if groupSize <= 0 {
+			groupSize = 1
+		}
+		traj := j.Trajectory
+		if traj == "" {
+			traj = DefaultTrajectory
+		}
+		src := ScheduleSource(j.ScheduleMode)
+		switch src {
+		case ScheduleSourceSampled, ScheduleSourceFixed:
+		case "":
+			src = ScheduleSourceSampled
+		default:
+			src = ScheduleSourceSampled
+		}
+		jSeed := uint64(j.Seed)
+		if jSeed == 0 && seed != 0 {
+			jSeed = uint64(seed)
+		}
+		jobs = append(jobs, JobScheduleSpec{
+			JobID:         j.Name,
+			Source:        src,
+			Seed:          jSeed,
+			StartOffsetMS: j.StartOffsetMS,
+			StepPauseMS:   j.StepPauseMS,
+			ParkPolicy:    j.Park,
+			Trajectory:    traj,
+			Steps:         stepsCount,
+			TasksPerStep:  tasksPerStep,
+			GroupSize:     groupSize,
+			Instances:     instances,
+		})
+	}
+	return ResolveSchedule(ResolveScheduleOptions{
+		ScenarioName: scenName,
+		Seed:         seed,
+		Jobs:         jobs,
+	})
+}
+
 // WriteSchedule validates and writes a Schedule to path as formatted JSON.
 func WriteSchedule(path string, sched *schema.Schedule) error {
 	if sched == nil {
@@ -271,6 +348,11 @@ func WriteSchedule(path string, sched *schema.Schedule) error {
 	}
 	if err := sched.Validate(); err != nil {
 		return err
+	}
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("swebench: mkdir schedule dir: %w", err)
+		}
 	}
 	data, err := json.MarshalIndent(sched, "", "  ")
 	if err != nil {

@@ -61,6 +61,46 @@ func (s *NodeCacheSnapshot) TotalHitsAndMisses() (hits int64, misses int64) {
 	return s.Hits, s.Misses
 }
 
+// Delta computes the CacheDelta between s (before) and after.
+func (s *NodeCacheSnapshot) Delta(after *NodeCacheSnapshot) CacheDelta {
+	if s == nil || after == nil {
+		return CacheDelta{}
+	}
+	bHits, bMisses := s.TotalHitsAndMisses()
+	aHits, aMisses := after.TotalHitsAndMisses()
+	hitsDelta := aHits - bHits
+	missesDelta := aMisses - bMisses
+	if hitsDelta < 0 {
+		hitsDelta = aHits
+	}
+	if missesDelta < 0 {
+		missesDelta = aMisses
+	}
+	nodesCount := len(after.Nodes)
+	if nodesCount == 0 && len(s.Nodes) > 0 {
+		nodesCount = len(s.Nodes)
+	}
+	var nodesWithMisses int
+	beforeByNode := map[string]int64{}
+	for _, n := range s.Nodes {
+		beforeByNode[n.Node] = n.Misses
+	}
+	for _, n := range after.Nodes {
+		if n.Misses-beforeByNode[n.Node] > 0 {
+			nodesWithMisses++
+		}
+	}
+	if missesDelta > 0 && nodesWithMisses == 0 {
+		nodesWithMisses = 1
+	}
+	return CacheDelta{
+		Nodes:           nodesCount,
+		Hits:            float64(hitsDelta),
+		Misses:          float64(missesDelta),
+		NodesWithMisses: nodesWithMisses,
+	}
+}
+
 // LoadNodeCacheSnapshot reads a cache_before or cache_after file (JSON or Prometheus tab-prefixed text).
 func LoadNodeCacheSnapshot(path string) (*NodeCacheSnapshot, error) {
 	raw, err := os.ReadFile(path)
@@ -204,29 +244,8 @@ func Validate(rep *Report, opts ValidateOptions) schema.ReportValidity {
 		missesDelta = aMisses - bMisses
 		hasCacheDelta = true
 		if rep.Cache == nil && (hitsDelta+missesDelta > 0 || opts.Footing != "") {
-			nodesCount := len(cacheAfter.Nodes)
-			if nodesCount == 0 && len(cacheBefore.Nodes) > 0 {
-				nodesCount = len(cacheBefore.Nodes)
-			}
-			var nodesWithMisses int
-			beforeByNode := map[string]int64{}
-			for _, n := range cacheBefore.Nodes {
-				beforeByNode[n.Node] = n.Misses
-			}
-			for _, n := range cacheAfter.Nodes {
-				if n.Misses-beforeByNode[n.Node] > 0 {
-					nodesWithMisses++
-				}
-			}
-			if missesDelta > 0 && nodesWithMisses == 0 {
-				nodesWithMisses = 1
-			}
-			rep.Cache = &CacheDelta{
-				Nodes:           nodesCount,
-				Hits:            float64(hitsDelta),
-				Misses:          float64(missesDelta),
-				NodesWithMisses: nodesWithMisses,
-			}
+			d := cacheBefore.Delta(cacheAfter)
+			rep.Cache = &d
 			rep.PopulateCacheMissesPerFirstCmd()
 		}
 	} else if rep.Cache != nil {
@@ -363,4 +382,41 @@ func Validate(rep *Report, opts ValidateOptions) schema.ReportValidity {
 	}
 	rep.Validity = &validity
 	return validity
+}
+
+// ValidateReportOrEvents loads a Report from reportPath (or summarizes eventsPath,
+// or initializes an empty Report), loads schedulePath if non-empty, and evaluates
+// Validate(rep, opts).
+func ValidateReportOrEvents(reportPath, eventsPath, schedulePath string, opts ValidateOptions) (*Report, schema.ReportValidity, error) {
+	var rep *Report
+	if reportPath != "" {
+		r, err := LoadOrSummarizeReport(reportPath)
+		if err != nil {
+			return nil, schema.ReportValidity{}, fmt.Errorf("load report %q: %w", reportPath, err)
+		}
+		rep = r
+	} else if eventsPath != "" {
+		f, err := os.Open(eventsPath)
+		if err != nil {
+			return nil, schema.ReportValidity{}, fmt.Errorf("open events %q: %w", eventsPath, err)
+		}
+		evs, err := ReadEvents(f)
+		_ = f.Close()
+		if err != nil {
+			return nil, schema.ReportValidity{}, fmt.Errorf("read events %q: %w", eventsPath, err)
+		}
+		rep = Build(evs)
+		opts.Events = evs
+	} else {
+		rep = &Report{}
+	}
+	if schedulePath != "" && opts.Schedule == nil {
+		sched, err := ReadSchedule(schedulePath)
+		if err != nil {
+			return nil, schema.ReportValidity{}, err
+		}
+		opts.Schedule = sched
+	}
+	v := Validate(rep, opts)
+	return rep, v, nil
 }

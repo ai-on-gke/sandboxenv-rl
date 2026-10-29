@@ -377,6 +377,32 @@ new = fleet.add_tasks(next_batch)                    # Task objects or dicts
 fleet.warm_images(sorted({t.image for t in new}), wait=False)
 ```
 
+### Size warm pools
+
+A warm pool's depth is its image's share of `max_concurrent`, not its task
+count. At most `max_concurrent` claims are in flight, so an image with a tenth
+of the tasks needs about a tenth of `max_concurrent` warm replicas:
+
+```text
+replicas = clamp(round(max_concurrent × tasks_image / tasks_total),
+                 1, min(tasks_image, max_warmpool_replicas))
+```
+
+`plan()` and `setup()` share the budget among all images. `warm_images()`
+shares it among the images it is given, so a window of the `sliding` and
+`pipelined` strategies is sized for the claims it serves. `warm_images(imgs,
+replicas=n)` still sets the depth directly. For RL, where the G rollouts of one
+problem claim at the same time, `warm_per_task=True` gives every task its own
+replica up to `max_warmpool_replicas`:
+
+```python
+FleetConfig(max_concurrent=64, max_warmpool_replicas=16, warm_per_task=True)
+```
+
+`setup()` and `warm_images()` warm up to `warm_parallelism` (16) images at
+once. A failed image does not stop the others: the first error is raised once
+every image was tried.
+
 ### Observability
 
 Three layers, all off the hot path when disabled. The base install has

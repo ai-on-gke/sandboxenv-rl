@@ -55,6 +55,20 @@ type fakeBackend struct {
 
 	inflight    atomic.Int32
 	maxInflight atomic.Int32
+	// awake counts environments created and not parked or deleted; maxAwake
+	// is its high-water mark, what the running slots would have to hold.
+	awake    atomic.Int32
+	maxAwake atomic.Int32
+}
+
+func (f *fakeBackend) bumpAwake(d int32) {
+	n := f.awake.Add(d)
+	for {
+		m := f.maxAwake.Load()
+		if n <= m || f.maxAwake.CompareAndSwap(m, n) {
+			return
+		}
+	}
 }
 
 func newFake() *fakeBackend {
@@ -83,12 +97,21 @@ func (f *fakeBackend) Create(ctx context.Context, id, image string) (Sandbox, er
 	if f.onCreate != nil {
 		f.onCreate(id)
 	}
+	f.bumpAwake(1)
 	return &fakeSandbox{b: f, id: id}, nil
 }
 
 type fakeSandbox struct {
-	b  *fakeBackend
-	id string
+	b      *fakeBackend
+	id     string
+	parked atomic.Bool
+}
+
+// wake counts the environment awake again on its first call after a park.
+func (s *fakeSandbox) wake() {
+	if s.parked.CompareAndSwap(true, false) {
+		s.b.bumpAwake(1)
+	}
 }
 
 func (s *fakeSandbox) enter() func() {
@@ -104,6 +127,7 @@ func (s *fakeSandbox) enter() func() {
 
 func (s *fakeSandbox) Run(ctx context.Context, command string, timeout time.Duration) (Result, error) {
 	defer s.enter()()
+	s.wake()
 	if atomic.AddInt32(&s.b.unavailable, -1) >= 0 {
 		return Result{}, status.Error(codes.Unavailable, "waking")
 	}
@@ -115,11 +139,15 @@ func (s *fakeSandbox) Run(ctx context.Context, command string, timeout time.Dura
 	if strings.HasPrefix(command, "exit ") {
 		return Result{ExitCode: int(command[5] - '0'), Stderr: "failed"}, nil
 	}
+	if strings.HasPrefix(command, "echo ") {
+		return Result{Stdout: strings.TrimPrefix(command, "echo ")}, nil
+	}
 	return Result{Stdout: "ok"}, nil
 }
 
 func (s *fakeSandbox) WriteFile(ctx context.Context, path string, content []byte, mode fs.FileMode) error {
 	defer s.enter()()
+	s.wake()
 	s.b.mu.Lock()
 	defer s.b.mu.Unlock()
 	s.b.files[s.id+":"+path] = string(content)
@@ -130,6 +158,9 @@ func (s *fakeSandbox) Suspend(ctx context.Context) error {
 	s.b.mu.Lock()
 	defer s.b.mu.Unlock()
 	s.b.suspended[s.id]++
+	if s.parked.CompareAndSwap(false, true) {
+		s.b.bumpAwake(-1)
+	}
 	return nil
 }
 
@@ -146,6 +177,9 @@ func (s *fakeSandbox) Delete(ctx context.Context) error {
 		return errors.New("delete refused")
 	}
 	s.b.deleted[s.id]++
+	if s.parked.CompareAndSwap(false, true) {
+		s.b.bumpAwake(-1)
+	}
 	return nil
 }
 
@@ -406,6 +440,87 @@ func TestStepsSuspendPark(t *testing.T) {
 	}
 }
 
+func TestStepsParkEachBoundsAwakeEnvironments(t *testing.T) {
+	for _, park := range []Park{ParkSuspend, ParkDelete} {
+		t.Run(string(park), func(t *testing.T) {
+			f := newFake()
+			var out bytes.Buffer
+			cfg := baseConfig(t, f, &out)
+			cfg.Mode = ModeSteps
+			cfg.Rollouts = 3 // 9 environments on a width of 2
+			cfg.Steps = 3
+			cfg.Park = park
+			cfg.ParkEach = true
+
+			sum, err := Run(context.Background(), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sum.Tasks != 27 || sum.Failed != 0 || sum.Rewarded != 27 {
+				t.Fatalf("summary %+v", sum)
+			}
+			if m := f.maxAwake.Load(); m > int32(cfg.Width) {
+				t.Fatalf("%d environments awake at once, want at most the width %d", m, cfg.Width)
+			}
+			rep := Build(parseEvents(t, out.String()))
+			if len(rep.Steps) != 3 || rep.Steps[0].Tasks != 9 || rep.Steps[0].BarrierMS == 0 || rep.Steps[0].ParkMS != 0 {
+				t.Fatalf("steps %+v, want 3 steps of 9 tasks with a barrier and no park event", rep.Steps)
+			}
+			wakes, ttfis := stat(rep, EventWake).Count, stat(rep, EventTTFI).Count
+			switch park {
+			case ParkSuspend:
+				if len(f.created) != 9 || wakes != 18 || ttfis != 9 {
+					t.Fatalf("created %d wakes %d ttfis %d, want 9 created once, 18 wakes, 9 ttfis", len(f.created), wakes, ttfis)
+				}
+				for id, n := range f.created {
+					if n != 1 || f.suspended[id] != 3 || f.deleted[id] != 1 {
+						t.Fatalf("env %s created %d suspended %d deleted %d, want 1, 3 (the last step parks too) and 1", id, n, f.suspended[id], f.deleted[id])
+					}
+				}
+			case ParkDelete:
+				if len(f.created) != 27 || wakes != 0 || ttfis != 27 {
+					t.Fatalf("created %d wakes %d ttfis %d, want 27 created once, no wakes, 27 ttfis", len(f.created), wakes, ttfis)
+				}
+				for id, n := range f.created {
+					if n != 1 || f.deleted[id] != 1 {
+						t.Fatalf("env %s created %d deleted %d", id, n, f.deleted[id])
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestStepsParkEachDeletesFailedEnvironmentsAtOnce(t *testing.T) {
+	f := newFake()
+	f.unavailable = 1000 // every first command fails until the wake budget runs out
+	var out bytes.Buffer
+	cfg := baseConfig(t, f, &out)
+	cfg.Mode = ModeSteps
+	cfg.Rollouts = 3
+	cfg.Steps = 2
+	cfg.Park = ParkSuspend
+	cfg.ParkEach = true
+	cfg.WakeBudget = 5 * time.Millisecond
+	cfg.WakeBackoff = 2 * time.Millisecond
+
+	sum, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Failed != 9 {
+		t.Fatalf("summary %+v, want all 9 failed", sum)
+	}
+	if m := f.maxAwake.Load(); m > int32(cfg.Width) {
+		t.Fatalf("%d environments awake at once, want at most the width %d: a failed environment kept its slot", m, cfg.Width)
+	}
+	for id, n := range f.created {
+		if n != 1 || f.deleted[id] != 1 || f.suspended[id] != 0 {
+			t.Fatalf("env %s created %d deleted %d suspended %d, want 1, 1 (deleted when its step failed) and 0", id, n, f.deleted[id], f.suspended[id])
+		}
+	}
+}
+
 func TestStepsDeleteParkRecreates(t *testing.T) {
 	f := newFake()
 	var out bytes.Buffer
@@ -557,6 +672,15 @@ func TestConfigValidation(t *testing.T) {
 		func(c *Config) { c.Mode = "bogus" },
 		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 0; c.Steps = 1 },
 		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 1; c.Steps = 1; c.Park = "bogus" },
+		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 1; c.Steps = 1; c.Park = ParkNone; c.ParkEach = true },
+		func(c *Config) {
+			c.Mode = ModeSteps
+			c.Rollouts = 1
+			c.Steps = 1
+			c.Park = ParkDelete
+			c.ParkEach = true
+			c.ImagesPerStep = 1
+		},
 	}
 	for i, mutate := range bad {
 		c := good
@@ -668,6 +792,99 @@ func TestValidateChecksTheLongestName(t *testing.T) {
 	cfg.Mode, cfg.TasksPerImage = ModeEval, 100001 // largest index 100000
 	if err := cfg.validate(); err == nil {
 		t.Fatal("eval mode with a 6-digit replay index: want the long name refused")
+	}
+}
+
+type zeroRewardGrader struct{}
+
+func (zeroRewardGrader) Parse(stdout []byte) (*int, string, error) {
+	if !strings.Contains(string(stdout), "RESOLVED=0") {
+		return nil, "", errors.New("no zero-reward marker")
+	}
+	r := 0
+	return &r, "custom-zero-verdict", nil
+}
+
+type zeroRewardAdapter struct{}
+
+func (zeroRewardAdapter) Kind() string                  { return "zero-reward-test" }
+func (zeroRewardAdapter) Validate(Instance) error       { return nil }
+func (zeroRewardAdapter) RequireGrading(Instance) error { return nil }
+func (zeroRewardAdapter) TemplateData(in Instance) (any, error) {
+	return in, nil
+}
+func (zeroRewardAdapter) Grades(t *Trajectory) bool {
+	for _, steps := range [][]Step{t.Setup, t.Reset, t.Steps} {
+		for _, s := range steps {
+			if strings.Contains(s.Run, "RESOLVED=0") {
+				return true
+			}
+		}
+	}
+	return false
+}
+func (zeroRewardAdapter) Grader() Grader { return zeroRewardGrader{} }
+
+func TestGraderRewardOverridesZeroExitCode(t *testing.T) {
+	RegisterAdapter(zeroRewardAdapter{})
+	t.Cleanup(func() { unregisterAdapter("zero-reward-test") })
+	f := newFake()
+	var out bytes.Buffer
+	cfg := baseConfig(t, f, &out)
+	cfg.Mode = ModeEval
+	cfg.TasksPerImage = 1
+	inst := Instance{InstanceID: "repo__repo-a", Image: "reg/img@" + goodDigest, Kind: "zero-reward-test", Patch: "PATCH", EvalScript: "EVAL"}
+	cfg.Instances = []Instance{inst}
+	// Reward step runs "echo RESOLVED=0" (exit code 0), and the adapter's Grader returns reward=0.
+	cfg.Trajectory = testTrajectory(t, "echo RESOLVED=0")
+
+	sum, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Tasks != 1 || sum.Failed != 0 || sum.Rewarded != 0 {
+		t.Fatalf("summary = %+v, want Tasks=1 Failed=0 Rewarded=0", sum)
+	}
+	rep := Build(parseEvents(t, out.String()))
+	if rep.RewardRate != 0 || len(rep.Unresolved) != 1 || rep.Unresolved[0].Reason != "custom-zero-verdict" {
+		t.Fatalf("report = %+v, want RewardRate=0 and unresolved reason custom-zero-verdict", rep)
+	}
+}
+
+type nilGraderAdapter struct{}
+
+func (nilGraderAdapter) Kind() string                          { return "nil-grader-test" }
+func (nilGraderAdapter) Validate(Instance) error               { return nil }
+func (nilGraderAdapter) RequireGrading(Instance) error         { return nil }
+func (nilGraderAdapter) TemplateData(in Instance) (any, error) { return in, nil }
+func (nilGraderAdapter) Grades(*Trajectory) bool               { return false }
+func (nilGraderAdapter) Grader() Grader                        { return nil }
+
+func TestGraderNilFallbackUsesExitCode(t *testing.T) {
+	RegisterAdapter(nilGraderAdapter{})
+	t.Cleanup(func() { unregisterAdapter("nil-grader-test") })
+
+	for _, tc := range []struct {
+		cmd        string
+		wantReward int
+	}{
+		{cmd: "true", wantReward: 1},
+		{cmd: "exit 1", wantReward: 0},
+	} {
+		f := newFake()
+		var out bytes.Buffer
+		cfg := baseConfig(t, f, &out)
+		cfg.Mode = ModeEval
+		cfg.TasksPerImage = 1
+		cfg.Instances = []Instance{{InstanceID: "repo__repo-a", Image: "reg/img@" + goodDigest, Kind: "nil-grader-test"}}
+		cfg.Trajectory = testTrajectory(t, tc.cmd)
+		sum, err := Run(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.cmd, err)
+		}
+		if sum.Rewarded != tc.wantReward {
+			t.Fatalf("%s: Rewarded = %d, want %d", tc.cmd, sum.Rewarded, tc.wantReward)
+		}
 	}
 }
 

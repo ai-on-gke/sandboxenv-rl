@@ -101,11 +101,13 @@ type Step struct {
 	// Timeout bounds a Run step; zero means the runner's default.
 	Timeout Duration `json:"timeout,omitempty"`
 	// ExpectExit, when set, fails the task if the exit code differs. A
-	// Reward step never fails the task on exit code: its exit code is the
-	// reward.
+	// Reward step never fails the task on exit code: its output or exit
+	// code decides the reward.
 	ExpectExit *int `json:"expect_exit,omitempty"`
-	// Reward marks the step whose exit code decides the task reward:
-	// 1 when it exits 0, else 0. At most one step per trajectory.
+	// Reward marks the step that decides the task reward: the dataset
+	// adapter's Grader parses its output when present, falling back to 1
+	// when the step exits 0 and 0 otherwise. At most one step per
+	// trajectory.
 	Reward bool `json:"reward,omitempty"`
 }
 
@@ -152,6 +154,9 @@ func LoadTrajectory(source string) (*Trajectory, error) {
 		return parseWithAssets(data, func(name string) ([]byte, error) {
 			return os.ReadFile(filepath.Join(dir, name))
 		})
+	}
+	if source == CommandTrajectoryName {
+		return ParseTrajectory([]byte(CommandAdapter{}.DefaultTrajectory()))
 	}
 	data, err := trajectoryFS.ReadFile("trajectories/" + source + ".yaml")
 	if err != nil {
@@ -299,21 +304,29 @@ func (s Step) validate() error {
 }
 
 // Grades reports whether the trajectory uses the instance's grading
-// material: a step references the eval script or the log parser, or hands
-// the whole instance to a script. Such a trajectory needs RequireGrading on
-// its dataset.
-func (t *Trajectory) Grades() bool {
-	for _, steps := range [][]Step{t.Setup, t.Reset, t.Steps} {
-		for _, s := range steps {
-			texts := []string{s.Run}
-			if s.Write != nil {
-				texts = append(texts, s.Write.Content)
-			}
-			for _, text := range texts {
-				if strings.Contains(text, ".EvalScript") || strings.Contains(text, ".LogParser") || strings.Contains(text, "json .}}") {
-					return true
-				}
-			}
+// material for any of the given dataset kinds (defaulting to DefaultKind when
+// no kinds are specified; for SWE-bench, a step references the eval script or
+// the log parser, or hands the whole instance to a script). Adapter lookups are
+// snapshotted before invoking Adapter.Grades so a recursive AdapterFor inside
+// an adapter cannot deadlock on adaptersMu.
+func (t *Trajectory) Grades(kinds ...string) bool {
+	if len(kinds) == 0 {
+		kinds = []string{DefaultKind}
+	}
+	snapshot := make([]Adapter, 0, len(kinds))
+	adaptersMu.RLock()
+	for _, k := range kinds {
+		if k == "" {
+			k = DefaultKind
+		}
+		if a := adapters[k]; a != nil {
+			snapshot = append(snapshot, a)
+		}
+	}
+	adaptersMu.RUnlock()
+	for _, a := range snapshot {
+		if a.Grades(t) {
+			return true
 		}
 	}
 	return false
@@ -347,33 +360,40 @@ func (t *Trajectory) VarsUsed(in Instance) (map[string]string, error) {
 }
 
 func (t *Trajectory) render(in Instance, used map[string]string) (*Trajectory, error) {
+	a := AdapterFor(in.Kind)
+	if a == nil {
+		return nil, fmt.Errorf("swebench: unknown dataset kind %q", in.Kind)
+	}
+	data, err := a.TemplateData(in)
+	if err != nil {
+		return nil, fmt.Errorf("trajectory %s instance %s: %w", t.Name, in.InstanceID, err)
+	}
 	out := &Trajectory{Name: t.Name, Vars: t.Vars}
 	funcs := templateFuncs(t.Vars, used)
-	var err error
-	if out.Setup, err = renderSteps(t.Name, t.Setup, in, funcs); err != nil {
+	if out.Setup, err = renderSteps(t.Name, t.Setup, data, funcs); err != nil {
 		return nil, err
 	}
-	if out.Reset, err = renderSteps(t.Name, t.Reset, in, funcs); err != nil {
+	if out.Reset, err = renderSteps(t.Name, t.Reset, data, funcs); err != nil {
 		return nil, err
 	}
-	if out.Steps, err = renderSteps(t.Name, t.Steps, in, funcs); err != nil {
+	if out.Steps, err = renderSteps(t.Name, t.Steps, data, funcs); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func renderSteps(tname string, steps []Step, in Instance, funcs template.FuncMap) ([]Step, error) {
+func renderSteps(tname string, steps []Step, data any, funcs template.FuncMap) ([]Step, error) {
 	out := make([]Step, len(steps))
 	for i, s := range steps {
 		r := s
 		var err error
-		if r.Run, err = renderText(s.Run, in, funcs); err != nil {
+		if r.Run, err = renderText(s.Run, data, funcs); err != nil {
 			return nil, fmt.Errorf("trajectory %s step %s run: %w", tname, s.Name, err)
 		}
 		if s.Write != nil {
 			w := *s.Write
 			if !w.raw {
-				if w.Content, err = renderText(s.Write.Content, in, funcs); err != nil {
+				if w.Content, err = renderText(s.Write.Content, data, funcs); err != nil {
 					return nil, fmt.Errorf("trajectory %s step %s write: %w", tname, s.Name, err)
 				}
 			}
@@ -423,7 +443,7 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-func renderText(text string, in Instance, funcs template.FuncMap) (string, error) {
+func renderText(text string, data any, funcs template.FuncMap) (string, error) {
 	if !strings.Contains(text, "{{") {
 		return text, nil
 	}
@@ -432,7 +452,7 @@ func renderText(text string, in Instance, funcs template.FuncMap) (string, error
 		return "", err
 	}
 	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, in); err != nil {
+	if err := tmpl.Execute(&buf, data); err != nil {
 		return "", err
 	}
 	return buf.String(), nil

@@ -54,8 +54,26 @@ class MockBackendDriver(BackendDriver):
         run_id: str | None = None,
         rootfs_image: str | None = None,
     ) -> None:
+        self._set_pool(template_id, rootfs_image, replicas)
+
+    def resize_pool(
+        self,
+        template_id: str,
+        replicas: int,
+        wait: bool = True,
+        rootfs_image: str | None = None,
+    ) -> None:
+        self._set_pool(template_id, rootfs_image, replicas)
+
+    def _set_pool(self, template_id: str, rootfs_image: str | None, replicas: int) -> None:
+        """Set the pool's size and move the observer's warm count by the
+        delta, up or down, so the gauge and the run report follow a shrink."""
         key = template_id if rootfs_image is None else (template_id, rootfs_image)
-        self._observe("warm_add", replicas - self.warm_pools.get(key, 0))
+        delta = replicas - self.warm_pools.get(key, 0)
+        if delta > 0:
+            self._observe("warm_add", delta)
+        elif delta < 0:
+            self._observe("warm_remove", -delta)
         self.warm_pools[template_id] = replicas
         if rootfs_image is not None:
             self.warm_pools[(template_id, rootfs_image)] = replicas
@@ -66,6 +84,10 @@ class MockBackendDriver(BackendDriver):
         self.warm_pools[template_id] = 0
         if rootfs_image is not None:
             self.warm_pools.pop((template_id, rootfs_image), None)
+
+    def pool_size(self, template_id: str, rootfs_image: str | None = None) -> int | None:
+        key = template_id if rootfs_image is None else (template_id, rootfs_image)
+        return self.warm_pools.get(key, 0)
 
     def acquire(
         self,

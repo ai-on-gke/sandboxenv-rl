@@ -25,3 +25,21 @@ Histograms are in seconds with one bucket set:
 Clients may send `x-ate-env-requested-at` (RFC 3339 with nanoseconds) as gRPC
 metadata on `CreateEnvironment`; `ate_env_api_create_to_ready_seconds` then starts at that time
 instead of the server's receipt of the call.
+
+## ate-env-guest
+
+With `--enable-metrics`, ate-env-guest serves this family at `/metrics` on its
+own listener, next to `/readyz`, on a private registry.
+
+Who can scrape it: the guest listener has no authentication, like the guest
+API it also serves, and it is reachable only inside the environment and
+through the atenet router (a request that names the environment in the
+`ate-target-actor` header, the path ate-env-api uses for guest calls).
+ate-env-api's port proxy refuses port 80, and `ate-env manifest` configures no
+scraper. Scrape it from a process inside the environment
+(`localhost:80/metrics`) or from a client in the cluster that can reach the
+router.
+
+| Name | Type | Labels | Description |
+|---|---|---|---|
+| `ate_env_guest_process_duration_seconds` | histogram | `exit_class` | Seconds from a process starting in the environment to its exit, by exit_class: zero, nonzero, signal (killed by a signal) or timeout (killed by the process timeout). The command is never a label. |

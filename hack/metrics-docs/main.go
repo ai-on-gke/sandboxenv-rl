@@ -66,20 +66,40 @@ references never appear in a label.
 Histograms are in seconds with one bucket set:
 `)
 	fmt.Fprintf(w, "`%s`.\n\n", joinFloats(telemetry.SecondsBuckets))
+	table(w, telemetry.Definitions)
+	fmt.Fprintf(w, `
+Clients may send `+"`%s`"+` (RFC 3339 with nanoseconds) as gRPC
+metadata on `+"`CreateEnvironment`"+`; `+"`%s`"+` then starts at that time
+instead of the server's receipt of the call.
+
+## ate-env-guest
+
+With `+"`--enable-metrics`"+`, ate-env-guest serves this family at `+"`/metrics`"+` on its
+own listener, next to `+"`/readyz`"+`, on a private registry.
+
+Who can scrape it: the guest listener has no authentication, like the guest
+API it also serves, and it is reachable only inside the environment and
+through the atenet router (a request that names the environment in the
+`+"`ate-target-actor`"+` header, the path ate-env-api uses for guest calls).
+ate-env-api's port proxy refuses port 80, and `+"`ate-env manifest`"+` configures no
+scraper. Scrape it from a process inside the environment
+(`+"`localhost:80/metrics`"+`) or from a client in the cluster that can reach the
+router.
+
+`, telemetry.RequestedAtHeader, telemetry.MetricCreateToReadySeconds)
+	table(w, telemetry.GuestDefinitions)
+}
+
+func table(w io.Writer, defs []telemetry.Definition) {
 	fmt.Fprintln(w, "| Name | Type | Labels | Description |")
 	fmt.Fprintln(w, "|---|---|---|---|")
-	for _, d := range telemetry.Definitions {
+	for _, d := range defs {
 		labels := make([]string, len(d.Labels))
 		for i, l := range d.Labels {
 			labels[i] = "`" + l + "`"
 		}
 		fmt.Fprintf(w, "| `%s` | %s | %s | %s |\n", d.Name, d.Type, strings.Join(labels, ", "), strings.ReplaceAll(d.Help, "|", `\|`))
 	}
-	fmt.Fprintf(w, `
-Clients may send `+"`%s`"+` (RFC 3339 with nanoseconds) as gRPC
-metadata on `+"`CreateEnvironment`"+`; `+"`%s`"+` then starts at that time
-instead of the server's receipt of the call.
-`, telemetry.RequestedAtHeader, telemetry.MetricCreateToReadySeconds)
 }
 
 func joinFloats(fs []float64) string {

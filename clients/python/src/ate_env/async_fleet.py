@@ -116,15 +116,10 @@ class AsyncSandboxFleet:
             self._fleet.load_tasks(tasks)
         await self.preflight()
         plan = await self.plan()
-        for entry in plan.entries:
-            if entry.replicas > 0:
-                await self._warm_pool_for_template(
-                    entry.template_id,
-                    entry.replicas,
-                    wait=True,
-                    rootfs_image=getattr(entry, "rootfs_image", None),
-                    family=repo_family(entry.image),
-                )
+        await self._warm_many(
+            [(e.image, e.template_id, e.rootfs_image, e.replicas) for e in plan.entries],
+            wait=True,
+        )
         return self
 
     async def _ensure_template_for_image_async(self, image: str) -> tuple[str, str | None]:
@@ -160,12 +155,86 @@ class AsyncSandboxFleet:
     async def warm_images(
         self, images: list[str], replicas: int | None = None, wait: bool = True
     ) -> None:
-        rep = replicas if replicas is not None else self.config.max_warmpool_replicas
-        for img in images:
+        """Warm pools for ``images``, sized as ``SandboxFleet.warm_images``.
+
+        Up to ``warm_parallelism`` images warm at once; the first error is
+        raised after every image was tried.
+        """
+        if replicas is not None:
+            sized = {img: replicas for img in images}
+        else:
+            sized = self._fleet._size_pools(self.image_counts(), images)
+        work = []
+        for img in dict.fromkeys(images):
             template_id, rootfs_image = await self._ensure_template_for_image_async(img)
-            await self._warm_pool_for_template(
-                template_id, rep, wait=wait, rootfs_image=rootfs_image, family=repo_family(img)
-            )
+            work.append((img, template_id, rootfs_image, sized[img]))
+        await self._warm_many(work, wait=wait)
+
+    async def _warm_many(
+        self, work: list[tuple[str, str, str | None, int]], wait: bool
+    ) -> None:
+        work = [w for w in work if w[3] > 0]
+        if not work:
+            return
+        sem = asyncio.Semaphore(self.config.warm_parallelism)
+
+        async def _warm_one(item: tuple[str, str, str | None, int]) -> None:
+            img, template_id, rootfs_image, rep = item
+            async with sem:
+                await self._warm_pool_for_template(
+                    template_id, rep, wait=wait, rootfs_image=rootfs_image,
+                    family=repo_family(img),
+                )
+
+        results = await asyncio.gather(*(_warm_one(w) for w in work), return_exceptions=True)
+        errors = [r for r in results if isinstance(r, BaseException)]
+        for r in errors:
+            if not isinstance(r, Exception):  # CancelledError, KeyboardInterrupt
+                raise r
+        if errors:
+            if len(errors) > 1:
+                logger.warning("%d of %d images failed to warm; raising the first",
+                               len(errors), len(work))
+            raise errors[0]
+
+    async def warm_image(
+        self, image: str, replicas: int | None = None, wait: bool = True
+    ) -> None:
+        """Warm one image's pool (agent-sandbox-rl's ``warm_image``)."""
+        await self.warm_images([image], replicas=replicas, wait=wait)
+
+    async def set_pool_replicas(self, image: str, replicas: int, wait: bool = True) -> None:
+        """Size one image's warm pool to exactly ``replicas``, up or down; see
+        ``SandboxFleet.set_pool_replicas``."""
+        replicas = max(0, int(replicas))
+        template_id, rootfs_image = await self._ensure_template_for_image_async(image)
+        family = repo_family(image)
+        try:
+            with self.observer.phase("warm_pool", backend=self._backend_label, family=family):
+                if hasattr(self.backend, "resize_pool_async"):
+                    await self.backend.resize_pool_async(
+                        template_id, replicas, wait=wait, rootfs_image=rootfs_image
+                    )
+                else:
+                    await asyncio.to_thread(
+                        self.backend.resize_pool,
+                        template_id,
+                        replicas,
+                        wait=wait,
+                        rootfs_image=rootfs_image,
+                    )
+        except NotImplementedError:
+            if replicas == 0:
+                await self.unwarm_image(image)
+            else:
+                logger.warning(
+                    "backend %s has no resize_pool: set_pool_replicas(%s, %d) can grow the "
+                    "pool but cannot shrink it below its current size",
+                    self._backend_label, image, replicas,
+                )
+                await self._warm_pool_for_template(
+                    template_id, replicas, wait=wait, rootfs_image=rootfs_image, family=family
+                )
 
     async def unwarm_image(self, image: str) -> None:
         entry = self._fleet._image_to_template.get(image)
@@ -177,6 +246,14 @@ class AsyncSandboxFleet:
                 await asyncio.to_thread(
                     self.backend.unwarm_pool, template_id, rootfs_image=rootfs_image
                 )
+
+    def acquired_count(self, image: str) -> int:
+        """Sandboxes acquired for ``image``, warm or cold (see ``SandboxFleet.acquired_count``)."""
+        return self._fleet.acquired_count(image)
+
+    def pool_size(self, image: str) -> int | None:
+        """Idle warm replicas for ``image`` (see ``SandboxFleet.pool_size``)."""
+        return self._fleet.pool_size(image)
 
     async def acquire(self, task: Task | str, timeout_s: float | None = None) -> SandboxHandle:
         """Asynchronously acquire a single sandbox."""
@@ -214,6 +291,7 @@ class AsyncSandboxFleet:
                 timeout_s=to_s,
                 rootfs_image=rootfs_image,
             )
+        self._fleet._count_acquire(task_obj.image)
 
         try:
             runtime, data_plane = self._fleet._build_runtime(raw_inst)

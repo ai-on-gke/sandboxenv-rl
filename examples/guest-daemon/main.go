@@ -96,7 +96,6 @@ func main() {
 		fmt.Printf("\nReceived signal %v, shutting down guest daemon gracefully...\n", sig)
 		grpcServer.GracefulStop()
 		_ = lis.Close()
-		cleanup()
 	}()
 
 	log.Printf("guest-daemon listening on gRPC %s (services=%s, workspace=%s, logdir=%s)",

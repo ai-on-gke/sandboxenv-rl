@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"math"
 	"math/rand"
 	"regexp"
 	"slices"
@@ -60,6 +61,7 @@ const (
 // same binary serves the smoke test and the 500-wide run.
 type Config struct {
 	RunID      string
+	Dataset    string
 	Backend    Backend
 	Instances  []Instance
 	Trajectory *Trajectory
@@ -392,6 +394,7 @@ type environment struct {
 	hasWSOverride bool
 	wsFresh       bool
 	wsWake        bool
+	slotWaitMS    float64
 }
 
 type runner struct {
@@ -445,6 +448,7 @@ func Run(ctx context.Context, cfg Config) (*Summary, error) {
 			OK:                   s.Failed == 0,
 			Count:                s.Tasks,
 			Labels:               cfg.labels(),
+			Tags:                 cfg.buildRunLoadTags(),
 			WorkingSetHits:       s.WorkingSetHits,
 			WorkingSetMisses:     s.WorkingSetMisses,
 			WorkingSetHitRate:    s.WorkingSetHitRate,
@@ -476,8 +480,56 @@ func Run(ctx context.Context, cfg Config) (*Summary, error) {
 	dur := time.Since(start)
 	s := &Summary{Tasks: r.tasks, Failed: r.failed, Rewarded: r.rewarded, Duration: dur}
 	r.rec.Record(Event{RunID: cfg.RunID, Event: EventRun, Name: string(cfg.Mode), DurMS: ms(dur),
-		OK: s.Failed == 0, Count: s.Tasks, Labels: cfg.labels()})
+		OK: s.Failed == 0, Count: s.Tasks, Labels: cfg.labels(), Tags: cfg.buildRunLoadTags()})
 	return s, ctx.Err()
+}
+
+func (c *Config) buildRunLoadTags() map[string]string {
+	tags := make(map[string]string)
+	if c.Dataset != "" {
+		tags["dataset"] = c.Dataset
+	}
+	imgSet := make(map[string]bool)
+	var firstImg string
+	for _, in := range c.Instances {
+		if in.Image != "" {
+			if firstImg == "" {
+				firstImg = in.Image
+			}
+			imgSet[in.Image] = true
+		}
+	}
+	if firstImg != "" {
+		tags["guest_image"] = firstImg
+	}
+	steps := c.Steps
+	if c.Mode != ModeSteps || steps < 1 {
+		steps = 1
+	}
+	groupSize := c.GroupSize
+	if groupSize < 1 {
+		if c.Mode == ModeSteps {
+			groupSize = c.Rollouts
+		} else {
+			groupSize = c.TasksPerImage
+		}
+	}
+	if groupSize < 1 {
+		groupSize = 1
+	}
+	tasksPerStep := c.TasksPerStep
+	if tasksPerStep < 1 {
+		tasksPerStep = len(c.Instances)
+	}
+	tags["load_tasks"] = fmt.Sprintf("%d", len(c.Instances))
+	tags["load_group_size"] = fmt.Sprintf("%d", groupSize)
+	tags["load_steps"] = fmt.Sprintf("%d", steps)
+	tags["load_tasks_per_step"] = fmt.Sprintf("%d", tasksPerStep)
+	tags["load_trajectories_per_step"] = fmt.Sprintf("%d", groupSize*tasksPerStep)
+	tags["load_max_concurrent"] = fmt.Sprintf("%d", c.Width)
+	tags["load_distinct_images"] = fmt.Sprintf("%d", len(imgSet))
+	tags["load_repeat"] = "1"
+	return tags
 }
 
 // trajectoryPicker draws trajectories from r.cfg.Trajectories (seeded by
@@ -1174,16 +1226,19 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 	taskStart := time.Now()
 	ok := true
 	var reward *int
+	var totalThinkMS float64
 	for _, s := range steps {
 		// No think time before the first command: it would land in the
 		// ttfi or wake measurement, and the "model" has nothing to think
 		// about before it has seen the environment.
 		if s.Think > 0 && !first {
+			thinkStart := time.Now()
 			select {
 			case <-ctx.Done():
 				ok = false
 			case <-time.After(time.Duration(s.Think)):
 			}
+			totalThinkMS += ms(time.Since(thinkStart))
 			if !ok {
 				break
 			}
@@ -1197,6 +1252,16 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 		if first {
 			fe := r.event(firstEvent, e, step, time.Since(firstStart), err)
 			fe.Attempts = attempts
+			fe.SlotWaitMS = e.slotWaitMS
+			if firstEvent == EventTTFI {
+				wireMS := math.Max(0, ms(stepStart.Sub(firstStart)))
+				firstCmdMS := ms(dur)
+				fe.Metrics = map[string]float64{
+					"sdk_slot_wait_ms":       round1(e.slotWaitMS),
+					"wire_claim_to_ready_ms": round1(wireMS),
+					"ready_to_first_cmd_ms":  round1(firstCmdMS),
+				}
+			}
 			r.rec.Record(fe)
 			first = false
 		}
@@ -1257,6 +1322,13 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 	ev := r.event(EventTask, e, step, time.Since(taskStart), nil)
 	ev.OK = ok
 	ev.Reward = reward
+	if totalThinkMS > 0 {
+		taskDurMS := ms(time.Since(taskStart))
+		ev.Metrics = map[string]float64{
+			"llm_think_ms": round1(totalThinkMS),
+			"env_wait_ms":  round1(math.Max(0, taskDurMS-totalThinkMS)),
+		}
+	}
 	r.rec.Record(ev)
 	r.countTask(e, step, ok, reward)
 	if !ok && r.cfg.Mode == ModeSteps {

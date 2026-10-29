@@ -290,7 +290,7 @@ func ReadSchedule(path string) (*schema.Schedule, error) {
 	if err != nil {
 		return nil, fmt.Errorf("swebench: decode schedule %s: %w", path, err)
 	}
-	return sched, nil
+	return &sched, nil
 }
 
 // InstancesByID indexes a slice of Instances by InstanceID.

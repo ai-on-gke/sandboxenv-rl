@@ -576,17 +576,18 @@ func runCmd(args []string) (retErr error) {
 
 	if *statsOut != "" || *validate {
 		rep, sErr := swebench.SummarizeFile(*out)
-		if sErr == nil {
-			if *statsOut != "" {
-				if wErr := swebench.WriteStatsJSONL(*statsOut, rep, *runID, *testName, *tag); wErr != nil {
-					return wErr
-				}
+		if sErr != nil {
+			return sErr
+		}
+		if *statsOut != "" {
+			if wErr := swebench.WriteStatsJSONL(*statsOut, rep, *runID, *testName, *tag); wErr != nil {
+				return wErr
 			}
-			if *validate {
-				v := swebench.Validate(rep, swebench.ValidateOptions{})
-				if !v.Valid {
-					return fmt.Errorf("report validation failed: %s", strings.Join(v.Reasons, "; "))
-				}
+		}
+		if *validate {
+			v := swebench.Validate(rep, swebench.ValidateOptions{})
+			if !v.Valid {
+				return fmt.Errorf("report validation failed: %s", strings.Join(v.Reasons, "; "))
 			}
 		}
 	}

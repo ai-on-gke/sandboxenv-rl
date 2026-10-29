@@ -23,6 +23,7 @@ through tar over both, the way Harbor's cloud providers stage them.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import itertools
 import json
@@ -121,6 +122,9 @@ class AteEnvEnvironment(BaseEnvironment):
     - ``platform``: build platform, the worker nodes' architecture; default
       ``linux/amd64``.
     - ``create_timeout_sec``: create plus the first guest answer; default 600.
+    - ``exec_timeout_sec``: the bound on a command Harbor runs without a
+      timeout (the verifier's test command, for one); default 24 hours. The
+      guest would apply its own default of one hour otherwise.
     - ``workdir``: working directory when neither the task nor the Dockerfile
       sets one.
     - ``scratch_dir``: where tar archives are staged inside the environment;
@@ -146,6 +150,7 @@ class AteEnvEnvironment(BaseEnvironment):
         build: str = "local",
         platform: str = "linux/amd64",
         create_timeout_sec: float = 600,
+        exec_timeout_sec: float = 24 * 3600,
         workdir: str | None = None,
         scratch_dir: str = "/tmp",
         docker_bin: str = "docker",
@@ -163,6 +168,7 @@ class AteEnvEnvironment(BaseEnvironment):
         if self._build not in BUILD_MODES:
             raise ValueError(f"build must be one of {', '.join(BUILD_MODES)}, got {build!r}")
         self._create_timeout = float(create_timeout_sec)
+        self._exec_timeout = float(exec_timeout_sec)
         self._workdir_kwarg = workdir or None
         self._scratch_dir = str(scratch_dir).rstrip("/") or "/tmp"
         self._resolver = ImageResolver(
@@ -237,11 +243,12 @@ class AteEnvEnvironment(BaseEnvironment):
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            pass
+            problem = asyncio.run(_probe_api(api, token))
         else:
-            _logger.debug("ate-env preflight skipped inside a running event loop")
-            return
-        problem = asyncio.run(_probe_api(api, token))
+            # Called from inside a loop (Harbor's local validation path):
+            # the probe needs a loop of its own, on a worker thread.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                problem = pool.submit(asyncio.run, _probe_api(api, token)).result()
         if problem:
             raise SystemExit(f"ate-env preflight: {problem}")
 
@@ -297,7 +304,9 @@ class AteEnvEnvironment(BaseEnvironment):
                 rootfs_image=image,
             )
         except FailedPreconditionError as e:
-            if template == self._template or "not found" not in str(e):
+            if template == self._template or not (
+                "base actor template" in str(e) and "not found" in str(e)
+            ):
                 raise
             hint = self._register_hint()
             if not self._may_fall_back():
@@ -359,13 +368,16 @@ class AteEnvEnvironment(BaseEnvironment):
                     f"environment {self._env_id} did not answer within "
                     f"{self._create_timeout:g}s{detail}"
                 )
+            probe = min(30.0, max(1.0, remaining))
             try:
-                result = await env.shell("true", timeout=min(30.0, max(1.0, remaining)))
+                result = await asyncio.wait_for(env.shell("true", timeout=probe), probe + 5)
                 if result.exit_code == 0:
                     return
                 last = RuntimeError(f"probe exited {result.exit_code}: {result.stderr.strip()}")
             except (NotFoundError, PermissionDeniedError, InvalidArgumentError):
                 raise
+            except TimeoutError as e:
+                last = e
             except RpcError as e:
                 if e.code not in _RETRY_CODES:
                     raise
@@ -427,7 +439,7 @@ class AteEnvEnvironment(BaseEnvironment):
             return
         self.logger.info(
             "environment %s is kept suspended; it wakes on the next call. Inspect it with: "
-            "ate-env %s shell --api %s --atespace %s",
+            "ate-env %s shell --api %s --atespace %s 'cat /logs/verifier/reward.txt'",
             self._env_id,
             self._env_id,
             self._api_url,
@@ -437,7 +449,8 @@ class AteEnvEnvironment(BaseEnvironment):
     async def attach(self) -> None:
         raise RuntimeError(
             "attach is not supported on ate-env; use: "
-            f"ate-env {self._env_id} shell --api {self._api_url} --atespace {self._atespace}"
+            f"ate-env {self._env_id} shell --api {self._api_url} --atespace {self._atespace} "
+            "'<command>'"
         )
 
     # --- commands ---
@@ -462,25 +475,41 @@ class AteEnvEnvironment(BaseEnvironment):
             effective_exec_cwd(cwd, self.task_env_config.workdir, self._dockerfile_workdir)
             or self._workdir_kwarg
         )
-        command = await self._as_user(command, resolved_user)
-        result = await handle.shell(command, cwd=workdir or "", env=merged, timeout=timeout_sec)
+        command = self._as_user_command(command, resolved_user, merged, await self._switch_tool_for(resolved_user))
+        timeout = float(timeout_sec) if timeout_sec is not None else self._exec_timeout
+        result = await handle.shell(command, cwd=workdir or "", env=merged, timeout=timeout)
         return ExecResult(stdout=result.stdout, stderr=result.stderr, return_code=result.exit_code)
 
-    async def _as_user(self, command: str, user: str | int | None) -> str:
-        """Wrap ``command`` so it runs as ``user``, when that differs from the image's."""
-        if user is None:
-            return command
-        name = str(user)
+    def _needs_switch(self, user: str | int | None) -> bool:
         # Unknown image user (no `id` in the image): run as is. Task images
         # run as root as a rule, and root is what Harbor asks for.
-        if self._image_user is None or name == self._image_user:
+        return user is not None and self._image_user is not None and str(user) != self._image_user
+
+    async def _switch_tool_for(self, user: str | int | None) -> str | None:
+        return await self._user_switch_tool() if self._needs_switch(user) else None
+
+    def _as_user_command(
+        self, command: str, user: str | int | None, env: dict[str, str] | None, tool: str | None
+    ) -> str:
+        """Wrap ``command`` so it runs as ``user`` when that differs from the image's.
+
+        The environment is inlined with ``env K=V ...``: sudo's ``env_reset``
+        drops the caller's variables, and the guest applied them to the outer
+        process only.
+        """
+        if not self._needs_switch(user):
             return command
-        tool = await self._user_switch_tool()
-        quoted = shlex.quote(command)
+        name = str(user)
+        inner = "sh -c " + shlex.quote(command)
+        if env:
+            inner = "env " + " ".join(shlex.quote(f"{k}={v}") for k, v in env.items()) + " " + inner
         if tool == "sudo":
-            return f"sudo -n -u {shlex.quote(name)} sh -c {quoted}"
+            target = f"#{name}" if name.isdigit() else name
+            return f"sudo -n -u {shlex.quote(target)} {inner}"
         if tool == "su" and self._image_user == "root":
-            return f"su {shlex.quote(name)} -s /bin/sh -c {quoted}"
+            if name.isdigit():
+                raise RuntimeError(f"user={name!r}: su wants a user name; a uid needs sudo in the image")
+            return f"su {shlex.quote(name)} -s /bin/sh -c {shlex.quote(inner)}"
         raise RuntimeError(
             f"ate-env runs commands as the image's user ({self._image_user!r}); "
             f"user={name!r} needs sudo in the image (or su, when the image runs as root)"
@@ -524,7 +553,15 @@ class AteEnvEnvironment(BaseEnvironment):
         payload = pack_dir_to_bytes(source_dir, compress=True).getvalue()
         await handle.write_file(archive, payload)
         unpack = remote_unpack_command(archive, target_dir)
-        result = await handle.shell(f"{unpack}; rc=$?; rm -f {shlex.quote(archive)}; exit $rc")
+        try:
+            result = await handle.shell(f"{unpack}; rc=$?; rm -f {shlex.quote(archive)}; exit $rc")
+        except BaseException:
+            # The shell command removes the archive itself; when the call
+            # does not come back (a transport error, a cancellation), remove
+            # it from here so a failed upload leaves nothing in scratch_dir.
+            with contextlib.suppress(Exception):
+                await handle.shell(f"rm -f {shlex.quote(archive)}")
+            raise
         if result.exit_code != 0:
             raise RuntimeError(
                 f"unpacking {source_dir} into {target_dir} failed ({result.exit_code}): "

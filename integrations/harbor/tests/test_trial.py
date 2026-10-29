@@ -38,7 +38,7 @@ pytestmark = pytest.mark.skipif(not docker_available(), reason="needs a docker d
 HARBOR = Path(sys.executable).parent / "harbor"
 
 
-async def run_harbor(addr: str, jobs_dir: Path, agent: str, *extra: str) -> tuple[dict, Path, str]:
+async def run_harbor(addr: str, jobs_dir: Path, agent: str, *extra: str, trials: int = 1) -> tuple[list[tuple[dict, Path]], str]:
     jobs_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         str(HARBOR), "run",
@@ -59,9 +59,9 @@ async def run_harbor(addr: str, jobs_dir: Path, agent: str, *extra: str) -> tupl
     out, _ = await asyncio.wait_for(proc.communicate(), 600)
     text = out.decode(errors="replace")
     # jobs/<job>/result.json is the job's; jobs/<job>/<trial>/result.json the trial's.
-    results = list(jobs_dir.glob("*/*/result.json"))
-    assert len(results) == 1, f"exit {proc.returncode}; output:\n{text}"
-    return json.loads(results[0].read_text()), results[0].parent, text
+    results = sorted(jobs_dir.glob("*/*/result.json"))
+    assert len(results) == trials, f"exit {proc.returncode}; output:\n{text}"
+    return [(json.loads(r.read_text()), r.parent) for r in results], text
 
 
 def reward(result: dict) -> set[float]:
@@ -69,10 +69,16 @@ def reward(result: dict) -> set[float]:
     return set((verifier.get("rewards") or {}).values())
 
 
+def diagnose(state, text: str) -> str:
+    """The harbor output plus the fake's exec log, for an assertion message."""
+    lines = [f"{e['env_id']} exit={e['code']} {e['command'][-1][:120]!r}" for e in state.execs[-20:]]
+    return text + "\n--- last execs ---\n" + "\n".join(lines)
+
+
 async def test_oracle_trial_rewards_one(docker_fake, tmp_path):
-    result, trial_dir, text = await run_harbor(docker_fake.addr, tmp_path / "jobs", "oracle")
-    assert result.get("exception_info") is None, text
-    assert reward(result) == {1}, text
+    [(result, trial_dir)], text = await run_harbor(docker_fake.addr, tmp_path / "jobs", "oracle")
+    assert result.get("exception_info") is None, diagnose(docker_fake.state, text)
+    assert reward(result) == {1}, diagnose(docker_fake.state, text)
     assert (trial_dir / "verifier" / "reward.txt").read_text().strip() == "1"
     record = json.loads((trial_dir / "ate_env.json").read_text())
     assert record["template"] == "harbor-c1-m512"
@@ -87,14 +93,28 @@ async def test_oracle_trial_rewards_one(docker_fake, tmp_path):
 
 
 async def test_nop_trial_rewards_zero(docker_fake, tmp_path):
-    result, trial_dir, text = await run_harbor(docker_fake.addr, tmp_path / "jobs", "nop")
+    [(result, _)], text = await run_harbor(docker_fake.addr, tmp_path / "jobs", "nop")
     assert result.get("exception_info") is None, text
     assert reward(result) == {0}, text
     assert docker_fake.state.envs == {}
 
 
+async def test_concurrent_attempts_share_the_channel(docker_fake, tmp_path):
+    results, text = await run_harbor(
+        docker_fake.addr, tmp_path / "jobs", "oracle", "-k", "3", "-n", "3", trials=3
+    )
+    for result, trial_dir in results:
+        assert result.get("exception_info") is None, diagnose(docker_fake.state, text)
+        assert reward(result) == {1}, diagnose(docker_fake.state, text)
+        assert (trial_dir / "ate_env.json").exists()
+    state = docker_fake.state
+    assert len(state.creates) == 3 and len({c["id"] for c in state.creates}) == 3
+    assert sorted(state.deletes) == sorted(c["id"] for c in state.creates)
+    assert state.envs == {}
+
+
 async def test_no_delete_keeps_the_environment_suspended(docker_fake, tmp_path):
-    result, _, text = await run_harbor(docker_fake.addr, tmp_path / "jobs", "nop", "--no-delete")
+    [(result, _)], text = await run_harbor(docker_fake.addr, tmp_path / "jobs", "nop", "--no-delete")
     assert result.get("exception_info") is None, text
     state = docker_fake.state
     assert len(state.suspends) == 1 and state.deletes == []

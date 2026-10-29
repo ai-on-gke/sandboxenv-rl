@@ -215,6 +215,7 @@ class FakeState:
     missing_templates: set[str] = field(default_factory=set)
     create_code: grpc.StatusCode | None = None
     unavailable_calls: int = 0  # guest calls answered UNAVAILABLE first, as a cold actor
+    fail_exec_containing: str | None = None  # the next exec with this text answers UNAVAILABLE
     required_token: str | None = None  # every call needs "authorization: Bearer <token>"
     wakes: int = 0
     counter: int = 0
@@ -365,6 +366,9 @@ class FakeProcessService(guest_pb2_grpc.ProcessServiceServicer):
         if not command:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "command cannot be empty")
         timeout = request.timeout.ToTimedelta().total_seconds() if request.HasField("timeout") else None
+        if s.fail_exec_containing and s.fail_exec_containing in command[-1]:
+            s.fail_exec_containing = None
+            await context.abort(grpc.StatusCode.UNAVAILABLE, "transport failed mid-command")
         if command == ["sh", "-c", WHOAMI_COMMAND]:
             code, out, err = 0, (s.whoami + "\n").encode(), b""
         else:

@@ -23,10 +23,6 @@ as existing) and ``gcloud builds submit``.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
-import os
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -38,92 +34,9 @@ from ate_env_harbor.images import (
     repository_of,
 )
 
-from .conftest import ALPINE
+from .conftest import ALPINE, _digest
 
 REGISTRY = "reg.example/harbor"
-
-STUB_DOCKER = textwrap.dedent(
-    """\
-    #!/usr/bin/env python3
-    import hashlib, json, os, sys, time
-    args = sys.argv[1:]
-    with open(os.environ["STUB_LOG"], "a") as f:
-        f.write(json.dumps(args) + "\\n")
-    exists_file = os.environ["STUB_EXISTS"]
-    existing = set(open(exists_file).read().split()) if os.path.exists(exists_file) else set()
-    digest = lambda ref: "sha256:" + hashlib.sha256(ref.encode()).hexdigest()
-    if args[:3] == ["buildx", "imagetools", "inspect"]:
-        ref = args[-1]
-        if ref in existing or "@sha256:" in ref or not ref.startswith("reg.example/"):
-            print(json.dumps(digest(ref)))
-            sys.exit(0)
-        sys.stderr.write("ERROR: %s: not found\\n" % ref)
-        sys.exit(1)
-    if args[:2] == ["buildx", "build"]:
-        tag = args[args.index("-t") + 1]
-        meta = args[args.index("--metadata-file") + 1]
-        time.sleep(float(os.environ.get("STUB_BUILD_SLEEP", "0")))
-        if os.environ.get("STUB_BUILD_FAIL"):
-            sys.stderr.write("boom: the Dockerfile is broken\\n")
-            sys.exit(1)
-        with open(meta, "w") as f:
-            json.dump({"containerimage.digest": digest(tag)}, f)
-        with open(exists_file, "a") as f:
-            f.write(tag + "\\n")
-        sys.exit(0)
-    sys.stderr.write("unexpected docker call: %r\\n" % (args,))
-    sys.exit(2)
-    """
-)
-
-STUB_GCLOUD = textwrap.dedent(
-    """\
-    #!/usr/bin/env python3
-    import hashlib, json, os, sys
-    args = sys.argv[1:]
-    with open(os.environ["STUB_LOG"], "a") as f:
-        f.write(json.dumps(args) + "\\n")
-    tag = args[args.index("--tag") + 1]
-    print(json.dumps({"results": {"images": [
-        {"name": tag, "digest": "sha256:" + hashlib.sha256(tag.encode()).hexdigest()}]}}))
-    """
-)
-
-
-def _digest(ref: str) -> str:
-    return "sha256:" + hashlib.sha256(ref.encode()).hexdigest()
-
-
-@pytest.fixture
-def stubs(tmp_path, monkeypatch):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    for name, body in (("docker", STUB_DOCKER), ("gcloud", STUB_GCLOUD)):
-        path = bin_dir / name
-        path.write_text(body)
-        path.chmod(0o755)
-    log = tmp_path / "calls.log"
-    monkeypatch.setenv("STUB_LOG", str(log))
-    monkeypatch.setenv("STUB_EXISTS", str(tmp_path / "exists.txt"))
-    monkeypatch.delenv("STUB_BUILD_SLEEP", raising=False)
-    monkeypatch.delenv("STUB_BUILD_FAIL", raising=False)
-
-    class Stubs:
-        docker = str(bin_dir / "docker")
-        gcloud = str(bin_dir / "gcloud")
-
-        @staticmethod
-        def calls() -> list[list[str]]:
-            if not log.exists():
-                return []
-            return [json.loads(line) for line in log.read_text().splitlines()]
-
-        @staticmethod
-        def builds() -> list[list[str]]:
-            return [c for c in Stubs.calls() if c[:2] == ["buildx", "build"]]
-
-    return Stubs
-
 
 @pytest.fixture
 def dockerfile_dir(tmp_path) -> Path:
@@ -156,7 +69,8 @@ def test_repository_helpers():
     assert repository_of("a/b@sha256:x") == "a/b"
     assert repository_of("a/b:t@sha256:x") == "a/b"
     assert repository_name("hello-world") == "hello-world"
-    assert repository_name("Hello World!/v2") == "hello-world-/v2"
+    assert repository_name("Hello World!/v2") == "hello-world/v2"
+    assert repository_name("a//b-") == "a/b"
     assert repository_name("...") == "task"
 
 
@@ -248,5 +162,10 @@ def test_build_mode_is_validated():
         ImageResolver(registry=None, build="remote")
 
 
-def test_stub_scripts_are_executable(stubs):
-    assert os.access(stubs.docker, os.X_OK)
+async def test_two_resolvers_share_one_build(stubs, dockerfile_dir, monkeypatch):
+    # Harbor makes one environment, thus one resolver, per trial: the cache
+    # and the locks are per process.
+    monkeypatch.setenv("STUB_BUILD_SLEEP", "0.3")
+    refs = await asyncio.gather(*(resolve(resolver(stubs), dockerfile_dir) for _ in range(5)))
+    assert len(set(refs)) == 1
+    assert len(stubs.builds()) == 1

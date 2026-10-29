@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import stat
 import time
 from pathlib import Path
@@ -37,6 +38,20 @@ from .conftest import ALPINE
 
 def commands(fake) -> list[str]:
     return [e["command"][-1] for e in fake.state.execs]
+
+
+TOOLS = ("sh", "mkdir", "tar", "gzip", "rm", "find", "chmod", "cat", "env", "dirname", "id", "sleep", "pwd", "true")
+
+
+def minimal_bin(tmp_path: Path) -> Path:
+    """A PATH with the tools the provider and the tests need, and nothing else."""
+    bin_dir = tmp_path / "minbin"
+    bin_dir.mkdir()
+    for name in TOOLS:
+        found = shutil.which(name)
+        if found:
+            (bin_dir / name).symlink_to(found)
+    return bin_dir
 
 
 async def test_start_creates_from_the_digest_and_the_class_template(fake, make_env):
@@ -152,37 +167,87 @@ async def test_exec_as_the_image_user_runs_the_command_as_is(fake, make_env):
 
 async def test_exec_as_another_user_needs_sudo_or_su(fake, make_env, tmp_path):
     fake.state.whoami = "app"
-    # A PATH with the usual tools but neither sudo nor su.
-    bin_dir = tmp_path / "userbin"
-    bin_dir.mkdir()
-    for tools in (Path("/bin"), Path("/usr/bin")):
-        for tool in tools.iterdir():
-            if tool.name not in ("sudo", "su") and not (bin_dir / tool.name).exists():
-                (bin_dir / tool.name).symlink_to(tool)
+    bin_dir = minimal_bin(tmp_path)  # neither sudo nor su
     fake.state.child_path = str(bin_dir)
     env = make_env()
     await env.start(force_build=False)
     try:
         with pytest.raises(RuntimeError, match="needs sudo"):
             await env.exec("echo hi", user="root")
-        # A sudo in the image is used, non-interactively.
-        sudo = bin_dir / "sudo"
-        sudo.write_text(
-            "#!/bin/sh\n"
-            "printf '%s\\n' \"$*\" > \"$SUDO_LOG\"\n"  # not echo: dash's echo eats a leading -n
-            'while [ "$1" != "sh" ]; do shift; done\n'
-            'exec "$@"\n'
-        )
-        sudo.chmod(0o755)
-        env2 = make_env()
-        await env2.start(force_build=False)
-        try:
-            log = tmp_path / "sudo.log"
-            result = await env2.exec("echo hi", user="root", env={"SUDO_LOG": str(log)})
-            assert (result.return_code, result.stdout.strip()) == (0, "hi")
-            assert log.read_text().split()[:4] == ["-n", "-u", "root", "sh"]
-        finally:
-            await env2.stop(delete=True)
+    finally:
+        await env.stop(delete=True)
+
+    # A sudo in the image is used, non-interactively. Like the real one, the
+    # stub resets the environment (env_reset), thus the variables Harbor
+    # passes reach the command only because the provider inlines them.
+    sudo = bin_dir / "sudo"
+    sudo.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" > \"$SUDO_LOG\"\n"  # not echo: dash's echo eats a leading -n
+        "shift 3\n"  # -n -u <user>
+        'exec env -i PATH="$PATH" "$@"\n'
+    )
+    sudo.chmod(0o755)
+    env2 = make_env(persistent_env={"PERSIST": "kept"})
+    await env2.start(force_build=False)
+    try:
+        log = tmp_path / "sudo.log"
+        result = await env2.exec("echo $PERSIST:$MARK", user="root", env={"SUDO_LOG": str(log), "MARK": "m"})
+        assert (result.return_code, result.stdout.strip()) == (0, "kept:m")
+        words = log.read_text().split()
+        assert words[:4] == ["-n", "-u", "root", "env"]
+        assert "MARK=m" in words and "PERSIST=kept" in words
+        assert fake.state.execs[-1]["command"][-1].startswith("sudo -n -u root env ")
+    finally:
+        await env2.stop(delete=True)
+
+
+async def test_exec_as_another_user_from_root_uses_su(fake, make_env, tmp_path):
+    fake.state.whoami = "root"
+    bin_dir = minimal_bin(tmp_path)
+    su = bin_dir / "su"
+    su.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" > \"$SU_LOG\"\n"
+        '[ "$2" = -s ] && [ "$4" = -c ] || exit 64\n'  # su <user> -s /bin/sh -c <inner>
+        'exec env -i PATH="$PATH" /bin/sh -c "$5"\n'
+    )
+    su.chmod(0o755)
+    fake.state.child_path = str(bin_dir)
+    env = make_env()
+    await env.start(force_build=False)
+    try:
+        log = tmp_path / "su.log"
+        result = await env.exec("echo as=$MARK", user="app", env={"SU_LOG": str(log), "MARK": "m"})
+        assert (result.return_code, result.stdout.strip()) == (0, "as=m")
+        assert log.read_text().split()[:4] == ["app", "-s", "/bin/sh", "-c"]
+        with pytest.raises(RuntimeError, match="su wants a user name"):
+            await env.exec("true", user=1000)
+    finally:
+        await env.stop(delete=True)
+
+
+async def test_numeric_user_goes_to_sudo_as_a_uid(fake, make_env):
+    env = make_env()
+    env._image_user = "app"
+    wrapped = env._as_user_command("echo hi", 1000, {"A": "1 2"}, "sudo")
+    assert wrapped == "sudo -n -u '#1000' env 'A=1 2' sh -c 'echo hi'"
+    assert env._as_user_command("echo hi", "app", None, "sudo") == "echo hi"
+
+
+async def test_exec_without_a_timeout_gets_the_configured_bound(fake, make_env):
+    env = make_env()
+    await env.start(force_build=False)
+    try:
+        await env.exec("true")
+        assert fake.state.execs[-1]["timeout"] == 24 * 3600
+    finally:
+        await env.stop(delete=True)
+    env = make_env(exec_timeout_sec=5)
+    await env.start(force_build=False)
+    try:
+        await env.exec("true")
+        assert fake.state.execs[-1]["timeout"] == 5
     finally:
         await env.stop(delete=True)
 
@@ -231,6 +296,38 @@ async def test_file_and_directory_round_trips(fake, make_env, tmp_path):
         await env.stop(delete=True)
 
 
+async def test_upload_dir_removes_the_archive_when_the_unpack_call_raises(fake, make_env, tmp_path):
+    env = make_env()
+    await env.start(force_build=False)
+    try:
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a").write_text("a")
+        fake.state.fail_exec_containing = "tar -xzf"
+        with pytest.raises(RpcError):
+            await env.upload_dir(src, str(tmp_path / "dst"))
+        archives = [p for p in (tmp_path / "scratch").glob(".harbor-upload-*")]
+        assert archives == []
+        assert commands(fake)[-1].startswith("rm -f ")
+    finally:
+        await env.stop(delete=True)
+
+
+async def test_shared_client_cache_evicts_closed_loops(fake):
+    from ate_env_harbor import _client
+
+    def on_its_own_loop() -> None:
+        async def make() -> None:
+            _client.shared_client(fake.addr, None)
+
+        asyncio.run(make())  # that loop is closed when asyncio.run returns
+
+    await asyncio.to_thread(on_its_own_loop)
+    assert any(bound.is_closed() for _, bound in _client._clients.values())
+    _client.shared_client(fake.addr, None)
+    assert not any(bound.is_closed() for _, bound in _client._clients.values())
+
+
 async def test_download_dir_of_a_missing_directory_fails_clearly(fake, make_env, tmp_path):
     env = make_env()
     await env.start(force_build=False)
@@ -260,6 +357,36 @@ async def test_readiness_timeout_deletes_the_environment(fake, make_env):
         await env.exec("true")
 
 
+async def test_failure_after_create_deletes_the_environment(fake, make_env):
+    cfg = EnvironmentConfig(docker_image=ALPINE, workdir="/dev/null/nope")
+    env = make_env(config=cfg)
+    with pytest.raises(RuntimeError, match="mkdir -p /dev/null/nope failed"):
+        await env.start(force_build=False)
+    assert fake.state.deletes == [env.env_id]
+    assert fake.state.envs == {}
+
+
+async def test_concurrent_environments_on_one_dockerfile_build_once(fake, make_env, stubs, tmp_path, monkeypatch):
+    # Harbor makes one environment per trial; the build and its digest are shared.
+    monkeypatch.setenv("STUB_BUILD_SLEEP", "0.3")
+    env_dir = tmp_path / "dockerfile-task" / "environment"
+    env_dir.mkdir(parents=True)
+    (env_dir / "Dockerfile").write_text("FROM alpine:3.20\n")
+    cfg = EnvironmentConfig(workdir=str(make_env.work))
+    envs = [
+        make_env(config=cfg, environment_dir=env_dir, build="local",
+                 registry="reg.example/harbor", docker_bin=stubs.docker)
+        for _ in range(3)
+    ]
+    await asyncio.gather(*(e.start(force_build=False) for e in envs))
+    try:
+        assert len(stubs.builds()) == 1
+        images = {c["rootfs_image"] for c in fake.state.creates}
+        assert len(images) == 1 and next(iter(images)).startswith("reg.example/harbor/echo@sha256:")
+    finally:
+        await asyncio.gather(*(e.stop(delete=True) for e in envs))
+
+
 async def test_create_failure_is_raised_as_is(fake, make_env):
     import grpc
 
@@ -277,7 +404,7 @@ async def test_stop_without_delete_suspends(fake, make_env, caplog):
     assert fake.state.suspends == [env.env_id]
     assert fake.state.deletes == []
     assert env.env_id in fake.state.envs
-    assert f"ate-env {env.env_id} shell --api {fake.addr}" in caplog.text
+    assert f"ate-env {env.env_id} shell --api {fake.addr} --atespace ate-env 'cat " in caplog.text
     await env.stop(delete=False)  # idempotent
     assert len(fake.state.suspends) == 1
 
@@ -311,7 +438,7 @@ async def test_token_kwarg_warns_once_without_the_value(fake, make_env, caplog, 
 
 async def test_attach_names_the_cli_command(fake, make_env):
     env = make_env()
-    with pytest.raises(RuntimeError, match=f"ate-env {env.env_id} shell"):
+    with pytest.raises(RuntimeError, match=f"ate-env {env.env_id} shell --api .* '<command>'"):
         await env.attach()
 
 
@@ -355,6 +482,11 @@ async def test_preflight_checks_the_api_from_the_environment(fake, monkeypatch):
     monkeypatch.setenv("SUBSTRATE_ENV_API", "127.0.0.1:1")
     with pytest.raises(SystemExit, match="cannot reach|no answer"):
         await asyncio.to_thread(AteEnvEnvironment.preflight)
+    # Inside a running loop (Harbor's local validation path) the probe runs on
+    # a worker thread instead of being skipped. Only the negative case can run
+    # here: the fake API is served by this very loop, which the call blocks.
+    with pytest.raises(SystemExit, match="cannot reach|no answer"):
+        AteEnvEnvironment.preflight()
 
 
 def test_task_dir_fixture_is_the_echo_task(task_dir: Path):

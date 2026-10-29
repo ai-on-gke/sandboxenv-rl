@@ -93,6 +93,10 @@ class AsyncSandboxFleet:
     def load_tasks(self, tasks: list[Any]) -> None:
         self._fleet.load_tasks(tasks)
 
+    def add_tasks(self, tasks: list[Any]) -> list[Task]:
+        """Append tasks and extend the plan (see ``SandboxFleet.add_tasks``)."""
+        return self._fleet.add_tasks(tasks)
+
     def image_counts(self) -> dict[str, int]:
         return self._fleet.image_counts()
 
@@ -162,6 +166,45 @@ class AsyncSandboxFleet:
             await self._warm_pool_for_template(
                 template_id, rep, wait=wait, rootfs_image=rootfs_image, family=repo_family(img)
             )
+
+    async def warm_image(
+        self, image: str, replicas: int | None = None, wait: bool = True
+    ) -> None:
+        """Warm one image's pool (agent-sandbox-rl's ``warm_image``)."""
+        await self.warm_images([image], replicas=replicas, wait=wait)
+
+    async def set_pool_replicas(self, image: str, replicas: int, wait: bool = True) -> None:
+        """Size one image's warm pool to exactly ``replicas``, up or down; see
+        ``SandboxFleet.set_pool_replicas``."""
+        replicas = max(0, int(replicas))
+        template_id, rootfs_image = await self._ensure_template_for_image_async(image)
+        family = repo_family(image)
+        try:
+            with self.observer.phase("warm_pool", backend=self._backend_label, family=family):
+                if hasattr(self.backend, "resize_pool_async"):
+                    await self.backend.resize_pool_async(
+                        template_id, replicas, wait=wait, rootfs_image=rootfs_image
+                    )
+                else:
+                    await asyncio.to_thread(
+                        self.backend.resize_pool,
+                        template_id,
+                        replicas,
+                        wait=wait,
+                        rootfs_image=rootfs_image,
+                    )
+        except NotImplementedError:
+            if replicas == 0:
+                await self.unwarm_image(image)
+            else:
+                logger.warning(
+                    "backend %s has no resize_pool: set_pool_replicas(%s, %d) can grow the "
+                    "pool but cannot shrink it below its current size",
+                    self._backend_label, image, replicas,
+                )
+                await self._warm_pool_for_template(
+                    template_id, replicas, wait=wait, rootfs_image=rootfs_image, family=family
+                )
 
     async def unwarm_image(self, image: str) -> None:
         entry = self._fleet._image_to_template.get(image)
@@ -309,9 +352,11 @@ class AsyncSandboxFleet:
         it: their phases go to the Prometheus series and spans, not to the
         report.
         """
-        c = concurrency or min(self.config.max_concurrent, len(self.tasks) or 1)
+        # One snapshot for the whole run: tasks added meanwhile are not run.
+        tasks = self.tasks
+        c = concurrency or min(self.config.max_concurrent, len(tasks) or 1)
         sem = asyncio.Semaphore(max(1, c))
-        results: list[Any] = [None] * len(self.tasks)
+        results: list[Any] = [None] * len(tasks)
         obs = self.observer
         backend = self._backend_label
 
@@ -348,6 +393,6 @@ class AsyncSandboxFleet:
         with obs.run(strategy, backend=backend) as report:
             self._fleet.report = report
             report.environment = self._fleet.describe_environment(concurrency=max(1, c))
-            await asyncio.gather(*(_worker(i, t) for i, t in enumerate(self.tasks)))
+            await asyncio.gather(*(_worker(i, t) for i, t in enumerate(tasks)))
         logger.debug("\n%s", report.summary())
         return results

@@ -15,7 +15,7 @@
 // Package fakecontrol implements an in-memory fake of the Substrate ateapi
 // Control service for tests. It mimics the control plane's lifecycle
 // semantics: actors are created suspended, resume/suspend/pause flip
-// status, and only suspended actors can be deleted.
+// status, and, like Substrate v0.6.0, an actor in any state can be deleted.
 package fakecontrol
 
 import (
@@ -274,7 +274,18 @@ func (s *Server) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorReq
 	if err != nil {
 		return nil, err
 	}
+	// SuspendModes records each call, also a rejected one.
 	s.SuspendModes = append(s.SuspendModes, req.GetOptions().GetMode())
+	// Like Substrate v0.6.0: a SUSPENDED actor is a no-op, and only a
+	// RUNNING or SUSPENDING one can be suspended.
+	switch st := a.GetStatus().GetState(); st {
+	case ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
+		return &ateapipb.SuspendActorResponse{Actor: clone(a)}, nil
+	case ateapipb.ActorState_ACTOR_STATE_RUNNING, ateapipb.ActorState_ACTOR_STATE_SUSPENDING:
+	default:
+		return nil, status.Errorf(codes.FailedPrecondition, "MarkSuspending prerequisite not met for Actor: %s (got: %v, want %s)",
+			req.GetActor().GetName(), st, ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	}
 	s.suspend(a)
 	return &ateapipb.SuspendActorResponse{Actor: clone(a)}, nil
 }
@@ -303,10 +314,8 @@ func (s *Server) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorReque
 	if err != nil {
 		return nil, err
 	}
-	if a.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
-		return nil, status.Errorf(codes.FailedPrecondition, "actor %q is %s, only suspended actors can be deleted",
-			ref.GetName(), a.GetStatus().GetState())
-	}
+	// Like Substrate v0.6.0, DeleteActor takes an actor in any state: it
+	// terminates the workload itself.
 	delete(s.actors, key(ref.GetAtespace(), ref.GetName()))
 	return clone(a), nil
 }

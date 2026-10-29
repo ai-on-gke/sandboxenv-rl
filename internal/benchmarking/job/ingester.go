@@ -294,7 +294,7 @@ func IngestArtifactDir(ctx IngestContext) (*IngestResult, error) {
 					if traceEvs[tIdx].Env != "" {
 						envStep[traceEvs[tIdx].Env] = stepNum
 					}
-					if rewardedTarget >= 0 {
+					if rewardedTarget >= 0 && traceEvs[tIdx].Reward == nil {
 						r := 0
 						if k < rewardedTarget {
 							r = 1

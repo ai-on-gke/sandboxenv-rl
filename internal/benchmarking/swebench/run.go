@@ -779,7 +779,11 @@ func dispatchOpenLoop(
 // ArrivalRate (tasks/sec), bounded by Width concurrent slots, and records the
 // time each arriving task waited for a concurrency slot in Event.SlotWaitMS.
 func (r *runner) runOpenLoop(ctx context.Context, envs []*environment) {
-	_ = dispatchOpenLoop(ctx, r.cfg.Seed, r.cfg.ArrivalRate, r.cfg.Width, len(envs), time.Time{}, func(i int, slotWaitMS float64) {
+	var deadline time.Time
+	if r.cfg.Duration > 0 {
+		deadline = time.Now().Add(r.cfg.Duration)
+	}
+	_ = dispatchOpenLoop(ctx, r.cfg.Seed, r.cfg.ArrivalRate, r.cfg.Width, len(envs), deadline, func(i int, slotWaitMS float64) {
 		env := envs[i]
 		env.slotWaitMS = slotWaitMS
 		if r.create(ctx, env, 0) {

@@ -1378,17 +1378,19 @@ func (r *runner) fork(ctx context.Context, e *environment, step int) bool {
 	} else {
 		child, err = r.cfg.Backend.Create(cctx, newID, e.inst.Image)
 	}
-	e.id = newID
 	ev := r.event(EventFork, e, step, time.Since(e.createStart), err)
+	ev.Env = newID
 	r.rec.Record(ev)
 	if err != nil {
 		e.failed = true
 		task := r.event(EventTask, e, step, 0, err)
+		task.Env = newID
 		r.rec.Record(task)
 		r.countTask(e, step, false, nil)
 		r.log.Warn("fork failed", slog.String("from", parentID), slog.String("env", newID), slog.String("err", err.Error()))
 		return false
 	}
+	e.id = newID
 	if parentSB != nil && !r.cfg.Keep {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 		_ = parentSB.Delete(cleanup)

@@ -325,6 +325,16 @@ benchmarking/swebench/harvest-restore-timings.sh pull-baseline restores.jsonl
 swebench-loader report pull-baseline.jsonl -restore-log restores.jsonl
 ```
 
+Kubelet rotates a busy atelet's log within the hour, so for a run longer
+than a few minutes let the run script harvest as it goes: with
+`RESTORE_LOG=restores.jsonl` it runs the harvest every ten minutes
+(`HARVEST_INTERVAL_MIN`) and once more at the end, merges the parts with
+duplicates dropped, and passes the file to the final report.
+
+```bash
+RESTORE_LOG=restores.jsonl benchmarking/swebench/run-in-cluster.sh pull-baseline images.jsonl ...
+```
+
 atelet logs one record per actor restore with the seconds each phase took:
 manifest fetch, snapshot download, image unpack, the worker's restore, and
 the total. The actor's name is the environment's name, so the report pairs

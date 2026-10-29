@@ -41,6 +41,12 @@
 # AUTH_TOKEN_SECRET names a Secret in NAMESPACE whose key `token` holds
 # ate-env-api's bearer token; the loader then reads it from
 # SUBSTRATE_ENV_AUTH_TOKEN. Leave it unset for an API without a token.
+# RESTORE_LOG, when set, is where atelet's restore records for the run are
+# collected: harvest-restore-timings.sh runs every HARVEST_INTERVAL_MIN
+# minutes (default 10) while the loader runs and once more at the end, and
+# the parts are merged with duplicates dropped. Kubelet rotates a busy
+# atelet's log within the hour, so one harvest at the end loses most of a
+# long run. The report then reads the file through -restore-log.
 
 set -o errexit -o nounset -o pipefail
 
@@ -75,11 +81,20 @@ if [[ -n "${AUTH_TOKEN_SECRET}" ]]; then
 fi
 command -v python3 >/dev/null || { echo "python3 is needed to encode the loader arguments" >&2; exit 2; }
 OUT_DIR="$(pwd)"
+RESTORE_LOG="${RESTORE_LOG:-}"
+HARVEST_INTERVAL_MIN="${HARVEST_INTERVAL_MIN:-10}"
+[[ "${HARVEST_INTERVAL_MIN}" =~ ^[1-9][0-9]*$ ]] || { echo "HARVEST_INTERVAL_MIN must be a whole number of minutes" >&2; exit 2; }
+if [[ -n "${RESTORE_LOG}" && "${RESTORE_LOG}" != /* ]]; then
+  RESTORE_LOG="${OUT_DIR}/${RESTORE_LOG}"
+fi
 
 # The repository is found from the script's own location, so the script can
 # run from any directory and the results land where it was invoked.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT}"
+HARVEST="${ROOT}/benchmarking/swebench/harvest-restore-timings.sh"
+HARVEST_DIR="$(mktemp -d)"
+HARVEST_PID=""
 KODATA=cmd/benchmarking/swebench-loader/kodata
 rm -rf "${KODATA}" && mkdir -p "${KODATA}"
 trap 'rm -rf "${KODATA}"' EXIT
@@ -155,10 +170,26 @@ KUBECTL_ERR="$(mktemp)"
 # shellcheck disable=SC2329 # invoked by the EXIT trap
 cleanup() {
   kc -n "${NS}" delete job "${JOB}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  rm -rf "${KODATA}"
+  if [[ -n "${HARVEST_PID}" ]]; then
+    kill "${HARVEST_PID}" 2>/dev/null || true
+  fi
+  rm -rf "${KODATA}" "${HARVEST_DIR}"
   rm -f "${KUBECTL_ERR}"
 }
 trap cleanup EXIT
+
+# harvest_part collects the restore records atelet logged in the last two
+# intervals into a numbered part under HARVEST_DIR. The window overlaps the
+# previous part on purpose; the merge drops the duplicates. The part is
+# written under a temporary name and renamed when complete, so the merge
+# never reads a part a harvest is still writing. atelet runs in ate-system
+# whatever NAMESPACE the loader uses.
+harvest_part() {
+  local part="${HARVEST_DIR}/part-$1"
+  NAMESPACE=ate-system SINCE="$(( 2 * HARVEST_INTERVAL_MIN ))m" "${HARVEST}" "${RUN_ID}" "${part}.tmp" >/dev/null 2>&1 || true
+  [[ -s "${part}.tmp" ]] && mv "${part}.tmp" "${part}.jsonl"
+  return 0
+}
 
 kc -n "${NS}" delete job "${JOB}" --ignore-not-found --wait=true >/dev/null
 # busybox 1.36, pinned by digest; Docker Hub rate-limits unauthenticated pulls.
@@ -246,6 +277,10 @@ if [[ -z "${POD}" ]] || ! kc -n "${NS}" get pod "${POD}" -o jsonpath='{.status.c
   exit 1
 fi
 echo "pod ${POD}; following the loader log"
+if [[ -n "${RESTORE_LOG}" ]]; then
+  ( n=0; while sleep "$(( HARVEST_INTERVAL_MIN * 60 ))"; do n=$(( n + 1 )); harvest_part "${n}"; done ) &
+  HARVEST_PID=$!
+fi
 kc -n "${NS}" logs -f "${POD}" -c loader || true
 
 # The log stream can end before the container does (or drop with the
@@ -275,10 +310,23 @@ until EXIT="$(kc -n "${NS}" get pod "${POD}" -o jsonpath='{.status.containerStat
   sleep 10
 done
 echo "loader exit code ${EXIT}"
+if [[ -n "${RESTORE_LOG}" ]]; then
+  kill "${HARVEST_PID}" 2>/dev/null || true
+  wait "${HARVEST_PID}" 2>/dev/null || true
+  HARVEST_PID=""
+  harvest_part final
+  cat "${HARVEST_DIR}"/part-*.jsonl 2>/dev/null | sort -u > "${RESTORE_LOG}"
+  echo "restore records in ${RESTORE_LOG}: $(wc -l < "${RESTORE_LOG}" | tr -d ' ')"
+fi
 if ! kc -n "${NS}" cp -c keep "${POD}:/work/${RUN_ID}.jsonl" "${OUT_DIR}/${RUN_ID}.jsonl"; then
   echo "no events file to copy; the loader exited before writing it" >&2
   exit "$(( EXIT == 0 ? 1 : EXIT ))"
 fi
 echo "events in ${OUT_DIR}/${RUN_ID}.jsonl"
-go run ./cmd/benchmarking/swebench-loader report "${OUT_DIR}/${RUN_ID}.jsonl" -json "${OUT_DIR}/${RUN_ID}.json"
+REPORT_ARGS=()
+if [[ -n "${RESTORE_LOG}" ]]; then
+  REPORT_ARGS=(-restore-log "${RESTORE_LOG}")
+fi
+go run ./cmd/benchmarking/swebench-loader report "${OUT_DIR}/${RUN_ID}.jsonl" -json "${OUT_DIR}/${RUN_ID}.json" \
+  ${REPORT_ARGS[@]+"${REPORT_ARGS[@]}"}
 exit "${EXIT}"

@@ -43,7 +43,7 @@ from typing import Any
 
 import grpc
 import httpx
-from ate_env import EnvError, NotFoundError, RpcError
+from ate_env import EnvError, EnvironmentStatus, NotFoundError, RpcError
 from openhands.sdk.logger import get_logger
 from openhands.sdk.workspace import RemoteWorkspace
 from pydantic import Field, PrivateAttr
@@ -74,6 +74,26 @@ _AMBIGUOUS_CODES = {
     grpc.StatusCode.CANCELLED,
     grpc.StatusCode.ABORTED,
 }
+
+
+# ate-env-api's port proxy names the actor state of an environment that will
+# not wake in this header: 410 Gone with CRASHED for a crashed one, 404 with
+# DELETING for one that is being deleted.
+ENV_STATE_HEADER = "X-Env-State"
+
+# While the health wait retries, how often it also reads the environment's
+# state over gRPC, so that a crashed environment stops the wait even when the
+# port proxy passes the router's 503 unchanged.
+STATE_CHECK_INTERVAL = 5.0
+# Deadline of that read, or the time left in the wait if less (at least 1 s).
+STATE_READ_TIMEOUT = 5.0
+
+
+def _read_timeout(deadline: float) -> float:
+    """Deadline of a state read in the health wait: STATE_READ_TIMEOUT, or the
+    time left in the wait if less, at least 1 s, so a stalled control plane
+    cannot hold the wait past its end."""
+    return max(1.0, min(STATE_READ_TIMEOUT, deadline - time.monotonic()))
 
 
 def _base_url(url: str) -> str:
@@ -206,8 +226,9 @@ class AteEnvWorkspace(RemoteWorkspace):
         description="Seconds to wait for the agent-server's /health through the proxy. "
         "The first use of a task image on a cluster bakes its golden snapshot and then "
         "pulls the image onto the node, minutes for a large image; later uses take "
-        "seconds. Answers that waiting cannot change (400, 401, 403, and 404 for a "
-        "deleted environment) stop the wait at once.",
+        "seconds. Answers that waiting cannot change (400, 401, 403, 404 for a "
+        "deleted environment, and 410 or X-Env-State for a crashed or deleting one) "
+        "stop the wait at once.",
     )
     delete_on_exit: bool | None = Field(
         default=None,
@@ -361,20 +382,29 @@ class AteEnvWorkspace(RemoteWorkspace):
         router (not running yet), a 502 and a refused connection are retried.
         Answers that waiting cannot change stop the wait at once: 401 and 403
         (the proxy refused the caller), 400 (the proxy refused the port or the
-        id) and 404 when the environment no longer exists. Otherwise the last
-        answer is in the error when the deadline passes.
+        id), 404 when the environment no longer exists, and 410 Gone or an
+        ``X-Env-State`` of CRASHED or DELETING (ate-env-api's port proxy
+        answers 410 with CRASHED for a crashed environment). While it retries,
+        the wait also reads the environment's state over gRPC, at most once
+        each STATE_CHECK_INTERVAL, and stops on CRASHED, DELETING or a deleted
+        environment: a proxy without that answer passes the router's 503 for
+        a crashed environment unchanged. Otherwise the last answer is in the
+        error when the deadline passes.
         """
         deadline = time.monotonic() + timeout
         url = f"{self.host}/health"
         headers = dict(self._headers)
         last = "no attempt"
+        next_state_check = 0.0
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            # One attempt can wait for the rest of the budget: the proxy holds
-            # a request while the environment wakes (its --wake-budget), and a
-            # shorter client timeout would cut a cold start and restart it.
+            # One attempt can wait for the rest of the budget: the Substrate
+            # router holds a request while the environment wakes, up to about
+            # 10 s, then answers 504 (or 503 with X-Env-State through a port
+            # proxy with the state check), which the loop retries. A shorter
+            # client timeout would only cut that hold short.
             budget = max(remaining, 1.0)
             try:
                 resp = httpx.get(url, headers=headers,
@@ -387,23 +417,64 @@ class AteEnvWorkspace(RemoteWorkspace):
                     return
                 text = resp.text.strip()[:200]
                 last = f"HTTP {code}: {text}"
+                self._raise_if_gone(resp, last)
                 if code in (401, 403):
                     raise PermissionError(
                         f"the port proxy refused the request for {self.atespace}/{self.env_id} "
                         f"({last}); api_token must be ate-env-api's bearer token")
                 if code == 400:
                     raise ValueError(f"the port proxy rejected {url} ({last})")
-                if code == 404 and not self._exists():
+                if code == 404 and not self._exists(_read_timeout(deadline)):
                     raise RuntimeError(f"environment {self.atespace}/{self.env_id} no longer "
                                        f"exists ({last})")
+            if time.monotonic() >= next_state_check:
+                next_state_check = time.monotonic() + STATE_CHECK_INTERVAL
+                self._raise_if_state_is_final(last, _read_timeout(deadline))
             time.sleep(min(1.0, max(deadline - time.monotonic(), 0)))
         raise RuntimeError(f"agent-server in {self.atespace}/{self.env_id} did not answer "
                            f"/health within {timeout}s; last: {last}")
 
-    def _exists(self) -> bool:
+    def _raise_if_gone(self, resp: httpx.Response, last: str) -> None:
+        """Raise when an answer says that the environment will not wake.
+
+        A crashed environment stays crashed: only a new one helps. Any answer
+        with ``X-Env-State: CRASHED`` counts, whatever its status, and so does
+        410 Gone without the header.
+        """
+        state = resp.headers.get(ENV_STATE_HEADER, "").strip().upper()
+        where = f"environment {self.atespace}/{self.env_id}"
+        if state == "CRASHED" or resp.status_code == 410:
+            raise RuntimeError(
+                f"{where} has crashed and will not recover ({last}); delete it and "
+                "create a new one")
+        if state == "DELETING":
+            raise RuntimeError(f"{where} is being deleted ({last})")
+
+    def _raise_if_state_is_final(self, last: str, timeout: float) -> None:
+        """Raise when GetEnvironment says the environment will not wake.
+
+        An error other than NotFound says nothing about the environment; the
+        wait goes on.
+        """
+        where = f"environment {self.atespace}/{self.env_id}"
+        try:
+            info = self._call(self._ate().get(self.env_id, atespace=self.atespace), timeout=timeout)
+        except NotFoundError:
+            raise RuntimeError(f"{where} no longer exists ({last})") from None
+        except Exception as exc:
+            logger.debug("state check of %s skipped: %s", where, exc)
+            return
+        if info.status == EnvironmentStatus.CRASHED:
+            raise RuntimeError(
+                f"{where} has crashed and will not recover (state CRASHED; last: {last}); "
+                "delete it and create a new one")
+        if info.status == EnvironmentStatus.DELETING:
+            raise RuntimeError(f"{where} is being deleted (state DELETING; last: {last})")
+
+    def _exists(self, timeout: float = CALL_TIMEOUT) -> bool:
         """Whether the environment still exists; True when that is unknown."""
         try:
-            self._call(self._ate().get(self.env_id, atespace=self.atespace))
+            self._call(self._ate().get(self.env_id, atespace=self.atespace), timeout=timeout)
         except NotFoundError:
             return False
         except Exception:

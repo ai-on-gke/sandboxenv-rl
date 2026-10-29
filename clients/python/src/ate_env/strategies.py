@@ -89,6 +89,7 @@ def run_none(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
              concurrency: int, teardown: bool = True) -> list[Any]:
     """No pre-warming: on-demand 1:1 acquisition per task."""
     try:
+        # fleet.tasks is a snapshot: tasks added during the run are not run.
         return process_parallel(fleet, fleet.tasks, process_fn, concurrency)
     finally:
         if teardown:
@@ -100,6 +101,7 @@ def run_naive(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
     """Pre-warm every image up front, process all tasks in parallel, tear down."""
     try:
         fleet.setup()
+        # fleet.tasks is a snapshot: tasks added during the run are not run.
         return process_parallel(fleet, fleet.tasks, process_fn, concurrency)
     finally:
         if teardown:
@@ -112,13 +114,15 @@ def run_sliding(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
     fleet.preflight()
     fleet.plan()
     window = fleet.config.window_size or fleet.config.batch_size
-    images = list(fleet.image_counts().keys())
+    # One snapshot for the whole run: tasks added meanwhile are not run.
+    tasks = fleet.tasks
+    images = list(dict.fromkeys(t.image for t in tasks))
 
     by_image: dict[str, list[tuple[int, Task]]] = collections.defaultdict(list)
-    for i, t in enumerate(fleet.tasks):
+    for i, t in enumerate(tasks):
         by_image[t.image].append((i, t))
 
-    results: list[Any] = [None] * len(fleet.tasks)
+    results: list[Any] = [None] * len(tasks)
     try:
         for start in range(0, len(images), window):
             batch = images[start:start + window]
@@ -152,13 +156,15 @@ def run_pipelined(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
     fleet.preflight()
     fleet.plan()
     window = fleet.config.window_size or fleet.config.batch_size
-    images = list(fleet.image_counts().keys())
+    # One snapshot for the whole run: tasks added meanwhile are not run.
+    tasks = fleet.tasks
+    images = list(dict.fromkeys(t.image for t in tasks))
 
     by_image: dict[str, list[tuple[int, Task]]] = collections.defaultdict(list)
-    for i, t in enumerate(fleet.tasks):
+    for i, t in enumerate(tasks):
         by_image[t.image].append((i, t))
 
-    results: list[Any] = [None] * len(fleet.tasks)
+    results: list[Any] = [None] * len(tasks)
     batches = [images[s:s + window] for s in range(0, len(images), window)]
 
     prefetch_executor = ThreadPoolExecutor(max_workers=1)

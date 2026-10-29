@@ -27,9 +27,10 @@ import (
 	"github.com/agent-substrate/env/internal/internaltest/fakerouter"
 	"github.com/agent-substrate/env/internal/internaltest/testcerts"
 	"github.com/agent-substrate/env/internal/routertls"
-	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
@@ -146,6 +147,10 @@ func TestDelete(t *testing.T) {
 	f := newFixture(t)
 	ctx := t.Context()
 	f.create(t, "sb-life")
+	conn, err := f.client.DialGuest("", "sb-life")
+	if err != nil {
+		t.Fatalf("DialGuest: %v", err)
+	}
 
 	if err := f.client.Delete(ctx, "", "sb-life"); err != nil {
 		t.Fatalf("Delete: %v", err)
@@ -154,6 +159,14 @@ func TestDelete(t *testing.T) {
 	// for a durable upload.
 	if got := f.control.SuspendModes; len(got) != 1 || got[0] != ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS {
 		t.Fatalf("suspend modes = %v, want one ASYNCHRONOUS", got)
+	}
+	// The pooled guest connection goes with the actor, so a create-and-delete
+	// workload does not keep one per environment it ever had.
+	if conn.GetState() != connectivity.Shutdown {
+		t.Fatalf("pooled guest connection after Delete: %s, want Shutdown", conn.GetState())
+	}
+	if again, err := f.client.DialGuest("", "sb-life"); err != nil || again == conn {
+		t.Fatalf("DialGuest after Delete = %p, %v; want a new connection", again, err)
 	}
 }
 

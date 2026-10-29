@@ -268,8 +268,11 @@ def rollout(task, handle):                        # task.metadata["ds"] is the d
 
 `AteEnvRuntime(DockerRuntime)` overrides the four `kubernetes-sandbox` hooks: bind the handle,
 no-op teardown, `handle.exec` for `run` (with R2E-Gym's `(output, exit_code)` strings and
-timeouts) and `handle.write_file` plus `tar` for `copy_to_container`. Everything else in the
-runtime (setup, patches, reward grading) runs unchanged. R2E-Gym is not on PyPI: install it from
+timeouts) and `handle.write_file` plus `tar` for `copy_to_container`. Commands run with
+R2E-Gym's `PATH` (its testbed venv first) plus `docker_kwargs["environment"]` (a dict or a list
+of `KEY=VALUE` strings), which can override `PATH`, as in R2E-Gym's kubernetes backends. Copied
+files are owned by root. Everything else in the runtime (setup, patches, reward grading) runs
+unchanged. R2E-Gym is not on PyPI: install it from
 its checkout (`pip install -e path/to/R2E-Gym`); the module imports without it and raises a clear
 `RuntimeError` on first use. R2E-Gym's runtime loads a kubeconfig for this backend; the adapter
 stubs that during construction, so no Kubernetes access is needed.

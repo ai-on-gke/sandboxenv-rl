@@ -29,7 +29,7 @@ import (
 	"github.com/agent-substrate/env/internal/internaltest/fakerouter"
 	"github.com/agent-substrate/env/internal/unknownfields"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
-	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -327,6 +327,25 @@ func TestDeleteEnvironment(t *testing.T) {
 		Id: "env-del",
 	})
 	if status.Code(err) != codes.NotFound {
+		t.Errorf("after delete, got code %v, want %v", status.Code(err), codes.NotFound)
+	}
+}
+
+// A crashed environment is deleted. Substrate rejects the suspend of a
+// CRASHED actor, but DeleteActor takes an actor in any state.
+func TestDeleteCrashedEnvironment(t *testing.T) {
+	client, control := newTestEnv(t)
+	ctx := context.Background()
+
+	if _, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "env-crashed"}); err != nil {
+		t.Fatalf("CreateEnvironment failed: %v", err)
+	}
+	control.SetState("env-crashed", ateapipb.ActorState_ACTOR_STATE_CRASHED)
+
+	if _, err := client.DeleteEnvironment(ctx, &ateenvv1alpha.DeleteEnvironmentRequest{Id: "env-crashed"}); err != nil {
+		t.Fatalf("DeleteEnvironment of a crashed environment: %v", err)
+	}
+	if _, err := client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "env-crashed"}); status.Code(err) != codes.NotFound {
 		t.Errorf("after delete, got code %v, want %v", status.Code(err), codes.NotFound)
 	}
 }

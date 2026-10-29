@@ -61,6 +61,7 @@ from .errors import (
 from .exceptions import SandboxError
 from .fleet import SandboxFleet
 from .handle import SandboxHandle
+from .lookahead import LookaheadWarmer, WarmReport
 from .observability import Observer, RunReport
 
 # Types
@@ -96,6 +97,8 @@ __all__ = [
     "SandboxFleet",
     "AsyncSandboxFleet",
     "SandboxHandle",
+    "LookaheadWarmer",
+    "WarmReport",
     # Telemetry
     "TracerConfig",
     "ObservabilityConfig",

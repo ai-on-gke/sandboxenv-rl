@@ -27,7 +27,7 @@ import (
 	"github.com/agent-substrate/env/internal/internaltest/fakerouter"
 	"github.com/agent-substrate/env/internal/internaltest/testcerts"
 	"github.com/agent-substrate/env/internal/routertls"
-	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
@@ -155,10 +155,9 @@ func TestDelete(t *testing.T) {
 	if err := f.client.Delete(ctx, "", "sb-life"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	// The snapshot is deleted right away: the suspend before it must not wait
-	// for a durable upload.
-	if got := f.control.SuspendModes; len(got) != 1 || got[0] != ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS {
-		t.Fatalf("suspend modes = %v, want one ASYNCHRONOUS", got)
+	// Substrate v0.6.0 deletes a running actor: no suspend first.
+	if got := f.control.SuspendModes; len(got) != 0 {
+		t.Fatalf("suspend calls = %v, want none", got)
 	}
 	// The pooled guest connection goes with the actor, so a create-and-delete
 	// workload does not keep one per environment it ever had.
@@ -167,6 +166,39 @@ func TestDelete(t *testing.T) {
 	}
 	if again, err := f.client.DialGuest("", "sb-life"); err != nil || again == conn {
 		t.Fatalf("DialGuest after Delete = %p, %v; want a new connection", again, err)
+	}
+	// A missing actor is ErrNotFound, which callers count as deleted.
+	if err := f.client.Delete(ctx, "", "sb-life"); !errors.Is(err, ate.ErrNotFound) {
+		t.Fatalf("Delete of a missing actor: err = %v, want ErrNotFound", err)
+	}
+}
+
+// Delete removes an actor in each state with DeleteActor alone, also a
+// CRASHED one, whose suspend Substrate rejects.
+func TestDeleteInAnyState(t *testing.T) {
+	for _, state := range []ateapipb.ActorState{
+		ateapipb.ActorState_ACTOR_STATE_RUNNING,
+		ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+		ateapipb.ActorState_ACTOR_STATE_CRASHED,
+		ateapipb.ActorState_ACTOR_STATE_RESUMING,
+		ateapipb.ActorState_ACTOR_STATE_REVERTING,
+		ateapipb.ActorState_ACTOR_STATE_DELETING,
+	} {
+		t.Run(state.String(), func(t *testing.T) {
+			f := newFixture(t)
+			f.create(t, "sb-del")
+			f.control.SetState("sb-del", state)
+
+			if err := f.client.Delete(t.Context(), "", "sb-del"); err != nil {
+				t.Fatalf("Delete of a %s actor: %v", state, err)
+			}
+			if _, err := f.client.Get(t.Context(), "", "sb-del"); !errors.Is(err, ate.ErrNotFound) {
+				t.Fatalf("Get after Delete: err = %v, want ErrNotFound", err)
+			}
+			if got := f.control.SuspendModes; len(got) != 0 {
+				t.Fatalf("suspend calls = %v, want none", got)
+			}
+		})
 	}
 }
 

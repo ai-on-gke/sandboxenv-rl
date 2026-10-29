@@ -541,6 +541,71 @@ class SubstrateBackendDriver(BackendDriver):
             )
         )
 
+    async def resize_pool_async(
+        self,
+        template_id: str,
+        replicas: int,
+        wait: bool = True,
+        rootfs_image: str | None = None,
+    ) -> None:
+        """Set the warm pool of (template, image) to exactly ``replicas`` paused
+        actors: grow through warm_pool_async, shrink by deleting idle paused
+        actors. Claimed actors are not in the pool and are never touched, so
+        ``held + warm`` stays what the caller asked for (the shape Tunix's
+        prewarm loop keeps with set_pool_replicas)."""
+        replicas = max(0, replicas)
+        pool_key = (template_id, rootfs_image)
+        with self._lock:
+            pool = self._warm_paused_pool.get(pool_key, [])
+            current = len(pool)
+            if replicas >= current:
+                surplus = []
+            else:
+                surplus = pool[replicas:]
+                del pool[replicas:]
+        if replicas > current:
+            await self.warm_pool_async(
+                template_id, replicas, wait=wait, rootfs_image=rootfs_image
+            )
+            return
+        if not surplus:
+            return
+        # The actors left the pool above; the shared warm-replica gauge and the
+        # run report follow, as in unwarm_pool_async.
+        self._observe("warm_remove", len(surplus))
+        logger.info(
+            "Shrinking warm pool for template %s (rootfs_image=%s) from %d to %d paused actors",
+            template_id, rootfs_image, current, replicas,
+        )
+        sem = asyncio.Semaphore(16)
+
+        async def _delete_one(actor_id: str) -> None:
+            async with sem:
+                try:
+                    await self.client.delete(actor_id, atespace=self.atespace)
+                except Exception as e:
+                    logger.warning("Failed deleting surplus warm actor %s: %s", actor_id, e)
+                with self._lock:
+                    self._owned_actors.pop(actor_id, None)
+
+        await asyncio.gather(*[_delete_one(aid) for aid in surplus], return_exceptions=True)
+
+    def resize_pool(
+        self,
+        template_id: str,
+        replicas: int,
+        wait: bool = True,
+        rootfs_image: str | None = None,
+    ) -> None:
+        self._sync(
+            self.resize_pool_async(template_id, replicas, wait=wait, rootfs_image=rootfs_image)
+        )
+
+    def pool_size(self, template_id: str, rootfs_image: str | None = None) -> int | None:
+        """Paused actors waiting in the warm pool of (template_id, rootfs_image)."""
+        with self._lock:
+            return len(self._warm_paused_pool.get((template_id, rootfs_image), []))
+
     async def unwarm_pool_async(self, template_id: str, rootfs_image: str | None = None) -> None:
         """Drain and delete paused actors in the warm pool."""
         logger.info("Unwarming pool for template %s (rootfs_image=%s)...", template_id, rootfs_image)

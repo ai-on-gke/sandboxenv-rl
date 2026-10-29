@@ -175,6 +175,9 @@ func (s *fakeSandbox) SuspendWithMode(ctx context.Context, async bool) error {
 	} else {
 		s.b.suspended[s.id]++
 	}
+	if s.parked.CompareAndSwap(false, true) {
+		s.b.bumpAwake(-1)
+	}
 	return nil
 }
 

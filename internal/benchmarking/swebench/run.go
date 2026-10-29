@@ -293,6 +293,9 @@ func (c *Config) validate() error {
 	if c.ImagesPerStep > 0 && c.Mode != ModeSteps {
 		return errors.New("images per step applies to steps mode")
 	}
+	if c.ParkEach && c.Mode != ModeSteps {
+		return errors.New("park each applies to steps mode")
+	}
 	if n := c.longestName(); len(n) > maxNameLen {
 		return fmt.Errorf("environment name %q has %d characters, more than Substrate's %d; "+
 			"use a shorter run id, fewer rollouts or tasks per image, or fewer steps", n, len(n), maxNameLen)
@@ -1409,6 +1412,10 @@ func isTransient(err error) bool {
 	return false
 }
 
+func (r *runner) suspend(ctx context.Context, e *environment, step int) {
+	r.suspendWithMode(ctx, e, step, false)
+}
+
 func (r *runner) suspendWithMode(ctx context.Context, e *environment, step int, async bool) {
 	start := time.Now()
 	var err error
@@ -1448,17 +1455,19 @@ func (r *runner) fork(ctx context.Context, e *environment, step int) bool {
 	} else {
 		child, err = r.cfg.Backend.Create(cctx, newID, e.inst.Image)
 	}
-	e.id = newID
 	ev := r.event(EventFork, e, step, time.Since(e.createStart), err)
+	ev.Env = newID
 	r.rec.Record(ev)
 	if err != nil {
 		e.failed = true
 		task := r.event(EventTask, e, step, 0, err)
+		task.Env = newID
 		r.rec.Record(task)
 		r.countTask(e, step, false, nil)
 		r.log.Warn("fork failed", slog.String("from", parentID), slog.String("env", newID), slog.String("err", err.Error()))
 		return false
 	}
+	e.id = newID
 	if parentSB != nil && !r.cfg.Keep {
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 		_ = parentSB.Delete(cleanup)

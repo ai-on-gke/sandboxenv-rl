@@ -166,12 +166,19 @@ jobs:
         run: cosign sign --yes "$API_IMAGE" "$GUEST_IMAGE" "$LAYER_IMAGE"
 
       # A single source makes imagetools copy the index as is: the tag points at
-      # the signed digest.
+      # the signed digest. The step checks that, and fails if it does not.
       - name: Tag the OpenHands layer
         env:
           LAYER_IMAGE: ${{ steps.layer.outputs.layer }}
           LAYER_TAG: ${{ steps.layer.outputs.layer_tag }}
-        run: docker buildx imagetools create --tag "$LAYER_TAG" "$LAYER_IMAGE"
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "$LAYER_TAG" "$LAYER_IMAGE"
+          tagged=$(docker buildx imagetools inspect "$LAYER_TAG" --format '{{.Manifest.Digest}}')
+          if [[ "${tagged}" != "${LAYER_IMAGE##*@}" ]]; then
+            echo "${LAYER_TAG} points at ${tagged}, not the signed ${LAYER_IMAGE##*@}" >&2
+            exit 1
+          fi
 
       - name: Build the CLI with the image digests as defaults
         env:

@@ -450,7 +450,10 @@ example in [`examples/verl_swebench`](../../examples/verl_swebench) uses both.
 ### Observability
 
 Three layers, all off the hot path when disabled. The base install has
-no telemetry dependency; the optional layers need extras:
+no telemetry dependency; the optional layers need extras. The
+repository-wide guide, with ate-env-api, the guest, collectors, Cloud
+Trace and the HTML report tool, is
+[docs/observability.md](../../docs/observability.md):
 
 ```bash
 pip install './clients/python[tracing,metrics]'

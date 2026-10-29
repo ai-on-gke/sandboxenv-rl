@@ -39,11 +39,13 @@ import (
 // demand. Its sandboxes answer every command with exit code 0 unless the
 // command names a nonzero exit (e.g. "exit 1").
 type fakeBackend struct {
-	mu          sync.Mutex
-	created     map[string]int
-	suspended   map[string]int
-	deleted     map[string]int
-	deletedByID map[string]int
+	mu             sync.Mutex
+	created        map[string]int
+	suspended      map[string]int
+	suspendedAsync map[string]int
+	forked         map[string]string
+	deleted        map[string]int
+	deletedByID    map[string]int
 	// onCreate, when set, runs after every successful create; tests use it
 	// to cancel a run at a known point.
 	onCreate    func(id string)
@@ -72,7 +74,8 @@ func (f *fakeBackend) bumpAwake(d int32) {
 }
 
 func newFake() *fakeBackend {
-	return &fakeBackend{created: map[string]int{}, suspended: map[string]int{}, deleted: map[string]int{},
+	return &fakeBackend{created: map[string]int{}, suspended: map[string]int{}, suspendedAsync: map[string]int{},
+		forked: map[string]string{}, deleted: map[string]int{},
 		deletedByID: map[string]int{}, files: map[string]string{}, failCreate: map[string]bool{},
 		failDelete: map[string]int{}}
 }
@@ -162,6 +165,28 @@ func (s *fakeSandbox) Suspend(ctx context.Context) error {
 		s.b.bumpAwake(-1)
 	}
 	return nil
+}
+
+func (s *fakeSandbox) SuspendWithMode(ctx context.Context, async bool) error {
+	s.b.mu.Lock()
+	defer s.b.mu.Unlock()
+	if async {
+		s.b.suspendedAsync[s.id]++
+	} else {
+		s.b.suspended[s.id]++
+	}
+	if s.parked.CompareAndSwap(false, true) {
+		s.b.bumpAwake(-1)
+	}
+	return nil
+}
+
+func (s *fakeSandbox) Fork(ctx context.Context, newID string) (Sandbox, error) {
+	s.b.mu.Lock()
+	defer s.b.mu.Unlock()
+	s.b.created[newID]++
+	s.b.forked[newID] = s.id
+	return &fakeSandbox{b: s.b, id: newID}, nil
 }
 
 // Delete fails on a done context, as the real API would, so a cleanup that
@@ -1054,5 +1079,57 @@ func TestImagesPerStepTakesTheNextWindowEachStep(t *testing.T) {
 	cfg.ImagesPerStep, cfg.Park = 2, ParkSuspend
 	if _, err := Run(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "park mode delete") {
 		t.Fatalf("a window with a suspend park must be rejected: %v", err)
+	}
+}
+
+func TestStepsSuspendAsyncAndForkPark(t *testing.T) {
+	// Test ParkSuspendAsync
+	fAsync := newFake()
+	var outAsync bytes.Buffer
+	cfgAsync := baseConfig(t, fAsync, &outAsync)
+	cfgAsync.Mode = ModeSteps
+	cfgAsync.Rollouts = 1
+	cfgAsync.Steps = 2
+	cfgAsync.Park = ParkSuspendAsync
+
+	sumAsync, err := Run(context.Background(), cfgAsync)
+	if err != nil {
+		t.Fatalf("Run(ParkSuspendAsync): %v", err)
+	}
+	if sumAsync.Tasks != 6 || sumAsync.Failed != 0 {
+		t.Fatalf("ParkSuspendAsync summary = %+v", sumAsync)
+	}
+	for id := range fAsync.created {
+		if fAsync.suspendedAsync[id] != 1 || fAsync.suspended[id] != 0 {
+			t.Fatalf("env %s suspendedAsync=%d suspended=%d, want 1 and 0", id, fAsync.suspendedAsync[id], fAsync.suspended[id])
+		}
+	}
+
+	// Test ParkFork
+	fFork := newFake()
+	var outFork bytes.Buffer
+	cfgFork := baseConfig(t, fFork, &outFork)
+	cfgFork.Mode = ModeSteps
+	cfgFork.Rollouts = 1
+	cfgFork.Steps = 2
+	cfgFork.Park = ParkFork
+
+	sumFork, err := Run(context.Background(), cfgFork)
+	if err != nil {
+		t.Fatalf("Run(ParkFork): %v", err)
+	}
+	if sumFork.Tasks != 6 || sumFork.Failed != 0 {
+		t.Fatalf("ParkFork summary = %+v", sumFork)
+	}
+	if len(fFork.forked) != 3 {
+		t.Fatalf("forked = %v, want 3 forked environments", fFork.forked)
+	}
+	for newID, fromID := range fFork.forked {
+		if !strings.HasSuffix(newID, "-s2") {
+			t.Errorf("forked newID = %q, want -s2 suffix", newID)
+		}
+		if fFork.deleted[fromID] != 1 || fFork.deleted[newID] != 1 {
+			t.Errorf("deleted[%s]=%d, deleted[%s]=%d, want 1 each", fromID, fFork.deleted[fromID], newID, fFork.deleted[newID])
+		}
 	}
 }

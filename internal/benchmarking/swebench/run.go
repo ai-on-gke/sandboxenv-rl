@@ -216,7 +216,7 @@ type Summary struct {
 
 func (c *Config) usesWorkingSet() bool {
 	return c.Mode == ModeSteps && (c.Schedule != nil || c.TasksPerStep > 0 || c.GroupSize > 0 ||
-		c.StepPause > 0 || c.Prefetch || c.Park == ParkSuspendAsync || c.Park == ParkSuspendSync || c.Park == ParkFork)
+		c.StepPause > 0 || c.Prefetch)
 }
 
 func (c *Config) validate() error {
@@ -293,6 +293,9 @@ func (c *Config) validate() error {
 	if c.ImagesPerStep > 0 && c.Mode != ModeSteps {
 		return errors.New("images per step applies to steps mode")
 	}
+	if c.ParkEach && c.Mode != ModeSteps {
+		return errors.New("park each applies to steps mode")
+	}
 	if n := c.longestName(); len(n) > maxNameLen {
 		return fmt.Errorf("environment name %q has %d characters, more than Substrate's %d; "+
 			"use a shorter run id, fewer rollouts or tasks per image, or fewer steps", n, len(n), maxNameLen)
@@ -312,7 +315,7 @@ func (c *Config) longestName() string {
 	k, suffix := c.TasksPerImage-1, ""
 	if c.Mode == ModeSteps {
 		k = c.Rollouts - 1
-		if (c.Park == ParkDelete || c.ImagesPerStep > 0) && c.Steps > 1 {
+		if (c.Park == ParkDelete || c.Park == ParkFork || c.ImagesPerStep > 0) && c.Steps > 1 {
 			suffix = fmt.Sprintf("-s%d", c.Steps)
 		}
 	}
@@ -788,6 +791,12 @@ func (r *runner) runSteps(ctx context.Context, envs []*environment) {
 					r.create(ctx, envs[i], step)
 				}
 			})
+		} else if step > 1 && r.cfg.Park == ParkFork {
+			forEach(ctx, len(envs), r.cfg.Width, func(i int) {
+				if !envs[i].failed {
+					r.fork(ctx, envs[i], step)
+				}
+			})
 		}
 		barrier := time.Now()
 		forEach(ctx, len(envs), r.cfg.Width, func(i int) {
@@ -811,8 +820,10 @@ func (r *runner) runSteps(ctx context.Context, envs []*environment) {
 				return
 			}
 			switch r.cfg.Park {
-			case ParkSuspend:
-				r.suspend(ctx, e, step)
+			case ParkSuspend, ParkSuspendSync:
+				r.suspendWithMode(ctx, e, step, false)
+			case ParkSuspendAsync, ParkFork:
+				r.suspendWithMode(ctx, e, step, true)
 			case ParkDelete:
 				r.remove(ctx, e, step)
 			}
@@ -1402,12 +1413,68 @@ func isTransient(err error) bool {
 }
 
 func (r *runner) suspend(ctx context.Context, e *environment, step int) {
+	r.suspendWithMode(ctx, e, step, false)
+}
+
+func (r *runner) suspendWithMode(ctx context.Context, e *environment, step int, async bool) {
 	start := time.Now()
-	err := e.sb.Suspend(ctx)
+	var err error
+	if ms, ok := e.sb.(ModeSuspender); ok {
+		err = ms.SuspendWithMode(ctx, async)
+	} else if async {
+		if as, ok := e.sb.(AsyncSuspender); ok {
+			err = as.SuspendAsync(ctx)
+		} else {
+			err = e.sb.Suspend(ctx)
+		}
+	} else {
+		err = e.sb.Suspend(ctx)
+	}
 	r.rec.Record(r.event(EventSuspend, e, step, time.Since(start), err))
 	if err != nil {
 		r.log.Warn("suspend failed", slog.String("env", e.id), slog.String("err", err.Error()))
 	}
+}
+
+func (r *runner) fork(ctx context.Context, e *environment, step int) bool {
+	parentID := e.id
+	parentSB := e.sb
+	newID := fmt.Sprintf("%s-s%d", e.base, step)
+	cctx, cancel := context.WithTimeout(ctx, r.cfg.CreateTimeout)
+	defer cancel()
+	e.createStart = time.Now()
+
+	var (
+		child Sandbox
+		err   error
+	)
+	if sf, ok := parentSB.(SandboxForker); ok {
+		child, err = sf.Fork(cctx, newID)
+	} else if fb, ok := r.cfg.Backend.(ForkBackend); ok {
+		child, err = fb.Fork(cctx, parentID, newID)
+	} else {
+		child, err = r.cfg.Backend.Create(cctx, newID, e.inst.Image)
+	}
+	ev := r.event(EventFork, e, step, time.Since(e.createStart), err)
+	ev.Env = newID
+	r.rec.Record(ev)
+	if err != nil {
+		e.failed = true
+		task := r.event(EventTask, e, step, 0, err)
+		task.Env = newID
+		r.rec.Record(task)
+		r.countTask(e, step, false, nil)
+		r.log.Warn("fork failed", slog.String("from", parentID), slog.String("env", newID), slog.String("err", err.Error()))
+		return false
+	}
+	e.id = newID
+	if parentSB != nil && !r.cfg.Keep {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		_ = parentSB.Delete(cleanup)
+		cancel()
+	}
+	e.sb = child
+	return true
 }
 
 func (r *runner) remove(ctx context.Context, e *environment, step int) {

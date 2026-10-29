@@ -224,6 +224,18 @@ func (ws *WorkingSet) Acquire(ctx context.Context, step, taskIndex int, instance
 	}, nil
 }
 
+func suspendSandbox(ctx context.Context, sb Sandbox, async bool) error {
+	if ms, ok := sb.(ModeSuspender); ok {
+		return ms.SuspendWithMode(ctx, async)
+	}
+	if async {
+		if as, ok := sb.(AsyncSuspender); ok {
+			return as.SuspendAsync(ctx)
+		}
+	}
+	return sb.Suspend(ctx)
+}
+
 func (ws *WorkingSet) acquireFork(ctx context.Context, step, taskIndex int, instanceID, image string) (*WorkingSetEntry, error) {
 	ws.mu.Lock()
 	base, hasBase := ws.forkBases[image]
@@ -247,7 +259,7 @@ func (ws *WorkingSet) acquireFork(ctx context.Context, step, taskIndex int, inst
 		if err != nil {
 			return nil, err
 		}
-		if err := baseSB.Suspend(ctx); err != nil {
+		if err := suspendSandbox(ctx, baseSB, true); err != nil {
 			_ = baseSB.Delete(context.Background())
 			return nil, err
 		}
@@ -281,6 +293,10 @@ func (ws *WorkingSet) acquireFork(ctx context.Context, step, taskIndex int, inst
 	)
 	if fb, ok := ws.backend.(ForkableBackend); ok {
 		childSB, err = fb.Fork(ctx, base.SandboxID, childID, image)
+	} else if sf, ok := base.Sandbox.(SandboxForker); ok {
+		childSB, err = sf.Fork(ctx, childID)
+	} else if fb, ok := ws.backend.(ForkBackend); ok {
+		childSB, err = fb.Fork(ctx, base.SandboxID, childID)
 	} else {
 		childSB, err = ws.backend.Create(ctx, childID, image)
 	}
@@ -336,7 +352,7 @@ func (ws *WorkingSet) Release(ctx context.Context, entry *WorkingSetEntry) error
 
 	case schema.ParkSuspendSync:
 		start := time.Now()
-		if err := entry.Sandbox.Suspend(ctx); err != nil {
+		if err := suspendSandbox(ctx, entry.Sandbox, false); err != nil {
 			_ = entry.Sandbox.Delete(context.Background())
 			ws.mu.Lock()
 			ws.retired++
@@ -364,7 +380,7 @@ func (ws *WorkingSet) Release(ctx context.Context, entry *WorkingSetEntry) error
 		}
 		go func(e *WorkingSetEntry) {
 			start := time.Now()
-			err := e.Sandbox.Suspend(ctx)
+			err := suspendSandbox(ctx, e.Sandbox, true)
 			e.asyncDur = time.Since(start)
 			e.asyncEnd = time.Now()
 			e.asyncErr = err
@@ -461,7 +477,7 @@ func (ws *WorkingSet) Prewarm(ctx context.Context, nextStep int, prefetchImages 
 			ws.mu.Unlock()
 
 			if ws.cfg.ParkPolicy == schema.ParkFork {
-				if err := sb.Suspend(ctx); err != nil {
+				if err := suspendSandbox(ctx, sb, true); err != nil {
 					_ = sb.Delete(context.Background())
 					fut.err = err
 					continue
@@ -488,7 +504,7 @@ func (ws *WorkingSet) Prewarm(ctx context.Context, nextStep int, prefetchImages 
 
 			wasParked := false
 			if ws.cfg.ParkPolicy == schema.ParkSuspendAsync || ws.cfg.ParkPolicy == schema.ParkSuspendSync {
-				if err := sb.Suspend(ctx); err != nil {
+				if err := suspendSandbox(ctx, sb, ws.cfg.ParkPolicy == schema.ParkSuspendAsync); err != nil {
 					_ = sb.Delete(context.Background())
 					fut.err = err
 					continue

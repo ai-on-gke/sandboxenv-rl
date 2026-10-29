@@ -46,6 +46,36 @@ type Sandbox interface {
 	Delete(ctx context.Context) error
 }
 
+// ModeSuspender is an optional interface implemented by Sandboxes that can
+// choose between synchronous and asynchronous checkpoint durability.
+type ModeSuspender interface {
+	SuspendWithMode(ctx context.Context, async bool) error
+}
+
+// AsyncSuspender is an optional interface implemented by Sandboxes that support
+// non-blocking asynchronous checkpointing (DURABILITY_MODE_ASYNCHRONOUS).
+type AsyncSuspender interface {
+	SuspendAsync(ctx context.Context) error
+}
+
+// SandboxForker is an optional interface implemented by Sandboxes that can
+// fork a new Sandbox from their latest checkpoint.
+type SandboxForker interface {
+	Fork(ctx context.Context, newID string) (Sandbox, error)
+}
+
+// ForkBackend is an optional interface implemented by Backends that can fork a
+// new Sandbox from an existing suspended environment ID.
+type ForkBackend interface {
+	Fork(ctx context.Context, fromID, newID string) (Sandbox, error)
+}
+
+// Prewarmer is an optional interface implemented by Backends that can prewarm
+// image templates or warm pools ahead of a training step.
+type Prewarmer interface {
+	Prewarm(ctx context.Context, images []string) error
+}
+
 // Backend creates sandboxes. The loader is written against this interface so
 // tests run it against an in-memory fake and a second SDK or backend can be
 // compared with the same workload.
@@ -127,6 +157,28 @@ func (b *EnvBackend) Delete(ctx context.Context, id string) error {
 	return b.pick().Delete(ctx, b.atespace, id)
 }
 
+// SuspendWithMode suspends the environment with id via the ate-env API.
+func (b *EnvBackend) SuspendWithMode(ctx context.Context, id string, _ bool) error {
+	return b.pick().Suspend(ctx, b.atespace, id)
+}
+
+// Prewarm ensures derived ActorTemplates exist for each image by creating and
+// immediately deleting a probe environment per image.
+func (b *EnvBackend) Prewarm(ctx context.Context, images []string) error {
+	for i, img := range images {
+		id := fmt.Sprintf("prewarm-%d-%d", time.Now().UnixNano()%1_000_000, i)
+		sb, err := b.Create(ctx, id, img)
+		if err != nil {
+			_ = b.Delete(ctx, id)
+			return fmt.Errorf("prewarm %s: %w", img, err)
+		}
+		if err := sb.Delete(ctx); err != nil {
+			return fmt.Errorf("prewarm cleanup %s: %w", id, err)
+		}
+	}
+	return nil
+}
+
 // Create implements Backend. The environment keeps the connection it was
 // created on for the rest of its life.
 func (b *EnvBackend) Create(ctx context.Context, id, image string) (Sandbox, error) {
@@ -161,24 +213,29 @@ const (
 	killTimeout = 10 * time.Second
 )
 
-// Run starts the command, polls until it exits and then reads its output.
-//
-// The SDK's streaming Shell holds one request open through the router for
-// the whole command, and the router's route timeout (five minutes by
-// default) cuts it off; SWE-bench test runs take up to twelve minutes.
-// Start, poll and read are each short calls, so no single request can
-// outlive it. This belongs in the SDK as an option of Env.Run, since every
-// SDK user with long commands meets the same timeout; it lives here until
-// that change lands so the benchmark does not wait on it.
-//
-// If Run returns before the process has exited, it kills the process, so a
-// retry of the same command never runs beside the first copy.
-func (s envSandbox) Run(ctx context.Context, command string, timeout time.Duration) (res Result, err error) {
+type processOutputStream interface {
+	Recv() (*ateenvv1alpha.ProcessOutput, error)
+}
+
+type polledProcessOps struct {
+	minPoll time.Duration
+	maxPoll time.Duration
+	start   func(ctx context.Context, req *ateenvv1alpha.StartProcessRequest) (string, error)
+	poll    func(ctx context.Context, procID string) (*ateenvv1alpha.Process, error)
+	kill    func(ctx context.Context, procID string) error
+	output  func(ctx context.Context, procID string) (processOutputStream, error)
+}
+
+// runPolledProcess starts command via ops.start, polls ops.poll with exponential
+// backoff until the process exits, and reads buffered stdout/stderr via
+// ops.output. If runPolledProcess returns before the process has exited, it
+// kills the process via ops.kill.
+func runPolledProcess(ctx context.Context, command string, timeout time.Duration, ops polledProcessOps) (res Result, err error) {
 	start := &ateenvv1alpha.StartProcessRequest{Command: []string{"sh", "-c", command}}
 	if timeout > 0 {
 		start.Timeout = durationpb.New(timeout)
 	}
-	proc, err := s.e.StartProcess(ctx, start)
+	procID, err := ops.start(ctx, start)
 	if err != nil {
 		return Result{}, err
 	}
@@ -189,12 +246,12 @@ func (s envSandbox) Run(ctx context.Context, command string, timeout time.Durati
 		}
 		kctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), killTimeout)
 		defer cancel()
-		if _, kerr := proc.Kill(kctx); kerr != nil && !errors.Is(kerr, env.ErrProcessExited) && err != nil {
+		if kerr := ops.kill(kctx, procID); kerr != nil && !errors.Is(kerr, env.ErrProcessExited) && err != nil {
 			err = fmt.Errorf("%w (and killing the process failed: %v)", err, kerr)
 		}
 	}()
 
-	pMin, pMax := s.minPoll, s.maxPoll
+	pMin, pMax := ops.minPoll, ops.maxPoll
 	if pMin <= 0 {
 		pMin = defaultPollMin
 	}
@@ -209,18 +266,22 @@ func (s envSandbox) Run(ctx context.Context, command string, timeout time.Durati
 			return Result{}, ctx.Err()
 		case <-time.After(wait):
 		}
-		p, perr := s.e.FindProcess(ctx, proc.ID())
+		p, perr := ops.poll(ctx, procID)
 		switch {
 		case perr == nil:
 			failures = 0
 			if p.GetState() == ateenvv1alpha.ProcessState_PROCESS_STATE_EXITED {
 				exited = true
-				return s.collect(ctx, proc, int(p.GetExitCode()))
+				stream, oerr := ops.output(ctx, procID)
+				if oerr != nil {
+					return Result{}, oerr
+				}
+				return collectProcessOutput(stream, int(p.GetExitCode()))
 			}
 		case status.Code(perr) == codes.Unavailable || status.Code(perr) == codes.DeadlineExceeded:
 			failures++
 			if failures > pollRetries {
-				return Result{}, fmt.Errorf("poll %s: %w", proc.ID(), perr)
+				return Result{}, fmt.Errorf("poll %s: %w", procID, perr)
 			}
 		default:
 			return Result{}, perr
@@ -231,13 +292,9 @@ func (s envSandbox) Run(ctx context.Context, command string, timeout time.Durati
 	}
 }
 
-// collect reads the exited process's buffered output in one non-following
-// call.
-func (s envSandbox) collect(ctx context.Context, proc *env.Process, exitCode int) (Result, error) {
-	stream, err := proc.Output(ctx, &ateenvv1alpha.StreamProcessOutputRequest{})
-	if err != nil {
-		return Result{}, err
-	}
+// collectProcessOutput reads an exited process's buffered output in one
+// non-following stream until EOF.
+func collectProcessOutput(stream processOutputStream, exitCode int) (Result, error) {
 	var stdout, stderr bytes.Buffer
 	for {
 		msg, err := stream.Recv()
@@ -259,10 +316,54 @@ func (s envSandbox) collect(ctx context.Context, proc *env.Process, exitCode int
 	return Result{ExitCode: exitCode, Stdout: stdout.String(), Stderr: stderr.String()}, nil
 }
 
+// Run starts the command, polls until it exits and then reads its output.
+//
+// The SDK's streaming Shell holds one request open through the router for
+// the whole command, and the router's route timeout (five minutes by
+// default) cuts it off; SWE-bench test runs take up to twelve minutes.
+// Start, poll and read are each short calls, so no single request can
+// outlive it. This belongs in the SDK as an option of Env.Run, since every
+// SDK user with long commands meets the same timeout; it lives here until
+// that change lands so the benchmark does not wait on it.
+//
+// If Run returns before the process has exited, it kills the process, so a
+// retry of the same command never runs beside the first copy.
+func (s envSandbox) Run(ctx context.Context, command string, timeout time.Duration) (Result, error) {
+	var proc *env.Process
+	return runPolledProcess(ctx, command, timeout, polledProcessOps{
+		minPoll: s.minPoll,
+		maxPoll: s.maxPoll,
+		start: func(ctx context.Context, req *ateenvv1alpha.StartProcessRequest) (string, error) {
+			p, err := s.e.StartProcess(ctx, req)
+			if err != nil {
+				return "", err
+			}
+			proc = p
+			return p.ID(), nil
+		},
+		poll: func(ctx context.Context, procID string) (*ateenvv1alpha.Process, error) {
+			return s.e.FindProcess(ctx, procID)
+		},
+		kill: func(ctx context.Context, _ string) error {
+			_, err := proc.Kill(ctx)
+			return err
+		},
+		output: func(ctx context.Context, _ string) (processOutputStream, error) {
+			return proc.Output(ctx, &ateenvv1alpha.StreamProcessOutputRequest{})
+		},
+	})
+}
+
 func (s envSandbox) WriteFile(ctx context.Context, path string, content []byte, mode fs.FileMode) error {
 	return s.e.WriteFile(ctx, path, bytes.NewReader(content), mode)
 }
 
 func (s envSandbox) Suspend(ctx context.Context) error { return s.e.Suspend(ctx) }
+
+func (s envSandbox) SuspendAsync(ctx context.Context) error { return s.e.Suspend(ctx) }
+
+func (s envSandbox) SuspendWithMode(ctx context.Context, _ bool) error {
+	return s.e.Suspend(ctx)
+}
 
 func (s envSandbox) Delete(ctx context.Context) error { return s.e.Delete(ctx) }

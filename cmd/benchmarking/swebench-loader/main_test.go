@@ -246,6 +246,28 @@ func TestEndToEndSWEBenchAndCommandDatasets(t *testing.T) {
 	if repSched.WorkingSetHitRate <= 0 || repSched.Created == 0 || repSched.Reused == 0 {
 		t.Fatalf("expected non-zero working-set hit rate and reuse in scheduled report: %+v", repSched)
 	}
+
+	// 4. Verify -backend and -access flags in runCmd.
+	for _, tc := range []struct {
+		backend, access string
+		wantErr         bool
+	}{
+		{backend: "substrate", access: "ate-env-api", wantErr: false},
+		{backend: "substrate", access: "direct", wantErr: false},
+		{backend: "agent-sandbox", access: "sdk", wantErr: false},
+		{backend: "bogus", access: "ate-env-api", wantErr: true},
+		{backend: "substrate", access: "bogus", wantErr: true},
+	} {
+		err := runCmd([]string{
+			"-dataset", cmdManifest,
+			"-backend", tc.backend,
+			"-access", tc.access,
+			"-dry-run",
+		})
+		if (err != nil) != tc.wantErr {
+			t.Fatalf("runCmd(-backend=%s -access=%s) err = %v, wantErr = %v", tc.backend, tc.access, err, tc.wantErr)
+		}
+	}
 }
 
 func TestLabelFlags(t *testing.T) {

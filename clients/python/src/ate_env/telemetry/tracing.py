@@ -39,7 +39,6 @@ import asyncio
 import atexit
 import collections
 import contextlib
-import contextvars
 import logging
 import os
 import re
@@ -57,6 +56,9 @@ from .trace_recorder import (
     is_trace_mode,
     should_auto_enable_tracing,
 )
+from .trace_recorder import (
+    current_slot_wait_s as current_slot_wait_s,
+)
 
 if TYPE_CHECKING:
     from ..config import TracerConfig
@@ -67,12 +69,6 @@ logger = logging.getLogger("ate_env.telemetry.tracing")
 # TracerConfig service name is the OTel resource ``service.name``; it does not
 # rename spans, so fleet and client spans keep one vocabulary.
 CLIENT_SPAN_PREFIX = "ate_env_client"
-
-# Task-local context variable for propagating fleet concurrency slot-wait
-# latency into backend driver acquire operations.
-current_slot_wait_s: contextvars.ContextVar[float] = contextvars.ContextVar(
-    "ate_env_slot_wait_s", default=0.0
-)
 
 _MISSING_EXTRA_MSG = (
     "OpenTelemetry not installed; tracing disabled. "

@@ -23,6 +23,16 @@ pip install ./clients/python './integrations/openhands[examples]'   # from the r
 [`convo_with_ate_env.py`](convo_with_ate_env.py) is OpenHands' agent-sandbox example 17
 with the workspace line changed: a command, a conversation, a pause and resume, a second message.
 
+```bash
+SESSION_KEY=<key> LLM_API_KEY=<key> [LLM_MODEL=<litellm model>] [LLM_BASE_URL=<url>] \
+  [ATE_ENV_TEMPLATE=oh-agent-server] [TASK_IMAGE=<repo>@sha256:<digest>] \
+  [API=127.0.0.1:7777] [API_TOKEN=<token>] python examples/openhands/convo_with_ate_env.py
+```
+
+It creates an environment from `ATE_ENV_TEMPLATE` (default `oh-agent-server`) with `TASK_IMAGE`
+(default: the template's image) through ate-env-api at `API`, and deletes it at the end. Set
+`API_TOKEN` when ate-env-api runs with `-auth-token-file`.
+
 The CodeAct agent, OpenHands' default agent (terminal, file editor, task tracker, finish) running on
 the agent-server inside an existing environment:
 
@@ -151,7 +161,9 @@ SUBSTRATE_ENV_API=127.0.0.1:7777 OH_TEMPLATE=oh-agent-server OH_SESSION_KEY=<key
 ```
 
 `OH_WARM` keeps that many idle sandboxes per image (`set_pool_replicas`); `OH_API_TOKEN` is the
-ate-env-api bearer when the API runs with `-auth-token-file`.
+ate-env-api bearer when the API runs with `-auth-token-file`. `OH_PROXY_URL` is the port proxy
+base URL (default: `http://` and `SUBSTRATE_ENV_API`), and `ATESPACE` the atespace (default
+`ate-env`).
 
 ## Limits
 

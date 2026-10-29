@@ -24,16 +24,25 @@ import pytest
 
 from ate_env_openhands import _runtime
 
+from .fakes import DEFAULT_ATESPACE, FakeAteEnv, serve
+
 
 class _FakeClient:
     made: list[_FakeClient] = []
 
     def __init__(self, endpoint, auth_token=None):
         self.closed = False
+        self.grace: float | None = None
         _FakeClient.made.append(self)
 
-    async def close(self):
+    async def close(self, grace=None):
         self.closed = True
+        self.grace = grace
+
+
+def _let_closes_run():
+    """Wait for the closes that client() scheduled on the loop before now."""
+    _runtime.run(asyncio.sleep(0))
 
 
 def test_a_client_that_loses_the_race_is_closed(monkeypatch):
@@ -138,7 +147,9 @@ def test_token_rotation_keeps_two_clients_per_endpoint(monkeypatch):
     other = _runtime.client("localhost:5", "t1")
     assert not t1.closed and not t2.closed, "the current and the previous token stay open"
     t3 = _runtime.client("localhost:4", "t3")
+    _let_closes_run()
     assert t1.closed, "the least recently used client of the endpoint is closed"
+    assert t1.grace == _runtime.EVICTED_CLIENT_GRACE, "its calls in progress can finish"
     assert not t2.closed and not t3.closed and not other.closed
     assert set(_runtime._clients) == {("localhost:4", "t2"), ("localhost:4", "t3"),
                                       ("localhost:5", "t1")}
@@ -151,4 +162,53 @@ def test_a_used_client_is_not_the_one_evicted(monkeypatch):
     t2 = _runtime.client("localhost:6", "t2")
     assert _runtime.client("localhost:6", "t1") is t1  # t1 is now the most recent
     _runtime.client("localhost:6", "t3")
+    _let_closes_run()
     assert t2.closed and not t1.closed
+
+
+def test_eviction_lets_a_call_in_progress_finish(own_runtime):
+    """A workspace on the oldest token is in a call when two newer tokens
+    arrive. Its client is evicted; the call must still return."""
+    state = FakeAteEnv(get_delay=1.0)
+    state.envs["e"] = {"atespace": DEFAULT_ATESPACE, "template": "t",
+                       "template_atespace": DEFAULT_ATESPACE, "status": 1}
+    with serve(state) as (api_url, _):
+        oldest = _runtime.client(api_url, "t1")
+        call = _runtime.submit(oldest.get("e", atespace=DEFAULT_ATESPACE))
+        for _ in range(500):
+            if state.gets:
+                break
+            threading.Event().wait(0.01)
+        assert state.gets == 1, "the call is in progress"
+        _runtime.client(api_url, "t2")
+        _runtime.client(api_url, "t3")  # evicts t1; does not wait for its close
+        assert (api_url, "t1") not in _runtime._clients
+        assert oldest in _runtime._retired
+        assert call.result(timeout=5).id == "e"
+        for _ in range(500):  # the close ends when the call does
+            if oldest not in _runtime._retired:
+                break
+            threading.Event().wait(0.01)
+        assert oldest not in _runtime._retired
+        with pytest.raises(Exception):
+            _runtime.run(oldest.get("e", atespace=DEFAULT_ATESPACE), timeout=5)
+
+
+def test_close_all_ends_a_graceful_close_in_progress(own_runtime):
+    state = FakeAteEnv(get_delay=30.0)
+    state.envs["e"] = {"atespace": DEFAULT_ATESPACE, "template": "t",
+                       "template_atespace": DEFAULT_ATESPACE, "status": 1}
+    with serve(state) as (api_url, _):
+        oldest = _runtime.client(api_url, "t1")
+        call = _runtime.submit(oldest.get("e", atespace=DEFAULT_ATESPACE))
+        for _ in range(500):
+            if state.gets:
+                break
+            threading.Event().wait(0.01)
+        _runtime.client(api_url, "t2")
+        _runtime.client(api_url, "t3")
+        assert oldest in _runtime._retired
+        _runtime.close_all(timeout=5)
+        assert not _runtime._retired
+        with pytest.raises(Exception):
+            call.result(timeout=5)  # cancelled by the shutdown, not left hanging

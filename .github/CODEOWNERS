@@ -1,0 +1,50 @@
+# Code owners, by support tier (docs/support.md). The last matching pattern wins,
+# thus the security-sensitive block comes last: its files keep their owners even
+# where a directory pattern above also matches them.
+
+# Default.
+*                               @tomergee
+
+# Clients and integrations.
+/cmd/ate-env/                   @tomergee
+/clients/go/                    @tomergee
+/clients/python/                @sunnylovestiramisu @tomergee
+/integrations/nemo-gym/         @tomergee
+/integrations/openhands/        @tomergee
+
+# Maintained tooling.
+/benchmarking/                  @vicentefb @tomergee
+/cmd/benchmarking/              @vicentefb @tomergee
+/internal/benchmarking/         @vicentefb @tomergee
+
+# Build, test and documentation files.
+/hack/                          @tomergee
+/internal/internaltest/         @tomergee
+/Makefile                       @tomergee
+/buf.gen.yaml                   @tomergee
+/.ko.yaml                       @tomergee
+/go.mod                         @tomergee
+/go.sum                         @tomergee
+/docs/                          @tomergee
+
+# Security-sensitive: the API listener, the port proxy, MCP, the Substrate
+# client, the router TLS client, the wire API, the deployment manifest, the
+# guest (PID 1 in each actor), the security policy and docs, and CI.
+/cmd/ate-env-api/               @tomergee
+/internal/apiservice/           @tomergee
+/internal/portproxy/            @tomergee
+/internal/mcp/                  @tomergee
+/internal/tool/                 @tomergee
+/internal/ate/                  @tomergee
+/internal/routertls/            @tomergee
+/proto/                         @tomergee
+/cmd/ate-env/manifest.go        @tomergee
+/cmd/ate-env-guest/             @tomergee
+/guest/                         @tomergee
+/SECURITY.md                    @tomergee
+/docs/security/                 @tomergee
+/.github/                       @tomergee
+
+# Not supported: no owners.
+/examples/
+/internal/examples/

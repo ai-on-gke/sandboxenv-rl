@@ -34,9 +34,13 @@ _clients: dict[tuple[str, str | None, int], tuple[Client, asyncio.AbstractEventL
 def shared_client(endpoint: str, token: str | None) -> Client:
     """The shared client for ``endpoint`` and ``token`` on the running loop."""
     loop = asyncio.get_running_loop()
+    # Loops come and go (asyncio.run per preflight, per test); drop the
+    # entries of closed ones so the cache does not grow with them.
+    for stale in [k for k, (_, bound) in _clients.items() if bound.is_closed()]:
+        del _clients[stale]
     key = (endpoint, token, id(loop))
     entry = _clients.get(key)
-    if entry is None or entry[1].is_closed():
+    if entry is None:
         entry = (Client(endpoint, auth_token=token), loop)
         _clients[key] = entry
     return entry[0]

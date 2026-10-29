@@ -296,6 +296,38 @@ async def test_file_and_directory_round_trips(fake, make_env, tmp_path):
         await env.stop(delete=True)
 
 
+async def test_upload_dir_removes_the_archive_when_the_unpack_call_raises(fake, make_env, tmp_path):
+    env = make_env()
+    await env.start(force_build=False)
+    try:
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a").write_text("a")
+        fake.state.fail_exec_containing = "tar -xzf"
+        with pytest.raises(RpcError):
+            await env.upload_dir(src, str(tmp_path / "dst"))
+        archives = [p for p in (tmp_path / "scratch").glob(".harbor-upload-*")]
+        assert archives == []
+        assert commands(fake)[-1].startswith("rm -f ")
+    finally:
+        await env.stop(delete=True)
+
+
+async def test_shared_client_cache_evicts_closed_loops(fake):
+    from ate_env_harbor import _client
+
+    def on_its_own_loop() -> None:
+        async def make() -> None:
+            _client.shared_client(fake.addr, None)
+
+        asyncio.run(make())  # that loop is closed when asyncio.run returns
+
+    await asyncio.to_thread(on_its_own_loop)
+    assert any(bound.is_closed() for _, bound in _client._clients.values())
+    _client.shared_client(fake.addr, None)
+    assert not any(bound.is_closed() for _, bound in _client._clients.values())
+
+
 async def test_download_dir_of_a_missing_directory_fails_clearly(fake, make_env, tmp_path):
     env = make_env()
     await env.start(force_build=False)

@@ -553,7 +553,15 @@ class AteEnvEnvironment(BaseEnvironment):
         payload = pack_dir_to_bytes(source_dir, compress=True).getvalue()
         await handle.write_file(archive, payload)
         unpack = remote_unpack_command(archive, target_dir)
-        result = await handle.shell(f"{unpack}; rc=$?; rm -f {shlex.quote(archive)}; exit $rc")
+        try:
+            result = await handle.shell(f"{unpack}; rc=$?; rm -f {shlex.quote(archive)}; exit $rc")
+        except BaseException:
+            # The shell command removes the archive itself; when the call
+            # does not come back (a transport error, a cancellation), remove
+            # it from here so a failed upload leaves nothing in scratch_dir.
+            with contextlib.suppress(Exception):
+                await handle.shell(f"rm -f {shlex.quote(archive)}")
+            raise
         if result.exit_code != 0:
             raise RuntimeError(
                 f"unpacking {source_dir} into {target_dir} failed ({result.exit_code}): "

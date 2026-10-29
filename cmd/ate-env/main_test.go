@@ -239,6 +239,38 @@ func TestHelpOutput(t *testing.T) {
 	})
 }
 
+// --help of each command with the token flags names the variable but never
+// prints its value: help output lands in terminals, CI logs and screenshots.
+func TestHelpDoesNotPrintAuthToken(t *testing.T) {
+	const secret = "s3cr3t-token-value"
+	t.Setenv("SUBSTRATE_ENV_AUTH_TOKEN", secret)
+	for _, args := range [][]string{
+		{"dev1", "--help"},
+		{"dev1", "read", "--help"},
+		{"create", "--help"},
+		{"suspend", "--help"},
+		{"delete", "--help"},
+		{"server-info", "--help"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			root := newRootCommand(args)
+			var buf bytes.Buffer
+			root.SetOut(&buf)
+			root.SetArgs(args)
+			if err := root.Execute(); err != nil {
+				t.Fatalf("Execute failed: %v", err)
+			}
+			out := buf.String()
+			if strings.Contains(out, secret) {
+				t.Errorf("help output prints the token:\n%s", out)
+			}
+			if !strings.Contains(out, "--auth-token") || !strings.Contains(out, "$SUBSTRATE_ENV_AUTH_TOKEN") {
+				t.Errorf("help output must list --auth-token and name $SUBSTRATE_ENV_AUTH_TOKEN:\n%s", out)
+			}
+		})
+	}
+}
+
 func TestCreateImageFlag(t *testing.T) {
 	args := []string{"create", "dev1", "--rootfs-image", "example.com/task@sha256:abc"}
 	root := newRootCommand(args)
@@ -289,6 +321,7 @@ func TestAuthFlagsResolve(t *testing.T) {
 	}{
 		{name: "token flag", args: []string{"--auth-token", "flag-tok"}, want: "flag-tok"},
 		{name: "environment variable", env: "env-tok", want: "env-tok"},
+		{name: "token flag over environment variable", env: "env-tok", args: []string{"--auth-token", "flag-tok"}, want: "flag-tok"},
 		{name: "file", args: []string{"--auth-token-file", file}, want: "from-file"},
 		{name: "file over environment variable", env: "env-tok", args: []string{"--auth-token-file", file}, want: "from-file"},
 		{name: "both flags", args: []string{"--auth-token", "x", "--auth-token-file", file}, wantErr: "cannot be used together"},
@@ -296,10 +329,12 @@ func TestAuthFlagsResolve(t *testing.T) {
 		{name: "missing file", args: []string{"--auth-token-file", file + ".missing"}, wantErr: "reading --auth-token-file"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("SUBSTRATE_ENV_AUTH_TOKEN", tc.env)
 			var a authFlags
 			cmd := &cobra.Command{Use: "x"}
 			a.register(cmd, false)
+			// Set after the flags are registered: the variable is read when
+			// the command runs, not when it is built.
+			t.Setenv("SUBSTRATE_ENV_AUTH_TOKEN", tc.env)
 			if err := cmd.ParseFlags(tc.args); err != nil {
 				t.Fatal(err)
 			}

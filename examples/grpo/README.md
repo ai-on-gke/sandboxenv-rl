@@ -126,8 +126,7 @@ Same names as the original (`MODEL, MAX_STEPS, REWARD_SANDBOXES, NUM_GENERATIONS
 MAX_COMPLETION, SUSPEND_MODE, DATASET_SLICE, ROLLOUT_LEN, EPISODE_LEDGER, BF16`) plus
 `ATE_ENV_ENDPOINT, ATE_TEMPLATE, ATE_ATESPACE, RUN_ID, EXEC_TIMEOUT, WAKE_RETRIES, WAKE_TIMEOUT,
 OUT, SMOKE`. Actors are named `RUN_ID-<n>`; a crashed run is swept with
-`kubectl-ate get actors -a ate-env | awk '/^RUN_ID-/{print $1}' | xargs -n1 kubectl-ate delete actor -a ate-env`
-(suspend first for any still RUNNING).
+`kubectl-ate get actors -a ate-env | awk '/^RUN_ID-/{print $1}' | xargs -n1 kubectl-ate delete actor -a ate-env`.
 
 ## Two clusters, one training loop (MC-1 on the harness side)
 

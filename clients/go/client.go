@@ -26,6 +26,8 @@ import (
 
 	"github.com/agent-substrate/env/internal/ate"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -54,6 +56,22 @@ type ClientOptions struct {
 	// On the client's own connection it is a per-RPC credential, thus each
 	// RPC carries it. With GRPCConn, each Client method attaches it instead.
 	AuthToken string
+
+	// TracerProvider, when set, makes the client emit OpenTelemetry spans
+	// named "<TraceServiceName>.<operation>" (create_environment,
+	// get_environment, suspend_environment, delete_environment,
+	// get_server_info, exec, read_file, write_file) with ate.* / ate_env.*
+	// attributes, the same as the Python client's, and send their W3C
+	// trace context to ate-env-api so its spans join the same trace. Nil
+	// means no spans; the client never creates an exporter itself (see
+	// NewTracerProvider). With GRPCConn set, the client puts the trace
+	// context into each call's metadata instead of adding the otelgrpc
+	// handler to a connection it does not own.
+	TracerProvider trace.TracerProvider
+
+	// TraceServiceName prefixes span names and names the instrumentation
+	// scope. Empty means DefaultTraceServiceName.
+	TraceServiceName string
 }
 
 // Client manages environments against an ate-env-api endpoint over gRPC.
@@ -65,6 +83,7 @@ type Client struct {
 	grpc       ateenvv1alpha.EnvironmentServiceClient
 	process    ateenvv1alpha.ProcessServiceClient
 	filesystem ateenvv1alpha.FileSystemServiceClient
+	tracer     clientTracer
 }
 
 // NewClient returns a Client targeting endpoint.
@@ -90,6 +109,11 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		if opts.AuthToken != "" {
 			dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(bearerCredentials{token: opts.AuthToken}))
 		}
+		if opts.TracerProvider != nil {
+			dialOpts = append(dialOpts, grpc.WithStatsHandler(otelgrpc.NewClientHandler(
+				otelgrpc.WithTracerProvider(opts.TracerProvider),
+				otelgrpc.WithPropagators(tracePropagator))))
+		}
 		grpcConn, err = grpc.NewClient(target, dialOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("env: connecting to gRPC %s: %w", target, err)
@@ -104,6 +128,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		grpc:       ateenvv1alpha.NewEnvironmentServiceClient(grpcConn),
 		process:    ateenvv1alpha.NewProcessServiceClient(grpcConn),
 		filesystem: ateenvv1alpha.NewFileSystemServiceClient(grpcConn),
+		tracer:     newClientTracer(opts),
 	}, nil
 }
 
@@ -141,13 +166,37 @@ func (c *Client) withAuth(ctx context.Context) context.Context {
 
 // Create registers a new env with the parameters given in req and
 // starts it using the gRPC EnvironmentService.
-func (c *Client) Create(ctx context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (*Env, error) {
+func (c *Client) Create(ctx context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (_ *Env, err error) {
+	ctx, span := c.tracer.startRPC(ctx, opCreateEnvironment, "CreateEnvironment",
+		AttrActorName.String(req.GetId()),
+		AttrAtespace.String(req.GetAtespace()),
+		AttrTemplateName.String(req.GetTemplate().GetName()),
+		AttrTemplateAtespace.String(req.GetTemplate().GetAtespace()),
+		AttrRootfsImage.String(imageRefAttr(req.GetRootfsImage())))
+	defer func() { endSpan(span, err) }()
 	resp, err := c.grpc.CreateEnvironment(c.withAuth(ctx), req)
 	if err != nil {
 		return nil, fromGRPCError(err)
 	}
 	created := resp.GetEnvironment()
+	// The server resolves the defaults; record what it chose.
+	setAttributes(span,
+		AttrAtespace.String(created.GetAtespace()),
+		AttrTemplateName.String(created.GetTemplate().GetName()),
+		AttrTemplateAtespace.String(created.GetTemplate().GetAtespace()))
 	return c.Env(created.GetAtespace(), created.GetId()), nil
+}
+
+// Get returns the environment's current status and configuration using the
+// gRPC EnvironmentService.
+func (c *Client) Get(ctx context.Context, atespace, id string) (_ *ateenvv1alpha.Environment, err error) {
+	ctx, span := c.tracer.startRPC(ctx, opGetEnvironment, "GetEnvironment", AttrActorName.String(id), AttrAtespace.String(atespace))
+	defer func() { endSpan(span, err) }()
+	resp, err := c.grpc.GetEnvironment(c.withAuth(ctx), &ateenvv1alpha.GetEnvironmentRequest{Id: id, Atespace: atespace})
+	if err != nil {
+		return nil, fromGRPCError(err)
+	}
+	return resp.GetEnvironment(), nil
 }
 
 // Suspend checkpoints and stops the environment using the gRPC
@@ -169,13 +218,15 @@ func (c *Client) SuspendLocal(ctx context.Context, atespace, id string) error {
 	return c.suspend(ctx, atespace, id, ateenvv1alpha.SuspendMode_SUSPEND_MODE_LOCAL)
 }
 
-func (c *Client) suspend(ctx context.Context, atespace, id string, mode ateenvv1alpha.SuspendMode) error {
+func (c *Client) suspend(ctx context.Context, atespace, id string, mode ateenvv1alpha.SuspendMode) (err error) {
+	ctx, span := c.tracer.startRPC(ctx, opSuspendEnvironment, "SuspendEnvironment", AttrActorName.String(id), AttrAtespace.String(atespace))
+	defer func() { endSpan(span, err) }()
 	req := &ateenvv1alpha.SuspendEnvironmentRequest{
 		Id:       id,
 		Atespace: atespace,
 		Mode:     mode,
 	}
-	_, err := c.grpc.SuspendEnvironment(c.withAuth(ctx), req)
+	_, err = c.grpc.SuspendEnvironment(c.withAuth(ctx), req)
 	if err != nil {
 		return fromGRPCError(err)
 	}
@@ -183,12 +234,14 @@ func (c *Client) suspend(ctx context.Context, atespace, id string, mode ateenvv1
 }
 
 // Delete removes the environment permanently using the gRPC EnvironmentService.
-func (c *Client) Delete(ctx context.Context, atespace, id string) error {
+func (c *Client) Delete(ctx context.Context, atespace, id string) (err error) {
+	ctx, span := c.tracer.startRPC(ctx, opDeleteEnvironment, "DeleteEnvironment", AttrActorName.String(id), AttrAtespace.String(atespace))
+	defer func() { endSpan(span, err) }()
 	req := &ateenvv1alpha.DeleteEnvironmentRequest{
 		Id:       id,
 		Atespace: atespace,
 	}
-	_, err := c.grpc.DeleteEnvironment(c.withAuth(ctx), req)
+	_, err = c.grpc.DeleteEnvironment(c.withAuth(ctx), req)
 	if err != nil {
 		return fromGRPCError(err)
 	}
@@ -199,7 +252,9 @@ func (c *Client) Delete(ctx context.Context, atespace, id string) error {
 // version it was built against and its optional features. Check a feature
 // with slices.Contains(info.GetFeatures(), name) before depending on it. A
 // server that predates GetServerInfo returns an error with codes.Unimplemented.
-func (c *Client) ServerInfo(ctx context.Context) (*ateenvv1alpha.GetServerInfoResponse, error) {
+func (c *Client) ServerInfo(ctx context.Context) (_ *ateenvv1alpha.GetServerInfoResponse, err error) {
+	ctx, span := c.tracer.startRPC(ctx, opGetServerInfo, "GetServerInfo")
+	defer func() { endSpan(span, err) }()
 	resp, err := c.grpc.GetServerInfo(c.withAuth(ctx), &ateenvv1alpha.GetServerInfoRequest{})
 	if err != nil {
 		return nil, fromGRPCError(err)

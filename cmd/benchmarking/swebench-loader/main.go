@@ -79,6 +79,10 @@ func main() {
 // the same one the ate-env CLI reads.
 const authTokenEnv = "SUBSTRATE_ENV_AUTH_TOKEN"
 
+// testBackendOverride allows hermetic end-to-end CLI tests in main_test.go to
+// exercise runCmd without dialing a live gRPC server.
+var testBackendOverride swebench.Backend
+
 // resolveAuthToken returns the token from file when file is set, otherwise
 // from authTokenEnv, otherwise "" (no token sent). A file that holds only
 // whitespace is an error, because it is a misconfiguration and not a request
@@ -253,6 +257,8 @@ func runCmd(args []string) (retErr error) {
 		rollouts      = fs.Int("rollouts", 2, "steps: environments per image.")
 		steps         = fs.Int("steps", 8, "steps: training steps.")
 		park          = fs.String("park", string(swebench.ParkSuspend), "steps: what happens between steps: suspend, delete or none.")
+		imagesPerStep = fs.Int("images-per-step", 0, "steps: each step takes the next N images (wrapping around the dataset) with fresh environments, retired after the step: the create-and-retire-pools-per-step shape; needs -park delete. 0 keeps one fleet across the steps.")
+		parkEach      = fs.Bool("park-each", false, "steps: park each environment as soon as its step ends instead of after the whole fleet's step, so at most -width are awake at once and the fleet can be larger than the running slots; the barrier then includes the parking.")
 		createTimeout = fs.Duration("create-timeout", 5*time.Minute, "Deadline for one create call.")
 		stepTimeout   = fs.Duration("step-timeout", 10*time.Minute, "Default deadline for a run step without its own timeout.")
 		wakeBudget    = fs.Duration("wake-budget", 3*time.Minute, "How long a task's first command is retried while the environment is still waking or its image is still being baked.")
@@ -306,8 +312,12 @@ func runCmd(args []string) (retErr error) {
 	if *images > 0 && len(selected) < *images && len(ids) == 0 {
 		fmt.Fprintf(os.Stderr, "note: %d instances requested, %d available after the exclude list\n", *images, len(selected))
 	}
+	trajSpec := *trajectory
+	if trajSpec == swebench.DefaultTrajectory && len(selected) > 0 && selected[0].Kind == swebench.CommandKind {
+		trajSpec = swebench.CommandTrajectoryName
+	}
 	var trajs []*swebench.Trajectory
-	for _, source := range strings.Split(*trajectory, ",") {
+	for _, source := range strings.Split(trajSpec, ",") {
 		if source = strings.TrimSpace(source); source == "" {
 			continue
 		}
@@ -316,10 +326,8 @@ func runCmd(args []string) (retErr error) {
 			return err
 		}
 		t.Vars = vars
-		if t.Grades() {
-			if err := swebench.RequireGrading(selected); err != nil {
-				return err
-			}
+		if err := swebench.RequireGrading(selected, t); err != nil {
+			return err
 		}
 		for _, in := range selected {
 			if _, err := t.Render(in); err != nil {
@@ -357,18 +365,29 @@ func runCmd(args []string) (retErr error) {
 	if swebench.Mode(*mode) == swebench.ModeSteps {
 		fanout = *rollouts
 	}
+	environments := len(selected) * fanout
+	if *imagesPerStep > 0 {
+		environments = *imagesPerStep * fanout // per step
+	}
 	log.Info("plan", slog.String("run", *runID), slog.String("mode", *mode), slog.Int("images", len(selected)),
-		slog.Int("environments", len(selected)*fanout), slog.Int("width", *width), slog.Int("steps", *steps),
+		slog.Int("images_per_step", *imagesPerStep),
+		slog.Int("environments", environments), slog.Int("width", *width), slog.Int("steps", *steps),
 		slog.String("park", *park), slog.String("trajectory", *trajectory), slog.String("out", *out))
 	if *dryRun {
 		return nil
 	}
 
-	backend, err := swebench.NewEnvBackend(*endpoint, *atespace, *baseTemplate, *connections, authToken)
-	if err != nil {
-		return err
+	var backend swebench.Backend
+	if testBackendOverride != nil {
+		backend = testBackendOverride
+	} else {
+		eb, err := swebench.NewEnvBackend(*endpoint, *atespace, *baseTemplate, *connections, authToken)
+		if err != nil {
+			return err
+		}
+		defer eb.Close()
+		backend = eb
 	}
-	defer backend.Close()
 
 	f, err := os.Create(*out)
 	if err != nil {
@@ -378,11 +397,11 @@ func runCmd(args []string) (retErr error) {
 	// Events lost to a write error, or a file that does not flush, must fail
 	// the run rather than produce a report with holes.
 	defer func() {
+		if rerr := rec.Close(); rerr != nil && retErr == nil {
+			retErr = fmt.Errorf("writing events to %s: %w", *out, rerr)
+		}
 		if cerr := f.Close(); cerr != nil && retErr == nil {
 			retErr = fmt.Errorf("closing %s: %w", *out, cerr)
-		}
-		if rerr := rec.Err(); rerr != nil && retErr == nil {
-			retErr = fmt.Errorf("writing events to %s: %w", *out, rerr)
 		}
 	}()
 
@@ -404,6 +423,8 @@ func runCmd(args []string) (retErr error) {
 		Rollouts:      *rollouts,
 		Steps:         *steps,
 		Park:          swebench.Park(*park),
+		ImagesPerStep: *imagesPerStep,
+		ParkEach:      *parkEach,
 		CreateTimeout: *createTimeout,
 		StepTimeout:   *stepTimeout,
 		WakeBudget:    *wakeBudget,
@@ -425,7 +446,11 @@ func runCmd(args []string) (retErr error) {
 	return nil
 }
 
-func reportCmd(args []string, w io.Writer) error {
+func reportCmd(args []string, ws ...io.Writer) error {
+	var w io.Writer = os.Stdout
+	if len(ws) > 0 && ws[0] != nil {
+		w = ws[0]
+	}
 	files, rest := leadingFiles(args)
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
 	var arms armFlags
@@ -463,12 +488,20 @@ func reportCmd(args []string, w io.Writer) error {
 	reps := make([]*swebench.Report, 0, len(files))
 	var events []swebench.Event // of the single file, for the restore join
 	for _, path := range files {
-		evs, err := readEventsFile(path)
+		if (*restoreLog != "" || *top > 0) && len(files) == 1 {
+			evs, err := readEventsFile(path)
+			if err != nil {
+				return fmt.Errorf("%s: %w", path, err)
+			}
+			events = evs
+			reps = append(reps, swebench.Build(evs))
+			continue
+		}
+		rep, err := summarizeFile(path)
 		if err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
-		events = evs
-		reps = append(reps, swebench.Build(evs))
+		reps = append(reps, rep)
 	}
 	if len(reps) > 1 {
 		// Several runs: one table, a column per run, for the same workload on
@@ -547,6 +580,15 @@ func leadingFiles(args []string) (files, rest []string) {
 		}
 	}
 	return args, nil
+}
+
+func summarizeFile(path string) (*swebench.Report, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return swebench.Summarize(f)
 }
 
 func readEventsFile(path string) ([]swebench.Event, error) {

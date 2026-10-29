@@ -220,10 +220,14 @@ def _build_classes() -> tuple[type, type]:
 
         def _exec_env(self) -> dict[str, str]:
             # R2E-Gym's PATH, overridden by docker_kwargs["environment"]. This
-            # follows R2E-Gym's kubernetes backends (docker.py:250, :1258),
-            # because these hooks replace exactly that backend; its docker
-            # backend instead passes PATH=DOCKER_PATH on each exec_run
-            # (docker.py:741), thus there DOCKER_PATH always wins.
+            # follows DockerRuntime's kubernetes backends, because these hooks
+            # replace exactly that backend: _start_kubernetes_pod (R2E-Gym
+            # master) and _ensure_sandbox_template_exists (the
+            # kubernetes-sandbox backend, tomergee/R2E-Gym
+            # agentic-sandbox-integration at 93021bb) put the same mapping in
+            # the pod env. Its docker backend instead passes PATH=DOCKER_PATH
+            # on each exec_run call (run and demux_run), thus there DOCKER_PATH
+            # always wins.
             extra = (getattr(self, "docker_kwargs", None) or {}).get("environment") or {}
             return {"PATH": docker_path, **_environment_dict(extra)}
 

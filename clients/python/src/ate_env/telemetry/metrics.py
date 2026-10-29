@@ -395,7 +395,7 @@ def render_prometheus() -> str:
             cnt = stats.get(st, 0)
             if cnt > 0 or st == "ok":
                 lines.append(f'{fam}_count{{status="{st}"}} {cnt}')
-        lines.append(f'{fam}_sum{{status="ok"}} {stats["sum_s"]:.6f}')
+        lines.append(f'{fam}_sum {stats["sum_s"]:.6f}')
     for (_key, stats) in sorted(snap["subphases"].items()):
         phase = stats["phase"]
         src = stats["source"]

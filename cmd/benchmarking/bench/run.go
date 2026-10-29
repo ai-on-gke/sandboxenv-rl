@@ -164,6 +164,35 @@ func executeScenarioRun(
 	}
 
 	runScen := *scen
+	if len(scen.Jobs) > 0 {
+		runScen.Jobs = append([]schema.JobSpec(nil), scen.Jobs...)
+		for i := range runScen.Jobs {
+			if len(scen.Jobs[i].TrainerCommand) > 0 {
+				runScen.Jobs[i].TrainerCommand = append([]string(nil), scen.Jobs[i].TrainerCommand...)
+			}
+			if len(scen.Jobs[i].EnvVars) > 0 {
+				envCopy := make(map[string]string, len(scen.Jobs[i].EnvVars))
+				for k, v := range scen.Jobs[i].EnvVars {
+					envCopy[k] = v
+				}
+				runScen.Jobs[i].EnvVars = envCopy
+			}
+		}
+	}
+	if len(scen.SUT.ExtraArgs) > 0 {
+		extraCopy := make(map[string]string, len(scen.SUT.ExtraArgs))
+		for k, v := range scen.SUT.ExtraArgs {
+			extraCopy[k] = v
+		}
+		runScen.SUT.ExtraArgs = extraCopy
+	}
+	if len(scen.SUT.Labels) > 0 {
+		labelsCopy := make(map[string]string, len(scen.SUT.Labels))
+		for k, v := range scen.SUT.Labels {
+			labelsCopy[k] = v
+		}
+		runScen.SUT.Labels = labelsCopy
+	}
 	defaultSource := string(schema.SourceWarmPool)
 	if overlayName != "" {
 		ov, err := overlay.ResolveOverlay(overlayName, scen.Overlays)

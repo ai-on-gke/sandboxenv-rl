@@ -28,12 +28,15 @@
 # -cache-after AFTER` turns the difference into the run's cold-pull count.
 # Reading the metrics needs RBAC get on pods/proxy in NAMESPACE. NAMESPACE defaults to ate-system; CONTEXT selects
 # the kubectl context as in run-in-cluster.sh; PARALLEL (default 16) bounds
-# the concurrent scrapes. A node whose scrape fails is reported and left out,
-# and the script exits 1 so the gap is not missed.
+# the concurrent scrapes. A node whose scrape fails is reported and left out.
+# The script exits 1 when more than MAX_MISSING_PCT percent of the nodes
+# (default 1) failed, so a gap is not missed; at hundreds of nodes a stray
+# failed scrape is normal and the report says how many nodes it differenced.
 
 set -o errexit -o nounset -o pipefail
 
 OUT="${1:?usage: $0 OUT}"
+MAX_MISSING_PCT="${MAX_MISSING_PCT:-1}"
 NS="${NAMESPACE:-ate-system}"
 CONTEXT="${CONTEXT:-}"
 PARALLEL="${PARALLEL:-16}"
@@ -74,4 +77,4 @@ want="$(wc -l < "${TMP}/pods" | tr -d ' ')"
 got="$(find "${TMP}/nodes" -type f ! -name '*.raw' | wc -l | tr -d ' ')"
 find "${TMP}/nodes" -type f ! -name '*.raw' -exec cat {} + | sort > "${OUT}"
 echo "sampled ${got} of ${want} atelet nodes into ${OUT}"
-[[ "${got}" == "${want}" ]]
+(( (want - got) * 100 <= want * MAX_MISSING_PCT ))

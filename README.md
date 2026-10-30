@@ -54,15 +54,27 @@ See [docs/architecture.md](./docs/architecture.md) for the full system design an
 |---|---|
 | [`cmd/ate-env`](./cmd/ate-env) | CLI: create, suspend and delete environments, run commands, move files, and print the Kubernetes and Substrate manifests. |
 | [`cmd/ate-env-api`](./cmd/ate-env-api) | The API service: environment lifecycle, guest calls, MCP and the port proxy. |
-| [`cmd/ate-env-guest`](./cmd/ate-env-guest) | The daemon inside each environment: processes and files. |
-| [`clients/python`](./clients/python/README.md) | Python client, import name `ate_env`: `Client` and `Env` for single environments, and the fleet SDK. |
-| [`clients/go`](./clients/go) | Go client. |
-| [`integrations/`](#integrations) | Framework integrations. |
-| [`examples/`](#examples) | Runnable examples. |
-| [`benchmarking/`](./benchmarking/swebench/README.md), [`cmd/benchmarking`](./cmd/benchmarking), [`internal/benchmarking`](./internal/benchmarking/DESIGN.md) | The SWE-bench loader, its scripts and the benchmark design. |
-| [`docs/`](./docs) | Architecture, glossary, rootfs images, runtime layers, the [metrics reference](./docs/metrics.md), the [threat model](./docs/security/threat-model.md), developer guides, and how releases are cut. |
+| [`cmd/ate-env-guest`](./cmd/ate-env-guest), [`guest/`](./guest) | The daemon inside each environment (a PID 1 init with sidecar supervision) and its services: `guest/process` and `guest/filesystem`. |
+| [`cmd/benchmarking`](./cmd/benchmarking) | The benchmark binaries: `swebench-loader` and the `bench` harness. |
+| [`clients/`](./clients/README.md) | The Go client (package `env`) and the Python client `ate_env` with the fleet SDK. |
+| [`integrations/`](./integrations/README.md) | Framework integrations: NeMo Gym, OpenHands, uni-agent. |
+| [`examples/`](./examples/README.md) | Runnable examples, from a Go MCP client to multi-node agentic GRPO recipes. Not supported. |
+| [`benchmarking/`](./benchmarking/README.md) | The SWE-bench loader scripts, the `bench` scenarios, the telemetry report tool and the benchmarking skills. |
+| [`internal/`](./internal) | The packages the binaries are built from: `apiservice` (the gRPC server), `ate` (the Substrate client), `mcp`, `portproxy`, `routertls`, `hostcheck`, `telemetry`, `tool`, `unknownfields`, `benchmarking/*`, the test doubles in `internaltest` (`fakecontrol`, `fakerouter`, `testcerts`) and a lifecycle walkthrough in `examples/env`. |
+| [`proto/ateenv/v1alpha`](./proto/ateenv/v1alpha) | The `ateenv.v1alpha` API: `env.proto` (`EnvironmentService`) and `guest.proto` (`ProcessService`, `FileSystemService`), with the generated Go stubs. |
+| [`docs/`](./docs) | [Architecture](./docs/architecture.md), [glossary](./docs/glossary.md), [observability](./docs/observability.md), the [metrics reference](./docs/metrics.md), [rootfs images and runtime layers](./docs/rootfs-images/README.md), the [threat model](./docs/security/threat-model.md), [support](./docs/support.md), [releases](./docs/release.md), and the developer guides in [`docs/dev`](./docs/dev). |
+| [`hack/`](./hack) | Repository checks and generators: license boilerplate, `metrics-docs` (renders `docs/metrics.md`). |
+| [`tests/telemetry`](./tests/telemetry) | The OpenTelemetry collector configuration of the telemetry acceptance run. |
+| [`.github/`](./.github) | CI and release workflows, Dependabot, code owners, the pull request template. |
+| [`AGENTS.md`](./AGENTS.md), [`.agents/skills`](./.agents/skills) | Instructions for coding agents and the repository skills. [`CHANGELOG.md`](./CHANGELOG.md) collects user-visible changes. |
+
+Each of `clients/`, `integrations/`, `examples/` and `benchmarking/` has a README that
+lists what is inside.
 
 ## Examples
+
+[`examples/README.md`](examples/README.md) lists each example with what it needs and how to run
+it.
 
 | Example | What it shows |
 |---|---|
@@ -72,8 +84,13 @@ See [docs/architecture.md](./docs/architecture.md) for the full system design an
 | [`examples/guest-daemon`](examples/guest-daemon/README.md) | Go: run the guest gRPC services standalone, without a cluster. |
 | [`examples/Qwen3.5-35B-A3B-verl`](examples/Qwen3.5-35B-A3B-verl/README.md) | Agentic GRPO on real SWE tasks: verl `separate_async` with a Megatron trainer and vLLM rollouts on separate nodes, a uni-agent ReAct agent whose tools and hidden-test grading run in environments. Two 8-GPU nodes. |
 | [`examples/openhands`](examples/openhands/README.md) | OpenHands agents and tools on the agent-server that a runtime layer mounts into any task image, through `integrations/openhands`. |
+| [`examples/Qwen3-1.7B-verl`](examples/Qwen3-1.7B-verl/README.md) | Agentic GRPO on MATH with verl `fully_async_policy`: the model writes Python that runs in an environment through a verl tool. Trainer and rollouts on separate GPU nodes. |
+| [`examples/verl_swebench`](examples/verl_swebench/README.md) | A GRPO-style asynchronous rollout loop on Ray that grades SWE-bench candidate patches in environments with the `ate_env` client and its SWE-bench adapter. |
 
 ## Integrations
+
+[`integrations/README.md`](integrations/README.md) lists what each package contains and how it is
+installed and tested.
 
 | Integration | Framework | What it does |
 |---|---|---|
@@ -88,7 +105,12 @@ the API the way a simulated RL job does: `eval` mode creates, replays, grades an
 and `steps` mode creates a fleet once and parks it between training steps. Image-delivery workloads
 compare image pull, image streaming and other loaders on the same images. The report breaks down
 what each phase cost.
-[`internal/benchmarking/DESIGN.md`](internal/benchmarking/DESIGN.md) specifies the benchmark system.
+The [`bench`](cmd/benchmarking/bench) harness runs the scenarios in
+[`benchmarking/scenarios`](benchmarking/scenarios) (resolve, render, prewarm, measure, reap,
+report), and [`benchmarking/telemetry_report`](benchmarking/telemetry_report) renders one run's
+report, spans and scrapes as one HTML page.
+[`internal/benchmarking/DESIGN.md`](internal/benchmarking/DESIGN.md) specifies the benchmark
+system; [`benchmarking/README.md`](benchmarking/README.md) lists the scripts and tools.
 
 ## Support
 

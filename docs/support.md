@@ -11,7 +11,7 @@ What this repository supports, and what that means.
 | [`cmd/ate-env-guest`](../cmd/ate-env-guest), [`guest/`](../guest) | The daemon inside each environment and its services. |
 | [`clients/go`](../clients/go) | The Go client. |
 | [`clients/python`](../clients/python/README.md) | The Python client (`ate_env`), including the fleet SDK (`SandboxFleet`, `AsyncSandboxFleet`). |
-| [`integrations/`](../integrations) | Framework integrations: today [`integrations/nemo-gym`](../integrations/nemo-gym/README.md). |
+| [`integrations/`](../integrations/README.md) | Framework integrations: [`nemo-gym`](../integrations/nemo-gym/README.md), [`openhands`](../integrations/openhands/README.md) and [`uni-agent`](../integrations/uni-agent/README.md). |
 | [`proto/ateenv/v1alpha`](../proto/ateenv/v1alpha) | The `ateenv.v1alpha` API. |
 
 The packages under [`internal/`](../internal) that these binaries are built from are part of them:
@@ -33,9 +33,9 @@ incompatible ways until v1.0.
 
 ## Maintained tooling, no compatibility promise
 
-[`benchmarking/`](../benchmarking/swebench/README.md), [`cmd/benchmarking`](../cmd/benchmarking) and
-[`internal/benchmarking`](../internal/benchmarking/DESIGN.md): the SWE-bench loader, its scripts and
-the benchmark design. They are kept working with the rest of the repository and CI runs their
+[`benchmarking/`](../benchmarking/README.md), [`cmd/benchmarking`](../cmd/benchmarking) and
+[`internal/benchmarking`](../internal/benchmarking/DESIGN.md): the SWE-bench loader and its scripts,
+the `bench` harness and its scenarios, the telemetry report tool and the benchmark design. They are kept working with the rest of the repository and CI runs their
 tests. Their flags can change at any time. A change to the fields of the events file or of the
 report JSON is called out in the PR description; that is notice, not a compatibility promise.
 

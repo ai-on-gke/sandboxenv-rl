@@ -22,8 +22,10 @@ and put the same peak load on the sandbox pool: eight `35b-easy` match `397b-eas
 | `397b-easy` | 16 | Qwen3.5-397B-A17B | same | same | 64 x 16 = 1,024 | R2E-Gym Easy, 8K / 32K, 100 steps |
 | `397b-v1` | 16 | Qwen3.5-397B-A17B | same | same | 1,024 x 16 = 16,384 | R2E-Gym-V1, 8K / 64K, 150 steps |
 
-Every profile runs 2 steps plus validation by default (`TOTAL_STEPS`); raise it and `TRAIN_INSTANCES` for a
-training run. `SESSIONS` is the whole step (`TRAIN_BATCH x ROLLOUT_N`), so every trajectory starts at once instead
+`TOTAL_STEPS` defaults to one epoch of the whole training set (43 / 63 / 10 / 7; `397b-smoke` runs 2): enough
+steps for performance numbers, not for convergence, which takes about 3 epochs (DeepSWE: 200 steps x 64 prompts
+over 4,500 R2E-Gym tasks); for that, raise `trainer.total_epochs` in `run_fully_async.sh`. Validation runs once,
+after the last step. `SESSIONS` is the whole step (`TRAIN_BATCH x ROLLOUT_N`), so every trajectory starts at once instead
 of queueing on the session cap. If the sandbox system cannot hold that many environments, set `SESSIONS` to its
 maximum capacity instead; the rest of the step then waits in uni-agent, holding no sandbox. In the `v1` profiles
 the step exceeds `replicas x ROLLOUT_MAX_NUM_SEQS`, so turns beyond what vLLM admits queue inside vLLM.
@@ -59,16 +61,16 @@ ate-env manifest template --template swe-1c4g --cpu 1 --memory 4Gi --workerpool 
     --atespace ate-env | kubectl-ate create actor-template -f -      # ATE_TEMPLATE; add --snapshots-bucket / --guest-image as in the Quickstart
 
 # 2. data slices + digest-pinned images (once per slice; match TRAIN_SOURCE / TRAIN_SEED / TRAIN_INSTANCES in the profile)
-python3 -m uni_agent_substrate.datasets --source r2e_gym_easy --max-instances 128 --images-out images.txt --out /tmp/train.parquet   # *-easy
+python3 -m uni_agent_substrate.datasets --source r2e_gym_easy --shuffle-seed 0 --max-instances 700 --images-out images.txt --out /tmp/train.parquet   # *-easy: whole set
 python3 -m uni_agent_substrate.datasets --source r2e_gym --dataset R2E-Gym/R2E-Gym-V1 --shuffle-seed 0 \
-    --max-instances 4096 --images-out images.txt --out /tmp/train.parquet                                                  # *-v1
+    --max-instances 8101 --images-out images.txt --out /tmp/train.parquet                                                  # *-v1: whole set
 python3 -m uni_agent_substrate.datasets --source swe_bench --max-instances 20 \
     --exclude-file ../../benchmarking/swebench/offline-exclusions.txt --images-out images-val.txt --out /tmp/val.parquet
 MODE=hubapi ../../integrations/uni-agent/scripts/resolve_images.sh images.txt <region>-docker.pkg.dev/<project>/<dockerhub-remote-repo> images.json
 ../../integrations/uni-agent/scripts/resolve_images.sh images-val.txt <region>-docker.pkg.dev/<project>/<dockerhub-remote-repo> images.json 6
 
 # 3. 35B on 2 nodes, 397B smoke on 16, then the 397B shape you want
-PROFILE=35b-easy ./deploy.sh up && ./deploy.sh logs      # ... ray nodes with GPUs: 2/2 ... step:1 ... step:2 ... === DONE rc=0 ===
+PROFILE=35b-easy ./deploy.sh up && ./deploy.sh logs      # ... ray nodes with GPUs: 2/2 ... step:1 ... step:43 ... === DONE rc=0 ===
 ./deploy.sh down
 PROFILE=397b-smoke ./deploy.sh up && ./deploy.sh logs    # 16/16 nodes
 ./deploy.sh down

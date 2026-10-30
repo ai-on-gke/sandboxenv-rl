@@ -28,9 +28,12 @@ export PYTHONUNBUFFERED=1 HF_HOME=/workspace/hf HF_HUB_ENABLE_HF_TRANSFER=1 CUDA
 : "${UNI_AGENT_REF:=174b040}"                                     # uni-agent commit; its verl submodule is the verl pin (3efe38c7)
 : "${MODEL_ID:=Qwen/Qwen3.5-397B-A17B}"
 : "${NNODES_TRAIN:=8}"; : "${NNODES_ROLLOUT:=8}"; NNODES=$((NNODES_TRAIN + NNODES_ROLLOUT))
-: "${TRAIN_SOURCE:=r2e_gym}"; : "${TRAIN_DATASET:=R2E-Gym/R2E-Gym-V1}"; : "${TRAIN_SPLIT:=train}"; : "${TRAIN_SEED:=0}"; : "${TRAIN_INSTANCES:=256}"
+: "${TRAIN_SOURCE:=r2e_gym}"; : "${TRAIN_DATASET:=R2E-Gym/R2E-Gym-V1}"; : "${TRAIN_SPLIT:=train}"; : "${TRAIN_SEED:=0}"; : "${TRAIN_INSTANCES:=8101}"   # whole set; one epoch = floor(TRAIN_INSTANCES / TRAIN_BATCH) steps
 : "${VAL_TASKS:=20}"
-: "${TRAIN_BATCH:=32}"; : "${ROLLOUT_N:=8}"; : "${MINI_BATCH:=16}"; : "${SYNC_STEP:=2}"; : "${TOTAL_STEPS:=2}"
+: "${TRAIN_BATCH:=32}"; : "${ROLLOUT_N:=8}"; : "${MINI_BATCH:=16}"; : "${SYNC_STEP:=2}"
+# TOTAL_STEPS: default one epoch (253 = floor(8101 / 32)): enough for performance numbers, not for convergence. 2 = smoke
+# (plumbing). Full ~ 3 epochs (DeepSWE: 200 steps x 64 prompts over 4,500 R2E-Gym tasks); needs trainer.total_epochs=3 below.
+: "${TOTAL_STEPS:=253}"
 # One session per trajectory, so a whole step (TRAIN_BATCH x ROLLOUT_N) starts at once instead of queueing on the cap.
 # If the sandbox system cannot hold that many environments, set SESSIONS to its maximum capacity instead.
 : "${SESSIONS:=$((TRAIN_BATCH * ROLLOUT_N))}"; : "${GATEWAYS:=4}"; : "${AGENT_WORKERS:=4}"; : "${AGENT_MAX_STEPS:=150}"

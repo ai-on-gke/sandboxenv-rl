@@ -27,6 +27,13 @@ Demonstrates:
    fresh sandbox and, if still failing, the rollout is *masked* (excluded from
    the advantage), never scored as reward 0.
 4. Group-relative (GRPO) advantage computation over the scored rollouts.
+5. Observability (``docs/observability.md``): the evaluator's fleet records a
+   ``RunReport`` (phases, claims, tasks) and Prometheus series; with
+   ``ENABLE_TRACING=1`` and ``OTEL_EXPORTER_OTLP_ENDPOINT`` set, every iteration
+   is one trace: ``verl.iteration`` (driver) -> ``ate_env_fleet.acquire`` /
+   ``ate_env_fleet.process`` (evaluator) -> ``ate_env_client.*`` -> ate-env-api ->
+   Substrate. The driver writes the report to ``REPORT_DIR`` as ``.txt`` and
+   ``.json``, with the evaluator's metrics as ``.prom``.
 
 The policy side is simulated: the sampler returns fixed candidates (the gold
 patch, a plausible-but-wrong patch, and a malformed patch) instead of running
@@ -38,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import itertools
 import json
 import os
@@ -45,6 +53,7 @@ import re
 import sys
 import time
 import uuid
+from collections.abc import Iterator
 from typing import Any
 
 import ray
@@ -55,10 +64,12 @@ PYTHON_SRC = os.path.abspath(os.path.join(SCRIPT_DIR, "../../clients/python/src"
 if os.path.isdir(PYTHON_SRC) and PYTHON_SRC not in sys.path:
     sys.path.insert(0, PYTHON_SRC)
 
-from ate_env import AsyncSandboxFleet, FleetConfig, SandboxHandle  # noqa: E402
+from ate_env import AsyncSandboxFleet, FleetConfig, ObservabilityConfig, SandboxHandle  # noqa: E402
 from ate_env.adapters import SweBenchAdapter  # noqa: E402
 from ate_env.errors import InfrastructureError  # noqa: E402
+from ate_env.observability import repo_family  # noqa: E402
 from ate_env.runtime.mock import MockRuntimeHook  # noqa: E402
+from ate_env.telemetry.metrics import status_of  # noqa: E402
 from ate_env.types import ExecResult, Task  # noqa: E402
 
 DEFAULT_INSTANCE_FILE = os.path.join(SCRIPT_DIR, "pytest-dev__pytest-5221.json")
@@ -72,6 +83,123 @@ MALFORMED_PATCH = "this is not a unified diff\n"
 
 # Attempts per candidate before an InfrastructureError masks the rollout.
 MAX_INFRA_ATTEMPTS = 2
+
+# Markers around the machine-readable run outputs in the driver log, so a
+# RayJob's logs can be turned into report inputs (see README, "Observability").
+REPORT_MARKER = "=== ATE_ENV_RUN_REPORT_JSON ==="
+METRICS_BEGIN = "=== ATE_ENV_METRICS_BEGIN ==="
+METRICS_END = "=== ATE_ENV_METRICS_END ==="
+
+
+# ==============================================================================
+# Observability helpers (no-ops unless ENABLE_TRACING=1 and the tracing extra)
+# ==============================================================================
+def tracing_enabled() -> bool:
+    return os.environ.get("ENABLE_TRACING", "").lower() in ("1", "true", "yes")
+
+
+def _otel() -> Any:
+    """The OpenTelemetry API modules, or None (tracing off or extra missing)."""
+    if not tracing_enabled():
+        return None
+    try:
+        from opentelemetry import context, trace
+        from opentelemetry.trace.propagation.tracecontext import (
+            TraceContextTextMapPropagator,
+        )
+    except ImportError:
+        return None
+    return context, trace, TraceContextTextMapPropagator()
+
+
+def setup_tracing(service_name: str) -> None:
+    """Install this process's OpenTelemetry SDK provider (OTLP/gRPC exporter).
+
+    The ate_env client never installs the global provider: it sends its spans
+    to the application's provider once one is installed. The pipeline is the
+    application here, so each process (the driver and the evaluator actor)
+    installs one. The driver's spans are then real, their context reaches the
+    actors, and the fleet and client spans join the same trace. The exporter
+    reads OTEL_EXPORTER_OTLP_ENDPOINT and the other standard variables.
+
+    Nothing is installed when neither OTEL_EXPORTER_OTLP_ENDPOINT nor
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is set (the RayJob renders an unset
+    variable as an empty string, which the exporter would dial as ``dns:///``),
+    or when the OTLP exporter or the SDK is not installed.
+    """
+    otel = _otel()
+    if otel is None:
+        return
+    if not (os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+            or os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")):
+        print("[tracing] ENABLE_TRACING is set but no OTLP endpoint; not exporting spans")
+        return
+    trace = otel[1]
+    try:
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+            OTLPSpanExporter,
+        )
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    except ImportError as err:
+        print(f"[tracing] OpenTelemetry SDK or OTLP exporter missing ({err}); not exporting spans")
+        return
+
+    if isinstance(trace.get_tracer_provider(), TracerProvider):
+        return  # already installed in this process
+    provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    trace.set_tracer_provider(provider)
+
+
+@contextlib.contextmanager
+def driver_span(name: str, **attrs: Any) -> Iterator[dict[str, str]]:
+    """Open a driver-side span; yields the W3C carrier to hand to Ray actors."""
+    otel = _otel()
+    if otel is None:
+        yield {}
+        return
+    _, trace, prop = otel
+    with trace.get_tracer("verl_swebench").start_as_current_span(name, attributes=attrs):
+        carrier: dict[str, str] = {}
+        prop.inject(carrier)
+        yield carrier
+
+
+@contextlib.contextmanager
+def remote_parent(carrier: dict[str, str] | None) -> Iterator[None]:
+    """Continue the driver's trace inside a Ray actor method."""
+    otel = _otel()
+    if otel is None or not carrier:
+        yield
+        return
+    context, _, prop = otel
+    token = context.attach(prop.extract(carrier))
+    try:
+        yield
+    finally:
+        context.detach(token)
+
+
+def flush_spans() -> None:
+    """Flush buffered spans; Ray may not run atexit hooks in actors."""
+    otel = _otel()
+    if otel is None:
+        return
+    provider = otel[1].get_tracer_provider()
+    flush = getattr(provider, "force_flush", None)
+    if flush is not None:
+        flush(10_000)
+
+
+def metrics_text() -> str:
+    """This process's Prometheus exposition (empty without the metrics extra)."""
+    try:
+        import prometheus_client
+    except ImportError:
+        return ""
+    return prometheus_client.generate_latest().decode()
 
 
 class DataProto:
@@ -289,15 +417,40 @@ class AsyncEvaluationPoolActor:
     """Owns an ``AsyncSandboxFleet``; leases sandboxes and grades candidates."""
 
     def __init__(self, fleet_cfg_dict: dict[str, Any], task_type: str):
-        self.fleet = AsyncSandboxFleet(FleetConfig.from_dict(fleet_cfg_dict))
+        cfg = FleetConfig.from_dict(fleet_cfg_dict)
+        setup_tracing(cfg.observability.trace_service_name)
+        self.fleet = AsyncSandboxFleet(cfg)
         self.task_type = task_type
         self._leases: dict[str, list[SandboxHandle]] = {}
+        self._run_done: asyncio.Event | None = None
+        self._run_task: asyncio.Task | None = None
+        self._report: Any = None
 
-    async def setup(self, task_dict: dict[str, Any]) -> None:
+    async def _run_scope(self, started: asyncio.Event) -> None:
+        # The whole job is one fleet run: the RunReport collects every phase,
+        # claim and task until teardown. The run lives in its own task so its
+        # span never becomes the parent of the per-iteration traces.
+        assert self._run_done is not None
+        with self.fleet.observer.run("verl-grpo", backend=self.fleet._backend_label) as report:
+            self._report = report
+            started.set()
+            await self._run_done.wait()
+
+    async def setup(self, task_dict: dict[str, Any], carrier: dict[str, str] | None = None) -> None:
         """Size and pre-warm the pool for the task's template."""
-        await self.fleet.setup([to_task(task_dict)])
+        self._run_done = asyncio.Event()
+        started = asyncio.Event()
+        self._run_task = asyncio.create_task(self._run_scope(started))
+        await started.wait()
+        with remote_parent(carrier):
+            await self.fleet.setup([to_task(task_dict)])
+        self._report.environment = self.fleet._fleet.describe_environment(
+            concurrency=self.fleet.config.batch_size
+        )
 
-    async def acquire(self, task_dict: dict[str, Any], count: int) -> dict[str, Any]:
+    async def acquire(
+        self, task_dict: dict[str, Any], count: int, carrier: dict[str, str] | None = None
+    ) -> dict[str, Any]:
         """Claim ``count`` sandboxes now and hold them under a lease id.
 
         ``acquire_s`` is the claim (the create or warm-pool RPCs) only: an
@@ -305,7 +458,8 @@ class AsyncEvaluationPoolActor:
         lands in the first evaluation command, not here.
         """
         t0 = time.monotonic()
-        handles = await self.fleet.acquire_batch([to_task(task_dict)] * count)
+        with remote_parent(carrier):
+            handles = await self.fleet.acquire_batch([to_task(task_dict)] * count)
         lease_id = uuid.uuid4().hex
         self._leases[lease_id] = handles
         return {"lease_id": lease_id, "acquire_s": time.monotonic() - t0}
@@ -313,29 +467,54 @@ class AsyncEvaluationPoolActor:
     async def _evaluate_one(
         self, idx: int, handle: SandboxHandle | None, task_dict: dict[str, Any], candidate: str
     ) -> dict[str, Any]:
+        """Grade one candidate, retrying infrastructure errors on a fresh sandbox.
+
+        The candidate is one task in the RunReport and the Prometheus series,
+        however many attempts it takes: ``ok`` when scored, ``error`` when
+        masked or failed, ``cancelled`` when cancelled. Its duration covers
+        every attempt, including the retries' acquires and all releases.
+        """
         t0 = time.monotonic()
+        obs = self.fleet.observer
+        backend = self.fleet._backend_label
+        task = to_task(task_dict)
+        family = repo_family(task)
+        status = "error"
         last_err: InfrastructureError | None = None
         attempt = 0
-        for attempt in range(1, MAX_INFRA_ATTEMPTS + 1):
-            try:
-                if handle is None:  # retry on a fresh sandbox
-                    handle = await self.fleet.acquire(to_task(task_dict))
-                async with handle:
-                    outcome = await score_candidate(handle, task_dict, candidate, self.task_type)
-                return {
-                    "candidate_id": idx,
-                    "sandbox_id": handle.sandbox_id,
-                    "status": "scored",
-                    "attempts": attempt,
-                    "eval_s": round(time.monotonic() - t0, 3),
-                    **outcome,
-                }
-            except InfrastructureError as err:
-                last_err = err
-                print(f"[Evaluator] candidate {idx} attempt {attempt}: infra error: {err!r}")
-                handle = None
-                if not err.retryable:
-                    break
+        try:
+            for attempt in range(1, MAX_INFRA_ATTEMPTS + 1):
+                try:
+                    if handle is None:  # retry on a fresh sandbox
+                        handle = await self.fleet.acquire(task)
+                    try:
+                        with obs.phase("process", backend=backend, family=family):
+                            outcome = await score_candidate(
+                                handle, task_dict, candidate, self.task_type
+                            )
+                    finally:
+                        # Through the fleet, so the release is a recorded phase.
+                        await self.fleet.release(handle)
+                    status = "ok"
+                    return {
+                        "candidate_id": idx,
+                        "sandbox_id": handle.sandbox_id,
+                        "status": "scored",
+                        "attempts": attempt,
+                        "eval_s": round(time.monotonic() - t0, 3),
+                        **outcome,
+                    }
+                except InfrastructureError as err:
+                    last_err = err
+                    print(f"[Evaluator] candidate {idx} attempt {attempt}: infra error: {err!r}")
+                    handle = None
+                    if not err.retryable:
+                        break
+        except BaseException as err:
+            status = status_of(err)
+            raise
+        finally:
+            obs.task_done(backend, family, status, time.monotonic() - t0)
         return {
             "candidate_id": idx,
             "sandbox_id": None,
@@ -350,12 +529,22 @@ class AsyncEvaluationPoolActor:
         }
 
     async def evaluate(
-        self, lease_id: str, task_dict: dict[str, Any], candidates: list[str]
+        self,
+        lease_id: str,
+        task_dict: dict[str, Any],
+        candidates: list[str],
+        carrier: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """Grade candidates concurrently, one leased sandbox each."""
+        with remote_parent(carrier):
+            return await self._evaluate(lease_id, task_dict, candidates)
+
+    async def _evaluate(
+        self, lease_id: str, task_dict: dict[str, Any], candidates: list[str]
+    ) -> list[dict[str, Any]]:
         handles = self._leases.pop(lease_id)
         if len(handles) != len(candidates):
-            await asyncio.gather(*(h.release_async() for h in handles), return_exceptions=True)
+            await asyncio.gather(*(self.fleet.release(h) for h in handles), return_exceptions=True)
             raise ValueError(f"lease has {len(handles)} sandboxes for {len(candidates)} candidates")
         # Each _evaluate_one releases its own sandbox (``async with``). Wait for
         # all of them before surfacing an unexpected error, so none are cut off
@@ -372,14 +561,31 @@ class AsyncEvaluationPoolActor:
                 raise r
         return list(results)  # type: ignore[arg-type]
 
-    async def teardown(self) -> None:
-        for handles in self._leases.values():
-            await asyncio.gather(*(h.release_async() for h in handles), return_exceptions=True)
-        self._leases.clear()
+    async def teardown(self, carrier: dict[str, str] | None = None) -> dict[str, Any]:
+        """Release everything, end the run and return its report and metrics."""
         try:
-            await self.fleet.teardown()
+            with remote_parent(carrier):
+                for handles in self._leases.values():
+                    await asyncio.gather(
+                        *(self.fleet.release(h) for h in handles), return_exceptions=True
+                    )
+                self._leases.clear()
+                await self.fleet.teardown()
         finally:
+            if self._run_done is not None and self._run_task is not None:
+                self._run_done.set()
+                await self._run_task
             self.fleet.close()
+            flush_spans()
+        # The driver prints these and writes them to REPORT_DIR
+        # (emit_run_outputs); writing here too would put a second copy of the
+        # report in a REPORT_DIR the driver shares, doubling every total.
+        report = self._report
+        out: dict[str, Any] = {"metrics": metrics_text(), "report": None, "summary": ""}
+        if report is not None:
+            out["report"] = report.to_dict()
+            out["summary"] = report.summary()
+        return out
 
 
 # ==============================================================================
@@ -390,8 +596,10 @@ def build_fleet_config(args: argparse.Namespace, task_dict: dict[str, Any]) -> F
     if task_dict.get("template"):
         image_templates[task_dict["image"]] = task_dict["template"]
     return FleetConfig(
+        observability=ObservabilityConfig(enable_tracing=tracing_enabled()),
         backend=args.backend,
-        endpoint=os.environ.get("SUBSTRATE_API_ENDPOINT", "ate-env-api.ate-env.svc.cluster.local:7777"),
+        # `or`: the RayJob renders an unset SUBSTRATE_API_ENDPOINT as "".
+        endpoint=os.environ.get("SUBSTRATE_API_ENDPOINT") or "ate-env-api.ate-env.svc.cluster.local:7777",
         data_plane=args.data_plane,
         tenancy=os.environ.get("SUBSTRATE_ATESPACE", "ate-env"),
         template=task_dict.get("template"),
@@ -410,6 +618,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
     if not ray.is_initialized():
         ray.init(ignore_reinit_error=True)
+    setup_tracing("verl-trainer")
 
     task_dict = load_task_dict(args.task_type, args.instance_file)
     fleet_cfg = build_fleet_config(args, task_dict)
@@ -425,53 +634,105 @@ async def main_async(args: argparse.Namespace) -> None:
         fleet_cfg.model_dump(), args.task_type
     )
 
+    result: dict[str, Any] | None = None
     try:
         print("\n[Orchestrator] Initializing fleet & sizing warm pool...")
-        await eval_pool.setup.remote(task_dict)
+        with driver_span("verl.setup") as carrier:
+            await eval_pool.setup.remote(task_dict, carrier)
 
         for iteration in range(1, args.num_iters + 1):
             print(f"\n────────────────── Iteration {iteration}/{args.num_iters} ──────────────────")
             t_iter = time.monotonic()
-
-            # 1+2. Decode and claim sandboxes at the same time.
-            sample_ref = sampler.generate_rollouts_async.remote(
-                task_dict, args.group_size, args.sample_latency_s
-            )
-            lease_ref = eval_pool.acquire.remote(task_dict, args.group_size)
-            (candidates, data_proto), lease = await asyncio.gather(sample_ref, lease_ref)
-            t_ready = time.monotonic() - t_iter
-            print(
-                f"[Orchestrator] {len(candidates)} candidates + sandboxes ready in {t_ready:.2f}s "
-                f"(sandbox claim took {lease['acquire_s']:.2f}s, overlapped with decoding; "
-                "readiness happens on the first command)"
-            )
-
-            # 3. Grade all candidates concurrently.
-            eval_results = await eval_pool.evaluate.remote(lease["lease_id"], task_dict, candidates)
-            for r in eval_results:
-                if r["status"] == "masked":
-                    icon = "⚠️ MASKED"
-                elif r["tests_passed"]:
-                    icon = "✅ PASS"
-                elif not r["applied"]:
-                    icon = "❌ NO-APPLY"
-                else:
-                    icon = "❌ FAIL"
-                print(
-                    f"  Cand #{r['candidate_id']} | {icon} | Eval: {r['eval_s']}s | "
-                    f"Attempts: {r['attempts']} | Sandbox: {r['sandbox_id']}"
+            with driver_span("verl.iteration", iteration=iteration,
+                             group_size=args.group_size) as carrier:
+                eval_results, data_proto = await run_iteration(
+                    sampler, eval_pool, task_dict, args, carrier, t_iter
                 )
-
-            # 4. GRPO advantage / policy update.
-            train_res = await trainer.compute_grpo_update.remote(data_proto, eval_results)
+                with driver_span("verl.train_step"):
+                    train_res = await trainer.compute_grpo_update.remote(data_proto, eval_results)
             print(
                 f"[Iter {iteration} Summary] Total: {time.monotonic() - t_iter:.2f}s | "
                 f"Mean Reward: {train_res['mean_reward']:.2f} | Masked: {train_res['num_masked']}"
             )
     finally:
         print("\n[Orchestrator] Tearing down fleet...")
-        await eval_pool.teardown.remote()
+        with driver_span("verl.teardown") as carrier:
+            result = await eval_pool.teardown.remote(carrier)
+        flush_spans()
+    if result is not None:
+        emit_run_outputs(result)
     print("✨ Async pipeline finished.")
+
+
+async def run_iteration(
+    sampler: Any,
+    eval_pool: Any,
+    task_dict: dict[str, Any],
+    args: argparse.Namespace,
+    carrier: dict[str, str],
+    t_iter: float,
+) -> tuple[list[dict[str, Any]], Any]:
+    # 1+2. Decode and claim sandboxes at the same time.
+    sample_ref = sampler.generate_rollouts_async.remote(
+        task_dict, args.group_size, args.sample_latency_s
+    )
+    lease_ref = eval_pool.acquire.remote(task_dict, args.group_size, carrier)
+    (candidates, data_proto), lease = await asyncio.gather(sample_ref, lease_ref)
+    t_ready = time.monotonic() - t_iter
+    print(
+        f"[Orchestrator] {len(candidates)} candidates + sandboxes ready in {t_ready:.2f}s "
+        f"(sandbox claim took {lease['acquire_s']:.2f}s, overlapped with decoding; "
+        "readiness happens on the first command)"
+    )
+
+    # 3. Grade all candidates concurrently.
+    eval_results = await eval_pool.evaluate.remote(
+        lease["lease_id"], task_dict, candidates, carrier
+    )
+    for r in eval_results:
+        if r["status"] == "masked":
+            icon = "⚠️ MASKED"
+        elif r["tests_passed"]:
+            icon = "✅ PASS"
+        elif not r["applied"]:
+            icon = "❌ NO-APPLY"
+        else:
+            icon = "❌ FAIL"
+        print(
+            f"  Cand #{r['candidate_id']} | {icon} | Eval: {r['eval_s']}s | "
+            f"Attempts: {r['attempts']} | Sandbox: {r['sandbox_id']}"
+        )
+    return eval_results, data_proto
+
+
+def emit_run_outputs(result: dict[str, Any]) -> None:
+    """Print the run report and the evaluator's metrics; write them to REPORT_DIR.
+
+    REPORT_DIR gets the summary (``.txt``), the RunReport (``.json``, the input
+    of ``build_report.py --report``) and the evaluator's metrics (``.prom``).
+    Only the driver writes them, so one run is one report there.
+    """
+    if result.get("summary"):
+        print("\n" + result["summary"])
+    if result.get("report") is not None:
+        print(REPORT_MARKER + " " + json.dumps(result["report"], separators=(",", ":")))
+    if result.get("metrics"):
+        print(METRICS_BEGIN)
+        print(result["metrics"].rstrip())
+        print(METRICS_END)
+    report_dir = os.environ.get("REPORT_DIR")
+    if report_dir and result.get("report") is not None:
+        os.makedirs(report_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        base = os.path.join(report_dir, f"verl-grpo_driver_{stamp}")
+        if result.get("summary"):
+            with open(base + ".txt", "w", encoding="utf-8") as fh:
+                fh.write(result["summary"] + "\n")
+        with open(base + ".json", "w", encoding="utf-8") as fh:
+            json.dump(result["report"], fh, indent=1)
+        if result.get("metrics"):
+            with open(base + ".prom", "w", encoding="utf-8") as fh:
+                fh.write(result["metrics"])
 
 
 def main() -> None:

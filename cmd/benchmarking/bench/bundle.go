@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,16 +35,21 @@ import (
 	"github.com/agent-substrate/env/internal/benchmarking/swebench"
 )
 
-// gcsFolderNameRe enforces the 4-part benchmark archive folder naming convention:
-// <YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>
-var gcsFolderNameRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}_[a-zA-Z0-9._-]+_[a-zA-Z0-9._-]+_[a-zA-Z0-9._-]+$`)
+// TracedFolderSuffix marks archive folders of runs that captured an SDK trace.
+const TracedFolderSuffix = "_traced"
 
-// ValidateGCSFolderName checks that folder matches <YYYY-MM-DD>_<model>_<dataset>_<nickname>.
-func ValidateGCSFolderName(folder string) error {
+// <YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>[_traced]; segments
+// exclude "_" so the suffix is unambiguous.
+var gcsFolderNameRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}_[a-zA-Z0-9.-]+_[a-zA-Z0-9.-]+_[a-zA-Z0-9.-]+(_traced)?$`)
+
+// ValidateGCSFolderName checks folder's form and that its _traced suffix
+// agrees with whether the bundle captured a trace: traced latencies include
+// trace overhead and must never be compared with untraced ones unknowingly.
+func ValidateGCSFolderName(folder string, traced bool) error {
 	folder = strings.Trim(strings.TrimSpace(folder), "/")
 	if !gcsFolderNameRe.MatchString(folder) {
 		return fmt.Errorf(
-			"invalid benchmark folder name %q: must match 4-part convention <YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname> (e.g. 2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed)",
+			"invalid benchmark folder name %q: must match <YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>[_traced] (e.g. 2026-10-27_synthetic-w4_math-bb4dcec_suspend-sync, 2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed_traced)",
 			folder,
 		)
 	}
@@ -51,7 +57,27 @@ func ValidateGCSFolderName(folder string) error {
 	if _, err := time.Parse("2006-01-02", datePrefix); err != nil {
 		return fmt.Errorf("invalid date prefix %q in folder name %q: %w", datePrefix, folder, err)
 	}
+	switch hasSuffix := strings.HasSuffix(folder, TracedFolderSuffix); {
+	case traced && !hasSuffix:
+		return fmt.Errorf("folder name %q must end in %s: the bundle captured an SDK trace", folder, TracedFolderSuffix)
+	case !traced && hasSuffix:
+		return fmt.Errorf("folder name %q ends in %s but the bundle has no trace", folder, TracedFolderSuffix)
+	}
 	return nil
+}
+
+// bundleTraceEvidence reports whether destDir's bundle captured a trace: trace
+// files on disk, report.json trace_captured, or run_window.json metadata.
+func bundleTraceEvidence(destDir string) (captured bool, traceFiles []string) {
+	traceFiles = swebench.FindTraceFiles(destDir)
+	captured = len(traceFiles) > 0
+	if rep, err := swebench.LoadOrSummarizeReport(filepath.Join(destDir, "report.json")); err == nil && rep.TraceCaptured {
+		captured = true
+	}
+	if rw, err := swebench.ReadRunWindow(filepath.Join(destDir, "run_window.json")); err == nil && rw.Metadata[swebench.TraceCapturedMetadataKey] == "true" {
+		captured = true
+	}
+	return captured, traceFiles
 }
 
 // NormalizeGCSBucket strips optional gs:// prefix and trailing slashes from a bucket argument.
@@ -70,9 +96,15 @@ func NormalizeGCSBucket(raw string) (string, error) {
 
 // BundleValidationResult summarizes full artifact directory validation (`bench validate -dest`).
 type BundleValidationResult struct {
-	Valid          bool                   `json:"valid"`
-	Mode           string                 `json:"mode,omitempty"`
-	Footing        string                 `json:"footing,omitempty"`
+	Valid   bool   `json:"valid"`
+	Mode    string `json:"mode,omitempty"`
+	Footing string `json:"footing,omitempty"`
+	// TraceCaptured reports whether an SDK trace was captured during the run
+	// (trace files in the bundle, or declared by the report / run_window
+	// metadata). Tracing adds per-call latency, so it is always surfaced.
+	TraceCaptured bool `json:"trace_captured"`
+	// TraceFiles lists the trace JSONL files found in the bundle, relative to it.
+	TraceFiles     []string               `json:"trace_files,omitempty"`
 	CheckedFiles   []string               `json:"checked_files,omitempty"`
 	Reasons        []string               `json:"reasons,omitempty"`
 	ReportValidity *schema.ReportValidity `json:"report_validity,omitempty"`
@@ -95,8 +127,17 @@ func ValidateArtifactBundle(destDir string, opts swebench.ValidateOptions, folde
 		return nil, fmt.Errorf("artifact directory %q does not exist or is not a directory", destDir)
 	}
 
+	traceCaptured, traceFiles := bundleTraceEvidence(destDir)
+	res.TraceCaptured = traceCaptured
+	for _, tf := range traceFiles {
+		rel, _ := filepath.Rel(destDir, tf)
+		res.TraceFiles = append(res.TraceFiles, rel)
+	}
+	opts.TraceCaptured = opts.TraceCaptured || traceCaptured
+	opts.TraceFileCount = len(traceFiles)
+
 	if strings.TrimSpace(folderName) != "" {
-		if err := ValidateGCSFolderName(folderName); err != nil {
+		if err := ValidateGCSFolderName(folderName, traceCaptured); err != nil {
 			addFailure("%s", err.Error())
 		}
 	}
@@ -145,12 +186,15 @@ func ValidateArtifactBundle(destDir string, opts swebench.ValidateOptions, folde
 
 	// 3. Always Required: run_window.json
 	rwPath := filepath.Join(destDir, "run_window.json")
+	var runWindow *schema.RunWindow
 	if rawRW, err := os.ReadFile(rwPath); err != nil {
 		addFailure("missing required file run_window.json")
 	} else {
 		markChecked("run_window.json")
-		if _, derr := schema.DecodeJSONStrict[schema.RunWindow](bytes.NewReader(rawRW)); derr != nil {
+		if rw, derr := schema.DecodeJSONStrict[schema.RunWindow](bytes.NewReader(rawRW)); derr != nil {
 			addFailure("invalid run_window.json: %v", derr)
+		} else {
+			runWindow = &rw
 		}
 	}
 
@@ -233,6 +277,14 @@ func ValidateArtifactBundle(destDir string, opts swebench.ValidateOptions, folde
 		}
 	}
 
+	// Rule 6: a missing trace_captured key is tolerated (older bundles); an
+	// explicit "false" contradicting the trace evidence is not.
+	if runWindow != nil && traceCaptured {
+		if declared, ok := runWindow.Metadata[swebench.TraceCapturedMetadataKey]; ok && declared != "true" {
+			addFailure("run_window.json says %s=%q but the bundle holds %d trace file(s); re-run bench report -dest", swebench.TraceCapturedMetadataKey, declared, len(traceFiles))
+		}
+	}
+
 	// Detect run type: real cluster RL run vs synthetic scenario run.
 	isClusterRLRun := fileExistsNonEmpty(filepath.Join(destDir, "verl-head.log")) ||
 		fileExistsNonEmpty(filepath.Join(destDir, "train.log")) ||
@@ -257,11 +309,6 @@ func ValidateArtifactBundle(destDir string, opts swebench.ValidateOptions, folde
 
 	// 8. Mode-Specific Required: Real Cluster RL Run
 	if isClusterRLRun {
-		traceFiles, _ := filepath.Glob(filepath.Join(destDir, "traces", "*.jsonl"))
-		if topTrace := filepath.Join(destDir, "trace.jsonl"); fileExistsNonEmpty(topTrace) {
-			traceFiles = append(traceFiles, topTrace)
-		}
-		sort.Strings(traceFiles)
 		if len(traceFiles) == 0 {
 			addFailure("cluster RL bundle requires traces/*.jsonl")
 		} else {
@@ -375,10 +422,20 @@ func fileExistsNonEmpty(p string) bool {
 	return err == nil && !st.IsDir() && st.Size() > 0
 }
 
-func ensureRunWindowFile(destDir, runID, cluster string, startTime, endTime time.Time) error {
+// ensureRunWindowFile creates run_window.json if absent and merges metadata
+// into it either way, so facts learned at report time land in the run metadata.
+func ensureRunWindowFile(destDir, runID, cluster string, startTime, endTime time.Time, metadata map[string]string) error {
 	rwPath := filepath.Join(destDir, "run_window.json")
 	if fileExistsNonEmpty(rwPath) {
-		return nil
+		existing, err := swebench.ReadRunWindow(rwPath)
+		if err != nil {
+			return err
+		}
+		if existing.Metadata == nil {
+			existing.Metadata = map[string]string{}
+		}
+		maps.Copy(existing.Metadata, metadata)
+		return swebench.WriteRunWindow(rwPath, *existing)
 	}
 	if strings.TrimSpace(runID) == "" {
 		runID = "bench-run"
@@ -396,6 +453,7 @@ func ensureRunWindowFile(destDir, runID, cluster string, startTime, endTime time
 		StartTS:       startTime.UTC().Format(time.RFC3339),
 		EndTS:         endTime.UTC().Format(time.RFC3339),
 		Cluster:       cluster,
+		Metadata:      maps.Clone(metadata),
 	}
 	b, err := json.MarshalIndent(rw, "", "  ")
 	if err != nil {
@@ -424,7 +482,7 @@ func uploadCmd(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	destDir := fs.String("dest", "", "Local benchmark artifact directory ($ARTIFACT_DIR) to upload. Required.")
 	bucketFlag := fs.String("bucket", "", "Target GCS bucket name or gs://<bucket> URI. Required (never hardcoded).")
-	folderFlag := fs.String("folder", "", "Target 4-part folder name in bucket (<YYYY-MM-DD>_<model>_<dataset>_<nickname>); defaults to basename of -dest.")
+	folderFlag := fs.String("folder", "", "Target folder name in bucket (<YYYY-MM-DD>_<model>_<dataset>_<nickname>[_traced]; _traced iff the bundle captured a trace); defaults to basename of -dest.")
 	footing := fs.String("footing", "", "Optional footing override (warm or cold) for pre-upload validation.")
 	skipValidate := fs.Bool("skip-validate", false, "Skip bundle validation prior to upload.")
 	dryRun := fs.Bool("dry-run", false, "Validate bundle and target GCS URI without executing gcloud storage cp.")
@@ -443,7 +501,8 @@ func uploadCmd(args []string, stdout, stderr io.Writer) error {
 	if folder == "" {
 		folder = filepath.Base(filepath.Clean(*destDir))
 	}
-	if err := ValidateGCSFolderName(folder); err != nil {
+	traced, _ := bundleTraceEvidence(*destDir)
+	if err := ValidateGCSFolderName(folder, traced); err != nil {
 		return err
 	}
 

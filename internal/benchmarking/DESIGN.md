@@ -452,7 +452,12 @@ A run counts only if all hold. The report marks invalid runs and says why.
 3. Task count meets the configured minimum.
 4. Failed creates stay under the configured fraction.
 5. Every job ran its full schedule.
-6. No job in the scenario ran in trace mode.
+6. Trace capture is recorded, not rejected: `report.json` `trace_captured`,
+   `run_window.json` `metadata.trace_captured`, the `stats.jsonl` label, and a
+   `_traced` suffix on the archive folder name all say whether an SDK trace was
+   captured, because trace instrumentation adds per-call latency and traced
+   runs must not be compared with untraced ones unknowingly. Run metadata or a
+   folder name that contradicts the bundle's trace evidence fails validation.
 7. Reap reaches zero remaining sandboxes, pools, templates, claims, and any
    Feature Overlay `reap_resources` within the reap timeout (zero orphans).
 

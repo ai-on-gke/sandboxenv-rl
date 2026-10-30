@@ -1,0 +1,2 @@
+{"schema_version":"v1","node":"node-1","env":"env-1","snapshot":"snap-golden-1","kind":"golden","ts":"2026-10-22T01:23:24Z","total_ms":120.5,"manifest_fetch_ms":10.0,"download_ms":0.0,"oci_unpack_ms":30.5,"worker_restore_ms":70.0,"persist_ms":10.0,"cache_hit":true}
+{"schema_version":"v1","node":"node-1","env":"env-2","snapshot":"snap-latest-2","kind":"latest","ts":"2026-10-22T01:24:39Z","total_ms":95.2,"manifest_fetch_ms":5.0,"download_ms":15.2,"oci_unpack_ms":20.0,"worker_restore_ms":45.0,"persist_ms":10.0,"cache_hit":false}

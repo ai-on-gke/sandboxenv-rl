@@ -1,0 +1,119 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Checks the development environment, on changes to anything that defines it,
+# weekly to catch breakage from outside the repository (nixpkgs, the base
+# image, runner images), and on demand:
+#
+# - check-pins: the Nix toolchain still satisfies go.mod (go/toolchain), every
+#   pyproject.toml (requires-python and each dependency) and the Dockerfile.ci
+#   base image digest; then DeterminateSystems' flake-checker reports stale,
+#   non-upstream or unsupported nixpkgs inputs (report only). To fix drift,
+#   run `make update-pins`, verify with `make check-pins`, and commit.
+# - devshell: each way of getting the toolchain (the Nix devShell on Linux and
+#   Apple Silicon macOS, the Docker image on Linux) builds and runs the basic
+#   tools through hack/ci-compat.sh, as `make dev-shell` would. The test suites
+#   run in ci.yaml.
+#
+# Actions are pinned by commit SHA (version in the trailing comment), as the
+# organization's workflow security scan requires.
+name: ci-devenv
+
+on:
+  pull_request:
+    paths: &devenv-paths
+      - flake.nix
+      - flake.lock
+      - "nix/**"
+      - "hack/ci/**"
+      - hack/ci-compat.sh
+      - go.mod
+      - go.sum
+      - "**/pyproject.toml"
+      - Dockerfile.ci
+      - .dockerignore
+      - .github/workflows/ci-devenv.yaml
+  push:
+    branches: [main]
+    paths: *devenv-paths
+  schedule:
+    # Run weekly on Monday at 06:00 UTC
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check-pins:
+    name: Check Nix toolchain and dependency pins
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify dependency and toolchain pins
+        shell: nix develop -c bash -eo pipefail {0}
+        run: check-pins
+
+  # GitHub's macOS runners have no Docker, so there is no macOS Docker entry.
+  devshell:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-nix-devshell
+            os: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+            runner: nix
+          - name: macos-nix-devshell
+            os: macos-15 # Apple Silicon; pinned on purpose
+            runner: nix
+          - name: linux-docker-devshell
+            os: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+            runner: docker
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        if: matrix.runner == 'nix'
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run basic tools in the devShell
+        env:
+          CI_RUNNER: ${{ matrix.runner }}
+        shell: bash hack/ci-compat.sh --script {0}
+        run: |
+          go version
+          python3 --version
+          python3 -c "import grpc, google.protobuf, pytest"
+          ruff --version
+          kubectl version --client
+          kind version
+          ko version
+          protoc-gen-go --version
+          make --version | head -n 1

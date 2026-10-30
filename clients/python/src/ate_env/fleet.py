@@ -33,6 +33,13 @@ from .observability import Observer, RunReport, repo_family
 from .runtime.base import RuntimeGuestHook
 from .sizing import plan_replicas
 from .strategies import STRATEGIES
+from .telemetry.trace_recorder import (
+    is_trace_mode,
+    record_trace_event,
+    register_env_meta,
+    should_auto_enable_tracing,
+    task_context,
+)
 from .types import (
     DataPlaneEndpoint,
     FleetPlan,
@@ -91,7 +98,11 @@ class SandboxFleet:
         # turns on tracing for the whole fleet under one service name, so
         # ate_env_fleet.* spans parent ate_env_client.* spans in one trace.
         obs_cfg = self.config.observability
-        tracing_on = self.config.tracing.enable_tracing or obs_cfg.enable_tracing
+        tracing_on = (
+            self.config.tracing.enable_tracing
+            or obs_cfg.enable_tracing
+            or should_auto_enable_tracing(self.config.tracing)
+        )
         service = (obs_cfg.trace_service_name if obs_cfg.enable_tracing
                    else self.config.tracing.trace_service_name)
         if (obs_cfg.enable_tracing and self.config.tracing.enable_tracing
@@ -497,9 +508,28 @@ class SandboxFleet:
             template_id, rootfs_image = self._ensure_template_for_image(task_obj.image)
 
         to_s = timeout_s or self.config.acquire_timeout_s
-        raw_inst = self.backend.acquire(
-            template_id, self.run_id, timeout_s=to_s, rootfs_image=rootfs_image
+        with task_context(
+            run_id=self.run_id, instance=task_obj.id, image=task_obj.image
+        ):
+            raw_inst = self.backend.acquire(
+                template_id, self.run_id, timeout_s=to_s, rootfs_image=rootfs_image
+            )
+        register_env_meta(
+            raw_inst.instance_id,
+            instance=task_obj.id,
+            image=task_obj.image,
+            run_id=self.run_id,
         )
+        if self.backend_label == "mock" and is_trace_mode():
+            record_trace_event(
+                "create",
+                env=raw_inst.instance_id,
+                dur_ms=0.0,
+                ok=True,
+                run=self.run_id,
+                instance=task_obj.id,
+                image=task_obj.image,
+            )
         self._count_acquire(task_obj.image)
 
         try:
@@ -515,6 +545,7 @@ class SandboxFleet:
                 )
             raise
 
+        claim_source = str(raw_inst.metadata.get("claim_source", "direct"))
         return SandboxHandle(
             sandbox_id=raw_inst.instance_id,
             endpoint=data_plane.address if data_plane else raw_inst.endpoint,
@@ -525,6 +556,7 @@ class SandboxFleet:
             data_plane=data_plane,
             default_timeout_s=self.config.step_timeout_s,
             tracer=self._tracer,
+            claim_source=claim_source,
         )
 
     def _build_runtime(
@@ -554,12 +586,32 @@ class SandboxFleet:
         for h in handle if isinstance(handle, (list, tuple)) else (handle,):
             with self._obs.phase("release", backend=self.backend_label, family=repo_family(h.task)):
                 h.release()
+                if self.backend_label == "mock" and is_trace_mode():
+                    record_trace_event(
+                        "delete",
+                        env=h.sandbox_id,
+                        dur_ms=0.0,
+                        ok=True,
+                        run=self.run_id,
+                        instance=h.task.id if h.task else None,
+                        image=h.task.image if h.task else None,
+                    )
 
     def recycle(self, handle: SandboxHandle | Sequence[SandboxHandle]) -> None:
         """Return sandbox instance(s) to the warm pool (see SandboxHandle.recycle)."""
         for h in handle if isinstance(handle, (list, tuple)) else (handle,):
             with self._obs.phase("recycle", backend=self.backend_label, family=repo_family(h.task)):
                 h.recycle()
+                if self.backend_label == "mock" and is_trace_mode():
+                    record_trace_event(
+                        "suspend",
+                        env=h.sandbox_id,
+                        dur_ms=0.0,
+                        ok=True,
+                        run=self.run_id,
+                        instance=h.task.id if h.task else None,
+                        image=h.task.image if h.task else None,
+                    )
 
     def teardown(self) -> None:
         """Teardown all resources provisioned by this fleet's run_id."""

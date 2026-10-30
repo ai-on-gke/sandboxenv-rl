@@ -136,11 +136,14 @@ from `tests/telemetry/otel-collector.yaml`, then builds the HTML run report
 ```bash
 VERL_WORKER_IMAGE=<registry>/verl-worker:<tag> \
 SWEBENCH_IMAGE=<registry>/sweb.eval.x86_64.pytest-dev_1776_pytest-5221:latest \
-API_SERVICE=<telemetry ate-env-api service> \
 examples/verl_swebench/run-telemetry-e2e.sh
 ```
+
+Set `API_SERVICE` when the telemetry `ate-env-api` is not the standard
+`ate-env-api` Deployment; the other settings are listed in the script's header.
 
 Each iteration is one trace: `verl.iteration` (driver) → `ate_env_fleet.acquire` /
 `ate_env_fleet.process` / `ate_env_fleet.release` (evaluator) → `ate_env_client.*` →
 `ateenv.v1alpha.*` on ate-env-api → `ateapi.Control/*`. The run report (phases,
-claims, tasks) is printed by the driver and written to `REPORT_DIR`.
+claims, tasks) is printed by the driver and written to `REPORT_DIR` (`.txt`,
+`.json`, and the evaluator's metrics as `.prom`).

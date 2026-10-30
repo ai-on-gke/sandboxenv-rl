@@ -308,6 +308,7 @@ func main() {
 		}
 		if callerAuth != nil {
 			ppOpts.Authenticate = callerAuth.Check
+			ppOpts.AuthenticateCapability = callerAuth.CheckCapability
 		}
 		if metrics != nil {
 			// A first contact through the port proxy ends create_to_ready too.

@@ -24,8 +24,10 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
+	"github.com/agent-substrate/env/internal/portproxy"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -136,6 +138,21 @@ func bearerToken(value string) (string, bool) {
 // expected bearer token. The port proxy calls it for forwarded requests.
 func (a *BearerAuth) Check(value string) error {
 	return a.checkHeader(value)
+}
+
+// CheckCapability reports whether capability is a valid port capability for
+// atespace/id:port, signed with the expected bearer token (see
+// portproxy.CapabilityUser). The port proxy calls it for WebSocket upgrades.
+func (a *BearerAuth) CheckCapability(capability, atespace, id string, port int) error {
+	want, err := a.expectedToken()
+	if err != nil {
+		log.Printf("apiservice: verifying port capability: %v", err)
+		return errVerify
+	}
+	if portproxy.VerifyCapability(want, capability, atespace, id, port, time.Now()) != nil {
+		return status.Error(codes.Unauthenticated, "invalid port capability")
+	}
+	return nil
 }
 
 func (a *BearerAuth) authorizeContext(ctx context.Context) error {

@@ -35,6 +35,11 @@ from ..errors import (
 )
 from ..loop_runner import LoopRunner
 from ..telemetry import metrics
+from ..telemetry.trace_recorder import (
+    current_slot_wait_s,
+    current_warm_claim,
+    in_driver_span,
+)
 from ..telemetry.tracing import (
     CLIENT_SPAN_PREFIX,
     mark_error,
@@ -237,7 +242,9 @@ class SubstrateBackendDriver(BackendDriver):
             self.api_endpoint,
         )
         try:
-            await self.client.get(f"preflight-probe-{uuid.uuid4().hex[:6]}", atespace=self.atespace)
+            await self.client.get(
+                f"preflight-probe-{uuid.uuid4().hex[:6]}", atespace=self.atespace
+            )
         except NotFoundError:
             # NotFoundError confirms the gRPC server is reachable and active.
             logger.debug("Preflight probe successfully reached ate-env-api")
@@ -316,25 +323,42 @@ class SubstrateBackendDriver(BackendDriver):
     ) -> RawSandboxInstance:
         """Acquire a live sandbox instance within timeout_s."""
         to_s = timeout_s or self.acquire_timeout_s
-        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.acquire",
-                        {"ate.template.name": template_id, "ate_env.run_id": run_id}) as span:
-            try:
-                with metrics.timed("acquire"):
-                    instance = await asyncio.wait_for(
-                        self._acquire_internal(template_id, run_id, rootfs_image=rootfs_image),
-                        timeout=to_s,
+        slot_wait_s = current_slot_wait_s.get() or 0.0
+        drv_token = in_driver_span.set(True)
+        try:
+            with start_span(
+                self.tracer,
+                f"{CLIENT_SPAN_PREFIX}.acquire",
+                {"ate.template.name": template_id, "ate_env.run_id": run_id},
+            ) as span:
+                try:
+                    with metrics.timed("acquire"):
+                        instance = await asyncio.wait_for(
+                            self._acquire_internal(template_id, run_id, rootfs_image=rootfs_image),
+                            timeout=to_s,
+                        )
+                except asyncio.TimeoutError as e:
+                    self._observe("claim", "error")
+                    metrics.observe_subphase(
+                        "slot_wait", slot_wait_s, status="error", source="direct"
                     )
-            except asyncio.TimeoutError as e:
-                self._observe("claim", "error")
-                raise SandboxStartError(
-                    f"Timed out acquiring sandbox for template {template_id} after {to_s:g}s"
-                ) from e
-            except BaseException as e:
-                self._observe("claim", metrics.status_of(e))
-                raise
-            self._observe("claim", "ok")
-            set_attributes(span, {"ate.actor.name": instance.instance_id})
-            return instance
+                    raise SandboxStartError(
+                        f"Timed out acquiring sandbox for template {template_id} after {to_s:g}s"
+                    ) from e
+                except BaseException as e:
+                    st = metrics.status_of(e)
+                    self._observe("claim", st)
+                    metrics.observe_subphase("slot_wait", slot_wait_s, status=st, source="direct")
+                    raise
+                self._observe("claim", "ok")
+                claim_source = str(instance.metadata.get("claim_source", "direct"))
+                metrics.observe_subphase(
+                    "slot_wait", slot_wait_s, status="ok", source=claim_source
+                )
+                set_attributes(span, {"ate.actor.name": instance.instance_id})
+                return instance
+        finally:
+            in_driver_span.reset(drv_token)
 
     async def _acquire_internal(
         self,
@@ -348,6 +372,7 @@ class SubstrateBackendDriver(BackendDriver):
         guest traffic, so ready_timeout_s does not measure readiness here.
         """
         pool_key = (template_id, rootfs_image)
+        claim_source = "cold_create"
         while True:
             actor_id: str | None = None
             with self._lock:
@@ -356,6 +381,7 @@ class SubstrateBackendDriver(BackendDriver):
                     actor_id = warm_list.pop()
 
             if actor_id:
+                claim_source = "warm_pool"
                 self._observe("warm_remove", 1)
                 claim_start = time.monotonic()
                 logger.info(
@@ -365,13 +391,16 @@ class SubstrateBackendDriver(BackendDriver):
                     rootfs_image,
                 )
                 # Verify warm actor still exists on the server
+                wc_token = current_warm_claim.set(True)
                 try:
                     await asyncio.wait_for(
                         self._client_for(actor_id).get(actor_id, atespace=self.atespace),
                         timeout=min(self.ready_timeout_s, 15.0),
                     )
                 except NotFoundError:
-                    logger.warning("Warm actor %s not found on server, dropping from pool", actor_id)
+                    logger.warning(
+                        "Warm actor %s not found on server, dropping from pool", actor_id
+                    )
                     with self._lock:
                         self._owned_actors.pop(actor_id, None)
                     continue
@@ -381,10 +410,21 @@ class SubstrateBackendDriver(BackendDriver):
                     with self._lock:
                         self._warm_paused_pool.setdefault(pool_key, []).append(actor_id)
                     self._observe("warm_add", 1)
+                    metrics.observe_subphase(
+                        "wire_claim",
+                        time.monotonic() - claim_start,
+                        status="error",
+                        source="warm_pool",
+                    )
                     raise SandboxStartError(f"Error checking warm actor {actor_id}: {e}") from e
-                metrics.observe("warm_claim", time.monotonic() - claim_start)
+                finally:
+                    current_warm_claim.reset(wc_token)
+                wire_dur = time.monotonic() - claim_start
+                metrics.observe("warm_claim", wire_dur)
+                metrics.observe_subphase("wire_claim", wire_dur, status="ok", source="warm_pool")
                 break
             else:
+                claim_source = "cold_create"
                 actor_id = f"sb-{uuid.uuid4().hex[:16]}"
                 logger.info(
                     "Creating environment %s (template=%s, atespace=%s, rootfs_image=%s)...",
@@ -393,6 +433,7 @@ class SubstrateBackendDriver(BackendDriver):
                     self.atespace,
                     rootfs_image,
                 )
+                wire_start = time.monotonic()
                 last_err: Exception | None = None
                 for attempt in range(4):
                     try:
@@ -405,6 +446,12 @@ class SubstrateBackendDriver(BackendDriver):
                         last_err = None
                         break
                     except (NotFoundError, FailedPreconditionError) as e:
+                        metrics.observe_subphase(
+                            "wire_claim",
+                            time.monotonic() - wire_start,
+                            status="error",
+                            source="cold_create",
+                        )
                         raise SandboxStartError(
                             f"ActorTemplate '{template_id}' invalid or does not exist on Substrate server: {e}"
                         ) from e
@@ -416,10 +463,25 @@ class SubstrateBackendDriver(BackendDriver):
                         if attempt < 3:
                             await asyncio.sleep(0.05 * (attempt + 1))
                 if last_err is not None:
-                    raise SandboxStartError(f"Failed to create environment {actor_id}: {last_err}") from last_err
+                    metrics.observe_subphase(
+                        "wire_claim",
+                        time.monotonic() - wire_start,
+                        status="error",
+                        source="cold_create",
+                    )
+                    raise SandboxStartError(
+                        f"Failed to create environment {actor_id}: {last_err}"
+                    ) from last_err
+                metrics.observe_subphase(
+                    "wire_claim",
+                    time.monotonic() - wire_start,
+                    status="ok",
+                    source="cold_create",
+                )
                 break
 
         instance = self._make_instance(actor_id, template_id, run_id, rootfs_image=rootfs_image)
+        instance.metadata["claim_source"] = claim_source
         with self._lock:
             self._owned_actors[actor_id] = instance
         return instance
@@ -432,7 +494,9 @@ class SubstrateBackendDriver(BackendDriver):
         rootfs_image: str | None = None,
     ) -> RawSandboxInstance:
         return self._sync(
-            self.acquire_async(template_id, run_id, timeout_s=timeout_s, rootfs_image=rootfs_image)
+            self.acquire_async(
+                template_id, run_id, timeout_s=timeout_s, rootfs_image=rootfs_image
+            )
         )
 
     async def warm_pool_async(
@@ -444,11 +508,15 @@ class SubstrateBackendDriver(BackendDriver):
         rootfs_image: str | None = None,
     ) -> None:
         """Pre-warm a pool of actors by creating and suspending them."""
-        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.warm_pool", {
-            "ate.template.name": template_id,
-            "ate_env.replicas": replicas,
-            "ate_env.run_id": run_id,
-        }):
+        with start_span(
+            self.tracer,
+            f"{CLIENT_SPAN_PREFIX}.warm_pool",
+            {
+                "ate.template.name": template_id,
+                "ate_env.replicas": replicas,
+                "ate_env.run_id": run_id,
+            },
+        ):
             await self._warm_pool_internal(
                 template_id, replicas, wait=wait, run_id=run_id, rootfs_image=rootfs_image
             )
@@ -481,21 +549,33 @@ class SubstrateBackendDriver(BackendDriver):
             actor_id = f"warm-{uuid.uuid4().hex[:10]}"
             async with sem:
                 try:
-                    await self._client_for(actor_id).create(
-                        actor_id,
-                        template_name=template_id,
-                        atespace=self.atespace,
-                        rootfs_image=rootfs_image,
-                    )
+                    drv_tok = in_driver_span.set(True)
+                    try:
+                        await self._client_for(actor_id).create(
+                            actor_id,
+                            template_name=template_id,
+                            atespace=self.atespace,
+                            rootfs_image=rootfs_image,
+                        )
+                    finally:
+                        in_driver_span.reset(drv_tok)
                     if wait:
                         await self._client_for(actor_id).suspend(actor_id, atespace=self.atespace)
                     else:
-                        task = asyncio.create_task(self._client_for(actor_id).suspend(actor_id, atespace=self.atespace))
+                        task = asyncio.create_task(
+                            self._client_for(actor_id).suspend(actor_id, atespace=self.atespace)
+                        )
                         self._background_tasks.add(task)
+
                         def _done(t: asyncio.Task[Any]) -> None:
                             self._background_tasks.discard(t)
                             if not t.cancelled() and t.exception():
-                                logger.warning("Background suspend for warm actor %s failed: %s", actor_id, t.exception())
+                                logger.warning(
+                                    "Background suspend for warm actor %s failed: %s",
+                                    actor_id,
+                                    t.exception(),
+                                )
+
                         task.add_done_callback(_done)
                     return actor_id
                 except (NotFoundError, FailedPreconditionError) as e:
@@ -541,15 +621,83 @@ class SubstrateBackendDriver(BackendDriver):
             )
         )
 
+    async def resize_pool_async(
+        self,
+        template_id: str,
+        replicas: int,
+        wait: bool = True,
+        rootfs_image: str | None = None,
+    ) -> None:
+        """Set the warm pool of (template, image) to exactly ``replicas`` paused
+        actors: grow through warm_pool_async, shrink by deleting idle paused
+        actors. Claimed actors are not in the pool and are never touched, so
+        ``held + warm`` stays what the caller asked for (the shape Tunix's
+        prewarm loop keeps with set_pool_replicas)."""
+        replicas = max(0, replicas)
+        pool_key = (template_id, rootfs_image)
+        with self._lock:
+            pool = self._warm_paused_pool.get(pool_key, [])
+            current = len(pool)
+            if replicas >= current:
+                surplus = []
+            else:
+                surplus = pool[replicas:]
+                del pool[replicas:]
+        if replicas > current:
+            await self.warm_pool_async(
+                template_id, replicas, wait=wait, rootfs_image=rootfs_image
+            )
+            return
+        if not surplus:
+            return
+        # The actors left the pool above; the shared warm-replica gauge and the
+        # run report follow, as in unwarm_pool_async.
+        self._observe("warm_remove", len(surplus))
+        logger.info(
+            "Shrinking warm pool for template %s (rootfs_image=%s) from %d to %d paused actors",
+            template_id, rootfs_image, current, replicas,
+        )
+        sem = asyncio.Semaphore(16)
+
+        async def _delete_one(actor_id: str) -> None:
+            async with sem:
+                try:
+                    await self.client.delete(actor_id, atespace=self.atespace)
+                except Exception as e:
+                    logger.warning("Failed deleting surplus warm actor %s: %s", actor_id, e)
+                with self._lock:
+                    self._owned_actors.pop(actor_id, None)
+
+        await asyncio.gather(*[_delete_one(aid) for aid in surplus], return_exceptions=True)
+
+    def resize_pool(
+        self,
+        template_id: str,
+        replicas: int,
+        wait: bool = True,
+        rootfs_image: str | None = None,
+    ) -> None:
+        self._sync(
+            self.resize_pool_async(template_id, replicas, wait=wait, rootfs_image=rootfs_image)
+        )
+
+    def pool_size(self, template_id: str, rootfs_image: str | None = None) -> int | None:
+        """Paused actors waiting in the warm pool of (template_id, rootfs_image)."""
+        with self._lock:
+            return len(self._warm_paused_pool.get((template_id, rootfs_image), []))
+
     async def unwarm_pool_async(self, template_id: str, rootfs_image: str | None = None) -> None:
         """Drain and delete paused actors in the warm pool."""
-        logger.info("Unwarming pool for template %s (rootfs_image=%s)...", template_id, rootfs_image)
+        logger.info(
+            "Unwarming pool for template %s (rootfs_image=%s)...", template_id, rootfs_image
+        )
         with self._lock:
             if rootfs_image is not None:
                 to_delete = self._warm_paused_pool.pop((template_id, rootfs_image), [])
             else:
                 keys_to_pop = [
-                    k for k in list(self._warm_paused_pool.keys())
+                    k
+                    for k in list(self._warm_paused_pool.keys())
                     if (isinstance(k, tuple) and k[0] == template_id)
                 ]
                 to_delete = []
@@ -588,8 +736,9 @@ class SubstrateBackendDriver(BackendDriver):
         tries again and raises if it still cannot delete it. An environment
         that is already gone (NotFound) counts as released.
         """
-        with start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.release",
-                        {"ate.actor.name": instance_id}) as span:
+        with start_span(
+            self.tracer, f"{CLIENT_SPAN_PREFIX}.release", {"ate.actor.name": instance_id}
+        ) as span:
             try:
                 with metrics.timed("release"):
                     await self._release_internal(instance_id, recycle)
@@ -620,7 +769,9 @@ class SubstrateBackendDriver(BackendDriver):
                 logger.info("Recycled actor %s to paused warm pool", instance_id)
                 return
             except Exception as e:
-                logger.warning("Failed to suspend actor %s for recycle, deleting: %s", instance_id, e)
+                logger.warning(
+                    "Failed to suspend actor %s for recycle, deleting: %s", instance_id, e
+                )
 
         try:
             await self._client_for(instance_id).delete(instance_id, atespace=self.atespace)
@@ -651,7 +802,8 @@ class SubstrateBackendDriver(BackendDriver):
             self._warm_paused_pool.clear()
 
             to_reap = [
-                aid for aid, inst in self._owned_actors.items()
+                aid
+                for aid, inst in self._owned_actors.items()
                 if inst.run_id == run_id or aid in warm_actors or inst.run_id == WARM_POOL_RUN_ID
             ]
             to_reap = list(dict.fromkeys(to_reap + warm_actors))

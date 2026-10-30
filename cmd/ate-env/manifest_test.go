@@ -16,14 +16,16 @@ package main
 
 import (
 	"bytes"
+	"io"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/hostcheck"
-	atev1alpha1 "go.ate.dev/substrate/pkg/api/v1alpha1"
-	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
+	atev1 "go.ate.dev/substrate/api/infra/k8s/ate/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/yaml"
@@ -99,7 +101,10 @@ func TestBuildManifests(t *testing.T) {
 		t.Errorf("namespace label %s = %q, want \"true\" (ate-system admits API clients by it)", apiAccessLabel, got)
 	}
 
-	pool := objs[1].(*atev1alpha1.WorkerPool)
+	pool := objs[1].(*atev1.WorkerPool)
+	if pool.APIVersion != "ate.dev/v1" {
+		t.Errorf("workerpool apiVersion = %q, want ate.dev/v1", pool.APIVersion)
+	}
 	if pool.Namespace != cfg.namespace || pool.Name != "default-template-workerpool" {
 		t.Errorf("workerpool = %s/%s, want %s/default-template-workerpool", pool.Namespace, pool.Name, cfg.namespace)
 	}
@@ -128,7 +133,7 @@ func TestBuildManifests(t *testing.T) {
 		t.Fatalf("workerpool sandboxClasses = %+v, want exactly one", pool.Spec.SandboxClasses)
 	}
 	sc := pool.Spec.SandboxClasses[0]
-	if sc.Name != atev1alpha1.SandboxClassGvisor || sc.ConfigRef == nil || sc.ConfigRef.Name != sandboxConfigName {
+	if sc.Name != atev1.SandboxClassGvisor || sc.ConfigRef == nil || sc.ConfigRef.Name != sandboxConfigName {
 		t.Errorf("workerpool sandboxClasses[0] = %+v, want gvisor with configRef %q", sc, sandboxConfigName)
 	}
 	sa := objs[2].(*corev1.ServiceAccount)
@@ -815,6 +820,246 @@ func TestBuildAPIDeploymentAuthTokenSecret(t *testing.T) {
 	}
 }
 
+// runManifest runs "ate-env manifest" with the image flags plus extra and
+// returns the output and the error.
+func runManifest(t *testing.T, extra ...string) (string, error) {
+	t.Helper()
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs(append([]string{
+		"--api-image=example.com/api@sha256:cccc",
+		"--worker-image=example.com/worker@sha256:bbbb",
+	}, extra...))
+	err := cmd.Execute()
+	return buf.String(), err
+}
+
+func TestManifestRequiresTheCallerTokenByDefault(t *testing.T) {
+	out, err := runManifest(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"-auth-token-file=/var/run/secrets/ate-env-auth/token", "secretName: " + defaultAuthTokenSecret} {
+		if !strings.Contains(out, want) {
+			t.Errorf("default manifest lacks %q:\n%s", want, out)
+		}
+	}
+	out, err = runManifest(t, "--auth-token-secret=team-token", "--port-proxy-atespaces=ate-env,team-a")
+	if err != nil || !strings.Contains(out, "secretName: team-token") || !strings.Contains(out, "-port-proxy-atespaces=ate-env,team-a") {
+		t.Errorf("--auth-token-secret=team-token --port-proxy-atespaces: err %v, output:\n%s", err, out)
+	}
+}
+
+func TestManifestInsecureNoAuth(t *testing.T) {
+	out, err := runManifest(t, "--insecure-no-auth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "auth-token-file") || strings.Contains(out, "ate-env-auth") {
+		t.Errorf("--insecure-no-auth still mounts the caller token:\n%s", out)
+	}
+	if _, err := runManifest(t, "--insecure-no-auth", "--auth-token-secret=x"); err == nil || !strings.Contains(err.Error(), "cannot be used together") {
+		t.Errorf("--insecure-no-auth with --auth-token-secret: err %v, want a conflict", err)
+	}
+	if _, err := runManifest(t, "--auth-token-secret="); err == nil || !strings.Contains(err.Error(), "--insecure-no-auth") {
+		t.Errorf("empty --auth-token-secret: err %v, want a pointer to --insecure-no-auth", err)
+	}
+	if _, err := runManifest(t, "--auth-token-secret=   "); err == nil || !strings.Contains(err.Error(), "--insecure-no-auth") {
+		t.Errorf("whitespace --auth-token-secret: err %v, want a pointer to --insecure-no-auth", err)
+	}
+}
+
+func TestManifestAuthSecretCommand(t *testing.T) {
+	run := func(args ...string) map[string]any {
+		t.Helper()
+		cmd := newManifestCommand()
+		var buf bytes.Buffer
+		cmd.SetOut(&buf)
+		cmd.SetArgs(append([]string{"auth-secret"}, args...))
+		if err := cmd.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := yaml.Unmarshal(buf.Bytes(), &m); err != nil {
+			t.Fatalf("%q: %v", buf.String(), err)
+		}
+		return m
+	}
+	token := func(m map[string]any) string {
+		sd, _ := m["stringData"].(map[string]any)
+		s, _ := sd["token"].(string)
+		return s
+	}
+	a, b := run(), run("--namespace", "team-env", "--name", "team-token")
+	if a["kind"] != "Secret" || a["type"] != "Opaque" {
+		t.Errorf("kind %v type %v, want an Opaque Secret", a["kind"], a["type"])
+	}
+	md, _ := a["metadata"].(map[string]any)
+	if md["name"] != defaultAuthTokenSecret || md["namespace"] != "ate-env" {
+		t.Errorf("metadata %v, want %s in ate-env", md, defaultAuthTokenSecret)
+	}
+	if md, _ := b["metadata"].(map[string]any); md["name"] != "team-token" || md["namespace"] != "team-env" {
+		t.Errorf("metadata %v, want team-token in team-env", md)
+	}
+	hex64 := regexp.MustCompile(`^[0-9a-f]{64}$`)
+	if !hex64.MatchString(token(a)) || !hex64.MatchString(token(b)) {
+		t.Errorf("tokens %q, %q: want 64 hex characters each", token(a), token(b))
+	}
+	if token(a) == token(b) {
+		t.Error("two runs printed the same token")
+	}
+	for _, bad := range [][]string{{"--namespace="}, {"--namespace=  "}, {"--name="}, {"--name=  "}} {
+		cmd := newManifestCommand()
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs(append([]string{"auth-secret"}, bad...))
+		if err := cmd.Execute(); err == nil {
+			t.Errorf("auth-secret %v: want error", bad)
+		}
+	}
+}
+
+func TestBuildAPIDeploymentRouterTLS(t *testing.T) {
+	cfg := testManifestConfig()
+	cfg.routerTLS = true
+	dep := buildAPIDeployment(cfg)
+	c := dep.Spec.Template.Spec.Containers[0]
+	args := strings.Join(c.Args, " ")
+	for _, want := range []string{"-atenet-client-cert=" + routerCredentialBundlePath, "-atenet-ca-file=" + routerTrustBundlePath} {
+		if !strings.Contains(args, want) {
+			t.Errorf("args %v lack %q", c.Args, want)
+		}
+	}
+	mounts := map[string]string{}
+	for _, m := range c.VolumeMounts {
+		mounts[m.Name] = m.MountPath
+	}
+	if mounts["podidentity"] != "/run/podidentity.podcert.ate.dev" || mounts["servicedns-ca"] != "/run/servicedns-ca" {
+		t.Errorf("mounts = %v", mounts)
+	}
+	var pod, trust bool
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Projected == nil || len(v.Projected.Sources) != 1 {
+			continue
+		}
+		src := v.Projected.Sources[0]
+		switch {
+		case v.Name == "podidentity" && src.PodCertificate != nil:
+			pc := src.PodCertificate
+			pod = pc.SignerName == "podidentity.podcert.ate.dev/identity" && pc.KeyType == "ECDSAP256" && pc.CredentialBundlePath == "credential-bundle.pem"
+		case v.Name == "servicedns-ca" && src.ClusterTrustBundle != nil:
+			tb := src.ClusterTrustBundle
+			trust = tb.SignerName != nil && *tb.SignerName == "servicedns.podcert.ate.dev/identity" && tb.Path == "trust-bundle.pem" &&
+				tb.LabelSelector != nil && tb.LabelSelector.MatchLabels["podcert.ate.dev/canarying"] == "live"
+		}
+	}
+	if !pod || !trust {
+		t.Errorf("volumes = %+v; pod certificate ok %v, trust bundle ok %v", dep.Spec.Template.Spec.Volumes, pod, trust)
+	}
+
+	cfg.routerTLS = false
+	dep = buildAPIDeployment(cfg)
+	c = dep.Spec.Template.Spec.Containers[0]
+	if strings.Contains(strings.Join(c.Args, " "), "-atenet-client-cert") {
+		t.Errorf("args %v: want no router TLS flags when off", c.Args)
+	}
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Name == "podidentity" || v.Name == "servicedns-ca" {
+			t.Errorf("volume %s present with router TLS off", v.Name)
+		}
+	}
+}
+
+func envMap(c *ateapipb.Container) (map[string]string, []string) {
+	m := map[string]string{}
+	var order []string
+	for _, e := range c.GetEnv() {
+		m[e.GetName()] = e.GetValue()
+		order = append(order, e.GetName())
+	}
+	return m, order
+}
+
+func TestBuildTemplateEnv(t *testing.T) {
+	cfg := testTemplateConfig()
+	cfg.env = []string{"OH_SESSION_API_KEYS_0=s3cret", "EMPTY=", "URL=http://x/?a=b"}
+	tmpl, err := buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, order := envMap(tmpl.Containers[0])
+	if strings.Join(order, ",") != "PORT,OH_SESSION_API_KEYS_0,EMPTY,URL" {
+		t.Errorf("env order = %v, want PORT first, then the flags in order", order)
+	}
+	if got["PORT"] != "80" || got["OH_SESSION_API_KEYS_0"] != "s3cret" || got["EMPTY"] != "" || got["URL"] != "http://x/?a=b" {
+		t.Errorf("env = %v", got)
+	}
+
+	// A rootfs-image template keeps the variables: the sidecars that read them
+	// run there.
+	cfg.rootfsImage = "docker.io/library/python@sha256:" + testHex64
+	cfg.guestImage = "example.com/guest@sha256:" + testHex64
+	tmpl, err = buildTemplate(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := envMap(tmpl.Containers[0]); got["OH_SESSION_API_KEYS_0"] != "s3cret" {
+		t.Errorf("rootfs-image template env = %v, want the --env values", got)
+	}
+}
+
+func TestTemplateConfigRejectsBadEnv(t *testing.T) {
+	for _, env := range [][]string{
+		{"NOEQUALS"},
+		{"1BAD=x"},
+		{"BAD-NAME=x"},
+		{"=x"},
+		{"PORT=81"},
+		{"A=1", "A=2"},
+	} {
+		cfg := testTemplateConfig()
+		cfg.env = env
+		if err := cfg.validateEnv(); err == nil {
+			t.Errorf("env %q: want error, got nil", env)
+		}
+	}
+}
+
+func TestManifestTemplateCommandEnv(t *testing.T) {
+	cmd := newManifestCommand()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{
+		"template",
+		"--guest-image=example.com/guest@sha256:aaaa",
+		"--snapshots-bucket=gs://bucket/prefix/",
+		"--env=OH_SESSION_API_KEYS_0=k",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "name: OH_SESSION_API_KEYS_0\n    value: k") {
+		t.Errorf("output lacks the --env variable:\n%s", out)
+	}
+}
+
+func TestManifestTemplateCommandRejectsBadEnv(t *testing.T) {
+	cmd := newManifestCommand()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{
+		"template",
+		"--guest-image=example.com/guest@sha256:aaaa",
+		"--snapshots-bucket=gs://bucket/prefix/",
+		"--env=PORT=81",
+	})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--env PORT") {
+		t.Errorf("execute with --env PORT=81: want the --env error, got %v", err)
+	}
+}
+
 // allowedHostsArg returns the value of the -allowed-hosts argument, or "" if
 // the deployment has none.
 func allowedHostsArg(dep *appsv1.Deployment) (string, bool) {
@@ -887,57 +1132,6 @@ func TestManifestCommandAPIAllowedHosts(t *testing.T) {
 	})
 	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--api-allowed-hosts") {
 		t.Errorf("a URL in --api-allowed-hosts: err = %v, want an --api-allowed-hosts error", err)
-	}
-}
-
-func TestBuildAPIDeploymentRouterTLS(t *testing.T) {
-	cfg := testManifestConfig()
-	cfg.routerTLS = true
-	dep := buildAPIDeployment(cfg)
-	c := dep.Spec.Template.Spec.Containers[0]
-	args := strings.Join(c.Args, " ")
-	for _, want := range []string{"-atenet-client-cert=" + routerCredentialBundlePath, "-atenet-ca-file=" + routerTrustBundlePath} {
-		if !strings.Contains(args, want) {
-			t.Errorf("args %v lack %q", c.Args, want)
-		}
-	}
-	mounts := map[string]string{}
-	for _, m := range c.VolumeMounts {
-		mounts[m.Name] = m.MountPath
-	}
-	if mounts["podidentity"] != "/run/podidentity.podcert.ate.dev" || mounts["servicedns-ca"] != "/run/servicedns-ca" {
-		t.Errorf("mounts = %v", mounts)
-	}
-	var pod, trust bool
-	for _, v := range dep.Spec.Template.Spec.Volumes {
-		if v.Projected == nil || len(v.Projected.Sources) != 1 {
-			continue
-		}
-		src := v.Projected.Sources[0]
-		switch {
-		case v.Name == "podidentity" && src.PodCertificate != nil:
-			pc := src.PodCertificate
-			pod = pc.SignerName == "podidentity.podcert.ate.dev/identity" && pc.KeyType == "ECDSAP256" && pc.CredentialBundlePath == "credential-bundle.pem"
-		case v.Name == "servicedns-ca" && src.ClusterTrustBundle != nil:
-			tb := src.ClusterTrustBundle
-			trust = tb.SignerName != nil && *tb.SignerName == "servicedns.podcert.ate.dev/identity" && tb.Path == "trust-bundle.pem" &&
-				tb.LabelSelector != nil && tb.LabelSelector.MatchLabels["podcert.ate.dev/canarying"] == "live"
-		}
-	}
-	if !pod || !trust {
-		t.Errorf("volumes = %+v; pod certificate ok %v, trust bundle ok %v", dep.Spec.Template.Spec.Volumes, pod, trust)
-	}
-
-	cfg.routerTLS = false
-	dep = buildAPIDeployment(cfg)
-	c = dep.Spec.Template.Spec.Containers[0]
-	if strings.Contains(strings.Join(c.Args, " "), "-atenet-client-cert") {
-		t.Errorf("args %v: want no router TLS flags when off", c.Args)
-	}
-	for _, v := range dep.Spec.Template.Spec.Volumes {
-		if v.Name == "podidentity" || v.Name == "servicedns-ca" {
-			t.Errorf("volume %s present with router TLS off", v.Name)
-		}
 	}
 }
 

@@ -15,11 +15,13 @@
 from __future__ import annotations
 
 import collections
+import contextvars
 import dataclasses
 import logging
 import threading
 import uuid
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from .backend.base import BackendDriver
@@ -29,7 +31,15 @@ from .config import ALLOWED_BACKENDS, FleetConfig, TracerConfig
 from .handle import SandboxHandle
 from .observability import Observer, RunReport, repo_family
 from .runtime.base import RuntimeGuestHook
+from .sizing import plan_replicas
 from .strategies import STRATEGIES
+from .telemetry.trace_recorder import (
+    is_trace_mode,
+    record_trace_event,
+    register_env_meta,
+    should_auto_enable_tracing,
+    task_context,
+)
 from .types import (
     DataPlaneEndpoint,
     FleetPlan,
@@ -78,6 +88,8 @@ class SandboxFleet:
         self._image_to_template: dict[str, tuple[str, str | None]] = {}
         self._plan: FleetPlan | None = None
         self._lock = threading.Lock()
+        # Sandboxes acquired per task image, warm or cold (acquired_count).
+        self._acquired: collections.Counter[str] = collections.Counter()
         # Serializes plan recomputation, so concurrent add_tasks calls leave
         # the plan of the last call, which saw every task added before it.
         self._plan_lock = threading.Lock()
@@ -86,7 +98,11 @@ class SandboxFleet:
         # turns on tracing for the whole fleet under one service name, so
         # ate_env_fleet.* spans parent ate_env_client.* spans in one trace.
         obs_cfg = self.config.observability
-        tracing_on = self.config.tracing.enable_tracing or obs_cfg.enable_tracing
+        tracing_on = (
+            self.config.tracing.enable_tracing
+            or obs_cfg.enable_tracing
+            or should_auto_enable_tracing(self.config.tracing)
+        )
         service = (obs_cfg.trace_service_name if obs_cfg.enable_tracing
                    else self.config.tracing.trace_service_name)
         if (obs_cfg.enable_tracing and self.config.tracing.enable_tracing
@@ -301,19 +317,37 @@ class SandboxFleet:
     def _plan_entries_locked(self) -> FleetPlan:
         entries: list[PlanEntry] = []
         counts = self.image_counts()
+        sized = self._size_pools(counts)
         for img, task_count in counts.items():
             template_id, rootfs_image = self._ensure_template_for_image(img)
-            # Size warm pool to min(task_count, max_warmpool_replicas)
-            replicas = min(task_count, self.config.max_warmpool_replicas)
             entries.append(PlanEntry(
                 image=img,
                 template_id=template_id,
-                replicas=replicas,
+                replicas=sized[img],
                 tasks=task_count,
                 rootfs_image=rootfs_image,
             ))
         self._plan = FleetPlan(entries)
         return self._plan
+
+    def _size_pools(
+        self, counts: dict[str, int], images: Sequence[str] | None = None
+    ) -> dict[str, int]:
+        """Warm replicas per image: its share of max_concurrent (see ate_env.sizing).
+
+        ``images`` limits the share to those images (a strategy's window). An
+        image with no loaded task has nothing to size by and gets
+        ``max_warmpool_replicas``.
+        """
+        cfg = self.config
+        selected = list(counts) if images is None else list(dict.fromkeys(images))
+        sized = plan_replicas(
+            counts, cfg.max_concurrent, cfg.max_warmpool_replicas,
+            per_task=cfg.warm_per_task, images=[i for i in selected if i in counts],
+        )
+        for img in selected:
+            sized.setdefault(img, cfg.max_warmpool_replicas)
+        return sized
 
     def setup(self, tasks: list[Any] | None = None) -> None:
         """Run preflight, plan, and pre-warm all planned images."""
@@ -321,26 +355,91 @@ class SandboxFleet:
             self.load_tasks(tasks)
         self.preflight()
         plan = self.plan()
-        for entry in plan.entries:
-            if entry.replicas > 0:
-                with self._obs.phase("warm_pool", backend=self.backend_label,
-                                     family=repo_family(entry.image)):
-                    self.backend.warm_pool(
-                        entry.template_id,
-                        entry.replicas,
-                        wait=True,
-                        run_id=self.run_id,
-                        rootfs_image=getattr(entry, "rootfs_image", None),
-                    )
+        self._warm_many(
+            [(e.image, e.template_id, e.rootfs_image, e.replicas) for e in plan.entries],
+            wait=True,
+        )
 
     def warm_images(self, images: list[str], replicas: int | None = None, wait: bool = True) -> None:
-        """Warm up pools for specific images (used by windowed strategies)."""
-        rep = replicas if replicas is not None else self.config.max_warmpool_replicas
-        for img in images:
+        """Warm up pools for specific images (used by windowed strategies).
+
+        Without ``replicas``, each image gets its share of ``max_concurrent``
+        among ``images`` (``warm_per_task``: one replica per task), capped by
+        ``max_warmpool_replicas``. Up to ``warm_parallelism`` images warm at
+        once; the first error is raised after every image was tried.
+        """
+        if replicas is not None:
+            sized = {img: replicas for img in images}
+        else:
+            sized = self._size_pools(self.image_counts(), images)
+        work = []
+        for img in dict.fromkeys(images):
             template_id, rootfs_image = self._ensure_template_for_image(img)
+            work.append((img, template_id, rootfs_image, sized[img]))
+        self._warm_many(work, wait=wait)
+
+    def _warm_many(
+        self, work: list[tuple[str, str, str | None, int]], wait: bool
+    ) -> None:
+        """Warm (image, template, rootfs_image, replicas) items, warm_parallelism at a time."""
+        work = [w for w in work if w[3] > 0]
+        if not work:
+            return
+
+        def _warm_one(item: tuple[str, str, str | None, int]) -> None:
+            img, template_id, rootfs_image, rep = item
             with self._obs.phase("warm_pool", backend=self.backend_label, family=repo_family(img)):
                 self.backend.warm_pool(template_id, rep, wait=wait, run_id=self.run_id,
                                        rootfs_image=rootfs_image)
+
+        if len(work) == 1 or self.config.warm_parallelism == 1:
+            errors: list[BaseException] = []
+            for item in work:
+                try:
+                    _warm_one(item)
+                except Exception as e:
+                    errors.append(e)
+        else:
+            workers = min(self.config.warm_parallelism, len(work))
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ate-env-warm") as ex:
+                # Each warm runs in a copy of the caller's context, so its
+                # span nests under the caller's current span.
+                futures = [ex.submit(contextvars.copy_context().run, _warm_one, item)
+                           for item in work]
+                errors = [e for e in (f.exception() for f in futures) if e is not None]
+        if errors:
+            if len(errors) > 1:
+                logger.warning("%d of %d images failed to warm; raising the first",
+                               len(errors), len(work))
+            raise errors[0]
+
+    def warm_image(self, image: str, replicas: int | None = None, wait: bool = True) -> None:
+        """Warm one image's pool (agent-sandbox-rl's ``warm_image``)."""
+        self.warm_images([image], replicas=replicas, wait=wait)
+
+    def set_pool_replicas(self, image: str, replicas: int, wait: bool = True) -> None:
+        """Size one image's warm pool to exactly ``replicas`` idle sandboxes,
+        up or down, without dropping it (agent-sandbox-rl's
+        ``set_pool_replicas``). Claimed sandboxes are not counted and never
+        touched, so a caller can keep ``held + warm == K`` per image as it
+        acquires. A backend without ``resize_pool`` grows through
+        ``warm_pool`` and drains through ``unwarm_pool`` when ``replicas`` is 0.
+        """
+        replicas = max(0, int(replicas))
+        template_id, rootfs_image = self._ensure_template_for_image(image)
+        with self._obs.phase("warm_pool", backend=self.backend_label, family=repo_family(image)):
+            try:
+                self.backend.resize_pool(template_id, replicas, wait=wait, rootfs_image=rootfs_image)
+            except NotImplementedError:
+                if replicas == 0:
+                    self.backend.unwarm_pool(template_id, rootfs_image=rootfs_image)
+                else:
+                    logger.warning(
+                        "backend %s has no resize_pool: set_pool_replicas(%s, %d) can grow the "
+                        "pool but cannot shrink it below its current size",
+                        self.backend_label, image, replicas,
+                    )
+                    self.backend.warm_pool(template_id, replicas, wait=wait, rootfs_image=rootfs_image)
 
     def unwarm_image(self, image: str) -> None:
         """Drain warm pool for a specific image."""
@@ -348,6 +447,26 @@ class SandboxFleet:
         if entry:
             template_id, rootfs_image = entry
             self.backend.unwarm_pool(template_id, rootfs_image=rootfs_image)
+
+    def acquired_count(self, image: str) -> int:
+        """Sandboxes this fleet has acquired for ``image`` so far, warm or cold.
+
+        A monotonic counter: callers take differences between two reads.
+        """
+        with self._lock:
+            return self._acquired[image]
+
+    def _count_acquire(self, image: str) -> None:
+        with self._lock:
+            self._acquired[image] += 1
+
+    def pool_size(self, image: str) -> int | None:
+        """Idle warm replicas for ``image``; None when the driver cannot tell."""
+        entry = self._image_to_template.get(image)
+        if entry is None:
+            return 0
+        template_id, rootfs_image = entry
+        return self.backend.pool_size(template_id, rootfs_image=rootfs_image)
 
     def acquire(
         self,
@@ -389,9 +508,29 @@ class SandboxFleet:
             template_id, rootfs_image = self._ensure_template_for_image(task_obj.image)
 
         to_s = timeout_s or self.config.acquire_timeout_s
-        raw_inst = self.backend.acquire(
-            template_id, self.run_id, timeout_s=to_s, rootfs_image=rootfs_image
+        with task_context(
+            run_id=self.run_id, instance=task_obj.id, image=task_obj.image
+        ):
+            raw_inst = self.backend.acquire(
+                template_id, self.run_id, timeout_s=to_s, rootfs_image=rootfs_image
+            )
+        register_env_meta(
+            raw_inst.instance_id,
+            instance=task_obj.id,
+            image=task_obj.image,
+            run_id=self.run_id,
         )
+        if self.backend_label == "mock" and is_trace_mode():
+            record_trace_event(
+                "create",
+                env=raw_inst.instance_id,
+                dur_ms=0.0,
+                ok=True,
+                run=self.run_id,
+                instance=task_obj.id,
+                image=task_obj.image,
+            )
+        self._count_acquire(task_obj.image)
 
         try:
             runtime, data_plane = self._build_runtime(raw_inst)
@@ -406,6 +545,7 @@ class SandboxFleet:
                 )
             raise
 
+        claim_source = str(raw_inst.metadata.get("claim_source", "direct"))
         return SandboxHandle(
             sandbox_id=raw_inst.instance_id,
             endpoint=data_plane.address if data_plane else raw_inst.endpoint,
@@ -416,6 +556,7 @@ class SandboxFleet:
             data_plane=data_plane,
             default_timeout_s=self.config.step_timeout_s,
             tracer=self._tracer,
+            claim_source=claim_source,
         )
 
     def _build_runtime(
@@ -445,12 +586,32 @@ class SandboxFleet:
         for h in handle if isinstance(handle, (list, tuple)) else (handle,):
             with self._obs.phase("release", backend=self.backend_label, family=repo_family(h.task)):
                 h.release()
+                if self.backend_label == "mock" and is_trace_mode():
+                    record_trace_event(
+                        "delete",
+                        env=h.sandbox_id,
+                        dur_ms=0.0,
+                        ok=True,
+                        run=self.run_id,
+                        instance=h.task.id if h.task else None,
+                        image=h.task.image if h.task else None,
+                    )
 
     def recycle(self, handle: SandboxHandle | Sequence[SandboxHandle]) -> None:
         """Return sandbox instance(s) to the warm pool (see SandboxHandle.recycle)."""
         for h in handle if isinstance(handle, (list, tuple)) else (handle,):
             with self._obs.phase("recycle", backend=self.backend_label, family=repo_family(h.task)):
                 h.recycle()
+                if self.backend_label == "mock" and is_trace_mode():
+                    record_trace_event(
+                        "suspend",
+                        env=h.sandbox_id,
+                        dur_ms=0.0,
+                        ok=True,
+                        run=self.run_id,
+                        instance=h.task.id if h.task else None,
+                        image=h.task.image if h.task else None,
+                    )
 
     def teardown(self) -> None:
         """Teardown all resources provisioned by this fleet's run_id."""

@@ -30,7 +30,7 @@ import (
 	"github.com/agent-substrate/env/internal/internaltest/fakerouter"
 	"github.com/agent-substrate/env/internal/telemetry"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
-	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"

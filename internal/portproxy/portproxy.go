@@ -29,11 +29,14 @@
 //
 // Trust model: without Options.Authenticate, the proxy does not authenticate
 // callers. Whoever can reach the listener it is served on can reach any TCP
-// port of any actor the router serves, in any atespace, including actors that
-// ate-env did not create. With it, a caller must present the API's bearer
-// token in EnvAuthorizationHeader or Authorization, and the token does not
-// reach the daemon. A WebSocket client that cannot set headers presents a port
-// capability instead (see CapabilityUser). Either way, a daemon behind it must
+// port of any actor the router serves in the atespaces Options.Atespaces
+// allows (all of them when it is empty), including actors that ate-env did not
+// create: Substrate actors carry no label that tells them apart, thus a
+// dedicated atespace is the boundary. With Authenticate, a caller must present
+// the API's bearer token in EnvAuthorizationHeader or Authorization, and the
+// token does not reach the daemon. A WebSocket client that cannot set headers
+// presents a port capability instead (see CapabilityUser). Either way, a daemon
+// behind it must
 // authenticate its own clients. The path form refuses
 // requests that a browser sends from another origin (see Options.TrustedOrigins),
 // so a web page cannot drive a daemon through a port-forwarded listener.
@@ -58,6 +61,8 @@ import (
 
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/routertls"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // The routing headers. They match the x-env-id and x-env-atespace metadata
@@ -148,6 +153,13 @@ type Options struct {
 	// Authorization is Basic with the user CapabilityUser and that has no
 	// EnvAuthorizationHeader. An error refuses the request with 401.
 	AuthenticateCapability func(capability, atespace, id string, port int) error
+
+	// Atespaces, when set, are the only atespaces whose environments the
+	// proxy forwards to; a request that names another gets 403, after
+	// Authenticate. Empty means any atespace the router serves.
+	// DefaultAtespace is not implied: list it to serve requests that name
+	// no atespace.
+	Atespaces []string
 	// OnConnected, when set, is called with the environment's atespace and
 	// id each time the router accepts a CONNECT to one of its ports, after
 	// any wait for a wake. ate-env-api uses it to end create_to_ready when a
@@ -158,13 +170,15 @@ type Options struct {
 // Proxy is an http.Handler that forwards each request to the environment port
 // its headers name.
 type Proxy struct {
-	opts Options
-	rp   *httputil.ReverseProxy
-	tr   *http.Transport
-	cop  *http.CrossOriginProtection
+	opts      Options
+	atespaces map[string]bool // nil: any atespace
+	rp        *httputil.ReverseProxy
+	tr        *http.Transport
+	cop       *http.CrossOriginProtection
 }
 
-// New returns a Proxy. It fails only on a malformed trusted origin.
+// New returns a Proxy. It fails only on a malformed trusted origin or
+// atespace.
 func New(opts Options) (*Proxy, error) {
 	if opts.HostSuffix == "" {
 		opts.HostSuffix = ate.DefaultHostSuffix
@@ -180,6 +194,16 @@ func New(opts Options) (*Proxy, error) {
 		if err := p.cop.AddTrustedOrigin(o); err != nil {
 			return nil, fmt.Errorf("trusted origin: %w", err)
 		}
+	}
+	if len(opts.Atespaces) > 0 {
+		p.atespaces = map[string]bool{}
+		for _, a := range opts.Atespaces {
+			if !label.MatchString(a) {
+				return nil, fmt.Errorf("atespace %q is not valid", a)
+			}
+			p.atespaces[a] = true
+		}
+		p.opts.Atespaces = nil
 	}
 	p.tr = &http.Transport{
 		DialContext:           p.dial,
@@ -361,7 +385,7 @@ func (p *Proxy) ServePath(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if !p.authenticate(w, r, &t) {
+	if !p.authenticate(w, r, &t) || !p.inScope(w, t) {
 		return
 	}
 	check := r
@@ -386,10 +410,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if !p.authenticate(w, r, &t) {
+	if !p.authenticate(w, r, &t) || !p.inScope(w, t) {
 		return
 	}
 	p.rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), targetKey{}, t)))
+}
+
+// inScope answers 403 and returns false when t's atespace is not one that
+// Options.Atespaces allows.
+func (p *Proxy) inScope(w http.ResponseWriter, t target) bool {
+	if p.atespaces == nil || p.atespaces[t.atespace] {
+		return true
+	}
+	http.Error(w, fmt.Sprintf("the port proxy does not forward to atespace %q", t.atespace), http.StatusForbidden)
+	return false
 }
 
 // authenticate checks the caller with Options.Authenticate, or a port
@@ -428,6 +462,10 @@ func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request, t *target) 
 		err = p.opts.Authenticate(r.Header.Get("Authorization"))
 	}
 	if err != nil {
+		if status.Code(err) == codes.Internal {
+			http.Error(w, status.Convert(err).Message(), http.StatusInternalServerError)
+			return false
+		}
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		http.Error(w, "missing or invalid bearer token; send it in "+EnvAuthorizationHeader+
 			" or Authorization", http.StatusUnauthorized)
@@ -438,6 +476,9 @@ func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request, t *target) 
 
 func (p *Proxy) rewrite(pr *httputil.ProxyRequest) {
 	t := pr.In.Context().Value(targetKey{}).(target)
+	// The transport dials with a context that does not end with the
+	// request; dial reads the request's own context back from this value.
+	pr.Out = pr.Out.WithContext(context.WithValue(pr.Out.Context(), callerKey{}, pr.Out.Context()))
 	pr.SetXForwarded()
 	// The URL host is the transport's pool key, not an address: one pool for
 	// each environment and port. dial reads the target back from it.
@@ -466,6 +507,62 @@ func (e *routerError) Error() string {
 	return fmt.Sprintf("router answered CONNECT with %d: %s", e.status, e.msg)
 }
 
+// callerKey holds the context of the request a dial is for (see rewrite).
+type callerKey struct{}
+
+// routerParkMargin is how long past the wake budget the dial context lasts,
+// beyond one retry interval: the attempt after the last wait can start at
+// the end of the budget, and the router holds (parks) a CONNECT for a
+// resuming actor before it answers, up to its --parked-request-budget, 5 s by
+// default in Substrate v0.6.0 (DefaultParkedRequestBudget,
+// cmd/atenet/internal/router/ingress/parking.go:29). The proxy does not know
+// the router's flag, thus twice the default. A variable for the tests.
+var routerParkMargin = 10 * time.Second
+
+// dialContext returns the context for one dial and its cancel. Since Go 1.23
+// http.Transport dials with context.WithoutCancel of the request context, so
+// that a finished dial can serve another request; a wake loop would then
+// keep sending CONNECTs for up to WakeBudget after its caller left. The
+// returned context ends when the request ends, and at the latest one retry
+// interval plus routerParkMargin after WakeBudget, so the last attempt gets
+// its answer from a router that parks it. The CONNECT attempts and anything
+// else the loop does with it stop then; dial reports that end as a spent
+// wake budget (see stopped).
+func (p *Proxy) dialContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(ctx, p.opts.WakeBudget+wakeRetryMaxBackoff+routerParkMargin)
+	caller, ok := ctx.Value(callerKey{}).(context.Context)
+	if !ok {
+		return ctx, cancel
+	}
+	stopAfter := context.AfterFunc(caller, cancel)
+	return ctx, func() { stopAfter(); cancel() }
+}
+
+// notWoken returns the error for a spent wake budget, last being the final
+// attempt's: a router 503, which handleError answers with 503. Logged here:
+// handleError keeps router 503s out of the log, and a spent wake budget is
+// the one 503 an operator wants to see, as the close of the "waiting" line
+// from the first attempt.
+func (p *Proxy) notWoken(atespace, id string, attempts int, last error) error {
+	var re *routerError
+	if !errors.As(last, &re) {
+		last = errors.Join(&routerError{status: http.StatusServiceUnavailable, msg: "the wake budget ended during the attempt"}, last)
+	}
+	err := fmt.Errorf("environment %s/%s did not wake within %s (%d attempts): %w", atespace, id, p.opts.WakeBudget, attempts, last)
+	log.Printf("port proxy: %v", err)
+	return err
+}
+
+// stopped returns the error for a dial whose context ended: the caller left,
+// which needs no answer and no log line, or the dial deadline passed, which
+// is a spent wake budget and gets the same 503.
+func (p *Proxy) stopped(ctx context.Context, atespace, id string, attempts int, last error) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return p.notWoken(atespace, id, attempts, last)
+	}
+	return ctx.Err()
+}
+
 // dial opens a CONNECT tunnel to the environment port encoded in addr (see
 // rewrite). While the router answers 503, which is what a suspended actor
 // and one still waking both look like, it tries again with backoff until
@@ -477,10 +574,15 @@ func (p *Proxy) dial(ctx context.Context, _, addr string) (net.Conn, error) {
 		return nil, err
 	}
 	id, atespace, _ := strings.Cut(host, ".")
+	ctx, stop := p.dialContext(ctx)
+	defer stop()
 	deadline := time.Now().Add(p.opts.WakeBudget)
 	backoff := wakeRetryInitialBackoff
 	for attempt := 1; ; attempt++ {
 		conn, err := p.connect(ctx, id, atespace, portStr)
+		if err != nil && ctx.Err() != nil {
+			return nil, p.stopped(ctx, atespace, id, attempt, err)
+		}
 		if err == nil && p.opts.OnConnected != nil {
 			p.opts.OnConnected(atespace, id)
 		}
@@ -490,19 +592,17 @@ func (p *Proxy) dial(ctx context.Context, _, addr string) (net.Conn, error) {
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			// Logged here: handleError keeps router 503s out of the log, and
-			// a spent wake budget is the one 503 an operator wants to see,
-			// as the close of the "waiting" line from the first attempt.
-			err = fmt.Errorf("environment %s/%s did not wake within %s (%d attempts): %w", atespace, id, p.opts.WakeBudget, attempt, err)
-			log.Printf("port proxy: %v", err)
-			return nil, err
+			return nil, p.notWoken(atespace, id, attempt, err)
+		}
+		if ctx.Err() != nil {
+			return nil, p.stopped(ctx, atespace, id, attempt, err)
 		}
 		if attempt == 1 {
 			log.Printf("port proxy: waiting for environment %s/%s to wake (wake budget %s)", atespace, id, p.opts.WakeBudget)
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, p.stopped(ctx, atespace, id, attempt, err)
 		case <-time.After(min(backoff, remaining)):
 		}
 		backoff = min(backoff*2, wakeRetryMaxBackoff)

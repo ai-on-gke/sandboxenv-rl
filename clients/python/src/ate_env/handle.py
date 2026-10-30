@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,6 +23,11 @@ from .backend.base import BackendDriver
 from .errors import CommandExecutionError, CommandTimeoutError
 from .runtime.base import RuntimeGuestHook
 from .telemetry import metrics
+from .telemetry.trace_recorder import (
+    annotate_span,
+    in_handle_span,
+    normalize_command_list,
+)
 from .telemetry.tracing import (
     CLIENT_SPAN_PREFIX,
     executable_attr,
@@ -51,6 +57,7 @@ class SandboxHandle:
     wake and readiness wait, and ends the time-to-first-command window that
     starts with ``ate_env_client.acquire``.
     """
+
     sandbox_id: str
     endpoint: str
     task: Task
@@ -60,40 +67,71 @@ class SandboxHandle:
     data_plane: DataPlaneEndpoint | None = None
     default_timeout_s: float = 120.0
     tracer: Any = field(default=None, repr=False, compare=False)
+    claim_source: str = field(default="direct", repr=False, compare=False)
     _first_command_started: bool = field(default=False, init=False, repr=False, compare=False)
+    _acquired_at: float = field(default_factory=time.monotonic, init=False, repr=False, compare=False)
 
     def _span_ids(self) -> dict[str, Any]:
-        return {"ate.actor.name": self.sandbox_id, "ate_env.run_id": self.run_id or None}
+        return {
+            "ate.actor.name": self.sandbox_id,
+            # The runtime's atespace, when it has one (the Substrate runtime);
+            # the Go client records it on its exec and file spans too.
+            "ate.atespace": getattr(self.runtime, "atespace", None) or None,
+            "ate_env.run_id": self.run_id or None,
+        }
 
-    def _exec_span(self, command: str | list[str]) -> Any:
+    def _note_first_command(self) -> bool:
+        first = not self._first_command_started
+        if first:
+            self._first_command_started = True
+            metrics.observe_subphase(
+                "ready_to_first_command",
+                max(0.0, time.monotonic() - self._acquired_at),
+                status="ok",
+                source=self.claim_source,
+            )
+        return first
+
+    def _exec_span(self, command: str | list[str], *, first: bool) -> Any:
         if not self.tracer:
             return nullcontext()
-        first = not self._first_command_started
-        self._first_command_started = True
-        return start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.exec", {
-            **self._span_ids(),
-            "ate_env.command.executable": executable_attr(command),
-            "ate_env.first_command": True if first else None,
-        })
+        return start_span(
+            self.tracer,
+            f"{CLIENT_SPAN_PREFIX}.exec",
+            {
+                **self._span_ids(),
+                "ate_env.command.executable": executable_attr(command),
+                "ate_env.first_command": True if first else None,
+            },
+        )
 
     def _file_span(self, op: str, path: str, content: bytes | str | None = None) -> Any:
         if not self.tracer:
             return nullcontext()
-        return start_span(self.tracer, f"{CLIENT_SPAN_PREFIX}.{op}", {
-            **self._span_ids(),
-            "ate_env.file.path": path,
-            "ate_env.file.size": None if content is None else _size(content),
-        })
+        return start_span(
+            self.tracer,
+            f"{CLIENT_SPAN_PREFIX}.{op}",
+            {
+                **self._span_ids(),
+                "ate_env.file.path": path,
+                "ate_env.file.size": None if content is None else _size(content),
+            },
+        )
 
     @staticmethod
     def _exec_result_attrs(span: Any, res: ExecResult, check: bool) -> None:
-        set_attributes(span, {"ate_env.exit_code": res.exit_code, "ate_env.timed_out": res.timed_out})
+        set_attributes(
+            span, {"ate_env.exit_code": res.exit_code, "ate_env.timed_out": res.timed_out}
+        )
+        annotate_span(span, exit=res.exit_code)
         # check=True raises after the span closes; mark it failed here so the
         # trace agrees with the caller. Only the exit state is recorded.
         if check and res.timed_out:
             mark_error(span, "command timed out")
+            annotate_span(span, ok=False, err="command timed out")
         elif check and res.exit_code != 0:
             mark_error(span, f"command exited with code {res.exit_code}")
+            annotate_span(span, ok=False, err=f"command exited with code {res.exit_code}")
 
     def exec(
         self,
@@ -111,10 +149,24 @@ class SandboxHandle:
         of ``check``.
         Returns ExecResult.
         """
+        first = self._note_first_command()
         to_s = self.default_timeout_s if timeout_s is None else timeout_s
-        with self._exec_span(command) as span, metrics.timed("exec"):
-            res = self.runtime.exec(command, cwd=cwd, env=env, timeout_s=to_s)
-            self._exec_result_attrs(span, res, check)
+        token = in_handle_span.set(True)
+        try:
+            with self._exec_span(command, first=first) as span, metrics.timed("exec"):
+                annotate_span(
+                    span,
+                    op="exec",
+                    env=self.sandbox_id,
+                    command=normalize_command_list(command, is_shell=True),
+                    instance=self.task.id if self.task else None,
+                    image=self.task.image if self.task else None,
+                    run_id=self.run_id,
+                )
+                res = self.runtime.exec(command, cwd=cwd, env=env, timeout_s=to_s)
+                self._exec_result_attrs(span, res, check)
+        finally:
+            in_handle_span.reset(token)
         if check and res.timed_out:
             raise CommandTimeoutError(
                 f"Command '{command}' timed out after {to_s:g}s:\n"
@@ -138,10 +190,24 @@ class SandboxHandle:
         check: bool = True,
     ) -> ExecResult:
         """Asynchronously execute command inside the sandbox."""
+        first = self._note_first_command()
         to_s = self.default_timeout_s if timeout_s is None else timeout_s
-        with self._exec_span(command) as span, metrics.timed("exec"):
-            res = await self.runtime.exec_async(command, cwd=cwd, env=env, timeout_s=to_s)
-            self._exec_result_attrs(span, res, check)
+        token = in_handle_span.set(True)
+        try:
+            with self._exec_span(command, first=first) as span, metrics.timed("exec"):
+                annotate_span(
+                    span,
+                    op="exec",
+                    env=self.sandbox_id,
+                    command=normalize_command_list(command, is_shell=True),
+                    instance=self.task.id if self.task else None,
+                    image=self.task.image if self.task else None,
+                    run_id=self.run_id,
+                )
+                res = await self.runtime.exec_async(command, cwd=cwd, env=env, timeout_s=to_s)
+                self._exec_result_attrs(span, res, check)
+        finally:
+            in_handle_span.reset(token)
         if check and res.timed_out:
             raise CommandTimeoutError(
                 f"Command '{command}' timed out after {to_s:g}s:\n"
@@ -158,27 +224,83 @@ class SandboxHandle:
 
     def write_file(self, path: str, content: bytes | str) -> None:
         """Write file content directly into sandbox filesystem."""
-        with self._file_span("write_file", path, content):
-            self.runtime.write_file(path, content)
+        token = in_handle_span.set(True)
+        try:
+            with self._file_span("write_file", path, content) as span:
+                annotate_span(
+                    span,
+                    op="write_file",
+                    env=self.sandbox_id,
+                    path=path,
+                    bytes=_size(content),
+                    instance=self.task.id if self.task else None,
+                    image=self.task.image if self.task else None,
+                    run_id=self.run_id,
+                )
+                self.runtime.write_file(path, content)
+        finally:
+            in_handle_span.reset(token)
 
     async def write_file_async(self, path: str, content: bytes | str) -> None:
         """Asynchronously write file content directly into sandbox filesystem."""
-        with self._file_span("write_file", path, content):
-            await self.runtime.write_file_async(path, content)
+        token = in_handle_span.set(True)
+        try:
+            with self._file_span("write_file", path, content) as span:
+                annotate_span(
+                    span,
+                    op="write_file",
+                    env=self.sandbox_id,
+                    path=path,
+                    bytes=_size(content),
+                    instance=self.task.id if self.task else None,
+                    image=self.task.image if self.task else None,
+                    run_id=self.run_id,
+                )
+                await self.runtime.write_file_async(path, content)
+        finally:
+            in_handle_span.reset(token)
 
     def read_file_bytes(self, path: str) -> bytes:
         """Read binary file content from sandbox filesystem."""
-        with self._file_span("read_file", path) as span:
-            data = self.runtime.read_file_bytes(path)
-            set_attributes(span, {"ate_env.file.size": len(data)})
-            return data
+        token = in_handle_span.set(True)
+        try:
+            with self._file_span("read_file", path) as span:
+                annotate_span(
+                    span,
+                    op="read_file",
+                    env=self.sandbox_id,
+                    path=path,
+                    instance=self.task.id if self.task else None,
+                    image=self.task.image if self.task else None,
+                    run_id=self.run_id,
+                )
+                data = self.runtime.read_file_bytes(path)
+                set_attributes(span, {"ate_env.file.size": len(data)})
+                annotate_span(span, bytes=len(data))
+                return data
+        finally:
+            in_handle_span.reset(token)
 
     async def read_file_bytes_async(self, path: str) -> bytes:
         """Asynchronously read binary file content from sandbox filesystem."""
-        with self._file_span("read_file", path) as span:
-            data = await self.runtime.read_file_bytes_async(path)
-            set_attributes(span, {"ate_env.file.size": len(data)})
-            return data
+        token = in_handle_span.set(True)
+        try:
+            with self._file_span("read_file", path) as span:
+                annotate_span(
+                    span,
+                    op="read_file",
+                    env=self.sandbox_id,
+                    path=path,
+                    instance=self.task.id if self.task else None,
+                    image=self.task.image if self.task else None,
+                    run_id=self.run_id,
+                )
+                data = await self.runtime.read_file_bytes_async(path)
+                set_attributes(span, {"ate_env.file.size": len(data)})
+                annotate_span(span, bytes=len(data))
+                return data
+        finally:
+            in_handle_span.reset(token)
 
     def initialize(
         self,

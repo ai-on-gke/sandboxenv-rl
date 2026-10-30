@@ -285,7 +285,7 @@ await env.write_file("/workspace/data.bin", patch, seek_offset=4096)
 
 ```python
 await env.suspend()   # checkpoint to a snapshot and free the worker
-await env.delete()    # remove permanently (suspends first if running)
+await env.delete()    # remove permanently, in any state
 ```
 
 A suspended environment keeps its filesystem and can be woken again just
@@ -377,10 +377,83 @@ new = fleet.add_tasks(next_batch)                    # Task objects or dicts
 fleet.warm_images(sorted({t.image for t in new}), wait=False)
 ```
 
+### Size warm pools
+
+A warm pool's depth is its image's share of `max_concurrent`, not its task
+count. At most `max_concurrent` claims are in flight, so an image with a tenth
+of the tasks needs about a tenth of `max_concurrent` warm replicas:
+
+```text
+replicas = clamp(round(max_concurrent × tasks_image / tasks_total),
+                 1, min(tasks_image, max_warmpool_replicas))
+```
+
+`plan()` and `setup()` share the budget among all images. `warm_images()`
+shares it among the images it is given, so a window of the `sliding` and
+`pipelined` strategies is sized for the claims it serves. `warm_images(imgs,
+replicas=n)` still sets the depth directly. For RL, where the G rollouts of one
+problem claim at the same time, `warm_per_task=True` gives every task its own
+replica up to `max_warmpool_replicas`:
+
+```python
+FleetConfig(max_concurrent=64, max_warmpool_replicas=16, warm_per_task=True)
+```
+
+`setup()` and `warm_images()` warm up to `warm_parallelism` (16) images at
+once. A failed image does not stop the others: the first error is raised once
+every image was tried.
+
+### Follow a trainer's batch stream with `LookaheadWarmer`
+
+An RL trainer owns its step loop. It knows the next batch or two ahead, and
+with off-policy staleness it may still be claiming for a batch it dispatched
+`max_staleness` steps ago. `LookaheadWarmer` keeps each image's pool sized for
+exactly the batches in flight:
+
+```python
+from ate_env import LookaheadWarmer
+
+warmer = LookaheadWarmer(fleet, keep_finished=max_staleness)  # cap = max_warmpool_replicas
+warmer.add(0, {img: n * G for img, n in batch0}, wait=True)   # start-up barrier
+warmer.add(1, counts_of(batch1))      # warms while step 0 runs
+...                                   # dispatch, fleet.acquire(task) per episode
+warmer.add(2, counts_of(batch2))
+warmer.finish(0)                      # kept for keep_finished more finishes, then drained
+warmer.close()                        # drains every pool it asked for
+```
+
+Each step's counts are its demand. An image's target is the sum of the
+*unclaimed* demand of live steps and the last `keep_finished` finished steps,
+capped at `cap`, and it is applied as the pool's idle size. Before each call
+the warmer reads how many sandboxes the fleet acquired per image since the last
+one (`fleet.acquired_count(img)`, warm or cold) and takes them off the steps'
+demand, oldest step first. Rollouts already served are not warmed for again,
+even when `cap` is below the demand and most of them were cold creates, and
+finishing a step drops only what its rollouts did not acquire, never the
+replicas of steps still live. Images change in parallel (`warm_parallelism`). A failed image lands in
+the returned `WarmReport.errors` and is retried on the next call, or is raised
+with `fail_fast=True`. `add_async` / `finish_async` / `close_async` run off the
+event loop, and an `AsyncSandboxFleet` works too.
+
+The warmer sizes pools with `fleet.set_pool_replicas(img, n)` (shrinking deletes
+idle paused actors only), reads them with `fleet.pool_size(img)` (None when the
+driver cannot tell) to trim recycled surplus, and counts claims with
+`fleet.acquired_count(img)`.
+
+### RL rollouts and benchmark adapters
+
+[USER_GUIDE.md](USER_GUIDE.md) covers what is specific to RL: overlapping
+sandbox claims with policy decoding (`AsyncSandboxFleet.acquire_batch`), and
+grading candidates with `ate_env.adapters` (`SweBenchAdapter`). The VeRL
+example in [`examples/verl_swebench`](../../examples/verl_swebench) uses both.
+
 ### Observability
 
 Three layers, all off the hot path when disabled. The base install has
-no telemetry dependency; the optional layers need extras:
+no telemetry dependency; the optional layers need extras. The
+repository-wide guide, with ate-env-api, the guest, collectors, Cloud
+Trace and the HTML report tool, is
+[docs/observability.md](../../docs/observability.md):
 
 ```bash
 pip install './clients/python[tracing,metrics]'
@@ -540,7 +613,7 @@ traces and lifecycle records without a mapping. Client-only fields use the
 | Key | Value | On |
 | --- | --- | --- |
 | `ate.actor.name` | environment id (the Substrate actor name) | every span of one environment: `Client` spans, `acquire`, `release`, `exec`, `write_file`, `read_file` |
-| `ate.atespace` | atespace | `Client` spans |
+| `ate.atespace` | atespace | `Client` spans; `exec`, `write_file`, `read_file` when the runtime has one (Substrate) |
 | `ate.template.name` | template name | `create_environment`, `ensure_template`, `acquire`, `warm_pool` |
 | `ate.template.atespace` | template atespace, when given | `create_environment` |
 | `ate_env.run_id` | fleet run id | `exec`, `write_file`, `read_file`, `acquire`, `warm_pool`, `reap` |
@@ -551,8 +624,14 @@ traces and lifecycle records without a mapping. Client-only fields use the
 | `ate_env.replicas` | warm pool size | `warm_pool` |
 | `ate_env.rootfs_image` | image reference without its tag | `create_environment` |
 
-`Client` spans also carry `rpc.system`, `rpc.service`, `rpc.method`,
-`server.address` and `server.port`, and have kind `CLIENT`.
+`Client` spans also carry `rpc.system.name` (`grpc`), `rpc.method` (the full
+gRPC method, for example `ateenv.v1alpha.EnvironmentService/CreateEnvironment`),
+`server.address` and `server.port`, and have kind `CLIENT`. These are the keys
+that otelgrpc puts on the `ate-env-api` server spans and the Go client's spans.
+Like otelgrpc, the client reads `OTEL_SEMCONV_STABILITY_OPT_IN` once at import:
+`rpc/old` gives the older `rpc.system`, `rpc.service` and the short
+`rpc.method` (`CreateEnvironment`), and `rpc/dup` gives both sets, with the full
+`rpc.method`. Set it to the same value for the client and for `ate-env-api`.
 
 **Time to first command (TTFC).** `acquire` ends when the create call
 returns. The wake and readiness wait happen inside the first command, so the

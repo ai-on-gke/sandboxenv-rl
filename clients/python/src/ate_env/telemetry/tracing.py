@@ -50,6 +50,16 @@ from typing import TYPE_CHECKING, Any
 import grpc
 import grpc.aio
 
+from .trace_recorder import (
+    TraceTapTracer,
+    get_default_trace_processor,
+    is_trace_mode,
+    should_auto_enable_tracing,
+)
+from .trace_recorder import (
+    current_slot_wait_s as current_slot_wait_s,
+)
+
 if TYPE_CHECKING:
     from ..config import TracerConfig
 
@@ -285,13 +295,58 @@ def start_span(
             raise
 
 
+# Which rpc.* keys rpc_attrs emits: "new" (the default), "old" or "dup" (both).
+_SEMCONV_NEW, _SEMCONV_OLD, _SEMCONV_DUP = "new", "old", "dup"
+
+
+def _rpc_semconv_mode(value: str | None) -> str:
+    """The rpc.* convention that OTEL_SEMCONV_STABILITY_OPT_IN selects.
+
+    Parsed as otelgrpc 0.72 parses it (``parseSemconvMode``), so the Python
+    client and the otelgrpc spans of ate-env-api and the Go client use the
+    same keys: a comma-separated list, each item trimmed; the first item that
+    is ``rpc/dup`` or ``rpc/old`` decides, and anything else means new.
+    """
+    for item in (value or "").split(","):
+        item = item.strip()
+        if item == "rpc/dup":
+            return _SEMCONV_DUP
+        if item == "rpc/old":
+            return _SEMCONV_OLD
+    return _SEMCONV_NEW
+
+
+# Read once at import, as otelgrpc reads it once when its handler is built.
+_RPC_SEMCONV_MODE = _rpc_semconv_mode(os.environ.get("OTEL_SEMCONV_STABILITY_OPT_IN"))
+
+
 def rpc_attrs(service: str, method: str, target: str | None) -> dict[str, Any]:
     """OTel semantic-convention attributes of one gRPC call.
 
-    service is the fully qualified gRPC service (``ateenv.v1alpha.X``) and
-    target the ``host:port`` of the channel (None for a caller-owned channel).
+    The rpc.* keys follow otelgrpc (0.72 and later), and so the ate-env-api
+    server spans and the Go client's spans, including its
+    OTEL_SEMCONV_STABILITY_OPT_IN switch:
+
+    - unset (new): ``rpc.system.name`` and ``rpc.method`` with the full method
+      name (``ateenv.v1alpha.EnvironmentService/CreateEnvironment``); no
+      ``rpc.service``.
+    - ``rpc/old``: ``rpc.system``, ``rpc.service`` and ``rpc.method`` with the
+      method name alone (``CreateEnvironment``).
+    - ``rpc/dup``: the keys of both; ``rpc.method`` is the full name, as in
+      otelgrpc, where the new value wins.
+
+    service is the fully qualified gRPC service (``ateenv.v1alpha.X``), method
+    the method name, and target the ``host:port`` of the channel (None for a
+    caller-owned channel).
     """
-    attrs: dict[str, Any] = {"rpc.system": "grpc", "rpc.service": service, "rpc.method": method}
+    full_method = f"{service}/{method}"
+    attrs: dict[str, Any]
+    if _RPC_SEMCONV_MODE == _SEMCONV_OLD:
+        attrs = {"rpc.system": "grpc", "rpc.service": service, "rpc.method": method}
+    elif _RPC_SEMCONV_MODE == _SEMCONV_DUP:
+        attrs = {"rpc.system": "grpc", "rpc.service": service, "rpc.system.name": "grpc", "rpc.method": full_method}
+    else:
+        attrs = {"rpc.system.name": "grpc", "rpc.method": full_method}
     if target:
         host, sep, port = target.rpartition(":")
         if sep and port.isdigit() and host:
@@ -331,8 +386,9 @@ def image_ref_attr(ref: str | None) -> str | None:
     return f"{name}{at}{digest}"
 
 
-# A leading shell variable assignment (``NAME=value``), e.g. ``API_KEY=x cmd``.
-_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# A leading shell variable assignment (``NAME=value`` or bash's ``NAME+=value``),
+# e.g. ``API_KEY=x cmd``. The Go client's envAssignment is the same pattern.
+_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
 
 
 def executable_attr(command: str | list[str] | tuple[str, ...]) -> str | None:
@@ -365,6 +421,9 @@ def mark_error(span: Any, description: str) -> None:
     """
     if span is None:
         return
+    if hasattr(span, "record_error"):
+        with contextlib.suppress(Exception):
+            span.record_error(description)
     otel = _load_otel()
     if otel is None:
         return
@@ -400,12 +459,21 @@ class TracerManager:
 
 def create_tracer_manager(config: TracerConfig) -> tuple[TracerManager | None, Any | None]:
     """Build a TracerManager from config; ``(None, None)`` when disabled or OTel absent."""
-    if config is None or not config.enable_tracing:
+    auto_trace = should_auto_enable_tracing(config)
+    if (config is None or not config.enable_tracing) and not auto_trace:
         return None, None
+    svc_name = config.trace_service_name if config is not None else "ate-env-client"
     if _load_otel() is None:
-        _log_missing_extra()
+        if is_trace_mode() and _OTEL is not False:
+            return None, TraceTapTracer(None, get_default_trace_processor())
+        if config is not None and config.enable_tracing:
+            _log_missing_extra()
+        if is_trace_mode():
+            return None, TraceTapTracer(None, get_default_trace_processor())
         return None, None
-    manager = TracerManager(service_name=config.trace_service_name)
+    manager = TracerManager(service_name=svc_name)
+    if auto_trace:
+        return manager, TraceTapTracer(manager.tracer, get_default_trace_processor())
     return manager, manager.tracer
 
 
@@ -415,9 +483,12 @@ def tracer_from_config(config: TracerConfig | None) -> Any | None:
     The tracer never installs a global provider; see initialize_tracer for
     where its spans go.
     """
-    if config is None or not config.enable_tracing:
+    auto_trace = should_auto_enable_tracing(config)
+    if (config is None or not config.enable_tracing) and not auto_trace:
         return None
-    initialize_tracer(config.trace_service_name)
+    svc_name = config.trace_service_name if config is not None else "ate-env-client"
+    if _load_otel() is not None:
+        initialize_tracer(svc_name)
     return create_tracer_manager(config)[1]
 
 

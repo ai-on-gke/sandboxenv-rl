@@ -29,7 +29,7 @@ import (
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/telemetry"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
-	"go.ate.dev/substrate/pkg/proto/ateapipb"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -84,6 +84,10 @@ type Server struct {
 	readyMu   sync.Mutex
 	pending   map[string]pendingCreate // atespace/id -> creation start, until the guest first answers
 	atespaces map[string]bool          // atespaces environments were created in, for EnvironmentCounts
+
+	// imageTemplates serializes the recreate of a failed derived template
+	// with the creates that use it.
+	imageTemplates imageTemplateLocks
 }
 
 // New creates a new Server.
@@ -124,7 +128,9 @@ func (s *Server) Close() {}
 // the container image and mounts the base's guest as a read-only image volume,
 // so the image runs unmodified (see ensureImageTemplate and
 // DeriveImageTemplate). It is created on first use and reused by later
-// creates on the same image, and the response reports it in
+// creates on the same image (created again when its golden snapshot build
+// failed long enough ago and no actor uses it; see
+// recreateFailedImageTemplate), and the response reports it in
 // Environment.template. When rootfs_image is empty the template is used as is.
 //
 // Errors: InvalidArgument for a missing id, a rootfs image not pinned by digest, a
@@ -132,8 +138,9 @@ func (s *Server) Close() {}
 // cannot be derived from (no containers, unpinned guest image, or a command
 // that cannot be re-rooted under the guest volume). FailedPrecondition when
 // the base template does not exist in the atespace, or when the derived name
-// is already held by a template running a different image. Other control
-// plane failures are mapped by toGRPCError.
+// is already held by a template running a different image. DeadlineExceeded
+// or Canceled when the request ends while a recreate of its derived template
+// runs. Other control plane failures are mapped by toGRPCError.
 func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (resp *ateenvv1alpha.CreateEnvironmentResponse, retErr error) {
 	if req.GetId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "id is required")
@@ -165,10 +172,11 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 	}
 
 	if image := req.GetRootfsImage(); image != "" {
-		name, err := s.ensureImageTemplate(ctx, atespace, templateName, image)
+		name, release, err := s.ensureImageTemplate(ctx, atespace, templateName, image)
 		if err != nil {
 			return nil, err
 		}
+		defer release()
 		templateName = name
 	}
 
@@ -196,40 +204,82 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 
 // ensureImageTemplate returns the name of the ActorTemplate that runs image
 // on top of base, creating it from base on first use. The derived template
-// lives in the environment's atespace, next to base.
-func (s *Server) ensureImageTemplate(ctx context.Context, atespace, base, image string) (string, error) {
-	name, err := ImageTemplateName(base, image)
+// lives in the environment's atespace, next to base. The caller must call
+// release once its actor is created: until then, this process does not
+// delete the template (see recreateFailedImageTemplate).
+func (s *Server) ensureImageTemplate(ctx context.Context, atespace, base, image string) (name string, release func(), err error) {
+	name, err = ImageTemplateName(base, image)
 	if err != nil {
-		return "", status.Error(codes.InvalidArgument, err.Error())
+		return "", nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	lock := s.imageTemplates.get(atespace, name)
+	if err := lock.rlock(ctx); err != nil {
+		return "", nil, err
+	}
+	tmpl, err := s.getOrCreateImageTemplate(ctx, atespace, base, name, image)
+	if err != nil {
+		lock.mu.RUnlock()
+		return "", nil, err
+	}
+	if !lock.recreateDue(tmpl, time.Now()) {
+		return name, lock.mu.RUnlock, nil
+	}
+	lock.mu.RUnlock()
+
+	lock.mu.Lock()
+	err = s.recreateFailedImageTemplate(ctx, lock, atespace, base, name, image)
+	lock.mu.Unlock()
+	if err != nil {
+		return "", nil, err
+	}
+	if err := lock.rlock(ctx); err != nil {
+		return "", nil, err
+	}
+	if _, err := s.getOrCreateImageTemplate(ctx, atespace, base, name, image); err != nil {
+		lock.mu.RUnlock()
+		return "", nil, err
+	}
+	return name, lock.mu.RUnlock, nil
+}
+
+// getOrCreateImageTemplate returns the derived template name, creating it
+// from base when it does not exist.
+func (s *Server) getOrCreateImageTemplate(ctx context.Context, atespace, base, name, image string) (*ateapipb.ActorTemplate, error) {
 	existing, err := s.client.GetActorTemplate(ctx, atespace, name)
 	switch {
 	case err == nil:
 		if got := firstContainerImage(existing); got != image {
-			return "", status.Errorf(codes.FailedPrecondition,
+			return nil, status.Errorf(codes.FailedPrecondition,
 				"actor template %q exists but runs %q, not %q; delete it or use another base template", name, got, image)
 		}
-		return name, nil
+		return existing, nil
 	case !errors.Is(err, ate.ErrNotFound):
-		return "", toGRPCError(err)
+		return nil, toGRPCError(err)
 	}
 	baseTmpl, err := s.client.GetActorTemplate(ctx, atespace, base)
 	if err != nil {
 		if errors.Is(err, ate.ErrNotFound) {
-			return "", status.Errorf(codes.FailedPrecondition,
+			return nil, status.Errorf(codes.FailedPrecondition,
 				"base actor template %q not found in atespace %q; register it first (ate-env manifest template)", base, atespace)
 		}
-		return "", toGRPCError(err)
+		return nil, toGRPCError(err)
 	}
 	derived, err := DeriveImageTemplate(baseTmpl, name, image)
 	if err != nil {
-		return "", status.Error(codes.InvalidArgument, err.Error())
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	// A concurrent create may have won the race; it built the same template.
-	if _, err := s.client.CreateActorTemplate(ctx, derived); err != nil && !errors.Is(err, ate.ErrAlreadyExists) {
-		return "", toGRPCError(err)
+	created, err := s.client.CreateActorTemplate(ctx, derived)
+	if err == nil {
+		return created, nil
 	}
-	return name, nil
+	if !errors.Is(err, ate.ErrAlreadyExists) {
+		return nil, toGRPCError(err)
+	}
+	// A concurrent create won the race; it built the same template.
+	if existing, err = s.client.GetActorTemplate(ctx, atespace, name); err != nil {
+		return nil, toGRPCError(err)
+	}
+	return existing, nil
 }
 
 func firstContainerImage(t *ateapipb.ActorTemplate) string {

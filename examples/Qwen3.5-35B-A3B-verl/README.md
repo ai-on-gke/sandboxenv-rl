@@ -89,7 +89,7 @@ after the last step whatever the length.
 |---|---|
 | `deploy.sh` | `up` / `logs` / `down`; renders the manifest, packs the ConfigMap, deletes leftover environments |
 | `job-fully-async.yaml` | Ray head Job + worker Job + headless Service, required pod anti-affinity, 8 GPUs each |
-| `run_fully_async.sh` | both pods: install pinned verl/uni-agent/provider, download the model; head: datasets, probe, Ray, verl `separate_async` |
+| `run_fully_async.sh` | both pods: install pinned verl/uni-agent/provider, download the model, build the datasets; head: probe, Ray, verl `separate_async` |
 | `task_config.yaml` | uni-agent task config: `r2e_gym` (train) and `swe_bench` (validation) on the `ate_env` provider, ReAct tools and SWE prompt |
 
 ## What it covers

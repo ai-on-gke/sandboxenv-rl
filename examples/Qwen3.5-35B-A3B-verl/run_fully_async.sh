@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 # Runs in both pods of job-fully-async.yaml.
-#   ROLE=worker : install, download the model, join the Ray head, block until the head stops Ray.
+#   ROLE=worker : install, download the model, build the datasets, join the Ray head, block until the head stops Ray.
 #   ROLE=head   : install, download the model, build the datasets, probe ate-env-api, start Ray, wait for
 #                 the worker node, then train with verl v1 separate_async:
 #                 Megatron trainer (TP2 EP8, whole node) + vLLM rollout engines (whole other node),
@@ -98,24 +98,25 @@ snapshot_download(repo_id="$MODEL_ID", revision="$MODEL_REVISION", local_dir="$M
 print("model ready: $MODEL_PATH")
 PY
 
-# Both pods: the uni-agent task runners are Ray tasks and run on either node, so every node needs the
-# task config and the image digest map at the same paths.
+# Both pods: the uni-agent task runners are Ray tasks and the verl trainer actor is placed by Ray, so either node may
+# run them; every node needs the task config, the image digest map and the datasets at the same paths.
 cp /workspace/cfg/images.json /workspace/agent/images.json
 export ATE_ENV_IMAGE_DIGESTS=/workspace/agent/images.json
 sed -e "s|\${ATE_ENV_ENDPOINT}|$ATE_ENV_ENDPOINT|g" -e "s|\${ATE_TEMPLATE}|$ATE_TEMPLATE|g" /workspace/cfg/task_config.yaml > /workspace/agent/task_config.yaml
+echo "=== Phase 3 (both pods): datasets ==="
+python3 -m uni_agent_substrate.datasets --source "$TRAIN_SOURCE" --split "$TRAIN_SPLIT" ${TRAIN_DATASET:+--dataset "$TRAIN_DATASET"} \
+    --max-instances "$TRAIN_INSTANCES" --image-digests /workspace/agent/images.json --out /workspace/data/train.parquet
+python3 -m uni_agent_substrate.datasets --source swe_bench --max-instances "$VAL_TASKS" --exclude-file /workspace/cfg/offline-exclusions.txt \
+    --image-digests /workspace/agent/images.json --out /workspace/data/val.parquet
 
 if [ "$ROLE" = "worker" ]; then
-  echo "=== Phase 3 (worker): join Ray head $RAY_HEAD_HOST:$RAY_PORT ==="
+  echo "=== Phase 4 (worker): join Ray head $RAY_HEAD_HOST:$RAY_PORT ==="
   for i in $(seq 1 360); do getent hosts "$RAY_HEAD_HOST" >/dev/null && break || sleep 10; done
   ray start --address="$RAY_HEAD_HOST:$RAY_PORT" --num-gpus=8 --num-cpus=40 --block || true   # returns when the head stops Ray
   echo "=== worker done ==="; exit 0
 fi
 
-echo "=== Phase 3 (head): datasets, ate-env-api probe ==="
-python3 -m uni_agent_substrate.datasets --source "$TRAIN_SOURCE" --split "$TRAIN_SPLIT" ${TRAIN_DATASET:+--dataset "$TRAIN_DATASET"} \
-    --max-instances "$TRAIN_INSTANCES" --image-digests /workspace/agent/images.json --out /workspace/data/train.parquet
-python3 -m uni_agent_substrate.datasets --source swe_bench --max-instances "$VAL_TASKS" --exclude-file /workspace/cfg/offline-exclusions.txt \
-    --image-digests /workspace/agent/images.json --out /workspace/data/val.parquet
+echo "=== Phase 3 (head): ate-env-api probe ==="
 export ENV_PREFIX ATE_TEMPLATE
 python3 - <<PY
 import asyncio, os, uuid

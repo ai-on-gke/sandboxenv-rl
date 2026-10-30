@@ -30,10 +30,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8",
+    "pytest>=9",
     "pytest-asyncio>=1.0",
     "grpcio-tools>=1.84",
-    "ruff==0.17.2",
+    "ruff~=0.17.2", # exact patch comes from flake.lock (Nix); see hack/ci/check-pins.py
 ]
 # OpenTelemetry tracing (ate_env.telemetry.tracing). 1.43 is the first release
 # whose opentelemetry-proto accepts protobuf 7. Only the OTLP/gRPC span

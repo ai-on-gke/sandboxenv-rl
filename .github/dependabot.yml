@@ -7,6 +7,12 @@
 # dependency is a path source Dependabot cannot resolve, nothing in it is
 # pinned, and its only other dependency, grpcio, is also one of the Python
 # client's. examples/ is not supported and has no entry.
+#
+# Keep docs/chores/check-pins.md in sync: its pin inventory and "When
+# Dependabot opens a PR" section describe which ecosystems, directories and
+# ignored dependencies this file covers. If you add, remove or ignore anything
+# here, update that doc in the same change. Substrate bumps are described in
+# docs/chores/check-substrate-head.md.
 version: 2
 updates:
   - package-ecosystem: gomod
@@ -32,8 +38,14 @@ updates:
     groups:
       python-deps:
         patterns: ["*"]
+    ignore:
+      # ruff's exact version comes from flake.lock; pyproject.toml only keeps a
+      # compatible range (~=) that check-pins verifies against Nix.
+      - dependency-name: ruff
   - package-ecosystem: github-actions
-    directory: /
+    # The workflows, plus the local composite actions under .github/actions,
+    # which pin actions of their own.
+    directories: ["/", "/.github/actions/*"]
     schedule:
       interval: weekly
     cooldown:
@@ -51,4 +63,22 @@ updates:
     labels: [dependencies]
     groups:
       openhands-layer-images:
+        patterns: ["*"]
+  # flake.lock pins the toolchain CI runs (Go, Python and its packages, ruff,
+  # ko, kind, kubectl; buf and the protobuf generators are go.mod tool lines,
+  # bumped by the gomod entry). A bump here is checked by ci-devenv.yaml,
+  # which fails with fix instructions if nixpkgs drifts from go.mod or a
+  # pyproject.toml.
+  - package-ecosystem: nix
+    directory: /
+    schedule:
+      # Every two weeks (1st and 15th) rather than weekly, while flake.nix
+      # follows nixos-unstable: fewer toolchain churn PRs.
+      interval: cron
+      cronjob: "0 6 1,15 * *"
+    cooldown:
+      default-days: 7 # a release has to be a week old before it is proposed
+    labels: [dependencies]
+    groups:
+      flake-inputs:
         patterns: ["*"]

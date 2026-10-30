@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+.DEFAULT_GOAL := build
+
 GOOGLE_CLOUD_PROJECT ?= $(shell gcloud config get-value project 2>/dev/null)
 ATE_ENV_IMAGE_REPO ?= gcr.io/$(GOOGLE_CLOUD_PROJECT)
+
+export PYTHONPATH := $(CURDIR)/clients/python/src:$(CURDIR)/integrations/nemo-gym/src$(if $(PYTHONPATH),:$(PYTHONPATH))
 
 # Baked into the ate-env CLI by build-cli (release.yaml does the same with the
 # published digests): `ate-env --version`, and the defaults of manifest
@@ -26,7 +30,51 @@ CLI_LDFLAGS := -X main.version=$(VERSION) -X main.defaultAPIImage=$(ATE_ENV_API_
 PRETTIER_VERSION := 3.8.3
 PRETTIER ?= npx --yes prettier@$(PRETTIER_VERSION)
 
-.PHONY: build build-cli install test vet clean images python-protos python-test nemo-gym-test verify-boilerplate verify-gofmt verify-docs format-docs
+.PHONY: build build-cli install test vet clean images python-protos python-test nemo-gym-test verify-boilerplate verify-gofmt verify-protos verify-docs format-docs \
+	help ci ci-go ci-python ci-openhands ci-e2e smoke check-substrate-head check-pins update-pins protos lint-actions-locally dev-shell
+
+help: ## Show this help message
+	@awk 'BEGIN {FS = ":[^#]*## "} /^[a-zA-Z0-9_-]+:[^#]*## / {printf "  %-22s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+ci: ## Run all local CI checks (Go and Python suites)
+	hack/ci-compat.sh ci
+
+ci-go: ## Run Go build, vet, test (-race), format, and proto checks
+	hack/ci-compat.sh ci-go
+
+ci-python: ## Run Python lint (ruff) and pytest test suites
+	hack/ci-compat.sh ci-python
+
+ci-openhands: ## Run OpenHands integration test and lint suite via openhands devShell
+	hack/ci-compat.sh --shell .#openhands sh -c 'python -m pytest integrations/openhands/tests -q && ruff check integrations/openhands examples/openhands'
+
+ci-e2e: ## Run end-to-end tests against local kind cluster
+	hack/ci-compat.sh --docker-socket ci-e2e
+
+smoke: ## Run smoke tests against a running cluster
+	hack/ci-compat.sh --host-network smoke
+
+check-substrate-head: ## Verify compatibility against substrate@HEAD (or custom REF/DIR via ARGS)
+	hack/ci-compat.sh check-substrate-head $(ARGS)
+
+check-pins: ## Verify flake and dependency pin freshness
+	hack/ci-compat.sh check-pins
+
+protos: ## Regenerate Go and Python protobuf stubs with the pinned generators (Go plugins in go.mod, grpcio-tools from the Nix env)
+	hack/ci-compat.sh sh -c 'make python-protos && go tool buf generate'
+
+update-pins: ## Update flake and dependency pins
+	hack/ci-compat.sh update-pins $(ARGS)
+
+lint-actions-locally: ## Lint GitHub Actions workflows locally (zizmor + actionlint)
+	hack/ci-compat.sh lint-actions-locally
+
+dev-shell: ## Enter interactive development shell
+	hack/ci-compat.sh bash
+
+# -----------------------------------------------------------------------------
+# Host-level targets (invoked directly or from within pinned runners)
+# -----------------------------------------------------------------------------
 
 build:
 	go build ./...
@@ -87,3 +135,6 @@ images:
 
 clean:
 	rm -rf bin
+
+verify-protos:
+	hack/verify/protos.sh

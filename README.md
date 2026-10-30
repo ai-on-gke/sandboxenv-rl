@@ -713,6 +713,97 @@ curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
        }
      }'
 ```
+## Local CI
+
+Maintainers run the CI checks locally using `make`, in a reproducible toolchain: tool versions come from `flake.lock`, `go.mod` (including the protobuf generators, via `tool` directives) and the `pyproject.toml` files, so a given commit gets the same toolchain on every host. The runs aren't hermetic: Kind E2E pulls `kindest/node`, Substrate images and `python:3.13-slim` by pinned digest at run time and clones Substrate at the `go.mod` pin.
+
+Supported hosts: CI runs on `x86_64-linux` (GitHub's `ubuntu-24.04`) with Go from `go.mod` and Python 3.13 (the previous workflow used 3.12); the uni-agent integration runs on Python 3.12, because upstream uni-agent doesn't support 3.13 yet. The flake also provides `aarch64-linux` and `aarch64-darwin` devShells. CI checks that the `aarch64-darwin` (Apple Silicon macOS) devShell builds and runs the basic tools, but runs the test suites only on Linux, so treat both as best effort. Intel macOS isn't supported, because current nixpkgs dropped `x86_64-darwin`. The E2E suite needs Docker on any host.
+
+Execution is managed by `hack/ci-compat.sh`, which automatically selects [Nix](https://nixos.org) (running impurely, inheriting your environment) and falls back to Docker (`Dockerfile.ci`) if Nix is not installed:
+
+```bash
+# Run all local CI checks (Go and Python suites)
+make ci
+
+# Run individual suites
+make ci-go
+make ci-python
+make ci-openhands
+make ci-e2e
+
+# Preserve the Kind cluster after ci-e2e completes
+KEEP_CLUSTER=1 make ci-e2e
+
+# Fast iteration: reuse an existing cluster without re-creating or deleting it
+REUSE_CLUSTER=sbx-e2e-abc123 make ci-e2e
+
+# Verify compatibility against substrate@HEAD (or custom git ref / local path)
+make check-substrate-head ARGS=main
+make check-substrate-head ARGS=../substrate
+
+# Verify and update dependency pins
+make check-pins
+make update-pins
+
+# Before pushing: lint GitHub Actions workflows locally (offline zizmor security audit + actionlint)
+make lint-actions-locally
+
+# Enter the interactive development shell
+make dev-shell
+
+# Enter project-specific development shells with isolated virtual environments
+nix develop .#openhands
+nix develop .#uni-agent
+
+# Override the runner (auto [default: nix -> docker], nix, docker, or host)
+CI_RUNNER=docker make ci
+```
+
+### Runners and Environment
+
+- **`auto` (default):** Runs via Nix (`nix develop -c <cmd>`) if `nix` is installed, else via Docker if `docker` is available.
+- **`nix`:** Runs impurely using `nix develop -c` without whitelisting or clearing the environment. In addition to the default devShell, project-specific devShells (`nix develop .#openhands` on Python 3.13 and `nix develop .#uni-agent` on Python 3.12) automatically create and activate isolated virtual environments with pinned native libraries (`LD_LIBRARY_PATH`) for integrations with floating PyPI dependencies.
+- **`docker`:** Automatically builds `sandboxenv-rl-ci:local` from a copy of the tree and runs the command in a container, with module caches in a named volume. Commands that write files (`make protos`, `make update-pins`) return a `git diff` that is applied on the host as you, so file ownership stays yours. Note that passing `--docker-socket` (used only by `make ci-e2e` in the Docker runner) mounts `/var/run/docker.sock`, which grants the container root-equivalent access to the host; `make smoke` uses `--host-network` instead. Both share the host network and mount the host kubeconfig read-only (a single file; a colon-separated `KUBECONFIG` isn't mounted), so `REUSE_CLUSTER` works under Docker too.
+- **`host`:** Executes the command directly on the host, with whatever is on `PATH`. Targets that only need Go and Python work without Nix or Docker: `make protos` needs Go (`GOTOOLCHAIN` fetches the version `go.mod` asks for) and `grpcio-tools` (`pip install -e 'clients/python[dev]'`); buf and the protoc plugins come from `go.mod` through `go tool`. The `ci-*`, `smoke`, `check-pins`, `update-pins`, `check-substrate-head` and `lint-actions-locally` commands are scripts the devShell provides, so with `host` they only work inside `nix develop`.
+
+> [!NOTE]
+> Online GitHub Actions security audits (such as ref-version-mismatch and impostor-commit) are covered by the organization's required GitHub Actions scan on pull requests. `make lint-actions-locally` runs zizmor in `--offline` mode alongside actionlint.
+
+### Developing against a local Substrate checkout
+
+When making cross-repository changes across [Agent Substrate](https://github.com/agent-substrate/substrate) and `sandboxenv-rl`, use Go workspaces (`go.work`) to link the checkouts:
+
+```bash
+# Initialize a Go workspace linking sandboxenv-rl and your local Substrate clone
+go work init . ../substrate
+
+# Or add Substrate to an existing workspace
+go work use ../substrate
+```
+
+Both `go.work` and `go.work.sum` are gitignored and never committed, ensuring CI always builds against the strictly pinned module version.
+
+To revert to the pinned `go.mod` dependency:
+```bash
+# Remove the workspace file
+rm go.work go.work.sum
+
+# Or temporarily bypass workspace mode for a command
+GOWORK=off make ci-go
+```
+
+**What uses the local checkout:**
+The Go module graph decides where Substrate comes from. When a workspace is active (or a `replace` directive is present in `go.mod`), the following tools automatically build against and run with your local Substrate checkout instead of the `go.mod` pin:
+- **Go compilation and test suites (`make ci-go` / `go build ./...` / `go test ./...`):** The Go compiler natively loads Substrate packages from the workspace directory.
+- **Substrate locator (`ensure-substrate`):** Discovers the local override from the module graph, prints the local directory, and skips commit hash checks (strict hash verification only applies when there is no override).
+- **Kind E2E integration pipeline (`make ci-e2e` / `hack/ci/e2e.py`):** Relies on `ensure-substrate` to build `kubectl-ate` from your local Substrate tree, compile the `ateworker-gvisor` container image from your local source, and execute cluster setup scripts (`hack/create-kind-cluster.sh` and `hack/install-ate-kind.sh`) directly from the local Substrate directory.
+
+Other tools do not consult the Go module graph: `check-pins` validates Nix and container digests against repository manifests, `nix devShell` manages CLI toolchain binaries, and `check-substrate-head` manages its own isolated target ref or temporary workspace.
+
+> [!NOTE]
+> **Parent-directory pitfall:** Go searches upward for `go.work` files. A `go.work` file placed in a parent directory (such as `~/Projects/rl-substrate/go.work`) will be discovered and applied to all child worktrees automatically. Run `go env GOWORK` to verify which `go.work` file is currently active.
+
+For maintenance chores and troubleshooting, see [Dependency pins and how to update them](docs/chores/check-pins.md), [Bumping the Substrate dependency](docs/chores/check-substrate-head.md), and the [Troubleshooting guide](docs/chores/troubleshooting.md).
 
 ## Observability
 

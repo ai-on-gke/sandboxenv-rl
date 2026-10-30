@@ -914,6 +914,7 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 	}
 	rep.AttachClusterTelemetry(sysDescPtr, outRep.Measurements)
 	swebench.NormalizeLegacyReport(rep)
+	rep.RecordTraceCapture(false, len(swebench.FindTraceFiles(destDir)))
 	if sysDescPtr != nil {
 		_ = sut.WriteSystemDescription(sysPath, *sysDescPtr)
 	}
@@ -941,7 +942,9 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 			endT = *outRep.Measurements.EndTS
 		}
 	}
-	_ = ensureRunWindowFile(destDir, runID, clusterName, startT, endT)
+	if err := ensureRunWindowFile(destDir, runID, clusterName, startT, endT, rep.TraceMetadata()); err != nil {
+		return fmt.Errorf("run_window.json: %w", err)
+	}
 
 	targetJSON := jsonOut
 	if targetJSON == "" {

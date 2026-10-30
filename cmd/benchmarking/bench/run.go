@@ -25,6 +25,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -319,8 +320,10 @@ func executeScenarioRun(
 	}
 	rep.AttachClusterTelemetry(&sysDesc, meas)
 	swebench.Validate(rep, swebench.ValidateOptions{
-		Footing:  runScen.Footing,
-		Schedule: sched,
+		Footing:        runScen.Footing,
+		Schedule:       sched,
+		TraceCaptured:  slices.ContainsFunc(runScen.Jobs, func(j schema.JobSpec) bool { return j.TraceMode == "trace" }),
+		TraceFileCount: len(swebench.FindTraceFiles(outDir)),
 	})
 
 	var mdBuf bytes.Buffer
@@ -328,7 +331,7 @@ func executeScenarioRun(
 	if err := os.WriteFile(filepath.Join(outDir, "report.md"), mdBuf.Bytes(), 0o644); err != nil {
 		return nil, err
 	}
-	if err := ensureRunWindowFile(outDir, runID, cluster, time.Time{}, time.Time{}); err != nil {
+	if err := ensureRunWindowFile(outDir, runID, cluster, time.Time{}, time.Time{}, rep.TraceMetadata()); err != nil {
 		return nil, err
 	}
 
@@ -346,7 +349,7 @@ func validateCmd(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	destDir := fs.String("dest", "", "Path to benchmark artifact directory ($ARTIFACT_DIR) for full bundle validation.")
-	folderName := fs.String("folder", "", "Optional 4-part GCS folder name (<YYYY-MM-DD>_<model>_<dataset>_<nickname>) to validate.")
+	folderName := fs.String("folder", "", "Optional GCS folder name to validate (<YYYY-MM-DD>_<model>_<dataset>_<nickname>[_traced]; _traced iff the bundle captured a trace).")
 	reportPath := fs.String("report", "", "Path to report.json (single-file mode when -dest is omitted).")
 	eventsPath := fs.String("events", "", "Optional path to events.jsonl (single-file mode).")
 	schedulePath := fs.String("schedule", "", "Optional path to schedule.json (single-file mode).")

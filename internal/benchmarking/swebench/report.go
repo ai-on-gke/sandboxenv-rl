@@ -367,6 +367,11 @@ type Report struct {
 	// SchemaEra identifies whether the report has post-audit or pre-audit-legacy telemetry.
 	SchemaEra string `json:"schema_era,omitempty"`
 
+	// TraceCaptured (Validity Rule 6): an SDK trace was captured, so latencies
+	// include trace overhead. Always emitted so "no trace" is explicit.
+	TraceCaptured  bool `json:"trace_captured"`
+	TraceFileCount int  `json:"trace_file_count,omitempty"`
+
 	// Auxiliary counters populated from event streams for validity rules and setup identification.
 	PrewarmCount        int  `json:"prewarm_count,omitempty"`
 	HasTraceEvents      bool `json:"has_trace_events,omitempty"`
@@ -2922,6 +2927,7 @@ func (rep *Report) WriteText(w io.Writer) {
 func (rep *Report) WriteMarkdown(w io.Writer) {
 	fmt.Fprintf(w, "# SWE-bench Benchmark Report (`%s`)\n\n", rep.RunID)
 	fmt.Fprintf(w, "- **Mode**: `%s`\n", rep.Mode)
+	fmt.Fprintf(w, "- **Trace captured**: %s\n", rep.TraceCapturedLabel())
 	if len(rep.Scopes) > 0 {
 		var scStrs []string
 		for _, sc := range rep.Scopes {
@@ -3202,7 +3208,8 @@ func WriteStatsJSONL(path string, s *Report, runID, testName, tag string) error 
 		ts = s.RunWindow.EndTS
 	}
 
-	baseLabels := map[string]string{}
+	// trace_captured on every row keeps traced and untraced runs from being aggregated together.
+	baseLabels := map[string]string{"trace_captured": strconv.FormatBool(s.TraceCaptured)}
 	if s.Mode != "" {
 		baseLabels["mode"] = s.Mode
 	}
@@ -3596,12 +3603,13 @@ func WriteComparison(w io.Writer, reps []*Report, names []string) {
 	}
 	fmt.Fprintln(tw)
 	row("mode", func(r *Report) string { return r.Mode })
+	row("trace_captured", func(r *Report) string { return strconv.FormatBool(r.TraceCaptured) })
 	row("reps", func(r *Report) string { return fmt.Sprintf("%d", r.Reps) })
 	row("tasks", func(r *Report) string { return fmt.Sprintf("%d", r.Tasks) })
 	row("failed", func(r *Report) string { return fmt.Sprintf("%d", r.Failed) })
 	row("reward_rate", func(r *Report) string { return fmt.Sprintf("%.3f", r.RewardRate) })
 	row("run_s", func(r *Report) string { return fmt.Sprintf("%.1f", r.RunMS/1000) })
-	builtin := map[string]bool{"run": true, "mode": true, "reps": true, "tasks": true, "failed": true, "reward_rate": true, "run_s": true}
+	builtin := map[string]bool{"run": true, "mode": true, "trace_captured": true, "reps": true, "tasks": true, "failed": true, "reward_rate": true, "run_s": true}
 	for _, k := range labelKeys(reps) {
 		if k == "mode" && labelMatchesMode(reps) {
 			continue // the loader's own label; the mode row above says it

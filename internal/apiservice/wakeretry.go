@@ -36,8 +36,14 @@ import (
 // router holds that request only for its own parking budget, a few seconds. A
 // wake that has to pull the environment's image onto the node or read its
 // snapshot across a region takes longer than that: 18 s for a cold image pull
-// and 7 s for a 1 GiB snapshot read across regions, measured on GKE.
-const DefaultWakeBudget = 2 * time.Minute
+// and 7 s for a 1 GiB snapshot read across regions, measured on GKE. The
+// control plane reports RUNNING only after the template's wakeup probe
+// passes, so the budget must also cover that probe's timeout: 120 s for a
+// template with a sidecar readiness URL (ate-env manifest template
+// --wakeup-timeout). Four minutes is that timeout plus the two minutes
+// this budget gave image pulls and snapshot reads before. A crashed or
+// deleted environment still fails at once, not after the budget.
+const DefaultWakeBudget = 4 * time.Minute
 
 // DefaultWakeRunningBudget bounds the wait when the control plane already
 // reports the environment RUNNING but the router still answers Unavailable.
@@ -63,7 +69,7 @@ const (
 // flips. Because the probe is the first request through the router, it is
 // also what wakes the actor; the calls that follow on conn find it up. The
 // state is read once per attempt, and the backoff caps attempts at roughly
-// one per two seconds, so a full two-minute wait costs about sixty
+// one per two seconds, so a full four-minute wait costs about 120
 // control-plane reads.
 //
 // With Metrics set, a wait (a first probe that found the guest unreachable)
@@ -117,6 +123,10 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 			s.finishCreate(atespace, id, telemetry.ReadyStatusCrashed)
 			return status.Errorf(codes.FailedPrecondition, "environment %s/%s crashed while waking: %v", atespace, id, err)
 		}
+		if state == ateapipb.ActorState_ACTOR_STATE_DELETING {
+			// It will not wake; the port proxy answers 404 for it too.
+			return status.Errorf(codes.NotFound, "environment %s/%s is being deleted", atespace, id)
+		}
 		allowed, since, which := budget, start, "wake budget"
 		if state == ateapipb.ActorState_ACTOR_STATE_RUNNING {
 			if runningSince.IsZero() {
@@ -152,6 +162,12 @@ func identityNote(id string) string {
 		return ""
 	}
 	return " (" + id + ")"
+}
+
+// ActorState is the state read ensureAwake uses, for the port proxy
+// (portproxy.Options.ActorState): a deleted environment is NotFound.
+func (s *Server) ActorState(ctx context.Context, atespace, id string) (ateapipb.ActorState, error) {
+	return s.actorState(ctx, atespace, id)
 }
 
 // actorState reads the actor's state from the control plane. A deleted

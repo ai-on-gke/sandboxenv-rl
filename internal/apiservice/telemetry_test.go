@@ -518,3 +518,22 @@ func TestCreateToReadyEndsOnPortProxyContact(t *testing.T) {
 		t.Errorf("create_to_ready{ok} after an unknown contact = %d samples, want still 1", n)
 	}
 }
+
+// A CRASHED state behind a port-proxy answer (ObserveCrashedContact, which
+// ate-env-api wires to portproxy.Options.OnCrashed) ends create_to_ready with
+// status crashed, once.
+func TestCreateToReadyEndsCrashedOnPortProxyContact(t *testing.T) {
+	te := newTelemetryEnv(t, false)
+	if _, err := te.envClient.CreateEnvironment(context.Background(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "broken"}); err != nil {
+		t.Fatal(err)
+	}
+	te.srv.ObserveCrashedContact(apiservice.DefaultAtespace, "broken")
+	crashed := map[string]string{"status": telemetry.ReadyStatusCrashed}
+	if n, _ := histogram(t, te.metrics, telemetry.MetricCreateToReadySeconds, crashed); n != 1 {
+		t.Fatalf("create_to_ready{crashed} after the proxied contact = %d samples, want 1", n)
+	}
+	te.srv.ObserveFirstContact(apiservice.DefaultAtespace, "broken")
+	if n, _ := histogram(t, te.metrics, telemetry.MetricCreateToReadySeconds, map[string]string{"status": telemetry.ReadyStatusOK}); n != 0 {
+		t.Errorf("create_to_ready{ok} after a later contact = %d samples, want 0", n)
+	}
+}

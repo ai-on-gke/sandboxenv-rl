@@ -132,6 +132,23 @@ func TestGuestCallFailsFastOnCrash(t *testing.T) {
 	}
 }
 
+// A deleting environment will not wake: the call fails at once with
+// NotFound, as the port proxy answers 404 for it.
+func TestGuestCallFailsFastOnDeleting(t *testing.T) {
+	te := newFullTestEnv(t)
+	envCtx := registerGuest(t, te, "deleting-test")
+	te.control.SetState("deleting-test", ateapipb.ActorState_ACTOR_STATE_DELETING)
+
+	start := time.Now()
+	_, err := te.procClient.StartProcess(envCtx, &ateenvv1alpha.StartProcessRequest{Command: []string{"sh", "-c", "true"}})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("StartProcess on a deleting environment: code %v (%v), want NotFound", status.Code(err), err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("took %s to report; the wake budget must not apply", elapsed)
+	}
+}
+
 // An environment that stays suspended past the wake budget fails with
 // Unavailable, naming the state and the attempt count.
 func TestGuestCallFailsWhenWakeBudgetExpires(t *testing.T) {

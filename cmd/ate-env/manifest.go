@@ -23,6 +23,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/hostcheck"
@@ -106,6 +107,21 @@ const sandboxConfigName = "gvisor-default"
 const (
 	defaultActorCPU    = "2"
 	defaultActorMemory = "4Gi"
+)
+
+// Wakeup-probe timeouts. Substrate fails an actor start or resume whose
+// probe has not answered 200 within the template's timeout_seconds (1 to
+// 3600; 30 when unset). The guest's /readyz waits for each --sidecar-readyz
+// URL, so a template with one inherits its sidecar's boot time: an OpenHands
+// agent-server takes 20 to 26 s on a quiet node and 22 to 29 s with 3 to 4
+// boots per node (p50 27.9 s), and 7 boots per node exceed 30 s. RL groups
+// start this way, many rollouts of one new task image at once, thus such a
+// template gets four times Substrate's 30 s default: about twice the 60 to
+// 65 s that 8 boots on a 16-CPU node extrapolate to.
+const (
+	substrateWakeupTimeout = 30 * time.Second
+	sidecarWakeupTimeout   = 120 * time.Second
+	maxWakeupTimeout       = 3600 * time.Second
 )
 
 // manifestConfig holds configuration for generating Kubernetes deployment manifests.
@@ -220,10 +236,39 @@ type templateConfig struct {
 	// Empty means defaultActorCPU and defaultActorMemory.
 	cpu    string
 	memory string
+	// wakeupTimeout is the wakeup probe's timeout_seconds as a duration.
+	// Zero means sidecarWakeupTimeout with --sidecar-readyz and
+	// substrateWakeupTimeout without.
+	wakeupTimeout time.Duration
 	// env are extra container environment variables, each NAME=VALUE. The
 	// guest passes its environment to sidecars, so this is how a runtime
 	// layer's daemon is configured.
 	env []string
+}
+
+// wakeupTimeoutSeconds returns the probe timeout the template carries.
+func (c *templateConfig) wakeupTimeoutSeconds() int32 {
+	d := c.wakeupTimeout
+	if d == 0 {
+		d = substrateWakeupTimeout
+		if len(c.sidecarReadyz) > 0 {
+			d = sidecarWakeupTimeout
+		}
+	}
+	return int32(d / time.Second)
+}
+
+// validateWakeupTimeout checks --wakeup-timeout against Substrate's bounds:
+// whole seconds from 1 s to 1 h. Zero means the default.
+func (c *templateConfig) validateWakeupTimeout() error {
+	d := c.wakeupTimeout
+	if d == 0 {
+		return nil
+	}
+	if d < time.Second || d > maxWakeupTimeout || d%time.Second != 0 {
+		return fmt.Errorf("--wakeup-timeout %s: want whole seconds from 1s to %s", d, maxWakeupTimeout)
+	}
+	return nil
 }
 
 // runtimeLayer is a parsed --layer value.
@@ -549,6 +594,9 @@ It prints YAML to stdout without touching the cluster.`,
 			if err := tCfg.validateResources(); err != nil {
 				return err
 			}
+			if err := tCfg.validateWakeupTimeout(); err != nil {
+				return err
+			}
 			if err := tCfg.validateEnv(); err != nil {
 				return err
 			}
@@ -573,6 +621,7 @@ It prints YAML to stdout without touching the cluster.`,
 	cmd.Flags().StringArrayVar(&tCfg.sidecarReadyz, "sidecar-readyz", nil, "URL the actor's readiness waits for, e.g. http://127.0.0.1:44772/ready (repeatable)")
 	cmd.Flags().StringVar(&tCfg.cpu, "cpu", defaultActorCPU, "CPU limit of each actor, a Kubernetes quantity such as 2 or 500m, at least 1m, rendered as whole millicores (rounded up); Substrate requires one")
 	cmd.Flags().StringVar(&tCfg.memory, "memory", defaultActorMemory, "memory limit of each actor, a Kubernetes quantity such as 4Gi, at least 1Mi, rendered as whole bytes (rounded up); Substrate requires one")
+	cmd.Flags().DurationVar(&tCfg.wakeupTimeout, "wakeup-timeout", 0, fmt.Sprintf("how long Substrate polls the guest's /readyz at each actor start and resume before it fails the actor, whole seconds from 1s to %s; 0 or unset means the default: %s with --sidecar-readyz, else Substrate's %s", maxWakeupTimeout, sidecarWakeupTimeout, substrateWakeupTimeout))
 	cmd.Flags().StringArrayVar(&tCfg.env, "env", nil, "environment variable for the actor's container as NAME=VALUE (repeatable); the guest passes it to sidecars, e.g. a layer daemon's API key")
 
 	return cmd
@@ -794,6 +843,7 @@ func buildActorTemplate(cfg templateConfig) *ateapipb.ActorTemplate {
 					Path: "/readyz",
 					Port: 80,
 				},
+				TimeoutSeconds: cfg.wakeupTimeoutSeconds(),
 			},
 		}},
 		SnapshotConfig: &ateapipb.SnapshotConfig{

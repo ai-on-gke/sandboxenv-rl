@@ -782,6 +782,14 @@ func (s *Server) ObserveFirstContact(atespace, id string) {
 	s.finishCreate(atespace, id, telemetry.ReadyStatusOK)
 }
 
+// ObserveCrashedContact ends create_to_ready (status crashed) for an
+// environment that the port proxy found CRASHED behind a router answer, as
+// ensureAwake does for a guest call. It does nothing for an environment that
+// is not pending, or without Metrics.
+func (s *Server) ObserveCrashedContact(atespace, id string) {
+	s.finishCreate(atespace, id, telemetry.ReadyStatusCrashed)
+}
+
 // finishCreate observes create_to_ready with readyStatus for a pending
 // environment, once; later calls for the same environment do nothing.
 func (s *Server) finishCreate(atespace, id, readyStatus string) {

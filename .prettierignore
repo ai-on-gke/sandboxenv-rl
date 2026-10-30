@@ -22,3 +22,4 @@
 !/.agents/**/*.md
 !/proto/ateenv/v1alpha/README.md
 !/clients/python/src/ate_env/_gen/README.md
+!/docs/plans/**/*.md

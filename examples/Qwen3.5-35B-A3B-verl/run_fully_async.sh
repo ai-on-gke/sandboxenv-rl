@@ -42,6 +42,9 @@ export PYTHONUNBUFFERED=1 HF_HOME=/workspace/hf HF_HUB_ENABLE_HF_TRANSFER=1 CUDA
 : "${PROMPT_LENGTH:=8192}"; : "${RESPONSE_LENGTH:=32768}"; : "${TRAIN_TP:=2}"; : "${TRAIN_CP:=1}"; : "${TRAIN_EP:=8}"; : "${ROLLOUT_TP:=2}"
 : "${ROLLOUT_HYBRID_FLAGS:=1}"           # vLLM flags for the hybrid (GDN) model; set 0 if your vLLM rejects them
 : "${ATE_ENV_ENDPOINT:=ate-env-api.ate-env.svc:7777}"; : "${ATE_TEMPLATE:=swe-2c6g}"
+# Ray CPU slots per node. Every session is a Ray task holding 1 CPU and the engines reserve 24 per node, so
+# 2 x (RAY_CPUS - 24) must cover SESSIONS; 40 capped a 128-session step at 32 concurrent sessions.
+: "${RAY_CPUS:=96}"
 MAX_MODEL_LEN=$((PROMPT_LENGTH + RESPONSE_LENGTH))
 mkdir -p /workspace/results /workspace/agent /workspace/data
 cd /workspace/results   # neutral cwd: the image's working directory holds a docker/ folder that shadows the docker package
@@ -112,7 +115,7 @@ python3 -m uni_agent_substrate.datasets --source swe_bench --max-instances "$VAL
 if [ "$ROLE" = "worker" ]; then
   echo "=== Phase 4 (worker): join Ray head $RAY_HEAD_HOST:$RAY_PORT ==="
   for i in $(seq 1 360); do getent hosts "$RAY_HEAD_HOST" >/dev/null && break || sleep 10; done
-  ray start --address="$RAY_HEAD_HOST:$RAY_PORT" --num-gpus=8 --num-cpus=40 --block || true   # returns when the head stops Ray
+  ray start --address="$RAY_HEAD_HOST:$RAY_PORT" --num-gpus=8 --num-cpus="$RAY_CPUS" --block || true   # returns when the head stops Ray
   echo "=== worker done ==="; exit 0
 fi
 
@@ -134,7 +137,7 @@ asyncio.run(probe())
 PY
 
 echo "=== Phase 4: Ray head + wait for $NNODES GPU nodes ==="
-ray start --head --port="$RAY_PORT" --num-gpus=8 --num-cpus=40 --disable-usage-stats
+ray start --head --port="$RAY_PORT" --num-gpus=8 --num-cpus="$RAY_CPUS" --disable-usage-stats
 export RAY_ADDRESS="127.0.0.1:$RAY_PORT"
 python3 - <<'WAIT'
 import os, time, ray

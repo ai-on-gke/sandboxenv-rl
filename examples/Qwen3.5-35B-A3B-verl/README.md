@@ -71,7 +71,8 @@ Knobs (Job env in `job-fully-async.yaml`): `TRAIN_SOURCE` / `TRAIN_SPLIT` /
 `TRAIN_INSTANCES` (192, >= `TOTAL_STEPS x TRAIN_BATCH`) / `TRAIN_DATASET`, `VAL_TASKS`, `TRAIN_BATCH`
 (16) = `SYNC_STEP` (2) x `MINI_BATCH` (8), `ROLLOUT_N` (8), `SESSIONS` (128), `GATEWAYS`,
 `AGENT_WORKERS`, `TOTAL_STEPS` (12), `PROMPT_LENGTH` (8192), `RESPONSE_LENGTH` (32768),
-`TRAIN_CP` (1; 2 if the 40k-token step runs out of memory), `ROLLOUT_TP` (2),
+`TRAIN_CP` (1; 2 if the 40k-token step runs out of memory), `ROLLOUT_TP` (2), `RAY_CPUS` (96 Ray
+CPU slots per node; sessions are Ray tasks, so 2 x (RAY_CPUS - 24) must cover `SESSIONS`),
 `ATE_TEMPLATE`, `ATE_ENV_ENDPOINT`. Sizing: `SESSIONS` defaults to `TRAIN_BATCH x ROLLOUT_N`
 so every trajectory of a step starts at once instead of queueing on the session cap, and
 `SANDBOX_STARTUP_CONCURRENCY` follows it. Keep `SESSIONS x 2 CPU / 6 GiB` within the worker

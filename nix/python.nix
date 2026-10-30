@@ -12,115 +12,136 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-{ pkgs, pyproject-nix }:
+{
+  pkgs,
+  pyproject-nix,
+  uv2nix,
+  pyproject-build-systems,
+}:
 
-# The devShell's Python: pkgs.python313 plus every dependency (base and all
-# extras) of the pyproject.toml files below whose PEP 508 marker matches this
-# interpreter, taken from nixpkgs by name, except the ones in `skipped` below:
-# our own projects, and extras listed in `skippedExtras`.
+# The Python envs of the devShells and the CI scripts, built from uv.lock with
+# uv2nix: every package is the exact version and wheel the lock names, so
+# `uv sync` outside Nix gives the same versions. The projects of the uv
+# workspace (pyproject.toml at the root) are installed editable, resolved
+# from $REPO_ROOT at run time (pureEnvSetup in nix/ci.nix exports it), so
+# editing their code needs no rebuild.
 #
-# Also provides a minimal env for clients/python with base + dev extra only
-# (no tracing/metrics) to test importorskip guards and fallbacks.
-#
-# Versions are not checked here, and a name nixpkgs lacks, removed or marks
-# broken is left out with a warning instead of failing evaluation, so
-# `make update-pins` can always run. hack/ci/check-pins.py compares the built
-# env with the pyproject.toml files and says what to fix.
-# See docs/chores/check-pins.md.
+# To add or bump a dependency, edit the pyproject.toml and run `uv lock` in
+# the devShell. See docs/chores/check-pins.md.
 let
   inherit (pkgs) lib;
-  inherit (pyproject-nix.lib)
-    pep508
-    pep621
-    project
-    pypa
-    ;
-  python = pkgs.python313;
-  environ = pep508.mkEnviron python;
 
-  clientProject = project.loadPyproject { projectRoot = ../clients/python; };
-  nemoProject = project.loadPyproject { projectRoot = ../integrations/nemo-gym; };
-  projects = [
-    clientProject
-    nemoProject
-  ];
+  workspace = uv2nix.lib.workspace.loadWorkspace { workspaceRoot = ../.; };
 
-  # Dependencies that deliberately don't come from nixpkgs, with the reason
-  # check-pins reports for them (it reads this through pureEnvSetup).
-  #
-  # Our own projects (e.g. nemo-gym-substrate depends on ate-env-client) are
-  # imported from this checkout through PYTHONPATH, not packaged.
-  localProjects = lib.listToAttrs (
-    map (p: {
-      name = pypa.normalizePackageName p.pyproject.project.name;
-      value = "a project in this repository, imported from the checkout through PYTHONPATH";
-    }) projects
-  );
-  # Extras whose packages nixpkgs doesn't have and the tests don't need, by
-  # project name. Every other extra is included.
-  skippedExtras = {
-    # nemo-gym itself is not in nixpkgs; the tests use the local fallback types.
-    nemo-gym-substrate = [ "gym" ];
+  # Wheels only, as uv picks them; the few packages without a usable wheel
+  # are built from source with the overrides below.
+  lockOverlay = workspace.mkPyprojectOverlay { sourcePreference = "wheel"; };
+
+  # uv.lock doesn't record build systems (astral-sh/uv#5190), so each package
+  # built from source names its own. Only the ones the envs below need.
+  buildSystemOverrides =
+    final: prev:
+    let
+      withBuildSystem =
+        name: spec:
+        prev.${name}.overrideAttrs (old: {
+          nativeBuildInputs = old.nativeBuildInputs ++ final.resolveBuildSystem spec;
+        });
+    in
+    {
+      # git source (integrations/uni-agent's uni-agent dependency group)
+      uni-agent = withBuildSystem "uni-agent" {
+        setuptools = [ ];
+        wheel = [ ];
+      };
+      # sdist only, from openhands-tools
+      func-timeout = withBuildSystem "func-timeout" { setuptools = [ ]; };
+    };
+
+  # Workspace projects, editable. Their sources are cut down to what the
+  # editable build reads (metadata and the top-level package), so only a
+  # metadata change rebuilds them. Dockerfile.ci copies the same files into
+  # its Nix layer.
+  editableOverlay = workspace.mkEditablePyprojectOverlay { root = "$REPO_ROOT"; };
+  # Each workspace project and its top-level package.
+  members = {
+    ate-env-client = "ate_env";
+    nemo-gym-substrate = "nemo_gym_substrate";
+    ate-env-openhands = "ate_env_openhands";
+    uni-agent-substrate = "uni_agent_substrate";
   };
-  extraSkips = lib.concatMapAttrs (
-    projectName: extras:
-    let
-      p = lib.findFirst (
-        p: p.pyproject.project.name == projectName
-      ) (throw "nix/python.nix: skippedExtras names unknown project ${projectName}") projects;
-      deps = pep621.filterDependenciesByEnviron environ [ ] p.dependencies;
-    in
-    lib.listToAttrs (
-      lib.concatMap (
-        extra:
-        map (d: {
-          name = d.name;
-          value = "only in the optional ${extra} extra of ${projectName}, which nix/python.nix leaves out";
-        }) (deps.extras.${extra} or [ ])
-      ) extras
-    )
-  ) skippedExtras;
-  skipped = localProjects // extraSkips;
-  notFromNix = builtins.attrNames skipped;
+  editableSources =
+    _final: prev:
+    lib.mapAttrs (
+      name: package:
+      prev.${name}.overrideAttrs (old: {
+        src = lib.fileset.toSource {
+          root = old.src;
+          fileset = lib.fileset.unions [
+            (old.src + "/pyproject.toml")
+            (old.src + "/README.md")
+            (old.src + "/src/${package}/__init__.py")
+          ];
+        };
+      })
+    ) members;
 
-  # tryEval turns removed (throwing) aliases and broken/insecure packages into
-  # false; isDerivation rejects non-package attrs of the set (e.g. `pkgs`).
-  usable =
-    ps: name:
-    let
-      r = builtins.tryEval (lib.isDerivation (ps.${name} or null) && ps.${name}.drvPath != "");
-    in
-    r.success && r.value
-    || lib.warn "nix/python.nix: ${name} left out of the Python env (not in nixpkgs, removed, or broken); run `make check-pins`" false;
-
-  buildEnv =
-    wanted:
-    python.withPackages (
-      ps: map (name: ps.${name}) (builtins.filter (usable ps) (lib.unique wanted)) ++ [ ps.packaging ]
+  mkPythonSet =
+    python:
+    (pkgs.callPackage pyproject-nix.build.packages { inherit python; }).overrideScope (
+      lib.composeManyExtensions [
+        pyproject-build-systems.overlays.wheel
+        lockOverlay
+        buildSystemOverrides
+        editableOverlay
+        editableSources
+      ]
     );
 
-  wantedAll = lib.subtractLists notFromNix (
-    lib.concatMap (
-      p:
-      let
-        deps = pep621.filterDependenciesByEnviron environ [ ] p.dependencies;
-      in
-      map (d: d.name) (deps.dependencies ++ lib.concatLists (builtins.attrValues deps.extras))
-    ) projects
-  );
+  # The default interpreter. uni-agent upstream declares requires-python
+  # <3.13, so its env stays on 3.12.
+  python = pkgs.python313;
+  pythonSet = mkPythonSet python;
+  python312Set = mkPythonSet pkgs.python312;
 
-  clientDeps = pep621.filterDependenciesByEnviron environ [ ] clientProject.dependencies;
-  wantedBase = lib.subtractLists notFromNix (
-    map (d: d.name) (clientDeps.dependencies ++ (clientDeps.extras.dev or [ ]))
-  );
+  # Every extra of a workspace project, as listed in its pyproject.toml.
+  allExtras = name: workspace.deps.optionals.${name};
 in
 {
-  # The interpreter both envs are built on. nix/ci.nix reuses it for the
-  # OpenHands venv, so bumping Python is this one line.
-  inherit python skipped;
-  # Everything: all projects, every extra. This is the devShell's Python.
-  pythonEnvFull = buildEnv wantedAll;
+  inherit python;
+
+  # Everything for the client and nemo-gym-substrate: every extra, except
+  # nemo-gym's `gym` (the real nemo-gym; its tests use local fallback types,
+  # and it pulls in ray). This is the devShell's Python.
+  pythonEnvFull = pythonSet.mkVirtualEnv "sandboxenv-rl-python" {
+    ate-env-client = allExtras "ate-env-client";
+    nemo-gym-substrate = lib.remove "gym" (allExtras "nemo-gym-substrate");
+  };
+
   # clients/python base dependencies plus only its dev extra (pytest), no
   # tracing/metrics: tests the client as a user without optional extras sees it.
-  pythonEnvBase = buildEnv wantedBase;
+  # Flake package python-env-base; ci-python builds it on first use, so the
+  # default devShell doesn't carry it.
+  pythonEnvBase = pythonSet.mkVirtualEnv "sandboxenv-rl-python-base" {
+    ate-env-client = [ "dev" ];
+  };
+
+  # integrations/openhands with its test extra (the agent-server the tests
+  # start); the .#openhands devShell and `make ci-openhands`.
+  openhandsEnv = pythonSet.mkVirtualEnv "sandboxenv-rl-python-openhands" {
+    ate-env-client = [ "dev" ];
+    ate-env-openhands = [ "test" ];
+  };
+
+  # integrations/uni-agent with its test extra and the uni-agent dependency
+  # group (uni-agent itself, from git), on Python 3.12; the .#uni-agent
+  # devShell, and ci-python's uni-agent suite (flake package
+  # python-env-uni-agent, built on first use like python-env-base).
+  uniAgentEnv = python312Set.mkVirtualEnv "sandboxenv-rl-python-uni-agent" {
+    ate-env-client = [ "dev" ];
+    uni-agent-substrate = [
+      "test"
+      "uni-agent"
+    ];
+  };
 }

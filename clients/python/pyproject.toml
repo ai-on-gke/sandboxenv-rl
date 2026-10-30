@@ -32,8 +32,11 @@ dependencies = [
 dev = [
     "pytest>=9",
     "pytest-asyncio>=1.0",
-    "grpcio-tools>=1.84",
-    "ruff~=0.17.2", # exact patch comes from flake.lock (Nix); see hack/ci/check-pins.py
+    # Generates the committed stubs in src/ate_env/_gen, which refuse to run on
+    # a grpcio older than the generator: keep it at the grpcio floor above, and
+    # move both together, then `make protos`.
+    "grpcio-tools==1.84.0",
+    "ruff~=0.17.2", # exact version in uv.lock; a minor bump changes the rules, so it is a deliberate edit
 ]
 # OpenTelemetry tracing (ate_env.telemetry.tracing). 1.43 is the first release
 # whose opentelemetry-proto accepts protobuf 7. Only the OTLP/gRPC span

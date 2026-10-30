@@ -170,10 +170,18 @@ type Options struct {
 	// no atespace.
 	Atespaces []string
 	// OnConnected, when set, is called with the environment's atespace and
-	// id each time the router accepts a CONNECT to one of its ports, after
-	// any wait for a wake. ate-env-api uses it to end create_to_ready when a
-	// port is an environment's first contact.
+	// id when an answer from the environment's port reaches the caller: the
+	// daemon answered, after any wake. It is not called for the router's or
+	// Envoy's own answers, which stand for an environment that sleeps,
+	// crashed, is deleting or is gone (see modifyResponse). ate-env-api uses
+	// it to end create_to_ready when a port is an environment's first
+	// contact. It can be called more than once for one environment.
 	OnConnected func(atespace, id string)
+	// OnCrashed, when set, is called with the environment's atespace and id
+	// when the state read behind a router answer finds the environment
+	// CRASHED, as the caller gets 410. ate-env-api uses it to end
+	// create_to_ready with status crashed.
+	OnCrashed func(atespace, id string)
 }
 
 // Proxy is an http.Handler that forwards each request to the environment port
@@ -576,9 +584,6 @@ func (p *Proxy) dial(ctx context.Context, _, addr string) (net.Conn, error) {
 		if err != nil && ctx.Err() != nil {
 			return nil, p.stopped(ctx, atespace, id, attempt, err)
 		}
-		if err == nil && p.opts.OnConnected != nil {
-			p.opts.OnConnected(atespace, id)
-		}
 		var re *routerError
 		if !errors.As(err, &re) || re.status != http.StatusServiceUnavailable {
 			return conn, err
@@ -647,31 +652,41 @@ type stateEntry struct {
 // The proxy never sends a request again. A refused WebSocket upgrade comes
 // here too.
 func (p *Proxy) modifyResponse(resp *http.Response) error {
-	if p.opts.ActorState == nil {
-		return nil
-	}
 	t, ok := resp.Request.Context().Value(targetKey{}).(target)
 	if !ok {
+		return nil
+	}
+	if p.opts.ActorState == nil {
+		// Without a state read the proxy cannot tell the router's 5xx from
+		// the daemon's; a lower status is the daemon's answer.
+		if resp.StatusCode < http.StatusInternalServerError {
+			p.connected(t)
+		}
 		return nil
 	}
 	head := resp.Request.Method == http.MethodHead
 	switch resp.StatusCode {
 	case http.StatusServiceUnavailable, http.StatusNotFound:
 		if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain") {
+			p.connected(t)
 			return nil
 		}
 		// HEAD has no body to match; status and content type decide, and
 		// the state read confirms.
 		if !head && !routerBody(resp, t) {
+			p.connected(t)
 			return nil
 		}
 	case http.StatusGatewayTimeout, http.StatusInternalServerError:
 		// Envoy's own answer when the wake outlasts its ext_proc timeout:
 		// no body. A daemon's error with a body is the daemon's.
 		if !head && resp.ContentLength != 0 {
+			p.connected(t)
 			return nil
 		}
 	default:
+		// The daemon answered, thus the environment is awake and serving.
+		p.connected(t)
 		return nil
 	}
 	st, err := p.actorState(resp.Request.Context(), t.atespace, t.id)
@@ -686,6 +701,7 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 		}
 	case st == ateapipb.ActorState_ACTOR_STATE_CRASHED:
 		replaceAnswer(resp, t, http.StatusGone, "CRASHED", "has crashed (actor state CRASHED); delete it and create a new one")
+		p.crashed(t)
 	case st == ateapipb.ActorState_ACTOR_STATE_DELETING:
 		replaceAnswer(resp, t, http.StatusNotFound, "DELETING", "is being deleted (actor state DELETING)")
 	case resp.StatusCode == http.StatusGatewayTimeout || resp.StatusCode == http.StatusInternalServerError:
@@ -699,6 +715,20 @@ func (p *Proxy) modifyResponse(resp *http.Response) error {
 		}
 	}
 	return nil
+}
+
+// connected reports an answer the daemon served to Options.OnConnected.
+func (p *Proxy) connected(t target) {
+	if p.opts.OnConnected != nil {
+		p.opts.OnConnected(t.atespace, t.id)
+	}
+}
+
+// crashed reports a CRASHED environment to Options.OnCrashed.
+func (p *Proxy) crashed(t target) {
+	if p.opts.OnCrashed != nil {
+		p.opts.OnCrashed(t.atespace, t.id)
+	}
 }
 
 // wakingStates are the states in which a timed-out wake goes on.

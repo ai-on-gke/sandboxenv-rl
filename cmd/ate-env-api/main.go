@@ -309,6 +309,7 @@ func main() {
 		if metrics != nil {
 			// A first contact through the port proxy ends create_to_ready too.
 			ppOpts.OnConnected = apisvc.ObserveFirstContact
+			ppOpts.OnCrashed = apisvc.ObserveCrashedContact
 		}
 		pp, err := portproxy.New(portProxyOptions(ppOpts, apisvc, callerAuth))
 		if err != nil {

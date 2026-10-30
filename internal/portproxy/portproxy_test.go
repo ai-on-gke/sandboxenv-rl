@@ -1511,7 +1511,9 @@ func TestCancelledRequestStopsTheWakeLoop(t *testing.T) {
 	srv := httptest.NewServer(p)
 	t.Cleanup(srv.Close)
 	s.router.RegisterPort("asleep", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	s.router.Running = func(string) bool { return false }
+	// An Envoy-level refusal is the one CONNECT answer the dial loop retries
+	// on: Substrate v0.6.0 accepts a CONNECT for any actor state.
+	s.router.RefuseConnect = func(string) (int, string) { return http.StatusServiceUnavailable, "upstream overflow" }
 
 	var wg sync.WaitGroup
 	for range 3 {
@@ -1611,7 +1613,14 @@ func TestParkedLastAttemptAtTheBudgetEnd(t *testing.T) {
 		t.Cleanup(srv.Close)
 		s.router.RegisterPort("parked", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "awake") }))
 		start := time.Now()
-		s.router.Running = func(string) bool { return tc.wakeAt > 0 && time.Since(start) >= tc.wakeAt }
+		// The recording router parks each CONNECT for hold before it answers;
+		// the refusal is at the Envoy level until the wake.
+		s.router.RefuseConnect = func(string) (int, string) {
+			if tc.wakeAt > 0 && time.Since(start) >= tc.wakeAt {
+				return 0, ""
+			}
+			return http.StatusServiceUnavailable, "upstream overflow"
+		}
 		// Attempt 1 is parked 0-3 s and refused; attempt 2 starts at 3.2 s,
 		// inside the 4 s budget, and is parked until 6.2 s, after it.
 		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
@@ -1641,10 +1650,13 @@ func TestSecondRequestSurvivesTheFirstOnesCancel(t *testing.T) {
 	s.router.RegisterPort("waking", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "awake") }))
 	var mu sync.Mutex
 	var wakeAt time.Time // zero: asleep
-	s.router.Running = func(string) bool {
+	s.router.RefuseConnect = func(string) (int, string) {
 		mu.Lock()
 		defer mu.Unlock()
-		return !wakeAt.IsZero() && time.Now().After(wakeAt)
+		if !wakeAt.IsZero() && time.Now().After(wakeAt) {
+			return 0, ""
+		}
+		return http.StatusServiceUnavailable, "upstream overflow"
 	}
 	newReq := func() *http.Request {
 		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
@@ -1683,9 +1695,10 @@ func TestSecondRequestSurvivesTheFirstOnesCancel(t *testing.T) {
 	}
 }
 
-// OnConnected fires once per accepted CONNECT, after the wake, with the
+// OnConnected fires once, on the answer the daemon serves, after two refused
+// CONNECTs; the refusals fire nothing.
 // environment's atespace and id; refused CONNECTs do not fire it.
-func TestOnConnectedFiresAfterTheWake(t *testing.T) {
+func TestOnConnectedFiresOnTheServedAnswerAfterRefusedConnects(t *testing.T) {
 	rr := &recordingRouter{Router: fakerouter.New()}
 	srv := httptest.NewServer(rr)
 	t.Cleanup(srv.Close)
@@ -1724,5 +1737,101 @@ func TestOnConnectedFiresAfterTheWake(t *testing.T) {
 	defer mu.Unlock()
 	if want := []string{"ate-env/waking"}; !slices.Equal(got, want) {
 		t.Errorf("OnConnected calls = %v, want %v (once, after two refused CONNECTs)", got, want)
+	}
+}
+
+// On Substrate v0.6.0 the router accepts the CONNECT at once and holds the
+// request inside it while the actor wakes. OnConnected fires once, on the
+// served answer, not when the tunnel opens.
+func TestOnConnectedWaitsForTheServedAnswerInsideTheTunnel(t *testing.T) {
+	s := newSetup(t)
+	var mu sync.Mutex
+	var got []string
+	p := mustNew(t, portproxy.Options{
+		ConnectAddr:      s.routerAddr,
+		DefaultAtespace:  "ate-env",
+		HandshakeTimeout: 5 * time.Second,
+		WakeBudget:       2 * time.Second,
+		ActorState: func(context.Context, string, string) (ateapipb.ActorState, error) {
+			return ateapipb.ActorState_ACTOR_STATE_RESUMING, nil
+		},
+		OnConnected: func(atespace, id string) {
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, atespace+"/"+id)
+		},
+	})
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+	s.router.RegisterPort("waking", 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "awake") }))
+	s.router.EnvoyTimeout = 2 * time.Second
+	start := time.Now()
+	s.router.Running = func(string) bool { return time.Since(start) >= 300*time.Millisecond }
+	code, body, _ := get(t, srv.URL, target("waking", 8000))
+	if code != http.StatusOK || body != "awake" {
+		t.Fatalf("got %d %q, want 200 \"awake\" after the wake inside the tunnel", code, body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"ate-env/waking"}; !slices.Equal(got, want) {
+		t.Errorf("OnConnected calls = %v, want %v (once, on the served answer)", got, want)
+	}
+}
+
+// The router's answers for an environment that sleeps or crashed are not a
+// contact: OnConnected stays silent, and a CRASHED state fires OnCrashed as
+// the caller gets 410.
+func TestRouterAnswersFireOnCrashedNotOnConnected(t *testing.T) {
+	s := newSetup(t)
+	var mu sync.Mutex
+	var connected, crashed []string
+	states := map[string]ateapipb.ActorState{
+		"asleep": ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+		"broken": ateapipb.ActorState_ACTOR_STATE_CRASHED,
+	}
+	p := mustNew(t, portproxy.Options{
+		ConnectAddr:      s.routerAddr,
+		DefaultAtespace:  "ate-env",
+		HandshakeTimeout: 5 * time.Second,
+		WakeBudget:       2 * time.Second,
+		ActorState: func(_ context.Context, _, id string) (ateapipb.ActorState, error) {
+			return states[id], nil
+		},
+		OnConnected: func(atespace, id string) {
+			mu.Lock()
+			defer mu.Unlock()
+			connected = append(connected, atespace+"/"+id)
+		},
+		OnCrashed: func(atespace, id string) {
+			mu.Lock()
+			defer mu.Unlock()
+			crashed = append(crashed, atespace+"/"+id)
+		},
+	})
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+	for _, id := range []string{"asleep", "broken"} {
+		s.router.RegisterPort(id, 8000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "awake") }))
+	}
+	s.router.Running = func(id string) bool { return id != "asleep" }
+	s.router.Deny = func(id string) (int, string) {
+		if id == "broken" {
+			return http.StatusServiceUnavailable, routerBody("broken", "CRASHED")
+		}
+		return 0, ""
+	}
+	if code, _, _ := get(t, srv.URL, target("asleep", 8000)); code != http.StatusServiceUnavailable {
+		t.Fatalf("asleep: got %d, want the router's 503", code)
+	}
+	if code, _, _ := get(t, srv.URL, target("broken", 8000)); code != http.StatusGone {
+		t.Fatalf("broken: got %d, want 410", code)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if connected != nil {
+		t.Errorf("OnConnected calls = %v, want none for the router's answers", connected)
+	}
+	if want := []string{"ate-env/broken"}; !slices.Equal(crashed, want) {
+		t.Errorf("OnCrashed calls = %v, want %v", crashed, want)
 	}
 }

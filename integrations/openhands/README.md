@@ -166,6 +166,14 @@ caller.
   ```
 - `port_url(port)` is the proxy URL of another port in the same environment. A request to it from
   outside the SDK adds `proxy_headers()` (empty without `api_token`).
+- `get_secrets()` returns `LookupSecret` references that the agent-server answers itself: each names
+  `http://127.0.0.1:<server_port>/api/settings/secrets/<name>` and carries the session key only.
+  Thus a lookup never goes through the port proxy, and `api_token` never enters the sandbox. The
+  agent-server resolves these URLs in process when it runs as `python -m openhands.agent_server`,
+  as the layer starts it: that start sets `OH_INTERNAL_SERVER_URL`. Started another way, it falls
+  back to an HTTP request to its own loopback address, authenticated by the session key, which can
+  stall its own event loop. Secret names follow the agent-server's rule
+  (`^[a-zA-Z][a-zA-Z0-9_]{0,63}$`).
 - A rejected session key fails the constructor with `PermissionError`; a version difference between
   `openhands-sdk` and the agent-server is logged as a warning.
 - The health wait stops at once on an answer that waiting cannot change: 401 or 403 from the proxy
@@ -380,6 +388,7 @@ does: 400 for port 80, and with a bearer token 401 for a request without it, and
 the answers that stop it at once (400, 401, 403, 404), cleanup after each failure (lost create answer,
 a create that lands after its timeout, refused create, health timeout, wrong session key), ownership
 (a failed attach or validation error deletes nothing, a copy never deletes), the token at the proxy,
+secret lookups that the agent-server answers in process without the token, invalid secret names,
 attach, pause and resume, exit ordering, files, the shared loop (`close_all`, the call timeout, a
 fork), and a `RemoteConversation` whose event WebSocket goes through the proxy. With the token,
 they cover the port capability: the proxy's test vector, the event WebSocket with a capability only,

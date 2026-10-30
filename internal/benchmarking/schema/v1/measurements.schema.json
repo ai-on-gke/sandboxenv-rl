@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-on-gke.github.io/sandboxenv-rl/schema/v1/measurements.schema.json",
+  "title": "Measurements",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "collected_at"],
+  "properties": {
+    "schema_version": { "type": "string", "enum": ["v1"] },
+    "run_id": { "type": "string", "minLength": 1 },
+    "collected_at": { "type": "string", "minLength": 1 },
+    "start_ts": { "type": "string", "minLength": 1 },
+    "end_ts": { "type": "string", "minLength": 1 },
+    "cache_before_ref": { "type": "string" },
+    "cache_after_ref": { "type": "string" },
+    "restore_timings_ref": { "type": "string" },
+    "logs_archive": { "type": "string" },
+    "prom_metrics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/PrometheusSeries" }
+    },
+    "server_summary": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/MetricSummary" }
+    },
+    "custom_metrics": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/MetricSummary" }
+    }
+  },
+  "$defs": {
+    "PrometheusSeries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "labels": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "status": { "type": "string", "enum": ["ok", "error"] },
+        "err": { "type": "string" },
+        "value": { "type": "number" },
+        "values": {
+          "type": "array",
+          "items": { "type": "number" }
+        }
+      }
+    },
+    "MetricSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "sum": { "type": "number" },
+        "min": { "type": "number" },
+        "max": { "type": "number" },
+        "p50": { "type": "number" },
+        "p90": { "type": "number" },
+        "p95": { "type": "number" },
+        "p99": { "type": "number" },
+        "unit": { "type": "string" }
+      }
+    }
+  }
+}

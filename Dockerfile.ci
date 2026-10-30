@@ -1,0 +1,57 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+FROM nixos/nix:latest@sha256:f159a58f390677f41e8e900a74b6e2f9c7f27b364122ae6acf7a652ce6c551c0 AS base
+
+ENV NIX_CONFIG="experimental-features = nix-command flakes"
+
+# Symlink Nix profile utilities into /bin for tests executing /bin/echo and similar standard FHS paths.
+RUN for f in /root/.nix-profile/bin/*; do [ -e "/bin/${f##*/}" ] || ln -s "$f" /bin/; done
+
+# Don't stay in the root directory for this.
+# https://github.com/NixOS/nix/issues/11217
+WORKDIR /workspace
+
+# The tree without the devShell, for `make update-pins`: it must run even when
+# the locked nixpkgs can't evaluate the devShell (e.g. go.mod asks for a Go
+# minor it lacks), which is exactly when the default stage below fails to build.
+# hack/ci-compat.sh builds this stage with `--target update-pins`.
+FROM base AS update-pins
+COPY . .
+RUN git init -q && git add -A && git -c user.email=ci@local -c user.name=ci commit -qm baseline
+
+FROM base
+
+# Copy just enough for Nix devShell and Go module caching without bringing in
+# the entire project, so we don't rebuild the Nix store layer on code edits.
+COPY flake.nix flake.lock go.mod go.sum ./
+COPY clients/python/pyproject.toml ./clients/python/
+COPY integrations/nemo-gym/pyproject.toml ./integrations/nemo-gym/
+COPY nix ./nix
+
+# Build the Nix flake devShell and pre-populate the Go module cache using the
+# exact versions locked in flake.lock.
+RUN nix develop path:///workspace -c go mod download
+
+# Copy the rest of the repository last so edits don't invalidate the Nix store layer.
+COPY . .
+
+# Initialize a clean baseline git repository so root-owned git commands
+# (verify-gofmt, verify-protos, go build VCS stamping) work cleanly without
+# dubious ownership errors or depending on host git state.
+RUN git init -q && git add -A && git -c user.email=ci@local -c user.name=ci commit -qm baseline
+
+ENTRYPOINT ["nix", "develop", "path:///workspace", "-c"]
+CMD ["ci"]
+

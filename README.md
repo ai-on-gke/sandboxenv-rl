@@ -36,6 +36,9 @@ The focus moves from a general environment service to RL training and evaluation
 
 ## Architecture
 
+See [docs/architecture.md](./docs/architecture.md) for the full system design and
+[docs/glossary.md](./docs/glossary.md) for terminology.
+
 ```
  ╭──────────────╮    ╭──────────────╮ lifecycle  ╭────────────╮
  │    Clients   │    │              ├───────────▶│   ateapi   │ Substrate control plane
@@ -49,15 +52,15 @@ The focus moves from a general environment service to RL training and evaluation
 
 | Path | What it is |
 |---|---|
-| [`cmd/ate-env`](cmd/ate-env) | CLI: create, suspend and delete environments, run commands, move files, and print the Kubernetes and Substrate manifests. |
-| [`cmd/ate-env-api`](cmd/ate-env-api) | The API service: environment lifecycle, guest calls, MCP and the port proxy. |
-| [`cmd/ate-env-guest`](cmd/ate-env-guest) | The daemon inside each environment: processes and files. |
-| [`clients/python`](clients/python/README.md) | Python client, import name `ate_env`: `Client` and `Env` for single environments, and the fleet SDK. |
-| [`clients/go`](clients/go) | Go client. |
+| [`cmd/ate-env`](./cmd/ate-env) | CLI: create, suspend and delete environments, run commands, move files, and print the Kubernetes and Substrate manifests. |
+| [`cmd/ate-env-api`](./cmd/ate-env-api) | The API service: environment lifecycle, guest calls, MCP and the port proxy. |
+| [`cmd/ate-env-guest`](./cmd/ate-env-guest) | The daemon inside each environment: processes and files. |
+| [`clients/python`](./clients/python/README.md) | Python client, import name `ate_env`: `Client` and `Env` for single environments, and the fleet SDK. |
+| [`clients/go`](./clients/go) | Go client. |
 | [`integrations/`](#integrations) | Framework integrations. |
 | [`examples/`](#examples) | Runnable examples. |
-| [`benchmarking/`](benchmarking/swebench/README.md), [`cmd/benchmarking`](cmd/benchmarking), [`internal/benchmarking`](internal/benchmarking/DESIGN.md) | The SWE-bench loader, its scripts and the benchmark design. |
-| [`docs/`](docs) | Rootfs images and runtime layers, the [metrics reference](docs/metrics.md), the [threat model](docs/security/threat-model.md), and how releases are cut. |
+| [`benchmarking/`](./benchmarking/swebench/README.md), [`cmd/benchmarking`](./cmd/benchmarking), [`internal/benchmarking`](./internal/benchmarking/DESIGN.md) | The SWE-bench loader, its scripts and the benchmark design. |
+| [`docs/`](./docs) | Architecture, glossary, rootfs images, runtime layers, the [metrics reference](./docs/metrics.md), the [threat model](./docs/security/threat-model.md), developer guides, and how releases are cut. |
 
 ## Examples
 
@@ -112,14 +115,16 @@ Deploy, and register a template ([deployment guide](#deployment-guide) explains 
 kubectl ate create atespace ate-env
 ate-env manifest access-policy | kubectl ate create access-policy -a ate-env -f -
 ate-env manifest --api-image <api-image> --worker-image <ateworker-gvisor-image> | kubectl apply -f -
+ate-env manifest auth-secret | kubectl create -f -   # the caller token; create it once
 ate-env manifest template --guest-image <guest-image> --snapshots-bucket <object-storage-url> \
   | kubectl-ate create actor-template -f -
 ```
 
-Try an environment:
+Try an environment. `ate-env-api` requires the token from the Secret:
 
 ```bash
 kubectl port-forward -n ate-env svc/ate-env-api 7777:7777 &
+export SUBSTRATE_ENV_AUTH_TOKEN="$(kubectl -n ate-env get secret ate-env-api-token -o jsonpath='{.data.token}' | base64 -d)"
 ate-env create dev1
 ate-env dev1 shell 'echo hello from $(hostname)'
 ate-env delete dev1
@@ -129,9 +134,12 @@ Drive environments from Python with the fleet SDK (`pip install ./clients/python
 `with` block deletes everything the fleet created:
 
 ```python
+import os
+
 from ate_env import FleetConfig, SandboxFleet, Task
 
-with SandboxFleet(FleetConfig(endpoint="127.0.0.1:7777")) as fleet:
+config = FleetConfig(endpoint="127.0.0.1:7777", auth_token=os.environ["SUBSTRATE_ENV_AUTH_TOKEN"])
+with SandboxFleet(config) as fleet:
     handle = fleet.acquire(Task(id="t1", image="docker.io/library/python@sha256:<digest>"))
     print(handle.exec(["python3", "-c", "print(6 * 7)"]).stdout)
     handle.write_file("/tmp/answer.txt", "42\n")
@@ -179,6 +187,9 @@ When you upgrade an existing cluster across these changes:
 
 - Create the atespace and the access policy (step 1) before you apply the new manifest. Without them
   `ate-env-api` fails at startup with `PermissionDenied` while it checks the default atespace.
+- Create the caller token Secret (`ate-env manifest auth-secret | kubectl create -f -`) if it does
+  not exist yet: `ate-env manifest` mounts `ate-env-api-token` by default unless `--insecure-no-auth`
+  is passed.
 - Base templates registered before keep working, because Substrate keeps their old `sandboxConfig`
   as an unknown field and drops it when it reads them, but they have no `workerSelector`. On a
   cluster with more than one WorkerPool, register them again (delete the base and its
@@ -254,6 +265,10 @@ ate-env manifest \
   --api-image      <registry>/ate-env-api@sha256:<digest> \
   --worker-image   <registry>/ateworker-gvisor@sha256:<digest> | kubectl apply -f -
 
+# The bearer token ate-env-api requires from callers. Each run prints a new
+# token, thus create the Secret once; ate-env-api starts when it exists.
+ate-env manifest auth-secret | kubectl create -f -
+
 # Ensure that the pods are running:
 kubectl get pods -n ate-env
 ```
@@ -278,15 +293,20 @@ does not set them, thus add them to the Deployment's arguments to change them.
   metrics listener has no authentication and no `Host` check: anyone who reaches it reads request
   counts, atespace names with environment counts, and the build version.
 
-By default `ate-env manifest` deploys `ate-env-api` without caller authentication for use over
-`kubectl port-forward`. Before exposing `ate-env-api` beyond loopback (e.g. through an internal
-LoadBalancer or to multi-tenant namespaces), create a Kubernetes Secret with a `token` key and pass
-`--auth-token-secret <secret-name>` to `ate-env manifest` (which mounts the secret and sets
-`-auth-token-file` on `ate-env-api`); callers then authenticate with `--auth-token-file`,
-`SUBSTRATE_ENV_AUTH_TOKEN` or `--auth-token` on the CLI (`--auth-token` shows the token in `ps`
-output and the shell history), `ClientOptions.AuthToken` in the Go SDK, `Client(..., auth_token=...)`
-in the Python SDK, or `Authorization: Bearer <token>` on MCP HTTP requests and port-proxy requests
-([Reaching a service inside an environment](#reaching-a-service-inside-an-environment)).
+`ate-env-api` requires a bearer token from each caller: `ate-env manifest` mounts the Secret that
+`--auth-token-secret` names (default `ate-env-api-token`, key `token`) and sets `-auth-token-file`.
+The pod does not start until the Secret exists. Read the token back for clients with
+`kubectl -n ate-env get secret ate-env-api-token -o jsonpath='{.data.token}' | base64 -d`; callers
+send it with `--auth-token-file`, `SUBSTRATE_ENV_AUTH_TOKEN` or `--auth-token` on the CLI
+(`--auth-token` shows the token in `ps` output and the shell history), `ClientOptions.AuthToken` in
+the Go SDK, `Client(..., auth_token=...)` or `FleetConfig(auth_token=...)` in the Python SDK, or
+`Authorization: Bearer <token>` on MCP HTTP requests and port-proxy requests
+([Reaching a service inside an environment](#reaching-a-service-inside-an-environment)). To
+rotate the token, replace the Secret's value; `ate-env-api` reads it again once the kubelet updates
+the mounted file, within about a minute. One token is valid at a time: from that moment, callers
+that still send the old one get 401, thus update the clients together with the Secret.
+`--insecure-no-auth` deploys `ate-env-api` without the token, in which case anyone who can reach
+its Service can create environments and run commands in them.
 The clients connect without TLS, thus the token travels in clear text. Past the cluster boundary,
 for example through an internal LoadBalancer, put TLS termination or a mesh with mTLS in front of
 `ate-env-api`.
@@ -346,8 +366,9 @@ for the design.
 Then create and use an environment:
 
 ```bash
-# Port-forward the ate-env-api service.
+# Port-forward the ate-env-api service and load the caller token.
 kubectl port-forward -n ate-env svc/ate-env-api 7777:7777 &
+export SUBSTRATE_ENV_AUTH_TOKEN="$(kubectl -n ate-env get secret ate-env-api-token -o jsonpath='{.data.token}' | base64 -d)"
 
 # Create an environment.
 ate-env create dev1
@@ -382,6 +403,7 @@ Alternatively, interact with the environment over MCP:
 
 ```bash
 curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
+     -H "Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" \
      -H "Content-Type: application/json" \
      -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"shell","arguments":{"command":"echo hi"}}}'
 ```
@@ -438,6 +460,12 @@ a cluster that already runs the Agent Substrate system: the target
 namespace, a WorkerPool of pre-warmed workers, and the ate-env-api service.
 It prints YAML to stdout without touching the cluster; apply it with kubectl.
 
+ate-env-api requires a bearer token from its callers, read from the Secret
+--auth-token-secret names (key token). Create that Secret once, in the
+namespace this manifest creates, with
+"ate-env manifest auth-secret | kubectl create -f -"; ate-env-api starts when
+the Secret exists. --insecure-no-auth deploys without the token.
+
 To generate the Substrate ActorTemplate manifest (for kubectl-ate), use
 the "template" subcommand: ate-env manifest template
 
@@ -447,26 +475,29 @@ Usage:
 
 Available Commands:
   access-policy Generate the Substrate access policy that lets ate-env-api manage environments
+  auth-secret   Generate the Secret with the bearer token ate-env-api requires from callers
   template      Generate Substrate ActorTemplate manifest
 
 Flags:
-      --api-allowed-hosts strings   extra host names that HTTP clients may use to reach ate-env-api, e.g. an internal load balancer name (a leading *. allows the names below it); the Service's in-cluster names, in the cluster's own DNS domain, IP addresses and localhost are always allowed
-      --api-image string            digest-pinned ate-env-api image for the API service (required: this ate-env was built from source; release binaries default to the image published with the release, see docs/release.md)
-      --api-port int32              port the ate-env-api service listens on (default 7777)
-      --api-replicas int32          number of API service replicas (default 1)
-      --api-router-tls              mount the pod identity certificate and the servicedns trust bundle into ate-env-api and dial the atenet router's TLS listeners, the only ones Substrate serves since v0.6.0; the API's SPIFFE ID must then be in the router's --ingress-allowed-spiffe-ids. Off, the API dials the plaintext addresses, which only the test fakes serve (default true)
-      --ateom-image string          alias for --worker-image, kept from before Substrate renamed ateom to ateworker
-      --auth-token-secret string    Kubernetes Secret name (with key 'token') to mount into ate-env-api and require as a caller bearer token
-      --enable-tracing              run ate-env-api with --enable-tracing, exporting OpenTelemetry traces over OTLP/gRPC
-  -h, --help                        help for manifest
-      --metrics-port int32          port ate-env-api serves Prometheus metrics on (--metrics-listen-addr), exposed on the container and the Service as "metrics" with prometheus.io scrape annotations; 0 leaves metrics off. The metrics listener has no authentication and no Host check
-      --namespace string            Kubernetes namespace to deploy into (default "ate-env")
-      --otlp-endpoint string        OTLP/gRPC collector endpoint for ate-env-api's traces, set as OTEL_EXPORTER_OTLP_ENDPOINT, e.g. http://otel-collector.observability:4317
-      --otlp-insecure               set OTEL_EXPORTER_OTLP_INSECURE=true: talk to the collector in plaintext
-      --replicas int32              number of pre-warmed worker pods (default 5)
-      --template string             ActorTemplate name (default "default-template")
-      --worker-image string         digest-pinned worker image for the worker pool, e.g. ateworker-gvisor built from the Substrate repo
-      --workerpool string           WorkerPool name (defaults to <template>-workerpool)
+      --api-allowed-hosts strings     extra host names that HTTP clients may use to reach ate-env-api, e.g. an internal load balancer name (a leading *. allows the names below it); the Service's in-cluster names, in the cluster's own DNS domain, IP addresses and localhost are always allowed
+      --api-image string              digest-pinned ate-env-api image for the API service (required: this ate-env was built from source; release binaries default to the image published with the release, see docs/release.md)
+      --api-port int32                port the ate-env-api service listens on (default 7777)
+      --api-replicas int32            number of API service replicas (default 1)
+      --api-router-tls                mount the pod identity certificate and the servicedns trust bundle into ate-env-api and dial the atenet router's TLS listeners, the only ones Substrate serves since v0.6.0; the API's SPIFFE ID must then be in the router's --ingress-allowed-spiffe-ids. Off, the API dials the plaintext addresses, which only the test fakes serve (default true)
+      --ateom-image string            alias for --worker-image, kept from before Substrate renamed ateom to ateworker
+      --auth-token-secret string      Kubernetes Secret (key 'token') mounted into ate-env-api; its value is the bearer token ate-env-api requires from callers. Create it with 'ate-env manifest auth-secret' (default "ate-env-api-token")
+      --enable-tracing                run ate-env-api with --enable-tracing, exporting OpenTelemetry traces over OTLP/gRPC
+  -h, --help                          help for manifest
+      --insecure-no-auth              deploy ate-env-api without a caller token: anyone who can reach its Service can create environments, run commands in them and reach their ports
+      --metrics-port int32            port ate-env-api serves Prometheus metrics on (--metrics-listen-addr), exposed on the container and the Service as "metrics" with prometheus.io scrape annotations; 0 leaves metrics off. The metrics listener has no authentication and no Host check
+      --namespace string              Kubernetes namespace to deploy into (default "ate-env")
+      --otlp-endpoint string          OTLP/gRPC collector endpoint for ate-env-api's traces, set as OTEL_EXPORTER_OTLP_ENDPOINT, e.g. http://otel-collector.observability:4317
+      --otlp-insecure                 set OTEL_EXPORTER_OTLP_INSECURE=true: talk to the collector in plaintext
+      --port-proxy-atespaces string   comma-separated atespaces whose environments ate-env-api's port proxy forwards to, or * for any (defaults to ate-env)
+      --replicas int32                number of pre-warmed worker pods (default 5)
+      --template string               ActorTemplate name (default "default-template")
+      --worker-image string           digest-pinned worker image for the worker pool, e.g. ateworker-gvisor built from the Substrate repo
+      --workerpool string             WorkerPool name (defaults to <template>-workerpool)
 
 Use "ate-env manifest [command] --help" for more information about a command.
 ```
@@ -546,7 +577,8 @@ and the proxy waits for the wake up to `--wake-budget` (the same wait as a guest
 answers 503.
 
 ```bash
-curl -H 'X-Env-Id: dev1' -H 'X-Env-Port: 6000' localhost:7777/health
+curl -H 'X-Env-Id: dev1' -H 'X-Env-Port: 6000' \
+     -H "X-Env-Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" localhost:7777/health
 ```
 
 Clients that cannot set headers, such as WebSocket clients and browsers, put the target in the path
@@ -556,18 +588,21 @@ outside `ate-env`. The API strips that prefix and forwards the rest, so a client
 through either form; gRPC to the daemon is not supported yet.
 
 ```bash
-curl localhost:7777/v1alpha/envs/dev1/ports/6000/health
+curl -H "Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" localhost:7777/v1alpha/envs/dev1/ports/6000/health
 ```
 
 The path form reaches the daemon exactly as sent: a path without the trailing slash is the daemon's
 root, and `//` or `..` after the prefix are not cleaned or redirected.
 
-**Who can use it.** Without `--auth-token-file`, the forwarding does not authenticate callers.
-Whoever can reach the API's listener can reach any TCP port of any actor the Substrate router serves,
-in any atespace, including actors that ate-env did not create. The guest API already reaches each actor that runs
-the guest; the forwarding extends that reach to every port. Keep the listener inside the cluster
-(the manifest's Service is `ClusterIP`), restrict it with a NetworkPolicy where other workloads
-share the cluster, and make each daemon check its own credential.
+**Who can use it.** The forwarding reaches environments only in the atespaces
+`--port-proxy-atespaces` names (default `ate-env`); a request for another atespace gets 403.
+Substrate actors carry no label that marks the ones ate-env created, thus inside those atespaces it
+reaches any TCP port of any actor, and a dedicated atespace for ate-env is the boundary. Without
+`--auth-token-file` (`ate-env manifest --insecure-no-auth`), it does not authenticate callers:
+whoever can reach the API's listener can reach those ports. The guest API already reaches each
+actor that runs the guest; the forwarding extends that reach to every port. Keep the listener inside
+the cluster (the manifest's Service is `ClusterIP`), restrict it with a NetworkPolicy where other
+workloads share the cluster, and make each daemon check its own credential.
 
 With `--auth-token-file`, each forwarded request, in either form, must carry the API's token, in
 `X-Env-Authorization: Bearer <token>` or in `Authorization: Bearer <token>`; the API answers 401
@@ -607,6 +642,7 @@ image keeps them. Add other names, such as an internal load balancer, with `--ap
 | `--allowed-hosts` | none | Comma-separated host names that HTTP callers may send in `Host`, next to IP addresses, `localhost`, names under `.localhost` and the names of `--service-name`, which are always allowed. A leading `*.` allows the names below it. Needed for a name such as an internal load balancer: `ate-env manifest --api-allowed-hosts` renders it. |
 | `--service-name` | `ate-env-api` | The Kubernetes Service in front of `ate-env-api`; its in-cluster names are allowed hosts. Empty allows none of them. |
 | `--atenet-connect` | `atenet-router.ate-system.svc.cluster.local:8081`, or `:8444` with `--atenet-client-cert` | The router's CONNECT listener. An empty value turns the forwarding off. |
+| `--port-proxy-atespaces` | `ate-env` | Comma-separated atespaces whose environments the forwarding reaches; `*` means any atespace the router serves. An empty value is an error. A request that names no atespace targets `ate-env`, thus list it to serve such requests. |
 | `--atenet-client-cert` | none | PEM credential bundle presented to the router's TLS listeners: the pod identity bundle the kubelet projects. With it, `--atenet` and `--atenet-connect` default to the TLS ports (443 and 8444), which are the only ones Substrate v0.6.0 serves. Re-read at every handshake. |
 | `--atenet-ca-file` | none | PEM trust bundle that signs the router's serving certificate, the servicedns bundle. Required with `--atenet-client-cert`; re-read at every handshake. |
 | `--atenet-server-name` | `atenet-router.ate-system.svc` | Name the router's serving certificate must carry. |
@@ -616,7 +652,9 @@ image keeps them. Add other names, such as an internal load balancer, with `--ap
 ## Built-in MCP Server
 
 The API exposes a streamable MCP endpoint at `POST /v1alpha/envs/{id}/mcp` serving built-in tools.
-Outside the `ate-env` atespace, add `?atespace=<name>` to the URL.
+Outside the `ate-env` atespace, add `?atespace=<name>` to the URL. Each request carries the caller
+token in `Authorization: Bearer <token>`; the examples read it from `SUBSTRATE_ENV_AUTH_TOKEN`. Leave
+the header out for an `ate-env-api` deployed with `--insecure-no-auth`.
 
 ### Available Tools
 
@@ -634,6 +672,7 @@ Clients communicate with the MCP server at `/v1alpha/envs/{id}/mcp` using JSON-R
 
 ```bash
 curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
+     -H "Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" \
      -H "Content-Type: application/json" \
      -H "Accept: application/json, text/event-stream" \
      -d '{
@@ -652,6 +691,7 @@ curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
 
 ```bash
 curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
+     -H "Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" \
      -H "Content-Type: application/json" \
      -H "Accept: application/json, text/event-stream" \
      -d '{
@@ -665,6 +705,7 @@ curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
 
 ```bash
 curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
+     -H "Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" \
      -H "Content-Type: application/json" \
      -H "Accept: application/json, text/event-stream" \
      -d '{
@@ -677,6 +718,103 @@ curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
        }
      }'
 ```
+## Local CI
+
+Maintainers run the CI checks locally using `make`, in a reproducible toolchain: tool versions come from `flake.lock`, `go.mod` (including the protobuf generators, via `tool` directives) and the `pyproject.toml` files, so a given commit gets the same toolchain on every host. The runs aren't hermetic: Kind E2E pulls `kindest/node`, Substrate images and `python:3.13-slim` by pinned digest at run time and clones Substrate at the `go.mod` pin.
+
+Supported hosts: CI runs on `x86_64-linux` (GitHub's `ubuntu-24.04`) with Go from `go.mod` and Python 3.13 (the previous workflow used 3.12); the uni-agent integration runs on Python 3.12, because upstream uni-agent doesn't support 3.13 yet. The flake also provides `aarch64-linux` and `aarch64-darwin` devShells. CI checks that the `aarch64-darwin` (Apple Silicon macOS) devShell builds and runs the basic tools, but runs the test suites only on Linux, so treat both as best effort. Intel macOS isn't supported, because current nixpkgs dropped `x86_64-darwin`. The E2E suite needs Docker on any host.
+
+Execution is managed by `hack/ci-compat.sh`, which automatically selects [Nix](https://nixos.org) (running impurely, inheriting your environment) and falls back to Docker (`Dockerfile.ci`) if Nix is not installed:
+
+```bash
+# Run all local CI checks (Go and Python suites)
+make ci
+
+# Run individual suites
+make ci-go
+make ci-python
+make ci-openhands
+make ci-e2e
+
+# Preserve the Kind cluster after ci-e2e completes
+KEEP_CLUSTER=1 make ci-e2e
+
+# Fast iteration: reuse an existing cluster without re-creating or deleting it
+REUSE_CLUSTER=sbx-e2e-abc123 make ci-e2e
+
+# Verify compatibility against substrate@HEAD (or custom git ref / local path)
+make check-substrate-head ARGS=main
+make check-substrate-head ARGS=../substrate
+
+# Verify and update dependency pins
+make check-pins
+make update-pins
+
+# Before pushing: lint GitHub Actions workflows locally (offline zizmor security audit + actionlint)
+make lint-actions-locally
+
+# Enter the interactive development shell
+make dev-shell
+
+# Enter project-specific development shells with isolated virtual environments
+nix develop .#openhands
+nix develop .#uni-agent
+
+# Override the runner (auto [default: nix -> docker], nix, docker, or host)
+CI_RUNNER=docker make ci
+```
+
+### Runners and Environment
+
+- **`auto` (default):** Runs via Nix (`nix develop -c <cmd>`) if `nix` is installed, else via Docker if `docker` is available.
+- **`nix`:** Runs impurely using `nix develop -c` without whitelisting or clearing the environment. In addition to the default devShell, project-specific devShells (`nix develop .#openhands` on Python 3.13 and `nix develop .#uni-agent` on Python 3.12) automatically create and activate isolated virtual environments with pinned native libraries (`LD_LIBRARY_PATH`) for integrations with floating PyPI dependencies.
+- **`docker`:** Automatically builds `sandboxenv-rl-ci:local` from a copy of the tree and runs the command in a container, with module caches in a named volume. Commands that write files (`make protos`, `make update-pins`) return a `git diff` that is applied on the host as you, so file ownership stays yours. Note that passing `--docker-socket` (used only by `make ci-e2e` in the Docker runner) mounts `/var/run/docker.sock`, which grants the container root-equivalent access to the host; `make smoke` uses `--host-network` instead. Both share the host network and mount the host kubeconfig read-only (a single file; a colon-separated `KUBECONFIG` isn't mounted), so `REUSE_CLUSTER` works under Docker too.
+- **`host`:** Executes the command directly on the host, with whatever is on `PATH`. Targets that only need Go and Python work without Nix or Docker: `make protos` needs Go (`GOTOOLCHAIN` fetches the version `go.mod` asks for) and `grpcio-tools` (`pip install -e 'clients/python[dev]'`); buf and the protoc plugins come from `go.mod` through `go tool`. The `ci-*`, `smoke`, `check-pins`, `update-pins`, `check-substrate-head` and `lint-actions-locally` commands are scripts the devShell provides, so with `host` they only work inside `nix develop`.
+
+> [!NOTE]
+> Online GitHub Actions security audits (such as ref-version-mismatch and impostor-commit) are covered by the organization's required GitHub Actions scan on pull requests. `make lint-actions-locally` runs zizmor in `--offline` mode alongside actionlint.
+
+### Developing against a local Substrate checkout
+
+When making cross-repository changes across [Agent Substrate](https://github.com/agent-substrate/substrate) and `sandboxenv-rl`, use Go workspaces (`go.work`) to link the checkouts:
+
+```bash
+# Initialize a Go workspace linking sandboxenv-rl and your local Substrate clone
+go work init . ../substrate
+
+# Or add Substrate to an existing workspace
+go work use ../substrate
+```
+
+Both `go.work` and `go.work.sum` are gitignored and never committed, ensuring CI always builds against the strictly pinned module version.
+
+To revert to the pinned `go.mod` dependency:
+```bash
+# Remove the workspace file
+rm go.work go.work.sum
+
+# Or temporarily bypass workspace mode for a command
+GOWORK=off make ci-go
+```
+
+**What uses the local checkout:**
+The Go module graph decides where Substrate comes from. When a workspace is active (or a `replace` directive is present in `go.mod`), the following tools automatically build against and run with your local Substrate checkout instead of the `go.mod` pin:
+- **Go compilation and test suites (`make ci-go` / `go build ./...` / `go test ./...`):** The Go compiler natively loads Substrate packages from the workspace directory.
+- **Substrate locator (`ensure-substrate`):** Discovers the local override from the module graph, prints the local directory, and skips commit hash checks (strict hash verification only applies when there is no override).
+- **Kind E2E integration pipeline (`make ci-e2e` / `hack/ci/e2e.py`):** Relies on `ensure-substrate` to build `kubectl-ate` from your local Substrate tree, compile the `ateworker-gvisor` container image from your local source, and execute cluster setup scripts (`hack/create-kind-cluster.sh` and `hack/install-ate-kind.sh`) directly from the local Substrate directory.
+
+Other tools do not consult the Go module graph: `check-pins` validates Nix and container digests against repository manifests, `nix devShell` manages CLI toolchain binaries, and `check-substrate-head` manages its own isolated target ref or temporary workspace.
+
+> [!NOTE]
+> **Parent-directory pitfall:** Go searches upward for `go.work` files. A `go.work` file placed in a parent directory (such as `~/Projects/rl-substrate/go.work`) will be discovered and applied to all child worktrees automatically. Run `go env GOWORK` to verify which `go.work` file is currently active.
+
+For maintenance chores and troubleshooting, see [Dependency pins and how to update them](docs/chores/check-pins.md), [Bumping the Substrate dependency](docs/chores/check-substrate-head.md), and the [Troubleshooting guide](docs/chores/troubleshooting.md).
+
+## Observability
+
+Run reports, Prometheus metrics and OpenTelemetry traces across the Python client, ate-env-api,
+the guest and the Go client, all off by default except the run report: see
+[docs/observability.md](docs/observability.md) and the metric reference [docs/metrics.md](docs/metrics.md).
 
 ## Security
 

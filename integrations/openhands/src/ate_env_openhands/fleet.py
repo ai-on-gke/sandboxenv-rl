@@ -69,16 +69,20 @@ def _reject_fleet_owned(kwargs: dict[str, Any], what: str) -> None:
 
 def _defaults_from_handle(handle: Any) -> dict[str, Any]:
     """What the handle knows that the workspace needs: the ate-env-api
-    address its data plane points at, and the atespace of its backend. A
-    caller's explicit kwargs win."""
+    address its data plane points at, and the atespace and caller token of
+    its backend (``FleetConfig.auth_token``). A caller's explicit kwargs win."""
     defaults: dict[str, Any] = {}
     data_plane = getattr(handle, "data_plane", None)
     address = getattr(data_plane, "address", None)
     if address:
         defaults["api_url"] = address
-    atespace = getattr(getattr(handle, "backend", None), "atespace", None)
+    backend = getattr(handle, "backend", None)
+    atespace = getattr(backend, "atespace", None)
     if atespace:
         defaults["atespace"] = atespace
+    token = getattr(backend, "auth_token", None)
+    if isinstance(token, str) and token:
+        defaults["api_token"] = token
     return defaults
 
 
@@ -89,8 +93,8 @@ def make_handle_workspace(handle: Any, **workspace_kwargs: Any) -> AteEnvWorkspa
     The form for ``fleet.run(process_fn)``: the fleet hands ``(task, handle)``
     to the function and releases the handle when it returns, so
     ``workspace.cleanup()`` only drops HTTP state. ``api_url``, ``proxy_url``,
-    ``api_key`` and the timeouts pass through; ``api_url`` and ``atespace``
-    default from the handle when it carries them. Fleet-owned fields
+    ``api_key`` and the timeouts pass through; ``api_url``, ``atespace`` and
+    ``api_token`` default from the handle when it carries them. Fleet-owned fields
     (``template``, ``image``, ``env_id``, ``delete_on_exit``) raise.
     """
     _reject_fleet_owned(workspace_kwargs, "make_handle_workspace")

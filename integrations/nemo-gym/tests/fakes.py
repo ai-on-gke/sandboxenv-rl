@@ -83,6 +83,18 @@ class FakeAteEnv:
     # None accepts any call. auth_seen records (method, authorization values).
     require_token: str | None = None
     auth_seen: list[tuple[str, list[str]]] = field(default_factory=list)
+    # Parking. suspends records (env id, SuspendMode value) per
+    # SuspendEnvironment; suspend_code refuses them; reject_local answers
+    # INVALID_ARGUMENT to SUSPEND_MODE_LOCAL, as an ate-env-api that predates
+    # the field does; suspend_settle_polls keeps the environment SUSPENDING
+    # for that many GetEnvironment calls before it settles. A guest call
+    # wakes a parked environment, as ate-env-api does, and fails on one that
+    # is still SUSPENDING, as the router does.
+    suspends: list[tuple[str, int]] = field(default_factory=list)
+    suspend_code: grpc.StatusCode | None = None
+    reject_local: bool = False
+    suspend_settle_polls: int = 0
+    _settling: dict[str, tuple[int, int]] = field(default_factory=dict)
     _probes: int = 0
     _seq: int = 0
 
@@ -106,6 +118,11 @@ async def _env_from_metadata(state: FakeAteEnv, context) -> str:
         await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "missing x-env-id metadata")
     if env_id not in state.envs:
         await context.abort(grpc.StatusCode.NOT_FOUND, f"environment {env_id!r} not found")
+    status = state.envs[env_id]["status"]
+    if status in (int(EnvironmentStatus.SUSPENDING), int(EnvironmentStatus.PAUSING)):
+        await context.abort(grpc.StatusCode.UNAVAILABLE, f"environment {env_id!r} is suspending")
+    if status in (int(EnvironmentStatus.SUSPENDED), int(EnvironmentStatus.PAUSED)):
+        state.set_status(env_id, EnvironmentStatus.RUNNING)  # the wake
     return env_id
 
 
@@ -142,12 +159,34 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
             await context.abort(s.get_code, "get refused")
         if request.id not in s.envs:
             await context.abort(grpc.StatusCode.NOT_FOUND, "no such env")
+        settling = s._settling.get(request.id)
+        if settling is not None:
+            polls_left, final = settling
+            if polls_left <= 1:
+                s._settling.pop(request.id)
+                s.envs[request.id]["status"] = final
+            else:
+                s._settling[request.id] = (polls_left - 1, final)
         return env_pb2.GetEnvironmentResponse(environment=s.env_pb(request.id))
 
     async def SuspendEnvironment(self, request, context):
-        if request.id not in self.state.envs:
+        s = self.state
+        if request.id not in s.envs:
             await context.abort(grpc.StatusCode.NOT_FOUND, "no such env")
-        self.state.set_status(request.id, EnvironmentStatus.SUSPENDED)
+        s.suspends.append((request.id, int(request.mode)))  # every request seen, refused ones too
+        if s.suspend_code is not None:
+            await context.abort(s.suspend_code, "suspend refused")
+        if s.reject_local and request.mode == env_pb2.SUSPEND_MODE_LOCAL:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "unknown field 3 in SuspendEnvironmentRequest")
+        if s.envs[request.id]["status"] != int(EnvironmentStatus.RUNNING):
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "environment is not RUNNING")
+        # Like ate-env-api: a local suspend is PAUSED until its upload lands.
+        final = EnvironmentStatus.PAUSED if request.mode == env_pb2.SUSPEND_MODE_LOCAL else EnvironmentStatus.SUSPENDED
+        if s.suspend_settle_polls > 0:
+            s.set_status(request.id, EnvironmentStatus.SUSPENDING)
+            s._settling[request.id] = (s.suspend_settle_polls, int(final))
+        else:
+            s.set_status(request.id, final)
         return env_pb2.SuspendEnvironmentResponse()
 
     async def DeleteEnvironment(self, request, context):

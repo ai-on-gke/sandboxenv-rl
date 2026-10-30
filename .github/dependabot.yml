@@ -42,3 +42,13 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+  - package-ecosystem: docker # the OpenHands layer's digest-pinned base images
+    directory: /integrations/openhands/layer
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7 # a release has to be a week old before it is proposed
+    labels: [dependencies]
+    groups:
+      openhands-layer-images:
+        patterns: ["*"]

@@ -213,47 +213,158 @@ func (l *lineLogger) flush() {
 // again. Readiness is a start-up gate, so Substrate's wakeup probe admits
 // traffic only when every runtime in the actor is serving, not a liveness
 // check on the sidecars.
+//
+// The sidecar check does not run on the probe request. Substrate drops each
+// probe request after 250 ms and polls every 1 ms, so a check bound to the
+// request would be cancelled with it, and a sidecar that takes longer than
+// 250 ms to answer would never count as ready. Each pending URL has at most
+// one check in flight, with its own checkTimeout, and checks of one URL
+// start at least minInterval apart. Ready starts the checks of all pending
+// URLs together and waits up to readyWait in total for them, thus fast
+// sidecars' answers, 2xx or not, are returned at once, and slow ones are
+// recorded for a later probe.
 type readyGate struct {
-	urls   []string
-	client *http.Client
+	urls         []string
+	client       *http.Client
+	checkTimeout time.Duration
+	readyWait    time.Duration
+	minInterval  time.Duration
 
-	mu   sync.Mutex
-	seen map[string]bool
+	mu        sync.Mutex
+	seen      map[string]bool
+	inflight  map[string]*readyCheck
+	last      map[string]string
+	lastStart map[string]time.Time
 }
+
+// readyCheck is one request to a sidecar readiness URL. ok and why are set
+// before done is closed.
+type readyCheck struct {
+	done chan struct{}
+	ok   bool
+	why  string
+}
+
+const (
+	// sidecarCheckTimeout bounds one request to a sidecar readiness URL.
+	sidecarCheckTimeout = 2 * time.Second
+	// sidecarReadyWait bounds how long one /readyz call waits for the checks
+	// in flight, all URLs together; it stays well inside the wakeup probe's
+	// 250 ms request limit.
+	sidecarReadyWait = 100 * time.Millisecond
+	// sidecarCheckInterval is the shortest gap between two check starts for
+	// one URL. The probe polls each 1 ms, and a sidecar that refuses
+	// connections at once would otherwise get about 1000 requests a second
+	// while it boots.
+	sidecarCheckInterval = 50 * time.Millisecond
+)
 
 func newReadyGate(urls []string) *readyGate {
 	return &readyGate{
-		urls:   urls,
-		client: &http.Client{Timeout: 2 * time.Second},
-		seen:   make(map[string]bool, len(urls)),
+		urls:         urls,
+		client:       &http.Client{},
+		checkTimeout: sidecarCheckTimeout,
+		readyWait:    sidecarReadyWait,
+		minInterval:  sidecarCheckInterval,
+		seen:         make(map[string]bool, len(urls)),
+		inflight:     make(map[string]*readyCheck, len(urls)),
+		last:         make(map[string]string, len(urls)),
+		lastStart:    make(map[string]time.Time, len(urls)),
 	}
 }
 
 // Ready reports whether every URL has answered 2xx, and if not, which one is
-// still pending and why.
+// still pending and why: the first in flag order. ctx only bounds the wait;
+// the checks themselves go on.
 func (g *readyGate) Ready(ctx context.Context) (bool, string) {
+	type pending struct {
+		url, last string
+		check     *readyCheck
+	}
+	var todo []pending
+	g.mu.Lock()
 	for _, u := range g.urls {
+		if !g.seen[u] {
+			todo = append(todo, pending{u, g.last[u], g.startCheckLocked(u)})
+		}
+	}
+	g.mu.Unlock()
+	if len(todo) == 0 {
+		return true, ""
+	}
+
+	timer := time.NewTimer(g.readyWait)
+	defer timer.Stop()
+	for _, p := range todo {
+		select {
+		case <-p.check.done:
+			if !p.check.ok {
+				return false, p.check.why
+			}
+		case <-timer.C:
+			return false, pendingReason(p.url, p.last)
+		case <-ctx.Done():
+			return false, pendingReason(p.url, p.last)
+		}
+	}
+	return true, ""
+}
+
+func pendingReason(u, last string) string {
+	if last != "" {
+		return fmt.Sprintf("sidecar readiness %s: check in flight; last: %s", u, last)
+	}
+	return fmt.Sprintf("sidecar readiness %s: check in flight", u)
+}
+
+// startCheckLocked returns the check in flight for u, or starts one, no
+// sooner than minInterval after the previous start. g.mu must be held.
+func (g *readyGate) startCheckLocked(u string) *readyCheck {
+	if c := g.inflight[u]; c != nil {
+		return c
+	}
+	now := time.Now()
+	delay := time.Duration(0)
+	if prev, ok := g.lastStart[u]; ok {
+		delay = max(prev.Add(g.minInterval).Sub(now), 0)
+	}
+	g.lastStart[u] = now.Add(delay)
+	c := &readyCheck{done: make(chan struct{})}
+	g.inflight[u] = c
+	go func() {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), g.checkTimeout)
+		defer cancel()
+		ok, why := g.check(ctx, u)
 		g.mu.Lock()
-		ok := g.seen[u]
-		g.mu.Unlock()
 		if ok {
-			continue
+			g.seen[u] = true
+		} else {
+			g.last[u] = why
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-		if err != nil {
-			return false, fmt.Sprintf("sidecar readiness %s: %v", u, err)
-		}
-		resp, err := g.client.Do(req)
-		if err != nil {
-			return false, fmt.Sprintf("sidecar readiness %s: %v", u, err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode/100 != 2 {
-			return false, fmt.Sprintf("sidecar readiness %s: HTTP %d", u, resp.StatusCode)
-		}
-		g.mu.Lock()
-		g.seen[u] = true
+		delete(g.inflight, u)
+		c.ok, c.why = ok, why
 		g.mu.Unlock()
+		close(c.done)
+	}()
+	return c
+}
+
+// check sends one GET to u and reports whether it answered 2xx.
+func (g *readyGate) check(ctx context.Context, u string) (bool, string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return false, fmt.Sprintf("sidecar readiness %s: %v", u, err)
+	}
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return false, fmt.Sprintf("sidecar readiness %s: %v", u, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return false, fmt.Sprintf("sidecar readiness %s: HTTP %d", u, resp.StatusCode)
 	}
 	return true, ""
 }

@@ -34,6 +34,8 @@ Quickstart:
 
 # Layer 1: Core Client & Env
 # Layer 2: High-Level Fleet Management & Abstractions
+# Layer 3: Benchmark & RL Task Adapters
+from .adapters import BenchmarkAdapter, EvalResult, SweBenchAdapter
 from .async_fleet import AsyncSandboxFleet
 from .client import DEFAULT_ATESPACE, Client
 from .config import FleetConfig, ObservabilityConfig, TracerConfig
@@ -61,6 +63,7 @@ from .errors import (
 from .exceptions import SandboxError
 from .fleet import SandboxFleet
 from .handle import SandboxHandle
+from .lookahead import LookaheadWarmer, WarmReport
 from .observability import Observer, RunReport
 
 # Types
@@ -96,11 +99,17 @@ __all__ = [
     "SandboxFleet",
     "AsyncSandboxFleet",
     "SandboxHandle",
+    "LookaheadWarmer",
+    "WarmReport",
     # Telemetry
     "TracerConfig",
     "ObservabilityConfig",
     "Observer",
     "RunReport",
+    # Benchmark Adapters
+    "BenchmarkAdapter",
+    "EvalResult",
+    "SweBenchAdapter",
     # Low-level Errors
     "EnvError",
     "FailedPreconditionError",

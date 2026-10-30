@@ -165,12 +165,14 @@ def instance_id_from_ref(ref: str, pinned: str) -> str:
 def write_image_only(images_file: str, out: str, limit: int = 0) -> int:
     """Manifest for image-delivery workloads: one record per image reference,
     no grading material. References may be tags (resolved to a digest with
-    crane) or already pinned by digest. A reference that pins the same image
-    as an earlier line is skipped; two different references whose ids would
-    still collide get a hash of the full reference appended. limit > 0 stops
-    after that many records."""
+    crane) or already pinned by digest. A reference whose digest an earlier
+    line already carries is skipped, whatever its repository: ate-env-api
+    derives one template per digest and refuses a second reference to it, so
+    the duplicate could only fail at create time. Two different images whose
+    ids would still collide get a hash of the full reference appended.
+    limit > 0 stops after that many records."""
     written = missing = 0
-    pinned_seen: set[str] = set()
+    digest_seen: dict[str, str] = {}
     ids: set[str] = set()
     with open(images_file) as src, open(out, "w") as dst:
         for line in src:
@@ -184,10 +186,11 @@ def write_image_only(images_file: str, out: str, limit: int = 0) -> int:
                 print(f"missing image: {ref}", file=sys.stderr)
                 missing += 1
                 continue
-            if pinned in pinned_seen:
-                print(f"duplicate image: {ref} pins {pinned}, already written", file=sys.stderr)
+            digest = pinned.rsplit("@", 1)[1]
+            if digest in digest_seen:
+                print(f"duplicate image: {ref} has the digest of {digest_seen[digest]}, already written", file=sys.stderr)
                 continue
-            pinned_seen.add(pinned)
+            digest_seen[digest] = pinned
             iid = instance_id_from_ref(ref, pinned)
             if iid in ids:
                 iid = f"{iid}-{hashlib.sha256(pinned.encode()).hexdigest()[:8]}"

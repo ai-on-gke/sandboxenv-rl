@@ -23,7 +23,10 @@ ATE_ENV_API_IMAGE ?=
 ATE_ENV_GUEST_IMAGE ?=
 CLI_LDFLAGS := -X main.version=$(VERSION) -X main.defaultAPIImage=$(ATE_ENV_API_IMAGE) -X main.defaultGuestImage=$(ATE_ENV_GUEST_IMAGE)
 
-.PHONY: build build-cli install test vet clean images python-protos python-test verify-boilerplate verify-gofmt
+PRETTIER_VERSION := 3.8.3
+PRETTIER ?= npx --yes prettier@$(PRETTIER_VERSION)
+
+.PHONY: build build-cli install test vet clean images python-protos python-test nemo-gym-test verify-boilerplate verify-gofmt verify-docs format-docs
 
 build:
 	go build ./...
@@ -49,6 +52,14 @@ verify-boilerplate:
 # Fail when any tracked Go file is not gofmt-formatted; prints the offenders.
 verify-gofmt:
 	@out=$$(gofmt -l $$(git ls-files '*.go')); if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
+
+# Format Markdown documentation files configured in .prettierrc.json.
+format-docs:
+	$(PRETTIER) --write .
+
+# Fail when any Markdown documentation file is not Prettier-formatted.
+verify-docs:
+	$(PRETTIER) --check .
 
 # Regenerate the committed Python gRPC stubs (requires grpcio-tools; see
 # clients/python/README.md).

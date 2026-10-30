@@ -31,7 +31,9 @@ export PYTHONUNBUFFERED=1 HF_HOME=/workspace/hf HF_HUB_ENABLE_HF_TRANSFER=1 CUDA
 : "${TRAIN_SOURCE:=r2e_gym}"; : "${TRAIN_DATASET:=R2E-Gym/R2E-Gym-V1}"; : "${TRAIN_SPLIT:=train}"; : "${TRAIN_SEED:=0}"; : "${TRAIN_INSTANCES:=256}"
 : "${VAL_TASKS:=20}"
 : "${TRAIN_BATCH:=32}"; : "${ROLLOUT_N:=8}"; : "${MINI_BATCH:=16}"; : "${SYNC_STEP:=2}"; : "${TOTAL_STEPS:=2}"
-: "${SESSIONS:=96}"; : "${GATEWAYS:=4}"; : "${AGENT_WORKERS:=4}"; : "${AGENT_MAX_STEPS:=150}"
+# One session per trajectory, so a whole step (TRAIN_BATCH x ROLLOUT_N) starts at once instead of queueing on the cap.
+# If the sandbox system cannot hold that many environments, set SESSIONS to its maximum capacity instead.
+: "${SESSIONS:=$((TRAIN_BATCH * ROLLOUT_N))}"; : "${GATEWAYS:=4}"; : "${AGENT_WORKERS:=4}"; : "${AGENT_MAX_STEPS:=150}"
 : "${MASK_UNFINISHED_EPISODE:=True}"  # True: episodes that hit AGENT_MAX_STEPS/RESPONSE_LENGTH keep their reward in the GRPO
                                       # group but train on no tokens; needs a budget most episodes finish within
 : "${PROMPT_LENGTH:=8192}"; : "${RESPONSE_LENGTH:=65536}"

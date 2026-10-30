@@ -23,10 +23,10 @@ and put the same peak load on the sandbox pool: eight `35b-easy` match `397b-eas
 | `397b-v1` | 16 | Qwen3.5-397B-A17B | same | same | 1,024 x 16 = 16,384 | R2E-Gym-V1, 8K / 64K, 150 steps |
 
 Every profile runs 2 steps plus validation by default (`TOTAL_STEPS`); raise it and `TRAIN_INSTANCES` for a
-training run. `SESSIONS` is `min(step, replicas x ROLLOUT_MAX_NUM_SEQS)`: the trajectories a replica cannot decode
-at once wait in uni-agent, holding no sandbox, instead of queueing inside vLLM. `397b-v1` runs a quarter of its
-step at a time; `35b-v1` also runs a quarter, at 512 sessions, so eight of them load the pool like one `397b-v1`
-(the 35B could decode more per GPU). More trajectories per step than `SESSIONS` means more waves, not a cap.
+training run. `SESSIONS` is the whole step (`TRAIN_BATCH x ROLLOUT_N`), so every trajectory starts at once instead
+of queueing on the session cap. If the sandbox system cannot hold that many environments, set `SESSIONS` to its
+maximum capacity instead; the rest of the step then waits in uni-agent, holding no sandbox. In the `v1` profiles
+the step exceeds `replicas x ROLLOUT_MAX_NUM_SEQS`, so turns beyond what vLLM admits queue inside vLLM.
 
 ## Prerequisites
 
@@ -123,19 +123,20 @@ PROFILE=397b-smoke ./deploy.sh up && ./deploy.sh logs    # 16/16 nodes
 
 For steps of thousands of trajectories. Profile values and Substrate settings only.
 
-- **`SESSIONS` = replicas x `ROLLOUT_MAX_NUM_SEQS`.** What vLLM cannot decode at once should wait in uni-agent,
-  where a waiting episode holds no sandbox and can go to whichever replica frees first, rather than inside
-  vLLM. The sandbox pool then needs about `SESSIONS` environments, not a whole step. Sessions beyond the
-  pool's capacity still wait up to `SANDBOX_START_WAIT_S` instead of failing. Each in-flight session is a
-  Ray task and worker process: `RAY_CPUS` >= `SESSIONS / GPU nodes`, `SESSION_TIMEOUT_S` covers wait plus episode.
+- **`SESSIONS` = the step (`TRAIN_BATCH x ROLLOUT_N`).** Every trajectory starts at once and holds a sandbox for
+  its whole episode, so the sandbox pool needs about `SESSIONS + VAL_TASKS` environments. If the sandbox system
+  cannot hold that many, set `SESSIONS` to its maximum capacity instead: sessions beyond the cap wait in
+  uni-agent, holding no sandbox, and sessions beyond the pool's capacity still wait up to `SANDBOX_START_WAIT_S`
+  instead of failing. Above `replicas x ROLLOUT_MAX_NUM_SEQS`, turns queue inside vLLM. Each in-flight session is
+  a Ray task and worker process: `RAY_CPUS` >= `SESSIONS / GPU nodes`, `SESSION_TIMEOUT_S` covers wait plus episode.
 - **The startup wave is gated job-wide.** The provider applies `SANDBOX_STARTUP_CONCURRENCY` through one
   Ray actor per job (uni-agent's own semaphore is per process), keeps waiting on the same environment when
   a wake is merely slow, retries deletes Substrate rejects as "another operation is in progress", and
   reclaims environments whose session never got ready or died. Size the gate so `SESSIONS / gate` times the
   start latency (20 to 45 s warm) stays under `SANDBOX_START_WAIT_S`.
 - **Step time is decode-bound.** Generation time is trajectories x tokens over the replicas' aggregate decode
-  rate, so more trajectories per step than `SESSIONS` means more waves, not slower waves; add rollout nodes
-  to shorten it. The update scales the same way on the trainer nodes and at these batches takes about as
+  rate; add rollout nodes to shorten it. A `SESSIONS` cut to the pool's capacity runs the step in `step / SESSIONS`
+  waves of the same length. The update scales the same way on the trainer nodes and at these batches takes about as
   long as generation; plan the window around both.
 - **Sandbox disk is the limit, not memory.** Substrate caches every image a node has booted (~0.6 GB each);
   a full disk evicts the worker and crashes every environment it hosts. A 2 TB disk holds ~3,000 images.

@@ -26,7 +26,9 @@ Operators register them once with ``ate-env manifest template``;
 from __future__ import annotations
 
 import re
+import tomllib
 from collections.abc import Sequence
+from pathlib import Path
 
 DEFAULT_PREFIX = "harbor-"
 _MAX_NAME_LEN = 63
@@ -94,3 +96,38 @@ def register_command(
     parts += manifest_template_args(cpus, memory_mb)
     parts += list(extra)
     return " ".join(parts) + " | kubectl-ate create actor-template -f -"
+
+
+def task_classes(
+    root: str | Path, prefix: str = DEFAULT_PREFIX
+) -> dict[str, tuple[int | float | None, int | None]]:
+    """The resource classes the tasks under ``root`` ask for: template name to
+    ``(cpus, memory_mb)``, in the order the tasks are found.
+
+    The ``[environment]`` table of each ``task.toml`` is parsed with Harbor's
+    ``EnvironmentConfig``, thus the values are the ones ``AteEnvEnvironment``
+    sees: ``memory = "4G"`` normalizes to ``memory_mb = 4096``, and ``cpus`` is
+    normalized the same way. The rest of the file is not validated.
+    """
+    from harbor.models.task.config import EnvironmentConfig
+
+    classes: dict[str, tuple[int | float | None, int | None]] = {}
+    for task_toml in sorted(Path(root).rglob("task.toml")):
+        with task_toml.open("rb") as f:
+            env = EnvironmentConfig.model_validate(tomllib.load(f).get("environment", {}))
+        name = class_template_name(prefix, env.cpus, env.memory_mb)
+        if name is not None:
+            classes.setdefault(name, (env.cpus, env.memory_mb))
+    return classes
+
+
+def register_commands(
+    root: str | Path, prefix: str = DEFAULT_PREFIX, extra: Sequence[str] = ()
+) -> list[str]:
+    """One ``register_command`` per class under ``root`` (``hack/register-templates.sh``)."""
+    commands: list[str] = []
+    for cpus, memory_mb in task_classes(root, prefix).values():
+        command = register_command(prefix, cpus, memory_mb, extra)
+        if command is not None:
+            commands.append(command)
+    return commands

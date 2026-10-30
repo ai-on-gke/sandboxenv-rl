@@ -214,6 +214,7 @@ class FakeState:
     procs: dict[str, dict[str, Any]] = field(default_factory=dict)
     missing_templates: set[str] = field(default_factory=set)
     create_code: grpc.StatusCode | None = None
+    create_delay: float = 0.0  # answer the create this late, after the server registered it
     unavailable_calls: int = 0  # guest calls answered UNAVAILABLE first, as a cold actor
     fail_exec_containing: str | None = None  # the next exec with this text answers UNAVAILABLE
     required_token: str | None = None  # every call needs "authorization: Bearer <token>"
@@ -304,6 +305,8 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
             "executor": executor,
             "image": image,
         }
+        if s.create_delay:
+            await asyncio.sleep(s.create_delay)
         return env_pb2.CreateEnvironmentResponse(environment=s.env_pb(request.id))
 
     async def GetEnvironment(self, request, context):

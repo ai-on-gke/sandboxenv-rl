@@ -280,9 +280,16 @@ class AteEnvEnvironment(BaseEnvironment):
             build_timeout_sec=cfg.build_timeout_sec,
         )
         client = shared_client(self._api_url, self._api_token)
-        env = await self._create(client, image)
+        # One deadline for the create and the first guest answer
+        # (create_timeout_sec). Harbor also wraps start() in
+        # build_timeout_sec, which can cancel the create after CreateActor
+        # succeeded on the server; the id is chosen before the call, thus the
+        # cleanup deletes by id whether or not the create returned.
+        deadline = time.monotonic() + self._create_timeout
+        env = client.env(self._env_id, atespace=self._atespace)
         try:
-            await self._wait_ready(env)
+            env = await self._create(client, image)
+            await self._wait_ready(env, deadline)
             await self._probe_user(env)
             self._env = env
             await self._ensure_workdir(env)
@@ -357,8 +364,8 @@ class AteEnvEnvironment(BaseEnvironment):
         )
         return f"{command} (integrations/harbor/hack/register-templates.sh prints these)"
 
-    async def _wait_ready(self, env: Env) -> None:
-        deadline = time.monotonic() + self._create_timeout
+    async def _wait_ready(self, env: Env, deadline: float) -> None:
+        """Wait for the first guest answer until ``deadline`` (``time.monotonic``)."""
         last: BaseException | None = None
         while True:
             remaining = deadline - time.monotonic()

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"math"
 	"math/rand"
 	"regexp"
 	"slices"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	env "github.com/agent-substrate/env/clients/go"
+	"github.com/agent-substrate/env/internal/benchmarking/schema"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -41,21 +43,28 @@ const (
 	ModeEval Mode = "eval"
 	// ModeSteps keeps a fleet across training steps and parks it in between.
 	ModeSteps Mode = "steps"
+	// ModeOpenLoop dispatches tasks at a Poisson arrival rate (-arrival-rate)
+	// bounded by Width concurrency slots, recording SlotWaitMS per task.
+	ModeOpenLoop Mode = "open-loop"
 )
 
 // Park is what happens to the fleet between training steps.
 type Park string
 
 const (
-	ParkNone    Park = "none"    // environments stay running
-	ParkSuspend Park = "suspend" // SuspendEnvironment; the next command wakes it
-	ParkDelete  Park = "delete"  // DeleteEnvironment; the next step creates again
+	ParkNone         Park = "none"          // environments stay running
+	ParkSuspend      Park = "suspend"       // SuspendEnvironment; the next command wakes it
+	ParkSuspendSync  Park = "suspend-sync"  // SuspendEnvironment synchronously at step barrier
+	ParkSuspendAsync Park = "suspend-async" // SuspendEnvironment asynchronously on task completion
+	ParkFork         Park = "fork"          // Fork from golden base snapshot per step
+	ParkDelete       Park = "delete"        // DeleteEnvironment; the next step creates again
 )
 
 // Config is one run. Every field that shapes the load is a parameter so the
 // same binary serves the smoke test and the 500-wide run.
 type Config struct {
 	RunID      string
+	Dataset    string
 	Backend    Backend
 	Instances  []Instance
 	Trajectory *Trajectory
@@ -80,6 +89,32 @@ type Config struct {
 	// which is the cost this shape measures. Requires ParkDelete. Zero keeps
 	// one fleet across the steps.
 	ImagesPerStep int
+	// ParkEach, in steps mode, parks each environment as soon as its step
+	// ends instead of parking the fleet after the whole step, so at most
+	// Width environments are awake at once and the fleet can be larger than
+	// the running slots: the shape of a trainer that releases a sandbox at
+	// the end of its episode. The step barrier then includes the parking and
+	// there is no park event. Requires ParkSuspend or ParkDelete, and not
+	// ImagesPerStep, which retires its environments anyway.
+	ParkEach bool
+
+	// Schedule is an optional pre-resolved step-by-step schedule. When set (or
+	// when TasksPerStep, GroupSize, StepPause, Prefetch, ParkSuspendAsync,
+	// ParkSuspendSync, or ParkFork are used in ModeSteps), steps mode drives a
+	// client-side WorkingSet across the scheduled steps.
+	Schedule     *schema.Schedule
+	TasksPerStep int
+	GroupSize    int
+	StepPause    time.Duration
+	Prefetch     bool
+
+	// ArrivalRate is the target Poisson arrival rate (tasks/sec) in ModeOpenLoop.
+	ArrivalRate float64
+	// Duration bounds the open-loop arrival window when set.
+	Duration     time.Duration
+	Concurrency  int
+	JobName      string
+	SnapshotLoop bool
 
 	// CreateTimeout bounds one create call; StepTimeout is the default for a
 	// run step without its own timeout.
@@ -132,6 +167,7 @@ var LoaderLabelKeys = []string{
 	"mode", "width", "images", "trajectory", "tasks_per_image", "rollouts", "steps", "park",
 	"create_timeout", "step_timeout", "wake_budget", "wake_backoff",
 	"dataset", "connections", "base_template", "exclude_file", "instances", "seed", "images_per_step",
+	"park_each",
 }
 
 // labels describes the run for its run event.
@@ -159,6 +195,9 @@ func (c *Config) labels() map[string]string {
 		if c.ImagesPerStep > 0 {
 			l["images_per_step"] = strconv.Itoa(c.ImagesPerStep)
 		}
+		if c.ParkEach {
+			l["park_each"] = "true"
+		}
 	}
 	for k, v := range c.Invocation {
 		l[k] = v
@@ -171,13 +210,41 @@ func (c *Config) labels() map[string]string {
 
 // Summary is what a run produced, for the exit status and the log.
 type Summary struct {
-	Tasks    int
-	Failed   int
-	Rewarded int
-	Duration time.Duration
+	Tasks                int
+	Failed               int
+	Rewarded             int
+	Duration             time.Duration
+	WorkingSetHits       int
+	WorkingSetMisses     int
+	WorkingSetHitRate    float64
+	StandingPoolSize     int
+	Created              int
+	Reused               int
+	Retired              int
+	PrefetchLeadMarginMS float64
+	ReleaseOverlapMS     float64
+}
+
+func (c *Config) usesWorkingSet() bool {
+	return c.Mode == ModeSteps && (c.Schedule != nil || c.TasksPerStep > 0 || c.GroupSize > 0 ||
+		c.StepPause > 0 || c.Prefetch)
 }
 
 func (c *Config) validate() error {
+	if c.Schedule != nil && c.Mode == ModeSteps && len(c.Schedule.Jobs) > 0 {
+		if c.Rollouts < 1 {
+			c.Rollouts = 1
+		}
+		if c.Steps < 1 {
+			c.Steps = len(c.Schedule.Jobs[0].Steps)
+		}
+		if c.Park == "" {
+			c.Park = Park(c.Schedule.Jobs[0].ParkPolicy)
+		}
+	}
+	if c.Mode == ModeSteps && c.Rollouts < 1 && c.GroupSize > 0 {
+		c.Rollouts = c.GroupSize
+	}
 	switch {
 	case c.RunID == "":
 		return errors.New("run id is required")
@@ -212,7 +279,7 @@ func (c *Config) validate() error {
 			return errors.New("rollouts and steps must be >= 1")
 		}
 		switch c.Park {
-		case ParkNone, ParkSuspend, ParkDelete:
+		case ParkNone, ParkSuspend, ParkSuspendSync, ParkSuspendAsync, ParkFork, ParkDelete:
 		default:
 			return fmt.Errorf("unknown park mode %q", c.Park)
 		}
@@ -225,11 +292,27 @@ func (c *Config) validate() error {
 		if c.ImagesPerStep > len(c.Instances) {
 			return fmt.Errorf("images per step (%d) is more than the %d instances; a window must not repeat an instance within one step", c.ImagesPerStep, len(c.Instances))
 		}
+		if c.ParkEach && c.Park == ParkNone {
+			return errors.New("park each needs park mode suspend or delete")
+		}
+		if c.ParkEach && c.ImagesPerStep > 0 {
+			return errors.New("park each keeps one fleet across the steps; it cannot be combined with images per step")
+		}
+	case ModeOpenLoop:
+		if c.TasksPerImage < 1 {
+			c.TasksPerImage = 1
+		}
+		if c.ArrivalRate <= 0 {
+			return errors.New("arrival rate must be > 0 in open-loop mode")
+		}
 	default:
 		return fmt.Errorf("unknown mode %q", c.Mode)
 	}
 	if c.ImagesPerStep > 0 && c.Mode != ModeSteps {
 		return errors.New("images per step applies to steps mode")
+	}
+	if c.ParkEach && c.Mode != ModeSteps {
+		return errors.New("park each applies to steps mode")
 	}
 	if n := c.longestName(); len(n) > maxNameLen {
 		return fmt.Errorf("environment name %q has %d characters, more than Substrate's %d; "+
@@ -250,7 +333,7 @@ func (c *Config) longestName() string {
 	k, suffix := c.TasksPerImage-1, ""
 	if c.Mode == ModeSteps {
 		k = c.Rollouts - 1
-		if (c.Park == ParkDelete || c.ImagesPerStep > 0) && c.Steps > 1 {
+		if (c.Park == ParkDelete || c.Park == ParkFork || c.ImagesPerStep > 0) && c.Steps > 1 {
 			suffix = fmt.Sprintf("-s%d", c.Steps)
 		}
 	}
@@ -328,6 +411,11 @@ type environment struct {
 	createStart time.Time
 	// failed environments are skipped for the rest of a steps run.
 	failed bool
+
+	hasWSOverride bool
+	wsFresh       bool
+	wsWake        bool
+	slotWaitMS    float64
 }
 
 type runner struct {
@@ -339,6 +427,7 @@ type runner struct {
 	tasks    int
 	failed   int
 	rewarded int
+	wsStats  WorkingSetStats
 }
 
 // Run executes the configured workload and returns its summary. A non-nil
@@ -350,6 +439,49 @@ func Run(ctx context.Context, cfg Config) (*Summary, error) {
 	}
 	cfg.defaults()
 	r := &runner{cfg: &cfg, rec: cfg.Recorder, log: cfg.Logger}
+
+	if cfg.usesWorkingSet() {
+		start := time.Now()
+		if err := r.runScheduledSteps(ctx); err != nil {
+			return nil, err
+		}
+		dur := time.Since(start)
+		s := &Summary{
+			Tasks:                r.tasks,
+			Failed:               r.failed,
+			Rewarded:             r.rewarded,
+			Duration:             dur,
+			WorkingSetHits:       r.wsStats.Hits,
+			WorkingSetMisses:     r.wsStats.Misses,
+			WorkingSetHitRate:    r.wsStats.HitRate,
+			StandingPoolSize:     r.wsStats.StandingPoolSize,
+			Created:              r.wsStats.Created,
+			Reused:               r.wsStats.Reused,
+			Retired:              r.wsStats.Retired,
+			PrefetchLeadMarginMS: r.wsStats.PrefetchLeadMarginMS,
+			ReleaseOverlapMS:     r.wsStats.ReleaseOverlapMS,
+		}
+		r.rec.Record(Event{
+			RunID:                cfg.RunID,
+			Event:                EventRun,
+			Name:                 string(cfg.Mode),
+			DurMS:                ms(dur),
+			OK:                   s.Failed == 0,
+			Count:                s.Tasks,
+			Labels:               cfg.labels(),
+			Tags:                 cfg.buildRunLoadTags(),
+			WorkingSetHits:       s.WorkingSetHits,
+			WorkingSetMisses:     s.WorkingSetMisses,
+			WorkingSetHitRate:    s.WorkingSetHitRate,
+			StandingPoolSize:     s.StandingPoolSize,
+			Created:              s.Created,
+			Reused:               s.Reused,
+			Retired:              s.Retired,
+			PrefetchLeadMarginMS: s.PrefetchLeadMarginMS,
+			ReleaseOverlapMS:     s.ReleaseOverlapMS,
+		})
+		return s, ctx.Err()
+	}
 
 	envs, err := r.plan()
 	if err != nil {
@@ -365,12 +497,105 @@ func Run(ctx context.Context, cfg Config) (*Summary, error) {
 		} else {
 			r.runSteps(ctx, envs)
 		}
+	case ModeOpenLoop:
+		r.runOpenLoop(ctx, envs)
 	}
 	dur := time.Since(start)
 	s := &Summary{Tasks: r.tasks, Failed: r.failed, Rewarded: r.rewarded, Duration: dur}
 	r.rec.Record(Event{RunID: cfg.RunID, Event: EventRun, Name: string(cfg.Mode), DurMS: ms(dur),
-		OK: s.Failed == 0, Count: s.Tasks, Labels: cfg.labels()})
+		OK: s.Failed == 0, Count: s.Tasks, Labels: cfg.labels(), Tags: cfg.buildRunLoadTags()})
 	return s, ctx.Err()
+}
+
+func (c *Config) buildRunLoadTags() map[string]string {
+	tags := make(map[string]string)
+	if c.Dataset != "" {
+		tags["dataset"] = c.Dataset
+	}
+	imgSet := make(map[string]bool)
+	var firstImg string
+	for _, in := range c.Instances {
+		if in.Image != "" {
+			if firstImg == "" {
+				firstImg = in.Image
+			}
+			imgSet[in.Image] = true
+		}
+	}
+	if firstImg != "" {
+		tags["guest_image"] = firstImg
+	}
+	steps := c.Steps
+	if c.Mode != ModeSteps || steps < 1 {
+		steps = 1
+	}
+	groupSize := c.GroupSize
+	if groupSize < 1 {
+		if c.Mode == ModeSteps {
+			groupSize = c.Rollouts
+		} else {
+			groupSize = c.TasksPerImage
+		}
+	}
+	if groupSize < 1 {
+		groupSize = 1
+	}
+	tasksPerStep := c.TasksPerStep
+	if tasksPerStep < 1 {
+		tasksPerStep = len(c.Instances)
+	}
+	tags["load_tasks"] = fmt.Sprintf("%d", len(c.Instances))
+	tags["load_group_size"] = fmt.Sprintf("%d", groupSize)
+	tags["load_steps"] = fmt.Sprintf("%d", steps)
+	tags["load_tasks_per_step"] = fmt.Sprintf("%d", tasksPerStep)
+	tags["load_trajectories_per_step"] = fmt.Sprintf("%d", groupSize*tasksPerStep)
+	tags["load_max_concurrent"] = fmt.Sprintf("%d", c.Width)
+	tags["load_distinct_images"] = fmt.Sprintf("%d", len(imgSet))
+	tags["load_repeat"] = "1"
+	return tags
+}
+
+// trajectoryPicker draws trajectories from r.cfg.Trajectories (seeded by
+// r.cfg.Seed when there is a mix) and caches rendered templates per
+// (source, instance).
+type trajectoryPicker struct {
+	r        *runner
+	pick     *rand.Rand
+	rendered map[*Trajectory]map[string]*Trajectory
+}
+
+func (r *runner) newTrajectoryPicker() *trajectoryPicker {
+	var pick *rand.Rand
+	if len(r.cfg.Trajectories) > 1 {
+		pick = rand.New(rand.NewSource(r.cfg.Seed))
+	}
+	return &trajectoryPicker{
+		r:        r,
+		pick:     pick,
+		rendered: make(map[*Trajectory]map[string]*Trajectory),
+	}
+}
+
+func (tp *trajectoryPicker) next(in Instance) (*Trajectory, error) {
+	source := tp.r.cfg.Trajectory
+	if tp.pick != nil {
+		source = tp.r.cfg.Trajectories[tp.pick.Intn(len(tp.r.cfg.Trajectories))]
+	}
+	byInstance := tp.rendered[source]
+	if byInstance == nil {
+		byInstance = make(map[string]*Trajectory)
+		tp.rendered[source] = byInstance
+	}
+	key := in.InstanceID + "\x00" + in.Image
+	if traj := byInstance[key]; traj != nil {
+		return traj, nil
+	}
+	traj, err := source.Render(in)
+	if err != nil {
+		return nil, err
+	}
+	byInstance[key] = traj
+	return traj, nil
 }
 
 // plan renders the trajectory per instance and names every environment.
@@ -392,34 +617,12 @@ func (r *runner) plan() ([]*environment, error) {
 		fanout = r.cfg.Rollouts
 	}
 	envs := make([]*environment, 0, len(r.cfg.Instances)*fanout)
-	// With a mix, each environment draws its trajectory from a seeded
-	// source, so the same seed gives the same assignment on every rep.
-	var pick *rand.Rand
-	if len(r.cfg.Trajectories) > 1 {
-		pick = rand.New(rand.NewSource(r.cfg.Seed))
-	}
-	// One render per trajectory and instance, shared by that instance's
-	// environments; a replay never writes to it.
-	rendered := map[*Trajectory]map[string]*Trajectory{}
+	tp := r.newTrajectoryPicker()
 	for _, in := range r.cfg.Instances {
 		for k := 0; k < fanout; k++ {
-			source := r.cfg.Trajectory
-			if pick != nil {
-				source = r.cfg.Trajectories[pick.Intn(len(r.cfg.Trajectories))]
-			}
-			byInstance := rendered[source]
-			if byInstance == nil {
-				byInstance = map[string]*Trajectory{}
-				rendered[source] = byInstance
-			}
-			traj := byInstance[in.InstanceID]
-			if traj == nil {
-				t, err := source.Render(in)
-				if err != nil {
-					return nil, err
-				}
-				traj = t
-				byInstance[in.InstanceID] = traj
+			traj, err := tp.next(in)
+			if err != nil {
+				return nil, err
 			}
 			id := EnvID(r.cfg.RunID, in.InstanceID, k)
 			envs = append(envs, &environment{
@@ -506,6 +709,94 @@ func (r *runner) runEval(ctx context.Context, envs []*environment) {
 	})
 }
 
+// dispatchOpenLoop dispatches fn according to a seeded Poisson arrival process
+// (rate tasks/sec) bounded by width concurrent slots, up to maxTasks (when > 0)
+// and/or deadline (when non-zero). Each invocation receives its 0-based
+// sequence index and the time (in ms) spent waiting for a concurrency slot.
+func dispatchOpenLoop(
+	ctx context.Context,
+	seed int64,
+	rate float64,
+	width int,
+	maxTasks int,
+	deadline time.Time,
+	fn func(seq int, slotWaitMS float64),
+) error {
+	if seed == 0 {
+		seed = 42
+	}
+	if width <= 0 {
+		width = 1
+	}
+	rng := rand.New(rand.NewSource(seed))
+	sem := make(chan struct{}, width)
+	var wg sync.WaitGroup
+
+	for seq := 0; maxTasks <= 0 || seq < maxTasks; seq++ {
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		if seq > 0 && rate > 0 {
+			delay := time.Duration(rng.ExpFloat64() / rate * float64(time.Second))
+			if !deadline.IsZero() && time.Now().Add(delay).After(deadline) {
+				break
+			}
+			if delay > 0 {
+				t := time.NewTimer(delay)
+				select {
+				case <-ctx.Done():
+					t.Stop()
+					wg.Wait()
+					return ctx.Err()
+				case <-t.C:
+				}
+			}
+		}
+		arrivalAt := time.Now()
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return ctx.Err()
+		case sem <- struct{}{}:
+		}
+		slotWaitMS := ms(time.Since(arrivalAt))
+
+		wg.Add(1)
+		go func(i int, waitMS float64) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			fn(i, waitMS)
+		}(seq, slotWaitMS)
+	}
+	wg.Wait()
+	return nil
+}
+
+// runOpenLoop dispatches tasks according to a Poisson arrival process with rate
+// ArrivalRate (tasks/sec), bounded by Width concurrent slots, and records the
+// time each arriving task waited for a concurrency slot in Event.SlotWaitMS.
+func (r *runner) runOpenLoop(ctx context.Context, envs []*environment) {
+	var deadline time.Time
+	if r.cfg.Duration > 0 {
+		deadline = time.Now().Add(r.cfg.Duration)
+	}
+	_ = dispatchOpenLoop(ctx, r.cfg.Seed, r.cfg.ArrivalRate, r.cfg.Width, len(envs), deadline, func(i int, slotWaitMS float64) {
+		env := envs[i]
+		env.slotWaitMS = slotWaitMS
+		if r.create(ctx, env, 0) {
+			r.replay(ctx, env, 0)
+		}
+		if !r.cfg.Keep {
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+			r.remove(cleanup, env, 0)
+			cancel()
+		}
+	})
+}
+
 // runSteps is the training shape: the fleet is created once, every step
 // replays the trajectory on all of it behind a barrier, and the fleet is
 // parked between steps.
@@ -523,17 +814,13 @@ func (r *runner) trajectories() []*Trajectory {
 // dataset, with Rollouts environments each. Names carry the step from step
 // 2 on, as a delete park's do, so an instance that comes around again gets
 // a fresh name while the previous one may still be deleting.
-func (r *runner) planWindow(step int, pick *rand.Rand) ([]*environment, error) {
+func (r *runner) planWindow(step int, tp *trajectoryPicker) ([]*environment, error) {
 	n := len(r.cfg.Instances)
 	envs := make([]*environment, 0, r.cfg.ImagesPerStep*r.cfg.Rollouts)
 	for i := 0; i < r.cfg.ImagesPerStep; i++ {
 		in := r.cfg.Instances[((step-1)*r.cfg.ImagesPerStep+i)%n]
 		for k := 0; k < r.cfg.Rollouts; k++ {
-			source := r.cfg.Trajectory
-			if pick != nil {
-				source = r.cfg.Trajectories[pick.Intn(len(r.cfg.Trajectories))]
-			}
-			traj, err := source.Render(in)
+			traj, err := tp.next(in)
 			if err != nil {
 				return nil, err
 			}
@@ -549,15 +836,12 @@ func (r *runner) planWindow(step int, pick *rand.Rand) ([]*environment, error) {
 // barrier, then retire them, recorded as a delete park. Nothing is kept
 // across steps, so the whole cost of a step is the cold path plus the work.
 func (r *runner) runWindows(ctx context.Context) {
-	var pick *rand.Rand
-	if len(r.cfg.Trajectories) > 1 {
-		pick = rand.New(rand.NewSource(r.cfg.Seed))
-	}
+	tp := r.newTrajectoryPicker()
 	for step := 1; step <= r.cfg.Steps; step++ {
 		if ctx.Err() != nil {
 			break
 		}
-		envs, err := r.planWindow(step, pick)
+		envs, err := r.planWindow(step, tp)
 		if err != nil {
 			r.log.Error("plan window", slog.Int("step", step), slog.String("err", err.Error()))
 			return
@@ -596,17 +880,29 @@ func (r *runner) runWindows(ctx context.Context) {
 }
 
 func (r *runner) runSteps(ctx context.Context, envs []*environment) {
-	forEach(ctx, len(envs), r.cfg.Width, func(i int) { r.create(ctx, envs[i], 0) })
-	r.log.Info("fleet created", slog.Int("environments", len(envs)), slog.Int("failed", r.countFailed(envs)))
+	if !r.cfg.ParkEach {
+		forEach(ctx, len(envs), r.cfg.Width, func(i int) { r.create(ctx, envs[i], 0) })
+		r.log.Info("fleet created", slog.Int("environments", len(envs)), slog.Int("failed", r.countFailed(envs)))
+	}
 
 	for step := 1; step <= r.cfg.Steps; step++ {
 		if ctx.Err() != nil {
 			break
 		}
+		if r.cfg.ParkEach {
+			r.stepParkEach(ctx, envs, step)
+			continue
+		}
 		if step > 1 && r.cfg.Park == ParkDelete {
 			forEach(ctx, len(envs), r.cfg.Width, func(i int) {
 				if !envs[i].failed {
 					r.create(ctx, envs[i], step)
+				}
+			})
+		} else if step > 1 && r.cfg.Park == ParkFork {
+			forEach(ctx, len(envs), r.cfg.Width, func(i int) {
+				if !envs[i].failed {
+					r.fork(ctx, envs[i], step)
 				}
 			})
 		}
@@ -632,8 +928,10 @@ func (r *runner) runSteps(ctx context.Context, envs []*environment) {
 				return
 			}
 			switch r.cfg.Park {
-			case ParkSuspend:
-				r.suspend(ctx, e, step)
+			case ParkSuspend, ParkSuspendSync:
+				r.suspendWithMode(ctx, e, step, false)
+			case ParkSuspendAsync, ParkFork:
+				r.suspendWithMode(ctx, e, step, true)
 			case ParkDelete:
 				r.remove(ctx, e, step)
 			}
@@ -654,6 +952,325 @@ func (r *runner) runSteps(ctx context.Context, envs []*environment) {
 			r.remove(cleanup, envs[i], r.cfg.Steps)
 		}
 	})
+}
+
+// stepParkEach runs one step with each environment created on its first
+// step (or every step under a delete park), replayed, and parked as soon as
+// its replay ends, Width at a time. The barrier covers the parking, so no
+// park event is recorded; the suspend and delete events carry the cost.
+// The last step parks too, since the fleet need not fit awake; the run's
+// cleanup deletes what a suspend park left. An environment whose step failed
+// leaves the run and is deleted at once, so it does not hold a slot until
+// the cleanup.
+func (r *runner) stepParkEach(ctx context.Context, envs []*environment, step int) {
+	barrier := time.Now()
+	forEach(ctx, len(envs), r.cfg.Width, func(i int) {
+		e := envs[i]
+		if e.failed {
+			return
+		}
+		if step == 1 {
+			if !r.create(ctx, e, 0) {
+				return
+			}
+		} else if r.cfg.Park == ParkDelete {
+			if !r.create(ctx, e, step) {
+				return
+			}
+		}
+		r.replay(ctx, e, step)
+		if ctx.Err() != nil {
+			return
+		}
+		if e.failed {
+			r.remove(ctx, e, step)
+			return
+		}
+		switch r.cfg.Park {
+		case ParkSuspend:
+			r.suspend(ctx, e, step)
+		case ParkDelete:
+			r.remove(ctx, e, step)
+		}
+	})
+	live := len(envs) - r.countFailed(envs)
+	r.rec.Record(Event{RunID: r.cfg.RunID, Event: EventBarrier, Step: step, DurMS: ms(time.Since(barrier)),
+		OK: ctx.Err() == nil, Count: live})
+	r.log.Info("step done", slog.Int("step", step), slog.Duration("barrier", time.Since(barrier)),
+		slog.Int("live", live), slog.Int("failed", r.failed), slog.Int("rewarded", r.rewarded))
+}
+
+func (r *runner) runScheduledSteps(ctx context.Context) error {
+	sched := r.cfg.Schedule
+	if sched == nil {
+		tasksPerStep := r.cfg.TasksPerStep
+		if tasksPerStep <= 0 {
+			tasksPerStep = len(r.cfg.Instances)
+		}
+		groupSize := r.cfg.GroupSize
+		if groupSize <= 0 {
+			groupSize = r.cfg.Rollouts
+		}
+		var err error
+		sched, err = ResolveSingleJobSchedule(
+			r.cfg.RunID,
+			uint64(r.cfg.Seed),
+			schema.ParkPolicy(r.cfg.Park),
+			r.cfg.Steps,
+			tasksPerStep,
+			groupSize,
+			r.cfg.Instances,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	if err := sched.Validate(); err != nil {
+		return err
+	}
+	job := sched.Jobs[0]
+	parkPolicy := job.ParkPolicy
+	if r.cfg.Park != "" {
+		if norm, err := schema.NormalizeParkPolicy(schema.ParkPolicy(r.cfg.Park)); err == nil {
+			parkPolicy = norm
+		}
+	}
+
+	for _, in := range r.cfg.Instances {
+		for _, t := range r.trajectories() {
+			if _, err := t.Render(in); err != nil {
+				return err
+			}
+		}
+	}
+	instByID := InstancesByID(r.cfg.Instances)
+	tp := r.newTrajectoryPicker()
+
+	ws, err := NewWorkingSet(WorkingSetConfig{
+		JobID:      r.cfg.RunID,
+		Backend:    r.cfg.Backend,
+		ParkPolicy: parkPolicy,
+	})
+	if err != nil {
+		return err
+	}
+
+	var (
+		totalPrefetchLeadMS   float64
+		totalReleaseOverlapMS float64
+		lastActive            []*WorkingSetEntry
+	)
+
+	for sIdx, st := range job.Steps {
+		if ctx.Err() != nil {
+			break
+		}
+		stepNum := st.Step
+		stepStart := time.Now()
+		leadMS, _ := ws.WaitPrewarm(ctx, stepNum, stepStart)
+		totalPrefetchLeadMS += leadMS
+
+		ws.BeginStep()
+		if r.cfg.Prefetch && len(st.PrefetchImages) > 0 && sIdx+1 < len(job.Steps) {
+			ws.Prewarm(ctx, stepNum+1, st.PrefetchImages)
+		}
+
+		stepInsts := make([]Instance, len(st.Tasks))
+		stepTrajs := make([]*Trajectory, len(st.Tasks))
+		stepRenderErrs := make([]error, len(st.Tasks))
+		for i, tk := range st.Tasks {
+			inst, ok := instByID[tk.InstanceID]
+			if !ok {
+				inst = Instance{InstanceID: tk.InstanceID, Image: tk.Image}
+			}
+			stepInsts[i] = inst
+			stepTrajs[i], stepRenderErrs[i] = tp.next(inst)
+		}
+
+		active := make([]*WorkingSetEntry, len(st.Tasks))
+		var liveCount int
+		var liveMu sync.Mutex
+
+		barrierStart := time.Now()
+		forEach(ctx, len(st.Tasks), r.cfg.Width, func(i int) {
+			tk := st.Tasks[i]
+			inst := stepInsts[i]
+			traj := stepTrajs[i]
+			if rerr := stepRenderErrs[i]; rerr != nil {
+				e := &environment{id: EnvID(r.cfg.RunID, tk.InstanceID, i), inst: inst, task: i}
+				r.rec.Record(r.event(EventTask, e, stepNum, 0, rerr))
+				r.countTask(e, stepNum, false, nil)
+				return
+			}
+
+			cctx, cancel := context.WithTimeout(ctx, r.cfg.CreateTimeout)
+			acqStart := time.Now()
+			entry, aerr := ws.Acquire(cctx, stepNum, i, tk.InstanceID, tk.Image)
+			cancel()
+			if aerr != nil {
+				e := &environment{id: EnvID(r.cfg.RunID, tk.InstanceID, i), inst: inst, task: i}
+				r.rec.Record(r.event(EventCreate, e, stepNum, time.Since(acqStart), aerr))
+				r.rec.Record(r.event(EventTask, e, stepNum, 0, aerr))
+				r.countTask(e, stepNum, false, nil)
+				return
+			}
+
+			e := &environment{
+				id:            entry.SandboxID,
+				base:          entry.BaseID,
+				inst:          inst,
+				task:          i,
+				traj:          traj,
+				sb:            entry.Sandbox,
+				createStart:   entry.CreateStart,
+				hasWSOverride: true,
+				wsFresh:       !entry.Hit || entry.IsForkChild,
+				wsWake:        entry.Hit && entry.WasParked,
+			}
+			if !entry.Hit {
+				r.rec.Record(r.event(EventCreate, e, stepNum, time.Since(entry.CreateStart), nil))
+			}
+
+			r.replay(ctx, e, stepNum)
+			if !e.failed {
+				liveMu.Lock()
+				liveCount++
+				liveMu.Unlock()
+			}
+			if e.failed {
+				cleanup, ccancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+				_ = entry.Sandbox.Delete(cleanup)
+				ccancel()
+				return
+			}
+
+			active[i] = entry
+		})
+
+		barrierDur := time.Since(barrierStart)
+		barrierDoneAt := time.Now()
+		var stepOverlapMS float64
+
+		if sIdx+1 < len(job.Steps) && ctx.Err() == nil {
+			if parkPolicy == schema.ParkSuspendAsync {
+				for _, entry := range active {
+					if entry != nil {
+						_ = ws.Release(ctx, entry)
+					}
+				}
+			} else if parkPolicy != schema.ParkNone {
+				parkStart := time.Now()
+				forEach(ctx, len(active), r.cfg.Width, func(i int) {
+					entry := active[i]
+					if entry == nil {
+						return
+					}
+					e := &environment{id: entry.SandboxID, base: entry.BaseID, inst: Instance{InstanceID: entry.InstanceID, Image: entry.Image}, task: i}
+					opStart := time.Now()
+					err := ws.Release(ctx, entry)
+					switch parkPolicy {
+					case schema.ParkSuspendSync:
+						r.rec.Record(r.event(EventSuspend, e, stepNum, time.Since(opStart), err))
+					case schema.ParkDelete, schema.ParkFork:
+						r.rec.Record(r.event(EventDelete, e, stepNum, time.Since(opStart), err))
+					}
+				})
+				stStats := ws.StepStats(leadMS, 0)
+				r.rec.Record(Event{
+					RunID:            r.cfg.RunID,
+					Event:            EventPark,
+					Name:             string(parkPolicy),
+					Step:             stepNum,
+					DurMS:            ms(time.Since(parkStart)),
+					OK:               ctx.Err() == nil,
+					Count:            liveCount,
+					StandingPoolSize: stStats.StandingPoolSize,
+				})
+			} else if parkPolicy == schema.ParkNone {
+				for _, entry := range active {
+					if entry != nil {
+						_ = ws.Release(ctx, entry)
+					}
+				}
+			}
+
+			stepPause := r.cfg.StepPause
+			if stepPause <= 0 && st.StepPauseMS > 0 {
+				stepPause = time.Duration(st.StepPauseMS * float64(time.Millisecond))
+			}
+			if stepPause > 0 {
+				select {
+				case <-ctx.Done():
+				case <-time.After(stepPause):
+				}
+			}
+
+			if parkPolicy == schema.ParkSuspendAsync {
+				parkStart := time.Now()
+				overlap, _ := ws.AwaitAsyncSuspends(ctx, barrierDoneAt, time.Now())
+				for i, entry := range active {
+					if entry == nil {
+						continue
+					}
+					e := &environment{id: entry.SandboxID, base: entry.BaseID, inst: Instance{InstanceID: entry.InstanceID, Image: entry.Image}, task: i}
+					r.rec.Record(r.event(EventSuspend, e, stepNum, entry.asyncDur, entry.asyncErr))
+				}
+				stepOverlapMS = overlap
+				totalReleaseOverlapMS += overlap
+				stStats := ws.StepStats(leadMS, stepOverlapMS)
+				r.rec.Record(Event{
+					RunID:            r.cfg.RunID,
+					Event:            EventPark,
+					Name:             string(parkPolicy),
+					Step:             stepNum,
+					DurMS:            ms(time.Since(parkStart)),
+					OK:               ctx.Err() == nil,
+					Count:            liveCount,
+					StandingPoolSize: stStats.StandingPoolSize,
+					ReleaseOverlapMS: stepOverlapMS,
+				})
+			}
+		} else {
+			lastActive = active
+		}
+
+		stStats := ws.StepStats(leadMS, stepOverlapMS)
+		r.rec.Record(Event{
+			RunID:                r.cfg.RunID,
+			Event:                EventBarrier,
+			Step:                 stepNum,
+			DurMS:                ms(barrierDur),
+			OK:                   ctx.Err() == nil,
+			Count:                liveCount,
+			WorkingSetHits:       stStats.Hits,
+			WorkingSetMisses:     stStats.Misses,
+			WorkingSetHitRate:    stStats.HitRate,
+			StandingPoolSize:     stStats.StandingPoolSize,
+			Created:              stStats.Created,
+			Reused:               stStats.Reused,
+			Retired:              stStats.Retired,
+			PrefetchLeadMarginMS: stStats.PrefetchLeadMarginMS,
+			ReleaseOverlapMS:     stStats.ReleaseOverlapMS,
+		})
+	}
+
+	r.wsStats = ws.SummaryStats(totalPrefetchLeadMS, totalReleaseOverlapMS)
+
+	if r.cfg.Keep {
+		return nil
+	}
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+	forEach(cleanup, len(lastActive), r.cfg.Width, func(i int) {
+		entry := lastActive[i]
+		if entry == nil || entry.Sandbox == nil {
+			return
+		}
+		e := &environment{id: entry.SandboxID, base: entry.BaseID, inst: Instance{InstanceID: entry.InstanceID, Image: entry.Image}, task: i, sb: entry.Sandbox}
+		r.remove(cleanup, e, len(job.Steps))
+	})
+	_ = ws.Close(cleanup)
+	return nil
 }
 
 func (r *runner) countFailed(envs []*environment) int {
@@ -704,6 +1321,9 @@ func (r *runner) create(ctx context.Context, e *environment, step int) bool {
 // Setup steps first; one that survived a park runs the Reset steps first.
 func (r *runner) replay(ctx context.Context, e *environment, step int) {
 	fresh := step <= 1 || r.cfg.Park == ParkDelete
+	if e.hasWSOverride {
+		fresh = e.wsFresh
+	}
 	prefix := e.traj.Reset
 	if fresh {
 		prefix = e.traj.Setup
@@ -716,7 +1336,12 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 	first := true
 	firstEvent := EventTTFI
 	firstStart := e.createStart
-	if step > 1 && r.cfg.Park != ParkDelete {
+	if e.hasWSOverride {
+		if e.wsWake {
+			firstEvent = EventWake
+			firstStart = time.Time{}
+		}
+	} else if step > 1 && r.cfg.Park != ParkDelete {
 		firstEvent = EventWake
 		firstStart = time.Time{}
 	}
@@ -724,16 +1349,19 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 	taskStart := time.Now()
 	ok := true
 	var reward *int
+	var totalThinkMS float64
 	for _, s := range steps {
 		// No think time before the first command: it would land in the
 		// ttfi or wake measurement, and the "model" has nothing to think
 		// about before it has seen the environment.
 		if s.Think > 0 && !first {
+			thinkStart := time.Now()
 			select {
 			case <-ctx.Done():
 				ok = false
 			case <-time.After(time.Duration(s.Think)):
 			}
+			totalThinkMS += ms(time.Since(thinkStart))
 			if !ok {
 				break
 			}
@@ -747,6 +1375,16 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 		if first {
 			fe := r.event(firstEvent, e, step, time.Since(firstStart), err)
 			fe.Attempts = attempts
+			fe.SlotWaitMS = e.slotWaitMS
+			if firstEvent == EventTTFI {
+				wireMS := math.Max(0, ms(stepStart.Sub(firstStart)))
+				firstCmdMS := ms(dur)
+				fe.Metrics = map[string]float64{
+					"sdk_slot_wait_ms":       round1(e.slotWaitMS),
+					"wire_claim_to_ready_ms": round1(wireMS),
+					"ready_to_first_cmd_ms":  round1(firstCmdMS),
+				}
+			}
 			r.rec.Record(fe)
 			first = false
 		}
@@ -763,10 +1401,32 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 			if res.ExitCode == 0 {
 				*reward = 1
 			}
+			out := res.Stdout + res.Stderr
+			if a := AdapterFor(e.inst.Kind); a != nil {
+				if ig, ok := a.(InstanceGrader); ok {
+					if parsedReward, detail, gerr := ig.GradeInstance(e.inst, res); gerr == nil {
+						if parsedReward != nil {
+							reward = parsedReward
+						}
+						if detail != "" {
+							ev.Detail = detail
+						}
+					}
+				} else if a.Grader() != nil {
+					if parsedReward, detail, gerr := a.Grader().Parse([]byte(out)); gerr == nil {
+						if parsedReward != nil {
+							reward = parsedReward
+						}
+						if detail != "" {
+							ev.Detail = detail
+						}
+					}
+				}
+			}
 			ev.Reward = reward
 			// The grader's verdict is the last line of a reward step's
 			// output; keep enough of it for the report to read it back.
-			ev.Tail = tail(res.Stdout+res.Stderr, 4000)
+			ev.Tail = tail(out, 4000)
 		case s.ExpectExit != nil && res.ExitCode != *s.ExpectExit:
 			ok = false
 			ev.OK = false
@@ -783,8 +1443,16 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 		ok = false
 	}
 	ev := r.event(EventTask, e, step, time.Since(taskStart), nil)
+	ev.SlotWaitMS = e.slotWaitMS
 	ev.OK = ok
 	ev.Reward = reward
+	if totalThinkMS > 0 {
+		taskDurMS := ms(time.Since(taskStart))
+		ev.Metrics = map[string]float64{
+			"llm_think_ms": round1(totalThinkMS),
+			"env_wait_ms":  round1(math.Max(0, taskDurMS-totalThinkMS)),
+		}
+	}
 	r.rec.Record(ev)
 	r.countTask(e, step, ok, reward)
 	if !ok && r.cfg.Mode == ModeSteps {
@@ -854,12 +1522,68 @@ func isTransient(err error) bool {
 }
 
 func (r *runner) suspend(ctx context.Context, e *environment, step int) {
+	r.suspendWithMode(ctx, e, step, false)
+}
+
+func (r *runner) suspendWithMode(ctx context.Context, e *environment, step int, async bool) {
 	start := time.Now()
-	err := e.sb.Suspend(ctx)
+	var err error
+	if ms, ok := e.sb.(ModeSuspender); ok {
+		err = ms.SuspendWithMode(ctx, async)
+	} else if async {
+		if as, ok := e.sb.(AsyncSuspender); ok {
+			err = as.SuspendAsync(ctx)
+		} else {
+			err = e.sb.Suspend(ctx)
+		}
+	} else {
+		err = e.sb.Suspend(ctx)
+	}
 	r.rec.Record(r.event(EventSuspend, e, step, time.Since(start), err))
 	if err != nil {
 		r.log.Warn("suspend failed", slog.String("env", e.id), slog.String("err", err.Error()))
 	}
+}
+
+func (r *runner) fork(ctx context.Context, e *environment, step int) bool {
+	parentID := e.id
+	parentSB := e.sb
+	newID := fmt.Sprintf("%s-s%d", e.base, step)
+	cctx, cancel := context.WithTimeout(ctx, r.cfg.CreateTimeout)
+	defer cancel()
+	e.createStart = time.Now()
+
+	var (
+		child Sandbox
+		err   error
+	)
+	if sf, ok := parentSB.(SandboxForker); ok {
+		child, err = sf.Fork(cctx, newID)
+	} else if fb, ok := r.cfg.Backend.(ForkBackend); ok {
+		child, err = fb.Fork(cctx, parentID, newID)
+	} else {
+		child, err = r.cfg.Backend.Create(cctx, newID, e.inst.Image)
+	}
+	ev := r.event(EventFork, e, step, time.Since(e.createStart), err)
+	ev.Env = newID
+	r.rec.Record(ev)
+	if err != nil {
+		e.failed = true
+		task := r.event(EventTask, e, step, 0, err)
+		task.Env = newID
+		r.rec.Record(task)
+		r.countTask(e, step, false, nil)
+		r.log.Warn("fork failed", slog.String("from", parentID), slog.String("env", newID), slog.String("err", err.Error()))
+		return false
+	}
+	e.id = newID
+	if parentSB != nil && !r.cfg.Keep {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+		_ = parentSB.Delete(cleanup)
+		cancel()
+	}
+	e.sb = child
+	return true
 }
 
 func (r *runner) remove(ctx context.Context, e *environment, step int) {
@@ -904,4 +1628,429 @@ func (r *runner) countTask(e *environment, step int, ok bool, reward *int) {
 	if reward != nil && *reward == 1 {
 		r.rewarded++
 	}
+}
+
+// EnvHandle describes an acquired sandbox environment in scenario runners.
+type EnvHandle struct {
+	Name   string
+	Source string
+}
+
+// ExecResult aliases Result for scenario runners.
+type ExecResult = Result
+
+// EnvClient is the lifecycle interface used by multi-job scenario runners.
+type EnvClient interface {
+	Create(ctx context.Context, image, instanceID string) (EnvHandle, error)
+	Exec(ctx context.Context, envName, cmd string, timeout time.Duration) (ExecResult, error)
+	Delete(ctx context.Context, envName string) error
+	Snapshot(ctx context.Context, envName string) (string, error)
+	Resume(ctx context.Context, snapshot, image, instanceID string) (EnvHandle, error)
+}
+
+// Runner drives an open-loop or closed-loop workload against an EnvClient and
+// records events to Recorder.
+type Runner struct {
+	Config     Config
+	Client     EnvClient
+	Recorder   *Recorder
+	Scheduled  schema.ScheduledJob
+	ParkPolicy schema.ParkPolicy
+	SleepFunc  func(ctx context.Context, d time.Duration) error
+}
+
+// Run executes the configured open-loop or closed-loop workload against r.Client.
+func (r *Runner) Run(ctx context.Context) error {
+	if r.Client == nil {
+		return errors.New("Runner.Client is required")
+	}
+	rec := r.Recorder
+	if rec == nil {
+		rec = r.Config.Recorder
+	}
+	if rec == nil {
+		rec = NewRecorder(nil)
+	}
+	if len(r.Scheduled.Steps) > 0 && r.Config.Mode != ModeOpenLoop {
+		return r.runClosedLoop(ctx, rec)
+	}
+	return r.runOpenLoop(ctx, rec)
+}
+
+func (r *Runner) runOpenLoop(ctx context.Context, rec *Recorder) error {
+	conc := r.Config.Concurrency
+	if conc <= 0 {
+		conc = r.Config.Width
+	}
+	if conc <= 0 {
+		conc = 4
+	}
+	rate := r.Config.ArrivalRate
+	if rate <= 0 {
+		rate = 10.0
+	}
+	dur := r.Config.Duration
+	if dur <= 0 {
+		dur = 100 * time.Millisecond
+	}
+	instances := r.Config.Instances
+	if len(instances) == 0 {
+		instances = SyntheticInstances(4, "")
+	}
+
+	deadline := time.Now().Add(dur)
+	return dispatchOpenLoop(ctx, r.Config.Seed, rate, conc, 0, deadline, func(tIdx int, slotWait float64) {
+		in := instances[tIdx%len(instances)]
+		tStart := time.Now()
+		h, err := r.Client.Create(ctx, in.Image, in.InstanceID)
+		cDur := DurMS(time.Since(tStart))
+		src := h.Source
+		if src == "" {
+			src = string(schema.SourceWarmPool)
+		}
+		rec.Emit(Event{
+			RunID:    r.Config.RunID,
+			Job:      r.Config.JobName,
+			Event:    EventPhase,
+			Name:     "create",
+			Phase:    "create",
+			Source:   src,
+			Env:      h.Name,
+			Instance: in.InstanceID,
+			Image:    in.Image,
+			Task:     tIdx,
+			DurMS:    cDur,
+			OK:       err == nil,
+		})
+		if err != nil {
+			return
+		}
+		_, execErr := r.Client.Exec(ctx, h.Name, "pytest -q", 30*time.Second)
+		_ = r.Client.Delete(context.Background(), h.Name)
+		reward := 1
+		if execErr != nil {
+			reward = 0
+		}
+		rec.Emit(Event{
+			RunID:      r.Config.RunID,
+			Job:        r.Config.JobName,
+			Event:      EventTask,
+			Source:     src,
+			Env:        h.Name,
+			Instance:   in.InstanceID,
+			Image:      in.Image,
+			Task:       tIdx,
+			DurMS:      DurMS(time.Since(tStart)),
+			SlotWaitMS: slotWait,
+			OK:         execErr == nil,
+			Reward:     &reward,
+		})
+	})
+}
+
+func (r *Runner) runClosedLoop(ctx context.Context, rec *Recorder) error {
+	sleepFn := r.SleepFunc
+	if sleepFn == nil {
+		sleepFn = func(ctx context.Context, d time.Duration) error {
+			if d <= 0 {
+				return nil
+			}
+			t := time.NewTimer(d)
+			defer t.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-t.C:
+				return nil
+			}
+		}
+	}
+	concurrency := r.Config.Concurrency
+	if concurrency <= 0 {
+		concurrency = r.Config.Width
+	}
+	if concurrency <= 0 {
+		concurrency = 4
+	}
+	parkPolicy := r.Scheduled.ParkPolicy
+	if parkPolicy == "" {
+		parkPolicy = r.ParkPolicy
+	}
+	if parkPolicy == "" {
+		parkPolicy = schema.ParkPolicyHold
+	}
+	jobName := r.Config.JobName
+	if jobName == "" {
+		jobName = r.Scheduled.Job
+	}
+
+	for stepIdx, step := range r.Scheduled.Steps {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		stepStart := time.Now()
+
+		for _, img := range step.PrefetchImages {
+			rec.Emit(Event{
+				RunID:  r.Config.RunID,
+				Job:    jobName,
+				Event:  EventPhase,
+				Name:   "prefetch_hint",
+				Phase:  "prefetch_hint",
+				Image:  img,
+				Step:   step.Step,
+				DurMS:  0,
+				OK:     true,
+				Detail: "lookahead image hint",
+			})
+		}
+
+		sem := make(chan struct{}, concurrency)
+		var wg sync.WaitGroup
+		var firstErr error
+		var errMu sync.Mutex
+
+		for taskIdx, task := range step.Tasks {
+			enqueueAt := time.Now()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case sem <- struct{}{}:
+			}
+			slotWaitMS := DurMS(time.Since(enqueueAt))
+
+			wg.Add(1)
+			go func(tIdx int, st schema.ScheduledTask, waitMS float64) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				workerName := fmt.Sprintf("%s-w%d", jobName, tIdx%concurrency)
+				if err := r.runScheduledTask(ctx, rec, jobName, workerName, step.Step, tIdx, st, waitMS, parkPolicy); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+				}
+			}(taskIdx, task, slotWaitMS)
+		}
+		wg.Wait()
+		if firstErr != nil {
+			return firstErr
+		}
+
+		if step.StepPauseMS > 0 && stepIdx < len(r.Scheduled.Steps)-1 {
+			pauseStart := time.Now()
+			if err := sleepFn(ctx, time.Duration(step.StepPauseMS*float64(time.Millisecond))); err != nil {
+				return err
+			}
+			rec.Emit(Event{
+				RunID:  r.Config.RunID,
+				Job:    jobName,
+				Event:  EventPhase,
+				Name:   "step_pause",
+				Phase:  "step_pause",
+				Step:   step.Step,
+				DurMS:  DurMS(time.Since(pauseStart)),
+				OK:     true,
+				Detail: string(parkPolicy),
+			})
+		}
+
+		rec.Emit(Event{
+			RunID: r.Config.RunID,
+			Job:   jobName,
+			Event: EventStep,
+			Step:  step.Step,
+			Count: len(step.Tasks),
+			DurMS: DurMS(time.Since(stepStart)),
+			OK:    true,
+			Tags: map[string]string{
+				"park_policy": string(parkPolicy),
+			},
+		})
+	}
+	return nil
+}
+
+func (r *Runner) runScheduledTask(
+	ctx context.Context,
+	rec *Recorder,
+	jobName string,
+	worker string,
+	step int,
+	taskNum int,
+	st schema.ScheduledTask,
+	slotWaitMS float64,
+	parkPolicy schema.ParkPolicy,
+) error {
+	taskStart := time.Now()
+	t0 := time.Now()
+	handle, err := r.Client.Create(ctx, st.Image, st.InstanceID)
+	createDur := DurMS(time.Since(t0))
+	if err != nil {
+		rec.Emit(Event{
+			RunID:    r.Config.RunID,
+			Job:      jobName,
+			Worker:   worker,
+			Event:    EventPhase,
+			Name:     "create",
+			Phase:    "create",
+			Instance: st.InstanceID,
+			Image:    st.Image,
+			Step:     step,
+			Task:     taskNum,
+			DurMS:    createDur,
+			OK:       false,
+			Err:      err.Error(),
+		})
+		return err
+	}
+	source := handle.Source
+	if source == "" {
+		source = string(schema.SourceColdStart)
+	}
+	rec.Emit(Event{
+		RunID:    r.Config.RunID,
+		Job:      jobName,
+		Worker:   worker,
+		Event:    EventPhase,
+		Name:     "create",
+		Phase:    "create",
+		Source:   source,
+		Env:      handle.Name,
+		Instance: st.InstanceID,
+		Image:    st.Image,
+		Step:     step,
+		Task:     taskNum,
+		DurMS:    createDur,
+		OK:       true,
+	})
+
+	defer func() {
+		td0 := time.Now()
+		delErr := r.Client.Delete(context.Background(), handle.Name)
+		rec.Emit(Event{
+			RunID:    r.Config.RunID,
+			Job:      jobName,
+			Worker:   worker,
+			Event:    EventPhase,
+			Name:     "delete",
+			Phase:    "delete",
+			Env:      handle.Name,
+			Instance: st.InstanceID,
+			Image:    st.Image,
+			Step:     step,
+			Task:     taskNum,
+			DurMS:    DurMS(time.Since(td0)),
+			OK:       delErr == nil,
+		})
+	}()
+
+	tb0 := time.Now()
+	res, err := r.Client.Exec(ctx, handle.Name, "echo bootstrap", 30*time.Second)
+	rec.Emit(Event{
+		RunID:    r.Config.RunID,
+		Job:      jobName,
+		Worker:   worker,
+		Event:    EventPhase,
+		Name:     "bootstrap",
+		Phase:    "bootstrap",
+		Env:      handle.Name,
+		Instance: st.InstanceID,
+		Image:    st.Image,
+		Step:     step,
+		Task:     taskNum,
+		DurMS:    DurMS(time.Since(tb0)),
+		OK:       err == nil && res.ExitCode == 0,
+	})
+
+	if r.Config.SnapshotLoop || parkPolicy == schema.ParkPolicySnapshot {
+		ts0 := time.Now()
+		snap, snapErr := r.Client.Snapshot(ctx, handle.Name)
+		rec.Emit(Event{
+			RunID:    r.Config.RunID,
+			Job:      jobName,
+			Worker:   worker,
+			Event:    EventPhase,
+			Name:     "snapshot",
+			Phase:    "snapshot",
+			Env:      handle.Name,
+			Instance: st.InstanceID,
+			Image:    st.Image,
+			Step:     step,
+			Task:     taskNum,
+			DurMS:    DurMS(time.Since(ts0)),
+			OK:       snapErr == nil,
+			Snapshot: snap,
+		})
+		if snapErr == nil {
+			tr0 := time.Now()
+			resumed, resErr := r.Client.Resume(ctx, snap, st.Image, st.InstanceID)
+			hit := true
+			rec.Emit(Event{
+				RunID:    r.Config.RunID,
+				Job:      jobName,
+				Worker:   worker,
+				Event:    EventPhase,
+				Name:     "resume",
+				Phase:    "resume",
+				Source:   string(schema.SourceSnapshotResume),
+				Env:      resumed.Name,
+				Instance: st.InstanceID,
+				Image:    st.Image,
+				Step:     step,
+				Task:     taskNum,
+				DurMS:    DurMS(time.Since(tr0)),
+				OK:       resErr == nil,
+				Snapshot: snap,
+				CacheHit: &hit,
+			})
+			if resErr == nil && resumed.Name != "" && resumed.Name != handle.Name {
+				_ = r.Client.Delete(ctx, handle.Name)
+				handle = resumed
+			}
+		}
+	}
+
+	te0 := time.Now()
+	evalRes, evalErr := r.Client.Exec(ctx, handle.Name, "pytest -q", 60*time.Second)
+	evalOK := evalErr == nil && evalRes.ExitCode == 0
+	reward := 0
+	if evalOK {
+		reward = 1
+	}
+	rec.Emit(Event{
+		RunID:    r.Config.RunID,
+		Job:      jobName,
+		Worker:   worker,
+		Event:    EventPhase,
+		Name:     "eval_harness",
+		Phase:    "eval_harness",
+		Env:      handle.Name,
+		Instance: st.InstanceID,
+		Image:    st.Image,
+		Step:     step,
+		Task:     taskNum,
+		DurMS:    DurMS(time.Since(te0)),
+		OK:       evalOK,
+		Reward:   &reward,
+	})
+
+	rec.Emit(Event{
+		RunID:      r.Config.RunID,
+		Job:        jobName,
+		Worker:     worker,
+		Event:      EventTask,
+		Source:     source,
+		Env:        handle.Name,
+		Instance:   st.InstanceID,
+		Image:      st.Image,
+		Step:       step,
+		Task:       taskNum,
+		DurMS:      DurMS(time.Since(taskStart)),
+		SlotWaitMS: slotWaitMS,
+		OK:         evalOK,
+		Reward:     &reward,
+	})
+	return nil
 }

@@ -15,8 +15,10 @@
 # limitations under the License.
 
 # Prints one `ate-env manifest template` command per resource class the
-# tasks under a directory ask for ([environment] cpus and memory_mb in each
-# task.toml), named the way ate_env_harbor picks them: <prefix>c<cpus>-m<memory_mb>.
+# tasks under a directory ask for ([environment] cpus and memory_mb, or memory,
+# in each task.toml), named the way ate_env_harbor picks them:
+# <prefix>c<cpus>-m<memory_mb>. --override-cpus and --override-memory-mb select
+# classes this script does not print; register those by hand.
 # Pipe the output to a shell to register them.
 #
 #   register-templates.sh [--prefix harbor-] <tasks-dir> [-- <ate-env manifest template flags>]
@@ -37,40 +39,16 @@ if [[ "${1:-}" == "--" ]]; then
   shift
 fi
 
-python3 -I - "${PREFIX}" "${TASKS_DIR}" ${@+"$@"} <<'PY'
-import pathlib
-import shlex
+# The parsing is the package's (ate_env_harbor.templates.task_classes), which
+# reads each [environment] table with Harbor's EnvironmentConfig: memory = "4G" and memory_mb
+# name the same class. Run it with the Python that has ate-env-harbor
+# installed (PYTHON, default python3).
+"${PYTHON:-python3}" -I -c '
 import sys
-import tomllib
+
+from ate_env_harbor.templates import register_commands
 
 prefix, root, *extra = sys.argv[1:]
-
-
-def cpu_quantity(cpus):
-    value = float(cpus)
-    return str(int(value)) if value.is_integer() else f"{round(value * 1000)}m"
-
-
-classes = {}
-for task_toml in sorted(pathlib.Path(root).rglob("task.toml")):
-    with task_toml.open("rb") as f:
-        env = tomllib.load(f).get("environment", {})
-    cpus, memory_mb = env.get("cpus"), env.get("memory_mb")
-    if cpus is None and memory_mb is None:
-        continue
-    tokens = []
-    if cpus is not None:
-        tokens.append("c" + cpu_quantity(cpus))
-    if memory_mb is not None:
-        tokens.append(f"m{int(memory_mb)}")
-    classes.setdefault(prefix + "-".join(tokens), (cpus, memory_mb))
-
-for name, (cpus, memory_mb) in classes.items():
-    parts = ["ate-env", "manifest", "template", "--template", name]
-    if cpus is not None:
-        parts += ["--cpu", cpu_quantity(cpus)]
-    if memory_mb is not None:
-        parts += ["--memory", f"{int(memory_mb)}Mi"]
-    parts += extra
-    print(" ".join(shlex.quote(p) for p in parts) + " | kubectl-ate create actor-template -f -")
-PY
+for command in register_commands(root, prefix, extra):
+    print(command)
+' "${PREFIX}" "${TASKS_DIR}" ${@+"$@"}

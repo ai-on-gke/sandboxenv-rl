@@ -20,17 +20,24 @@ unknown environment is a 404, a suspended one is woken by the request, the
 routing prefix is stripped, and HTTP upgrades are relayed both ways. It also
 keeps ate-env-api's own answers: 400 for port 80 (the guest) and a port out
 of range, and, with ``api_token``, 401 for a request without the bearer in
-X-Env-Authorization or Authorization, which it removes before it forwards.
+X-Env-Authorization or Authorization, which it removes before it forwards. A
+WebSocket upgrade can instead carry a port capability as ``Authorization:
+Basic`` with the user ``ate-env-capability``; the proxy checks it for the
+environment port and never forwards it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import hashlib
+import hmac
 import http.client
 import re
 import socket
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -67,6 +74,7 @@ class FakeAteEnv:
     create_lands_after: float | None = None  # create succeeds this late, after the client gave up
     wakes: int = 0
     proxied: list[dict] = field(default_factory=list)
+    received: list[dict] = field(default_factory=list)  # each request as the proxy got it
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def env_pb(self, env_id: str) -> env_pb2.Environment:
@@ -152,6 +160,32 @@ def _relay(a: socket.socket, b: socket.socket) -> None:
             b.shutdown(socket.SHUT_WR)
 
 
+def _capability(authorization: str | None) -> str | None:
+    """The port capability in an ``Authorization: Basic`` value, if any."""
+    scheme, _, payload = (authorization or "").strip().partition(" ")
+    if scheme.lower() != "basic":
+        return None
+    try:
+        user, _, capability = base64.b64decode(payload.strip()).decode().partition(":")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return capability if user == "ate-env-capability" else None
+
+
+def _capability_ok(token: str, capability: str, atespace: str, env_id: str, port: int) -> bool:
+    """Checks a port capability the way ate-env-api's port proxy does."""
+    version, _, rest = capability.partition(".")
+    expiry, _, mac = rest.partition(".")
+    if version != "v1" or not expiry.isdigit():
+        return False
+    left = int(expiry) - time.time()
+    if left <= 0 or left > 7 * 24 * 3600:
+        return False
+    msg = f"ate-env port capability v1\n{atespace}\n{env_id}\n{port}\n{expiry}".encode()
+    want = hmac.new(token.encode(), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(mac, want)
+
+
 def _handler(state: FakeAteEnv):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -161,6 +195,9 @@ def _handler(state: FakeAteEnv):
 
         def _route(self):
             """(upstream, rest, headers to drop) for a request, or None once answered."""
+            with state.lock:
+                state.received.append({"method": self.command, "path": self.path,
+                                       "headers": dict(self.headers.items())})
             if state.refuse is not None:
                 state.refusals += 1
                 self._reply(*state.refuse)
@@ -178,17 +215,25 @@ def _handler(state: FakeAteEnv):
                 self._reply(400, f"port {m['port']!r} is not a TCP port (1-65535)")
                 return None
             drop = {"x-env-authorization"}
+            env_id, atespace = m["id"], m["a"] or DEFAULT_ATESPACE
+            capability = _capability(self.headers.get("Authorization"))
+            if capability is not None:
+                drop.add("authorization")  # a capability is never the daemon's
             if state.api_token is not None:
                 want = f"Bearer {state.api_token}"
                 given = self.headers.get("X-Env-Authorization")
-                if given is None:
-                    given = self.headers.get("Authorization")
+                if given is not None:
+                    ok = given == want
+                elif capability is not None:
+                    ok = (self.headers.get("Upgrade", "").lower() == "websocket"
+                          and _capability_ok(state.api_token, capability, atespace, env_id, port))
+                else:
                     drop.add("authorization")
-                if given != want:
+                    ok = self.headers.get("Authorization") == want
+                if not ok:
                     self._reply(401, "missing or invalid bearer token; send it in "
                                      "X-Env-Authorization or Authorization")
                     return None
-            env_id, atespace = m["id"], m["a"] or DEFAULT_ATESPACE
             with state.lock:
                 env = state.envs.get(env_id)
                 if env is None or env["atespace"] != atespace:

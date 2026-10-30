@@ -22,6 +22,7 @@ in numbers.
 |---|---|---|
 | eval (SWE-bench Verified evaluation) | `-mode eval -images 500 -tasks-per-image 6 -width 500` | 500 in flight. Each task: create from the image, replay the trajectory, record the reward, delete. With the offline exclusion list the 500 become 445 images and 2,670 tasks; the loader prints the reduced count. |
 | steps (training loop) | `-mode steps -images 500 -rollouts 2 -steps 8 -park suspend` | 1,000 environments created once. Each step replays the trajectory on all of them, waits for the last (the barrier), then parks the fleet. `-park` is `suspend`, `delete` or `none`. |
+| steps, parked one by one (fleet larger than the slots) | `-mode steps -images 500 -rollouts 16 -steps 8 -park suspend -width 64 -park-each` | 8,000 environments, created on their first step. Each environment is parked as soon as its own step ends instead of after the whole fleet's, so at most 64 are awake at once and the fleet can be many times the running slots: the shape of a trainer that releases a sandbox at the end of its episode, and the way to measure how many parked environments a node can hold. The barrier includes the parking and there is no `park` event. |
 | steps with a window (pools per step) | `-mode steps -images-per-step 32 -rollouts 16 -steps 6 -park delete` | Each step takes the next 32 images (wrapping around the dataset), creates 16 fresh environments per image, 512 in all, runs the step behind a barrier, and retires them. Nothing survives a step, so every task pays the cold path, and a new image is a new derived template and a golden bake on first use: the shape of a trainer that creates and retires pools every step. Run several loaders at once, one run id each, for several jobs on one cluster. |
 
 The trajectory is YAML (`internal/benchmarking/swebench/trajectories/`,
@@ -51,7 +52,7 @@ API server included, which is what a trainer sees):
 | `task` | one replay end to end, ok and reward |
 | `suspend`, `delete` | the calls |
 | `step_barrier` | steps mode: first task start to last task end in a training step |
-| `park` | steps mode: parking the whole fleet |
+| `park` | steps mode: parking the whole fleet; absent with `-park-each`, where the barrier includes the parking |
 | `run` | the whole run |
 
 `swebench-loader report RUN.jsonl -json summary.json` prints count, failed,
@@ -324,6 +325,16 @@ benchmarking/swebench/harvest-restore-timings.sh pull-baseline restores.jsonl
 swebench-loader report pull-baseline.jsonl -restore-log restores.jsonl
 ```
 
+Kubelet rotates a busy atelet's log within the hour, so for a run longer
+than a few minutes let the run script harvest as it goes: with
+`RESTORE_LOG=restores.jsonl` it runs the harvest every ten minutes
+(`HARVEST_INTERVAL_MIN`) and once more at the end, merges the parts with
+duplicates dropped, and passes the file to the final report.
+
+```bash
+RESTORE_LOG=restores.jsonl benchmarking/swebench/run-in-cluster.sh pull-baseline images.jsonl ...
+```
+
 atelet logs one record per actor restore with the seconds each phase took:
 manifest fetch, snapshot download, image unpack, the worker's restore, and
 the total. The actor's name is the environment's name, so the report pairs
@@ -376,3 +387,77 @@ loader records its own flags itself: mode, width, images, trajectory,
 dataset, tasks per image or rollouts, steps and park, connections, base
 template, exclude file, instances, and the create, step, wake-budget and
 wake-backoff timeouts. The report alone is not reproducible without them.
+
+## Unified `bench` CLI (Synthetic & Real RL)
+
+`cmd/benchmarking/bench` is the unified orchestrator for both scenario-driven
+synthetic workloads and real RL training recipes (`examples/*-verl`). Every
+subcommand communicates through a single artifact directory (`-dest "$ARTIFACT_DIR"`):
+
+| Subcommand | Purpose |
+|---|---|
+| `bench run` | End-to-end execution of a declarative `scenario.yaml` (resolve -> prewarm -> execute -> measure -> reap -> report) |
+| `bench resolve` | Resolve a `scenario.yaml` and dataset into a deterministic `schedule.json` |
+| `bench render` | Render Kubernetes Job manifests from a `scenario.yaml` |
+| `bench prewarm` | Prewarm templates or standing sandbox pools prior to the timed run window |
+| `bench spinup` | Scale `WorkerPool` (`0 -> N` `ateworker` pods), wait for `ate-env-api` + all worker pods `Ready`, and record `workerpool_spinup_wall_ms` and `worker_pod_*_ms` into `measurements.json` and `events/substrate_lifecycle.jsonl` |
+| `bench spindown` | Scale `WorkerPool` (`N -> 0` `ateworker` pods), wait for all worker pods to terminate, and record `workerpool_spindown_wall_ms` and `worker_pod_terminate_ms` into `measurements.json` and `events/substrate_lifecycle.jsonl` |
+| `bench measure` | Collect K8s (`-k8s`), Substrate (`-ate-endpoint`), Prometheus (`-prom-url`), node cache (`-sample-node-cache`), and restore timings (`-restore-log`) into `measurements.json` and `system_description.json` |
+| `bench reap` | Verify zero orphaned environments remain post-run and emit `events/reap.jsonl` |
+| `bench report` | Ingest `events/*.jsonl`, `traces/*.jsonl`, `train.log`, `measurements.json`, and `system_description.json` into `report.json` and `report.md` |
+| `bench validate` | Validate `report.json`, `measurements.json`, and `system_description.json` against strict `v1` schemas, and with `-folder` the archive folder name |
+| `bench upload` | Validate, then copy `$ARTIFACT_DIR` to `gs://<bucket>/<folder>/` |
+| `bench compare` | Diff two or more `report.json` files or artifact directories side-by-side |
+
+### 1. Synthetic / Scenario-Driven Run
+
+```bash
+ARTIFACT_DIR=/tmp/bench-run
+go run ./cmd/benchmarking/bench run \
+  -scenario benchmarking/scenarios/multi-job-swebench.yaml \
+  -dest "$ARTIFACT_DIR"
+go run ./cmd/benchmarking/bench validate -dest "$ARTIFACT_DIR"
+```
+
+### 2. Real RL Training Run (`examples/*-verl`)
+
+```bash
+ARTIFACT_DIR=/tmp/rl-bench-run
+mkdir -p "$ARTIFACT_DIR/measurements_snapshots"
+
+# 1. Spin up Substrate WorkerPool (0 -> N ateworker pods) & capture pre-run node image-cache snapshot
+go run ./cmd/benchmarking/bench spinup -namespace ate-env -workerpool default-template-workerpool -replicas 32 -dest "$ARTIFACT_DIR"
+go run ./cmd/benchmarking/bench measure -sample-node-cache "$ARTIFACT_DIR/cache_before.prom"
+
+# 2. Launch the RL recipe (with ATE_ENV_TRACE_DIR=/workspace/results/traces enabled in the Job)
+(cd examples/Qwen3-1.7B-verl && ./deploy.sh up)
+
+# 3. Sample live K8s + Substrate state while training steps are active
+kubectl -n ate-env port-forward deploy/ate-env-api 18443:8443 &
+go run ./cmd/benchmarking/bench measure -k8s -ate-endpoint 127.0.0.1:18443 \
+  -atespace ate-env -dest "$ARTIFACT_DIR"
+
+# 4. After training completes, copy train.log + traces/*.jsonl into $ARTIFACT_DIR, then reap, sample post-cache, & spin down WorkerPool (N -> 0)
+go run ./cmd/benchmarking/bench reap -ate-endpoint 127.0.0.1:18443 -atespace ate-env -prefix verl- -dest "$ARTIFACT_DIR"
+go run ./cmd/benchmarking/bench measure -sample-node-cache "$ARTIFACT_DIR/cache_after.prom"
+benchmarking/swebench/harvest-restore-timings.sh <run-id> "$ARTIFACT_DIR/restore_timings.jsonl"
+go run ./cmd/benchmarking/bench spindown -namespace ate-env -workerpool default-template-workerpool -dest "$ARTIFACT_DIR"
+
+# 5. Generate and validate report.json + report.md
+go run ./cmd/benchmarking/bench report -dest "$ARTIFACT_DIR"
+go run ./cmd/benchmarking/bench validate -dest "$ARTIFACT_DIR"
+```
+
+### 3. Archiving Results & Further Guides
+
+Archive completed `$ARTIFACT_DIR` directories to object storage under a
+consistent folder name, with `_traced` iff the run captured an SDK trace
+(`report.json` `trace_captured: true`; traced latencies include trace overhead):
+
+```text
+gs://<YOUR_BENCHMARK_BUCKET>/<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>/
+gs://<YOUR_BENCHMARK_BUCKET>/<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>_traced/
+```
+
+- **Telemetry scopes & feature debug plugins**: [`internal/benchmarking/TELEMETRY_GUIDE.md`](../../internal/benchmarking/TELEMETRY_GUIDE.md)
+- **Agent integration & execution playbook**: [`benchmarking/SKILL.md`](../SKILL.md)

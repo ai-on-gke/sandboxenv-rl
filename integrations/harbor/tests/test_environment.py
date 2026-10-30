@@ -387,6 +387,30 @@ async def test_concurrent_environments_on_one_dockerfile_build_once(fake, make_e
         await asyncio.gather(*(e.stop(delete=True) for e in envs))
 
 
+async def test_create_cancelled_after_the_server_registered_deletes_by_id(fake, make_env):
+    """Harbor wraps start() in build_timeout_sec. A create that the server
+    completed but that the caller did not wait out must not leak: the id is
+    known before the call, thus the cleanup deletes by id."""
+    fake.state.create_delay = 2.0
+    env = make_env()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(env.start(force_build=False), 0.3)
+    assert fake.state.deletes == [env.env_id]
+    assert fake.state.envs == {}
+    with pytest.raises(RuntimeError, match="not started"):
+        await env.exec("true")
+
+
+async def test_create_timeout_covers_the_create_itself(fake, make_env):
+    """create_timeout_sec starts before the create, not after it returns."""
+    fake.state.create_delay = 1.0
+    env = make_env(create_timeout_sec=0.5)
+    fake.state.unavailable_calls = 10**6
+    with pytest.raises(TimeoutError, match="did not answer within 0.5s"):
+        await env.start(force_build=False)
+    assert fake.state.deletes == [env.env_id]
+
+
 async def test_create_failure_is_raised_as_is(fake, make_env):
     import grpc
 

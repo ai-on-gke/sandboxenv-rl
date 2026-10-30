@@ -73,7 +73,9 @@ applied) select the base:
   spelled in millicores, `harbor-c500m-m2048`. A task without resources uses
   `template`.
 - Register the classes a dataset needs once. `hack/register-templates.sh`
-  prints the commands:
+  prints the commands. It parses each `task.toml` with Harbor's own model, thus
+  `memory = "4G"` and `memory_mb = 4096` name the same class, and it runs with
+  the Python that has `ate-env-harbor` installed (`PYTHON=.venv/bin/python`):
 
   ```bash
   integrations/harbor/hack/register-templates.sh <tasks-dir> -- \
@@ -81,6 +83,9 @@ applied) select the base:
     --snapshots-bucket <object-storage-url> | sh
   ```
 
+- `--override-cpus` and `--override-memory-mb` select classes the script does
+  not print (the tasks do not ask for them); register those by hand with the
+  same command shape.
 - Under the default `auto` policy a missing class template falls back to
   `template` with a warning that names the registration command. Under
   `--cpus limit` or `--memory limit` the trial fails instead. `ignore` uses

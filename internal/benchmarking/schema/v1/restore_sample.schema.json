@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-on-gke.github.io/sandboxenv-rl/schema/v1/restore_sample.schema.json",
+  "title": "RestoreSample",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["env", "total_ms"],
+  "properties": {
+    "schema_version": { "type": "string", "enum": ["v1"] },
+    "node": { "type": "string" },
+    "env": { "type": "string", "minLength": 1 },
+    "snapshot": { "type": "string" },
+    "kind": { "type": "string" },
+    "ts": { "type": "string" },
+    "total_ms": { "type": "number", "minimum": 0 },
+    "manifest_fetch_ms": { "type": "number", "minimum": 0 },
+    "download_ms": { "type": "number", "minimum": 0 },
+    "oci_unpack_ms": { "type": "number", "minimum": 0 },
+    "worker_restore_ms": { "type": "number", "minimum": 0 },
+    "persist_ms": { "type": "number", "minimum": 0 },
+    "cache_hit": { "type": "boolean" }
+  }
+}

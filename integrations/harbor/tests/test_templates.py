@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -27,6 +29,8 @@ from ate_env_harbor.templates import (
 )
 
 SCRIPT = Path(__file__).parent.parent / "hack" / "register-templates.sh"
+# The script parses task.toml with Harbor's model, thus it runs with this Python.
+SCRIPT_ENV = {**os.environ, "PYTHON": sys.executable}
 
 
 @pytest.mark.parametrize(
@@ -76,22 +80,29 @@ def test_script_prints_one_command_per_class(tmp_path):
     _task(tasks, "b", "cpus = 0.5\nmemory_mb = 2048")
     _task(tasks, "c", "cpus = 1\nmemory_mb = 512")  # the same class as a
     _task(tasks, "d", "")  # no resources: the default template serves it
+    _task(tasks, "e", 'cpus = 2\nmemory = "4G"')  # Harbor normalizes memory to memory_mb
     out = subprocess.run(
         [str(SCRIPT), str(tasks), "--", "--snapshots-bucket", "gs://b"],
-        check=True, capture_output=True, text=True,
+        check=True, capture_output=True, text=True, env=SCRIPT_ENV,
     ).stdout.splitlines()
     assert out == [
         register_command("harbor-", 1, 512, extra=("--snapshots-bucket", "gs://b")),
         register_command("harbor-", 0.5, 2048, extra=("--snapshots-bucket", "gs://b")),
+        register_command("harbor-", 2, 4096, extra=("--snapshots-bucket", "gs://b")),
     ]
     names = [line.split("--template ")[1].split()[0] for line in out]
-    assert names == [class_template_name("harbor-", 1, 512), class_template_name("harbor-", 0.5, 2048)]
+    assert names == [
+        class_template_name("harbor-", 1, 512),
+        class_template_name("harbor-", 0.5, 2048),
+        class_template_name("harbor-", 2, 4096),
+    ]
 
 
 def test_script_prefix_option(tmp_path):
     tasks = tmp_path / "tasks"
     _task(tasks, "a", "cpus = 2\nmemory_mb = 1024")
     out = subprocess.run(
-        [str(SCRIPT), "--prefix", "tb-", str(tasks)], check=True, capture_output=True, text=True
+        [str(SCRIPT), "--prefix", "tb-", str(tasks)],
+        check=True, capture_output=True, text=True, env=SCRIPT_ENV,
     ).stdout
     assert "--template tb-c2-m1024 --cpu 2 --memory 1024Mi |" in out

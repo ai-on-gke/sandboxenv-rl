@@ -29,11 +29,13 @@
 //
 // Trust model: without Options.Authenticate, the proxy does not authenticate
 // callers. Whoever can reach the listener it is served on can reach any TCP
-// port of any actor the router serves, in any atespace, including actors that
-// ate-env did not create. With it, a caller must present the API's bearer
-// token in EnvAuthorizationHeader or Authorization, and the token does not
-// reach the daemon. Either way, a daemon behind it must authenticate its own
-// clients. The path form refuses
+// port of any actor the router serves in the atespaces Options.Atespaces
+// allows (all of them when it is empty), including actors that ate-env did not
+// create: Substrate actors carry no label that tells them apart, thus a
+// dedicated atespace is the boundary. With Authenticate, a caller must present
+// the API's bearer token in EnvAuthorizationHeader or Authorization, and the
+// token does not reach the daemon. Either way, a daemon behind it must
+// authenticate its own clients. The path form refuses
 // requests that a browser sends from another origin (see Options.TrustedOrigins),
 // so a web page cannot drive a daemon through a port-forwarded listener.
 package portproxy
@@ -57,6 +59,8 @@ import (
 
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/routertls"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // The routing headers. They match the x-env-id and x-env-atespace metadata
@@ -141,6 +145,12 @@ type Options struct {
 	// daemon: the proxy drops EnvAuthorizationHeader, and drops Authorization
 	// when it carried the credential.
 	Authenticate func(credential string) error
+	// Atespaces, when set, are the only atespaces whose environments the
+	// proxy forwards to; a request that names another gets 403, after
+	// Authenticate. Empty means any atespace the router serves.
+	// DefaultAtespace is not implied: list it to serve requests that name
+	// no atespace.
+	Atespaces []string
 	// OnConnected, when set, is called with the environment's atespace and
 	// id each time the router accepts a CONNECT to one of its ports, after
 	// any wait for a wake. ate-env-api uses it to end create_to_ready when a
@@ -151,13 +161,15 @@ type Options struct {
 // Proxy is an http.Handler that forwards each request to the environment port
 // its headers name.
 type Proxy struct {
-	opts Options
-	rp   *httputil.ReverseProxy
-	tr   *http.Transport
-	cop  *http.CrossOriginProtection
+	opts      Options
+	atespaces map[string]bool // nil: any atespace
+	rp        *httputil.ReverseProxy
+	tr        *http.Transport
+	cop       *http.CrossOriginProtection
 }
 
-// New returns a Proxy. It fails only on a malformed trusted origin.
+// New returns a Proxy. It fails only on a malformed trusted origin or
+// atespace.
 func New(opts Options) (*Proxy, error) {
 	if opts.HostSuffix == "" {
 		opts.HostSuffix = ate.DefaultHostSuffix
@@ -173,6 +185,16 @@ func New(opts Options) (*Proxy, error) {
 		if err := p.cop.AddTrustedOrigin(o); err != nil {
 			return nil, fmt.Errorf("trusted origin: %w", err)
 		}
+	}
+	if len(opts.Atespaces) > 0 {
+		p.atespaces = map[string]bool{}
+		for _, a := range opts.Atespaces {
+			if !label.MatchString(a) {
+				return nil, fmt.Errorf("atespace %q is not valid", a)
+			}
+			p.atespaces[a] = true
+		}
+		p.opts.Atespaces = nil
 	}
 	p.tr = &http.Transport{
 		DialContext:           p.dial,
@@ -354,7 +376,7 @@ func (p *Proxy) ServePath(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if !p.authenticate(w, r, &t) {
+	if !p.authenticate(w, r, &t) || !p.inScope(w, t) {
 		return
 	}
 	check := r
@@ -379,10 +401,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if !p.authenticate(w, r, &t) {
+	if !p.authenticate(w, r, &t) || !p.inScope(w, t) {
 		return
 	}
 	p.rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), targetKey{}, t)))
+}
+
+// inScope answers 403 and returns false when t's atespace is not one that
+// Options.Atespaces allows.
+func (p *Proxy) inScope(w http.ResponseWriter, t target) bool {
+	if p.atespaces == nil || p.atespaces[t.atespace] {
+		return true
+	}
+	http.Error(w, fmt.Sprintf("the port proxy does not forward to atespace %q", t.atespace), http.StatusForbidden)
+	return false
 }
 
 // authenticate checks the caller with Options.Authenticate and records in t
@@ -398,6 +430,10 @@ func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request, t *target) 
 		t.dropAuthorization = true
 	}
 	if err := p.opts.Authenticate(credential); err != nil {
+		if status.Code(err) == codes.Internal {
+			http.Error(w, status.Convert(err).Message(), http.StatusInternalServerError)
+			return false
+		}
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		http.Error(w, "missing or invalid bearer token; send it in "+EnvAuthorizationHeader+
 			" or Authorization", http.StatusUnauthorized)

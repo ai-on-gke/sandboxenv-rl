@@ -39,8 +39,9 @@ Expect in the log: `ate-env-api probe ok`, `ray nodes with GPUs: 2/2`, then
 `step:1` ... `step:12`, `=== DONE rc=0 ===`. About 10 minutes end to end on H200
 (image pull, install and model download on both nodes, ~10 s per step).
 
-Knobs (Job env in `job-fully-async.yaml`): `LOCAL_UPDATES` (12: 1 warmup + 11 measured
-steps; 2 for a smoke test, 468 for one epoch of the 7489 MATH prompts),
+Knobs (Job env in `job-fully-async.yaml`): `LOCAL_UPDATES` (24 local updates = 12 logged
+steps, one per `SYNC_EVERY`: 1 warmup + 11 measured; 4 for a smoke test, 468 for one epoch of
+the 7489 MATH prompts),
 `PPO_MINI_BATCH` (16), `N_SAMPLES` (4), `SYNC_EVERY` (2), `STALENESS` (0.5),
 `NGPUS_TRAIN`/`NGPUS_ROLLOUT` (8/8), `NODE_WAIT_S` (3600), `MODEL_ID`.
 Tool settings in `tool_config.yaml`: `endpoint`, `max_envs`, `timeout_s`,

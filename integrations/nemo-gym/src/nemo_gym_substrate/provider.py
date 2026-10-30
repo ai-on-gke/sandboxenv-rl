@@ -603,8 +603,12 @@ class SubstrateSandboxProvider:
         while True:
             async with state.lock:
                 if not state.inflight:
-                    if state.parked:
+                    # The flag alone is not enough: traffic through endpoint()
+                    # wakes the sandbox on the server without a guest call
+                    # through this provider, thus confirm with the control plane.
+                    if state.parked and await self._parked_on_server(handle):
                         return
+                    state.parked = False
                     status = await self._park(handle, mode)
                     state.parked = status in _PARKED
                     break
@@ -619,6 +623,23 @@ class SubstrateSandboxProvider:
             raise RuntimeError(
                 f"substrate env {handle.sandbox_id!r} is {_status_name(status)} after pause()"
             )
+
+    async def _parked_on_server(self, handle: SandboxHandle) -> bool:
+        """Whether the control plane still reports the sandbox parked.
+
+        ``GetEnvironment`` reads the actor's state without touching the guest.
+        A sandbox that is gone or that does not answer counts as not parked,
+        thus ``pause()`` goes on to ``_park``, which raises for it.
+        """
+        raw = handle.raw or {}
+        try:
+            info = await asyncio.wait_for(
+                self._ate().get(handle.sandbox_id, atespace=self._atespace_of(raw)),
+                timeout=self._connection.request_timeout_s,
+            )
+        except (EnvError, asyncio.TimeoutError):
+            return False
+        return info.status in _PARKED
 
     async def resume(self, handle: SandboxHandle) -> None:
         """Wake a parked sandbox (``SupportsSandboxPauseResume``): one guest
@@ -832,6 +853,10 @@ class SubstrateSandboxProvider:
         if self._park_mode is None:
             return
         state = self._parking_state(handle)
+        if state.inflight:
+            # Another request holds the sandbox; the last one to finish
+            # schedules the park.
+            return
         self._cancel_pending_park(state)
         # Always a task of its own, shielded from the caller: a suspend
         # cancelled client-side would leave the sandbox mid-transition on the

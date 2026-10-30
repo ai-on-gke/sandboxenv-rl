@@ -871,6 +871,26 @@ def test_pause_and_resume():
     run(t())
 
 
+def test_pause_parks_a_sandbox_that_proxy_traffic_woke():
+    """Requests through endpoint() reach the sandbox without a guest call
+    through the provider: the server wakes it while the provider still holds
+    it as parked. pause() must then park it again, not return early."""
+    async def t():
+        async with stack(PAUSE) as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            assert _parks(fake, handle.sandbox_id) == [LOCAL]
+            # What the router does for a request through the port proxy.
+            fake.envs[handle.sandbox_id]["status"] = int(EnvironmentStatus.RUNNING)
+            await provider.pause(handle)
+            assert _parks(fake, handle.sandbox_id) == [LOCAL, LOCAL]
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+            # Parked for real: a second pause() is a no-op.
+            await provider.pause(handle)
+            assert _parks(fake, handle.sandbox_id) == [LOCAL, LOCAL]
+
+    run(t())
+
+
 def test_pause_waits_for_a_command_in_flight(monkeypatch):
     monkeypatch.setattr(provider_mod, "_EXEC_GRACE_S", 0.05)
     monkeypatch.setattr(provider_mod, "_MIN_GUEST_TIMEOUT_S", 0.05)

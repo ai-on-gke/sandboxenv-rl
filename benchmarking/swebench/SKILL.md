@@ -20,18 +20,20 @@ is one command.
    show `resources.limits` with cpu and memory. A base template with `limits: {}` (and every
    template derived from it) is admitted without any resource check, up to the worker's actor cap
    of 1000; slot arithmetic is then meaningless. Newer servers refuse such templates; older ones
-   keep the ones they have. Create a new base template with `ate-env manifest template --cpu
-   --memory` and run with `-base-template NAME`.
+   keep the ones they have. Create a new base template with `ate-env manifest template --template
+   NAME --guest-image IMAGE --cpu 2 --memory 4Gi` and run with `-base-template NAME`.
 2. **Worker capacity is what you think.** The API log's GetWorker response, or `kubectl-ate get
    workers -o yaml`, shows each worker's `capacity`. With no limits on the WorkerPool template
    each worker registers the node's allocatable, so N workers on one node each claim the whole
    node. Set `spec.template.resources.limits` on the pool for a fixed slot count.
 3. **Every template has a golden before a restore measurement.** Count templates against
-   templates with a golden tag (`kubectl-ate get actor-templates -a ATESPACE`, third column).
-   Goldens bake at 5 concurrent per ateapi replica, about two minutes each; thousands of new
-   templates mean hours. An actor whose template has no golden boots from the image, silently.
-   Wait for the counts to match, or scale `ate-api-server` replicas, or label the run a cold
-   boot.
+   templates with a golden tag: `kubectl-ate get actor-templates -a ATESPACE -o json`, field
+   `.actorTemplates[].status.goldenSnapshotStatus.goldenTag.name`; a template whose bake failed
+   has `.errorMessage` instead and never gets a tag, so compare against the count without an
+   error rather than the total. Goldens bake at 5 concurrent per ateapi replica, about two
+   minutes each; thousands of new templates mean hours. An actor whose template has no golden
+   boots from the image, silently. Wait for the counts to match, or scale `ate-api-server`
+   replicas, or label the run a cold boot.
 4. **atelet's image cache GC is ahead of kubelet's eviction.** `kubectl -n ate-system get ds
    atelet -o jsonpath='{.spec.template.spec.containers[0].args}'` should show
    `--image-cache-gc-period`, `--image-cache-high-percent` and `--image-cache-low-percent`. The
@@ -42,10 +44,14 @@ is one command.
    over the worker nodes. A golden restores with memory only on the family it was baked on;
    elsewhere it relaxes to a rootfs restore, in effect a boot, with nothing in the events saying
    so. Label one family into the pool, or pin `--min-cpu-platform` on the node pools.
-6. **Nodes can pull the pause image.** Private nodes without Cloud NAT cannot reach
-   `registry.k8s.io`; every sandbox start fails with an i/o timeout in atelet's log and the
-   golden bake never completes. Editing the SandboxConfig's `pauseImage` does not take effect on
-   running builds; add a NAT scoped to the cluster's subnet.
+6. **Nodes can reach every registry a sandbox start needs.** On Substrate before v1.0.0-rc.1
+   (commit 4f71f0ea), a gVisor sandbox pulls a pause image from `registry.k8s.io`; private nodes
+   without Cloud NAT cannot reach it, every sandbox start fails with an i/o timeout in atelet's
+   log, and the golden bake never completes. Editing the SandboxConfig's `pauseImage` does not
+   take effect on a running build; add a NAT scoped to the cluster's subnet. From v1.0.0-rc.1 on,
+   gVisor runs with `-no-root-container`, pulls no pause image, and the CRD has no `pauseImage`;
+   the check is then only that nodes reach the registry the task images come from and the
+   bucket the gVisor assets come from.
 7. **The worker selector matches something.** `ate-env manifest template --workerpool` writes a
    `workerSelector`; on clusters whose workers carry no labels it matches nothing and placement
    fails with "no worker has room". Compare with a working template; drop the selector if it has
@@ -58,14 +64,18 @@ is one command.
 ## 2. Run
 
 From the directory where results should land, never from inside the repository (the events
-file must not dirty the tree ko builds from):
+file must not dirty the tree ko builds from). The scripts are addressed through the checkout,
+and `run-in-cluster.sh` builds the loader image with ko, so the `report` binary is built
+separately into the results directory:
 
 ```bash
+export ENV_REPO=<path to the sandboxenv-rl checkout>
 export KO_DOCKER_REPO=<registry the cluster pulls from>
-benchmarking/swebench/sample-node-cache.sh before-RUN.txt
-RESTORE_LOG=restores-RUN.jsonl benchmarking/swebench/run-in-cluster.sh RUN DATASET.jsonl <shape flags> -label arm=NAME
-benchmarking/swebench/sample-node-cache.sh after-RUN.txt
-swebench-loader report RUN.jsonl -restore-log restores-RUN.jsonl -cache-before before-RUN.txt -cache-after after-RUN.txt -unresolved unresolved-RUN.txt
+"${ENV_REPO}/benchmarking/swebench/sample-node-cache.sh" before-RUN.txt
+RESTORE_LOG=restores-RUN.jsonl "${ENV_REPO}/benchmarking/swebench/run-in-cluster.sh" RUN DATASET.jsonl <shape flags> -label arm=NAME
+"${ENV_REPO}/benchmarking/swebench/sample-node-cache.sh" after-RUN.txt
+go -C "${ENV_REPO}" build -o "${PWD}/swebench-loader" ./cmd/benchmarking/swebench-loader
+"${PWD}/swebench-loader" report RUN.jsonl -restore-log restores-RUN.jsonl -cache-before before-RUN.txt -cache-after after-RUN.txt -unresolved unresolved-RUN.txt
 ```
 
 - `RESTORE_LOG` harvests atelet's restore records every ten minutes during the run; kubelet

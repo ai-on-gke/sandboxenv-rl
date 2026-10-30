@@ -5,6 +5,7 @@ unmodified task image (glibc 2.31 or newer) and connects the OpenHands SDK to it
 `AteEnvWorkspace` is an OpenHands `RemoteWorkspace` that mirrors OpenHands' own
 `AgentSandboxWorkspace` (`openhands-workspace[agent-sandbox]`, kubernetes-sigs/agent-sandbox):
 code written against that workspace moves to Agent Substrate by changing the constructor.
+A program written against agent-sandbox-rl's fleet moves by changing its imports (section 8).
 
 ```python
 from ate_env_openhands import AteEnvWorkspace
@@ -30,11 +31,13 @@ How it fits together:
   `/v1alpha/atespaces/<atespace>/envs/<env>/ports/<port>/...`, with the agent-server's own session
   key, and with `api_token` in `X-Env-Authorization` when ate-env-api requires its bearer token.
   The SDK uses that URL as its workspace host, so commands, files and `RemoteConversation`
-  (the agent loop and its event WebSocket) work unchanged. No `kubectl port-forward`.
+  (the agent loop and its event WebSocket) work unchanged. With `api_token`, the event WebSocket
+  carries a port capability instead of the token, because the SDK sends no headers on it.
+  No `kubectl port-forward`.
 
 | path | what it is |
 |---|---|
-| [`src/ate_env_openhands/`](src/ate_env_openhands) | `AteEnvWorkspace`, `port_url` |
+| [`src/ate_env_openhands/`](src/ate_env_openhands) | `AteEnvWorkspace`, `port_url`, the fleet and R2E-Gym adapters, `agent_sandbox_rl` |
 | [`layer/`](layer) | the runtime layer: Dockerfile, hash-locked dependencies, `lock.sh` |
 | [`../../examples/openhands`](../../examples/openhands) | the examples: OpenHands' agent-sandbox example 17, CodeAct, trajectory execution, a plain-HTTP demo, a fleet rollout |
 | [`tests/`](tests) | unit and integration tests: a fake ate-env-api and port proxy in front of a real agent-server |
@@ -51,6 +54,13 @@ The package pins `openhands-sdk` to the agent-server version in the layer (see
 [Versions](#versions)). Python 3.12 or newer, as openhands-sdk requires.
 
 ## 2. Build the layer
+
+Each release of this repo publishes the layer as
+`ghcr.io/ai-on-gke/sandboxenv-rl/oh-agent-server-layer`, multi-arch and signed, tagged
+`<agent-server version>-<release tag>`. The digest is in the release notes and in the release's
+`images_<tag>.txt`; [docs/release.md](../../docs/release.md#verify-a-signature) shows how to verify it.
+Use that digest in section 3. Build the layer yourself for another registry or another agent-server
+version:
 
 ```bash
 docker buildx build --platform linux/amd64,linux/arm64 \
@@ -126,11 +136,12 @@ caller.
 |---|---|---|---|
 | `template` | required to create | base template with the agent-server layer | `warmpool` |
 | `image` | the template's image | task image, `repo@sha256:…` | none (fixed in the SandboxTemplate) |
-| `atespace` | `ate-env` | atespace of the environment | `namespace` |
+| `atespace` | `ate-env` | atespace of the environment; the port proxy must list it in `--port-proxy-atespaces` | `namespace` |
 | `template_atespace` | the server default | atespace of `template` | none |
 | `api_url` | `127.0.0.1:7777` | ate-env-api, host:port or URL | `host` in `direct` mode |
 | `proxy_url` | `api_url` | port proxy base URL, when it differs | none |
 | `api_token` | none | ate-env-api's bearer token: on gRPC calls, and in `X-Env-Authorization` on proxy requests, which ate-env-api removes before it forwards them | none |
+| `ws_capability_ttl` | `86400` | with `api_token`: seconds the port capability in `host` stays valid, at most `604500` (seven days less five minutes) | none |
 | `env_id` | generated | attach to this environment instead of creating one | none |
 | `server_port` | `8000` | agent-server port | `server_port` |
 | `working_dir` | `/workspace` (created) | where commands run; `/testbed` on SWE-bench images | `working_dir` |
@@ -140,8 +151,9 @@ caller.
 | `delete_on_exit` | created: yes, attached: no | delete in `cleanup()` | always deletes the claim |
 
 - `pause()` suspends the environment; its filesystem stays in Substrate's snapshot.
-  `resume()` waits for `/health`, which also wakes it; any request wakes it as well. The host does
-  not change, unlike a port-forward. To park an environment between agent turns, close the
+  `resume()` waits for `/health`, which also wakes it; any request wakes it as well. The address
+  does not change, unlike a port-forward; with `api_token`, `resume()` puts a new port capability
+  in `host`. To park an environment between agent turns, close the
   conversation first and reattach it after `resume()`; the agent-server keeps the conversation:
 
   ```python
@@ -179,6 +191,10 @@ caller.
   `__del__` does nothing during interpreter shutdown. A create that fails ambiguously (a timeout,
   a lost answer) deletes the environment by name and retries for 10 s, because the server can still
   be creating it. Get, suspend and delete have a 30 s deadline.
+- `renew_ws_capability()` puts a new port capability, valid `ws_capability_ttl` from now, in
+  `host`; without `api_token` it does nothing. Only a conversation opened or reattached after it
+  uses the new capability (see [Limits](#limits)). `port_capability(token, atespace, env_id, port,
+  expiry)` makes a capability for any port, for a WebSocket client outside the SDK.
 
 From `AgentSandboxWorkspace`:
 
@@ -193,10 +209,9 @@ From `AgentSandboxWorkspace`:
      conversation = Conversation(agent=agent, workspace=workspace)
 ```
 
-Not mapped yet: `shutdown_after_seconds` (ate-env has no environment TTL), `labels`,
-`pod_labels` and `pod_annotations` (environments have no labels), and agent-sandbox-rl's fleet
-adapters (`make_handle_workspace`, `make_fleet_workspace`) and R2E-Gym adapter, which follow in
-later changes.
+Not mapped: `shutdown_after_seconds` (ate-env has no environment TTL), `labels`,
+`pod_labels` and `pod_annotations` (environments have no labels). agent-sandbox-rl's fleet
+adapters, its R2E-Gym adapter and its fleet API are in sections 6, 7 and 8.
 
 ## 5. Examples
 
@@ -237,8 +252,9 @@ results = fleet.run(rollout)
 ```
 
 - `make_handle_workspace(handle, **kw)`: an `AteEnvWorkspace` on `handle.sandbox_id`,
-  `delete_on_exit=False`. `api_url` and `atespace` default from the handle (its data plane and
-  its backend's atespace); `api_key`, `proxy_url`, `api_token` and the timeouts pass through.
+  `delete_on_exit=False`. `api_url`, `atespace` and `api_token` default from the handle (its data
+  plane, its backend's atespace and the fleet's `auth_token`); `api_key`, `proxy_url`, the
+  timeouts and an explicit `api_token` pass through.
 - `make_fleet_workspace(fleet, task, **kw)`: acquires on construction and calls
   `fleet.release(handle)` from `cleanup()`, so `with make_fleet_workspace(...) as ws:` owns one
   episode; a failed start (health, session key) releases the handle before the error is raised.
@@ -272,11 +288,77 @@ def rollout(task, handle):                        # task.metadata["ds"] is the d
 
 `AteEnvRuntime(DockerRuntime)` overrides the four `kubernetes-sandbox` hooks: bind the handle,
 no-op teardown, `handle.exec` for `run` (with R2E-Gym's `(output, exit_code)` strings and
-timeouts) and `handle.write_file` plus `tar` for `copy_to_container`. Everything else in the
-runtime (setup, patches, reward grading) runs unchanged. R2E-Gym is not on PyPI: install it from
+timeouts) and `handle.write_file` plus `tar` for `copy_to_container`. Commands run with
+R2E-Gym's `PATH` (its testbed venv first) plus `docker_kwargs["environment"]` (a dict or a list
+of `KEY=VALUE` strings), which can override `PATH`, as in R2E-Gym's kubernetes backends. Copied
+files are owned by root. Everything else in the runtime (setup, patches, reward grading) runs
+unchanged. R2E-Gym is not on PyPI: install it from
 its checkout (`pip install -e path/to/R2E-Gym`); the module imports without it and raises a clear
 `RuntimeError` on first use. R2E-Gym's runtime loads a kubeconfig for this backend; the adapter
 stubs that during construction, so no Kubernetes access is needed.
+
+## 8. agent-sandbox-rl programs: change the imports
+
+`ate_env_openhands.agent_sandbox_rl` has agent-sandbox-rl's fleet API (`ClusterConfig`,
+`FleetConfig`, `ResourceSpec`, `TemplateSpec`, `ObservabilityConfig`, `SandboxFleet`, `Task`, and
+`adapters.openhands`) on top of `ate_env`. A program written for agent-sandbox-rl, such as
+agent-sandbox's `examples/agent-sandbox-rl/examples/run_openhands_fleet.py`, runs on ate-env when
+its imports change and nothing else:
+
+```diff
+-from agent_sandbox_rl import (
++from ate_env_openhands.agent_sandbox_rl import (
+     ClusterConfig, FleetConfig, ResourceSpec, SandboxFleet, Task, TemplateSpec,
+ )
+-from agent_sandbox_rl.adapters.openhands import make_handle_workspace
++from ate_env_openhands.agent_sandbox_rl.adapters.openhands import make_handle_workspace
+```
+
+The program's configuration has no ate-env address, token or base template. They come from the
+environment:
+
+| variable | what | default |
+|---|---|---|
+| `SUBSTRATE_ENV_API` | ate-env-api address (the `ate-env` CLI reads it too) | `127.0.0.1:7777` |
+| `SUBSTRATE_ENV_AUTH_TOKEN` | ate-env-api's bearer token (the `ate-env` CLI reads it too) | none |
+| `SUBSTRATE_ENV_TEMPLATE` | the base template, for OpenHands the one from section 3 | `default-template` |
+| `SUBSTRATE_ENV_ATESPACE` | the atespace when `ClusterConfig.namespace` is `"default"` | `ate-env` |
+
+`ClusterConfig(endpoint=..., auth_token=...)` and `TemplateSpec(name=...)` set the same values in
+code; they exist only here, not in agent-sandbox-rl. `auth_token` is a `SecretStr`: `repr`,
+`model_dump()`, `model_dump_json()` and validation errors do not show it. Prefer the variable for
+the token, so that it is not in the program; surrounding white space is removed from it.
+
+| agent-sandbox-rl | on ate-env |
+|---|---|
+| `ClusterConfig.namespace` | the atespace (`"default"`: see the table above) |
+| `max_concurrent`, `window_size`, `run_id` | the same `ate_env.FleetConfig` fields |
+| `window_size=None` | `run()` derives the sliding and pipelined window as agent-sandbox-rl does (`recommended_window()`): the leading images whose warm replicas fit in `max_concurrent`, half that for pipelined; without `warm_per_task` and the disk caps, which are ignored |
+| `max_warmpool_size` | `max_warmpool_replicas` |
+| `ready_timeout` | `acquire_timeout_s` and `ready_timeout_s` |
+| `observability` | `ate_env.ObservabilityConfig` (metrics, tracing, service name); `enable_metrics=True`, the default, maps to `None`: metrics when `prometheus_client` is installed, as in agent-sandbox-rl |
+| `run(fn, strategy, concurrency, epochs=)` | `ate_env`'s strategy of the same name; an unknown name (also `""`) raises `ValueError`. With `epochs > 1`, the warm pools stay between passes, the fleet tears down once after the last pass, and `fleet.report` covers all passes |
+| `handle.cluster_name` | the name of the `ClusterConfig` |
+| `make_handle_workspace`, `make_fleet_workspace` | section 6; the token comes from the fleet |
+
+- Ignored, with one INFO log that names each field set to a value other than its default: the
+  pod fields of `TemplateSpec` (`resources`, `keepalive_command`, `runtime_class`,
+  `node_selector`, `image_pull_*`, `colocate_replicas`, `extra_pod_spec`), because the base
+  template fixes the command, resources and placement when it is registered; the Kubernetes
+  fields of `ClusterConfig` (`kubeconfig`, `context`, `in_cluster`, `node_selector`,
+  `runtime_class`, `image_pull_secret`, `weight`, `max_replicas`); and the Kubernetes mechanics
+  of `FleetConfig` (`placement`, `warm_per_task`, `warm_create_budget`, `overcommit_factor`,
+  `max_live_sandboxes`, the breaker, teardown hooks, pool and template names, run-namespace
+  settings, `labels`, disk-aware sizing). A session key in `extra_pod_spec` has no effect: the
+  agent-server takes the base template's key.
+- Refused with `ValueError`: more than one cluster (one fleet talks to one ate-env-api; run one
+  fleet for each), `adopt_existing=True` and `run_isolation` other than `"none"`. agent-sandbox-rl's
+  validators apply too, also to the ignored fields: a configuration that it refuses is refused here.
+- Refused with `NotImplementedError`: `run(keep_warm=True)`, `run(recycle=True)` and
+  `run(reset=...)`. Each task gets a new environment, and the fleet deletes it on release.
+  `max_reuses`, `reset_timeout`, `use_session` and `scale_on_hold` only tune that reuse and have
+  no effect.
+- Handles have no Kubernetes fields (`claim_name`, `pod_name`, `hostname`, `pod_ip`).
 
 ## Versions
 
@@ -303,7 +385,15 @@ the answers that stop it at once (400, 401, 403, 404), cleanup after each failur
 a create that lands after its timeout, refused create, health timeout, wrong session key), ownership
 (a failed attach or validation error deletes nothing, a copy never deletes), the token at the proxy,
 attach, pause and resume, exit ordering, files, the shared loop (`close_all`, the call timeout, a
-fork), and a `RemoteConversation` whose event WebSocket goes through the proxy.
+fork), and a `RemoteConversation` whose event WebSocket goes through the proxy. With the token,
+they cover the port capability: the proxy's test vector, the event WebSocket with a capability only,
+expiry, renewal by `resume()` and `renew_ws_capability()`, no capability on REST requests or in
+secret URLs, and masking in `repr`, errors and logs.
+
+`test_agent_sandbox_rl.py` covers the section 8 mapping, and runs an agent-sandbox-rl program with
+only its imports changed through a Substrate fleet against the same fakes, with the token required.
+To run agent-sandbox's own `run_openhands_fleet.py` the same way, set `AGENT_SANDBOX_RL_EXAMPLE` to
+its path; the test checks that the import lines are the only diff.
 
 ## Verified
 
@@ -348,10 +438,25 @@ to this package. They do not test those changes.
   (ate-env-api with `-auth-token-file`). An older ate-env-api forwards the header to the
   agent-server: do not set `api_token` with it. Without `-auth-token-file`, whoever reaches
   ate-env-api reaches the agent-server port and needs only the session key.
-- With `-auth-token-file`, the conversation event WebSocket gets 401: `RemoteConversation` opens it
-  with `websockets.connect(ws_url)` and sends no extra headers. Commands, files and the REST calls of
-  a conversation work. The fix is a follow-up: a query-parameter token in the port proxy, or a
-  header option in the SDK.
+- With `api_token`, the workspace host carries a port capability in its user info, because
+  `RemoteConversation` opens the event WebSocket with `websockets.connect(ws_url)`: no extra headers,
+  and the host's query string is dropped. The capability is an HMAC of this environment port and an
+  expiry, keyed with the token, and ate-env-api accepts it on WebSocket upgrades only. Only the event
+  WebSocket sends it: the workspace's REST client uses the host without user info, thus no REST
+  request carries the capability. `repr`, `str` and the model dumps mask the capability and leave
+  out `api_token`; error messages show the host without the capability; the workspace masks it in
+  the `httpx`, `httpcore`, `websockets` and OpenHands workspace and conversation loggers, including
+  the `Authorization: Basic` header that `websockets` logs at DEBUG level. The token itself is never
+  in a URL. A leaked capability opens this port until it expires (`ws_capability_ttl`, default one
+  day, at most seven days less five minutes for clock skew).
+- A conversation keeps the capability it opened with. Its event WebSocket gets 401 when it
+  reconnects after `ws_capability_ttl`, or after a token rotation. `resume()` and
+  `renew_ws_capability()` put a new capability in the host; reattach the conversation after them
+  (`Conversation(agent=..., workspace=..., conversation_id=...)`) so its event WebSocket uses it.
+  `renew_ws_capability()` keeps the HTTP client open, thus a live conversation can still send
+  messages. The capability needs an
+  ate-env-api whose port proxy checks port capabilities; an older one answers the event WebSocket
+  401.
 - With a live `RemoteConversation`, `pause()` does not keep the environment suspended: the suspend
   breaks the event WebSocket, the SDK reconnects after about a second, and the proxy wakes the
   environment for that request. Thus a paused environment with a live conversation is a running
@@ -361,7 +466,9 @@ to this package. They do not test those changes.
   environment. Each viewer of the atespace can read it with `GetActorTemplate`, and each template
   derived per task image copies it. Substrate's `EnvVar` has a name and a value only: logs redact
   the value, reads do not, and a template cannot refer to a secret. Use a dedicated atespace for
-  these environments. Refer to the OpenHands agent-server in the
+  these environments, and add it to `ate-env manifest --port-proxy-atespaces` (for example
+  `--port-proxy-atespaces=ate-env,oh-envs`): the port proxy forwards only to the atespaces listed
+  there, default `ate-env`, and answers 403 for the others. Refer to the OpenHands agent-server in the
   [threat model](../../docs/security/threat-model.md#the-openhands-agent-server).
 - The agent-server runs as the image's user and keeps its state under that user's home. The first
   environment on a node pulls the layer.

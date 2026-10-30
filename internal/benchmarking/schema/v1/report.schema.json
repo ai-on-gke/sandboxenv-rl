@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-on-gke.github.io/sandboxenv-rl/schema/v1/report.schema.json",
+  "title": "Report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "scenario_name", "generated_at", "validity"],
+  "properties": {
+    "schema_version": { "type": "string", "enum": ["v1"] },
+    "run_id": { "type": "string", "minLength": 1 },
+    "scenario_name": { "type": "string", "minLength": 1 },
+    "tag": { "type": "string" },
+    "generated_at": { "type": "string", "minLength": 1 },
+    "system_description": { "$ref": "system_description.schema.json" },
+    "measurements_ref": { "type": "string" },
+    "measurements": { "type": "object" },
+    "validity": { "$ref": "#/$defs/ReportValidity" },
+    "jobs": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/JobReportSummary" }
+    },
+    "custom_metrics": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/MetricSummary" }
+    }
+  },
+  "$defs": {
+    "ReportValidity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valid"],
+      "properties": {
+        "valid": { "type": "boolean" },
+        "reasons": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "JobReportSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tasks", "failed", "rewarded", "reward_rate"],
+      "properties": {
+        "tasks": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "rewarded": { "type": "integer", "minimum": 0 },
+        "reward_rate": { "type": "number", "minimum": 0 },
+        "steps": { "type": "integer", "minimum": 0 },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/MetricSummary" }
+        }
+      }
+    },
+    "MetricSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "sum": { "type": "number" },
+        "min": { "type": "number" },
+        "max": { "type": "number" },
+        "p50": { "type": "number" },
+        "p90": { "type": "number" },
+        "p95": { "type": "number" },
+        "p99": { "type": "number" },
+        "unit": { "type": "string" }
+      }
+    }
+  }
+}

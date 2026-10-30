@@ -17,10 +17,13 @@ package swebench
 import (
 	"bytes"
 	"errors"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/agent-substrate/env/internal/benchmarking/schema"
 )
 
 func TestPercentile(t *testing.T) {
@@ -57,15 +60,20 @@ func TestSummarizeRoundTrip(t *testing.T) {
 	rec.Record(Event{RunID: "r", Event: EventTask, Step: 1, DurMS: 600, OK: false})
 	rec.Record(Event{RunID: "r", Event: EventWake, Step: 2, DurMS: 40, OK: true, Attempts: 3})
 	rec.Record(Event{RunID: "r", Event: EventStep, Name: "grade", Instance: "repo__x-1", DurMS: 9, OK: true, Reward: intp(0),
-		Tail: `{"valid": true, "resolved": false, "f2p": "1/1", "p2p": "3/4"}`})
+		Detail: "f2p 1/1 p2p 3/4"})
 	rec.Record(Event{RunID: "r", Event: EventStep, Name: "grade", Instance: "repo__x-2", DurMS: 9, OK: true, Reward: intp(0), Tail: "no json"})
+	rec.Record(Event{RunID: "r", Event: EventStep, Name: "grade", Instance: "repo__x-3", DurMS: 9, OK: true, Reward: intp(0),
+		Tail: `{"valid": true, "resolved": false, "f2p": "0/1", "p2p": "2/2"}`})
 	rec.Record(Event{RunID: "r", Event: EventStep, Name: "grade", Instance: "repo__x-1", DurMS: 9, OK: true, Reward: intp(0),
 		Tail: `{"valid": false, "resolved": false}`})
 	rec.Record(Event{RunID: "r", Event: EventTask, Step: 2, DurMS: 700, OK: true, Reward: intp(0)})
 	rec.Record(Event{RunID: "r", Event: EventBarrier, Step: 1, DurMS: 650, OK: true, Count: 2})
 	rec.Record(Event{RunID: "r", Event: EventPark, Name: "suspend", Step: 1, DurMS: 90, OK: true, Count: 1})
 	rec.Record(Event{RunID: "r", Event: EventRun, Name: "steps", DurMS: 2000, OK: false, Count: 3})
-	if rec.Len() != 14 {
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Len() != 15 {
 		t.Fatalf("recorded %d", rec.Len())
 	}
 
@@ -103,8 +111,8 @@ func TestSummarizeRoundTrip(t *testing.T) {
 	if w := find(EventWake, ""); w.Retried != 1 {
 		t.Fatalf("wake retried: %+v", w)
 	}
-	if len(rep.Unresolved) != 2 || rep.Unresolved[0].Instance != "repo__x-1" || rep.Unresolved[0].Reason != "f2p 1/1 p2p 3/4" ||
-		rep.Unresolved[1].Reason != "reward 0" {
+	if len(rep.Unresolved) != 3 || rep.Unresolved[0].Instance != "repo__x-1" || rep.Unresolved[0].Reason != "f2p 1/1 p2p 3/4" ||
+		rep.Unresolved[1].Reason != "reward 0" || rep.Unresolved[2].Reason != "f2p 0/1 p2p 2/2" {
 		t.Fatalf("unresolved: %+v", rep.Unresolved)
 	}
 	var excl bytes.Buffer
@@ -137,6 +145,111 @@ func TestRecorderKeepsFirstWriteError(t *testing.T) {
 	}
 	if NewRecorder(nil).Err() != nil {
 		t.Fatal("a discarding recorder has no error")
+	}
+}
+
+type spyWriter struct {
+	buf    bytes.Buffer
+	writes int
+}
+
+func (s *spyWriter) Write(p []byte) (int, error) {
+	s.writes++
+	return s.buf.Write(p)
+}
+
+func TestRecorderBufferedFlushAndClose(t *testing.T) {
+	spy := &spyWriter{}
+	rec := NewRecorder(spy)
+	// Normal fine-grained events stay in the 64 KiB buffer until a boundary event or Flush/Close.
+	rec.Record(Event{RunID: "r", Event: EventCreate, Env: "e1", DurMS: 10, OK: true})
+	rec.Record(Event{RunID: "r", Event: EventStep, Name: "explore", Env: "e1", DurMS: 20, OK: true})
+	if spy.writes != 0 {
+		t.Fatalf("writes before boundary/flush = %d, want 0", spy.writes)
+	}
+	// Coarse boundary events (step_barrier, park, run) auto-flush immediately.
+	rec.Record(Event{RunID: "r", Event: EventBarrier, Step: 1, DurMS: 30, OK: true, Count: 1})
+	if spy.writes != 1 {
+		t.Fatalf("writes after EventBarrier = %d, want 1", spy.writes)
+	}
+	rec.Record(Event{RunID: "r", Event: EventPark, Name: "suspend", Step: 1, DurMS: 15, OK: true, Count: 1})
+	if spy.writes != 2 {
+		t.Fatalf("writes after EventPark = %d, want 2", spy.writes)
+	}
+	rec.Record(Event{RunID: "r", Event: EventDelete, Env: "e1", DurMS: 5, OK: true})
+	if spy.writes != 2 {
+		t.Fatalf("writes after EventDelete = %d, want 2 (still buffered)", spy.writes)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close() = %v", err)
+	}
+	if spy.writes != 3 {
+		t.Fatalf("writes after Close() = %d, want 3", spy.writes)
+	}
+	evs, err := ReadEvents(&spy.buf)
+	if err != nil || len(evs) != 5 {
+		t.Fatalf("ReadEvents = %d, %v; want 5 events", len(evs), err)
+	}
+}
+
+func TestBuildAndSummarizeParity(t *testing.T) {
+	var buf bytes.Buffer
+	rec := NewRecorder(&buf)
+	input := []Event{
+		{RunID: "parity", Event: EventCreate, Env: "e1", Instance: "repo__a-1", DurMS: 110, OK: true},
+		{RunID: "parity", Event: EventCreate, Env: "e2", Instance: "repo__a-2", DurMS: 210, OK: false, Err: "create boom"},
+		{RunID: "parity", Event: EventTTFI, Env: "e1", Instance: "repo__a-1", Step: 1, DurMS: 950, OK: true, Attempts: 2},
+		{RunID: "parity", Event: EventStep, Name: "grade", Env: "e1", Instance: "repo__a-1", Step: 1, DurMS: 45, OK: true, Reward: intp(0), Detail: "f2p 0/1 p2p 3/3"},
+		{RunID: "parity", Event: EventStep, Name: "grade", Env: "e2", Instance: "repo__a-2", Step: 1, DurMS: 55, OK: true, Reward: intp(0), Tail: `{"valid": true, "resolved": false, "f2p": "0/2", "p2p": "1/1"}`},
+		{RunID: "parity", Event: EventTask, Env: "e1", Instance: "repo__a-1", Step: 1, DurMS: 1000, OK: true, Reward: intp(0)},
+		{RunID: "parity", Event: EventTask, Env: "e2", Instance: "repo__a-2", Step: 1, DurMS: 1200, OK: false},
+		{RunID: "parity", Event: EventBarrier, Step: 1, DurMS: 1250, OK: true, Count: 2},
+		{RunID: "parity", Event: EventPark, Name: "suspend", Step: 1, DurMS: 80, OK: true, Count: 1},
+		{RunID: "parity", Event: EventWake, Env: "e1", Instance: "repo__a-1", Step: 2, DurMS: 35, OK: true, Attempts: 1},
+		{RunID: "parity", Event: EventTask, Env: "e1", Instance: "repo__a-1", Step: 2, DurMS: 800, OK: true, Reward: intp(1)},
+		{RunID: "parity", Event: EventRun, Name: "steps", DurMS: 2500, OK: false, Count: 3},
+	}
+	for _, e := range input {
+		rec.Record(e)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	evs, err := ReadEvents(strings.NewReader(buf.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromBuild := Build(evs)
+	fromStream, err := Summarize(strings.NewReader(buf.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(fromBuild, fromStream) {
+		t.Fatalf("Build vs Summarize mismatch:\nBuild:     %+v\nSummarize: %+v", fromBuild, fromStream)
+	}
+	if fromStream.RunID != "parity" || fromStream.Mode != "steps" || fromStream.RunMS != 2500 {
+		t.Fatalf("unexpected header: %+v", fromStream)
+	}
+	if fromStream.Tasks != 3 || fromStream.Failed != 1 || fromStream.Rewarded != 1 || fromStream.RewardRate != 1.0/3.0 {
+		t.Fatalf("unexpected task totals: Tasks=%d Failed=%d Rewarded=%d RewardRate=%v",
+			fromStream.Tasks, fromStream.Failed, fromStream.Rewarded, fromStream.RewardRate)
+	}
+	if len(fromStream.Errors) != 1 || fromStream.Errors[0] != (ErrorCount{Err: "create boom", Count: 1}) {
+		t.Fatalf("unexpected errors: %+v", fromStream.Errors)
+	}
+	wantUnresolved := []Unresolved{
+		{Instance: "repo__a-1", Reason: "f2p 0/1 p2p 3/3"},
+		{Instance: "repo__a-2", Reason: "f2p 0/2 p2p 1/1"},
+	}
+	if !reflect.DeepEqual(fromStream.Unresolved, wantUnresolved) {
+		t.Fatalf("unexpected unresolved: got %+v, want %+v", fromStream.Unresolved, wantUnresolved)
+	}
+	wantSteps := []StepStat{
+		{Step: 1, Tasks: 2, Failed: 1, Rewarded: 0, Live: 2, BarrierMS: 1250, ParkMS: 80},
+		{Step: 2, Tasks: 1, Failed: 0, Rewarded: 1, WakeP50MS: 35, WakeP95MS: 35},
+	}
+	if !reflect.DeepEqual(fromStream.Steps, wantSteps) {
+		t.Fatalf("unexpected steps: got %+v, want %+v", fromStream.Steps, wantSteps)
 	}
 }
 
@@ -483,5 +596,88 @@ func TestSlowest(t *testing.T) {
 	rep.WriteText(&text)
 	if flat := strings.Join(strings.Fields(text.String()), " "); !strings.Contains(flat, "slowest first commands and wakes: event env instance step ms attempts ttfi e2 i2 0 30 2") {
 		t.Fatalf("slowest table:\n%s", text.String())
+	}
+}
+
+func TestBuildInterferenceSummaryMultiJob(t *testing.T) {
+	t0 := time.Date(2026, 10, 21, 10, 0, 0, 0, time.UTC)
+	events := []Event{
+		{Time: t0.Add(100 * time.Millisecond), RunID: "r", Job: "job-a", Event: EventCreate, DurMS: 50, OK: true, Source: "warm_pool"},
+		{Time: t0.Add(200 * time.Millisecond), RunID: "r", Job: "job-a", Event: EventTask, Step: 1, DurMS: 100, OK: true, Reward: intp(1)},
+		{Time: t0.Add(500 * time.Millisecond), RunID: "r", Job: "job-a", Event: EventBarrier, Step: 1, DurMS: 500, OK: true, Count: 1},
+		{Time: t0.Add(150 * time.Millisecond), RunID: "r", Job: "job-b", Event: EventCreate, DurMS: 60, OK: true, Source: "cold_start"},
+		{Time: t0.Add(250 * time.Millisecond), RunID: "r", Job: "job-b", Event: EventTask, Step: 1, DurMS: 120, OK: true, Reward: intp(1)},
+		{Time: t0.Add(450 * time.Millisecond), RunID: "r", Job: "job-b", Event: EventBarrier, Step: 1, DurMS: 400, OK: true, Count: 1},
+	}
+	rep := Build(events)
+	if rep.Interference == nil {
+		t.Fatal("expected non-nil Interference summary for overlapping multi-job steps")
+	}
+	if rep.Interference.OverlapWindowCount == 0 {
+		t.Fatalf("expected OverlapWindowCount > 0, got %+v", rep.Interference)
+	}
+	if rep.AcquisitionSources["warm_pool"] != 1 || rep.AcquisitionSources["cold_start"] != 1 {
+		t.Fatalf("unexpected AcquisitionSources: %+v", rep.AcquisitionSources)
+	}
+}
+
+func TestActiveVsPausedSandboxesAndConcurrencyCap(t *testing.T) {
+	t0 := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	events := []Event{
+		{Time: t0.Add(10 * time.Millisecond), RunID: "warm", Event: EventCreate, Env: "e1", Step: 1, DurMS: 50, OK: true},
+		{Time: t0.Add(20 * time.Millisecond), RunID: "warm", Event: EventCreate, Env: "e2", Step: 1, DurMS: 60, OK: true},
+		{Time: t0.Add(100 * time.Millisecond), RunID: "warm", Event: EventTask, Env: "e1", Step: 1, DurMS: 80, OK: true, Reward: intp(1)},
+		{Time: t0.Add(110 * time.Millisecond), RunID: "warm", Event: EventTask, Env: "e2", Step: 1, DurMS: 90, OK: true, Reward: intp(1)},
+		{Time: t0.Add(120 * time.Millisecond), RunID: "warm", Event: EventBarrier, Step: 1, DurMS: 120, OK: true, Count: 2, StandingPoolSize: 2},
+		{Time: t0.Add(140 * time.Millisecond), RunID: "warm", Event: EventSuspend, Env: "e1", Step: 1, DurMS: 20, OK: true, SizeMB: 128},
+		{Time: t0.Add(150 * time.Millisecond), RunID: "warm", Event: EventSuspend, Env: "e2", Step: 1, DurMS: 25, OK: true, SizeMB: 132},
+		{Time: t0.Add(160 * time.Millisecond), RunID: "warm", Event: EventPark, Name: "suspend-sync", Step: 1, DurMS: 30, OK: true, StandingPoolSize: 2},
+		{Time: t0.Add(200 * time.Millisecond), RunID: "warm", Event: EventWake, Env: "e1", Step: 2, DurMS: 15, OK: true},
+		{Time: t0.Add(210 * time.Millisecond), RunID: "warm", Event: EventTask, Env: "e1", Step: 2, DurMS: 70, OK: true, Reward: intp(1)},
+		{Time: t0.Add(220 * time.Millisecond), RunID: "warm", Event: EventBarrier, Step: 2, DurMS: 80, OK: true, Count: 1, StandingPoolSize: 2},
+		{Time: t0.Add(250 * time.Millisecond), RunID: "warm", Event: EventRun, Name: "steps", DurMS: 250, OK: true, StandingPoolSize: 2},
+	}
+	rep := Build(events)
+	if rep.PeakActiveSandboxes != 2 || rep.PeakParkedSandboxes != 2 {
+		t.Fatalf("unexpected peak active/paused sandboxes: active=%d paused=%d", rep.PeakActiveSandboxes, rep.PeakParkedSandboxes)
+	}
+	sys := &schema.SystemDescription{
+		SchemaVersion: schema.SchemaVersion,
+		Cluster:       "test-cluster",
+		SandboxFootprint: &schema.SandboxFootprint{
+			CPU:       2,
+			MemoryGiB: 6,
+		},
+	}
+	meas := &schema.Measurements{
+		SchemaVersion: schema.SchemaVersion,
+		ServerSummary: map[string]schema.MetricSummary{
+			"active_sandboxes":        {Count: 1, P50: 1},
+			"parked_sandboxes":        {Count: 1, P50: 1},
+			"total_sandboxes":         {Count: 1, P50: 2},
+			"worker_node_count":       {Count: 1, P50: 10},
+			"worker_allocatable_vcpu": {Count: 1, P50: 318.5},
+			"worker_allocatable_gib":  {Count: 1, P50: 1172.29},
+		},
+	}
+	rep.AttachClusterTelemetry(sys, meas)
+	if rep.HardwareCost == nil {
+		t.Fatal("expected non-nil HardwareCost")
+	}
+	if rep.HardwareCost.ActiveSandboxes != 1 || rep.HardwareCost.PausedSandboxes != 1 || rep.HardwareCost.ParkedSandboxes != 1 || rep.HardwareCost.TotalSandboxes != 2 {
+		t.Fatalf("unexpected active/paused/total sandboxes: %+v", rep.HardwareCost)
+	}
+	if rep.HardwareCost.PeakActiveSandboxes != 2 || rep.HardwareCost.PeakParkedSandboxes != 2 {
+		t.Fatalf("unexpected peak active/paused in HardwareCost: %+v", rep.HardwareCost)
+	}
+	// 10 nodes * min(floor(31.85/2)=15, floor(117.229/6)=19) = 150 concurrent sandboxes cap.
+	if rep.HardwareCost.MaxConcurrentSandboxesCap != 150 || sys.MaxConcurrentSandboxesCap != 150 {
+		t.Fatalf("unexpected MaxConcurrentSandboxesCap: hc=%d sys=%d, want 150", rep.HardwareCost.MaxConcurrentSandboxesCap, sys.MaxConcurrentSandboxesCap)
+	}
+	if len(rep.Steps) != 2 || rep.Steps[0].ActiveSandboxes != 2 || rep.Steps[0].PausedSandboxes != 2 {
+		t.Fatalf("unexpected step[0] active/paused sandboxes: %+v", rep.Steps)
+	}
+	if rep.LifecyclePolicy == nil || rep.LifecyclePolicy.Mode != "warm_pool" || rep.LifecyclePolicy.ParkMode != "suspend-sync" || rep.LifecyclePolicy.PerStepWarming != "wake_on_demand" {
+		t.Fatalf("unexpected LifecyclePolicy for warm run: %+v", rep.LifecyclePolicy)
 	}
 }

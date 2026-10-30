@@ -1,0 +1,119 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+queries:
+  - name: up
+    expr: up
+    required: true
+  # Python SDK fleet series (#109, #115)
+  - name: ate_env_fleet_phase_latency_seconds
+    expr: ate_env_fleet_phase_latency_seconds_sum
+    required: false
+  - name: ate_env_fleet_task_latency_seconds
+    expr: ate_env_fleet_task_latency_seconds_sum
+    required: false
+  - name: ate_env_fleet_run_latency_seconds
+    expr: ate_env_fleet_run_latency_seconds_sum
+    required: false
+  - name: ate_env_fleet_claims_total
+    expr: ate_env_fleet_claims_total
+    required: false
+  - name: ate_env_fleet_tasks_total
+    expr: ate_env_fleet_tasks_total
+    required: false
+  - name: ate_env_fleet_release_failures_total
+    expr: ate_env_fleet_release_failures_total
+    required: false
+  - name: ate_env_fleet_warm_replicas
+    expr: ate_env_fleet_warm_replicas
+    required: false
+  # Python SDK client & W11 sub-phase series (#109)
+  - name: ate_env_client_acquire_seconds
+    expr: ate_env_client_acquire_seconds_sum
+    required: false
+  - name: ate_env_client_exec_seconds
+    expr: ate_env_client_exec_seconds_sum
+    required: false
+  - name: ate_env_client_suspend_seconds
+    expr: ate_env_client_suspend_seconds_sum
+    required: false
+  - name: ate_env_client_warm_claim_seconds
+    expr: ate_env_client_warm_claim_seconds_sum
+    required: false
+  - name: ate_env_client_release_seconds
+    expr: ate_env_client_release_seconds_sum
+    required: false
+  - name: ate_env_client_slot_wait_seconds
+    expr: ate_env_client_slot_wait_seconds_sum
+    required: false
+  - name: ate_env_client_wire_claim_seconds
+    expr: ate_env_client_wire_claim_seconds_sum
+    required: false
+  - name: ate_env_client_ready_to_first_command_seconds
+    expr: ate_env_client_ready_to_first_command_seconds_sum
+    required: false
+  # ate-env-api server series (#114)
+  - name: ate_env_api_requests_total
+    expr: ate_env_api_requests_total
+    required: false
+  - name: ate_env_api_request_duration_seconds
+    expr: ate_env_api_request_duration_seconds_sum
+    required: false
+  - name: ate_env_api_create_to_ready_seconds
+    expr: ate_env_api_create_to_ready_seconds_sum
+    required: false
+  - name: ate_env_api_wake_wait_seconds
+    expr: ate_env_api_wake_wait_seconds_sum
+    required: false
+  - name: ate_env_api_environments
+    expr: max by (atespace, state) (ate_env_api_environments)
+    required: false
+  - name: ate_env_api_build_info
+    expr: ate_env_api_build_info
+    required: false
+  # Substrate node image cache series
+  - name: ate_imagecache_requests_total
+    expr: ate_imagecache_requests_total
+    required: false
+  # Kernel PSI stall %, node disk utilization %, K8s apiserver & atenet router series
+  - name: psi_cpu_stall_pct
+    expr: 100 * rate(node_pressure_cpu_waiting_seconds_total[1m])
+    required: false
+  - name: psi_mem_stall_pct
+    expr: 100 * rate(node_pressure_memory_waiting_seconds_total[1m])
+    required: false
+  - name: psi_io_stall_pct
+    expr: 100 * rate(node_pressure_io_waiting_seconds_total[1m])
+    required: false
+  - name: node_disk_used_pct
+    expr: 100 * (1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"})
+    required: false
+  - name: node_imagefs_used_pct
+    expr: 100 * container_fs_usage_bytes / container_fs_limit_bytes
+    required: false
+  - name: apiserver_request_p99_ms
+    expr: 1000 * histogram_quantile(0.99, sum by (verb, le) (rate(apiserver_request_duration_seconds_bucket{verb!~"WATCH|CONNECT"}[5m])))
+    required: false
+  - name: apiserver_429_total
+    expr: sum(apiserver_request_total{code="429"})
+    required: false
+  - name: cilium_identity_count
+    expr: max(cilium_identity)
+    required: false
+  - name: atenet_router_latency_p99_ms
+    expr: 1000 * histogram_quantile(0.99, sum by (le) (rate(atenet_router_request_duration_seconds_bucket[5m])))
+    required: false
+  - name: atenet_router_rejections_total
+    expr: sum(atenet_router_rejections_total)
+    required: false

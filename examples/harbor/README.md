@@ -38,7 +38,7 @@ works the same way.
   ```bash
   ate-env create hb-probe --rootfs-image ubuntu@sha256:<digest>
   ate-env hb-probe shell 'apt-get update >/dev/null && echo egress ok'
-  ate-env hb-probe delete
+  ate-env delete hb-probe
   ```
 
 ## 2. Get the tasks
@@ -47,22 +47,28 @@ works the same way.
 harbor datasets download terminal-bench@2.0 -o ./tb2   # ./tb2/terminal-bench/<task>/...
 ```
 
-## 3. Prebuild the images
+## 3. Images
 
-ate-env runs images by digest. Build the dataset once and push it to your
-registry; Harbor writes the image tags into the task files, and the provider
-resolves them to digests at run time:
+Terminal-Bench 2.0 tasks already name a prebuilt image in `task.toml` (`docker_image`,
+for example `alexgshaw/adaptive-rejection-sampler:20251031`). With the default
+`HB_BUILD=none` the provider resolves that tag to a digest and the actors pull it from
+Docker Hub: no build step, but the nodes need egress to Docker Hub and meet its pull
+limits.
+
+To serve the images from your own registry instead, mirror the dataset once. Harbor
+rewrites `docker_image` in the task files only with `--override-config`, because the
+tasks already have one; without the flag the push happens and the run keeps pulling
+from Docker Hub:
 
 ```bash
 harbor admin upload-images -t ./tb2/terminal-bench -r "$SUBSTRATE_ENV_HARBOR_REGISTRY" \
-  --tag tb2 --push --update-config
+  --tag tb2 --push --update-config --override-config
 ```
 
-The alternative is to let the provider build each task's `environment/Dockerfile`
-at its first trial (`HB_BUILD=local`, or `cloud-build` for a build in your GCP
-project). Builds are skipped when the tag exists and happen once per task, but a
-run at `-n 50` then starts with up to 50 builds on your machine. Prebuilding is
-the better default.
+The third option, `HB_BUILD=local` (or `cloud-build` for a build in your GCP project),
+builds each task's `environment/Dockerfile` at its first trial. Builds are skipped when
+the tag exists and happen once per task, but a run at `-n 50` then starts with up to 50
+builds on your machine.
 
 ## 4. Register the resource classes
 
@@ -112,7 +118,7 @@ cat jobs/<job>/<trial>/ate_env.json          # environment id, atespace, templat
 
 `--no-delete` keeps each environment suspended after its trial; the log names
 the `ate-env <id> shell` command to inspect it. Delete them when done:
-`ate-env <id> delete`.
+`ate-env delete <id>`.
 
 ## 7. Compare with Docker
 

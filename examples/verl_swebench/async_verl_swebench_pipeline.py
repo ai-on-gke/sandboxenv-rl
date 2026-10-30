@@ -32,7 +32,8 @@ Demonstrates:
    ``ENABLE_TRACING=1`` and ``OTEL_EXPORTER_OTLP_ENDPOINT`` set, every iteration
    is one trace: ``verl.iteration`` (driver) -> ``ate_env_fleet.acquire`` /
    ``ate_env_fleet.process`` (evaluator) -> ``ate_env_client.*`` -> ate-env-api ->
-   Substrate. ``REPORT_DIR`` receives the report as ``.txt`` and ``.json``.
+   Substrate. The driver writes the report to ``REPORT_DIR`` as ``.txt`` and
+   ``.json``, with the evaluator's metrics as ``.prom``.
 
 The policy side is simulated: the sampler returns fixed candidates (the gold
 patch, a plausible-but-wrong patch, and a malformed patch) instead of running
@@ -68,6 +69,7 @@ from ate_env.adapters import SweBenchAdapter  # noqa: E402
 from ate_env.errors import InfrastructureError  # noqa: E402
 from ate_env.observability import repo_family  # noqa: E402
 from ate_env.runtime.mock import MockRuntimeHook  # noqa: E402
+from ate_env.telemetry.metrics import status_of  # noqa: E402
 from ate_env.types import ExecResult, Task  # noqa: E402
 
 DEFAULT_INSTANCE_FILE = os.path.join(SCRIPT_DIR, "pytest-dev__pytest-5221.json")
@@ -119,15 +121,30 @@ def setup_tracing(service_name: str) -> None:
     installs one. The driver's spans are then real, their context reaches the
     actors, and the fleet and client spans join the same trace. The exporter
     reads OTEL_EXPORTER_OTLP_ENDPOINT and the other standard variables.
+
+    Nothing is installed when neither OTEL_EXPORTER_OTLP_ENDPOINT nor
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT is set (the RayJob renders an unset
+    variable as an empty string, which the exporter would dial as ``dns:///``),
+    or when the OTLP exporter or the SDK is not installed.
     """
     otel = _otel()
     if otel is None:
         return
+    if not (os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+            or os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")):
+        print("[tracing] ENABLE_TRACING is set but no OTLP endpoint; not exporting spans")
+        return
     trace = otel[1]
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    try:
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+            OTLPSpanExporter,
+        )
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    except ImportError as err:
+        print(f"[tracing] OpenTelemetry SDK or OTLP exporter missing ({err}); not exporting spans")
+        return
 
     if isinstance(trace.get_tracer_provider(), TracerProvider):
         return  # already installed in this process
@@ -450,42 +467,54 @@ class AsyncEvaluationPoolActor:
     async def _evaluate_one(
         self, idx: int, handle: SandboxHandle | None, task_dict: dict[str, Any], candidate: str
     ) -> dict[str, Any]:
+        """Grade one candidate, retrying infrastructure errors on a fresh sandbox.
+
+        The candidate is one task in the RunReport and the Prometheus series,
+        however many attempts it takes: ``ok`` when scored, ``error`` when
+        masked or failed, ``cancelled`` when cancelled. Its duration covers
+        every attempt, including the retries' acquires and all releases.
+        """
         t0 = time.monotonic()
+        obs = self.fleet.observer
+        backend = self.fleet._backend_label
+        task = to_task(task_dict)
+        family = repo_family(task)
+        status = "error"
         last_err: InfrastructureError | None = None
         attempt = 0
-        for attempt in range(1, MAX_INFRA_ATTEMPTS + 1):
-            try:
-                if handle is None:  # retry on a fresh sandbox
-                    handle = await self.fleet.acquire(to_task(task_dict))
-                obs = self.fleet.observer
-                backend = self.fleet._backend_label
-                family = repo_family(to_task(task_dict))
-                t_task = time.monotonic()
-                status = "error"
+        try:
+            for attempt in range(1, MAX_INFRA_ATTEMPTS + 1):
                 try:
-                    with obs.phase("process", backend=backend, family=family):
-                        outcome = await score_candidate(
-                            handle, task_dict, candidate, self.task_type
-                        )
+                    if handle is None:  # retry on a fresh sandbox
+                        handle = await self.fleet.acquire(task)
+                    try:
+                        with obs.phase("process", backend=backend, family=family):
+                            outcome = await score_candidate(
+                                handle, task_dict, candidate, self.task_type
+                            )
+                    finally:
+                        # Through the fleet, so the release is a recorded phase.
+                        await self.fleet.release(handle)
                     status = "ok"
-                finally:
-                    obs.task_done(backend, family, status, time.monotonic() - t_task)
-                    # Through the fleet, so the release is a recorded phase.
-                    await self.fleet.release(handle)
-                return {
-                    "candidate_id": idx,
-                    "sandbox_id": handle.sandbox_id,
-                    "status": "scored",
-                    "attempts": attempt,
-                    "eval_s": round(time.monotonic() - t0, 3),
-                    **outcome,
-                }
-            except InfrastructureError as err:
-                last_err = err
-                print(f"[Evaluator] candidate {idx} attempt {attempt}: infra error: {err!r}")
-                handle = None
-                if not err.retryable:
-                    break
+                    return {
+                        "candidate_id": idx,
+                        "sandbox_id": handle.sandbox_id,
+                        "status": "scored",
+                        "attempts": attempt,
+                        "eval_s": round(time.monotonic() - t0, 3),
+                        **outcome,
+                    }
+                except InfrastructureError as err:
+                    last_err = err
+                    print(f"[Evaluator] candidate {idx} attempt {attempt}: infra error: {err!r}")
+                    handle = None
+                    if not err.retryable:
+                        break
+        except BaseException as err:
+            status = status_of(err)
+            raise
+        finally:
+            obs.task_done(backend, family, status, time.monotonic() - t0)
         return {
             "candidate_id": idx,
             "sandbox_id": None,
@@ -548,13 +577,14 @@ class AsyncEvaluationPoolActor:
                 await self._run_task
             self.fleet.close()
             flush_spans()
+        # The driver prints these and writes them to REPORT_DIR
+        # (emit_run_outputs); writing here too would put a second copy of the
+        # report in a REPORT_DIR the driver shares, doubling every total.
         report = self._report
         out: dict[str, Any] = {"metrics": metrics_text(), "report": None, "summary": ""}
         if report is not None:
             out["report"] = report.to_dict()
             out["summary"] = report.summary()
-            if os.environ.get("REPORT_DIR"):
-                report.write(os.environ["REPORT_DIR"])
         return out
 
 
@@ -568,7 +598,8 @@ def build_fleet_config(args: argparse.Namespace, task_dict: dict[str, Any]) -> F
     return FleetConfig(
         observability=ObservabilityConfig(enable_tracing=tracing_enabled()),
         backend=args.backend,
-        endpoint=os.environ.get("SUBSTRATE_API_ENDPOINT", "ate-env-api.ate-env.svc.cluster.local:7777"),
+        # `or`: the RayJob renders an unset SUBSTRATE_API_ENDPOINT as "".
+        endpoint=os.environ.get("SUBSTRATE_API_ENDPOINT") or "ate-env-api.ate-env.svc.cluster.local:7777",
         data_plane=args.data_plane,
         tenancy=os.environ.get("SUBSTRATE_ATESPACE", "ate-env"),
         template=task_dict.get("template"),
@@ -675,7 +706,12 @@ async def run_iteration(
 
 
 def emit_run_outputs(result: dict[str, Any]) -> None:
-    """Print the run report and the evaluator's metrics; copy them to REPORT_DIR."""
+    """Print the run report and the evaluator's metrics; write them to REPORT_DIR.
+
+    REPORT_DIR gets the summary (``.txt``), the RunReport (``.json``, the input
+    of ``build_report.py --report``) and the evaluator's metrics (``.prom``).
+    Only the driver writes them, so one run is one report there.
+    """
     if result.get("summary"):
         print("\n" + result["summary"])
     if result.get("report") is not None:
@@ -689,6 +725,9 @@ def emit_run_outputs(result: dict[str, Any]) -> None:
         os.makedirs(report_dir, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         base = os.path.join(report_dir, f"verl-grpo_driver_{stamp}")
+        if result.get("summary"):
+            with open(base + ".txt", "w", encoding="utf-8") as fh:
+                fh.write(result["summary"] + "\n")
         with open(base + ".json", "w", encoding="utf-8") as fh:
             json.dump(result["report"], fh, indent=1)
         if result.get("metrics"):

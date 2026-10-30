@@ -20,15 +20,18 @@
 #   1. checks the telemetry ate-env-api (--enable-tracing, :9090/metrics) and the
 #      acceptance collector (tests/telemetry/otel-collector.yaml), deploying the
 #      collector if it is missing; optionally rebuilds ate-env-api with ko
-#   2. empties the collector's span file, scrapes ate-env-api's /metrics
+#   2. empties the collector's span file, scrapes /metrics of every ate-env-api
+#      pod
 #   3. packages clients/python/src + this example into a ConfigMap, renders
 #      ray-job.async-verl.yaml with tracing on and applies it under a fresh name
 #   4. waits for the RayJob, then collects the driver log (run report and the
 #      evaluator's Prometheus exposition), the collector's spans and a second
-#      ate-env-api scrape
+#      scrape of every ate-env-api pod; the report gets each pod's change
+#      between the two scrapes, so traffic from before the run is left out
 #   5. builds report.html with benchmarking/telemetry_report and checks that
-#      the telemetry showed up: a run report, and traces that cross from the
-#      trainer through the fleet into ate-env-api
+#      the telemetry showed up: a run report, the evaluator's ate_env_fleet_*
+#      metrics, ate-env-api's create_to_ready observations from this run, and
+#      traces that cross from the trainer through the fleet into ate-env-api
 #
 # Run from the repository root:
 #
@@ -47,7 +50,7 @@
 #   JOB_NAME              RayJob name (default: verl-telemetry-<timestamp>)
 #   RAY_NAMESPACE         namespace of the RayJob and ConfigMap (default: default)
 #   API_NAMESPACE         namespace of the telemetry ate-env-api (default: ate-env)
-#   API_SERVICE           its Deployment and Service (default: ate-env-api-telemetry-plan)
+#   API_SERVICE           its Deployment and Service (default: ate-env-api)
 #   TELEMETRY_NAMESPACE   namespace of the collector (default: ate-env-telemetry)
 #   PKG_CONFIGMAP         ConfigMap with the code (default: sandbox-sdk-pkg-telemetry)
 #   NUM_ITERS, GROUP_SIZE pipeline size (default: 3, 4)
@@ -66,7 +69,7 @@ SWEBENCH_TEMPLATE="${SWEBENCH_TEMPLATE:-}"
 JOB_NAME="${JOB_NAME:-verl-telemetry-$(date -u +%Y%m%d-%H%M%S)}"
 RAY_NAMESPACE="${RAY_NAMESPACE:-default}"
 API_NAMESPACE="${API_NAMESPACE:-ate-env}"
-API_SERVICE="${API_SERVICE:-ate-env-api-telemetry-plan}"
+API_SERVICE="${API_SERVICE:-ate-env-api}"
 TELEMETRY_NAMESPACE="${TELEMETRY_NAMESPACE:-ate-env-telemetry}"
 PKG_CONFIGMAP="${PKG_CONFIGMAP:-sandbox-sdk-pkg-telemetry}"
 NUM_ITERS="${NUM_ITERS:-3}"
@@ -79,7 +82,21 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 k() { kubectl --context "${CONTEXT}" "$@"; }
 log() { printf '\n==> %s\n' "$*"; }
-scrape_api() { k get --raw "/api/v1/namespaces/${API_NAMESPACE}/services/${API_SERVICE}:9090/proxy/metrics"; }
+# One gRPC connection carries all of the fleet's calls, so one ate-env-api
+# replica serves the run and the others stay at zero: scrape every pod of the
+# Deployment, one file each, and let build_report.py sum them.
+scrape_api() {
+  local dir="$1" selector pod
+  selector="$(k -n "${API_NAMESPACE}" get deploy "${API_SERVICE}" \
+    -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}')"
+  mkdir -p "${dir}"
+  for pod in $(k -n "${API_NAMESPACE}" get pods -l "${selector%,}" \
+      --field-selector=status.phase=Running -o name); do
+    pod="${pod#pod/}"
+    k get --raw "/api/v1/namespaces/${API_NAMESPACE}/pods/${pod}:9090/proxy/metrics" \
+      > "${dir}/ate-env-api-${pod}.prom"
+  done
+}
 
 mkdir -p "${OUT}/reports" "${OUT}/scrapes"
 echo "context=${CONTEXT} job=${JOB_NAME} out=${OUT}"
@@ -118,7 +135,7 @@ if [[ "${SWEBENCH_IMAGE}" != *@sha256:* ]]; then
 fi
 echo "sandbox image: ${SWEBENCH_IMAGE}"
 
-scrape_api > "${OUT}/ate-env-api.before.prom"
+scrape_api "${OUT}/api-before"
 
 # ------------------------------------------------------------------- 2. launch
 log "Packaging the client and the example into ${RAY_NAMESPACE}/${PKG_CONFIGMAP}"
@@ -165,7 +182,42 @@ sed -n '/=== ATE_ENV_METRICS_BEGIN ===/,/=== ATE_ENV_METRICS_END ===/p' "${OUT}/
 sleep 10
 k -n "${TELEMETRY_NAMESPACE}" exec deploy/otel-collector -c files -- cat /data/spans.jsonl \
   > "${OUT}/spans.jsonl"
-scrape_api > "${OUT}/scrapes/ate-env-api.prom"
+scrape_api "${OUT}/api-after"
+# ate-env-api's counters and histograms count everything since the pod
+# started; keep only what this run added (after - before, per pod and series).
+python3 - "${OUT}" <<'PY'
+import os, re, sys
+
+out = sys.argv[1]
+SAMPLE = re.compile(r"^([A-Za-z_:][\w:]*(?:\{.*\})?)\s+(\S+)")
+
+def series(path):
+    vals = {}
+    if os.path.exists(path):
+        for line in open(path, encoding="utf-8"):
+            m = SAMPLE.match(line)
+            if m and not line.startswith("#"):
+                vals[m.group(1)] = float(m.group(2))
+    return vals
+
+for name in sorted(os.listdir(f"{out}/api-after")):
+    before = series(f"{out}/api-before/{name}")
+    with open(f"{out}/api-after/{name}", encoding="utf-8") as src, \
+         open(f"{out}/scrapes/{name}", "w", encoding="utf-8") as dst:
+        for line in src:
+            m = SAMPLE.match(line)
+            if line.startswith("#") or not m:
+                dst.write(line)
+                continue
+            key, val = m.group(1), float(m.group(2))
+            metric = key.split("{", 1)[0]
+            prev = before.get(key, 0.0)
+            # A value below the first scrape means the container restarted
+            # and the counter began again from zero (as PromQL increase()).
+            if metric.endswith(("_bucket", "_count", "_sum", "_total")) and val >= prev:
+                val -= prev
+            dst.write(f"{key} {val!r}\n")
+PY
 
 if [[ "${status}" != "SUCCEEDED" ]]; then
   echo "error: RayJob ended with status '${status}'; see ${OUT}/driver.log" >&2
@@ -194,8 +246,12 @@ if not iters:
     problems.append("no verl.iteration traces in the collector")
 elif len(joined) != len(iters):
     problems.append(f"only {len(joined)}/{len(iters)} iteration traces reach ate-env-api")
-if not data["metrics"]["histograms"].get("ate_env_api_create_to_ready_seconds"):
-    problems.append("ate_env_api_create_to_ready_seconds has no observations")
+metrics = data["metrics"]
+families = set(metrics["histograms"]) | set(metrics["counters"]) | set(metrics["gauges"])
+if not any(f.startswith("ate_env_fleet_") for f in families):
+    problems.append("no ate_env_fleet_* metrics from the evaluator (driver log)")
+if not metrics["histograms"].get("ate_env_api_create_to_ready_seconds"):
+    problems.append("ate_env_api_create_to_ready_seconds has no observations in this run")
 
 r = runs[0] if runs else {}
 print(json.dumps({

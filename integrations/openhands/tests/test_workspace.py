@@ -793,6 +793,38 @@ def test_a_conversation_runs_through_the_port_proxy(stack, tmp_path):
         "the event stream went through the proxy as a WebSocket")
 
 
+def test_a_conversation_survives_pause_and_resume(stack, tmp_path):
+    """A live RemoteConversation holds the workspace's HTTP client; pause() and
+    resume() keep that client open, thus the conversation works afterwards."""
+    pytest.importorskip("openhands.tools")
+    from openhands.sdk import LLM, Conversation
+    from openhands.tools.preset.default import get_default_agent
+    from pydantic import SecretStr
+
+    api_url, state = stack
+    llm = LLM(usage_id="agent", model="openai/unused", api_key=SecretStr("x"),
+              base_url="http://127.0.0.1:9")  # never called: the conversation is not run
+    with make(api_url, state, tmp_path) as ws:
+        conversation = Conversation(agent=get_default_agent(llm=llm, cli_mode=True), workspace=ws)
+        try:
+            client = ws.client
+            ws.pause()
+            ws.resume()
+            assert ws.client is client and not client.is_closed
+            before = len(state.proxied)
+            conversation.send_message("still connected after resume")
+            events = f"/api/conversations/{conversation.state.id}/events"
+            sent = [p for p in state.proxied[before:]
+                    if p["method"] == "POST" and p["path"].split("?")[0] == events]
+            assert sent, "the message after the resume reached the agent-server"
+        finally:
+            conversation.close()
+        target = tmp_path / "work" / "after-resume.txt"
+        ws.execute_command(f"echo ok > {target}", timeout=30)
+        assert ws.execute_command(f"cat {target}", timeout=30).stdout.strip() == "ok"
+    assert client.is_closed, "cleanup() closes the client that pause and resume kept"
+
+
 def test_a_closed_conversation_lets_the_environment_stay_parked(stack, tmp_path):
     """The park pattern: close the conversation, pause, resume, reattach by id."""
     pytest.importorskip("openhands.tools")

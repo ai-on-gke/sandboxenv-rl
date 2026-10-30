@@ -18,6 +18,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"reflect"
 	"slices"
 	"testing"
 
@@ -33,6 +34,25 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protowire"
 )
+
+func TestPortProxyAtespaces(t *testing.T) {
+	for in, want := range map[string][]string{
+		"ate-env":            {"ate-env"},
+		" ate-env , team-a ": {"ate-env", "team-a"},
+		"*":                  nil,
+		" * ":                nil,
+	} {
+		if got, err := portProxyAtespaces(in); err != nil || !reflect.DeepEqual(got, want) {
+			t.Errorf("portProxyAtespaces(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	// An empty value must not mean "any atespace", and "*" cannot be combined with names.
+	for _, in := range []string{"", " ", ",", " , ", "ate-env,*", "*,ate-env"} {
+		if got, err := portProxyAtespaces(in); err == nil {
+			t.Errorf("portProxyAtespaces(%q) = %q, want an error", in, got)
+		}
+	}
+}
 
 func TestIsLoopbackAddr(t *testing.T) {
 	cases := []struct {

@@ -184,6 +184,13 @@ class FleetConfig:
     max_concurrent: int = 64
     max_warmpool_replicas: int = 4
     window_size: int | None = None
+    # Warm-pool depth. False sizes each image's pool to its share of
+    # max_concurrent (see ate_env.sizing); True gives every task its own warm
+    # replica, up to max_warmpool_replicas, so the G rollouts of a problem
+    # claim at once.
+    warm_per_task: bool = False
+    # Images warmed at the same time by setup() and warm_images().
+    warm_parallelism: int = 16
     # gRPC connections to ate-env-api. Each HTTP/2 connection carries a
     # bounded number of concurrent calls (the server's MaxConcurrentStreams,
     # 250 on a Go server without an HTTP/2 config), and a Service spreads
@@ -245,6 +252,13 @@ class FleetConfig:
 
         if self.window_size is not None and (not isinstance(self.window_size, int) or self.window_size < 1):
             raise ValidationError(f"window_size must be >= 1, got {self.window_size}")
+
+        if not isinstance(self.warm_per_task, bool):
+            raise ValidationError(f"warm_per_task must be a bool, got {self.warm_per_task!r}")
+
+        if (not isinstance(self.warm_parallelism, int) or isinstance(self.warm_parallelism, bool)
+                or self.warm_parallelism < 1):
+            raise ValidationError(f"warm_parallelism must be >= 1, got {self.warm_parallelism}")
 
         if self.connections is not None and (
             not isinstance(self.connections, int) or isinstance(self.connections, bool) or self.connections < 1

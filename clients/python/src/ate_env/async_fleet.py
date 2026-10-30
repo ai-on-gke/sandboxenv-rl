@@ -32,6 +32,13 @@ from .fleet import SandboxFleet
 from .handle import SandboxHandle
 from .observability import Observer, RunReport, repo_family
 from .telemetry.metrics import status_of
+from .telemetry.trace_recorder import (
+    current_slot_wait_s,
+    is_trace_mode,
+    record_trace_event,
+    register_env_meta,
+    task_context,
+)
 from .types import FleetPlan, Task
 
 logger = logging.getLogger("sandbox_sdk.async_fleet")
@@ -116,15 +123,10 @@ class AsyncSandboxFleet:
             self._fleet.load_tasks(tasks)
         await self.preflight()
         plan = await self.plan()
-        for entry in plan.entries:
-            if entry.replicas > 0:
-                await self._warm_pool_for_template(
-                    entry.template_id,
-                    entry.replicas,
-                    wait=True,
-                    rootfs_image=getattr(entry, "rootfs_image", None),
-                    family=repo_family(entry.image),
-                )
+        await self._warm_many(
+            [(e.image, e.template_id, e.rootfs_image, e.replicas) for e in plan.entries],
+            wait=True,
+        )
         return self
 
     async def _ensure_template_for_image_async(self, image: str) -> tuple[str, str | None]:
@@ -160,12 +162,47 @@ class AsyncSandboxFleet:
     async def warm_images(
         self, images: list[str], replicas: int | None = None, wait: bool = True
     ) -> None:
-        rep = replicas if replicas is not None else self.config.max_warmpool_replicas
-        for img in images:
+        """Warm pools for ``images``, sized as ``SandboxFleet.warm_images``.
+
+        Up to ``warm_parallelism`` images warm at once; the first error is
+        raised after every image was tried.
+        """
+        if replicas is not None:
+            sized = {img: replicas for img in images}
+        else:
+            sized = self._fleet._size_pools(self.image_counts(), images)
+        work = []
+        for img in dict.fromkeys(images):
             template_id, rootfs_image = await self._ensure_template_for_image_async(img)
-            await self._warm_pool_for_template(
-                template_id, rep, wait=wait, rootfs_image=rootfs_image, family=repo_family(img)
-            )
+            work.append((img, template_id, rootfs_image, sized[img]))
+        await self._warm_many(work, wait=wait)
+
+    async def _warm_many(
+        self, work: list[tuple[str, str, str | None, int]], wait: bool
+    ) -> None:
+        work = [w for w in work if w[3] > 0]
+        if not work:
+            return
+        sem = asyncio.Semaphore(self.config.warm_parallelism)
+
+        async def _warm_one(item: tuple[str, str, str | None, int]) -> None:
+            img, template_id, rootfs_image, rep = item
+            async with sem:
+                await self._warm_pool_for_template(
+                    template_id, rep, wait=wait, rootfs_image=rootfs_image,
+                    family=repo_family(img),
+                )
+
+        results = await asyncio.gather(*(_warm_one(w) for w in work), return_exceptions=True)
+        errors = [r for r in results if isinstance(r, BaseException)]
+        for r in errors:
+            if not isinstance(r, Exception):  # CancelledError, KeyboardInterrupt
+                raise r
+        if errors:
+            if len(errors) > 1:
+                logger.warning("%d of %d images failed to warm; raising the first",
+                               len(errors), len(work))
+            raise errors[0]
 
     async def warm_image(
         self, image: str, replicas: int | None = None, wait: bool = True
@@ -217,6 +254,14 @@ class AsyncSandboxFleet:
                     self.backend.unwarm_pool, template_id, rootfs_image=rootfs_image
                 )
 
+    def acquired_count(self, image: str) -> int:
+        """Sandboxes acquired for ``image``, warm or cold (see ``SandboxFleet.acquired_count``)."""
+        return self._fleet.acquired_count(image)
+
+    def pool_size(self, image: str) -> int | None:
+        """Idle warm replicas for ``image`` (see ``SandboxFleet.pool_size``)."""
+        return self._fleet.pool_size(image)
+
     async def acquire(self, task: Task | str, timeout_s: float | None = None) -> SandboxHandle:
         """Asynchronously acquire a single sandbox."""
         task_obj: Task
@@ -229,8 +274,9 @@ class AsyncSandboxFleet:
         else:
             task_obj = task
 
-        with self.observer.phase("acquire", backend=self._backend_label,
-                                 family=repo_family(task_obj)):
+        with self.observer.phase(
+            "acquire", backend=self._backend_label, family=repo_family(task_obj)
+        ):
             return await self._acquire_task(task_obj, timeout_s)
 
     async def _acquire_task(self, task_obj: Task, timeout_s: float | None) -> SandboxHandle:
@@ -242,17 +288,45 @@ class AsyncSandboxFleet:
         to_s = timeout_s or self.config.acquire_timeout_s
 
         if hasattr(self.backend, "acquire_async"):
-            raw_inst = await self.backend.acquire_async(
-                template_id, self._fleet.run_id, timeout_s=to_s, rootfs_image=rootfs_image
-            )
+            with task_context(
+                run_id=self._fleet.run_id,
+                instance=task_obj.id,
+                image=task_obj.image,
+            ):
+                raw_inst = await self.backend.acquire_async(
+                    template_id, self._fleet.run_id, timeout_s=to_s, rootfs_image=rootfs_image
+                )
         else:
-            raw_inst = await asyncio.to_thread(
-                self.backend.acquire,
-                template_id,
-                self._fleet.run_id,
-                timeout_s=to_s,
-                rootfs_image=rootfs_image,
+            with task_context(
+                run_id=self._fleet.run_id,
+                instance=task_obj.id,
+                image=task_obj.image,
+            ):
+                raw_inst = await asyncio.to_thread(
+                    self.backend.acquire,
+                    template_id,
+                    self._fleet.run_id,
+                    timeout_s=to_s,
+                    rootfs_image=rootfs_image,
+                )
+
+        register_env_meta(
+            raw_inst.instance_id,
+            instance=task_obj.id,
+            image=task_obj.image,
+            run_id=self._fleet.run_id,
+        )
+        if self._backend_label == "mock" and is_trace_mode():
+            record_trace_event(
+                "create",
+                env=raw_inst.instance_id,
+                dur_ms=0.0,
+                ok=True,
+                run=self._fleet.run_id,
+                instance=task_obj.id,
+                image=task_obj.image,
             )
+        self._fleet._count_acquire(task_obj.image)
 
         try:
             runtime, data_plane = self._fleet._build_runtime(raw_inst)
@@ -270,6 +344,7 @@ class AsyncSandboxFleet:
                 )
             raise
 
+        claim_source = str(raw_inst.metadata.get("claim_source", "direct"))
         return SandboxHandle(
             sandbox_id=raw_inst.instance_id,
             endpoint=data_plane.address if data_plane else raw_inst.endpoint,
@@ -280,20 +355,54 @@ class AsyncSandboxFleet:
             data_plane=data_plane,
             default_timeout_s=self.config.step_timeout_s,
             tracer=self._fleet._tracer,
+            claim_source=claim_source,
         )
 
     async def acquire_batch(
         self, tasks: list[Task | str], timeout_s: float | None = None
     ) -> list[SandboxHandle]:
-        """Asynchronously acquire a batch of sandboxes in parallel."""
-        return list(
-            await asyncio.gather(*(self.acquire(t, timeout_s=timeout_s) for t in tasks))
+        """Asynchronously acquire a batch of sandboxes in parallel.
+
+        All-or-nothing: if any acquisition fails, the sandboxes that were
+        acquired are released before the first error is re-raised, so a partial
+        failure never leaks sandboxes.
+        """
+        results = await asyncio.gather(
+            *(self.acquire(t, timeout_s=timeout_s) for t in tasks), return_exceptions=True
         )
+        errors = [r for r in results if isinstance(r, BaseException)]
+        if not errors:
+            return list(results)  # type: ignore[arg-type]
+        acquired = [r for r in results if isinstance(r, SandboxHandle)]
+        # Through self.release, so these releases are in the run report and
+        # the release-phase metrics like any other.
+        released = await asyncio.gather(
+            *(self.release(h) for h in acquired), return_exceptions=True
+        )
+        for h, rel in zip(acquired, released):
+            if isinstance(rel, BaseException):
+                logger.warning(
+                    "Failed to release sandbox %s after batch acquire error",
+                    h.sandbox_id,
+                    exc_info=rel,
+                )
+        raise errors[0]
 
     async def release(self, handle: SandboxHandle) -> None:
-        with self.observer.phase("release", backend=self._backend_label,
-                                 family=repo_family(handle.task)):
+        with self.observer.phase(
+            "release", backend=self._backend_label, family=repo_family(handle.task)
+        ):
             await handle.release_async()
+            if self._backend_label == "mock" and is_trace_mode():
+                record_trace_event(
+                    "delete",
+                    env=handle.sandbox_id,
+                    dur_ms=0.0,
+                    ok=True,
+                    run=self._fleet.run_id,
+                    instance=handle.task.id if handle.task else None,
+                    image=handle.task.image if handle.task else None,
+                )
 
     async def teardown(self) -> None:
         try:
@@ -365,28 +474,46 @@ class AsyncSandboxFleet:
             # one release does not stall (and inflate) the other tasks' phases.
             with obs.phase("release", backend=backend, family=repo_family(handle.task)):
                 await handle.release_async()
+                if backend == "mock" and is_trace_mode():
+                    record_trace_event(
+                        "delete",
+                        env=handle.sandbox_id,
+                        dur_ms=0.0,
+                        ok=True,
+                        run=self._fleet.run_id,
+                        instance=handle.task.id if handle.task else None,
+                        image=handle.task.image if handle.task else None,
+                    )
 
         async def _worker(idx: int, task: Task) -> None:
+            wait_start = time.monotonic()
             async with sem:
                 family = repo_family(task)
                 start = time.monotonic()
+                slot_token = current_slot_wait_s.set(max(0.0, start - wait_start))
                 status = "ok"
                 try:
-                    handle = await self.acquire(task)
-                    try:
-                        with obs.phase("process", backend=backend, family=family):
-                            res = await self._call_process_fn(process_fn, task, handle)
-                        results[idx] = res
-                        await _release(handle)
-                    except Exception as e:
-                        status = "error"
-                        logger.error("Async execution failed for task %s: %s", task.id, e)
-                        await _release(handle)
-                        results[idx] = e
+                    with task_context(
+                        run_id=self._fleet.run_id,
+                        instance=task.id,
+                        image=task.image,
+                    ):
+                        handle = await self.acquire(task)
+                        try:
+                            with obs.phase("process", backend=backend, family=family):
+                                res = await self._call_process_fn(process_fn, task, handle)
+                            results[idx] = res
+                            await _release(handle)
+                        except Exception as e:
+                            status = "error"
+                            logger.error("Async execution failed for task %s: %s", task.id, e)
+                            await _release(handle)
+                            results[idx] = e
                 except BaseException as e:
                     status = status_of(e)
                     raise
                 finally:
+                    current_slot_wait_s.reset(slot_token)
                     obs.task_done(backend, family, status, time.monotonic() - start)
 
         strategy = self.config.strategy

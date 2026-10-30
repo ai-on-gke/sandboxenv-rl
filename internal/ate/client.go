@@ -370,13 +370,9 @@ func (c *Client) List(ctx context.Context, atespace string) ([]*ateapipb.Actor, 
 // stays on the node and uploads in the background); ate-env keeps the
 // durable behavior it always had.
 func (c *Client) Suspend(ctx context.Context, atespace, id string) error {
-	return c.suspend(ctx, atespace, id, ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS)
-}
-
-func (c *Client) suspend(ctx context.Context, atespace, id string, mode ateapipb.DurabilityMode) error {
 	req := &ateapipb.SuspendActorRequest{
 		Actor:   c.ref(atespace, id),
-		Options: &ateapipb.SuspendOptions{Mode: mode},
+		Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
 	}
 	if _, err := c.control.SuspendActor(ctx, req); err != nil {
 		return fmt.Errorf("ate: suspending %q: %w", id, wrapGRPCError(err))
@@ -384,16 +380,16 @@ func (c *Client) suspend(ctx context.Context, atespace, id string, mode ateapipb
 	return nil
 }
 
-// Delete removes the actor with ID in atespace permanently. Substrate only deletes suspended
-// actors, so Delete suspends the actor first.
+// Delete removes the actor with ID in atespace permanently, in any state.
 // If atespace is empty, DefaultAtespace is used.
 func (c *Client) Delete(ctx context.Context, atespace, id string) error {
-	// Substrate deletes only suspended actors. The snapshot is deleted right
-	// after, thus waiting for it to reach object storage is wasted time: the
-	// suspend before a delete is asynchronous.
-	if err := c.suspend(ctx, atespace, id, ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS); err != nil {
-		return err
-	}
+	// Delete calls DeleteActor directly; ate-env requires Substrate v0.6.0 or
+	// later. There, DeleteActor takes an actor in any state: it marks the
+	// actor DELETING, terminates the workload, releases the worker and
+	// deletes the actor's snapshots. Older Substrate deleted only suspended
+	// actors, thus Delete suspended first. That suspend gave the workload no
+	// graceful stop, its snapshot was deleted right away, and Substrate
+	// rejects it for a CRASHED actor, which then could not be deleted.
 	_, err := c.control.DeleteActor(ctx, &ateapipb.DeleteActorRequest{Actor: c.ref(atespace, id)})
 	if err != nil {
 		return fmt.Errorf("actor: deleting %q: %w", id, wrapGRPCError(err))
@@ -451,6 +447,21 @@ func (c *Client) CreateActorTemplate(ctx context.Context, tmpl *ateapipb.ActorTe
 		return nil, fmt.Errorf("ate: creating template %q: %w", name, wrapGRPCError(err))
 	}
 	return created, nil
+}
+
+// DeleteActorTemplate deletes the ActorTemplate name in atespace, but only
+// while it still has uid: a template that a concurrent caller created
+// under the same name since is kept, and Substrate answers Aborted. A
+// missing template is ErrNotFound.
+func (c *Client) DeleteActorTemplate(ctx context.Context, atespace, name, uid string) error {
+	req := &ateapipb.DeleteActorTemplateRequest{
+		ActorTemplate: c.ref(atespace, name),
+		Options:       &ateapipb.DeleteOptions{Uid: uid},
+	}
+	if _, err := c.control.DeleteActorTemplate(ctx, req); err != nil {
+		return fmt.Errorf("ate: deleting template %q: %w", name, wrapGRPCError(err))
+	}
+	return nil
 }
 
 func (c *Client) ref(atespace, id string) *ateapipb.ObjectRef {

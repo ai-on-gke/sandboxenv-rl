@@ -113,8 +113,8 @@ port out as `endpoint()`; see
   environment and port.
 
   ```bash
-  curl -H 'X-Env-Id: py1' -H 'X-Env-Port: 44772' localhost:7777/ready
-  curl localhost:7777/v1alpha/envs/py1/ports/44772/ready   # the same, for clients without headers
+  curl -H "X-Env-Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" -H 'X-Env-Id: py1' -H 'X-Env-Port: 44772' localhost:7777/ready
+  curl -H "Authorization: Bearer $SUBSTRATE_ENV_AUTH_TOKEN" localhost:7777/v1alpha/envs/py1/ports/44772/ready   # the same, for clients without routing headers
   ```
 
   The runtime must listen on all interfaces, not 127.0.0.1: the router
@@ -132,13 +132,14 @@ port out as `endpoint()`; see
 - **The runtime must listen on `0.0.0.0`.** The router reaches the port on
   the actor's address. A runtime bound to `127.0.0.1` serves only processes
   inside the environment, and requests from outside fail with 502.
-- **Only the API token is checked on the way in.** Without `-auth-token-file`,
-  `ate-env-api` forwards for any caller that reaches its listener; with it,
-  for any caller that has the token. Either way it reaches any port of any
-  actor the router serves. A runtime that executes commands or edits files
+- **The API token is the only check on the way in.** `ate-env-api` forwards
+  for each caller that has its bearer token (in `X-Env-Authorization` or
+  `Authorization`), to any port of any actor in the atespaces
+  `--port-proxy-atespaces` names; with `--insecure-no-auth`, for any caller
+  that reaches its listener. A runtime that executes commands or edits files
   must check its own credential, as OpenSandbox's `execd` token and the
-  OpenHands agent-server's session key do. See the README section "Reaching a service inside an
-  environment" for the browser checks and the flags.
+  OpenHands agent-server's session key do. See the README section "Reaching a
+  service inside an environment" for the browser checks and the flags.
 
 ## Suspend, resume and restarts
 

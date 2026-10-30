@@ -74,20 +74,19 @@ def test_write_image_only_unique_ids_and_dedupe(tmp_path, monkeypatch):
     rc, rows, meta = _write(tmp_path, [
         "# comment",
         "reg.io/a/img@" + D1,
-        "reg.io/b/img@" + D1,        # same digest, other repository: a different pull, id gets a hash
+        "reg.io/b/img@" + D1,        # same digest, other repository: the API keys templates by digest, skipped
         "reg.io/a/img@" + D2,        # same repository, other digest: distinct id
         "reg.io/a/img:tag@" + D2,    # same reference as the line above once the tag is dropped: skipped
         "reg.io/a/missing:tag",      # crane cannot see it
     ], monkeypatch)
     assert rc == 1
     ids = [r["instance_id"] for r in rows]
-    assert len(ids) == len(set(ids)) == 3
-    assert ids[0] == "img-" + "a" * 12
-    assert ids[1].startswith("img-" + "a" * 12 + "-") and rows[1]["image"] == "reg.io/b/img@" + D1
-    assert ids[2] == "img-" + "b" * 12 and rows[2]["image"] == "reg.io/a/img@" + D2
+    assert len(ids) == len(set(ids)) == 2
+    assert ids[0] == "img-" + "a" * 12 and rows[0]["image"] == "reg.io/a/img@" + D1
+    assert ids[1] == "img-" + "b" * 12 and rows[1]["image"] == "reg.io/a/img@" + D2
     assert all(r["image"].count(":") == 1 and "@sha256:" in r["image"] for r in rows)
     assert all(r["eval_script"] == "" for r in rows)
-    assert meta["instances"] == 3 and meta["missing_images"] == 1 and meta["grading"] is False
+    assert meta["instances"] == 2 and meta["missing_images"] == 1 and meta["grading"] is False
 
 
 def test_write_image_only_id_collision_gets_hash(tmp_path, monkeypatch):
@@ -103,5 +102,6 @@ def test_write_image_only_id_collision_gets_hash(tmp_path, monkeypatch):
 
 
 def test_write_image_only_limit(tmp_path, monkeypatch):
-    rc, rows, meta = _write(tmp_path, ["reg.io/a/img@" + D1, "reg.io/a/img@" + D2, "reg.io/a/other@" + D1], monkeypatch, limit=2)
+    D3 = "sha256:" + "c" * 64
+    rc, rows, meta = _write(tmp_path, ["reg.io/a/img@" + D1, "reg.io/a/img@" + D2, "reg.io/a/other@" + D3], monkeypatch, limit=2)
     assert rc == 0 and len(rows) == 2 and meta["instances"] == 2

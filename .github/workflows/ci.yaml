@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Checks for pull requests and main: the Go build, vet and tests, gofmt, the
-# license headers, the Python client's unit tests, and the integrations' tests. Release publishing lives in
-# release.yaml. Actions are pinned by commit SHA (version in the trailing
-# comment), as the organization's workflow security scan requires.
+# Checks for pull requests and main: Go build, vet, test, protos, license
+# headers, Markdown formatting and the generated docs/metrics.md; Python
+# client (base install and telemetry extras), telemetry report tool and
+# integration tests; the OpenHands integration; and Kind E2E smoke tests.
+# Release publishing lives in release.yaml. Actions are pinned by commit SHA
+# (version in the trailing comment), as the organization's workflow security
+# scan requires.
 name: ci
 
 on:
@@ -23,93 +26,127 @@ on:
   push:
     branches: [main]
 
-# A new push to the same branch or pull request supersedes the running checks.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
+  # Required status check on main (or planned); renaming requires a matching ruleset update.
   go:
     name: Go build, vet, test and license headers
-    runs-on: ubuntu-24.04 # pinned: ubuntu-latest moves to 26.04 from 2026-10-19; bump deliberately
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
         with:
-          go-version-file: go.mod
-      - run: go build ./...
-      - run: go vet ./...
-      - run: go test ./...
-      - run: make verify-gofmt
-      - run: hack/verify/boilerplate.sh
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/cache-go-and-substrate
+        with:
+          mode: restore
+          scope: go
+      - name: Run Go CI checks via Nix
+        shell: nix develop -c bash -eo pipefail {0}
+        run: ci-go
+      - uses: ./.github/actions/cache-go-and-substrate
+        with:
+          mode: save
+          scope: go
 
+  # Required status check on main (or planned); renaming requires a matching ruleset update.
   python:
     name: Python client and integration tests
-    runs-on: ubuntu-24.04 # pinned: ubuntu-latest moves to 26.04 from 2026-10-19; bump deliberately
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
         with:
-          python-version: "3.12"
-      - run: python -m pip install -e 'clients/python[dev]' -e 'integrations/nemo-gym[test]'
-      - run: python -m pytest clients/python/tests -q
-      - run: python -m pytest internal/benchmarking/swebench/trajectories -q
-      - run: python -m pytest benchmarking/swebench -q
-      - run: ruff check clients/python
-      - run: ruff check --config clients/python/pyproject.toml examples/Qwen3-1.7B-verl
-      - run: python -m pytest examples/Qwen3-1.7B-verl/tests -q
-      - run: python -m pytest integrations/nemo-gym/tests -q
-      # Again with the tracing and metrics extras: the whole client suite, so
-      # the span, traceparent and Prometheus tests run instead of skipping,
-      # and the instrumented code paths are tested with OpenTelemetry and
-      # prometheus_client installed.
-      - run: python -m pip install -e 'clients/python[dev,tracing,metrics]'
-      - run: python -m pytest clients/python/tests -q
-      - name: Install uni-agent (pinned, without its verl submodule) and the Substrate integration
-        run: |
-          git clone --quiet --filter=blob:none https://github.com/verl-project/uni-agent.git /tmp/uni-agent
-          git -C /tmp/uni-agent checkout --quiet 174b040
-          python -m pip install --no-deps /tmp/uni-agent
-          python -m pip install pydantic pyyaml httpx jsonschema openai
-          python -m pip install -e 'integrations/uni-agent[test]'
-      - run: ruff check integrations/uni-agent
-      - run: python -m pytest integrations/uni-agent/tests -q
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run Python CI checks via Nix
+        shell: nix develop -c bash -eo pipefail {0}
+        run: ci-python
 
+  # Required status check on main (or planned); renaming requires a matching ruleset update.
+  e2e-kind:
+    name: E2E Kind and Smoke Test
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      # A separate scope from the Go job: ko's build flags differ, so the two
+      # caches don't share entries (see the action for details).
+      - uses: ./.github/actions/cache-go-and-substrate
+        with:
+          mode: restore
+          scope: e2e
+      - name: Run E2E Kind and Smoke Test via Nix
+        shell: nix develop -c bash -eo pipefail {0}
+        run: ci-e2e
+      - uses: ./.github/actions/cache-go-and-substrate
+        with:
+          mode: save
+          scope: e2e
+
+  # Required status check on main (or planned); renaming requires a matching ruleset update.
   openhands:
     # A job of its own: openhands-sdk and the agent-server the tests start pull
-    # in a large dependency set that the other Python checks do not need.
+    # in a large dependency set that the other Python checks do not need. It runs
+    # in the .#openhands devShell via pip venv because exact openhands-* pins
+    # aren't in nixpkgs.
+    # TODO(#179): pip resolves everything except the openhands-* pins from PyPI
+    # at run time, so those versions float. Pin them (pyproject.toml or a lock
+    # file) once #179 publishes ate-env-client to PyPI.
     name: OpenHands integration
-    runs-on: ubuntu-24.04 # pinned: ubuntu-latest moves to 26.04 from 2026-10-19; bump deliberately
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
         with:
-          python-version: "3.12"
-      - run: python -m pip install -e 'clients/python[dev]' -e 'integrations/openhands[test]'
-      - run: python -m pytest integrations/openhands/tests -q
-      - run: ruff check integrations/openhands examples/openhands
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run OpenHands tests and ruff
+        shell: nix develop .#openhands -c bash -eo pipefail {0}
+        run: |
+          python -m pytest integrations/openhands/tests -q
+          ruff check integrations/openhands examples/openhands
 
   harbor:
     # Its own job: harbor pulls a large dependency set, and the trial test
-    # starts containers through the runner's docker daemon.
+    # starts containers through the runner's docker daemon. It runs in the
+    # .#harbor devShell via pip venv, like the OpenHands job: harbor is pinned
+    # to one minor in integrations/harbor/pyproject.toml and is not in nixpkgs.
     name: Harbor integration
-    runs-on: ubuntu-24.04 # pinned: ubuntu-latest moves to 26.04 from 2026-10-19; bump deliberately
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
         with:
-          python-version: "3.12"
-      - run: python -m pip install -e 'clients/python[dev]' -e 'integrations/harbor[test]'
-      - run: python -m pytest integrations/harbor/tests -q
-      - run: ruff check integrations/harbor
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run Harbor tests and ruff
+        shell: nix develop .#harbor -c bash -eo pipefail {0}
+        run: |
+          python -m pytest integrations/harbor/tests -q
+          ruff check integrations/harbor

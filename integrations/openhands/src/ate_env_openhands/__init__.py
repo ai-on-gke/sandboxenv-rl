@@ -22,12 +22,13 @@ that workspace moves over by changing the constructor.
 """
 
 from .fleet import FleetWorkspace, make_fleet_workspace, make_handle_workspace
-from .workspace import AteEnvWorkspace, port_url
+from .workspace import AteEnvWorkspace, port_capability, port_url
 
 __all__ = [
     "AteEnvWorkspace",
     "FleetWorkspace",
     "make_fleet_workspace",
     "make_handle_workspace",
+    "port_capability",
     "port_url",
 ]

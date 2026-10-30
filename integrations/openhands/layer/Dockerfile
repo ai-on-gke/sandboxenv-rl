@@ -43,7 +43,7 @@
 # the digest together.
 
 # The interpreter is fetched and verified in a small stage of its own.
-FROM curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6 AS fetch
+FROM curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777 AS fetch
 
 ARG TARGETARCH
 ARG PBS_RELEASE=20261013
@@ -63,7 +63,7 @@ RUN case "${TARGETARCH}" in \
     mkdir -p /tmp/oh; \
     tar -xzf "/tmp/${f}" -C /tmp/oh
 
-FROM ghcr.io/astral-sh/uv:0.11.18@sha256:78bc42400d77b0678ba95765305c826652ed5431f399257271dda681d0318f03 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 AS uv
 
 # Debian 13. Its own glibc does not matter: uv selects wheels for the target
 # platform, and the slim image has no compiler, so a native package without a

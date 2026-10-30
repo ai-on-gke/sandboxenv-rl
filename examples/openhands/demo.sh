@@ -74,7 +74,9 @@
 #                     not apply)
 #   KEEP              1 keeps the environments and prints how to reach them
 #   TEMPLATE          base template name (default oh-agent-server)
-#   ATESPACE          atespace (default ate-env)
+#   ATESPACE          atespace (default ate-env); another atespace must be in
+#                     ate-env manifest --port-proxy-atespaces, or the proxy
+#                     answers 403
 #   API               ate-env-api address for the CLI and the proxy
 #                     (default 127.0.0.1:7777; port-forward it)
 #   ATE_ENV, KUBECTL_ATE  binaries (default: on PATH)

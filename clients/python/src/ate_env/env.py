@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterable, AsyncIterator, Iterable, Mapping, Sequence
+from contextlib import nullcontext
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -24,6 +26,19 @@ import grpc
 
 from ._gen.ateenv.v1alpha import guest_pb2
 from .errors import ProcessExitedError, map_rpc_error
+from .telemetry import metrics
+from .telemetry.trace_recorder import (
+    annotate_span,
+    in_env_span,
+    in_handle_span,
+    is_measure_mode,
+)
+from .telemetry.tracing import (
+    CLIENT_SPAN_PREFIX,
+    executable_attr,
+    set_attributes,
+    start_span,
+)
 from .types import (
     EnvironmentInfo,
     ProcessInfo,
@@ -61,6 +76,20 @@ class Env:
         self._client = client
         self._id = id
         self._atespace = atespace
+        self._acquired_at = time.monotonic()
+        self._first_command_sent = False
+
+    def _record_first_command_if_needed(self) -> bool:
+        first = not self._first_command_sent
+        self._first_command_sent = True
+        if first and (metrics.client_metrics_enabled() or is_measure_mode()):
+            metrics.observe_subphase(
+                "ready_to_first_command",
+                max(0.0, time.monotonic() - self._acquired_at),
+                status="ok",
+                source="direct",
+            )
+        return first
 
     @property
     def id(self) -> str:
@@ -116,10 +145,42 @@ class Env:
             req.timeout.FromTimedelta(
                 timeout if isinstance(timeout, timedelta) else timedelta(seconds=timeout)
             )
-        try:
-            proc = await self._client._processes.StartProcess(req, metadata=self._metadata())
-        except grpc.RpcError as e:
-            raise map_rpc_error(e) from e
+        outer = not in_handle_span.get() and not in_env_span.get()
+        tracer = self._client.tracer if outer else None
+        first = self._record_first_command_if_needed() if outer else False
+        span_cm = (
+            start_span(
+                tracer,
+                f"{CLIENT_SPAN_PREFIX}.start_process",
+                {
+                    "ate.actor.name": self._id,
+                    "ate.atespace": self._atespace,
+                    "ate_env.command.executable": executable_attr(list(command)),
+                    "ate_env.first_command": True if first else None,
+                },
+            )
+            if tracer
+            else nullcontext()
+        )
+        metric_cm = (
+            metrics.timed("exec")
+            if outer and is_measure_mode()
+            else nullcontext()
+        )
+        with span_cm as span, metric_cm:
+            if span is not None:
+                annotate_span(
+                    span,
+                    op="start_process",
+                    env=self._id,
+                    command=[str(c) for c in command],
+                )
+            try:
+                proc = await self._client._processes.StartProcess(
+                    req, metadata=self._metadata()
+                )
+            except grpc.RpcError as e:
+                raise map_rpc_error(e) from e
         return Process(self, proc.process_id)
 
     def process(self, process_id: str) -> Process:
@@ -140,29 +201,83 @@ class Env:
         Output is buffered fully in memory; for incremental output or
         interactive input use start_process().
         """
-        proc = await self.start_process(
-            ["sh", "-c", command_line], cwd=cwd, env=env, stdin=stdin is not None, timeout=timeout
+        outer = not in_handle_span.get() and not in_env_span.get()
+        tracer = self._client.tracer if outer else None
+        first = self._record_first_command_if_needed() if outer else False
+        span_cm = (
+            start_span(
+                tracer,
+                f"{CLIENT_SPAN_PREFIX}.shell",
+                {
+                    "ate.actor.name": self._id,
+                    "ate.atespace": self._atespace,
+                    "ate_env.command.executable": executable_attr(command_line),
+                    "ate_env.first_command": True if first else None,
+                },
+            )
+            if tracer
+            else nullcontext()
         )
-        if stdin is not None:
-            await proc.write_input(stdin.encode() if isinstance(stdin, str) else stdin, close=True)
+        metric_cm = (
+            metrics.timed("exec")
+            if outer and is_measure_mode()
+            else nullcontext()
+        )
+        tok = in_env_span.set(True)
+        try:
+            with span_cm as span, metric_cm:
+                if span is not None:
+                    annotate_span(
+                        span,
+                        op="shell",
+                        env=self._id,
+                        command=["sh", "-c", command_line],
+                    )
+                proc = await self.start_process(
+                    ["sh", "-c", command_line],
+                    cwd=cwd,
+                    env=env,
+                    stdin=stdin is not None,
+                    timeout=timeout,
+                )
+                if stdin is not None:
+                    await proc.write_input(
+                        stdin.encode() if isinstance(stdin, str) else stdin, close=True
+                    )
 
-        stdout = bytearray()
-        stderr = bytearray()
-        exit_info: ProcessInfo | None = None
-        async for out in proc.output(follow=True):
-            if out.stdout is not None:
-                stdout.extend(out.stdout)
-            elif out.stderr is not None:
-                stderr.extend(out.stderr)
-            elif out.exit is not None:
-                exit_info = out.exit
-        if exit_info is None:
-            raise RuntimeError("ate_env: output stream ended before the process exited")
-        return ShellResult(
-            stdout=stdout.decode("utf-8", errors="replace"),
-            stderr=stderr.decode("utf-8", errors="replace"),
-            exit_code=exit_info.exit_code,
-        )
+                stdout = bytearray()
+                stderr = bytearray()
+                exit_info: ProcessInfo | None = None
+                async for out in proc.output(follow=True):
+                    if out.stdout is not None:
+                        stdout.extend(out.stdout)
+                    elif out.stderr is not None:
+                        stderr.extend(out.stderr)
+                    elif out.exit is not None:
+                        exit_info = out.exit
+                if exit_info is None:
+                    raise RuntimeError(
+                        "ate_env: output stream ended before the process exited"
+                    )
+                if span is not None:
+                    set_attributes(span, {"ate_env.exit_code": exit_info.exit_code})
+                    annotate_span(
+                        span,
+                        exit=exit_info.exit_code,
+                        ok=exit_info.exit_code == 0,
+                        err=(
+                            f"exit code {exit_info.exit_code}"
+                            if exit_info.exit_code != 0
+                            else None
+                        ),
+                    )
+                return ShellResult(
+                    stdout=stdout.decode("utf-8", errors="replace"),
+                    stderr=stderr.decode("utf-8", errors="replace"),
+                    exit_code=exit_info.exit_code,
+                )
+        finally:
+            in_env_span.reset(tok)
 
     # --- files ---
 
@@ -171,16 +286,44 @@ class Env:
 
         Errors (e.g. NotFoundError) surface on the first iteration.
         """
+        outer = not in_handle_span.get() and not in_env_span.get()
+        tracer = self._client.tracer if outer else None
+        span_cm = (
+            start_span(
+                tracer,
+                f"{CLIENT_SPAN_PREFIX}.read_file",
+                {
+                    "ate.actor.name": self._id,
+                    "ate.atespace": self._atespace,
+                    "ate_env.file.path": path,
+                },
+            )
+            if tracer
+            else nullcontext()
+        )
+        metric_cm = (
+            metrics.timed("read_file")
+            if outer and is_measure_mode()
+            else nullcontext()
+        )
         req = guest_pb2.ReadFileRequest(path=path)
-        call = self._client._filesystem.ReadFile(req, metadata=self._metadata())
-        try:
-            async for msg in call:
-                if msg.chunk:
-                    yield msg.chunk
-        except grpc.RpcError as e:
-            raise map_rpc_error(e) from e
-        finally:
-            call.cancel()
+        total_bytes = 0
+        with span_cm as span, metric_cm:
+            if span is not None:
+                annotate_span(span, op="read_file", env=self._id, path=path)
+            call = self._client._filesystem.ReadFile(req, metadata=self._metadata())
+            try:
+                async for msg in call:
+                    if msg.chunk:
+                        total_bytes += len(msg.chunk)
+                        yield msg.chunk
+                if span is not None:
+                    set_attributes(span, {"ate_env.file.size": total_bytes})
+                    annotate_span(span, bytes=total_bytes)
+            except grpc.RpcError as e:
+                raise map_rpc_error(e) from e
+            finally:
+                call.cancel()
 
     async def read_file_bytes(self, path: str) -> bytes:
         """Read a whole file into memory."""
@@ -205,13 +348,41 @@ class Env:
         _validate_byte_source(data, "write_file")
         if seek_offset < 0:
             raise ValueError(f"ate_env: seek_offset must be >= 0, got {seek_offset}")
-        try:
-            resp = await self._client._filesystem.WriteFile(
-                self._write_requests(path, data, mode, seek_offset), metadata=self._metadata()
+        outer = not in_handle_span.get() and not in_env_span.get()
+        tracer = self._client.tracer if outer else None
+        span_cm = (
+            start_span(
+                tracer,
+                f"{CLIENT_SPAN_PREFIX}.write_file",
+                {
+                    "ate.actor.name": self._id,
+                    "ate.atespace": self._atespace,
+                    "ate_env.file.path": path,
+                },
             )
-        except grpc.RpcError as e:
-            raise map_rpc_error(e) from e
-        return resp.bytes_written
+            if tracer
+            else nullcontext()
+        )
+        metric_cm = (
+            metrics.timed("write_file")
+            if outer and is_measure_mode()
+            else nullcontext()
+        )
+        with span_cm as span, metric_cm:
+            if span is not None:
+                annotate_span(span, op="write_file", env=self._id, path=path)
+            try:
+                resp = await self._client._filesystem.WriteFile(
+                    self._write_requests(path, data, mode, seek_offset),
+                    metadata=self._metadata(),
+                )
+            except grpc.RpcError as e:
+                raise map_rpc_error(e) from e
+            written = int(resp.bytes_written)
+            if span is not None:
+                set_attributes(span, {"ate_env.file.size": written})
+                annotate_span(span, bytes=written)
+            return written
 
     async def _write_requests(
         self, path: str, data: _ByteSource, mode: int, seek_offset: int

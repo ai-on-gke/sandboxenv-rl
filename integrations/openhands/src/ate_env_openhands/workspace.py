@@ -22,7 +22,15 @@ to that port in the environment, so the proxy URL is the workspace host: the
 SDK appends its ``/api/...`` paths to it, and ``RemoteConversation`` builds
 its event WebSocket from it. With ``api_token``, each request carries it in
 ``X-Env-Authorization``, which ate-env-api checks and removes before it
-forwards the request.
+forwards the request. The SDK opens the event WebSocket without extra headers
+and drops the host's query string, but keeps its user info, which the
+WebSocket client sends as ``Authorization: Basic``. Thus with ``api_token`` the
+host carries a port capability in its user info: an HMAC of this environment
+port and an expiry, keyed with the token. ate-env-api accepts it on WebSocket
+upgrades only and never forwards it; the token itself is never in a URL. Only
+the event WebSocket uses the user info: the REST client gets the host without
+it and never sends the capability, and ``repr``, dumps, errors and the known
+loggers mask it.
 
 Mirrors ``openhands.workspace.AgentSandboxWorkspace``: same lifecycle order
 (create, health wait, parent init; clean up on any failure after create),
@@ -34,6 +42,10 @@ image, which agent-sandbox fixes in its SandboxTemplate, is a field here.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import logging
+import re
 import secrets
 import shlex
 import sys
@@ -46,7 +58,7 @@ import httpx
 from ate_env import EnvError, EnvironmentStatus, NotFoundError, RpcError
 from openhands.sdk.logger import get_logger
 from openhands.sdk.workspace import RemoteWorkspace
-from pydantic import Field, PrivateAttr
+from pydantic import Field, PrivateAttr, field_serializer
 
 from . import _runtime
 
@@ -57,6 +69,14 @@ DEFAULT_ATESPACE = "ate-env"
 # The port proxy reads the caller's ate-env-api credential from this header
 # and does not forward it, so the agent-server's own credentials stay apart.
 ENV_AUTHORIZATION_HEADER = "X-Env-Authorization"
+
+# The user of the port capability in the host's user info (see
+# port_capability), and the latest expiry ate-env-api accepts.
+CAPABILITY_USER = "ate-env-capability"
+MAX_CAPABILITY_TTL = 7 * 24 * 3600.0
+# ws_capability_ttl stays this far below the maximum, because the proxy checks
+# the expiry against its own clock and a client clock can run ahead.
+CAPABILITY_CLOCK_MARGIN = 300.0
 
 # Deadline for get, suspend and delete, so that cleanup() cannot block forever.
 CALL_TIMEOUT = 30.0
@@ -104,6 +124,96 @@ def _base_url(url: str) -> str:
 def port_url(api_url: str, atespace: str, env_id: str, port: int) -> str:
     """URL of ``port`` in an environment, through ate-env-api's port proxy."""
     return f"{_base_url(api_url)}/v1alpha/atespaces/{atespace}/envs/{env_id}/ports/{port}"
+
+
+def port_capability(token: str, atespace: str, env_id: str, port: int, expiry: int) -> str:
+    """A port capability for ``port`` in an environment, signed with ``token``.
+
+    ``v1.<expiry>.<mac>``, with ``mac`` the hex HMAC-SHA256, keyed with
+    ate-env-api's bearer token, of the atespace, the environment id, the port
+    and ``expiry`` (Unix seconds). ate-env-api's port proxy accepts it on
+    WebSocket upgrades to that port until ``expiry``, at most seven days
+    ahead.
+    """
+    msg = f"ate-env port capability v1\n{atespace}\n{env_id}\n{port}\n{expiry}"
+    mac = hmac.new(token.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return f"v1.{expiry}.{mac}"
+
+
+def _with_capability(url: str, capability: str) -> str:
+    scheme, rest = url.split("://", 1)
+    return f"{scheme}://{CAPABILITY_USER}:{capability}@{rest}"
+
+
+def _without_userinfo(url: str) -> str:
+    """The URL without user info, thus without a port capability."""
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return url
+    netloc, slash, path = rest.partition("/")
+    return f"{scheme}://{netloc.rpartition('@')[2]}{slash}{path}"
+
+
+_CAPABILITY_IN_URL = re.compile(re.escape(CAPABILITY_USER) + r":[^@/\s]+@")
+# "Basic " and the base64 text of "ate-env-capability:..."; the user name is 18
+# bytes, thus its first 24 base64 characters do not depend on the capability.
+_CAPABILITY_IN_BASIC = re.compile(r"Basic\s+YXRlLWVudi1jYXBhYmlsaXR5[A-Za-z0-9+/=]*")
+
+
+def _redact(text: str) -> str:
+    text = _CAPABILITY_IN_URL.sub(CAPABILITY_USER + ":***@", text)
+    return _CAPABILITY_IN_BASIC.sub("Basic ***", text)
+
+
+def _needs_redact(text: str) -> bool:
+    return CAPABILITY_USER in text or "YXRlLWVudi1jYXBhYmlsaXR5" in text
+
+
+class _RedactCapability(logging.Filter):
+    """Masks port capabilities in log records.
+
+    httpx logs request URLs, and websockets logs each handshake header at DEBUG
+    level, ``Authorization: Basic`` included, as a ``"> %s: %s"`` record.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str) and _needs_redact(record.msg):
+            record.msg = _redact(record.msg)
+        if isinstance(record.args, tuple) and record.args:
+            args = list(record.args)
+            if len(args) == 2 and str(args[0]).lower() == "authorization":
+                args[1] = "***"
+            record.args = tuple(_redact(str(a)) if _needs_redact(str(a)) else a for a in args)
+        return True
+
+
+_redact_filter = _RedactCapability()
+
+# A logger filter applies only to records of that exact logger, not to its
+# children, thus name each logger that can log the host or the handshake.
+_REDACTED_LOGGERS = (
+    "httpx",
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "websockets.client",
+    "openhands.sdk.workspace.remote.base",
+    "openhands.sdk.conversation.impl.remote_conversation",
+)
+
+
+def _redact_capabilities_in_logs() -> None:
+    for name in _REDACTED_LOGGERS:
+        log = logging.getLogger(name)
+        if _redact_filter not in log.filters:
+            log.addFilter(_redact_filter)
+
+
+def _strip_userinfo_from_request(request: httpx.Request) -> None:
+    """httpx request hook: a REST request never carries the host's user info."""
+    if request.url.userinfo:
+        request.url = request.url.copy_with(userinfo=b"")
 
 
 def _new_env_id() -> str:
@@ -197,10 +307,23 @@ class AteEnvWorkspace(RemoteWorkspace):
     )
     api_token: str | None = Field(
         default=None,
+        repr=False,
+        exclude=True,
         description="Bearer token for ate-env-api (its -auth-token-file). Sent on gRPC "
         "calls, and on port-proxy requests in X-Env-Authorization, which ate-env-api "
         "checks and removes before it forwards a request. The conversation event "
-        "WebSocket does not carry it (see the README's Limits).",
+        "WebSocket carries a port capability derived from it instead (see "
+        "ws_capability_ttl); the token is never in a URL.",
+    )
+    ws_capability_ttl: float = Field(
+        default=86400.0,
+        gt=0.0,
+        le=MAX_CAPABILITY_TTL - CAPABILITY_CLOCK_MARGIN,
+        description="Seconds the port capability in host stays valid, with api_token. "
+        "A conversation's event WebSocket keeps the capability it opened with and "
+        "reconnects with it, thus a conversation that lives longer needs a longer value "
+        "(at most seven days less five minutes), or a reattach after "
+        "renew_ws_capability() or resume().",
     )
     env_id: str | None = Field(
         default=None,
@@ -268,13 +391,13 @@ class AteEnvWorkspace(RemoteWorkspace):
         # Everything past the create must clean up on failure: the caller gets
         # no object to close when the constructor raises.
         try:
-            object.__setattr__(self, "host", self.port_url(self.server_port))
+            self._set_host()
             self._wait_for_health(timeout=self.health_check_timeout)
             super().model_post_init(context)
             self._check_session_key()
             self._ensure_working_dir()
             self._check_versions()
-            logger.info("ate-env workspace is ready at %s", self.host)
+            logger.info("ate-env workspace is ready at %s", _redact(self.host))
         except Exception:
             self.cleanup()
             raise
@@ -289,6 +412,81 @@ class AteEnvWorkspace(RemoteWorkspace):
             self._client = client
         copy._is_copy = True
         return copy
+
+    def __repr_args__(self):  # type: ignore[no-untyped-def]
+        for name, value in super().__repr_args__():
+            if name == "host" and isinstance(value, str):
+                value = _redact(value)
+            yield name, value
+
+    @field_serializer("host")
+    def _serialize_host(self, host: str) -> str:
+        return _redact(host)
+
+    def _set_host(self) -> None:
+        """Set host from the proxy URL, with a new port capability when api_token is set."""
+        host = self.port_url(self.server_port)
+        if self.api_token:
+            expiry = int(time.time() + self.ws_capability_ttl)
+            capability = port_capability(self.api_token, self.atespace, self.env_id,
+                                         self.server_port, expiry)
+            host = _with_capability(host, capability)
+            _redact_capabilities_in_logs()
+        object.__setattr__(self, "host", host)
+
+    def renew_ws_capability(self) -> None:
+        """Put a new port capability, valid ``ws_capability_ttl`` from now, in host.
+
+        A ``RemoteConversation`` keeps the host it opened with, thus only a
+        conversation opened or reattached after this call uses the new
+        capability for its event WebSocket. The HTTP client stays open: REST
+        requests do not use the capability, thus a live conversation can still
+        send messages. No-op without ``api_token``.
+        """
+        if self.api_token:
+            self._set_host()
+
+    @property
+    def _rest_host(self) -> str:
+        """host without user info: the base of all REST requests."""
+        return _without_userinfo(self.host)
+
+    @property
+    def client(self) -> httpx.Client:
+        """The SDK's HTTP client, without the port capability.
+
+        Only the event WebSocket uses host's user info. The client's base URL
+        drops it; a no-op ``auth`` keeps httpx from sending it as Basic
+        credentials; and a request hook removes it from the absolute URLs the
+        SDK builds from host, thus it is in no request, log line or error.
+        """
+        client = super().client
+        if not getattr(client, "_ate_env_rest", False):
+            client.base_url = httpx.URL(self._rest_host)
+            client.auth = httpx.Auth()
+            hooks = client.event_hooks
+            client.event_hooks = {
+                "request": [*hooks.get("request", []), _strip_userinfo_from_request],
+                "response": list(hooks.get("response", [])),
+            }
+            client._ate_env_rest = True  # type: ignore[attr-defined]
+        return client
+
+    @property
+    def alive(self) -> bool:
+        """Whether the agent-server answers /health, through the authenticated proxy."""
+        try:
+            resp = httpx.get(f"{self._rest_host}/health", headers=dict(self._headers),
+                             timeout=5.0)
+        except httpx.HTTPError:
+            return False
+        return 200 <= resp.status_code < 300
+
+    def get_secrets(self, names=None):  # type: ignore[no-untyped-def,override]
+        """The SDK's ``get_secrets()``, with lookup URLs that carry no port capability."""
+        secrets = super().get_secrets(names)
+        return {name: secret.model_copy(update={"url": _without_userinfo(secret.url)})
+                for name, secret in secrets.items()}
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -390,7 +588,7 @@ class AteEnvWorkspace(RemoteWorkspace):
         error when the deadline passes.
         """
         deadline = time.monotonic() + timeout
-        url = f"{self.host}/health"
+        url = f"{self._rest_host}/health"
         headers = dict(self._headers)
         last = "no attempt"
         next_state_check = 0.0
@@ -551,11 +749,15 @@ class AteEnvWorkspace(RemoteWorkspace):
         """Wake the environment and wait for the agent-server.
 
         Any request wakes a suspended environment; this one makes the wait
-        explicit. The host does not change.
+        explicit. With ``api_token``, host gets a new port capability first
+        (``renew_ws_capability()``), thus a conversation reattached after the
+        resume can open its event WebSocket however long the pause was.
         """
         if self.env_id is None or self._deleted:
             raise RuntimeError("Cannot resume: no active environment")
         logger.info("Resuming environment %s/%s", self.atespace, self.env_id)
+        if self.api_token:
+            self._set_host()
         self._wait_for_health(timeout=self.health_check_timeout)
         self.reset_client()
 

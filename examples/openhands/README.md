@@ -167,10 +167,10 @@ base URL (default: `http://` and `SUBSTRATE_ENV_API`), and `ATESPACE` the atespa
 
 ## Limits
 
-- With `API_TOKEN` (ate-env-api with `-auth-token-file`), a `RemoteConversation`'s event WebSocket
-  gets 401, because the SDK sends no extra headers on it. Commands, files and `run_trajectory.py`
-  work; `codeact_agent.py` and `convo_with_ate_env.py` need the follow-up in the integration's
-  [Limits](../../integrations/openhands/README.md#limits).
+- With `API_TOKEN`, `codeact_agent.py` and `convo_with_ate_env.py` pass it to `AteEnvWorkspace` as
+  `api_token`, and the event WebSocket of a `RemoteConversation` carries a port capability. An
+  ate-env-api without port capability support answers that WebSocket with 401 (see the
+  integration's [Limits](../../integrations/openhands/README.md#limits)).
 
 - `codeact_agent.py` calls the model from inside the environment (see above); `run_trajectory.py`
   and a client-side agent built on it do not.

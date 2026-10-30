@@ -28,13 +28,17 @@ export PYTHONUNBUFFERED=1 HF_HOME=/workspace/hf HF_HUB_ENABLE_HF_TRANSFER=1 CUDA
 : "${MODEL_REVISION:=59d61f3c}"   # Hugging Face commit of MODEL_ID
 : "${ENV_PREFIX:=verl-qwen3p5-35b}"
 : "${MODEL_ID:=Qwen/Qwen3.5-35B-A3B}"
-: "${TRAIN_SOURCE:=r2e_gym_easy}"; : "${TRAIN_SPLIT:=train}"; : "${TRAIN_INSTANCES:=64}"; : "${TRAIN_DATASET:=}"
+: "${TRAIN_SOURCE:=r2e_gym_easy}"; : "${TRAIN_SPLIT:=train}"; : "${TRAIN_INSTANCES:=192}"; : "${TRAIN_DATASET:=}"   # >= TOTAL_STEPS x TRAIN_BATCH, else the one-epoch run ends early
 : "${VAL_TASKS:=20}"
 : "${TRAIN_BATCH:=16}"; : "${ROLLOUT_N:=8}"; : "${MINI_BATCH:=8}"; : "${SYNC_STEP:=2}"
 # One session per trajectory, so a whole step (TRAIN_BATCH x ROLLOUT_N) starts at once instead of queueing on the cap.
 # If the sandbox system cannot hold that many environments, set SESSIONS to its maximum capacity instead.
 : "${SESSIONS:=$((TRAIN_BATCH * ROLLOUT_N))}"; : "${SANDBOX_STARTUP_CONCURRENCY:=$SESSIONS}"
-: "${GATEWAYS:=2}"; : "${AGENT_WORKERS:=2}"; : "${TOTAL_STEPS:=2}"
+: "${GATEWAYS:=2}"; : "${AGENT_WORKERS:=2}"
+# TOTAL_STEPS: 2 = smoke (plumbing: one cold step, one steady step). 12 = performance numbers (1 warmup + 11 measured; step
+# time varies ~17% step to step, so 11 steps put the mean within ~10%). Full = epochs x floor(TRAIN_INSTANCES / TRAIN_BATCH):
+# 43 per epoch on the whole 700-instance slice, 86 for the archived 2-epoch run (trainer.total_epochs is 1 below).
+: "${TOTAL_STEPS:=12}"
 : "${PROMPT_LENGTH:=8192}"; : "${RESPONSE_LENGTH:=32768}"; : "${TRAIN_TP:=2}"; : "${TRAIN_CP:=1}"; : "${TRAIN_EP:=8}"; : "${ROLLOUT_TP:=2}"
 : "${ROLLOUT_HYBRID_FLAGS:=1}"           # vLLM flags for the hybrid (GDN) model; set 0 if your vLLM rejects them
 : "${ATE_ENV_ENDPOINT:=ate-env-api.ate-env.svc:7777}"; : "${ATE_TEMPLATE:=swe-2c6g}"

@@ -32,7 +32,8 @@ export HF_HOME=/workspace/hf PYTHONUNBUFFERED=1 VLLM_USE_V1=1 NCCL_CUMEM_ENABLE=
 : "${NGPUS_ROLLOUT:=8}"               # rollout pool (whole node; vLLM replicas, TP=1 each)
 : "${PPO_MINI_BATCH:=16}"             # prompts per local update (global)
 : "${N_SAMPLES:=4}"                   # rollouts per prompt
-: "${LOCAL_UPDATES:=4}"               # how many local updates to run
+: "${LOCAL_UPDATES:=12}"              # trainer steps: 2 = smoke, 12 = performance numbers (1 warmup + 11 measured; step time
+                                      # varies ~9%), full = one epoch = floor(7489 MATH prompts / PPO_MINI_BATCH) = 468
 : "${SYNC_EVERY:=2}"                  # trigger_parameter_sync_step
 : "${STALENESS:=0.5}"
 : "${ATE_ENV_CLIENT_REF:=eedeb63}"      # ai-on-gke/sandboxenv-rl main (clients/python); move to the merge commit of this PR

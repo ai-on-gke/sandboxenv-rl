@@ -18,7 +18,7 @@ revisions in `run_fully_async.sh`, `TransferQueue==0.1.11`, `cupy-cuda12x==13.6.
 - Two GKE GPU nodes with 8 GPUs each (validated on a3-ultragpu-8g / H200).
   Standard `nvidia.com/gpu` taint is tolerated; extra taints go in
   `GPU_TOLERATIONS`.
-- CPU for the environments: the run keeps 32 environments (2 CPU / 4 GiB
+- CPU for the environments: the run keeps 64 environments (2 CPU / 4 GiB
   limits each) on Substrate's workers, which schedule on untainted nodes.
 - GPU pod egress to GitHub, PyPI and Hugging Face; `kubectl` rights for Jobs,
   Services and ConfigMaps in `default`. No Ray operator needed.
@@ -36,10 +36,11 @@ export KUBE_CONTEXT=<context>          # or PROJECT_ID ZONE CLUSTER
 ```
 
 Expect in the log: `ate-env-api probe ok`, `ray nodes with GPUs: 2/2`, then
-`step:1`, `step:2`, `=== DONE rc=0 ===`. About 10 minutes end to end on H200
+`step:1` ... `step:12`, `=== DONE rc=0 ===`. About 10 minutes end to end on H200
 (image pull, install and model download on both nodes, ~10 s per step).
 
-Knobs (Job env in `job-fully-async.yaml`): `LOCAL_UPDATES` (4),
+Knobs (Job env in `job-fully-async.yaml`): `LOCAL_UPDATES` (12: 1 warmup + 11 measured
+steps; 2 for a smoke test, 468 for one epoch of the 7489 MATH prompts),
 `PPO_MINI_BATCH` (16), `N_SAMPLES` (4), `SYNC_EVERY` (2), `STALENESS` (0.5),
 `NGPUS_TRAIN`/`NGPUS_ROLLOUT` (8/8), `NODE_WAIT_S` (3600), `MODEL_ID`.
 Tool settings in `tool_config.yaml`: `endpoint`, `max_envs`, `timeout_s`,

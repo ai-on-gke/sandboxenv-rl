@@ -46,14 +46,14 @@ ate-env manifest template --template swe-2c6g --cpu 2 --memory 6Gi --workerpool 
 
 # 2. dataset slices and digest-pinned images (once per slice)
 pip install -e '../../integrations/uni-agent[datasets]'
-python3 -m uni_agent_substrate.datasets --source r2e_gym_easy --max-instances 64 --images-out images.txt --out /tmp/train.parquet
+python3 -m uni_agent_substrate.datasets --source r2e_gym_easy --max-instances 192 --images-out images.txt --out /tmp/train.parquet   # = TRAIN_INSTANCES; 700 for a full epoch
 python3 -m uni_agent_substrate.datasets --source swe_bench --max-instances 20 \
     --exclude-file ../../benchmarking/swebench/offline-exclusions.txt --images-out images-val.txt --out /tmp/val.parquet
 ../../integrations/uni-agent/scripts/resolve_images.sh images.txt     <region>-docker.pkg.dev/<project>/<dockerhub-remote-repo> images.json
 ../../integrations/uni-agent/scripts/resolve_images.sh images-val.txt <region>-docker.pkg.dev/<project>/<dockerhub-remote-repo> images.json
 
-# 3. training smoke (2 steps), then cleanup
-./deploy.sh up && ./deploy.sh logs          # ... ray nodes with GPUs: 2/2 ... step:1 ... step:2 ... === DONE rc=0 ===
+# 3. 12-step measurement run (TOTAL_STEPS=2 for a smoke test), then cleanup
+./deploy.sh up && ./deploy.sh logs          # ... ray nodes with GPUs: 2/2 ... step:1 ... step:12 ... === DONE rc=0 ===
 ./deploy.sh down
 ```
 
@@ -61,9 +61,9 @@ python3 -m uni_agent_substrate.datasets --source swe_bench --max-instances 20 \
 `./images.json`, git-ignored) and shipped to the pods in the ConfigMap.
 
 Knobs (Job env in `job-fully-async.yaml`): `TRAIN_SOURCE` / `TRAIN_SPLIT` /
-`TRAIN_INSTANCES` / `TRAIN_DATASET`, `VAL_TASKS`, `TRAIN_BATCH`
+`TRAIN_INSTANCES` (192, >= `TOTAL_STEPS x TRAIN_BATCH`) / `TRAIN_DATASET`, `VAL_TASKS`, `TRAIN_BATCH`
 (16) = `SYNC_STEP` (2) x `MINI_BATCH` (8), `ROLLOUT_N` (8), `SESSIONS` (128), `GATEWAYS`,
-`AGENT_WORKERS`, `TOTAL_STEPS` (2), `PROMPT_LENGTH` (8192), `RESPONSE_LENGTH` (32768),
+`AGENT_WORKERS`, `TOTAL_STEPS` (12), `PROMPT_LENGTH` (8192), `RESPONSE_LENGTH` (32768),
 `TRAIN_CP` (1; 2 if the 40k-token step runs out of memory), `ROLLOUT_TP` (2),
 `ATE_TEMPLATE`, `ATE_ENV_ENDPOINT`. Sizing: `SESSIONS` defaults to `TRAIN_BATCH x ROLLOUT_N`
 so every trajectory of a step starts at once instead of queueing on the session cap, and
@@ -73,6 +73,15 @@ If the sandbox system cannot hold a full step, set `SESSIONS` to its maximum cap
 instead. Timeline on H200: ~5 min install, ~5 min model download
 on each node, ~1.5 min engine start, then roughly 10 to 15 minutes per
 step with 100-turn episodes.
+
+Run length (`TOTAL_STEPS`): 2 is a smoke test (one cold step, one steady step). 12, the
+default, gives performance numbers: 1 warmup step plus 11 measured, which puts mean step
+time within about 10% given the ~17% step-to-step variation of a 60-step run, about 1.5 to
+3 h in all. Full training is `epochs x floor(TRAIN_INSTANCES / TRAIN_BATCH)`: 43 steps per
+epoch on the whole 700-instance slice (`TRAIN_INSTANCES=700` and the matching
+`--max-instances`), 86 for the archived 2-epoch run, whose reward plateaued inside the first
+epoch; the script fixes `trainer.total_epochs` at 1. Validation runs before training and
+after the last step whatever the length.
 
 ## Files
 

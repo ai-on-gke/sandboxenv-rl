@@ -70,6 +70,12 @@ _PROBE_TIMEOUT_S = 10.0
 _MIN_GUEST_TIMEOUT_S = 1.0
 # Exit code the guest reports for a process group it killed with SIGKILL.
 _SIGKILL_EXIT = 137
+# Return code of an exec result that carries no process exit status: the
+# command timed out, or the sandbox could not run it at all. The value is the
+# sentinel NeMo Gym's own providers use; what makes it a runtime failure is
+# the `error_type` next to it ("timeout" or "sandbox"), which Gym's agents
+# check to end a rollout instead of treating the result as an observation.
+_SANDBOX_RUNTIME_RETURN_CODE = 125
 
 # Routing headers of ate-env-api's port proxy (internal/portproxy): a plain
 # HTTP request carrying them is forwarded to that port inside the environment.
@@ -106,19 +112,39 @@ def _validate_ports(ports: object) -> list[int]:
         out.append(p)
     return out
 
-# Env lifecycle status -> Gym status. Parked (suspended / paused) actors report
-# RUNNING: the router resumes them on the next guest call, which is what a
-# rollout loop wants to see (see README, "Resource mapping").
+# Gym's status for a parked sandbox. PAUSED arrived with nemo-gym 0.7: the
+# sandbox is alive and one call away, since the router resumes it on the next
+# guest call. An older nemo-gym has no such member, and RUNNING is the nearest
+# truth there.
+_PAUSED = getattr(SandboxStatus, "PAUSED", SandboxStatus.RUNNING)
+
+# Env lifecycle status -> Gym status (see README, "Resource mapping").
 _STATUS_MAP = {
     EnvironmentStatus.RESUMING: SandboxStatus.STARTING,
     EnvironmentStatus.RUNNING: SandboxStatus.RUNNING,
-    EnvironmentStatus.SUSPENDING: SandboxStatus.RUNNING,
-    EnvironmentStatus.SUSPENDED: SandboxStatus.RUNNING,
-    EnvironmentStatus.PAUSING: SandboxStatus.RUNNING,
-    EnvironmentStatus.PAUSED: SandboxStatus.RUNNING,
+    EnvironmentStatus.SUSPENDING: _PAUSED,
+    EnvironmentStatus.SUSPENDED: _PAUSED,
+    EnvironmentStatus.PAUSING: _PAUSED,
+    EnvironmentStatus.PAUSED: _PAUSED,
     EnvironmentStatus.CRASHED: SandboxStatus.ERROR,
     EnvironmentStatus.DELETING: SandboxStatus.STOPPED,
 }
+
+
+def _runtime_failure(
+    error_type: str, message: str, *, stdout: str | None = None, stderr: str | None = None
+) -> SandboxExecResult:
+    """An exec result for a command the sandbox did not run to completion.
+
+    ``error_type`` is "timeout" or "sandbox"; the return code is the runtime
+    sentinel. Output the command produced before it was cut is kept, and
+    ``message`` goes on stderr after it."""
+    return SandboxExecResult(
+        stdout=stdout,
+        stderr=f"{stderr}\n{message}" if stderr else message,
+        return_code=_SANDBOX_RUNTIME_RETURN_CODE,
+        error_type=error_type,
+    )
 
 
 def _require_keys(options: Mapping[str, Any], allowed: frozenset[str], where: str) -> None:
@@ -371,11 +397,18 @@ class SubstrateSandboxProvider:
             None if timeout_s is None else max(_MIN_GUEST_TIMEOUT_S, float(timeout_s))
         )
 
+        # A failure of the sandbox itself is a result with an `error_type`, not
+        # an exception: that is the shape Gym's agents check to end a rollout
+        # whose sandbox is gone, and it is how Gym's own providers report it.
+        # A nonzero exit of the command stays a plain result.
         sandbox = self._env(handle)
         started = time.monotonic()
-        process = await sandbox.start_process(
-            argv, cwd=effective_cwd, env=merged_env, timeout=guest_timeout
-        )
+        try:
+            process = await sandbox.start_process(
+                argv, cwd=effective_cwd, env=merged_env, timeout=guest_timeout
+            )
+        except EnvError as exc:
+            return _runtime_failure("sandbox", self._sandbox_failure(handle, exc))
         try:
             result = await asyncio.wait_for(
                 self._collect(process),
@@ -384,26 +417,32 @@ class SubstrateSandboxProvider:
         except asyncio.TimeoutError:
             with contextlib.suppress(EnvError):
                 await process.kill()
-            return SandboxExecResult(
-                stdout=None,
-                stderr=f"substrate provider: exec timed out after {timeout_s}s",
-                return_code=-1,
+            return _runtime_failure(
+                "timeout", f"substrate provider: exec timed out after {timeout_s}s"
             )
+        except EnvError as exc:
+            return _runtime_failure("sandbox", self._sandbox_failure(handle, exc))
         if (
             guest_timeout is not None
             and result.return_code == _SIGKILL_EXIT
             and time.monotonic() - started >= guest_timeout
         ):
             # The guest reports a deadline kill as a plain SIGKILL and nothing
-            # in the exit state says why; the elapsed time does. Name it: 137
-            # with an empty stderr tells a rollout nothing.
-            note = f"substrate provider: exec timed out after {timeout_s}s (killed by the guest)"
-            return SandboxExecResult(
+            # in the exit state says why; the elapsed time does. Report it as
+            # the timeout it is, with the output the command got out first.
+            return _runtime_failure(
+                "timeout",
+                f"substrate provider: exec timed out after {timeout_s}s (killed by the guest)",
                 stdout=result.stdout,
-                stderr=f"{result.stderr}\n{note}" if result.stderr else note,
-                return_code=result.return_code,
+                stderr=result.stderr,
             )
         return result
+
+    @staticmethod
+    def _sandbox_failure(handle: SandboxHandle, exc: EnvError) -> str:
+        if isinstance(exc, NotFoundError):
+            return f"substrate env {handle.sandbox_id!r} does not exist: {_describe(exc)}"
+        return f"substrate env {handle.sandbox_id!r}: {_describe(exc)}"
 
     async def upload_file(self, handle: SandboxHandle, source_path: Path, target_path: str) -> None:
         await self._env(handle).write_file(

@@ -27,8 +27,15 @@ Provider, task, dataset and image tooling: [`integrations/uni-agent`](../../inte
   6 GiB is a booking, not a hard cap: SWE test suites peak well above it, and if the sum
   exceeds the worker's limit the worker is OOM-killed with everything it hosts (watch
   `kubectl -n ate-env get pods` restarts; 10 per node still did that in validation).
+  With other worker sizes, capacity = replicas x floor(worker CPU / 2); 10 workers of
+  27 CPU (13 environments each) carried 128 sessions.
 - Per-instance task images reachable by the nodes as digest-pinned references: an
-  Artifact Registry remote repository proxying Docker Hub (no copying) or a mirror.
+  Artifact Registry remote repository proxying Docker Hub (no copying) or a mirror that
+  the node service account can read. Resolving a digest from the prep machine proves
+  nothing about the nodes: an image they cannot pull fails only at actor start, as
+  `ACTOR_STATE_CRASHED` with `imageCache.EnsureImage ... token` in the actor's crash message
+  and `UNAVAILABLE ... AssignWorker prerequisite not met` in the agent log; the provider
+  retries three times, then the episode fails.
 - `crane`, Python 3.11+ with `datasets`, `pyarrow`, `huggingface_hub` on the machine
   that prepares the slices; GPU pod egress to GitHub, PyPI and Hugging Face.
 
@@ -119,3 +126,14 @@ after the last step whatever the length.
   after a Substrate reinstall.
 - Environments created by this recipe are named `verl-qwen3p5-35b-*` (`actor_prefix` in
   `task_config.yaml`); `deploy.sh up`/`down` delete only those when `KUBECTL_ATE` is set.
+- Derived templates are named `<ATE_TEMPLATE>-<digest:12>` and keep the image reference
+  they were created with. A later `images.json` that pins the same digest under another
+  registry path fails at create with `FAILED_PRECONDITION: actor template ... exists but
+  runs <ref>, not <ref>`. Reuse the reference the template runs (`kubectl-ate get
+  actor-template -a ate-env -o json`) or delete the stale derived template.
+- A template whose golden bake failed (`kubectl-ate get actor-template -a ate-env` shows
+  ERROR, status `GoldenActorCrashed`) is fixed by deleting it and running the same
+  `ate-env manifest template` command again; it re-bakes in about two minutes.
+- Nothing copies results out of the pods. Save `kubectl -n default logs
+  job/verl-qwen3p5-35b-swe --tail=-1` after `=== DONE` and before `deploy.sh down`, which
+  deletes the Jobs.

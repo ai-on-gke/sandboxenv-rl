@@ -13,7 +13,9 @@ revisions in `run_fully_async.sh`, `TransferQueue==0.1.11`, `cupy-cuda12x==13.6.
 
 - Agent Substrate v0.6.0 or later with this repository's `ate-env-api` installed in namespace
   `ate-env` per the Quickstart (which puts `ate-env-api` on the router's allow-list), with
-  template `default-template`. If `ate-env-api` requires a caller token, export
+  template `default-template` whose golden bake succeeded (`kubectl-ate get actor-template
+  -a ate-env` shows a GOLDEN TAG, not ERROR; delete and recreate it otherwise). If
+  `ate-env-api` requires a caller token, export
   `SUBSTRATE_ENV_AUTH_TOKEN` in the pods; the tool and the probe send it as the bearer token.
 - Two GKE GPU nodes with 8 GPUs each (validated on a3-ultragpu-8g / H200).
   Standard `nvidia.com/gpu` taint is tolerated; extra taints go in
@@ -36,8 +38,9 @@ export KUBE_CONTEXT=<context>          # or PROJECT_ID ZONE CLUSTER
 ```
 
 Expect in the log: `ate-env-api probe ok`, `ray nodes with GPUs: 2/2`, then
-`step:1` ... `step:12`, `=== DONE rc=0 ===`. About 10 minutes end to end on H200
-(image pull, install and model download on both nodes, ~10 s per step).
+`step:1` ... `step:12`, `=== DONE rc=0 ===`. About 8 minutes end to end on H200
+(image pull, install and model download on both nodes; the first logged step takes
+~12 s, later ones ~4.5 s).
 
 Knobs (Job env in `job-fully-async.yaml`): `LOCAL_UPDATES` (24 local updates = 12 logged
 steps, one per `SYNC_EVERY`: 1 warmup + 11 measured; 4 for a smoke test, 468 for one epoch of
@@ -87,3 +90,5 @@ hidden tests through the `ate_env` client; nothing else changes.
   `KUBECTL_ATE` is set, otherwise `kubectl-ate delete actor <id> -a ate-env --any-state`.
 - The guest image is Python 3.11 standard library; set `rootfs_image` for
   other images.
+- Nothing copies results out of the pods. Save `kubectl -n default logs
+  job/verl-qwen3-1p7b-fully-async --tail=-1` after `=== DONE` and before `deploy.sh down`.

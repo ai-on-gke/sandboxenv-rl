@@ -86,10 +86,13 @@ families, so a W3C `traceparent` in gRPC metadata continues a trace into the con
 
 ## 4. Design decisions, as settled
 
-1. Propagation carrier: gRPC metadata end to end, as planned. Substrate's asynchronous hops
-   (scheduler placement, atelet restore) join the trace only when Substrate exports to the same
-   backend, under `ate-env-api`'s `ateapi.Control/*` client spans. A trace-context label on actors
-   remains a question for the Substrate repository.
+1. Propagation carrier: gRPC metadata end to end, as planned. Substrate continues it on its own: the
+   atenet router's ingress extracts `traceparent` and resumes the actor under it, `ateapi` stamps
+   actor identity on its server span and opens a `step.<name>` span per workflow step, and atelet
+   and ateworker follow through otelgrpc and the atelet relay. Every component samples parent-based,
+   so a trace the client samples is complete through to the worker once Substrate exports to the
+   same backend. No trace-context label on actors is needed (checked against Substrate `28520c0d` on
+   2026-10-30).
 2. Units and names: seconds everywhere; one histogram bucket set; prefixes `ate_env_client_*`,
    `ate_env_fleet_*`, `ate_env_api_*` and `ate_env_guest_*`. The proposal's `atefleet_*` and
    `atefleet.*` became `ate_env_fleet_*` and `ate_env_fleet.*`.
@@ -128,10 +131,12 @@ families, so a W3C `traceparent` in gRPC metadata continues a trace into the con
 [acceptance-criteria.md](./acceptance-criteria.md) maps each criterion to the test or evidence
 behind it.
 
-## 6. Open questions, as of 2026-10-29
+## 6. Open questions, as of 2026-10-30
 
-- Substrate's asynchronous work still joins the trace only through the `ateapi` RPC span. A
-  trace-context label or annotation on the actor is open with the Substrate team.
+- Closed on 2026-10-30: Substrate's resume and suspend workflows already join the client trace
+  through the router and `ateapi` (section 4, item 1). What remains is deployment: Substrate's
+  components and the ate-env collector must export to the same backend, and the Substrate
+  `Actor state changed` records, which carry the trace id, must reach a store the site can query.
 - `docs/glossary.md` has no telemetry section yet; the phase glossary lives in
   [docs/observability.md](../../observability.md#phase-glossary).
 - #186 (VeRL SWE-bench example) is the last pull request in the series and awaits review.

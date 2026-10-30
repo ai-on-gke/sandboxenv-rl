@@ -119,3 +119,10 @@ Append-only. Each entry: date, who, what, why.
   atelet restore join the client trace; `docs/glossary.md` has no telemetry section (the phase
   glossary is in `docs/observability.md`); no overhead measurement of telemetry off against on is
   recorded.
+- 2026-10-30, orchestrator: the Substrate trace join is closed, from reading Substrate at
+  `28520c0d`. The atenet router's ingress extracts `traceparent` from the request metadata and calls
+  `ResumeActor` under it; `ateapi` stamps actor identity on its server span, opens a `step.<name>`
+  span per workflow step and calls atelet `Restore` with otelgrpc; ateworker's spans follow through
+  the atelet relay. Every component samples parent-based, so a trace the client samples is complete
+  through to the worker once Substrate exports to the same backend. No trace-context label on actors
+  is needed. Substrate's `Actor state changed` records carry the trace id as well.

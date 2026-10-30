@@ -57,9 +57,10 @@ Tests section of each pull request and CI. [decisions.md](./decisions.md) record
 
 ## Accepted limitations
 
-- Substrate's asynchronous work (scheduler placement, atelet restore) joins the client trace only
-  when Substrate exports to the same backend, under `ate-env-api`'s `ateapi.Control/*` client spans.
-  A trace-context label on actors stays an open question for Substrate.
+- Substrate's resume and suspend workflows join the client trace when Substrate exports to the same
+  backend: the router resumes under the caller's `traceparent`, and `ateapi`, atelet and ateworker
+  continue it. The plan treated this as an open question; reading Substrate `28520c0d` on 2026-10-30
+  closed it, see `decisions.md`.
 - Guest instrumentation was gated on the `ate-env-guest` image growing by less than 5 MB. It grew by
   2.6 MiB (13.82 MB to 16.56 MB stripped) and shipped.
 - No dashboards, alert rules or production collector; `tests/telemetry/otel-collector.yaml` is a

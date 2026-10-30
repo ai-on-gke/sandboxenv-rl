@@ -112,6 +112,7 @@ or later, and ate-env-api's SPIFFE ID (`spiffe://cluster.local/ns/<namespace>/sa
 
 ```bash
 ate-env manifest template --template oh-agent-server \
+  --rootfs-image   docker.io/library/debian@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 \
   --guest-image    <registry>/ate-env-guest@sha256:<digest> \
   --layer          oh=<registry>/oh-agent-server-layer@sha256:<digest>=/opt/oh \
   --sidecar        '/opt/oh/python/bin/python3 -m openhands.agent_server --host 0.0.0.0 --port 8000' \
@@ -124,6 +125,19 @@ This is the counterpart of agent-sandbox's SandboxTemplate and warm pool. Furthe
 settings are more `--env` flags. The first environment created from an image derives a template
 for it (layer, sidecar and settings included); later ones reuse it.
 
+The base template runs in a glibc image of its own (`--rootfs-image`), because its golden actor
+starts the layer too. Without it, the container image is the guest image, which has no C library for
+the layer's CPython, and the golden actor crashes. `debian:bookworm-slim` (glibc 2.36, `/bin/sh`
+and `bash`, 26 MB compressed for amd64) is the smallest common image that meets the glibc 2.31
+floor; any image that meets the floor works. An environment created without `image=` runs in this
+base image. A template derived for a task image replaces only the image: the guest volume, the layer
+and the sidecar stay. A base registered earlier without `--rootfs-image` keeps a crashed golden
+actor: delete it and register it again with the same session key. Its `<base>-<12 hex digits>`
+templates can stay, because a template derived from the new base is identical to one derived from
+the old base. Delete them only to make Substrate bake their golden snapshots again, or when the
+session key changes, because each derived template copies the key. The cluster runs under
+[Verified](#verified) came before this base image and do not test it.
+
 ## 4. Use `AteEnvWorkspace`
 
 `AteEnvWorkspace(template=..., image=...)` creates an environment, waits until the agent-server
@@ -135,7 +149,7 @@ caller.
 | Field | Default | Meaning | `AgentSandboxWorkspace` |
 |---|---|---|---|
 | `template` | required to create | base template with the agent-server layer | `warmpool` |
-| `image` | the template's image | task image, `repo@sha256:…` | none (fixed in the SandboxTemplate) |
+| `image` | the base template's image (`debian:bookworm-slim` in section 3) | task image, `repo@sha256:…` | none (fixed in the SandboxTemplate) |
 | `atespace` | `ate-env` | atespace of the environment; the port proxy must list it in `--port-proxy-atespaces` | `namespace` |
 | `template_atespace` | the server default | atespace of `template` | none |
 | `api_url` | `127.0.0.1:7777` | ate-env-api, host:port or URL | `host` in `direct` mode |

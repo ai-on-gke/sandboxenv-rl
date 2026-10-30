@@ -32,7 +32,12 @@
 # deletes templates only with RECREATE=1: then it deletes the base template
 # and every template derived from it, with their golden snapshots, and
 # registers the base again. Use RECREATE=1 only for templates that nobody else
-# uses.
+# uses. It deletes the derived templates too, because they copy the session
+# key, and a new key makes them stale. A base registered without a glibc base
+# image (its own golden actor crashes; see BASE_IMAGE) needs only the base
+# registered again: with the same SESSION_KEY, the derived templates stay
+# valid, because a template derived from either base is identical. RECREATE=1
+# with that key also works; it bakes each golden snapshot again.
 #
 # The session key and the API token go to curl in a header file (mode 0600,
 # removed on exit), not on its command line. The template registration still
@@ -46,6 +51,10 @@
 #                     agent-server in; any image with /bin/sh and glibc 2.31
 #                     or newer
 # Optional:
+#   BASE_IMAGE        digest-pinned glibc image the base template runs in
+#                     (default debian:bookworm-slim, pinned). The base
+#                     template bakes its own golden snapshot with the layer
+#                     started, thus it needs glibc 2.31 or newer and /bin/sh
 #   SESSION_KEY       agent-server API key on the template. Required when the
 #                     template exists (it carries its own key) and with KEEP=1;
 #                     otherwise random and never printed
@@ -82,6 +91,8 @@ PORT=${PORT:-8000}
 # shellcheck disable=SC2016 # expanded by the environment's shell, not here
 COMMAND=${COMMAND:-'head -1 /etc/os-release; echo "user: $(id -un)"; echo "cwd: $(pwd)"'}
 TEMPLATE=${TEMPLATE:-oh-agent-server}
+# debian:bookworm-slim: glibc 2.36, /bin/sh and bash, 26 MB compressed for amd64.
+BASE_IMAGE=${BASE_IMAGE:-docker.io/library/debian@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8}
 ATESPACE=${ATESPACE:-ate-env}
 API=${API:-127.0.0.1:7777}
 ATE_ENV=${ATE_ENV:-ate-env}
@@ -94,6 +105,20 @@ if [ -n "${REUSE:-}" ]; then
 fi
 
 step() { printf '\n== %s\n' "$*"; }
+
+# base_has_guest_volume: whether the base template mounts the guest as an image
+# volume, which only a base registered with --rootfs-image does.
+base_has_guest_volume() {
+  "${KUBECTL_ATE}" get actor-template --atespace "${ATESPACE}" -o json |
+    TEMPLATE="${TEMPLATE}" python3 -c '
+import json, os, sys
+d = json.load(sys.stdin)
+for t in d.get("actorTemplates", d.get("actor_templates", [])):
+    if t.get("metadata", {}).get("name", "") == os.environ["TEMPLATE"]:
+        names = [v.get("name") for v in t.get("volumes", [])]
+        sys.exit(0 if "guest" in names else 1)
+sys.exit(1)'
+}
 
 # templates: the names of the base template and the templates derived from it.
 templates() {
@@ -171,6 +196,11 @@ done
 
 if [ "${register}" = 0 ]; then
   step "reusing ${ATESPACE}/${TEMPLATE} and the templates derived from it (RECREATE=1 registers it again)"
+  if ! base_has_guest_volume; then
+    echo "note: ${ATESPACE}/${TEMPLATE} has no glibc base image (no guest image volume), thus its own golden" >&2
+    echo "actor crashes. Environments from task images still work. To fix the base, run again with" >&2
+    echo "RECREATE=1 and the same SESSION_KEY." >&2
+  fi
 else
   if [ "${RECREATE:-}" = 1 ]; then
     for name in ${existing}; do
@@ -178,8 +208,9 @@ else
       "${KUBECTL_ATE}" delete actor-template --atespace "${ATESPACE}" "${name}" >/dev/null
     done
   fi
-  step "register ${ATESPACE}/${TEMPLATE}: guest + agent-server layer on port ${PORT}"
+  step "register ${ATESPACE}/${TEMPLATE}: ${BASE_IMAGE%%@*} + guest + agent-server layer on port ${PORT}"
   "${ATE_ENV}" manifest template --template "${TEMPLATE}" --atespace "${ATESPACE}" \
+    --rootfs-image "${BASE_IMAGE}" \
     --guest-image "${GUEST_IMAGE}" --snapshots-bucket "${SNAPSHOTS_BUCKET}" \
     --layer "oh=${LAYER_IMAGE}=/opt/oh" \
     --sidecar "/opt/oh/python/bin/python3 -m openhands.agent_server --host 0.0.0.0 --port ${PORT}" \

@@ -43,7 +43,11 @@ Knobs (Job env in `job-fully-async.yaml`): `LOCAL_UPDATES` (4),
 `PPO_MINI_BATCH` (16), `N_SAMPLES` (4), `SYNC_EVERY` (2), `STALENESS` (0.5),
 `NGPUS_TRAIN`/`NGPUS_ROLLOUT` (8/8), `NODE_WAIT_S` (3600), `MODEL_ID`.
 Tool settings in `tool_config.yaml`: `endpoint`, `max_envs`, `timeout_s`,
-optional `rootfs_image`.
+optional `rootfs_image`. Sizing: `max_envs` (32) x `agent.num_workers` (2, in
+`run_fully_async.sh`) = `PPO_MINI_BATCH` x `N_SAMPLES`, so every trajectory of a step
+can run a tool call at once instead of queueing on the pool. If the sandbox system
+cannot hold that many environments, set `max_envs` to its maximum capacity divided by
+the worker count.
 
 ## Files
 

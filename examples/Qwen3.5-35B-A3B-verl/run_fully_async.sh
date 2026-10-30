@@ -31,7 +31,10 @@ export PYTHONUNBUFFERED=1 HF_HOME=/workspace/hf HF_HUB_ENABLE_HF_TRANSFER=1 CUDA
 : "${TRAIN_SOURCE:=r2e_gym_easy}"; : "${TRAIN_SPLIT:=train}"; : "${TRAIN_INSTANCES:=64}"; : "${TRAIN_DATASET:=}"
 : "${VAL_TASKS:=20}"
 : "${TRAIN_BATCH:=16}"; : "${ROLLOUT_N:=8}"; : "${MINI_BATCH:=8}"; : "${SYNC_STEP:=2}"
-: "${SESSIONS:=24}"; : "${GATEWAYS:=2}"; : "${AGENT_WORKERS:=2}"; : "${TOTAL_STEPS:=2}"
+# One session per trajectory, so a whole step (TRAIN_BATCH x ROLLOUT_N) starts at once instead of queueing on the cap.
+# If the sandbox system cannot hold that many environments, set SESSIONS to its maximum capacity instead.
+: "${SESSIONS:=$((TRAIN_BATCH * ROLLOUT_N))}"; : "${SANDBOX_STARTUP_CONCURRENCY:=$SESSIONS}"
+: "${GATEWAYS:=2}"; : "${AGENT_WORKERS:=2}"; : "${TOTAL_STEPS:=2}"
 : "${PROMPT_LENGTH:=8192}"; : "${RESPONSE_LENGTH:=32768}"; : "${TRAIN_TP:=2}"; : "${TRAIN_CP:=1}"; : "${TRAIN_EP:=8}"; : "${ROLLOUT_TP:=2}"
 : "${ROLLOUT_HYBRID_FLAGS:=1}"           # vLLM flags for the hybrid (GDN) model; set 0 if your vLLM rejects them
 : "${ATE_ENV_ENDPOINT:=ate-env-api.ate-env.svc:7777}"; : "${ATE_TEMPLATE:=swe-2c6g}"
@@ -158,7 +161,7 @@ OVERRIDES=(
   '+ray_kwargs.ray_init.runtime_env.env_vars.HF_HUB_OFFLINE="1"'
   "${NCCL_IF[@]}"
   "${AUTH_ENV[@]}"
-  '+ray_kwargs.ray_init.runtime_env.env_vars.SANDBOX_STARTUP_CONCURRENCY="32"'
+  "+ray_kwargs.ray_init.runtime_env.env_vars.SANDBOX_STARTUP_CONCURRENCY=\"$SANDBOX_STARTUP_CONCURRENCY\""
   "+ray_kwargs.ray_init.runtime_env.env_vars.ATE_ENV_IMAGE_DIGESTS=$ATE_ENV_IMAGE_DIGESTS"
   '+ray_kwargs.ray_init.runtime_env.env_vars.VLLM_DISABLE_COMPILE_CACHE="1"'
   '+ray_kwargs.ray_init.runtime_env.env_vars.CUDA_DEVICE_MAX_CONNECTIONS="1"'

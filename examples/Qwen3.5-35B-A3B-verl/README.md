@@ -38,7 +38,7 @@ Provider, task, dataset and image tooling: [`integrations/uni-agent`](../../inte
 export KUBE_CONTEXT=<context> KUBECTL_ATE=<path to kubectl-ate>
 
 # 1. Substrate workers onto the sandbox pool + SWE template (once; replicas = nodes = ceil((SESSIONS + VAL_TASKS) * 1.15 / 6))
-kubectl -n ate-env patch workerpool default-template-workerpool --type=merge -p '{"spec":{"replicas":8,"template":{
+kubectl -n ate-env patch workerpool default-template-workerpool --type=merge -p '{"spec":{"replicas":29,"template":{
   "nodeSelector":{"ate.dev/sandboxClass":"gvisor"},
   "resources":{"requests":{"cpu":"12","memory":"110Gi"},"limits":{"cpu":"12","memory":"110Gi"}}}}}'
 ate-env manifest template --template swe-2c6g --cpu 2 --memory 6Gi --workerpool default-template-workerpool \
@@ -62,12 +62,15 @@ python3 -m uni_agent_substrate.datasets --source swe_bench --max-instances 20 \
 
 Knobs (Job env in `job-fully-async.yaml`): `TRAIN_SOURCE` / `TRAIN_SPLIT` /
 `TRAIN_INSTANCES` / `TRAIN_DATASET`, `VAL_TASKS`, `TRAIN_BATCH`
-(16) = `SYNC_STEP` (2) x `MINI_BATCH` (8), `ROLLOUT_N` (8), `SESSIONS` (24), `GATEWAYS`,
+(16) = `SYNC_STEP` (2) x `MINI_BATCH` (8), `ROLLOUT_N` (8), `SESSIONS` (128), `GATEWAYS`,
 `AGENT_WORKERS`, `TOTAL_STEPS` (2), `PROMPT_LENGTH` (8192), `RESPONSE_LENGTH` (32768),
 `TRAIN_CP` (1; 2 if the 40k-token step runs out of memory), `ROLLOUT_TP` (2),
-`ATE_TEMPLATE`, `ATE_ENV_ENDPOINT`. Sizing: keep `SESSIONS x 2 CPU / 6 GiB` within the
-worker pool, counting validation sessions too, and scale `TRAIN_BATCH` and `SESSIONS`
-together (WorkerPool replicas = `ceil((SESSIONS + VAL_TASKS) * 1.15 / 6)`). Timeline on H200: ~5 min install, ~5 min model download
+`ATE_TEMPLATE`, `ATE_ENV_ENDPOINT`. Sizing: `SESSIONS` defaults to `TRAIN_BATCH x ROLLOUT_N`
+so every trajectory of a step starts at once instead of queueing on the session cap, and
+`SANDBOX_STARTUP_CONCURRENCY` follows it. Keep `SESSIONS x 2 CPU / 6 GiB` within the worker
+pool, counting validation sessions too (WorkerPool replicas = `ceil((SESSIONS + VAL_TASKS) * 1.15 / 6)`).
+If the sandbox system cannot hold a full step, set `SESSIONS` to its maximum capacity
+instead. Timeline on H200: ~5 min install, ~5 min model download
 on each node, ~1.5 min engine start, then roughly 10 to 15 minutes per
 step with 100-turn episodes.
 

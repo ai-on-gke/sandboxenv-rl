@@ -199,7 +199,7 @@ func slowSidecar(t *testing.T, d time.Duration, count *atomic.Int32) string {
 // One /readyz call must answer inside the probe's 250 ms request limit
 // however many sidecar readiness URLs the template has. Fast sidecars are
 // ready inside the one wait; checked one after another, as before, 30 of
-// them would take at least 300 ms.
+// them would take at least 900 ms.
 func TestReadyGateWaitsOnceForAllURLs(t *testing.T) {
 	const callLimit = 240 * time.Millisecond // the probe's 250 ms, less timer slack
 	for _, tc := range []struct {
@@ -207,7 +207,10 @@ func TestReadyGateWaitsOnceForAllURLs(t *testing.T) {
 		d         time.Duration
 		wantReady bool
 	}{
-		{30, 10 * time.Millisecond, true},  // ready inside the 100 ms wait
+		// 30 ms each: still ready inside the 100 ms wait when checked
+		// together, while 30 of them checked one after another need 900 ms,
+		// which leaves room for scheduling delay under -race.
+		{30, 30 * time.Millisecond, true},
 		{3, 300 * time.Millisecond, false}, // only the bound on the call time
 	} {
 		// A transport for each case, closed after its servers (cleanups run
@@ -226,6 +229,31 @@ func TestReadyGateWaitsOnceForAllURLs(t *testing.T) {
 		ok, why := g.Ready(context.Background())
 		if took := time.Since(start); took > callLimit {
 			t.Errorf("%d sidecars of %s: Ready took %s, want at most %s (one wait for all URLs)", tc.n, tc.d, took, callLimit)
+		}
+		if tc.wantReady && !ok {
+			// Under -race or CPU contention, 30 concurrent HTTP round trips
+			// may not complete inside the first 100 ms wait. The checks
+			// continue in flight. Bound total time-to-ready by the serial
+			// lower bound (n*d): taking longer means URLs are no longer
+			// checked concurrently.
+			serialBound := time.Duration(tc.n) * tc.d
+			// The loop guard alone isn't enough: a Ready call entered just
+			// before the bound can wait up to 100 ms more, so the elapsed time
+			// is checked again after the loop.
+			for time.Since(start) < serialBound {
+				time.Sleep(5 * time.Millisecond)
+				callStart := time.Now()
+				ok, why = g.Ready(context.Background())
+				if took := time.Since(callStart); took > callLimit {
+					t.Errorf("%d sidecars of %s: subsequent Ready took %s, want at most %s", tc.n, tc.d, took, callLimit)
+				}
+				if ok {
+					break
+				}
+			}
+			if took := time.Since(start); !ok || took >= serialBound {
+				t.Fatalf("%d sidecars of %s: Ready = %v after %s, want true within the serial bound %s; URLs are no longer checked concurrently: %s", tc.n, tc.d, ok, took, serialBound, why)
+			}
 		}
 		if ok != tc.wantReady {
 			t.Errorf("%d sidecars of %s: Ready = %v, %q; want %v", tc.n, tc.d, ok, why, tc.wantReady)

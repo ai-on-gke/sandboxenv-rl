@@ -264,7 +264,6 @@ def run_tests(
             ATE_ENV_TEMPLATE=tmpl,
             ATE_ENV_BIN=str(ate_env),
             ATE_ENV_ROOTFS_IMAGE=target.rootfs_image or "",
-            PYTHONPATH=f"{root}/clients/python/src:{root}/integrations/nemo-gym/src:{os.environ.get('PYTHONPATH', '')}",
         )
         # The Kind API runs without caller auth (--insecure-no-auth above); never
         # send a token from the shell, which may belong to another cluster.

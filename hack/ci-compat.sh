@@ -53,8 +53,8 @@
 #
 # Outputs / exit codes:
 #   - Prints `ci-compat: runner=<runner>` to stderr.
-#   - Builds Docker image sandboxenv-rl-ci:local (or the devShell-free sandboxenv-rl-ci:update-pins
-#     stage for update-pins) and volume sandboxenv-rl-cache if using Docker.
+#   - Builds Docker image sandboxenv-rl-ci:local and volumes sandboxenv-rl-cache and
+#     sandboxenv-rl-nix if using Docker.
 #   - Passes through the exit code of the executed command.
 #
 # Troubleshooting:
@@ -171,19 +171,16 @@ if [[ "${RUNNER}" == "nix" ]]; then
 fi
 
 if [[ "${RUNNER}" == "docker" ]]; then
-  # update-pins gets an image without the devShell (Dockerfile.ci's
-  # `update-pins` stage), so it still works when the devShell doesn't evaluate.
-  if [[ "${1:-}" == "update-pins" ]]; then
-    DOCKER_IMAGE="sandboxenv-rl-ci:update-pins"
-    docker build -q -f Dockerfile.ci --target update-pins -t "${DOCKER_IMAGE}" . >/dev/null
-  else
-    DOCKER_IMAGE="sandboxenv-rl-ci:local"
-    docker build -q -f Dockerfile.ci -t "${DOCKER_IMAGE}" . >/dev/null
-  fi
+  DOCKER_IMAGE="sandboxenv-rl-ci:local"
+  docker build -q -f Dockerfile.ci -t "${DOCKER_IMAGE}" . >/dev/null
 
   DOCKER_RUN_ARGS=(
     run --rm
     -v sandboxenv-rl-cache:/root/.cache
+    # The Nix store, kept across runs like on a host: the first run builds the
+    # devShell into it, later runs reuse it and add only what changed.
+    # `docker volume rm sandboxenv-rl-nix` starts over.
+    -v sandboxenv-rl-nix:/nix
   )
   if [[ "${DOCKER_SOCKET}" -eq 1 ]]; then
     DOCKER_RUN_ARGS+=(

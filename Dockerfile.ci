@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM nixos/nix:latest@sha256:f159a58f390677f41e8e900a74b6e2f9c7f27b364122ae6acf7a652ce6c551c0 AS base
+FROM nixos/nix:latest@sha256:f159a58f390677f41e8e900a74b6e2f9c7f27b364122ae6acf7a652ce6c551c0
 
 ENV NIX_CONFIG="experimental-features = nix-command flakes"
+# Go's module cache in the cache volume hack/ci-compat.sh mounts, next to its
+# build cache (~/.cache/go-build), so modules download once.
+ENV GOMODCACHE=/root/.cache/go/mod
 
 # Symlink Nix profile utilities into /bin for tests executing /bin/echo and similar standard FHS paths.
 RUN for f in /root/.nix-profile/bin/*; do [ -e "/bin/${f##*/}" ] || ln -s "$f" /bin/; done
@@ -23,28 +26,9 @@ RUN for f in /root/.nix-profile/bin/*; do [ -e "/bin/${f##*/}" ] || ln -s "$f" /
 # https://github.com/NixOS/nix/issues/11217
 WORKDIR /workspace
 
-# The tree without the devShell, for `make update-pins`: it must run even when
-# the locked nixpkgs can't evaluate the devShell (e.g. go.mod asks for a Go
-# minor it lacks), which is exactly when the default stage below fails to build.
-# hack/ci-compat.sh builds this stage with `--target update-pins`.
-FROM base AS update-pins
-COPY . .
-RUN git init -q && git add -A && git -c user.email=ci@local -c user.name=ci commit -qm baseline
-
-FROM base
-
-# Copy just enough for Nix devShell and Go module caching without bringing in
-# the entire project, so we don't rebuild the Nix store layer on code edits.
-COPY flake.nix flake.lock go.mod go.sum ./
-COPY clients/python/pyproject.toml ./clients/python/
-COPY integrations/nemo-gym/pyproject.toml ./integrations/nemo-gym/
-COPY nix ./nix
-
-# Build the Nix flake devShell and pre-populate the Go module cache using the
-# exact versions locked in flake.lock.
-RUN nix develop path:///workspace -c go mod download
-
-# Copy the rest of the repository last so edits don't invalidate the Nix store layer.
+# Only the tree: the devShell and everything else build on first use into the
+# /nix volume hack/ci-compat.sh mounts, and stay there, like on a Nix host. That
+# also keeps `make update-pins` working when the devShell doesn't evaluate.
 COPY . .
 
 # Initialize a clean baseline git repository so root-owned git commands
@@ -54,4 +38,3 @@ RUN git init -q && git add -A && git -c user.email=ci@local -c user.name=ci comm
 
 ENTRYPOINT ["nix", "develop", "path:///workspace", "-c"]
 CMD ["ci"]
-

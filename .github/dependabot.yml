@@ -2,11 +2,9 @@
 # kept out of the Go group on purpose: its bumps change the API the manifests
 # and the client are generated from and go through the bump procedure, not
 # through an automated PR. The entries cover the supported components
-# (docs/support.md): the Go module, the Python client and the GitHub Actions.
-# integrations/nemo-gym is supported but not listed: its ate-env-client
-# dependency is a path source Dependabot cannot resolve, nothing in it is
-# pinned, and its only other dependency, grpcio, is also one of the Python
-# client's. examples/ is not supported and has no entry.
+# (docs/support.md): the Go module, the Python projects (one uv workspace and
+# uv.lock at the root: clients/python and the integrations) and the GitHub
+# Actions. examples/ is not supported and has no entry.
 #
 # Keep docs/chores/check-pins.md in sync: its pin inventory and "When
 # Dependabot opens a PR" section describe which ecosystems, directories and
@@ -28,8 +26,9 @@ updates:
         exclude-patterns: ["go.ate.dev/substrate"]
     ignore:
       - dependency-name: go.ate.dev/substrate
-  - package-ecosystem: pip
-    directory: /clients/python
+  # uv.lock, which the Nix devShell's Python envs are built from (nix/python.nix).
+  - package-ecosystem: uv
+    directory: /
     schedule:
       interval: weekly
     cooldown:
@@ -39,9 +38,17 @@ updates:
       python-deps:
         patterns: ["*"]
     ignore:
-      # ruff's exact version comes from flake.lock; pyproject.toml only keeps a
-      # compatible range (~=) that check-pins verifies against Nix.
-      - dependency-name: ruff
+      # Pinned to the agent-server in integrations/openhands/layer/requirements.in;
+      # the SDK and the server it talks to move together, by hand.
+      - dependency-name: "openhands-*"
+      # A git source pinned by commit in integrations/uni-agent/pyproject.toml.
+      # Dependabot would look it up on PyPI instead
+      # (https://github.com/dependabot/dependabot-core/issues/16129).
+      - dependency-name: uni-agent
+      # Generates the committed Python stubs, which require a grpcio at least
+      # as new as the generator; it moves with the client's grpcio floor and a
+      # `make protos`, by hand.
+      - dependency-name: grpcio-tools
   - package-ecosystem: github-actions
     # The workflows, plus the local composite actions under .github/actions,
     # which pin actions of their own.
@@ -64,11 +71,11 @@ updates:
     groups:
       openhands-layer-images:
         patterns: ["*"]
-  # flake.lock pins the toolchain CI runs (Go, Python and its packages, ruff,
-  # ko, kind, kubectl; buf and the protobuf generators are go.mod tool lines,
-  # bumped by the gomod entry). A bump here is checked by ci-devenv.yaml,
-  # which fails with fix instructions if nixpkgs drifts from go.mod or a
-  # pyproject.toml.
+  # flake.lock pins the toolchain CI runs (Go, the Python interpreters, uv,
+  # ko, kind, kubectl; the Python packages come from uv.lock; buf and the
+  # protobuf generators are go.mod tool lines, bumped by the gomod entry). A
+  # bump here is checked by ci-devenv.yaml, which fails with fix instructions
+  # if nixpkgs drifts from go.mod.
   - package-ecosystem: nix
     directory: /
     schedule:

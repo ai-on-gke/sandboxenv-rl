@@ -18,14 +18,12 @@
 What it does:
   1. Reads the nixpkgs revision and date from flake.lock (shown in every mismatch message).
   2. Compares Go toolchain directives in go.mod against Nix go package version.
-  3. Checks Python interpreter requirements (pyproject.toml) against Nix python version.
-  4. Checks every requirement in the pyproject.toml files whose packages come from Nix
-     (PYPROJECTS: clients/python, integrations/nemo-gym) against the installed Nix Python env
-     (importlib.metadata). OpenHands and uni-agent are not checked: they run in pip venvs
-     (ci-venv / .#openhands / .#uni-agent) whose PyPI dependencies float by design, and pip
-     itself enforces their requires-python against the venv interpreter.
-  5. Verifies Dockerfile.ci base image is pinned to an immutable @sha256: digest.
-  6. In update mode, runs `nix flake update`, re-pins Dockerfile.ci via crane, and re-checks.
+  3. Checks that uv.lock is up to date with the uv workspace's pyproject.toml files
+     (`uv lock --check`). The Python envs are built from uv.lock (nix/python.nix), so the lock
+     is the only Python pin; uv checked every requirement against it when it locked.
+  4. Verifies Dockerfile.ci base image is pinned to an immutable @sha256: digest.
+  5. In update mode, runs `nix flake update` and `uv lock --upgrade`, re-pins Dockerfile.ci via
+     crane, prints the versions that changed, and re-checks.
 
 When it runs:
   - CI: .github/workflows/ci-devenv.yaml on PRs touching toolchain files, push to main, and weekly cron.
@@ -40,11 +38,13 @@ How to run:
   Examples:
     make check-pins
     make update-pins
-    python3 hack/ci/check-pins.py update nixpkgs
+    python3 hack/ci/check-pins.py update nixpkgs   # one flake input, uv.lock untouched
+    python3 hack/ci/check-pins.py update uv        # only uv.lock
     python3 hack/ci/check-pins.py versions --json
 
 Prerequisites:
-  - Python 3.11+ with `packaging` (the Nix devShell python) for check mode.
+  - Python 3.11+ and uv (the Nix devShell) for check mode; no network (`uv lock --check
+    --offline`), except for flake-checker in `make check-pins`.
   - For update mode: Nix with flakes enabled and internet access (crane used via nixpkgs).
 
 Environment variables:
@@ -54,14 +54,14 @@ Environment variables:
 Outputs / exit codes:
   - Prints the pin check results (or, in update mode, a before/after version table) to stdout.
   - Emits workflow annotations and appends markdown report to $GITHUB_STEP_SUMMARY when in CI.
-  - Mutates flake.lock and Dockerfile.ci in update mode.
+  - Mutates flake.lock, uv.lock and Dockerfile.ci in update mode.
   - Exit code 0 if all checks pass; exit code 1 on pin mismatch or update failure.
 
 Troubleshooting:
   - Base image resolution: Resolves the multi-arch digest for `nixos/nix:latest` via crane
     from Docker Hub and re-pins Dockerfile.ci.
-  - Python dependency mismatch: If pyproject.toml requires a version unavailable in Nix, either
-    update flake inputs via `make update-pins` or relax the pin constraint in pyproject.toml.
+  - uv.lock out of date: a pyproject.toml changed without re-locking. Run `uv lock` in the
+    devShell (it changes only what the edit requires) and commit uv.lock.
   - Stale nixpkgs: freshness is not checked here. `make check-pins` runs DeterminateSystems'
     flake-checker afterwards, which reports inputs older than 30 days; refresh with
     `make update-pins`.
@@ -71,7 +71,8 @@ Troubleshooting:
     than aborting, allowing recovery via `make update-pins ARGS=nixpkgs`.
 
 See also:
-  .github/workflows/ci-devenv.yaml, flake.lock, Dockerfile.ci, nix/ci.nix, nix/python.nix, Makefile.
+  .github/workflows/ci-devenv.yaml, flake.lock, uv.lock, Dockerfile.ci, nix/ci.nix, nix/python.nix,
+  Makefile.
 """
 
 import argparse
@@ -107,6 +108,7 @@ TOOL_SPECS: list[tuple[str, list[str], str]] = [
     ("go", ["go", "env", "GOVERSION"], r"(?:go)?([0-9.]+)"),
     ("python", ["python3", "--version"], r"([0-9.]+)"),
     ("ruff", ["ruff", "--version"], r"(\S+)$"),
+    ("uv", ["uv", "--version"], r"uv ([0-9.]+)"),
     ("ko", ["ko", "version"], r"(\S+)$"),
     ("kind", ["kind", "version"], r"(v[0-9.]+)"),
     ("kubectl", ["kubectl", "version", "--client=true"], r"(v[0-9.]+)"),
@@ -121,6 +123,29 @@ def probe_tool_version(name: str, cmd: list[str], pat: str) -> str:
         return m.group(1) if m else proc.stdout.strip().split()[-1]
     except (RuntimeError, subprocess.SubprocessError, OSError):
         return "unknown"
+
+
+# Python packages whose uv.lock versions `update` shows next to the tools; the
+# rest of the lock is summarized as a count.
+LOCK_PACKAGES = ("grpcio", "protobuf", "pytest", "opentelemetry-sdk", "prometheus-client", "openhands-sdk")
+
+
+def read_uv_lock_versions(repo_root: pathlib.Path) -> dict[str, str]:
+    """Return {package: version} for every package in uv.lock ({} if there is none).
+
+    A package the resolver forked (different versions for different markers) has one
+    [[package]] entry per version; they are joined, e.g. "1.2.0, 2.0.1".
+    """
+    import tomllib
+
+    try:
+        lock = tomllib.loads((repo_root / "uv.lock").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    versions: dict[str, set[str]] = {}
+    for p in lock.get("package", []):
+        versions.setdefault(p["name"], set()).add(p.get("version", "?"))
+    return {name: ", ".join(sorted(v)) for name, v in versions.items()}
 
 
 def collect_tool_versions() -> dict[str, str]:
@@ -283,85 +308,42 @@ def check_go(
         )
 
 
-PYPROJECTS = (
-    "clients/python/pyproject.toml",
-    "integrations/nemo-gym/pyproject.toml",
-)
-
-
-def check_python(repo_root: pathlib.Path, nix_info: str, results: list[CheckResult]) -> None:
-    """Check each pyproject.toml against the Nix Python environment running this script.
-
-    Every requirement line is checked on its own against what is installed, so
-    duplicates across base/extras are all enforced, and a dependency nix/python.nix
-    left out (absent, removed or broken in nixpkgs) shows up as not installed.
-    """
-    import platform
-    import tomllib
-    from importlib import metadata
-
-    from packaging.requirements import Requirement
-    from packaging.specifiers import SpecifierSet
-    from packaging.utils import canonicalize_name
-
-    # nix/python.nix decides which dependencies don't come from nixpkgs (our own
-    # projects, and extras it leaves out) and exports them with a reason.
-    raw_skip = os.environ.get("SANDBOXENV_NIX_PYTHON_SKIPPED")
-    if raw_skip is None:
-        raise SystemExit("check-pins: SANDBOXENV_NIX_PYTHON_SKIPPED is unset; run inside the devShell "
-                         "(make check-pins, or nix develop -c python3 hack/ci/check-pins.py)")
-    skip = {canonicalize_name(k): v for k, v in json.loads(raw_skip).items()}
-
-    py = platform.python_version()
-    for rel in PYPROJECTS:
-        path = repo_root / rel
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
-        project = data.get("project", {})
-
-        if rp := project.get("requires-python"):
-            add_result(
-                results,
-                category="Python Interpreter",
-                target_file=rel,
-                line_number=find_line_number(path, r"requires-python\s*="),
-                item=f"{rel}: requires-python",
-                requirement=rp,
-                nix_version=py,
-                passed=SpecifierSet(rp).contains(py, prereleases=True),
-                pass_msg=f"Nix provides {py}, satisfies {rel} ({rp})",
-                fail_msg=f"pin mismatch: Python interpreter — {rel} requires {rp}, Nix ({nix_info}) provides {py}",
-                fix_advice=make_fix_advice(f"Update python in nix/python.nix or adjust requires-python in {rel}."),
-            )
-
-        lines = list(project.get("dependencies", []))
-        for extra in project.get("optional-dependencies", {}).values():
-            lines.extend(extra)
-        for line in lines:
-            req = Requirement(line)
-            if req.marker is not None and not req.marker.evaluate():
-                continue
-            name, spec = canonicalize_name(req.name), str(req.specifier)
-            # The quoted requirement as written: exact even for duplicates and
-            # for names that prefix others (grpcio vs grpcio-tools).
-            line_no = find_line_number(path, rf"[\"']{re.escape(line)}[\"']")
-            if name in skip:
-                results.append(CheckResult("Python Package", rel, line_no, name, "not from Nix", f"skipped: {skip[name]}",
-                                           "SKIP", f"Python package {name} skipped: {skip[name]} ({rel})", None))
-                continue
-            try:
-                version = metadata.version(name)
-            except metadata.PackageNotFoundError:
-                version = None
-            add_result(
-                results, "Python Package", rel, line_no, name, spec or "any", version or "not in Nix pythonEnv",
-                passed=version is not None and req.specifier.contains(version, prereleases=True),
-                pass_msg=f"Nix provides {name} {version}, satisfies {rel} ({spec or 'any'})",
-                fail_msg=f"pin mismatch: {name} — {rel} requires {spec}, Nix ({nix_info}) provides {version}" if version else
-                f"{name} is not in the Nix Python env: nixpkgs lacks it, removed it, or marks it broken",
-                fix_advice=make_fix_advice(f"Or relax the pin in {rel}." if version else
-                                           f"Package/override {name} in nix/python.nix; if it's only in an optional extra the "
-                                           f"tests don't need, add that extra to skippedExtras there."),
-            )
+def check_uv_lock(repo_root: pathlib.Path, results: list[CheckResult]) -> None:
+    """Check that uv.lock is up to date with the workspace's pyproject.toml files."""
+    advice = (
+        "How to fix:\n"
+        "  1. Run `uv lock` in the devShell (`nix develop -c uv lock`, or `make dev-shell`). It\n"
+        "     re-locks only what the pyproject.toml edit requires; `uv lock --upgrade-package <name>`\n"
+        "     moves one package, `make update-pins` moves everything.\n"
+        "  2. Commit uv.lock together with the pyproject.toml change.\n"
+        "  3. Run `make check-pins` to verify."
+    )
+    uv_version = probe_tool_version("uv", ["uv", "--version"], r"uv ([0-9.]+)")
+    if not (repo_root / "uv.lock").exists():
+        results.append(CheckResult("Python", "uv.lock", 1, "uv.lock", "exists", f"uv {uv_version}", "FAIL",
+                                   "uv.lock is missing", advice))
+        return
+    # --offline: checking needs no index or git access (uv compares the lock with the
+    # pyproject.toml files, and the lock records uni-agent's commit), so no network.
+    proc = run(["uv", "lock", "--check", "--offline"], check=False, capture_output=True, cwd=repo_root)
+    # uv's error, wrapped over several lines, without the progress before it or
+    # the closing `hint:` (the fix advice says the same).
+    lines = (proc.stderr or proc.stdout).strip().splitlines()
+    start = next((i for i, line in enumerate(lines) if line.startswith("error:")), 0)
+    detail = " ".join(line.strip() for line in lines[start:] if not line.startswith("hint:"))
+    add_result(
+        results,
+        category="Python",
+        target_file="uv.lock",
+        line_number=1,
+        item="uv.lock",
+        requirement="up to date with every pyproject.toml",
+        nix_version=f"uv {uv_version}",
+        passed=proc.returncode == 0,
+        pass_msg="uv.lock is up to date with the uv workspace's pyproject.toml files",
+        fail_msg=f"uv.lock is out of date with the pyproject.toml files: {detail or f'exit {proc.returncode}'}",
+        fix_advice=advice,
+    )
 
 
 def check_dockerfile_base_image(
@@ -463,7 +445,7 @@ def run_check(repo_root: pathlib.Path) -> int:
 
     results: list[CheckResult] = []
     check_go(repo_root, nix_info, results)
-    check_python(repo_root, nix_info, results)
+    check_uv_lock(repo_root, results)
     check_dockerfile_base_image(repo_root, results)
 
     print("\nResults:")
@@ -519,8 +501,8 @@ def update_dockerfile_base_image(repo_root: pathlib.Path) -> None:
         return
 
     content = dockerfile_path.read_text(encoding="utf-8")
-    # Only the image reference changes; anything after it on the line (e.g.
-    # Dockerfile.ci's `AS base`, which later stages build on) is kept.
+    # Only the image reference changes; anything after it on the line (e.g. a
+    # stage name) is kept.
     if not (m := re.search(r"(?m)^FROM\s+(\S+)(.*)$", content)):
         return
 
@@ -561,11 +543,19 @@ def cmd_versions(as_json: bool) -> int:
     return 0
 
 
-def cmd_update(repo_root: pathlib.Path, flake_inputs: list[str]) -> int:
-    """Update Nix flake inputs, display before/after versions, re-pin Dockerfile.ci, and check."""
+def cmd_update(repo_root: pathlib.Path, inputs: list[str]) -> int:
+    """Update flake inputs and uv.lock, display before/after versions, re-pin Dockerfile.ci, and check.
+
+    `inputs` names flake inputs to update, plus the pseudo-input `uv` for uv.lock; with none,
+    everything is updated.
+    """
     if not shutil.which("nix"):
         print("ERROR: Nix is required to update pins ('nix' not found on PATH).", file=sys.stderr)
         return 1
+
+    flake_inputs = [i for i in inputs if i != "uv"]
+    update_flake = not inputs or bool(flake_inputs)
+    update_uv = not inputs or "uv" in inputs
 
     print("==> Recording toolchain versions before update...")
     try:
@@ -573,19 +563,29 @@ def cmd_update(repo_root: pathlib.Path, flake_inputs: list[str]) -> int:
     except RuntimeError:
         print("NOTE: 'Before' toolchain versions are unknown because the old lock failed to evaluate.")
         before_versions = {}
+    before_lock = read_uv_lock_versions(repo_root)
 
-    cmd = ["nix", "flake", "update"]
-    if flake_inputs:
-        print(f"==> Updating Nix flake inputs: {' '.join(flake_inputs)}...")
-        cmd.extend(flake_inputs)
-    else:
-        print("==> Updating all Nix flake inputs...")
+    if update_flake:
+        cmd = ["nix", "flake", "update", *flake_inputs]
+        if flake_inputs:
+            print(f"==> Updating Nix flake inputs: {' '.join(flake_inputs)}...")
+        else:
+            print("==> Updating all Nix flake inputs...")
+        try:
+            run(cmd, cwd=repo_root)
+        except (RuntimeError, subprocess.SubprocessError, OSError) as e:
+            print(f"ERROR: Nix flake update failed: {e}", file=sys.stderr)
+            return 1
 
-    try:
-        run(cmd, cwd=repo_root)
-    except (RuntimeError, subprocess.SubprocessError, OSError) as e:
-        print(f"ERROR: Nix flake update failed: {e}", file=sys.stderr)
-        return 1
+    if update_uv:
+        # With the uv of the (possibly just updated) flake.lock's nixpkgs, but not
+        # through the devShell, which may not evaluate (see the docstring).
+        print("==> Upgrading every package in uv.lock (uv lock --upgrade)...")
+        try:
+            run(["nix", "shell", "--inputs-from", ".", "nixpkgs#uv", "-c", "uv", "lock", "--upgrade"], cwd=repo_root)
+        except (RuntimeError, subprocess.SubprocessError, OSError) as e:
+            print(f"ERROR: uv lock --upgrade failed: {e}", file=sys.stderr)
+            return 1
 
     print("==> Recording toolchain versions after update...")
     try:
@@ -597,21 +597,30 @@ def cmd_update(repo_root: pathlib.Path, flake_inputs: list[str]) -> int:
         print(f"ERROR: the devShell still doesn't evaluate after the update:\n{e}", file=sys.stderr)
         print("Lower the `go` directive in go.mod (or whatever the error names), then run `make check-pins`.", file=sys.stderr)
         return 1
+    after_lock = read_uv_lock_versions(repo_root)
+
+    def row(name: str, b_val: str, a_val: str) -> None:
+        status = "(unchanged)" if b_val == a_val else "UPDATED"
+        print(f"{name:<28} {b_val:<20} {a_val:<20} {status:<12}")
 
     print(
-        "\n========================================================================\n"
+        "\n====================================================================================\n"
         "Toolchain & Dependency Version Changes\n"
-        "========================================================================\n"
-        f"{'Tool':<12} {'Before':<20} {'After':<20} {'Status':<12}\n"
-        "------------------------------------------------------------------------"
+        "====================================================================================\n"
+        f"{'Tool':<28} {'Before':<20} {'After':<20} {'Status':<12}\n"
+        "------------------------------------------------------------------------------------"
     )
     for name, _, _ in TOOL_SPECS:
-        b_val, a_val = before_versions.get(name, "unknown"), after_versions.get(name, "unknown")
-        status = "(unchanged)" if b_val == a_val else "UPDATED"
-        print(f"{name:<12} {b_val:<20} {a_val:<20} {status:<12}")
-    print("========================================================================\n")
+        row(name, before_versions.get(name, "unknown"), after_versions.get(name, "unknown"))
+    for name in LOCK_PACKAGES:
+        row(f"{name} (uv.lock)", before_lock.get(name, "-"), after_lock.get(name, "-"))
+    changed = sorted(n for n in before_lock.keys() | after_lock.keys() if before_lock.get(n) != after_lock.get(n))
+    print(f"uv.lock: {len(changed)} of {len(after_lock)} packages changed"
+          + (f" ({', '.join(changed[:10])}{', ...' if len(changed) > 10 else ''})" if changed else ""))
+    print("====================================================================================\n")
 
-    update_dockerfile_base_image(repo_root)
+    if update_flake:
+        update_dockerfile_base_image(repo_root)
 
     print("\n==> Running check-pins to verify consistency...")
     return run(["nix", "develop", "-c", "python3", "hack/ci/check-pins.py", "check"], check=False, cwd=repo_root).returncode
@@ -624,8 +633,9 @@ def main() -> int:
     )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("check", help="Verify toolchain and dependency pins (default)")
-    up = sub.add_parser("update", help="Update Nix flake inputs and re-pin dependencies")
-    up.add_argument("inputs", nargs="*", metavar="INPUT", help="Specific Nix flake inputs to update (default: all)")
+    up = sub.add_parser("update", help="Update Nix flake inputs and uv.lock, and re-pin dependencies")
+    up.add_argument("inputs", nargs="*", metavar="INPUT",
+                    help="Specific Nix flake inputs to update, or `uv` for uv.lock (default: all of them)")
     v = sub.add_parser("versions", help="Display toolchain versions")
     v.add_argument("--json", action="store_true", help="Output versions as JSON")
 

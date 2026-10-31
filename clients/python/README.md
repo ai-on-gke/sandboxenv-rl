@@ -8,9 +8,11 @@ API (`ate-env-api`):
 1. **Single Environment Lifecycle & Guest Operations**: `Client` and `Env` for fine-grained gRPC control, process execution, and file streaming.
 2. **Fleet & Sandbox Orchestration**: `SandboxFleet` for managing batches of sandboxes with pool sizing, pre-warming, and execution strategies.
 
-Requires Python >= 3.10. Everything is `asyncio`-native: methods are
-coroutines, log/file streams are async iterators, and cancellation works
-through standard task cancellation and `asyncio.timeout()`.
+Requires Python >= 3.10, but only 3.12 and later are locked and tested: the
+repository's `uv.lock` resolves for 3.12+ (the OpenHands integration needs
+it), and CI runs the client's tests on 3.13. Everything is `asyncio`-native:
+methods are coroutines, log/file streams are async iterators, and cancellation
+works through standard task cancellation and `asyncio.timeout()`.
 
 ## How it works
 

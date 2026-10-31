@@ -18,18 +18,28 @@
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
+    # The Python envs are built from uv.lock: uv2nix turns the lock into
+    # pyproject.nix packages, and build-system-pkgs provides the build
+    # backends (setuptools, ...) that source builds and editable installs need.
     pyproject-nix = {
       url = "github:pyproject-nix/pyproject.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    uv2nix = {
+      url = "github:pyproject-nix/uv2nix";
+      inputs.pyproject-nix.follows = "pyproject-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    pyproject-build-systems = {
+      url = "github:pyproject-nix/build-system-pkgs";
+      inputs.pyproject-nix.follows = "pyproject-nix";
+      inputs.uv2nix.follows = "uv2nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
   outputs =
-    {
-      flake-parts,
-      pyproject-nix,
-      ...
-    }@inputs:
+    { flake-parts, ... }@inputs:
     flake-parts.lib.mkFlake { inherit inputs; } (
       { ... }:
       {
@@ -42,14 +52,16 @@
         perSystem =
           { pkgs, ... }:
           let
-            ci = import ./nix/ci.nix { inherit pkgs pyproject-nix; };
+            ci = import ./nix/ci.nix {
+              inherit pkgs;
+              inherit (inputs) pyproject-nix uv2nix pyproject-build-systems;
+            };
             scripts = {
               default = ci.ci;
               inherit (ci)
                 ci
                 ci-go
                 ci-python
-                ci-venv
                 ci-e2e
                 smoke
                 check-substrate-head
@@ -61,7 +73,12 @@
             };
           in
           {
-            packages = scripts;
+            # The scripts, plus the Python envs ci-python builds on first use
+            # (they are not part of the default devShell).
+            packages = scripts // {
+              python-env-base = ci.pythonEnvBase;
+              python-env-uni-agent = ci.uniAgentEnv;
+            };
 
             devShells = {
               default = pkgs.mkShell {

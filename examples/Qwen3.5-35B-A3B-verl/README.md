@@ -27,8 +27,15 @@ Provider, task, dataset and image tooling: [`integrations/uni-agent`](../../inte
   6 GiB is a booking, not a hard cap: SWE test suites peak well above it, and if the sum
   exceeds the worker's limit the worker is OOM-killed with everything it hosts (watch
   `kubectl -n ate-env get pods` restarts; 10 per node still did that in validation).
+  With other worker sizes, capacity = replicas x floor(worker CPU / 2); 10 workers of
+  27 CPU (13 environments each) carried 128 sessions.
 - Per-instance task images reachable by the nodes as digest-pinned references: an
-  Artifact Registry remote repository proxying Docker Hub (no copying) or a mirror.
+  Artifact Registry remote repository proxying Docker Hub (no copying) or a mirror that
+  the node service account can read. Resolving a digest from the prep machine proves
+  nothing about the nodes: an image they cannot pull fails only at actor start, as
+  `ACTOR_STATE_CRASHED` with `imageCache.EnsureImage ... token` in the actor's crash message
+  and `UNAVAILABLE ... AssignWorker prerequisite not met` in the agent log; the provider
+  retries three times, then the episode fails.
 - `crane`, Python 3.11+ with `datasets`, `pyarrow`, `huggingface_hub` on the machine
   that prepares the slices; GPU pod egress to GitHub, PyPI and Hugging Face.
 
@@ -38,7 +45,7 @@ Provider, task, dataset and image tooling: [`integrations/uni-agent`](../../inte
 export KUBE_CONTEXT=<context> KUBECTL_ATE=<path to kubectl-ate>
 
 # 1. Substrate workers onto the sandbox pool + SWE template (once; replicas = nodes = ceil((SESSIONS + VAL_TASKS) * 1.15 / 6))
-kubectl -n ate-env patch workerpool default-template-workerpool --type=merge -p '{"spec":{"replicas":8,"template":{
+kubectl -n ate-env patch workerpool default-template-workerpool --type=merge -p '{"spec":{"replicas":29,"template":{
   "nodeSelector":{"ate.dev/sandboxClass":"gvisor"},
   "resources":{"requests":{"cpu":"12","memory":"110Gi"},"limits":{"cpu":"12","memory":"110Gi"}}}}}'
 ate-env manifest template --template swe-2c6g --cpu 2 --memory 6Gi --workerpool default-template-workerpool \
@@ -46,14 +53,14 @@ ate-env manifest template --template swe-2c6g --cpu 2 --memory 6Gi --workerpool 
 
 # 2. dataset slices and digest-pinned images (once per slice)
 pip install -e '../../integrations/uni-agent[datasets]'
-python3 -m uni_agent_substrate.datasets --source r2e_gym_easy --max-instances 64 --images-out images.txt --out /tmp/train.parquet
+python3 -m uni_agent_substrate.datasets --source r2e_gym_easy --max-instances 192 --images-out images.txt --out /tmp/train.parquet   # = TRAIN_INSTANCES; 700 for a full epoch
 python3 -m uni_agent_substrate.datasets --source swe_bench --max-instances 20 \
     --exclude-file ../../benchmarking/swebench/offline-exclusions.txt --images-out images-val.txt --out /tmp/val.parquet
 ../../integrations/uni-agent/scripts/resolve_images.sh images.txt     <region>-docker.pkg.dev/<project>/<dockerhub-remote-repo> images.json
 ../../integrations/uni-agent/scripts/resolve_images.sh images-val.txt <region>-docker.pkg.dev/<project>/<dockerhub-remote-repo> images.json
 
-# 3. training smoke (2 steps), then cleanup
-./deploy.sh up && ./deploy.sh logs          # ... ray nodes with GPUs: 2/2 ... step:1 ... step:2 ... === DONE rc=0 ===
+# 3. 12-step measurement run (TOTAL_STEPS=2 for a smoke test), then cleanup
+./deploy.sh up && ./deploy.sh logs          # ... ray nodes with GPUs: 2/2 ... step:1 ... step:12 ... === DONE rc=0 ===
 ./deploy.sh down
 ```
 
@@ -61,15 +68,28 @@ python3 -m uni_agent_substrate.datasets --source swe_bench --max-instances 20 \
 `./images.json`, git-ignored) and shipped to the pods in the ConfigMap.
 
 Knobs (Job env in `job-fully-async.yaml`): `TRAIN_SOURCE` / `TRAIN_SPLIT` /
-`TRAIN_INSTANCES` / `TRAIN_DATASET`, `VAL_TASKS`, `TRAIN_BATCH`
-(16) = `SYNC_STEP` (2) x `MINI_BATCH` (8), `ROLLOUT_N` (8), `SESSIONS` (24), `GATEWAYS`,
-`AGENT_WORKERS`, `TOTAL_STEPS` (2), `PROMPT_LENGTH` (8192), `RESPONSE_LENGTH` (32768),
-`TRAIN_CP` (1; 2 if the 40k-token step runs out of memory), `ROLLOUT_TP` (2),
-`ATE_TEMPLATE`, `ATE_ENV_ENDPOINT`. Sizing: keep `SESSIONS x 2 CPU / 6 GiB` within the
-worker pool, counting validation sessions too, and scale `TRAIN_BATCH` and `SESSIONS`
-together (WorkerPool replicas = `ceil((SESSIONS + VAL_TASKS) * 1.15 / 6)`). Timeline on H200: ~5 min install, ~5 min model download
+`TRAIN_INSTANCES` (192, >= `TOTAL_STEPS x TRAIN_BATCH`) / `TRAIN_DATASET`, `VAL_TASKS`, `TRAIN_BATCH`
+(16) = `SYNC_STEP` (2) x `MINI_BATCH` (8), `ROLLOUT_N` (8), `SESSIONS` (128), `GATEWAYS`,
+`AGENT_WORKERS`, `TOTAL_STEPS` (12), `PROMPT_LENGTH` (8192), `RESPONSE_LENGTH` (32768),
+`TRAIN_CP` (1; 2 if the 40k-token step runs out of memory), `ROLLOUT_TP` (2), `RAY_CPUS` (96 Ray
+CPU slots per node; sessions are Ray tasks, so 2 x (RAY_CPUS - 24) must cover `SESSIONS`),
+`ATE_TEMPLATE`, `ATE_ENV_ENDPOINT`. Sizing: `SESSIONS` defaults to `TRAIN_BATCH x ROLLOUT_N`
+so every trajectory of a step starts at once instead of queueing on the session cap, and
+`SANDBOX_STARTUP_CONCURRENCY` follows it. Keep `SESSIONS x 2 CPU / 6 GiB` within the worker
+pool, counting validation sessions too (WorkerPool replicas = `ceil((SESSIONS + VAL_TASKS) * 1.15 / 6)`).
+If the sandbox system cannot hold a full step, set `SESSIONS` to its maximum capacity
+instead. Timeline on H200: ~5 min install, ~5 min model download
 on each node, ~1.5 min engine start, then roughly 10 to 15 minutes per
 step with 100-turn episodes.
+
+Run length (`TOTAL_STEPS`): 2 is a smoke test (one cold step, one steady step). 12, the
+default, gives performance numbers: 1 warmup step plus 11 measured, which puts mean step
+time within about 10% given the ~17% step-to-step variation of a 60-step run, about 1.5 to
+3 h in all. Full training is `epochs x floor(TRAIN_INSTANCES / TRAIN_BATCH)`: 43 steps per
+epoch on the whole 700-instance slice (`TRAIN_INSTANCES=700` and the matching
+`--max-instances`), 86 for the archived 2-epoch run, whose reward plateaued inside the first
+epoch; the script fixes `trainer.total_epochs` at 1. Validation runs before training and
+after the last step whatever the length.
 
 ## Files
 
@@ -77,7 +97,7 @@ step with 100-turn episodes.
 |---|---|
 | `deploy.sh` | `up` / `logs` / `down`; renders the manifest, packs the ConfigMap, deletes leftover environments |
 | `job-fully-async.yaml` | Ray head Job + worker Job + headless Service, required pod anti-affinity, 8 GPUs each |
-| `run_fully_async.sh` | both pods: install pinned verl/uni-agent/provider, download the model; head: datasets, probe, Ray, verl `separate_async` |
+| `run_fully_async.sh` | both pods: install pinned verl/uni-agent/provider, download the model, build the datasets; head: probe, Ray, verl `separate_async` |
 | `task_config.yaml` | uni-agent task config: `r2e_gym` (train) and `swe_bench` (validation) on the `ate_env` provider, ReAct tools and SWE prompt |
 
 ## What it covers
@@ -107,3 +127,14 @@ step with 100-turn episodes.
   after a Substrate reinstall.
 - Environments created by this recipe are named `verl-qwen3p5-35b-*` (`actor_prefix` in
   `task_config.yaml`); `deploy.sh up`/`down` delete only those when `KUBECTL_ATE` is set.
+- Derived templates are named `<ATE_TEMPLATE>-<digest:12>` and keep the image reference
+  they were created with. A later `images.json` that pins the same digest under another
+  registry path fails at create with `FAILED_PRECONDITION: actor template ... exists but
+  runs <ref>, not <ref>`. Reuse the reference the template runs (`kubectl-ate get
+  actor-template -a ate-env -o json`) or delete the stale derived template.
+- A template whose golden bake failed (`kubectl-ate get actor-template -a ate-env` shows
+  ERROR, status `GoldenActorCrashed`) is fixed by deleting it and running the same
+  `ate-env manifest template` command again; it re-bakes in about two minutes.
+- Nothing copies results out of the pods. Save `kubectl -n default logs
+  job/verl-qwen3p5-35b-swe --tail=-1` after `=== DONE` and before `deploy.sh down`, which
+  deletes the Jobs.

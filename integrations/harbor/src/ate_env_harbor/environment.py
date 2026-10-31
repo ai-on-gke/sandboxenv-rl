@@ -130,6 +130,11 @@ class AteEnvEnvironment(BaseEnvironment):
     - ``scratch_dir``: where tar archives are staged inside the environment;
       default ``/tmp``.
     - ``docker_bin``, ``gcloud_bin``: the executables used for images.
+    - ``tool_paths``: directories that a runtime layer mounts into the
+      environment (``ate-env manifest template --layer``), put first on
+      ``PATH`` for every command; a list, or one string with ``:`` between
+      the paths. ``start`` fails when one is missing, which means the base
+      template lacks the layer. See ``examples/harbor-tools-layer``.
     """
 
     def __init__(
@@ -155,6 +160,7 @@ class AteEnvEnvironment(BaseEnvironment):
         scratch_dir: str = "/tmp",
         docker_bin: str = "docker",
         gcloud_bin: str = "gcloud",
+        tool_paths: str | list[str] | tuple[str, ...] | None = None,
         **kwargs: Any,
     ) -> None:
         self._api_url = api_url or os.environ.get(API_ENV) or DEFAULT_API_URL
@@ -171,6 +177,7 @@ class AteEnvEnvironment(BaseEnvironment):
         self._exec_timeout = float(exec_timeout_sec)
         self._workdir_kwarg = workdir or None
         self._scratch_dir = str(scratch_dir).rstrip("/") or "/tmp"
+        self._tool_paths = _parse_tool_paths(tool_paths)
         self._resolver = ImageResolver(
             registry=registry or os.environ.get(REGISTRY_ENV),
             build=self._build,
@@ -213,6 +220,18 @@ class AteEnvEnvironment(BaseEnvironment):
     @property
     def api_url(self) -> str:
         return self._api_url
+
+    @property
+    def tool_paths(self) -> tuple[str, ...]:
+        """Layer directories put first on PATH for every command."""
+        return self._tool_paths
+
+    def _tooled(self, command: str) -> str:
+        """``command`` with the tool paths first on PATH, when there are any."""
+        if not self._tool_paths:
+            return command
+        prefix = shlex.quote(":".join(self._tool_paths))
+        return f'PATH={prefix}:"$PATH"; export PATH; {command}'
 
     @property
     def capabilities(self) -> EnvironmentCapabilities:
@@ -291,6 +310,7 @@ class AteEnvEnvironment(BaseEnvironment):
             env = await self._create(client, image)
             await self._wait_ready(env, deadline)
             await self._probe_user(env)
+            await self._check_tool_paths(env)
             self._env = env
             await self._ensure_workdir(env)
             await self.ensure_dirs(self._mount_targets(writable_only=True))
@@ -406,6 +426,18 @@ class AteEnvEnvironment(BaseEnvironment):
         if workdir:
             await self._mkdir(env, workdir)
 
+    async def _check_tool_paths(self, env: Env) -> None:
+        """Fail early when the layer the tool paths come from is not mounted."""
+        for path in self._tool_paths:
+            result = await env.shell(f"test -d {shlex.quote(path)}", timeout=30)
+            if result.exit_code != 0:
+                raise RuntimeError(
+                    f"tool path {path} is not in environment {self._env_id}: the base template "
+                    f"({self._template_used}) must mount a runtime layer there, with "
+                    f"`ate-env manifest template ... --layer tools=<image@sha256:...>={_mount_of(path)}` "
+                    "(see examples/harbor-tools-layer)"
+                )
+
     async def _delete_quietly(self, env: Env) -> None:
         try:
             await env.delete()
@@ -424,6 +456,7 @@ class AteEnvEnvironment(BaseEnvironment):
             "session_id": self.session_id,
             "context_id": str(self.context_id) if self.context_id else None,
             "api_url": self._api_url,
+            "tool_paths": list(self._tool_paths),
         }
         try:
             self.trial_paths.trial_dir.mkdir(parents=True, exist_ok=True)
@@ -482,7 +515,11 @@ class AteEnvEnvironment(BaseEnvironment):
             effective_exec_cwd(cwd, self.task_env_config.workdir, self._dockerfile_workdir)
             or self._workdir_kwarg
         )
-        command = self._as_user_command(command, resolved_user, merged, await self._switch_tool_for(resolved_user))
+        # The tool paths go inside the command, thus inside the `sh -c` a user
+        # switch wraps, where sudo's reset of the environment cannot drop them.
+        command = self._as_user_command(
+            self._tooled(command), resolved_user, merged, await self._switch_tool_for(resolved_user)
+        )
         timeout = float(timeout_sec) if timeout_sec is not None else self._exec_timeout
         result = await handle.shell(command, cwd=workdir or "", env=merged, timeout=timeout)
         return ExecResult(stdout=result.stdout, stderr=result.stderr, return_code=result.exit_code)
@@ -541,7 +578,7 @@ class AteEnvEnvironment(BaseEnvironment):
     async def _mkdir(self, handle: Env, directory: str) -> None:
         if directory in ("", "/", "."):
             return
-        result = await handle.shell(f"mkdir -p {shlex.quote(directory)}")
+        result = await handle.shell(self._tooled(f"mkdir -p {shlex.quote(directory)}"))
         if result.exit_code != 0:
             raise RuntimeError(
                 f"mkdir -p {directory} failed ({result.exit_code}): {result.stderr.strip()}"
@@ -561,7 +598,9 @@ class AteEnvEnvironment(BaseEnvironment):
         await handle.write_file(archive, payload)
         unpack = remote_unpack_command(archive, target_dir)
         try:
-            result = await handle.shell(f"{unpack}; rc=$?; rm -f {shlex.quote(archive)}; exit $rc")
+            result = await handle.shell(
+                self._tooled(f"{unpack}; rc=$?; rm -f {shlex.quote(archive)}; exit $rc")
+            )
         except BaseException:
             # The shell command removes the archive itself; when the call
             # does not come back (a transport error, a cancellation), remove
@@ -585,7 +624,7 @@ class AteEnvEnvironment(BaseEnvironment):
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
         handle = self._require_started()
         archive = self._scratch_path("download")
-        result = await handle.shell(remote_pack_command(source_dir, archive))
+        result = await handle.shell(self._tooled(remote_pack_command(source_dir, archive)))
         if result.exit_code != 0:
             raise RuntimeError(
                 f"packing {source_dir} failed ({result.exit_code}): "
@@ -597,6 +636,22 @@ class AteEnvEnvironment(BaseEnvironment):
             with contextlib.suppress(EnvError):
                 await handle.shell(f"rm -f {shlex.quote(archive)}")
         extract_dir_from_bytes(data, target_dir)
+
+
+def _parse_tool_paths(value: str | list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    if value is None or value == "":
+        return ()
+    parts = value.split(":") if isinstance(value, str) else [str(p) for p in value]
+    paths = tuple(p.rstrip("/") or "/" for p in (q.strip() for q in parts) if p)
+    for path in paths:
+        if not path.startswith("/"):
+            raise ValueError(f"tool_paths must be absolute directories inside the environment, got {path!r}")
+    return paths
+
+
+def _mount_of(path: str) -> str:
+    """The layer mount point a tool path sits in: its parent for ``.../bin``, else itself."""
+    return posixpath.dirname(path) if posixpath.basename(path) in ("bin", "sbin") else path
 
 
 def _warn_token_kwarg() -> None:

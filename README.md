@@ -269,7 +269,7 @@ kubectl get pods -n ate-env
 ```
 
 `ate-env-api` waits for a suspended environment to wake before forwarding a guest call, up to
-`--wake-budget` (default 2m; cold image pulls and cross-region snapshot reads exceed the router's own
+`--wake-budget` (default 5m; cold image pulls and cross-region snapshot reads exceed the router's own
 parking budget) and, once the control plane reports the environment RUNNING, up to
 `--wake-running-budget` (default 20s). Both are flags of the `ate-env-api` binary; `ate-env manifest`
 does not set them, thus add them to the Deployment's arguments to change them.

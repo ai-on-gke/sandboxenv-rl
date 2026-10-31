@@ -696,6 +696,20 @@ func TestCreateFromImageDerivesTemplate(t *testing.T) {
 	if n := control.TemplateCount(); n != 2 {
 		t.Errorf("template count = %d, want 2 (base + one derived)", n)
 	}
+
+	// Another repository path with the same digest is the same image and
+	// reuses the template too.
+	samePath := "example.com/mirror/python@sha256:" + testRootfsImage[len(testRootfsImage)-64:]
+	resp, err = envClient.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "img3", RootfsImage: samePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.GetEnvironment().GetTemplate().GetName(); got != want {
+		t.Errorf("same-digest template = %q, want %q", got, want)
+	}
+	if n := control.TemplateCount(); n != 2 {
+		t.Errorf("template count after same-digest create = %d, want 2", n)
+	}
 }
 
 func TestCreateFromImageUsesNamedBaseAndAtespace(t *testing.T) {

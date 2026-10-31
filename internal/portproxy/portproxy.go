@@ -85,9 +85,9 @@ const DefaultHandshakeTimeout = 2 * time.Minute
 // environment to wake. The router's CONNECT is what resumes a suspended
 // actor, and the router holds it only for its own parking budget, a few
 // seconds; a wake that pulls an image or reads a snapshot across a region
-// takes longer. The same two minutes as ate-env-api's guest calls
+// takes longer. The same five minutes as ate-env-api's guest calls
 // (apiservice.DefaultWakeBudget).
-const DefaultWakeBudget = 2 * time.Minute
+const DefaultWakeBudget = 5 * time.Minute
 
 // Idle tunnels: each one is a TCP stream from the API to an actor, held open
 // by the router and the worker. Keep few, and not for long, so an idle

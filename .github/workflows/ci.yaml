@@ -15,10 +15,10 @@
 # Checks for pull requests and main: Go build, vet, test, protos, license
 # headers, Markdown formatting and the generated docs/metrics.md; Python
 # client (base install and telemetry extras), telemetry report tool and
-# integration tests; the OpenHands integration; and Kind E2E smoke tests.
-# Release publishing lives in release.yaml. Actions are pinned by commit SHA
-# (version in the trailing comment), as the organization's workflow security
-# scan requires.
+# integration tests; the OpenHands integration; release builds and
+# distributions; and Kind E2E smoke tests. Release publishing lives in
+# release.yaml. Actions are pinned by commit SHA (version in the trailing
+# comment), as the organization's workflow security scan requires.
 name: ci
 
 on:
@@ -140,3 +140,24 @@ jobs:
         run: |
           python -m pytest integrations/openhands/tests -q
           ruff check integrations/openhands examples/openhands
+
+  validate-release:
+    name: Validate release builds and distributions
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/cache-go-and-substrate
+        with:
+          mode: restore
+          scope: go
+      - name: Validate release builds and distributions via Nix
+        shell: nix develop -c bash -eo pipefail {0}
+        run: ci-release

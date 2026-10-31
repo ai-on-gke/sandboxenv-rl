@@ -63,6 +63,7 @@
                 ci-go
                 ci-python
                 ci-coverage
+                ci-release
                 ci-e2e
                 smoke
                 check-substrate-head

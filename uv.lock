@@ -326,7 +326,6 @@ wheels = [
 
 [[package]]
 name = "ate-env-client"
-version = "0.1.0"
 source = { editable = "clients/python" }
 dependencies = [
     { name = "grpcio" },
@@ -368,7 +367,6 @@ provides-extras = ["dev", "tracing", "metrics"]
 
 [[package]]
 name = "ate-env-openhands"
-version = "0.1.0"
 source = { editable = "integrations/openhands" }
 dependencies = [
     { name = "ate-env-client" },
@@ -3772,7 +3770,6 @@ wheels = [
 
 [[package]]
 name = "nemo-gym-substrate"
-version = "0.2.0"
 source = { editable = "integrations/nemo-gym" }
 dependencies = [
     { name = "ate-env-client" },
@@ -9027,7 +9024,6 @@ source = { git = "https://github.com/verl-project/uni-agent?rev=174b040e541f7023
 
 [[package]]
 name = "uni-agent-substrate"
-version = "0.1.0"
 source = { editable = "integrations/uni-agent" }
 dependencies = [
     { name = "ate-env-client" },

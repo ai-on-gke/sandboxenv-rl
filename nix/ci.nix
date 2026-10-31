@@ -63,6 +63,22 @@ let
     }/bin/diff-cover $out/bin/diff-cover
   '';
 
+  pythonReleaseTools =
+    let
+      env = pythonEnvs.python.withPackages (ps: [
+        ps.build
+        ps.setuptools
+        ps.setuptools-scm
+        ps.wheel
+        ps.twine
+      ]);
+    in
+    pkgs.runCommand "python-release-tools" { } ''
+      mkdir -p $out/bin
+      ln -s ${env}/bin/pyproject-build $out/bin/pyproject-build
+      ln -s ${env}/bin/twine $out/bin/twine
+    '';
+
   ciPackages = with pkgs; [
     # Go toolchain selected from go.mod's `go` directive (see goToolchain)
     goToolchain
@@ -103,6 +119,9 @@ let
     # Coverage and diff-coverage tooling
     gocover-cobertura
     diffCover
+
+    # Python release tools
+    pythonReleaseTools
   ];
 
   devTools = with pkgs; [
@@ -228,7 +247,7 @@ let
       base_env="$(nix build --no-link --print-out-paths .#python-env-base)"
       uni_agent_env="$(nix build --no-link --print-out-paths .#python-env-uni-agent)"
       echo "--> Python ruff check..."
-      ruff check clients/python examples/verl_swebench
+      ruff check clients/python examples/verl_swebench hack/release
       ruff check --config clients/python/pyproject.toml examples/Qwen3-1.7B-verl
       ruff check benchmarking/telemetry_report
       # The base-env suites only mean something if the base env really lacks
@@ -426,6 +445,48 @@ let
 
   ci-all = ci;
 
+  ci-release = pkgs.writeShellApplication {
+    name = "ci-release";
+    runtimeInputs = ciPackages;
+    text = ''
+      set -euo pipefail
+      cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+      ${pureEnvSetup}
+
+      bin_tmp="$(mktemp -d)"
+      dist_tmp="$(mktemp -d)"
+      # shellcheck disable=SC2329
+      cleanup() {
+        rm -rf "$bin_tmp" "$dist_tmp"
+      }
+      trap cleanup EXIT INT TERM
+
+      echo "=== [sandboxenv-rl] Release Distribution & Tooling Validation ==="
+      echo "--> Cross-compiling ate-env CLI (linux/darwin x amd64/arm64)..."
+      for os in linux darwin; do
+        for arch in amd64 arm64; do
+          echo "    building ate-env for ''${os}/''${arch}..."
+          CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -o "$bin_tmp/ate-env_''${os}_''${arch}" ./cmd/ate-env
+        done
+      done
+
+      echo "--> Building and validating Python distributions (sdist & wheel)..."
+      for pkg in clients/python integrations/nemo-gym integrations/openhands integrations/uni-agent; do
+        echo "    building $pkg..."
+        pyproject-build --no-isolation --outdir "$dist_tmp" "$pkg"
+      done
+
+      echo "--> Checking Python distributions with twine..."
+      twine check "$dist_tmp"/*
+
+      echo "--> Validating release cutting script..."
+      python3 -m py_compile hack/release/create-release.py
+      python3 hack/release/create-release.py --help >/dev/null
+
+      echo "=== [sandboxenv-rl] Release validation passed ==="
+    '';
+  };
+
   ensure-substrate = mkHackScript "ensure-substrate" "./hack/ci/ensure-substrate.sh";
   ci-e2e = mkHackScript "ci-e2e" "./hack/ci/e2e.py";
   smoke = mkHackScript "smoke" "pytest hack/ci/test_smoke.py -v";
@@ -476,6 +537,7 @@ in
     ci-go
     ci-python
     ci-coverage
+    ci-release
     ci-e2e
     smoke
     check-substrate-head

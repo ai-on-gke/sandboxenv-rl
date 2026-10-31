@@ -14,18 +14,18 @@
 #
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "uni-agent-substrate"
-version = "0.1.0"
+dynamic = ["version"]
 description = "uni-agent sandbox provider and SWE tasks backed by Agent Substrate environments (via ate-env-api)"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 requires-python = ">=3.11"
 dependencies = [
-  "ate-env-client",   # clients/python of this repository (pip install ./clients/python)
+  "ate-env-client>=0.1.0.dev0",   # clients/python of this repository (pip install ./clients/python)
   "pydantic>=2",
   # uni-agent itself is not on PyPI: install git+https://github.com/verl-project/uni-agent@174b040
   # with --no-deps first (see README); it is deliberately not declared here.
@@ -40,6 +40,10 @@ uni-agent-substrate-datasets = "uni_agent_substrate.datasets:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools_scm]
+root = "../.."
+fallback_version = "0.1.0"
 
 [tool.ruff]
 target-version = "py311"

@@ -13,12 +13,12 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ate-env-client"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Async Python client for the Agent Substrate Environment API (ate-env-api)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -54,7 +54,11 @@ metrics = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/agent-substrate/env"
+Homepage = "https://github.com/ai-on-gke/sandboxenv-rl"
+
+[tool.setuptools_scm]
+root = "../.."
+fallback_version = "0.1.0"
 
 [tool.setuptools.packages.find]
 where = ["src"]

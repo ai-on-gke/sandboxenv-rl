@@ -108,6 +108,7 @@
 
               openhands = ci.openhandsShell;
               uni-agent = ci.uniAgentShell;
+              harbor = ci.harborShell;
             };
           };
       }

@@ -124,3 +124,25 @@ jobs:
         run: |
           python -m pytest integrations/openhands/tests -q
           ruff check integrations/openhands examples/openhands
+
+  harbor:
+    # Its own job: harbor pulls a large dependency set, and the trial test
+    # starts containers through the runner's docker daemon. It runs in the
+    # .#harbor devShell via pip venv, like the OpenHands job: harbor is pinned
+    # to one minor in integrations/harbor/pyproject.toml and is not in nixpkgs.
+    name: Harbor integration
+    runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run Harbor tests and ruff
+        shell: nix develop .#harbor -c bash -eo pipefail {0}
+        run: |
+          python -m pytest integrations/harbor/tests -q
+          ruff check integrations/harbor

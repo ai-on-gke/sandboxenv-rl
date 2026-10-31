@@ -29,7 +29,7 @@ PRETTIER_VERSION := 3.8.3
 PRETTIER ?= npx --yes prettier@$(PRETTIER_VERSION)
 
 .PHONY: build build-cli install test vet clean images python-protos python-test nemo-gym-test verify-boilerplate verify-gofmt verify-protos verify-docs format-docs \
-	help ci ci-go ci-python ci-openhands ci-e2e smoke check-substrate-head check-pins update-pins protos lint-actions-locally dev-shell
+	help ci ci-go ci-python ci-openhands ci-harbor ci-e2e smoke check-substrate-head check-pins update-pins protos lint-actions-locally dev-shell
 
 help: ## Show this help message
 	@awk 'BEGIN {FS = ":[^#]*## "} /^[a-zA-Z0-9_-]+:[^#]*## / {printf "  %-22s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -45,6 +45,9 @@ ci-python: ## Run Python lint (ruff) and pytest test suites
 
 ci-openhands: ## Run OpenHands integration test and lint suite via openhands devShell
 	hack/ci-compat.sh --shell .#openhands sh -c 'python -m pytest integrations/openhands/tests -q && ruff check integrations/openhands examples/openhands'
+
+ci-harbor: ## Run Harbor integration test and lint suite via harbor devShell
+	hack/ci-compat.sh --shell .#harbor sh -c 'python -m pytest integrations/harbor/tests -q && ruff check integrations/harbor'
 
 ci-e2e: ## Run end-to-end tests against local kind cluster
 	hack/ci-compat.sh --docker-socket ci-e2e
@@ -122,6 +125,12 @@ python-test:
 # 'integrations/nemo-gym[test]').
 nemo-gym-test:
 	cd integrations/nemo-gym && python3 -m pytest
+
+# Run the Harbor provider tests (requires an environment with the client and
+# the provider's test extra installed: pip install clients/python -e
+# 'integrations/harbor[test]'; the trial test also needs a docker daemon).
+harbor-test:
+	cd integrations/harbor && python3 -m pytest
 
 images:
 	@echo "Building and pushing container images to $(ATE_ENV_IMAGE_REPO)..."

@@ -69,6 +69,7 @@ let
     nemo-gym-substrate = "nemo_gym_substrate";
     ate-env-openhands = "ate_env_openhands";
     uni-agent-substrate = "uni_agent_substrate";
+    ate-env-harbor = "ate_env_harbor";
   };
   editableSources =
     _final: prev:
@@ -131,6 +132,13 @@ in
   openhandsEnv = pythonSet.mkVirtualEnv "sandboxenv-rl-python-openhands" {
     ate-env-client = [ "dev" ];
     ate-env-openhands = [ "test" ];
+  };
+
+  # integrations/harbor with its test extra (Harbor's own trial runner on this
+  # provider); the .#harbor devShell and `make ci-harbor`.
+  harborEnv = pythonSet.mkVirtualEnv "sandboxenv-rl-python-harbor" {
+    ate-env-client = [ "dev" ];
+    ate-env-harbor = [ "test" ];
   };
 
   # integrations/uni-agent with its test extra and the uni-agent dependency

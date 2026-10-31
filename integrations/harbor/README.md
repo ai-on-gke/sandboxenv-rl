@@ -37,6 +37,7 @@ Each setting is a constructor kwarg and an `--ek key=value` flag (repeatable).
 | `workdir` | none | Working directory when neither the task nor the Dockerfile sets one |
 | `scratch_dir` | `/tmp` | Where tar archives are staged inside the environment |
 | `docker_bin`, `gcloud_bin` | `docker`, `gcloud` | The executables used for images |
+| `tool_paths` | none | Directories a runtime layer mounts into the environment, `:`-separated, put first on `PATH` for every command; `start` fails when one is missing. See [Tools as a second layer](#tools-as-a-second-layer) |
 
 `preflight()` checks `SUBSTRATE_ENV_API` (reachable, token accepted) before any
 trial is queued; an `api_url` kwarg is checked when the first trial starts.
@@ -114,6 +115,21 @@ applied) select the base:
    instead: it costs no worker, keeps its filesystem in the snapshot and wakes
    on the next call; the log names the `ate-env <id> shell '<command>'` form
    to inspect it.
+
+## Tools as a second layer
+
+Harbor's agents install their tools at the start of every trial (terminus-2:
+tmux and asciinema through the image's package manager). A runtime layer, a
+second digest-pinned image the template mounts read-only next to the guest
+(`ate-env manifest template --layer tools=<image@sha256:...>=/opt/harbor-tools`),
+can carry them instead. With `--ek tool_paths=/opt/harbor-tools/bin` the
+provider puts that directory first on `PATH` for every command it runs, the
+agent's, the verifier's and the user-switched ones alike, so the agents' own
+`command -v` checks find the tools and skip the install. At `start` the
+provider checks that each path exists and fails with the `--layer` flag to add
+when the template lacks the layer. `trial_dir/ate_env.json` records the paths.
+[`examples/harbor-tools-layer`](../../examples/harbor-tools-layer/README.md)
+builds a static tmux and asciinema layer and runs Terminal-Bench with it.
 
 ## Limits
 

@@ -515,3 +515,82 @@ async def test_preflight_checks_the_api_from_the_environment(fake, monkeypatch):
 
 def test_task_dir_fixture_is_the_echo_task(task_dir: Path):
     assert (task_dir / "tests" / "test.sh").exists()
+
+
+# --- tools as a second layer: tool_paths ---
+
+
+def _layer(tmp_path: Path) -> Path:
+    tools = tmp_path / "layer" / "bin"
+    tools.mkdir(parents=True)
+    tool = tools / "hb-tool"
+    tool.write_text("#!/bin/sh\necho from-layer\n")
+    tool.chmod(0o755)
+    return tools
+
+
+async def test_tool_paths_go_first_on_path_for_every_exec(fake, make_env, tmp_path):
+    tools = _layer(tmp_path)
+    env = make_env(tool_paths=str(tools))
+    await env.start(force_build=False)
+    try:
+        result = await env.exec("hb-tool")
+        assert (result.return_code, result.stdout.strip()) == (0, "from-layer")
+        command = fake.state.execs[-1]["command"][-1]
+        assert command.startswith("PATH=") and str(tools) in command and command.endswith("; hb-tool")
+        result = await env.exec('echo "$PATH"')
+        assert result.stdout.startswith(f"{tools}:")
+        record = json.loads((env.trial_paths.trial_dir / RECORD_FILE).read_text())
+        assert record["tool_paths"] == [str(tools)]
+    finally:
+        await env.stop(delete=True)
+
+
+def test_tool_paths_accepts_a_list_or_a_colon_separated_string(fake, make_env):
+    assert make_env(tool_paths="/opt/a/bin:/opt/b/bin").tool_paths == ("/opt/a/bin", "/opt/b/bin")
+    assert make_env(tool_paths=["/opt/a/bin"]).tool_paths == ("/opt/a/bin",)
+    assert make_env().tool_paths == ()
+    with pytest.raises(ValueError, match="absolute"):
+        make_env(tool_paths="opt/a/bin")
+
+
+async def test_missing_tool_path_fails_start_and_deletes_the_environment(fake, make_env, tmp_path):
+    absent = tmp_path / "no-layer" / "bin"
+    env = make_env(tool_paths=str(absent))
+    with pytest.raises(RuntimeError, match="--layer"):
+        await env.start(force_build=False)
+    assert fake.state.deletes == [env.env_id]
+    assert fake.state.envs == {}
+
+
+async def test_tool_paths_survive_the_user_switch(fake, make_env, tmp_path):
+    fake.state.whoami = "app"
+    bin_dir = minimal_bin(tmp_path)
+    sudo = bin_dir / "sudo"
+    sudo.write_text('#!/bin/sh\nshift 3\nexec env -i PATH="$PATH" "$@"\n')  # resets the environment, like sudo
+    sudo.chmod(0o755)
+    fake.state.child_path = str(bin_dir)
+    tools = _layer(tmp_path)
+    env = make_env(tool_paths=str(tools))
+    await env.start(force_build=False)
+    try:
+        result = await env.exec("hb-tool", user="root")
+        assert (result.return_code, result.stdout.strip()) == (0, "from-layer")
+    finally:
+        await env.stop(delete=True)
+
+
+async def test_file_helpers_see_the_tool_path(fake, make_env, tmp_path):
+    tools = _layer(tmp_path)
+    env = make_env(tool_paths=str(tools))
+    await env.start(force_build=False)
+    try:
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a").write_text("a")
+        await env.upload_dir(src, str(tmp_path / "dst"))
+        unpack = [c for c in commands(fake) if "tar -xzf" in c][-1]
+        assert unpack.startswith("PATH=") and str(tools) in unpack
+        assert (tmp_path / "dst" / "a").read_text() == "a"
+    finally:
+        await env.stop(delete=True)

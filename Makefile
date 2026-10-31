@@ -17,8 +17,6 @@
 GOOGLE_CLOUD_PROJECT ?= $(shell gcloud config get-value project 2>/dev/null)
 ATE_ENV_IMAGE_REPO ?= gcr.io/$(GOOGLE_CLOUD_PROJECT)
 
-export PYTHONPATH := $(CURDIR)/clients/python/src:$(CURDIR)/integrations/nemo-gym/src$(if $(PYTHONPATH),:$(PYTHONPATH))
-
 # Baked into the ate-env CLI by build-cli (release.yaml does the same with the
 # published digests): `ate-env --version`, and the defaults of manifest
 # --api-image and manifest template --guest-image.
@@ -63,7 +61,7 @@ check-substrate-head: ## Verify compatibility against substrate@HEAD (or custom 
 check-pins: ## Verify flake and dependency pin freshness
 	hack/ci-compat.sh check-pins
 
-protos: ## Regenerate Go and Python protobuf stubs with the pinned generators (Go plugins in go.mod, grpcio-tools from the Nix env)
+protos: ## Regenerate Go and Python protobuf stubs with the pinned generators (Go plugins in go.mod, grpcio-tools in uv.lock)
 	hack/ci-compat.sh sh -c 'make python-protos && go tool buf generate'
 
 update-pins: ## Update flake and dependency pins

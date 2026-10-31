@@ -16,9 +16,9 @@
 # weekly to catch breakage from outside the repository (nixpkgs, the base
 # image, runner images), and on demand:
 #
-# - check-pins: the Nix toolchain still satisfies go.mod (go/toolchain), every
-#   pyproject.toml (requires-python and each dependency) and the Dockerfile.ci
-#   base image digest; then DeterminateSystems' flake-checker reports stale,
+# - check-pins: the Nix toolchain still satisfies go.mod (go/toolchain),
+#   uv.lock is up to date with every pyproject.toml, and the Dockerfile.ci
+#   base image is pinned by digest; then DeterminateSystems' flake-checker reports stale,
 #   non-upstream or unsupported nixpkgs inputs (report only). To fix drift,
 #   run `make update-pins`, verify with `make check-pins`, and commit.
 # - devshell: each way of getting the toolchain (the Nix devShell on Linux and
@@ -41,6 +41,7 @@ on:
       - go.mod
       - go.sum
       - "**/pyproject.toml"
+      - uv.lock
       - Dockerfile.ci
       - .dockerignore
       - .github/workflows/ci-devenv.yaml

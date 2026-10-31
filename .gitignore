@@ -6,8 +6,10 @@ node_modules/
 *.pyc
 deployment.yaml
 
-# uv writes a lockfile next to each pyproject it runs; the Python projects here are libraries and ship none.
+# The uv workspace's lockfile at the root is committed; anywhere else, uv.lock is a stray from
+# running uv outside the workspace.
 uv.lock
+!/uv.lock
 cmd/benchmarking/swebench-loader/kodata/
 
 # Developer-local workspace overrides; never committed, so CI always uses the strict module pin.

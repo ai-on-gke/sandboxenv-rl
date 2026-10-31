@@ -47,8 +47,9 @@
 #
 # Prerequisites:
 #   - Go toolchain (go.mod pins buf, protoc-gen-go, and protoc-gen-go-grpc via tool directives).
-#   - Python 3 with `grpcio-tools` installed (pre-packaged in nix develop / Dockerfile.ci).
-#     Note: Python stub generator versions follow pyproject.toml / nixpkgs.
+#   - Python 3 with `grpcio-tools` installed (in the devShell's Python env, built from uv.lock).
+#     Note: the Python stub generator (grpcio-tools) is pinned in clients/python/pyproject.toml
+#     and uv.lock.
 #
 # Environment variables:
 #   PYTHON  python3  Python interpreter to use for generating Python stubs (must have grpcio-tools)

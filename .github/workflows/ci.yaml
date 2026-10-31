@@ -107,11 +107,7 @@ jobs:
   openhands:
     # A job of its own: openhands-sdk and the agent-server the tests start pull
     # in a large dependency set that the other Python checks do not need. It runs
-    # in the .#openhands devShell via pip venv because exact openhands-* pins
-    # aren't in nixpkgs.
-    # TODO(#179): pip resolves everything except the openhands-* pins from PyPI
-    # at run time, so those versions float. Pin them (pyproject.toml or a lock
-    # file) once #179 publishes ate-env-client to PyPI.
+    # in the .#openhands devShell, whose env nix/python.nix builds from uv.lock.
     name: OpenHands integration
     runs-on: ubuntu-24.04 # pinned on purpose: ubuntu-latest now resolves to 26.04; bump deliberately
     timeout-minutes: 15

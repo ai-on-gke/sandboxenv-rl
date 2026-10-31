@@ -1,14 +1,38 @@
 ## Why
 
-<!-- The problem or the motivation. Link the issue. -->
+<!--
+What problem or motivation does this PR address?
+- Why is this change needed now?
+- Which issue(s) does it resolve or relate to? (Use `Fixes #<num>` to auto-close on merge, or `Ref #<num>`.)
+-->
+Fixes #
 
 ## What
 
-<!-- What changes, and what stays the same. -->
+<!--
+What changes in this PR, and what intentionally stays the same?
+- Which components, RPCs, CLI flags, or SDK methods are added or modified?
+- Are there any behavior, configuration, or compatibility changes callers should know about?
+-->
 
 ## Tests
 
-<!-- What you ran and the results: unit tests, CI, a live run on a cluster. -->
+<!--
+How was this change verified?
+- Which unit, integration, or end-to-end tests did you run, and what were the results?
+- If tested against a live cluster (Kind or GKE), which scenarios were exercised?
+-->
+
+## Release note
+
+<!--
+If this PR has user-visible changes (features, fixes, image/layer updates, or breaking changes),
+summarize them below for users upgrading `sandboxenv-rl`. Write `NONE` if no release note is needed.
+For breaking changes, describe the required upgrade steps clearly and apply the `breaking-change` label.
+-->
+```release-note
+
+```
 
 ## Security impact
 

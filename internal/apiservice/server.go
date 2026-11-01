@@ -248,7 +248,10 @@ func (s *Server) getOrCreateImageTemplate(ctx context.Context, atespace, base, n
 	existing, err := s.client.GetActorTemplate(ctx, atespace, name)
 	switch {
 	case err == nil:
-		if got := firstContainerImage(existing); got != image {
+		got := firstContainerImage(existing)
+		gotDigest, _ := ImageDigest(got)
+		imageDigest, _ := ImageDigest(image)
+		if gotDigest == "" || imageDigest == "" || gotDigest != imageDigest {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"actor template %q exists but runs %q, not %q; delete it or use another base template", name, got, image)
 		}

@@ -202,7 +202,7 @@ sequenceDiagram
     Op->>LD: preflight -manifest tasks.jsonl -plan placement.json
     loop each of the 500 images
         LD->>API: CreateEnvironment(template=base, rootfs_image) then Delete
-        API->>CP: CreateActorTemplate base-<digest12>
+        API->>CP: CreateActorTemplate (derived template base-digest12)
         CP->>N: golden bake on some worker: boot, readiness, snapshot
         N->>Ext: pull layers (bake node only), upload golden snapshot
         LD->>API: GetImageStatus(rootfs_image) until golden COMPLETED
@@ -211,7 +211,7 @@ sequenceDiagram
     Note over Op,Ext: step 2: coverage, per (image, domain), concurrency = nodes x k
     loop each (image, domain) in placement.json
         par k probes per node of the domain
-            LD->>API: CreateEnvironment(template, rootfs_image, worker_selector={ate-env/domain: d})
+            LD->>API: CreateEnvironment(template, rootfs_image, worker_selector = domain d)
             API->>CP: CreateActor(worker_selector)
             CP->>N: Restore on a worker of domain d
             N->>Ext: layers (image cache miss) + golden snapshot (file cache miss)
@@ -223,12 +223,12 @@ sequenceDiagram
     end
 
     Note over Op,Ext: step 3: record and verify
-    LD->>Op: events/preflight.jsonl, coverage matrix, node cache before/after; exit 0 or a table of misses
+    LD->>Op: events/preflight.jsonl, coverage matrix, node cache before/after, then exit 0 or a table of misses
 
     Note over Op,Ext: the run
     Op->>LD: run -placement placement.json -mode steps
     loop each task environment (500 tasks x rollouts, per step)
-        LD->>API: CreateEnvironment(template, rootfs_image, worker_selector={domain of image})
+        LD->>API: CreateEnvironment(template, rootfs_image, worker_selector = the image's domain)
         API->>CP: CreateActor
         CP->>N: Restore on a warm node of the domain
         N-->>API: oci_unpack 0, download 0, worker_restore 0.1-1 s, readiness

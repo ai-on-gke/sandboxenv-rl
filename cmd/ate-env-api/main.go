@@ -440,6 +440,7 @@ func portProxyOptions(base portproxy.Options, apisvc *apiservice.Server, callerA
 	base.ActorState = apisvc.ActorState
 	if callerAuth != nil {
 		base.Authenticate = callerAuth.Check
+		base.AuthenticateCapability = callerAuth.CheckCapability
 	}
 	return base
 }

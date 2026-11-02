@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-on-gke.github.io/sandboxenv-rl/schema/v1/image_placement.schema.json",
+  "title": "ImagePlacement",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "unpack_factor", "replication", "domains", "images"],
+  "properties": {
+    "schema_version": { "type": "string", "enum": ["v1"] },
+    "unpack_factor": { "type": "number", "exclusiveMinimum": 0 },
+    "replication": { "type": "integer", "minimum": 1 },
+    "domains": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/PlacementDomain" }
+    },
+    "images": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ImagePlacementEntry" }
+    },
+    "unplaced": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/UnplacedImage" }
+    }
+  },
+  "$defs": {
+    "PlacementDomain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "selector", "nodes", "node_cache_bytes", "assigned_bytes", "image_count"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "selector": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "type": "string", "minLength": 1 }
+        },
+        "nodes": { "type": "integer", "minimum": 1 },
+        "node_cache_bytes": { "type": "integer", "minimum": 0 },
+        "assigned_bytes": { "type": "integer", "minimum": 0 },
+        "image_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "ImagePlacementEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "domains", "bytes_compressed", "bytes_unpacked"],
+      "properties": {
+        "image": { "type": "string", "minLength": 1 },
+        "domains": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "bytes_compressed": { "type": "integer", "minimum": 0 },
+        "bytes_unpacked": { "type": "integer", "minimum": 0 },
+        "size_assumed": { "type": "boolean" },
+        "demand": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "UnplacedImage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "reason"],
+      "properties": {
+        "image": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

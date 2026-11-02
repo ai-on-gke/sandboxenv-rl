@@ -69,6 +69,7 @@ wrong** variant of it that still applies (fails tests), and a **malformed patch*
 | Env var | Default | Meaning |
 |---|---|---|
 | `SUBSTRATE_API_ENDPOINT` | `ate-env-api.ate-env.svc.cluster.local:7777` | ate-env API |
+| `SUBSTRATE_ENV_AUTH_TOKEN` | _(none)_ | Caller bearer token for ate-env-api (Secret `ate-env-api-token`, key `token`); leave unset for an API run with `--insecure-no-auth` |
 | `SUBSTRATE_ATESPACE` | `ate-env` | Tenancy / atespace |
 | `SWEBENCH_IMAGE` | `docker.io/swebench/sweb.eval.x86_64.<instance>:latest` | Sandbox image |
 | `SWEBENCH_TEMPLATE` | _(derived from image)_ | Pre-built ActorTemplate for the image |
@@ -114,8 +115,15 @@ kubectl create configmap sandbox-sdk-pkg --from-file=pkg.tar.gz.b64=/tmp/pkg.tar
 export VERL_WORKER_IMAGE=<registry>/verl-worker:<tag>   # python3 + ray + torch
 export SWEBENCH_IMAGE=<registry>/sweb.eval.x86_64.pytest-dev_1776_pytest-5221:latest
 export SWEBENCH_TEMPLATE=<actor-template-for-that-image>   # optional; empty uses default-template
+# The caller token: the RayJob reads Secret ate-env-api-token from its own namespace.
+kubectl -n ate-env get secret ate-env-api-token -o go-template='{{.data.token | base64decode}}' \
+  | kubectl create secret generic ate-env-api-token --from-file=token=/dev/stdin \
+      --dry-run=client -o yaml | kubectl apply -f -
 envsubst < examples/verl_swebench/ray-job.async-verl.yaml | kubectl apply -f -
 ```
+
+Skip the Secret copy when `ate-env-api` runs with `--insecure-no-auth`: the
+Secret reference is optional, and without it the job sends no token.
 
 The job runs on a CPU head node plus one `cpu-evaluators` worker. The evaluator
 actor is pinned to that worker through the `sandbox_evaluator` custom resource.
@@ -144,6 +152,6 @@ Set `API_SERVICE` when the telemetry `ate-env-api` is not the standard
 
 Each iteration is one trace: `verl.iteration` (driver) → `ate_env_fleet.acquire` /
 `ate_env_fleet.process` / `ate_env_fleet.release` (evaluator) → `ate_env_client.*` →
-`ateenv.v1alpha.*` on ate-env-api → `ateapi.Control/*`. The run report (phases,
+`ateenv.v1alpha.*` on ate-env-api → `substrate.ateapi.v1.Control/*`. The run report (phases,
 claims, tasks) is printed by the driver and written to `REPORT_DIR` (`.txt`,
 `.json`, and the evaluator's metrics as `.prom`).

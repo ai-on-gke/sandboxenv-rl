@@ -144,6 +144,22 @@ tar czf - --exclude=__pycache__ clients/python/src examples/verl_swebench/*.py \
 k -n "${RAY_NAMESPACE}" create configmap "${PKG_CONFIGMAP}" \
   --from-file=pkg.tar.gz.b64="${OUT}/pkg.tar.gz.b64" --dry-run=client -o yaml | k apply -f -
 
+# ate-env-api requires the caller token from Secret ate-env-api-token unless it
+# runs with --insecure-no-auth. The RayJob reads that Secret from its own
+# namespace, so copy it there (through stdin, so the token never reaches argv
+# or disk). Without the Secret in API_NAMESPACE, the job sends no token.
+if [[ "${RAY_NAMESPACE}" != "${API_NAMESPACE}" ]]; then
+  if k -n "${API_NAMESPACE}" get secret ate-env-api-token >/dev/null 2>&1; then
+    log "Copying Secret ate-env-api-token from ${API_NAMESPACE} to ${RAY_NAMESPACE}"
+    k -n "${API_NAMESPACE}" get secret ate-env-api-token -o go-template='{{.data.token | base64decode}}' \
+      | k -n "${RAY_NAMESPACE}" create secret generic ate-env-api-token --from-file=token=/dev/stdin \
+          --dry-run=client -o yaml \
+      | k apply -f - >/dev/null
+  else
+    echo "no Secret ${API_NAMESPACE}/ate-env-api-token; the RayJob sends no caller token"
+  fi
+fi
+
 log "Applying RayJob ${RAY_NAMESPACE}/${JOB_NAME}"
 VERL_WORKER_IMAGE="${VERL_WORKER_IMAGE}" SWEBENCH_IMAGE="${SWEBENCH_IMAGE}" \
 SWEBENCH_TEMPLATE="${SWEBENCH_TEMPLATE}" \

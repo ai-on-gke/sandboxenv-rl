@@ -26,6 +26,11 @@
 #                      http://otel-collector.ate-env-telemetry.svc.cluster.local:4317
 #                      (tests/telemetry/otel-collector.yaml); unused when tracing is off.
 #
+# The caller token for ate-env-api (SUBSTRATE_ENV_AUTH_TOKEN) comes from Secret
+# ate-env-api-token (key "token") in the RayJob's namespace when it exists:
+# `ate-env manifest` creates it in ate-env, so copy it here. Without the Secret,
+# no token is sent, which suits an ate-env-api run with --insecure-no-auth.
+#
 # The policy (sampler/trainer) is simulated, so this job requests no GPUs. To run
 # a real VeRL policy, add a GPU worker group and pass --sampler-gpus/--trainer-gpus.
 
@@ -120,6 +125,12 @@ spec:
               value: "true"
             - name: REPORT_DIR
               value: "/tmp/ate-env-reports"
+            - name: SUBSTRATE_ENV_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ate-env-api-token
+                  key: token
+                  optional: true
             ports:
             - containerPort: 6379
               name: gcs-server

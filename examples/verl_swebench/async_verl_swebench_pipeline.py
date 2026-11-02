@@ -600,6 +600,9 @@ def build_fleet_config(args: argparse.Namespace, task_dict: dict[str, Any]) -> F
         backend=args.backend,
         # `or`: the RayJob renders an unset SUBSTRATE_API_ENDPOINT as "".
         endpoint=os.environ.get("SUBSTRATE_API_ENDPOINT") or "ate-env-api.ate-env.svc.cluster.local:7777",
+        # The caller bearer token ate-env-api requires unless it runs with
+        # --insecure-no-auth; unset or empty sends none.
+        auth_token=os.environ.get("SUBSTRATE_ENV_AUTH_TOKEN") or None,
         data_plane=args.data_plane,
         tenancy=os.environ.get("SUBSTRATE_ATESPACE", "ate-env"),
         template=task_dict.get("template"),

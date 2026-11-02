@@ -72,12 +72,15 @@ separately into the results directory:
 export ENV_REPO=<path to the sandboxenv-rl checkout>
 export KO_DOCKER_REPO=<registry the cluster pulls from>
 "${ENV_REPO}/benchmarking/swebench/sample-node-cache.sh" before-RUN.txt
-RESTORE_LOG=restores-RUN.jsonl "${ENV_REPO}/benchmarking/swebench/run-in-cluster.sh" RUN DATASET.jsonl <shape flags> -label arm=NAME
+RESTORE_LOG=restores-RUN.jsonl AUTH_TOKEN_SECRET=ate-env-api-token "${ENV_REPO}/benchmarking/swebench/run-in-cluster.sh" RUN DATASET.jsonl <shape flags> -label arm=NAME -label substrate=VERSION -label cluster=NAME -label nodes=COUNTxTYPE -label disk=TYPE-GB -label loader=$(git -C "${ENV_REPO}" rev-parse --short HEAD)
 "${ENV_REPO}/benchmarking/swebench/sample-node-cache.sh" after-RUN.txt
 go -C "${ENV_REPO}" build -o "${PWD}/swebench-loader" ./cmd/benchmarking/swebench-loader
 "${PWD}/swebench-loader" report RUN.jsonl -restore-log restores-RUN.jsonl -cache-before before-RUN.txt -cache-after after-RUN.txt -unresolved unresolved-RUN.txt
 ```
 
+- `AUTH_TOKEN_SECRET` names the Secret with ate-env-api's caller token; without it every create
+  fails with `Unauthenticated`. The labels after `arm` record what the run ran on; the loader
+  records its own flags itself, and the report refuses to pool runs whose labels differ.
 - `RESTORE_LOG` harvests atelet's restore records every ten minutes during the run; kubelet
   rotates a busy atelet's log within the hour and one harvest at the end loses most of a long run.
 - Do not chain the sampler with `&&`: it exits non-zero when any node scrape fails, and at
@@ -94,6 +97,50 @@ wrong:
 - Many cold restores per node at once measure the node's disk and CPU under contention, not the
   per-restore cost. 0.65 unpacks per 8-vCPU node gave 15.8 s median; 13 per node gave 50 s; 160
   per 16-vCPU node gave 243 s. Choose the per-node concurrency on purpose and state it.
+
+### Named runs
+
+Two runs are the standard: ask for them by name and change nothing but the thing under test.
+Their manifests are in `gs://swebench_benchmarks/datasets/`, pinned by digest, so every run uses
+the same images; copy the file next to the results.
+
+**The standard run** (any change in the trainer loop: control plane, router, scheduler, suspend
+and resume, env API, guest). SWE-bench Verified, 445 images, `swebench-verified-445.jsonl`, on
+40 n2-standard-8 with 320 workers. Two arms, about 45 and 7 minutes:
+
+```bash
+... run-in-cluster.sh RUN swebench-verified-445.jsonl -mode steps -rollouts 2 -steps 50 -width 890 -park delete -images-per-step 445 -trajectory workload-file-read-one -label arm=startup ...
+... run-in-cluster.sh RUN swebench-verified-445.jsonl -mode steps -rollouts 2 -steps 50 -width 890 -park suspend -trajectory workload-file-read-one -label arm=wake ...
+```
+
+Baseline: startup create 0.67 s, ttfi 6.4 s p50 / 39.7 s p95, step 20 to 28 s warm and 118 s on
+the first cold steps; wake 2.1 s p50 / 5.5 s p95, step 6.6 s, no retries. The images fit the
+nodes, so from about step 10 every start is warm: this run does not measure image delivery.
+
+**The image-delivery run** (streaming, disks, registries, anything that changes a cold start).
+The first 94 images of the Prime SWE-RL manifest plus three of its 9 GB images,
+`prime-swe-rl-94.jsonl`, one task per image. Width 3 on a two-node pool (1.5 starts per node), 30
+on a cluster of hundreds of nodes (0.04 per node). Two arms, 10 to 17 minutes each, bounded by
+the large images:
+
+```bash
+... run-in-cluster.sh RUN prime-swe-rl-94.jsonl -mode eval -images 94 -tasks-per-image 1 -width 3 -trajectory workload-file-read-one -set READ_FILE=/etc/passwd -label arm=start ...
+... run-in-cluster.sh RUN prime-swe-rl-94.jsonl -mode eval -images 94 -tasks-per-image 1 -width 3 -trajectory workload-file-read -set READ_FILES=200 -label arm=read ...
+```
+
+Caches must be cold per rep: a fresh node pool, or a cluster with hundreds of nodes, where 94
+images never land on a node that holds them. Goldens are baked once beforehand and not timed.
+Baseline, plain pull on pd-balanced: start 31 to 32 s p50 / 73 s p95 with unpack 97% of it, the
+three large images 200 to 600 s, the read step 4 to 5 s; 94 starts per arm, two reps when the p95 matters. It measures the
+per-start cost without contention; a width of 160 per node measures contention instead, and the two are not comparable
+on ttfi.
+
+For iterating on a delivery change, a smoke tier: `prime-swe-rl-30.jsonl`, the first 30 images
+without the large ones, `-images 30 -width 10` (3 on two nodes), about four minutes, the median
+within about 10% and nothing else. Confirm on the 94 before comparing or publishing.
+
+Bundle folders: `<date>_simulated_swebench-verified_fast-<arm>` and
+`<date>_simulated_prime-swe-rl-94_delivery-<arm>`.
 
 ## 3. Read the report
 

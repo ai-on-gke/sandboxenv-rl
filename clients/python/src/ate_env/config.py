@@ -198,9 +198,17 @@ class FleetConfig:
     # ceil(max_concurrent / 200).
     connections: int | None = None
 
-    # Hardware & placement (reserved for template placement and future scheduler extensions)
+    # Hardware & placement. worker_family and tolerations are reserved.
     worker_family: str | None = "c2"
+    # Labels the worker pool of every environment must carry: sent as the
+    # per-environment worker_selector on CreateEnvironment, which Substrate
+    # ANDs with the template's own selector, so it narrows the template's
+    # pools and never widens them, and holds for the environment's wakes.
     node_selector: dict[str, str] = field(default_factory=dict)
+    # Per-image labels merged over node_selector, keyed by the task image
+    # (the rootfs_image): the placement plan that keeps an image's
+    # environments on the pools whose nodes already hold it.
+    placement: dict[str, dict[str, str]] = field(default_factory=dict)
     tolerations: list[dict[str, Any]] = field(default_factory=list)
     labels: dict[str, str] = field(default_factory=dict)
 

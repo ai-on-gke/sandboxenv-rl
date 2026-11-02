@@ -7,6 +7,10 @@ user needs to know across them.
 ## Unreleased
 
 ### Added
+- Python client: `FleetConfig.node_selector` is sent as every environment's
+  `worker_selector`, and `FleetConfig.placement` adds labels per task image;
+  `SubstrateBackendDriver(worker_selector=, placement=)` and
+  `worker_selector_for(image)`.
 - ate-env-api: `worker_selector` on `CreateEnvironment`, labels the worker pool
   must carry, ANDed with the template's own selector (`Actor.worker_selector`,
   so it holds for wakes too); `node` and `worker_selector` on `Environment`.

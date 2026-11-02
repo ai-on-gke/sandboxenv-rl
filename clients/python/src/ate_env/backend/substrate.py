@@ -113,6 +113,8 @@ class SubstrateBackendDriver(BackendDriver):
         loop_runner: LoopRunner | None = None,
         tracer_config: TracerConfig | None = None,
         connections: int = 1,
+        worker_selector: Mapping[str, str] | None = None,
+        placement: Mapping[str, Mapping[str, str]] | None = None,
     ):
         if not isinstance(connections, int) or connections < 1:
             raise ValueError(f"connections must be >= 1, got {connections!r}")
@@ -129,6 +131,11 @@ class SubstrateBackendDriver(BackendDriver):
         self.image_templates = dict(image_templates or {})
         self.default_template = default_template
         self.labels = dict(labels or {})
+        # The per-environment worker selector every create sends, and the
+        # per-image labels merged over it (FleetConfig.node_selector and
+        # FleetConfig.placement).
+        self.worker_selector = dict(worker_selector or {})
+        self.placement = {img: dict(sel) for img, sel in (placement or {}).items()}
         self.acquire_timeout_s = acquire_timeout_s
         self.ready_timeout_s = ready_timeout_s
         self.tracer_config = tracer_config or TracerConfig()
@@ -255,6 +262,15 @@ class SubstrateBackendDriver(BackendDriver):
 
     def preflight(self) -> None:
         self._sync(self.preflight_async())
+
+    def worker_selector_for(self, rootfs_image: str | None) -> dict[str, str] | None:
+        """The worker selector a create for rootfs_image sends: the fleet-wide
+        labels with the image's placement labels merged over them, or None
+        when there are none, which leaves the template's selection alone."""
+        selector = dict(self.worker_selector)
+        if rootfs_image:
+            selector.update(self.placement.get(rootfs_image, {}))
+        return selector or None
 
     def ensure_template(self, env: EnvironmentSpec | str) -> str:
         """Resolve ActorTemplate name from template ID or task image.
@@ -442,6 +458,7 @@ class SubstrateBackendDriver(BackendDriver):
                             template_name=template_id,
                             atespace=self.atespace,
                             rootfs_image=rootfs_image,
+                            worker_selector=self.worker_selector_for(rootfs_image),
                         )
                         last_err = None
                         break
@@ -556,6 +573,7 @@ class SubstrateBackendDriver(BackendDriver):
                             template_name=template_id,
                             atespace=self.atespace,
                             rootfs_image=rootfs_image,
+                            worker_selector=self.worker_selector_for(rootfs_image),
                         )
                     finally:
                         in_driver_span.reset(drv_tok)

@@ -409,6 +409,25 @@ FleetConfig(max_concurrent=64, max_warmpool_replicas=16, warm_per_task=True)
 once. A failed image does not stop the others: the first error is raised once
 every image was tried.
 
+### Keep environments on the worker pools that hold their image
+
+`FleetConfig.node_selector` is sent as the per-environment `worker_selector` on
+every create: labels the worker pool must carry, which Substrate ANDs with the
+template's own selector, so it narrows the template's pools and never widens
+them, and holds for the environment's wakes. `FleetConfig.placement` adds labels
+per task image, merged over `node_selector`: the placement plan that keeps an
+image's environments on the pools whose nodes already hold it.
+
+```python
+FleetConfig(
+    node_selector={"ate-env/workerpool": "c4"},
+    placement={"ghcr.io/org/django@sha256:…": {"ate-env/domain": "d0"}},
+)
+```
+
+Both are empty by default, which leaves the template's selection alone.
+`client.get(id).node` reports the node an environment landed on.
+
 ### Follow a trainer's batch stream with `LookaheadWarmer`
 
 An RL trainer owns its step loop. It knows the next batch or two ahead, and

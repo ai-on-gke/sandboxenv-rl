@@ -55,7 +55,7 @@ spec:
         - {name: NNODES, value: "2"}
         - {name: NGPUS_TRAIN, value: "8"}       # trainer pool = one whole node
         - {name: NGPUS_ROLLOUT, value: "8"}     # rollout pool = the other whole node
-        - {name: LOCAL_UPDATES, value: "4"}
+        - {name: LOCAL_UPDATES, value: "24"}       # 4 smoke, 24 performance numbers (12 logged steps), 468 full (one epoch); see run_fully_async.sh
         - {name: MODEL_ID, value: "Qwen/Qwen3-1.7B"}
         - {name: NODE_WAIT_S, value: "3600"}       # how long the head waits for the worker node to join
         resources:

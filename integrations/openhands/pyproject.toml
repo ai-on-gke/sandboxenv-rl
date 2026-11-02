@@ -44,7 +44,7 @@ test = ["pytest>=8", "openhands-agent-server==1.55.0", "openhands-tools==1.55.0"
 where = ["src"]
 
 [tool.uv.sources]
-ate-env-client = { path = "../../clients/python", editable = true }
+ate-env-client = { workspace = true }
 
 [tool.ruff]
 target-version = "py312"

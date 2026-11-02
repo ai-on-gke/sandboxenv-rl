@@ -36,8 +36,10 @@ import (
 // router holds that request only for its own parking budget, a few seconds. A
 // wake that has to pull the environment's image onto the node or read its
 // snapshot across a region takes longer than that: 18 s for a cold image pull
-// and 7 s for a 1 GiB snapshot read across regions, measured on GKE.
-const DefaultWakeBudget = 2 * time.Minute
+// and 7 s for a 1 GiB snapshot read across regions, measured on GKE. A cold
+// restore of a 9 GB image on a node that is unpacking other images takes
+// more than two minutes while still making progress, so the budget is five.
+const DefaultWakeBudget = 5 * time.Minute
 
 // DefaultWakeRunningBudget bounds the wait when the control plane already
 // reports the environment RUNNING but the router still answers Unavailable.

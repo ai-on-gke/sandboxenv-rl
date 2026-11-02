@@ -24,7 +24,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -195,6 +197,7 @@ func newCreateCommand() *cobra.Command {
 		createTemplate         string
 		createTemplateAtespace string
 		rootfsImage            string
+		workerSelector         []string
 	)
 	cmd := &cobra.Command{
 		Use:   "create <id>",
@@ -217,10 +220,15 @@ func newCreateCommand() *cobra.Command {
 			}
 			defer client.Close()
 
+			selector, err := parseWorkerSelector(workerSelector)
+			if err != nil {
+				return err
+			}
 			req := &ateenvv1alpha.CreateEnvironmentRequest{
-				Id:          args[0],
-				Atespace:    atespace,
-				RootfsImage: rootfsImage,
+				Id:             args[0],
+				Atespace:       atespace,
+				RootfsImage:    rootfsImage,
+				WorkerSelector: selector,
 			}
 			if createTemplate != "" || createTemplateAtespace != "" {
 				tmplAtespace := createTemplateAtespace
@@ -242,6 +250,82 @@ func newCreateCommand() *cobra.Command {
 	cmd.Flags().StringVar(&createTemplate, "template", "", "ActorTemplate name (defaults to server default)")
 	cmd.Flags().StringVar(&createTemplateAtespace, "template-atespace", "", "Substrate atespace of the ActorTemplate (defaults to environment atespace)")
 	cmd.Flags().StringVar(&rootfsImage, "rootfs-image", "", "digest-pinned rootfs image to run unmodified (repo@sha256:...); the template becomes the base the guest is taken from")
+	cmd.Flags().StringSliceVar(&workerSelector, "worker-selector", nil, "label a worker pool must carry, key=value; repeat the flag or separate with commas. ANDed with the template's own selector, thus it narrows the pools the environment can run on")
+	return cmd
+}
+
+// parseWorkerSelector turns key=value items into the labels a worker pool
+// must carry. A later item overrides an earlier one with the same key.
+func parseWorkerSelector(items []string) (map[string]string, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	selector := make(map[string]string, len(items))
+	for _, item := range items {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok || key == "" {
+			return nil, fmt.Errorf("--worker-selector %q: want key=value", item)
+		}
+		selector[key] = value
+	}
+	return selector, nil
+}
+
+func newGetCommand() *cobra.Command {
+	var (
+		endpoint string
+		atespace string
+		auth     authFlags
+		asJSON   bool
+	)
+	cmd := &cobra.Command{
+		Use:   "get <id>",
+		Short: "Show an environment: template, status, node and worker selector",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			token, err := auth.resolve(cmd)
+			if err != nil {
+				return err
+			}
+			client, err := env.NewClient(env.ClientOptions{
+				Endpoint:  endpoint,
+				AuthToken: token,
+			})
+			if err != nil {
+				return err
+			}
+			defer client.Close()
+			e, err := client.Get(cmd.Context(), atespace, args[0])
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			if asJSON {
+				b, err := protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}.Marshal(e)
+				if err != nil {
+					return err
+				}
+				_, err = fmt.Fprintf(out, "%s\n", b)
+				return err
+			}
+			fmt.Fprintf(out, "id: %s\natespace: %s\ntemplate: %s/%s\nstatus: %s\nnode: %s\n",
+				e.GetId(), e.GetAtespace(), e.GetTemplate().GetAtespace(), e.GetTemplate().GetName(),
+				strings.ToLower(strings.TrimPrefix(e.GetStatus().String(), "ENVIRONMENT_STATUS_")), e.GetNode())
+			if sel := e.GetWorkerSelector(); len(sel) > 0 {
+				keys := slices.Sorted(maps.Keys(sel))
+				items := make([]string, 0, len(keys))
+				for _, k := range keys {
+					items = append(items, k+"="+sel[k])
+				}
+				fmt.Fprintf(out, "worker selector: %s\n", strings.Join(items, ","))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&endpoint, "api", envOr("SUBSTRATE_ENV_API", "127.0.0.1:7777"), "address of the ate-env-api service (e.g. localhost:7777)")
+	cmd.Flags().StringVar(&atespace, "atespace", apiservice.DefaultAtespace, "Substrate atespace")
+	auth.register(cmd, false)
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print the environment as JSON")
 	return cmd
 }
 
@@ -390,6 +474,7 @@ Common environment commands:
 
 	root.AddCommand(newManifestCommand())
 	root.AddCommand(newCreateCommand())
+	root.AddCommand(newGetCommand())
 	root.AddCommand(newSuspendCommand())
 	root.AddCommand(newDeleteCommand())
 	root.AddCommand(newServerInfoCommand())

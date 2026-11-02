@@ -7,7 +7,12 @@ user needs to know across them.
 ## Unreleased
 
 ### Added
-
+- ate-env-api: `worker_selector` on `CreateEnvironment`, labels the worker pool
+  must carry, ANDed with the template's own selector (`Actor.worker_selector`,
+  so it holds for wakes too); `node` and `worker_selector` on `Environment`.
+  `ate-env create --worker-selector key=value`, `ate-env get <id>`;
+  `worker_selector=` on the Python client's `create()` and `node`,
+  `worker_selector` on `EnvironmentInfo`.
 - Observability across the stack, all off by default except the run report;
   see [docs/observability.md](docs/observability.md).
 - Python client: OpenTelemetry tracing behind the `tracing` extra

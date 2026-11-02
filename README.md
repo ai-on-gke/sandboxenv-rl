@@ -168,7 +168,11 @@ template's `workerSelector` matches, and on any pool at all without a selector. 
 WorkerPool `ate-env/workerpool: <pool>` and each template selects that label, thus actors stay on
 their pool and its sandbox class; `--workerpool` on `ate-env manifest template` names the pool to select:
 it defaults to `default-template-workerpool`, the pool `ate-env manifest` creates by default, whatever
-the template is named. Pass it when you deploy with another `--template` or `--workerpool`. The templates also use
+the template is named. Pass it when you deploy with another `--template` or `--workerpool`. An
+environment can narrow its template's pools further: `worker_selector` on `CreateEnvironment`
+(`ate-env create --worker-selector key=value`) is ANDed with the template's selector and applies to the
+environment's wakes too, thus a job can keep an image's environments on the pools that already hold
+the image; `ate-env get <id>` shows the node an environment is on. The templates also use
 `snapshotConfig` and `wakeupProbe` and declare CPU and memory limits, and `--worker-image` must be the
 `ateworker-gvisor` image built from the Substrate version on the cluster.
 
@@ -380,6 +384,11 @@ ate-env create py1 --rootfs-image docker.io/library/python@sha256:<digest>
 ate-env create web1 --template layered
 ate-env web1 shell '/opt/web/bin/busybox wget -qO- http://127.0.0.1:44772/etc/os-release'
 ate-env create node1 --template layered --rootfs-image docker.io/library/node@sha256:<digest>
+
+# Or keep the environment on the worker pools that carry a label (for example
+# the pools that already hold the image); ANDed with the template's selector.
+ate-env create t1 --rootfs-image docker.io/library/python@sha256:<digest> --worker-selector ate-env/domain=d0
+ate-env get t1    # template, status, the node it is on, the selector
 
 # Execute a shell command inside the environment.
 ate-env dev1 shell 'echo hello > /note.txt'

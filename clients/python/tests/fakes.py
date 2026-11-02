@@ -75,6 +75,7 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
             template=template,
             status=env_pb2.ENVIRONMENT_STATUS_RUNNING,
         )
+        environment.worker_selector.update(request.worker_selector)
         self.environments[key] = environment
         return env_pb2.CreateEnvironmentResponse(environment=environment)
 

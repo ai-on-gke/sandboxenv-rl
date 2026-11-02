@@ -181,9 +181,17 @@ type Environment struct {
 	// ActorTemplate configuration the environment is instantiated from.
 	Template *Template `protobuf:"bytes,3,opt,name=template,proto3" json:"template,omitempty"`
 	// Current lifecycle status of the environment.
-	Status        EnvironmentStatus `protobuf:"varint,4,opt,name=status,proto3,enum=ateenv.v1alpha.EnvironmentStatus" json:"status,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Status EnvironmentStatus `protobuf:"varint,4,opt,name=status,proto3,enum=ateenv.v1alpha.EnvironmentStatus" json:"status,omitempty"`
+	// Kubernetes node hosting the environment's actor, or its local snapshot
+	// while it is suspended; empty before its first placement and after
+	// Substrate detaches it from a full node. Substrate's
+	// Actor.status.assigned_node, or the worker assignment's node.
+	Node string `protobuf:"bytes,5,opt,name=node,proto3" json:"node,omitempty"`
+	// The per-environment worker selector the environment was created with
+	// (CreateEnvironmentRequest.worker_selector); empty when none was given.
+	WorkerSelector map[string]string `protobuf:"bytes,6,rep,name=worker_selector,json=workerSelector,proto3" json:"worker_selector,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Environment) Reset() {
@@ -244,6 +252,20 @@ func (x *Environment) GetStatus() EnvironmentStatus {
 	return EnvironmentStatus_ENVIRONMENT_STATUS_UNSPECIFIED
 }
 
+func (x *Environment) GetNode() string {
+	if x != nil {
+		return x.Node
+	}
+	return ""
+}
+
+func (x *Environment) GetWorkerSelector() map[string]string {
+	if x != nil {
+		return x.WorkerSelector
+	}
+	return nil
+}
+
 // Request to create and start a new environment.
 type CreateEnvironmentRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -263,9 +285,15 @@ type CreateEnvironmentRequest struct {
 	// "<base>-<first 12 hex digits of the digest>" in the base's atespace; it
 	// is created on first use and reused afterwards, and the response reports
 	// it.
-	RootfsImage   string `protobuf:"bytes,4,opt,name=rootfs_image,json=rootfsImage,proto3" json:"rootfs_image,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	RootfsImage string `protobuf:"bytes,4,opt,name=rootfs_image,json=rootfsImage,proto3" json:"rootfs_image,omitempty"`
+	// Labels the worker pool that runs this environment must carry, matched by
+	// exact equality. Optional. Substrate ANDs it with the template's own
+	// worker selector, thus it narrows the template's pools and never widens
+	// them; an empty map keeps the template's selection. It is set on the
+	// actor as Actor.worker_selector, which also applies to its later wakes.
+	WorkerSelector map[string]string `protobuf:"bytes,5,rep,name=worker_selector,json=workerSelector,proto3" json:"worker_selector,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CreateEnvironmentRequest) Reset() {
@@ -324,6 +352,13 @@ func (x *CreateEnvironmentRequest) GetRootfsImage() string {
 		return x.RootfsImage
 	}
 	return ""
+}
+
+func (x *CreateEnvironmentRequest) GetWorkerSelector() map[string]string {
+	if x != nil {
+		return x.WorkerSelector
+	}
+	return nil
 }
 
 // Response returned after creating an environment.
@@ -783,17 +818,26 @@ const file_proto_ateenv_v1alpha_env_proto_rawDesc = "" +
 	"\x1eproto/ateenv/v1alpha/env.proto\x12\x0eateenv.v1alpha\":\n" +
 	"\bTemplate\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1a\n" +
-	"\batespace\x18\x02 \x01(\tR\batespace\"\xaa\x01\n" +
+	"\batespace\x18\x02 \x01(\tR\batespace\"\xdb\x02\n" +
 	"\vEnvironment\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
 	"\batespace\x18\x02 \x01(\tR\batespace\x124\n" +
 	"\btemplate\x18\x03 \x01(\v2\x18.ateenv.v1alpha.TemplateR\btemplate\x129\n" +
-	"\x06status\x18\x04 \x01(\x0e2!.ateenv.v1alpha.EnvironmentStatusR\x06status\"\x9f\x01\n" +
+	"\x06status\x18\x04 \x01(\x0e2!.ateenv.v1alpha.EnvironmentStatusR\x06status\x12\x12\n" +
+	"\x04node\x18\x05 \x01(\tR\x04node\x12X\n" +
+	"\x0fworker_selector\x18\x06 \x03(\v2/.ateenv.v1alpha.Environment.WorkerSelectorEntryR\x0eworkerSelector\x1aA\n" +
+	"\x13WorkerSelectorEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xc9\x02\n" +
 	"\x18CreateEnvironmentRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
 	"\batespace\x18\x02 \x01(\tR\batespace\x124\n" +
 	"\btemplate\x18\x03 \x01(\v2\x18.ateenv.v1alpha.TemplateR\btemplate\x12!\n" +
-	"\frootfs_image\x18\x04 \x01(\tR\vrootfsImage\"Z\n" +
+	"\frootfs_image\x18\x04 \x01(\tR\vrootfsImage\x12e\n" +
+	"\x0fworker_selector\x18\x05 \x03(\v2<.ateenv.v1alpha.CreateEnvironmentRequest.WorkerSelectorEntryR\x0eworkerSelector\x1aA\n" +
+	"\x13WorkerSelectorEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"Z\n" +
 	"\x19CreateEnvironmentResponse\x12=\n" +
 	"\venvironment\x18\x01 \x01(\v2\x1b.ateenv.v1alpha.EnvironmentR\venvironment\"C\n" +
 	"\x15GetEnvironmentRequest\x12\x0e\n" +
@@ -845,7 +889,7 @@ func file_proto_ateenv_v1alpha_env_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_ateenv_v1alpha_env_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_ateenv_v1alpha_env_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_proto_ateenv_v1alpha_env_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_proto_ateenv_v1alpha_env_proto_goTypes = []any{
 	(EnvironmentStatus)(0),             // 0: ateenv.v1alpha.EnvironmentStatus
 	(*Template)(nil),                   // 1: ateenv.v1alpha.Template
@@ -860,28 +904,32 @@ var file_proto_ateenv_v1alpha_env_proto_goTypes = []any{
 	(*DeleteEnvironmentResponse)(nil),  // 10: ateenv.v1alpha.DeleteEnvironmentResponse
 	(*GetServerInfoRequest)(nil),       // 11: ateenv.v1alpha.GetServerInfoRequest
 	(*GetServerInfoResponse)(nil),      // 12: ateenv.v1alpha.GetServerInfoResponse
+	nil,                                // 13: ateenv.v1alpha.Environment.WorkerSelectorEntry
+	nil,                                // 14: ateenv.v1alpha.CreateEnvironmentRequest.WorkerSelectorEntry
 }
 var file_proto_ateenv_v1alpha_env_proto_depIdxs = []int32{
 	1,  // 0: ateenv.v1alpha.Environment.template:type_name -> ateenv.v1alpha.Template
 	0,  // 1: ateenv.v1alpha.Environment.status:type_name -> ateenv.v1alpha.EnvironmentStatus
-	1,  // 2: ateenv.v1alpha.CreateEnvironmentRequest.template:type_name -> ateenv.v1alpha.Template
-	2,  // 3: ateenv.v1alpha.CreateEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
-	2,  // 4: ateenv.v1alpha.GetEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
-	3,  // 5: ateenv.v1alpha.EnvironmentService.CreateEnvironment:input_type -> ateenv.v1alpha.CreateEnvironmentRequest
-	5,  // 6: ateenv.v1alpha.EnvironmentService.GetEnvironment:input_type -> ateenv.v1alpha.GetEnvironmentRequest
-	7,  // 7: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:input_type -> ateenv.v1alpha.SuspendEnvironmentRequest
-	9,  // 8: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:input_type -> ateenv.v1alpha.DeleteEnvironmentRequest
-	11, // 9: ateenv.v1alpha.EnvironmentService.GetServerInfo:input_type -> ateenv.v1alpha.GetServerInfoRequest
-	4,  // 10: ateenv.v1alpha.EnvironmentService.CreateEnvironment:output_type -> ateenv.v1alpha.CreateEnvironmentResponse
-	6,  // 11: ateenv.v1alpha.EnvironmentService.GetEnvironment:output_type -> ateenv.v1alpha.GetEnvironmentResponse
-	8,  // 12: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:output_type -> ateenv.v1alpha.SuspendEnvironmentResponse
-	10, // 13: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:output_type -> ateenv.v1alpha.DeleteEnvironmentResponse
-	12, // 14: ateenv.v1alpha.EnvironmentService.GetServerInfo:output_type -> ateenv.v1alpha.GetServerInfoResponse
-	10, // [10:15] is the sub-list for method output_type
-	5,  // [5:10] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	13, // 2: ateenv.v1alpha.Environment.worker_selector:type_name -> ateenv.v1alpha.Environment.WorkerSelectorEntry
+	1,  // 3: ateenv.v1alpha.CreateEnvironmentRequest.template:type_name -> ateenv.v1alpha.Template
+	14, // 4: ateenv.v1alpha.CreateEnvironmentRequest.worker_selector:type_name -> ateenv.v1alpha.CreateEnvironmentRequest.WorkerSelectorEntry
+	2,  // 5: ateenv.v1alpha.CreateEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
+	2,  // 6: ateenv.v1alpha.GetEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
+	3,  // 7: ateenv.v1alpha.EnvironmentService.CreateEnvironment:input_type -> ateenv.v1alpha.CreateEnvironmentRequest
+	5,  // 8: ateenv.v1alpha.EnvironmentService.GetEnvironment:input_type -> ateenv.v1alpha.GetEnvironmentRequest
+	7,  // 9: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:input_type -> ateenv.v1alpha.SuspendEnvironmentRequest
+	9,  // 10: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:input_type -> ateenv.v1alpha.DeleteEnvironmentRequest
+	11, // 11: ateenv.v1alpha.EnvironmentService.GetServerInfo:input_type -> ateenv.v1alpha.GetServerInfoRequest
+	4,  // 12: ateenv.v1alpha.EnvironmentService.CreateEnvironment:output_type -> ateenv.v1alpha.CreateEnvironmentResponse
+	6,  // 13: ateenv.v1alpha.EnvironmentService.GetEnvironment:output_type -> ateenv.v1alpha.GetEnvironmentResponse
+	8,  // 14: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:output_type -> ateenv.v1alpha.SuspendEnvironmentResponse
+	10, // 15: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:output_type -> ateenv.v1alpha.DeleteEnvironmentResponse
+	12, // 16: ateenv.v1alpha.EnvironmentService.GetServerInfo:output_type -> ateenv.v1alpha.GetServerInfoResponse
+	12, // [12:17] is the sub-list for method output_type
+	7,  // [7:12] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_proto_ateenv_v1alpha_env_proto_init() }
@@ -895,7 +943,7 @@ func file_proto_ateenv_v1alpha_env_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_ateenv_v1alpha_env_proto_rawDesc), len(file_proto_ateenv_v1alpha_env_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   12,
+			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

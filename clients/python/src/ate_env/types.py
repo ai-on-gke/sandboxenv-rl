@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import enum
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -122,6 +123,11 @@ class EnvironmentInfo:
     atespace: str
     template: Template | None
     status: EnvironmentStatus
+    # Kubernetes node the environment runs on, or last ran on; "" before its
+    # first placement.
+    node: str = ""
+    # The per-environment worker selector it was created with; {} when none.
+    worker_selector: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -189,6 +195,8 @@ def _environment_info_from_pb(pb: env_pb2.Environment) -> EnvironmentInfo:
         atespace=pb.atespace,
         template=template,
         status=EnvironmentStatus(pb.status),
+        node=pb.node,
+        worker_selector=dict(pb.worker_selector),
     )
 
 

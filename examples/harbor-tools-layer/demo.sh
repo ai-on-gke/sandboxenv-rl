@@ -59,7 +59,7 @@ COMMANDS="$("${ROOT}/integrations/harbor/hack/register-templates.sh" "${TASKS}" 
   --layer "tools=${LAYER_REF}=${MOUNT}" ${TEMPLATE_FLAGS:-})"
 printf '%s\n' "${COMMANDS}"
 if [[ "${APPLY:-}" == "1" ]]; then
-  printf '%s\n' "${COMMANDS}" | sh
+  printf '%s\n' "${COMMANDS}" | bash -euo pipefail
 else
   echo "== (set APPLY=1 to register them; continuing with the run)"
 fi

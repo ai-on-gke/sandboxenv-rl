@@ -83,6 +83,9 @@ TOKEN_ENV = "SUBSTRATE_ENV_AUTH_TOKEN"
 REGISTRY_ENV = "SUBSTRATE_ENV_HARBOR_REGISTRY"
 # The probe that learns which user the image runs as; the test fakes answer it.
 WHOAMI_COMMAND = "id -un"
+# Login shells source /etc/profile, which overwrites PATH on Debian, Ubuntu and
+# Alpine images, then the files in /etc/profile.d; this one restores the tool paths.
+DEFAULT_TOOL_PATHS_PROFILE = "/etc/profile.d/zz-harbor-tools.sh"
 _COMPOSE_FILE = "docker-compose.yaml"
 _PREFLIGHT_TIMEOUT = 15.0
 # gRPC statuses a guest call answers with while the actor is still coming up.
@@ -135,6 +138,10 @@ class AteEnvEnvironment(BaseEnvironment):
       ``PATH`` for every command; a list, or one string with ``:`` between
       the paths. ``start`` fails when one is missing, which means the base
       template lacks the layer. See ``examples/harbor-tools-layer``.
+    - ``tool_paths_profile``: the ``/etc/profile.d`` drop-in written at
+      ``start`` so login shells (terminus-2's ``bash --login`` tmux session)
+      see the tool paths too; default ``/etc/profile.d/zz-harbor-tools.sh``,
+      empty to skip. A write the image user is not allowed is a warning.
     """
 
     def __init__(
@@ -161,6 +168,7 @@ class AteEnvEnvironment(BaseEnvironment):
         docker_bin: str = "docker",
         gcloud_bin: str = "gcloud",
         tool_paths: str | list[str] | tuple[str, ...] | None = None,
+        tool_paths_profile: str | None = DEFAULT_TOOL_PATHS_PROFILE,
         **kwargs: Any,
     ) -> None:
         self._api_url = api_url or os.environ.get(API_ENV) or DEFAULT_API_URL
@@ -178,6 +186,7 @@ class AteEnvEnvironment(BaseEnvironment):
         self._workdir_kwarg = workdir or None
         self._scratch_dir = str(scratch_dir).rstrip("/") or "/tmp"
         self._tool_paths = _parse_tool_paths(tool_paths)
+        self._tool_paths_profile = str(tool_paths_profile) if tool_paths_profile else None
         self._resolver = ImageResolver(
             registry=registry or os.environ.get(REGISTRY_ENV),
             build=self._build,
@@ -230,8 +239,9 @@ class AteEnvEnvironment(BaseEnvironment):
         """``command`` with the tool paths first on PATH, when there are any."""
         if not self._tool_paths:
             return command
-        prefix = shlex.quote(":".join(self._tool_paths))
-        return f'PATH={prefix}:"$PATH"; export PATH; {command}'
+        # ${PATH:+:$PATH}: an empty PATH must not leave a trailing colon,
+        # which POSIX sh reads as the current directory.
+        return f"PATH={_path_prefix(self._tool_paths)}; export PATH; {command}"
 
     @property
     def capabilities(self) -> EnvironmentCapabilities:
@@ -311,6 +321,7 @@ class AteEnvEnvironment(BaseEnvironment):
             await self._wait_ready(env, deadline)
             await self._probe_user(env)
             await self._check_tool_paths(env)
+            await self._write_tool_profile(env)
             self._env = env
             await self._ensure_workdir(env)
             await self.ensure_dirs(self._mount_targets(writable_only=True))
@@ -438,6 +449,24 @@ class AteEnvEnvironment(BaseEnvironment):
                     "(see examples/harbor-tools-layer)"
                 )
 
+    async def _write_tool_profile(self, env: Env) -> None:
+        """Give login shells the tool paths: /etc/profile overwrites PATH, then sources profile.d."""
+        if not self._tool_paths or not self._tool_paths_profile:
+            return
+        content = (
+            "# ate-env-harbor: the runtime layer's tools first on PATH, for login shells too.\n"
+            f"PATH={_path_prefix(self._tool_paths)}; export PATH\n"
+        )
+        try:
+            await env.write_file(self._tool_paths_profile, content.encode(), mode=0o644)
+        except EnvError as e:
+            self.logger.warning(
+                "could not write %s (%s); login shells in this environment will not see "
+                "tool_paths unless the image's profile keeps PATH",
+                self._tool_paths_profile,
+                e,
+            )
+
     async def _delete_quietly(self, env: Env) -> None:
         try:
             await env.delete()
@@ -457,6 +486,7 @@ class AteEnvEnvironment(BaseEnvironment):
             "context_id": str(self.context_id) if self.context_id else None,
             "api_url": self._api_url,
             "tool_paths": list(self._tool_paths),
+            "tool_paths_profile": self._tool_paths_profile if self._tool_paths else None,
         }
         try:
             self.trial_paths.trial_dir.mkdir(parents=True, exist_ok=True)
@@ -606,7 +636,7 @@ class AteEnvEnvironment(BaseEnvironment):
             # does not come back (a transport error, a cancellation), remove
             # it from here so a failed upload leaves nothing in scratch_dir.
             with contextlib.suppress(Exception):
-                await handle.shell(f"rm -f {shlex.quote(archive)}")
+                await handle.shell(self._tooled(f"rm -f {shlex.quote(archive)}"))
             raise
         if result.exit_code != 0:
             raise RuntimeError(
@@ -634,19 +664,25 @@ class AteEnvEnvironment(BaseEnvironment):
             data = await handle.read_file_bytes(archive)
         finally:
             with contextlib.suppress(EnvError):
-                await handle.shell(f"rm -f {shlex.quote(archive)}")
+                await handle.shell(self._tooled(f"rm -f {shlex.quote(archive)}"))
         extract_dir_from_bytes(data, target_dir)
 
 
 def _parse_tool_paths(value: str | list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
     if value is None or value == "":
         return ()
-    parts = value.split(":") if isinstance(value, str) else [str(p) for p in value]
+    items = [value] if isinstance(value, str) else [str(p) for p in value]
+    parts = [part for item in items for part in item.split(":")]
     paths = tuple(p.rstrip("/") or "/" for p in (q.strip() for q in parts) if p)
     for path in paths:
         if not path.startswith("/"):
             raise ValueError(f"tool_paths must be absolute directories inside the environment, got {path!r}")
     return paths
+
+
+def _path_prefix(paths: tuple[str, ...]) -> str:
+    """``<paths>${PATH:+:$PATH}``, the value that puts the tool paths first."""
+    return shlex.quote(":".join(paths)) + "${PATH:+:$PATH}"
 
 
 def _mount_of(path: str) -> str:

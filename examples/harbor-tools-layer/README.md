@@ -74,10 +74,15 @@ examples/harbor/run-tb2.sh -p ./tb2/terminal-bench -a terminus-2 -m <model> -n 1
 [provider README](../../integrations/harbor/README.md#settings)): the
 directories, `:`-separated, that go first on `PATH` for every command the
 provider runs, the agent's and the verifier's alike and the user-switched ones
-too. At `start` the provider checks that each directory exists in the
-environment and fails with the `--layer` flag to add when it does not, which
-is what a template without the layer looks like. `trial_dir/ate_env.json`
-records the paths.
+too. Login shells get them as well: terminus-2 starts its tmux session with
+`bash --login`, and `/etc/profile` on Debian, Ubuntu and Alpine images
+overwrites `PATH`, thus the provider also writes
+`/etc/profile.d/zz-harbor-tools.sh` at `start` (`tool_paths_profile` names the
+file; it is a warning, not an error, when the image user cannot write there).
+At `start` the provider checks that each directory exists in the environment
+and fails with the `--layer` flag to add when it does not, which is what a
+template without the layer looks like. `trial_dir/ate_env.json` records the
+paths.
 
 [`demo.sh`](demo.sh) does the three steps in a row for a tasks directory:
 
@@ -95,7 +100,11 @@ LAYER_REPO=... GUEST_IMAGE=... SNAPSHOTS_BUCKET=... APPLY=1 \
 - Images without `sh` or `tar` (distroless) can take a static busybox under a
   second directory, for example `/opt/harbor-tools/busybox`, added to
   `tool_paths` on purpose. It is not on `PATH` by default: busybox's `find`
-  and `tar` would shadow the image's GNU tools for every task script.
+  and `tar` would shadow the image's GNU tools for every task script. One more
+  step for such images: the guest resolves `sh` from the container's own
+  `PATH` before any command runs, thus the template must carry the directory
+  too, with `ate-env manifest template --env PATH=/opt/harbor-tools/busybox:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
+  `tool_paths` alone cannot start the first `sh`.
 - Order matters: the first entry of `tool_paths` wins, and all of them come
   before the image's `PATH`.
 

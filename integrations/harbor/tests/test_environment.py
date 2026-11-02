@@ -538,10 +538,15 @@ async def test_tool_paths_go_first_on_path_for_every_exec(fake, make_env, tmp_pa
         assert (result.return_code, result.stdout.strip()) == (0, "from-layer")
         command = fake.state.execs[-1]["command"][-1]
         assert command.startswith("PATH=") and str(tools) in command and command.endswith("; hb-tool")
+        assert "${PATH:+:$PATH}" in command
         result = await env.exec('echo "$PATH"')
         assert result.stdout.startswith(f"{tools}:")
+        # An empty PATH gets the tools alone: no trailing colon, no cwd on PATH.
+        result = await env.exec("sh -c 'unset PATH; " + env._tooled('echo "$PATH"') + "'")
+        assert result.stdout.strip() == str(tools)
         record = json.loads((env.trial_paths.trial_dir / RECORD_FILE).read_text())
         assert record["tool_paths"] == [str(tools)]
+        assert record["tool_paths_profile"] == env._tool_paths_profile
     finally:
         await env.stop(delete=True)
 
@@ -549,9 +554,12 @@ async def test_tool_paths_go_first_on_path_for_every_exec(fake, make_env, tmp_pa
 def test_tool_paths_accepts_a_list_or_a_colon_separated_string(fake, make_env):
     assert make_env(tool_paths="/opt/a/bin:/opt/b/bin").tool_paths == ("/opt/a/bin", "/opt/b/bin")
     assert make_env(tool_paths=["/opt/a/bin"]).tool_paths == ("/opt/a/bin",)
+    assert make_env(tool_paths=["/opt/a/bin:/opt/b/bin"]).tool_paths == ("/opt/a/bin", "/opt/b/bin")
     assert make_env().tool_paths == ()
     with pytest.raises(ValueError, match="absolute"):
         make_env(tool_paths="opt/a/bin")
+    with pytest.raises(ValueError, match="absolute"):
+        make_env(tool_paths=["/opt/a/bin:rel"])  # a list item that hides a relative path
 
 
 async def test_missing_tool_path_fails_start_and_deletes_the_environment(fake, make_env, tmp_path):
@@ -592,5 +600,47 @@ async def test_file_helpers_see_the_tool_path(fake, make_env, tmp_path):
         unpack = [c for c in commands(fake) if "tar -xzf" in c][-1]
         assert unpack.startswith("PATH=") and str(tools) in unpack
         assert (tmp_path / "dst" / "a").read_text() == "a"
+        await env.download_dir(str(tmp_path / "dst"), tmp_path / "back")
+        pack, cleanup = [c for c in commands(fake) if "tar -czf" in c or c.endswith(".tgz")][-2:]
+        assert pack.startswith("PATH=") and cleanup.startswith("PATH=") and "rm -f" in cleanup
+    finally:
+        await env.stop(delete=True)
+
+
+async def test_tool_paths_profile_gives_login_shells_the_tools(fake, make_env, tmp_path):
+    tools = _layer(tmp_path)
+    profile = tmp_path / "etc" / "profile.d" / "zz-harbor-tools.sh"
+    env = make_env(tool_paths=str(tools), tool_paths_profile=str(profile))
+    await env.start(force_build=False)
+    try:
+        text = profile.read_text()
+        assert text.splitlines()[-1] == f"PATH={tools}${{PATH:+:$PATH}}; export PATH"
+        # What /etc/profile does on Debian and Alpine: set PATH, then source the drop-in.
+        result = await env.exec(f"PATH=/usr/bin:/bin; . {profile}; command -v hb-tool; echo \"$PATH\"")
+        assert result.stdout.splitlines() == [f"{tools}/hb-tool", f"{tools}:/usr/bin:/bin"]
+    finally:
+        await env.stop(delete=True)
+
+
+async def test_tool_paths_profile_is_a_warning_when_not_writable(fake, make_env, tmp_path, caplog):
+    tools = _layer(tmp_path)
+    env = make_env(tool_paths=str(tools), tool_paths_profile="/dev/null/zz-harbor-tools.sh")
+    with caplog.at_level(logging.WARNING):
+        await env.start(force_build=False)
+    try:
+        assert "could not write /dev/null/zz-harbor-tools.sh" in caplog.text
+        assert (await env.exec("hb-tool")).stdout.strip() == "from-layer"
+    finally:
+        await env.stop(delete=True)
+
+
+async def test_tool_paths_profile_can_be_disabled(fake, make_env, tmp_path):
+    tools = _layer(tmp_path)
+    env = make_env(tool_paths=str(tools), tool_paths_profile="")
+    await env.start(force_build=False)
+    try:
+        assert not any(w[0].endswith("zz-harbor-tools.sh") for w in fake.state.writes)
+        record = json.loads((env.trial_paths.trial_dir / RECORD_FILE).read_text())
+        assert record["tool_paths_profile"] is None
     finally:
         await env.stop(delete=True)

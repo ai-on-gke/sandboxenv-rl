@@ -354,16 +354,21 @@ a duplicate of #276).
 | Per-node cached-image visibility | substrate#276 needs atelet to report cached digests to ate-api | ask in a comment on #276 to expose that report (metric with the digest, or `Worker.status`) |
 | **Per-actor node placement**: mirror node labels into `Worker.labels`, or a per-actor node affinity | none found | the one new issue to file; it is what makes domains unnecessary |
 
-## Work breakdown
+## Work breakdown and status
 
-| # | PR | Size | Depends on |
-|---|---|---|---|
-| 1 | ate-env-api: `worker_selector` on create, `node` on get, CLI + Go + Python | M | — |
-| 2 | ate-env-api: `GetImageStatus` (golden state) | S | — |
-| 3 | `make-dataset.py`: unpacked image sizes in the manifest | S | — |
-| 0 | Experiment, no code: base template per pool on the C4 cluster, two domains, ten images; confirms the cache fill and the measurement before PR 1 lands | — | — |
-| 4 | `PreflightWarmer` + `swebench-loader preflight`: planner, coverage pass, events, verify | L | 1, 2, 3 |
-| 5 | `swebench-loader run -placement`, `bench` scenario `preflight:` and Validity Rule 1 | M | 1, 4 |
-| 6 | Measurement on C4: baseline vs PreflightWarmer, record under `docs/benchmarks/` | — | 4, 5 |
-| 7 | Python fleet: `FleetConfig.placement`, `ate_env.PreflightWarmer` | M | 1 |
-| 8 | Substrate: file the per-actor node placement issue; comment on #276 (cached-image visibility) and #1383 (prefetch RPC); cite #3484, #3478, #3482 | S | — |
+Status as of 2026-11-02. Update this table when a row moves; it is the backlog.
+
+| # | Item | Size | Depends on | Status |
+|---|---|---|---|---|
+| 0 | Experiment, no code: base template per pool on the C4 cluster, two domains, ten images; restore timing breakdown before and after. Decides the replication factor and the domain size the planner starts from. | — | cluster time | not started |
+| 1 | `ate-env-api`: `worker_selector` on `CreateEnvironment`, `node` and `worker_selector` on `Environment`; `ate-env create --worker-selector`, `ate-env get`; Go and Python clients | M | — | **PR #207**, branch `api/worker-selector-node` |
+| 2 | `ate-env-api`: `GetImageStatus` and `EnsureImageTemplate` (derived template, golden `NONE/PENDING/READY/FAILED`, tag, reason); feature `image_status`; `ate-env image-status`; clients | S | 1 (shared proto) | **PR #209**, branch `api/image-status`, stacked on #207; retarget to `main` after #207 merges |
+| 3 | `make-dataset.py`: `image_bytes_compressed` per instance from `crane manifest --platform`; `Instance.ImageBytesCompressed` | S | — | **PR #208**, branch `swebench/manifest-image-bytes` |
+| 4 | `PreflightWarmer` (`internal/benchmarking/swebench/preflight.go`) and `swebench-loader preflight`: the planner (`placement.json` from the manifest, the schedule and the cluster shape, under the per-node cache budget), the golden wait on `EnsureImageTemplate`/`GetImageStatus`, the coverage pass (probes with `worker_selector` until every node of a domain has run the image, node read back from `Environment.node`), delete or pin-by-parking, `events/preflight.jsonl`, the verify step. `bench prewarm` becomes its templates-only mode. | L | 1, 2, 3 | not started; build on the #209 branch so the RPCs are available before they merge |
+| 5 | `swebench-loader run -placement placement.json`; `bench` scenario step `preflight: {plan, pin}`; Validity Rule 1 reads real coverage events; `internal/benchmarking/DESIGN.md` and `benchmarking/swebench/README.md` updated to what is true | M | 1, 4 | not started |
+| 6 | Measurement on C4: baseline vs PreflightWarmer with the acceptance criteria above, recorded next to the 2026-10-08 C4 run | — | 4, 5 | not started |
+| 7 | Python fleet: `FleetConfig.placement`, `warm_pool`/`acquire`/`LookaheadWarmer`/`-prefetch` passing the image's selector, `ate_env.PreflightWarmer` with its own report phases | M | 1 | not started; after #207 merges |
+| 8 | Upstream (`agent-substrate/substrate`): comments on #276 (node placement and cached-image visibility for the unified node-locality design), #3484 (a second consumer for the bake flag and the golden-vs-boot signal), #1383 (prefetch-image RPC); file the per-actor node placement issue; cite #3482, #3478, #3528 | S | — | comments posted 2026-11-02; the node placement issue not filed yet |
+| 9 | `ate-env manifest`: render N domain pools with a domain label from one flag (optional; an operator step until row 0 says how many domains a run wants) | S | 0 | open question |
+
+Tracking issue: sandboxenv-rl #205. Follow-up: task-level tags, #206.

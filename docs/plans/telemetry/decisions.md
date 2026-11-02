@@ -126,3 +126,6 @@ Append-only. Each entry: date, who, what, why.
   the atelet relay. Every component samples parent-based, so a trace the client samples is complete
   through to the worker once Substrate exports to the same backend. No trace-context label on actors
   is needed. Substrate's `Actor state changed` records carry the trace id as well.
+- 2026-11-02, orchestrator: #186 merged as `9c30be1`; the series is complete. #202 (`5fc65b1`,
+  2026-11-02) raised the default wake budget from two minutes to five; no document in this directory
+  cites the figure.

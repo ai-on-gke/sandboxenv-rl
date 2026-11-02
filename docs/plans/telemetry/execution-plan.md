@@ -1,7 +1,7 @@
 # Execution plan: telemetry and the OpenTelemetry adapter for sandboxenv-rl
 
-Status: complete for pull requests 1 to 5; pull request 6 (#186) in review. Written 2026-10-21;
-revised 2026-10-29 to `main` at `3b03b03`.
+Status: complete; all six pull requests are merged. Written 2026-10-21; revised 2026-11-02 after
+#186 merged as `9c30be1`.
 
 Goal: `ai-on-gke/sandboxenv-rl` gains the three telemetry layers agent-sandbox has (always-on run
 report, Prometheus metrics, OpenTelemetry traces) across the Python client, the fleet,
@@ -142,7 +142,7 @@ The lead is the arbiter between developer and reviewer. A disputed finding is se
 | 4   | `telemetry-pr4`                           | #150             | `ClientOptions.TracerProvider` and `TraceServiceName`, `Attr*`, client handler, `Client.Get`; guest `-enable-tracing` and `-enable-metrics`; tests                                                 | 3          |
 | f   | `python-rpc-semconv`                      | #164             | otelgrpc's `rpc.system.name` and full `rpc.method` on Python `Client` spans; `OTEL_SEMCONV_STABILITY_OPT_IN`                                                                                       | 1, 4       |
 | 5   | `telemetry-pr5`                           | #168             | swebench event spans, GRPO and NeMo Gym on the `Observer`, `REPORT_DIR`, HTML report tool, `docs/observability.md`, `hack/metrics-docs` CI step, CHANGELOG, Python extras run in CI                | 2, 3, 4    |
-| 6   | `telemetry-pr6`                           | #186 (open)      | VeRL SWE-bench example: one run report per RayJob, one trace per iteration, `run-telemetry-e2e.sh` against the acceptance collector                                                                | 5          |
+| 6   | `telemetry-pr6`                           | #186, `9c30be1`  | VeRL SWE-bench example: one run report per RayJob, one trace per iteration, `run-telemetry-e2e.sh` against the acceptance collector                                                                | 5          |
 
 ## Risks and outcomes
 

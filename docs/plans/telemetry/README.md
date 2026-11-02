@@ -1,10 +1,9 @@
 # Plan: telemetry and the OpenTelemetry adapter for sandboxenv-rl
 
-Status: executed. Describes `main` at `3b03b03` (2026-10-29). The five pull requests this plan
-sequenced are merged. A sixth, telemetry in the VeRL SWE-bench example, is open as #186. The plan
-was written on 2026-10-21 against `8ff5c3e` as a proposal to replicate agent-sandbox's telemetry;
-this revision records the names, flags and families that shipped and where they differ from the
-proposal.
+Status: executed. Contracts checked against `main` at `3b03b03` (2026-10-29); the series completed
+with #186 (`9c30be1`, 2026-11-02). All six pull requests are merged. The plan was written on
+2026-10-21 against `8ff5c3e` as a proposal to replicate agent-sandbox's telemetry; this revision
+records the names, flags and families that shipped and where they differ from the proposal.
 
 Companion documents in this directory: [prd.md](./prd.md), [execution-plan.md](./execution-plan.md),
 [interfaces.md](./interfaces.md) (the shipped contracts),
@@ -24,7 +23,7 @@ Companion documents in this directory: [prd.md](./prd.md), [execution-plan.md](.
 | follow-up | Python `Client` spans use otelgrpc's `rpc.*` keys           | #164                              | `5a59850`, 2026-10-28                                      |
 | follow-up | Tests wait for server spans and sidecars                    | #187                              | `975d351`, 2026-10-29                                      |
 | related   | JSONL trace recorder on the client spans (benchmark series) | #173                              | `5548e10`, 2026-10-29                                      |
-| 6         | Telemetry in the VeRL SWE-bench example                     | #186                              | open, CI green                                             |
+| 6         | Telemetry in the VeRL SWE-bench example                     | #186                              | `9c30be1`, 2026-11-02                                      |
 
 Section 3 lists, element by element, what the proposal asked for and what landed.
 [decisions.md](./decisions.md) records why each name changed.
@@ -139,6 +138,5 @@ behind it.
   `Actor state changed` records, which carry the trace id, must reach a store the site can query.
 - `docs/glossary.md` has no telemetry section yet; the phase glossary lives in
   [docs/observability.md](../../observability.md#phase-glossary).
-- #186 (VeRL SWE-bench example) is the last pull request in the series and awaits review.
 - No overhead measurement for telemetry off against on is recorded in the series' pull requests;
   [test-plan.md](./test-plan.md) section 7 keeps the procedure.

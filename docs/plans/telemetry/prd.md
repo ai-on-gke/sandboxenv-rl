@@ -1,9 +1,9 @@
 # PRD: telemetry for sandboxenv-rl
 
-Status: delivered. Drafted 2026-10-21; revised 2026-10-29 to `main` at `3b03b03`. Companion
-documents: [README.md](./README.md) (design and mapping), [execution-plan.md](./execution-plan.md),
-[acceptance-criteria.md](./acceptance-criteria.md), [test-plan.md](./test-plan.md),
-[interfaces.md](./interfaces.md) and [decisions.md](./decisions.md).
+Status: delivered. Drafted 2026-10-21; revised 2026-11-02; the series completed at `9c30be1`.
+Companion documents: [README.md](./README.md) (design and mapping),
+[execution-plan.md](./execution-plan.md), [acceptance-criteria.md](./acceptance-criteria.md),
+[test-plan.md](./test-plan.md), [interfaces.md](./interfaces.md) and [decisions.md](./decisions.md).
 
 ## Problem
 
@@ -47,8 +47,8 @@ path.
    `benchmarking/telemetry_report/build_report.py`, [docs/observability.md](../../observability.md),
    generated [docs/metrics.md](../../metrics.md) with a CI freshness check, `CHANGELOG.md` and the
    Python client README.
-6. In review: telemetry in the VeRL SWE-bench example (#186): one run report per RayJob, one trace
-   per iteration, an end-to-end script against the acceptance collector.
+6. VeRL SWE-bench example (#186, merged 2026-11-02): one run report per RayJob, one trace per
+   iteration, an end-to-end script against the acceptance collector.
 
 ### Accepted limitations
 

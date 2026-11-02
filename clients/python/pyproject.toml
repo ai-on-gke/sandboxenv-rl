@@ -37,6 +37,7 @@ dev = [
     # move both together, then `make protos`.
     "grpcio-tools==1.84.0",
     "ruff~=0.17.2", # exact version in uv.lock; a minor bump changes the rules, so it is a deliberate edit
+    "coverage>=7.10",
 ]
 # OpenTelemetry tracing (ate_env.telemetry.tracing). 1.43 is the first release
 # whose opentelemetry-proto accepts protobuf 7. Only the OTLP/gRPC span

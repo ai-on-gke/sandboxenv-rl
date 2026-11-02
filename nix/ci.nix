@@ -52,6 +52,7 @@ let
     pythonEnvBase
     openhandsEnv
     uniAgentEnv
+    harborEnv
     ;
 
   diffCover = pkgs.runCommand "diff-cover" { } ''
@@ -204,6 +205,7 @@ let
     };
   openhandsShell = mkPythonShell openhandsEnv;
   uniAgentShell = mkPythonShell uniAgentEnv;
+  harborShell = mkPythonShell harborEnv;
 
   ci-python = pkgs.writeShellApplication {
     name = "ci-python";
@@ -485,6 +487,7 @@ in
     lint-actions-locally
     openhandsShell
     uniAgentShell
+    harborShell
     pythonEnvBase
     uniAgentEnv
     ;

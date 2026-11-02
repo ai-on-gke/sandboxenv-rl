@@ -23,6 +23,7 @@ members = [
     "integrations/nemo-gym",
     "integrations/openhands",
     "integrations/uni-agent",
+    "integrations/harbor",
 ]
 
 [tool.uv]

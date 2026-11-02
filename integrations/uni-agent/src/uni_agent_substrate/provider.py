@@ -270,7 +270,7 @@ class _SandboxCoordinator:
                 continue
             except FailedPreconditionError as exc:
                 # CRASHED actors cannot be suspended, and this API deletes by suspend-then-delete: no retry will
-                # help. They hold no booking; deploy.sh purges them with an any-state delete at up/down.
+                # help. They hold no booking; deploy.sh purges them through kubectl-ate at up/down.
                 self._due.pop(env_id, None)
                 logger.info("sandbox coordinator: %s cannot be deleted through the API (%s); left for the purge", env_id, exc)
                 continue

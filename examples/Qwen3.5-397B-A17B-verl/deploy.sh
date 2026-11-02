@@ -65,7 +65,10 @@ render_job() {  # profile-derived sizes and GPU placement knobs into the Job man
       -e "s|__WORKER_REPLICAS__|$((nnodes_train + nnodes_rollout - 1))|" \
       -e "s|__MEM_REQUEST__|${mem}|" -e "s|__EPH_REQUEST__|${eph}|" "$HERE/job-fully-async.yaml"
 }
-profile_get() { sed -n "s/^$1=//p" "$PROFILE_FILE" | tail -1; }
+profile_env() {  # the profile as KEY=VALUE lines: inline comments and blank lines dropped (kubectl --from-env-file keeps them in the value)
+  sed -E -e 's/[[:space:]]+#.*$//' -e '/^[[:space:]]*(#|$)/d' "$PROFILE_FILE"
+}
+profile_get() { profile_env | sed -n "s/^$1=//p" | tail -1; }
 kube_context() {
   if [ -z "${KUBE_CONTEXT:-}" ]; then
     : "${PROJECT_ID:?set KUBE_CONTEXT, or PROJECT_ID+ZONE+CLUSTER}"; : "${ZONE:?set ZONE}"; : "${CLUSTER:?set CLUSTER}"
@@ -78,9 +81,11 @@ purge_envs() {  # environments the provider left behind (sessions cut off mid-ep
   if [ -n "${KUBECTL_ATE:-}" ]; then
     # only this instance's ids (<prefix>-<12 hex>, so `ua-` does not match `ua-a-...`) plus anything CRASHED; skip actors already
     # DELETING: their delete is in progress (or stuck on a node that no longer exists) and re-issuing it only waits
-    for a in $("$KUBECTL_ATE" --context "$KUBE_CONTEXT" get actors -a ate-env 2>/dev/null | awk -v p="^${ACTOR_PREFIX}-[0-9a-f]{12}$" 'NR>1 && $4 != "ACTOR_STATE_DELETING" && ($2 ~ p || $4 == "ACTOR_STATE_CRASHED") {print $2}'); do
-      "$KUBECTL_ATE" --context "$KUBE_CONTEXT" delete actor "$a" -a ate-env --any-state >/dev/null 2>&1 || true
-    done
+    # 16 deletes at a time: a step of thousands of sessions can leave thousands behind, and one at a time takes an hour.
+    # kubectl-ate at the pinned Substrate deletes an actor in any state (the older --any-state flag is gone).
+    "$KUBECTL_ATE" --context "$KUBE_CONTEXT" get actors -a ate-env 2>/dev/null \
+      | awk -v p="^${ACTOR_PREFIX}-[0-9a-f]{12}$" 'NR>1 && $4 != "ACTOR_STATE_DELETING" && ($2 ~ p || $4 == "ACTOR_STATE_CRASHED") {print $2}' \
+      | xargs -r -P 16 -n 1 "$KUBECTL_ATE" --context "$KUBE_CONTEXT" delete actor -a ate-env >/dev/null 2>&1 || true
   else
     echo "note: set KUBECTL_ATE=<path to kubectl-ate> to delete leftover ${ACTOR_PREFIX}-* environments in atespace ate-env"
   fi
@@ -102,7 +107,8 @@ up_job() {  # ConfigMaps: run script, task config, image map, the code the pods 
       --from-file=ate-client.tgz="$tmp/ate-client.tgz" \
       --from-file=offline-exclusions.txt="$REPO/benchmarking/swebench/offline-exclusions.txt" \
       --dry-run=client -o yaml | $K -n default apply --server-side --force-conflicts -f -   # server-side: no last-applied annotation (256 KiB cap) for the big payload
-  $K -n default create configmap "$JOB-profile" --from-env-file="$PROFILE_FILE" --dry-run=client -o yaml | $K -n default apply -f -
+  profile_env > "$tmp/profile.env"
+  $K -n default create configmap "$JOB-profile" --from-env-file="$tmp/profile.env" --dry-run=client -o yaml | $K -n default apply -f -
   if [ -n "${HF_TOKEN:-}" ]; then
     $K -n default create secret generic hf-token --from-literal=token="$HF_TOKEN" --dry-run=client -o yaml | $K -n default apply -f -
   fi

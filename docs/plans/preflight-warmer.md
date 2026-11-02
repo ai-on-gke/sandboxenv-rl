@@ -50,9 +50,9 @@ available on Substrate main, not the whole answer.
 
 | # | Cost | Size | Lever | Where |
 |---|---|---|---|---|
-| 1 | No golden yet: cold boot (container start + guest start + wakeup probe) | 30–60 s on dense nodes (sandboxenv-rl #139) | bake every golden before the run; bake throughput is 5 per ateapi replica | PreflightWarmer step 1; Substrate ask 5 |
+| 1 | No golden yet: cold boot (container start + guest start + wakeup probe) | 30–60 s on dense nodes (sandboxenv-rl #139) | bake every golden before the run; bake throughput is 5 per ateapi replica. A golden saves the boot only on a node that already holds the layers (substrate#3481) | PreflightWarmer step 1; substrate#3484 |
 | 2 | First boot on the job's critical path at all | whatever 3–5 add up to | pre-create the working set as suspended environments ahead of the step (`LookaheadWarmer`, `-prefetch`), so the trainer sees a wake (~0.2–1 s pinned) not a boot | fleet SDK, loader; PreflightWarmer makes those creates cheap and the tail short |
-| 3 | `oci_unpack`: layers not in the node's image cache | seconds to minutes per GB; ~28 s in #3482 | put the layers on the nodes first (PreflightWarmer); upstream: image-aware placement (#298), lazy layers (EROFS, #2609), dedup of shared base layers already in the cache | this plan |
+| 3 | `oci_unpack`: layers not in the node's image cache | 1 ms with the layers on the node, 9–50 s without, 300 s under contention; ~97 % of a cold first command (substrate#3481) | put the layers on the nodes first (PreflightWarmer); upstream: image-aware placement (#298), lazy layers (EROFS, #2609), dedup of shared base layers already in the cache | this plan |
 | 4 | `download`: golden snapshot not in the node's file cache | snapshot size / GCS throughput | same pass fills it (shared tag snapshots are node-cached); upstream: hard links instead of copies (#2948) | this plan |
 | 5 | `worker_restore`: memory restore of the golden | 0.1–1 s; a boot if the CPU family differs | one CPU family per domain; small guest memory; MEMORY fidelity | domains |
 | 6 | Wake moved to a cold node because the pinned node was full | 36 k of 105 k wakes in one density run (#3482) | per-environment selector keeps the detach inside the domain; upstream #3482, #3528 | PR 1 |
@@ -318,8 +318,10 @@ Baseline and after, on the C4 bench cluster with the SWE-bench Verified manifest
 
 ## Risks and open questions
 
-- **Eviction between pre-flight and run.** GC runs every 5 min above 85 %; a plan that
-  fills a node past the low watermark is undone. The planner budgets below it, the
+- **Eviction between pre-flight and run.** GC runs every 5 min above 85 %, which is also
+  kubelet's DiskPressure threshold, so an overshoot evicts pods, not only layers
+  (substrate#3478: 40 nodes in DiskPressure at step 2 with 32 new images per step);
+  a plan that fills a node past the low watermark is undone. The planner budgets below it, the
   verify step checks evictions, and pin-by-parking removes the window.
 - **Detach on wake still ignores images** (#3482). The per-environment selector
   narrows the detach to the domain, which holds the image; full fix is upstream.
@@ -337,14 +339,20 @@ Baseline and after, on the C4 bench cluster with the SWE-bench Verified manifest
 
 ## Substrate asks
 
-1. Mirror node labels (or `kubernetes.io/hostname`) into `Worker.labels`, or add a
-   per-actor node affinity, so a client can place without one pool per node.
-2. Image-aware placement and detach (#298, #3482); count suspended actors in
-   placement (#3528).
-3. An atelet/ateapi "prefetch image onto worker/node" RPC, so a pre-flight needs no
-   probe actors.
-4. Per-node cached-image visibility: a metric with the image digest, or a list endpoint.
-5. A golden-bake concurrency flag per replica.
+Most of this already has an issue, several by Vicente from the 2026-10-30 density runs;
+the plan cites those instead of filing twins (substrate#3481 was closed the same day as
+a duplicate of #276).
+
+| Need | Upstream | Status |
+|---|---|---|
+| Image-aware placement: prefer a worker on a node that holds the image | substrate#276, PR #298 | open since Sep; #3481 (closed → #276) adds the measurements: `oci_unpack` 1 ms with the layers on the node, 9–50 s without (300 s under contention), ~97 % of a cold first command; a cold golden restore onto a cold node (16.6 s) was no faster than a cold boot (14.6 s) |
+| Image-aware detach on wake; record the move on the actor | substrate#3482 | open |
+| Count suspended actors in placement | substrate#3528 | open |
+| Golden-bake concurrency as a flag; tell the caller golden vs boot | substrate#3484 | open; also the upstream half of `GetImageStatus` |
+| Image-cache GC below kubelet's DiskPressure threshold | substrate#3478 | open; until then the SKILL's 30 s / 70 / 60 flags |
+| Pull the image off the request path; "pre-warming a node should make it warm" | substrate#1383 | open; the natural home for a prefetch-image RPC, as a comment, not a new issue |
+| Per-node cached-image visibility | substrate#276 needs atelet to report cached digests to ate-api | ask in a comment on #276 to expose that report (metric with the digest, or `Worker.status`) |
+| **Per-actor node placement**: mirror node labels into `Worker.labels`, or a per-actor node affinity | none found | the one new issue to file; it is what makes domains unnecessary |
 
 ## Work breakdown
 
@@ -358,4 +366,4 @@ Baseline and after, on the C4 bench cluster with the SWE-bench Verified manifest
 | 5 | `swebench-loader run -placement`, `bench` scenario `preflight:` and Validity Rule 1 | M | 1, 4 |
 | 6 | Measurement on C4: baseline vs PreflightWarmer, record under `docs/benchmarks/` | — | 4, 5 |
 | 7 | Python fleet: `FleetConfig.placement`, `ate_env.PreflightWarmer` | M | 1 |
-| 8 | Substrate issues for the asks above | S | — |
+| 8 | Substrate: file the per-actor node placement issue; comment on #276 (cached-image visibility) and #1383 (prefetch RPC); cite #3484, #3478, #3482 | S | — |

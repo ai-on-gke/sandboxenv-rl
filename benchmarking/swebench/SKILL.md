@@ -128,8 +128,12 @@ the large images:
 ... run-in-cluster.sh RUN prime-swe-rl-94.jsonl -mode eval -images 94 -tasks-per-image 1 -width 3 -trajectory workload-file-read -set READ_FILES=200 -label arm=read ...
 ```
 
-Caches must be cold per rep: a fresh node pool, or a cluster with hundreds of nodes, where 94
-images never land on a node that holds them. Goldens are baked once beforehand and not timed.
+Sizing: nodes = width / 1.3, rounded up, e2-standard-8 with a 500 GB pd-balanced disk. 1.3 to
+1.5 starts per node at a time is what every baseline used, so the number is the per-start cost
+and not disk contention; width 3 needs 2 nodes, width 13 needs 10. Caches must be cold per rep:
+recreate the node pool, or use at least 47 images per node, the full run's ratio, so a start never
+lands on a node that holds its image. A 500 GB disk holds about 290 unpacked Prime images under
+the 70% eviction mark. Goldens are baked once beforehand and not timed.
 Baseline, plain pull on pd-balanced: start 31 to 32 s p50 / 73 s p95 with unpack 97% of it, the
 three large images 200 to 600 s, the read step 4 to 5 s; 94 starts per arm, two reps when the p95 matters. It measures the
 per-start cost without contention; a width of 160 per node measures contention instead, and the two are not comparable

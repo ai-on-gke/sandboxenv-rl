@@ -38,11 +38,13 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	EnvironmentService_CreateEnvironment_FullMethodName  = "/ateenv.v1alpha.EnvironmentService/CreateEnvironment"
-	EnvironmentService_GetEnvironment_FullMethodName     = "/ateenv.v1alpha.EnvironmentService/GetEnvironment"
-	EnvironmentService_SuspendEnvironment_FullMethodName = "/ateenv.v1alpha.EnvironmentService/SuspendEnvironment"
-	EnvironmentService_DeleteEnvironment_FullMethodName  = "/ateenv.v1alpha.EnvironmentService/DeleteEnvironment"
-	EnvironmentService_GetServerInfo_FullMethodName      = "/ateenv.v1alpha.EnvironmentService/GetServerInfo"
+	EnvironmentService_CreateEnvironment_FullMethodName   = "/ateenv.v1alpha.EnvironmentService/CreateEnvironment"
+	EnvironmentService_GetEnvironment_FullMethodName      = "/ateenv.v1alpha.EnvironmentService/GetEnvironment"
+	EnvironmentService_SuspendEnvironment_FullMethodName  = "/ateenv.v1alpha.EnvironmentService/SuspendEnvironment"
+	EnvironmentService_DeleteEnvironment_FullMethodName   = "/ateenv.v1alpha.EnvironmentService/DeleteEnvironment"
+	EnvironmentService_GetServerInfo_FullMethodName       = "/ateenv.v1alpha.EnvironmentService/GetServerInfo"
+	EnvironmentService_GetImageStatus_FullMethodName      = "/ateenv.v1alpha.EnvironmentService/GetImageStatus"
+	EnvironmentService_EnsureImageTemplate_FullMethodName = "/ateenv.v1alpha.EnvironmentService/EnsureImageTemplate"
 )
 
 // EnvironmentServiceClient is the client API for EnvironmentService service.
@@ -63,6 +65,15 @@ type EnvironmentServiceClient interface {
 	// the optional features it serves, so a client can check them before it
 	// depends on them.
 	GetServerInfo(ctx context.Context, in *GetServerInfoRequest, opts ...grpc.CallOption) (*GetServerInfoResponse, error)
+	// Report the ActorTemplate derived for a rootfs image: whether it exists
+	// and whether its golden snapshot is ready, still baking, or failed. Reads
+	// only; a missing template is reported, not created.
+	GetImageStatus(ctx context.Context, in *GetImageStatusRequest, opts ...grpc.CallOption) (*ImageStatus, error)
+	// Create the ActorTemplate derived for a rootfs image when it is missing,
+	// which starts its golden snapshot bake, and report it as GetImageStatus
+	// does. No environment is created. A template whose golden bake failed is
+	// recreated the way CreateEnvironment would.
+	EnsureImageTemplate(ctx context.Context, in *EnsureImageTemplateRequest, opts ...grpc.CallOption) (*ImageStatus, error)
 }
 
 type environmentServiceClient struct {
@@ -123,6 +134,26 @@ func (c *environmentServiceClient) GetServerInfo(ctx context.Context, in *GetSer
 	return out, nil
 }
 
+func (c *environmentServiceClient) GetImageStatus(ctx context.Context, in *GetImageStatusRequest, opts ...grpc.CallOption) (*ImageStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ImageStatus)
+	err := c.cc.Invoke(ctx, EnvironmentService_GetImageStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *environmentServiceClient) EnsureImageTemplate(ctx context.Context, in *EnsureImageTemplateRequest, opts ...grpc.CallOption) (*ImageStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ImageStatus)
+	err := c.cc.Invoke(ctx, EnvironmentService_EnsureImageTemplate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // EnvironmentServiceServer is the server API for EnvironmentService service.
 // All implementations must embed UnimplementedEnvironmentServiceServer
 // for forward compatibility.
@@ -141,6 +172,15 @@ type EnvironmentServiceServer interface {
 	// the optional features it serves, so a client can check them before it
 	// depends on them.
 	GetServerInfo(context.Context, *GetServerInfoRequest) (*GetServerInfoResponse, error)
+	// Report the ActorTemplate derived for a rootfs image: whether it exists
+	// and whether its golden snapshot is ready, still baking, or failed. Reads
+	// only; a missing template is reported, not created.
+	GetImageStatus(context.Context, *GetImageStatusRequest) (*ImageStatus, error)
+	// Create the ActorTemplate derived for a rootfs image when it is missing,
+	// which starts its golden snapshot bake, and report it as GetImageStatus
+	// does. No environment is created. A template whose golden bake failed is
+	// recreated the way CreateEnvironment would.
+	EnsureImageTemplate(context.Context, *EnsureImageTemplateRequest) (*ImageStatus, error)
 	mustEmbedUnimplementedEnvironmentServiceServer()
 }
 
@@ -165,6 +205,12 @@ func (UnimplementedEnvironmentServiceServer) DeleteEnvironment(context.Context, 
 }
 func (UnimplementedEnvironmentServiceServer) GetServerInfo(context.Context, *GetServerInfoRequest) (*GetServerInfoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetServerInfo not implemented")
+}
+func (UnimplementedEnvironmentServiceServer) GetImageStatus(context.Context, *GetImageStatusRequest) (*ImageStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetImageStatus not implemented")
+}
+func (UnimplementedEnvironmentServiceServer) EnsureImageTemplate(context.Context, *EnsureImageTemplateRequest) (*ImageStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method EnsureImageTemplate not implemented")
 }
 func (UnimplementedEnvironmentServiceServer) mustEmbedUnimplementedEnvironmentServiceServer() {}
 func (UnimplementedEnvironmentServiceServer) testEmbeddedByValue()                            {}
@@ -277,6 +323,42 @@ func _EnvironmentService_GetServerInfo_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _EnvironmentService_GetImageStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetImageStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EnvironmentServiceServer).GetImageStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EnvironmentService_GetImageStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EnvironmentServiceServer).GetImageStatus(ctx, req.(*GetImageStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _EnvironmentService_EnsureImageTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnsureImageTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EnvironmentServiceServer).EnsureImageTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: EnvironmentService_EnsureImageTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EnvironmentServiceServer).EnsureImageTemplate(ctx, req.(*EnsureImageTemplateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // EnvironmentService_ServiceDesc is the grpc.ServiceDesc for EnvironmentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -303,6 +385,14 @@ var EnvironmentService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetServerInfo",
 			Handler:    _EnvironmentService_GetServerInfo_Handler,
+		},
+		{
+			MethodName: "GetImageStatus",
+			Handler:    _EnvironmentService_GetImageStatus_Handler,
+		},
+		{
+			MethodName: "EnsureImageTemplate",
+			Handler:    _EnvironmentService_EnsureImageTemplate_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

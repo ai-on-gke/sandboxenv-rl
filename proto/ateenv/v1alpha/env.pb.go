@@ -116,6 +116,70 @@ func (EnvironmentStatus) EnumDescriptor() ([]byte, []int) {
 	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{0}
 }
 
+// State of a derived template's golden snapshot, the snapshot every
+// environment on the image restores from instead of booting.
+type GoldenSnapshotState int32
+
+const (
+	GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_UNSPECIFIED GoldenSnapshotState = 0
+	// The derived template does not exist, thus no bake has started.
+	GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_NONE GoldenSnapshotState = 1
+	// The template exists and its golden snapshot is baking; environments
+	// created now boot from the image.
+	GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_PENDING GoldenSnapshotState = 2
+	// The golden snapshot is tagged; environments restore from it.
+	GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_READY GoldenSnapshotState = 3
+	// The bake failed and will not be retried on this template
+	// (golden_error says why); environments boot from the image until the
+	// template is recreated.
+	GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_FAILED GoldenSnapshotState = 4
+)
+
+// Enum value maps for GoldenSnapshotState.
+var (
+	GoldenSnapshotState_name = map[int32]string{
+		0: "GOLDEN_SNAPSHOT_STATE_UNSPECIFIED",
+		1: "GOLDEN_SNAPSHOT_STATE_NONE",
+		2: "GOLDEN_SNAPSHOT_STATE_PENDING",
+		3: "GOLDEN_SNAPSHOT_STATE_READY",
+		4: "GOLDEN_SNAPSHOT_STATE_FAILED",
+	}
+	GoldenSnapshotState_value = map[string]int32{
+		"GOLDEN_SNAPSHOT_STATE_UNSPECIFIED": 0,
+		"GOLDEN_SNAPSHOT_STATE_NONE":        1,
+		"GOLDEN_SNAPSHOT_STATE_PENDING":     2,
+		"GOLDEN_SNAPSHOT_STATE_READY":       3,
+		"GOLDEN_SNAPSHOT_STATE_FAILED":      4,
+	}
+)
+
+func (x GoldenSnapshotState) Enum() *GoldenSnapshotState {
+	p := new(GoldenSnapshotState)
+	*p = x
+	return p
+}
+
+func (x GoldenSnapshotState) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (GoldenSnapshotState) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_ateenv_v1alpha_env_proto_enumTypes[1].Descriptor()
+}
+
+func (GoldenSnapshotState) Type() protoreflect.EnumType {
+	return &file_proto_ateenv_v1alpha_env_proto_enumTypes[1]
+}
+
+func (x GoldenSnapshotState) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use GoldenSnapshotState.Descriptor instead.
+func (GoldenSnapshotState) EnumDescriptor() ([]byte, []int) {
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{1}
+}
+
 // Template represents an ActorTemplate used to instantiate environments.
 type Template struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -407,6 +471,229 @@ func (x *CreateEnvironmentResponse) GetEnvironment() *Environment {
 	return nil
 }
 
+// Request for the state of the template derived for a rootfs image.
+type GetImageStatusRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Rootfs image, pinned by digest (repo@sha256:...). Required.
+	RootfsImage string `protobuf:"bytes,1,opt,name=rootfs_image,json=rootfsImage,proto3" json:"rootfs_image,omitempty"`
+	// Base ActorTemplate the derived template comes from; defaults as in
+	// CreateEnvironmentRequest.template.
+	Template *Template `protobuf:"bytes,2,opt,name=template,proto3" json:"template,omitempty"`
+	// Atespace of the templates (defaults as in CreateEnvironmentRequest).
+	Atespace      string `protobuf:"bytes,3,opt,name=atespace,proto3" json:"atespace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetImageStatusRequest) Reset() {
+	*x = GetImageStatusRequest{}
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetImageStatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetImageStatusRequest) ProtoMessage() {}
+
+func (x *GetImageStatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetImageStatusRequest.ProtoReflect.Descriptor instead.
+func (*GetImageStatusRequest) Descriptor() ([]byte, []int) {
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *GetImageStatusRequest) GetRootfsImage() string {
+	if x != nil {
+		return x.RootfsImage
+	}
+	return ""
+}
+
+func (x *GetImageStatusRequest) GetTemplate() *Template {
+	if x != nil {
+		return x.Template
+	}
+	return nil
+}
+
+func (x *GetImageStatusRequest) GetAtespace() string {
+	if x != nil {
+		return x.Atespace
+	}
+	return ""
+}
+
+// Request to create the template derived for a rootfs image when missing.
+type EnsureImageTemplateRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Rootfs image, pinned by digest (repo@sha256:...). Required.
+	RootfsImage string `protobuf:"bytes,1,opt,name=rootfs_image,json=rootfsImage,proto3" json:"rootfs_image,omitempty"`
+	// Base ActorTemplate the derived template comes from; defaults as in
+	// CreateEnvironmentRequest.template.
+	Template *Template `protobuf:"bytes,2,opt,name=template,proto3" json:"template,omitempty"`
+	// Atespace of the templates (defaults as in CreateEnvironmentRequest).
+	Atespace      string `protobuf:"bytes,3,opt,name=atespace,proto3" json:"atespace,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *EnsureImageTemplateRequest) Reset() {
+	*x = EnsureImageTemplateRequest{}
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *EnsureImageTemplateRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*EnsureImageTemplateRequest) ProtoMessage() {}
+
+func (x *EnsureImageTemplateRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use EnsureImageTemplateRequest.ProtoReflect.Descriptor instead.
+func (*EnsureImageTemplateRequest) Descriptor() ([]byte, []int) {
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *EnsureImageTemplateRequest) GetRootfsImage() string {
+	if x != nil {
+		return x.RootfsImage
+	}
+	return ""
+}
+
+func (x *EnsureImageTemplateRequest) GetTemplate() *Template {
+	if x != nil {
+		return x.Template
+	}
+	return nil
+}
+
+func (x *EnsureImageTemplateRequest) GetAtespace() string {
+	if x != nil {
+		return x.Atespace
+	}
+	return ""
+}
+
+// The template derived for a rootfs image and the state of its golden
+// snapshot.
+type ImageStatus struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The rootfs image asked about.
+	RootfsImage string `protobuf:"bytes,1,opt,name=rootfs_image,json=rootfsImage,proto3" json:"rootfs_image,omitempty"`
+	// The derived template: "<base>-<first 12 hex digits of the digest>" in
+	// the base's atespace, whether or not it exists yet.
+	Template *Template `protobuf:"bytes,2,opt,name=template,proto3" json:"template,omitempty"`
+	// Whether the derived template exists.
+	TemplateExists bool `protobuf:"varint,3,opt,name=template_exists,json=templateExists,proto3" json:"template_exists,omitempty"`
+	// State of the golden snapshot.
+	Golden GoldenSnapshotState `protobuf:"varint,4,opt,name=golden,proto3,enum=ateenv.v1alpha.GoldenSnapshotState" json:"golden,omitempty"`
+	// Name of the golden tag when golden is READY.
+	GoldenTag string `protobuf:"bytes,5,opt,name=golden_tag,json=goldenTag,proto3" json:"golden_tag,omitempty"`
+	// Why the bake failed when golden is FAILED ("<Reason>: <detail>").
+	GoldenError   string `protobuf:"bytes,6,opt,name=golden_error,json=goldenError,proto3" json:"golden_error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ImageStatus) Reset() {
+	*x = ImageStatus{}
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ImageStatus) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ImageStatus) ProtoMessage() {}
+
+func (x *ImageStatus) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ImageStatus.ProtoReflect.Descriptor instead.
+func (*ImageStatus) Descriptor() ([]byte, []int) {
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *ImageStatus) GetRootfsImage() string {
+	if x != nil {
+		return x.RootfsImage
+	}
+	return ""
+}
+
+func (x *ImageStatus) GetTemplate() *Template {
+	if x != nil {
+		return x.Template
+	}
+	return nil
+}
+
+func (x *ImageStatus) GetTemplateExists() bool {
+	if x != nil {
+		return x.TemplateExists
+	}
+	return false
+}
+
+func (x *ImageStatus) GetGolden() GoldenSnapshotState {
+	if x != nil {
+		return x.Golden
+	}
+	return GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_UNSPECIFIED
+}
+
+func (x *ImageStatus) GetGoldenTag() string {
+	if x != nil {
+		return x.GoldenTag
+	}
+	return ""
+}
+
+func (x *ImageStatus) GetGoldenError() string {
+	if x != nil {
+		return x.GoldenError
+	}
+	return ""
+}
+
 // Request to inspect an environment.
 type GetEnvironmentRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -420,7 +707,7 @@ type GetEnvironmentRequest struct {
 
 func (x *GetEnvironmentRequest) Reset() {
 	*x = GetEnvironmentRequest{}
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[4]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -432,7 +719,7 @@ func (x *GetEnvironmentRequest) String() string {
 func (*GetEnvironmentRequest) ProtoMessage() {}
 
 func (x *GetEnvironmentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[4]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -445,7 +732,7 @@ func (x *GetEnvironmentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetEnvironmentRequest.ProtoReflect.Descriptor instead.
 func (*GetEnvironmentRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{4}
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *GetEnvironmentRequest) GetId() string {
@@ -473,7 +760,7 @@ type GetEnvironmentResponse struct {
 
 func (x *GetEnvironmentResponse) Reset() {
 	*x = GetEnvironmentResponse{}
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[5]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -485,7 +772,7 @@ func (x *GetEnvironmentResponse) String() string {
 func (*GetEnvironmentResponse) ProtoMessage() {}
 
 func (x *GetEnvironmentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[5]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -498,7 +785,7 @@ func (x *GetEnvironmentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetEnvironmentResponse.ProtoReflect.Descriptor instead.
 func (*GetEnvironmentResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{5}
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *GetEnvironmentResponse) GetEnvironment() *Environment {
@@ -521,7 +808,7 @@ type SuspendEnvironmentRequest struct {
 
 func (x *SuspendEnvironmentRequest) Reset() {
 	*x = SuspendEnvironmentRequest{}
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[6]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -533,7 +820,7 @@ func (x *SuspendEnvironmentRequest) String() string {
 func (*SuspendEnvironmentRequest) ProtoMessage() {}
 
 func (x *SuspendEnvironmentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[6]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -546,7 +833,7 @@ func (x *SuspendEnvironmentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SuspendEnvironmentRequest.ProtoReflect.Descriptor instead.
 func (*SuspendEnvironmentRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{6}
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *SuspendEnvironmentRequest) GetId() string {
@@ -572,7 +859,7 @@ type SuspendEnvironmentResponse struct {
 
 func (x *SuspendEnvironmentResponse) Reset() {
 	*x = SuspendEnvironmentResponse{}
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[7]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -584,7 +871,7 @@ func (x *SuspendEnvironmentResponse) String() string {
 func (*SuspendEnvironmentResponse) ProtoMessage() {}
 
 func (x *SuspendEnvironmentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[7]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -597,7 +884,7 @@ func (x *SuspendEnvironmentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SuspendEnvironmentResponse.ProtoReflect.Descriptor instead.
 func (*SuspendEnvironmentResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{7}
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{10}
 }
 
 // Request to delete an environment.
@@ -613,7 +900,7 @@ type DeleteEnvironmentRequest struct {
 
 func (x *DeleteEnvironmentRequest) Reset() {
 	*x = DeleteEnvironmentRequest{}
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[8]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -625,7 +912,7 @@ func (x *DeleteEnvironmentRequest) String() string {
 func (*DeleteEnvironmentRequest) ProtoMessage() {}
 
 func (x *DeleteEnvironmentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[8]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -638,7 +925,7 @@ func (x *DeleteEnvironmentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteEnvironmentRequest.ProtoReflect.Descriptor instead.
 func (*DeleteEnvironmentRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{8}
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *DeleteEnvironmentRequest) GetId() string {
@@ -664,7 +951,7 @@ type DeleteEnvironmentResponse struct {
 
 func (x *DeleteEnvironmentResponse) Reset() {
 	*x = DeleteEnvironmentResponse{}
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[9]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -676,7 +963,7 @@ func (x *DeleteEnvironmentResponse) String() string {
 func (*DeleteEnvironmentResponse) ProtoMessage() {}
 
 func (x *DeleteEnvironmentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[9]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -689,7 +976,7 @@ func (x *DeleteEnvironmentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteEnvironmentResponse.ProtoReflect.Descriptor instead.
 func (*DeleteEnvironmentResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{9}
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{12}
 }
 
 // Request for the server's identity and features.
@@ -701,7 +988,7 @@ type GetServerInfoRequest struct {
 
 func (x *GetServerInfoRequest) Reset() {
 	*x = GetServerInfoRequest{}
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[10]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -713,7 +1000,7 @@ func (x *GetServerInfoRequest) String() string {
 func (*GetServerInfoRequest) ProtoMessage() {}
 
 func (x *GetServerInfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[10]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -726,7 +1013,7 @@ func (x *GetServerInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetServerInfoRequest.ProtoReflect.Descriptor instead.
 func (*GetServerInfoRequest) Descriptor() ([]byte, []int) {
-	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{10}
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{13}
 }
 
 // Identity, version and optional features of the server.
@@ -755,7 +1042,7 @@ type GetServerInfoResponse struct {
 
 func (x *GetServerInfoResponse) Reset() {
 	*x = GetServerInfoResponse{}
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[11]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -767,7 +1054,7 @@ func (x *GetServerInfoResponse) String() string {
 func (*GetServerInfoResponse) ProtoMessage() {}
 
 func (x *GetServerInfoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[11]
+	mi := &file_proto_ateenv_v1alpha_env_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -780,7 +1067,7 @@ func (x *GetServerInfoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetServerInfoResponse.ProtoReflect.Descriptor instead.
 func (*GetServerInfoResponse) Descriptor() ([]byte, []int) {
-	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{11}
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *GetServerInfoResponse) GetServer() string {
@@ -839,7 +1126,23 @@ const file_proto_ateenv_v1alpha_env_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"Z\n" +
 	"\x19CreateEnvironmentResponse\x12=\n" +
-	"\venvironment\x18\x01 \x01(\v2\x1b.ateenv.v1alpha.EnvironmentR\venvironment\"C\n" +
+	"\venvironment\x18\x01 \x01(\v2\x1b.ateenv.v1alpha.EnvironmentR\venvironment\"\x8c\x01\n" +
+	"\x15GetImageStatusRequest\x12!\n" +
+	"\frootfs_image\x18\x01 \x01(\tR\vrootfsImage\x124\n" +
+	"\btemplate\x18\x02 \x01(\v2\x18.ateenv.v1alpha.TemplateR\btemplate\x12\x1a\n" +
+	"\batespace\x18\x03 \x01(\tR\batespace\"\x91\x01\n" +
+	"\x1aEnsureImageTemplateRequest\x12!\n" +
+	"\frootfs_image\x18\x01 \x01(\tR\vrootfsImage\x124\n" +
+	"\btemplate\x18\x02 \x01(\v2\x18.ateenv.v1alpha.TemplateR\btemplate\x12\x1a\n" +
+	"\batespace\x18\x03 \x01(\tR\batespace\"\x8e\x02\n" +
+	"\vImageStatus\x12!\n" +
+	"\frootfs_image\x18\x01 \x01(\tR\vrootfsImage\x124\n" +
+	"\btemplate\x18\x02 \x01(\v2\x18.ateenv.v1alpha.TemplateR\btemplate\x12'\n" +
+	"\x0ftemplate_exists\x18\x03 \x01(\bR\x0etemplateExists\x12;\n" +
+	"\x06golden\x18\x04 \x01(\x0e2#.ateenv.v1alpha.GoldenSnapshotStateR\x06golden\x12\x1d\n" +
+	"\n" +
+	"golden_tag\x18\x05 \x01(\tR\tgoldenTag\x12!\n" +
+	"\fgolden_error\x18\x06 \x01(\tR\vgoldenError\"C\n" +
 	"\x15GetEnvironmentRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
 	"\batespace\x18\x02 \x01(\tR\batespace\"W\n" +
@@ -868,13 +1171,21 @@ const file_proto_ateenv_v1alpha_env_proto_rawDesc = "" +
 	"\x1aENVIRONMENT_STATUS_PAUSING\x10\x05\x12\x1d\n" +
 	"\x19ENVIRONMENT_STATUS_PAUSED\x10\x06\x12\x1e\n" +
 	"\x1aENVIRONMENT_STATUS_CRASHED\x10\a\x12\x1f\n" +
-	"\x1bENVIRONMENT_STATUS_DELETING\x10\b2\x94\x04\n" +
+	"\x1bENVIRONMENT_STATUS_DELETING\x10\b*\xc2\x01\n" +
+	"\x13GoldenSnapshotState\x12%\n" +
+	"!GOLDEN_SNAPSHOT_STATE_UNSPECIFIED\x10\x00\x12\x1e\n" +
+	"\x1aGOLDEN_SNAPSHOT_STATE_NONE\x10\x01\x12!\n" +
+	"\x1dGOLDEN_SNAPSHOT_STATE_PENDING\x10\x02\x12\x1f\n" +
+	"\x1bGOLDEN_SNAPSHOT_STATE_READY\x10\x03\x12 \n" +
+	"\x1cGOLDEN_SNAPSHOT_STATE_FAILED\x10\x042\xca\x05\n" +
 	"\x12EnvironmentService\x12h\n" +
 	"\x11CreateEnvironment\x12(.ateenv.v1alpha.CreateEnvironmentRequest\x1a).ateenv.v1alpha.CreateEnvironmentResponse\x12_\n" +
 	"\x0eGetEnvironment\x12%.ateenv.v1alpha.GetEnvironmentRequest\x1a&.ateenv.v1alpha.GetEnvironmentResponse\x12k\n" +
 	"\x12SuspendEnvironment\x12).ateenv.v1alpha.SuspendEnvironmentRequest\x1a*.ateenv.v1alpha.SuspendEnvironmentResponse\x12h\n" +
 	"\x11DeleteEnvironment\x12(.ateenv.v1alpha.DeleteEnvironmentRequest\x1a).ateenv.v1alpha.DeleteEnvironmentResponse\x12\\\n" +
-	"\rGetServerInfo\x12$.ateenv.v1alpha.GetServerInfoRequest\x1a%.ateenv.v1alpha.GetServerInfoResponseBCZAgithub.com/agent-substrate/env/proto/ateenv/v1alpha;ateenvv1alphab\x06proto3"
+	"\rGetServerInfo\x12$.ateenv.v1alpha.GetServerInfoRequest\x1a%.ateenv.v1alpha.GetServerInfoResponse\x12T\n" +
+	"\x0eGetImageStatus\x12%.ateenv.v1alpha.GetImageStatusRequest\x1a\x1b.ateenv.v1alpha.ImageStatus\x12^\n" +
+	"\x13EnsureImageTemplate\x12*.ateenv.v1alpha.EnsureImageTemplateRequest\x1a\x1b.ateenv.v1alpha.ImageStatusBCZAgithub.com/agent-substrate/env/proto/ateenv/v1alpha;ateenvv1alphab\x06proto3"
 
 var (
 	file_proto_ateenv_v1alpha_env_proto_rawDescOnce sync.Once
@@ -888,48 +1199,60 @@ func file_proto_ateenv_v1alpha_env_proto_rawDescGZIP() []byte {
 	return file_proto_ateenv_v1alpha_env_proto_rawDescData
 }
 
-var file_proto_ateenv_v1alpha_env_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_ateenv_v1alpha_env_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_proto_ateenv_v1alpha_env_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_proto_ateenv_v1alpha_env_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_proto_ateenv_v1alpha_env_proto_goTypes = []any{
 	(EnvironmentStatus)(0),             // 0: ateenv.v1alpha.EnvironmentStatus
-	(*Template)(nil),                   // 1: ateenv.v1alpha.Template
-	(*Environment)(nil),                // 2: ateenv.v1alpha.Environment
-	(*CreateEnvironmentRequest)(nil),   // 3: ateenv.v1alpha.CreateEnvironmentRequest
-	(*CreateEnvironmentResponse)(nil),  // 4: ateenv.v1alpha.CreateEnvironmentResponse
-	(*GetEnvironmentRequest)(nil),      // 5: ateenv.v1alpha.GetEnvironmentRequest
-	(*GetEnvironmentResponse)(nil),     // 6: ateenv.v1alpha.GetEnvironmentResponse
-	(*SuspendEnvironmentRequest)(nil),  // 7: ateenv.v1alpha.SuspendEnvironmentRequest
-	(*SuspendEnvironmentResponse)(nil), // 8: ateenv.v1alpha.SuspendEnvironmentResponse
-	(*DeleteEnvironmentRequest)(nil),   // 9: ateenv.v1alpha.DeleteEnvironmentRequest
-	(*DeleteEnvironmentResponse)(nil),  // 10: ateenv.v1alpha.DeleteEnvironmentResponse
-	(*GetServerInfoRequest)(nil),       // 11: ateenv.v1alpha.GetServerInfoRequest
-	(*GetServerInfoResponse)(nil),      // 12: ateenv.v1alpha.GetServerInfoResponse
-	nil,                                // 13: ateenv.v1alpha.Environment.WorkerSelectorEntry
-	nil,                                // 14: ateenv.v1alpha.CreateEnvironmentRequest.WorkerSelectorEntry
+	(GoldenSnapshotState)(0),           // 1: ateenv.v1alpha.GoldenSnapshotState
+	(*Template)(nil),                   // 2: ateenv.v1alpha.Template
+	(*Environment)(nil),                // 3: ateenv.v1alpha.Environment
+	(*CreateEnvironmentRequest)(nil),   // 4: ateenv.v1alpha.CreateEnvironmentRequest
+	(*CreateEnvironmentResponse)(nil),  // 5: ateenv.v1alpha.CreateEnvironmentResponse
+	(*GetImageStatusRequest)(nil),      // 6: ateenv.v1alpha.GetImageStatusRequest
+	(*EnsureImageTemplateRequest)(nil), // 7: ateenv.v1alpha.EnsureImageTemplateRequest
+	(*ImageStatus)(nil),                // 8: ateenv.v1alpha.ImageStatus
+	(*GetEnvironmentRequest)(nil),      // 9: ateenv.v1alpha.GetEnvironmentRequest
+	(*GetEnvironmentResponse)(nil),     // 10: ateenv.v1alpha.GetEnvironmentResponse
+	(*SuspendEnvironmentRequest)(nil),  // 11: ateenv.v1alpha.SuspendEnvironmentRequest
+	(*SuspendEnvironmentResponse)(nil), // 12: ateenv.v1alpha.SuspendEnvironmentResponse
+	(*DeleteEnvironmentRequest)(nil),   // 13: ateenv.v1alpha.DeleteEnvironmentRequest
+	(*DeleteEnvironmentResponse)(nil),  // 14: ateenv.v1alpha.DeleteEnvironmentResponse
+	(*GetServerInfoRequest)(nil),       // 15: ateenv.v1alpha.GetServerInfoRequest
+	(*GetServerInfoResponse)(nil),      // 16: ateenv.v1alpha.GetServerInfoResponse
+	nil,                                // 17: ateenv.v1alpha.Environment.WorkerSelectorEntry
+	nil,                                // 18: ateenv.v1alpha.CreateEnvironmentRequest.WorkerSelectorEntry
 }
 var file_proto_ateenv_v1alpha_env_proto_depIdxs = []int32{
-	1,  // 0: ateenv.v1alpha.Environment.template:type_name -> ateenv.v1alpha.Template
+	2,  // 0: ateenv.v1alpha.Environment.template:type_name -> ateenv.v1alpha.Template
 	0,  // 1: ateenv.v1alpha.Environment.status:type_name -> ateenv.v1alpha.EnvironmentStatus
-	13, // 2: ateenv.v1alpha.Environment.worker_selector:type_name -> ateenv.v1alpha.Environment.WorkerSelectorEntry
-	1,  // 3: ateenv.v1alpha.CreateEnvironmentRequest.template:type_name -> ateenv.v1alpha.Template
-	14, // 4: ateenv.v1alpha.CreateEnvironmentRequest.worker_selector:type_name -> ateenv.v1alpha.CreateEnvironmentRequest.WorkerSelectorEntry
-	2,  // 5: ateenv.v1alpha.CreateEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
-	2,  // 6: ateenv.v1alpha.GetEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
-	3,  // 7: ateenv.v1alpha.EnvironmentService.CreateEnvironment:input_type -> ateenv.v1alpha.CreateEnvironmentRequest
-	5,  // 8: ateenv.v1alpha.EnvironmentService.GetEnvironment:input_type -> ateenv.v1alpha.GetEnvironmentRequest
-	7,  // 9: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:input_type -> ateenv.v1alpha.SuspendEnvironmentRequest
-	9,  // 10: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:input_type -> ateenv.v1alpha.DeleteEnvironmentRequest
-	11, // 11: ateenv.v1alpha.EnvironmentService.GetServerInfo:input_type -> ateenv.v1alpha.GetServerInfoRequest
-	4,  // 12: ateenv.v1alpha.EnvironmentService.CreateEnvironment:output_type -> ateenv.v1alpha.CreateEnvironmentResponse
-	6,  // 13: ateenv.v1alpha.EnvironmentService.GetEnvironment:output_type -> ateenv.v1alpha.GetEnvironmentResponse
-	8,  // 14: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:output_type -> ateenv.v1alpha.SuspendEnvironmentResponse
-	10, // 15: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:output_type -> ateenv.v1alpha.DeleteEnvironmentResponse
-	12, // 16: ateenv.v1alpha.EnvironmentService.GetServerInfo:output_type -> ateenv.v1alpha.GetServerInfoResponse
-	12, // [12:17] is the sub-list for method output_type
-	7,  // [7:12] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	17, // 2: ateenv.v1alpha.Environment.worker_selector:type_name -> ateenv.v1alpha.Environment.WorkerSelectorEntry
+	2,  // 3: ateenv.v1alpha.CreateEnvironmentRequest.template:type_name -> ateenv.v1alpha.Template
+	18, // 4: ateenv.v1alpha.CreateEnvironmentRequest.worker_selector:type_name -> ateenv.v1alpha.CreateEnvironmentRequest.WorkerSelectorEntry
+	3,  // 5: ateenv.v1alpha.CreateEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
+	2,  // 6: ateenv.v1alpha.GetImageStatusRequest.template:type_name -> ateenv.v1alpha.Template
+	2,  // 7: ateenv.v1alpha.EnsureImageTemplateRequest.template:type_name -> ateenv.v1alpha.Template
+	2,  // 8: ateenv.v1alpha.ImageStatus.template:type_name -> ateenv.v1alpha.Template
+	1,  // 9: ateenv.v1alpha.ImageStatus.golden:type_name -> ateenv.v1alpha.GoldenSnapshotState
+	3,  // 10: ateenv.v1alpha.GetEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
+	4,  // 11: ateenv.v1alpha.EnvironmentService.CreateEnvironment:input_type -> ateenv.v1alpha.CreateEnvironmentRequest
+	9,  // 12: ateenv.v1alpha.EnvironmentService.GetEnvironment:input_type -> ateenv.v1alpha.GetEnvironmentRequest
+	11, // 13: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:input_type -> ateenv.v1alpha.SuspendEnvironmentRequest
+	13, // 14: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:input_type -> ateenv.v1alpha.DeleteEnvironmentRequest
+	15, // 15: ateenv.v1alpha.EnvironmentService.GetServerInfo:input_type -> ateenv.v1alpha.GetServerInfoRequest
+	6,  // 16: ateenv.v1alpha.EnvironmentService.GetImageStatus:input_type -> ateenv.v1alpha.GetImageStatusRequest
+	7,  // 17: ateenv.v1alpha.EnvironmentService.EnsureImageTemplate:input_type -> ateenv.v1alpha.EnsureImageTemplateRequest
+	5,  // 18: ateenv.v1alpha.EnvironmentService.CreateEnvironment:output_type -> ateenv.v1alpha.CreateEnvironmentResponse
+	10, // 19: ateenv.v1alpha.EnvironmentService.GetEnvironment:output_type -> ateenv.v1alpha.GetEnvironmentResponse
+	12, // 20: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:output_type -> ateenv.v1alpha.SuspendEnvironmentResponse
+	14, // 21: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:output_type -> ateenv.v1alpha.DeleteEnvironmentResponse
+	16, // 22: ateenv.v1alpha.EnvironmentService.GetServerInfo:output_type -> ateenv.v1alpha.GetServerInfoResponse
+	8,  // 23: ateenv.v1alpha.EnvironmentService.GetImageStatus:output_type -> ateenv.v1alpha.ImageStatus
+	8,  // 24: ateenv.v1alpha.EnvironmentService.EnsureImageTemplate:output_type -> ateenv.v1alpha.ImageStatus
+	18, // [18:25] is the sub-list for method output_type
+	11, // [11:18] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_proto_ateenv_v1alpha_env_proto_init() }
@@ -942,8 +1265,8 @@ func file_proto_ateenv_v1alpha_env_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_ateenv_v1alpha_env_proto_rawDesc), len(file_proto_ateenv_v1alpha_env_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   14,
+			NumEnums:      2,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

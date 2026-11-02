@@ -149,18 +149,7 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 	if s.Metrics != nil {
 		start = requestedAt(ctx, time.Now())
 	}
-	tmpl := req.GetTemplate()
-	templateName := tmpl.GetName()
-	if templateName == "" {
-		templateName = DefaultTemplate
-	}
-	atespace := req.GetAtespace()
-	if atespace == "" {
-		atespace = tmpl.GetAtespace()
-	}
-	if atespace == "" {
-		atespace = DefaultAtespace
-	}
+	templateName, atespace := templateDefaults(req.GetTemplate(), req.GetAtespace())
 	if s.Metrics != nil {
 		defer func() {
 			if retErr != nil {
@@ -202,6 +191,85 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 			WorkerSelector: req.GetWorkerSelector(),
 		},
 	}, nil
+}
+
+// templateDefaults resolves a request's base template name and atespace the
+// way CreateEnvironment does: the template name defaults to DefaultTemplate,
+// the atespace to the template's, then to DefaultAtespace.
+func templateDefaults(tmpl *ateenvv1alpha.Template, atespace string) (name, space string) {
+	name = tmpl.GetName()
+	if name == "" {
+		name = DefaultTemplate
+	}
+	space = atespace
+	if space == "" {
+		space = tmpl.GetAtespace()
+	}
+	if space == "" {
+		space = DefaultAtespace
+	}
+	return name, space
+}
+
+// GetImageStatus reports the template derived for a rootfs image and the
+// state of its golden snapshot, without creating anything.
+func (s *Server) GetImageStatus(ctx context.Context, req *ateenvv1alpha.GetImageStatusRequest) (*ateenvv1alpha.ImageStatus, error) {
+	base, atespace := templateDefaults(req.GetTemplate(), req.GetAtespace())
+	name, err := ImageTemplateName(base, req.GetRootfsImage())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	tmpl, err := s.client.GetActorTemplate(ctx, atespace, name)
+	if err != nil && !errors.Is(err, ate.ErrNotFound) {
+		return nil, toGRPCError(err)
+	}
+	return imageStatus(req.GetRootfsImage(), atespace, name, tmpl), nil
+}
+
+// EnsureImageTemplate creates the template derived for a rootfs image when
+// it is missing, which starts its golden snapshot bake, and reports it. It
+// takes the same path a create does, so a template whose bake failed is
+// recreated under the same rules, but no actor is created.
+func (s *Server) EnsureImageTemplate(ctx context.Context, req *ateenvv1alpha.EnsureImageTemplateRequest) (*ateenvv1alpha.ImageStatus, error) {
+	base, atespace := templateDefaults(req.GetTemplate(), req.GetAtespace())
+	name, release, err := s.ensureImageTemplate(ctx, atespace, base, req.GetRootfsImage())
+	if err != nil {
+		return nil, err
+	}
+	release()
+	tmpl, err := s.client.GetActorTemplate(ctx, atespace, name)
+	if err != nil && !errors.Is(err, ate.ErrNotFound) {
+		return nil, toGRPCError(err)
+	}
+	return imageStatus(req.GetRootfsImage(), atespace, name, tmpl), nil
+}
+
+// imageStatus is the ImageStatus for the derived template tmpl, nil when it
+// does not exist. The golden state follows Substrate's
+// golden_snapshot_status: a tag means READY, an error message FAILED, and a
+// template with neither is still baking.
+func imageStatus(image, atespace, name string, tmpl *ateapipb.ActorTemplate) *ateenvv1alpha.ImageStatus {
+	out := &ateenvv1alpha.ImageStatus{
+		RootfsImage: image,
+		Template:    &ateenvv1alpha.Template{Name: name, Atespace: atespace},
+		Golden:      ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_NONE,
+	}
+	if tmpl == nil {
+		return out
+	}
+	out.TemplateExists = true
+	golden := tmpl.GetStatus().GetGoldenSnapshotStatus()
+	switch {
+	case golden.GetErrorMessage() != "":
+		out.Golden = ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_FAILED
+		out.GoldenError = golden.GetErrorMessage()
+	case golden.GetGoldenTag().GetName() != "":
+		out.Golden = ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_READY
+		out.GoldenTag = golden.GetGoldenTag().GetName()
+	default:
+		out.Golden = ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_PENDING
+	}
+	return out
 }
 
 // ensureImageTemplate returns the name of the ActorTemplate that runs image

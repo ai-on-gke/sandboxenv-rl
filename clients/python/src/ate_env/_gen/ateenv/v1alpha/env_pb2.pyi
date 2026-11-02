@@ -32,6 +32,14 @@ class EnvironmentStatus(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     ENVIRONMENT_STATUS_PAUSED: _ClassVar[EnvironmentStatus]
     ENVIRONMENT_STATUS_CRASHED: _ClassVar[EnvironmentStatus]
     ENVIRONMENT_STATUS_DELETING: _ClassVar[EnvironmentStatus]
+
+class GoldenSnapshotState(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    GOLDEN_SNAPSHOT_STATE_UNSPECIFIED: _ClassVar[GoldenSnapshotState]
+    GOLDEN_SNAPSHOT_STATE_NONE: _ClassVar[GoldenSnapshotState]
+    GOLDEN_SNAPSHOT_STATE_PENDING: _ClassVar[GoldenSnapshotState]
+    GOLDEN_SNAPSHOT_STATE_READY: _ClassVar[GoldenSnapshotState]
+    GOLDEN_SNAPSHOT_STATE_FAILED: _ClassVar[GoldenSnapshotState]
 ENVIRONMENT_STATUS_UNSPECIFIED: EnvironmentStatus
 ENVIRONMENT_STATUS_RESUMING: EnvironmentStatus
 ENVIRONMENT_STATUS_RUNNING: EnvironmentStatus
@@ -41,6 +49,11 @@ ENVIRONMENT_STATUS_PAUSING: EnvironmentStatus
 ENVIRONMENT_STATUS_PAUSED: EnvironmentStatus
 ENVIRONMENT_STATUS_CRASHED: EnvironmentStatus
 ENVIRONMENT_STATUS_DELETING: EnvironmentStatus
+GOLDEN_SNAPSHOT_STATE_UNSPECIFIED: GoldenSnapshotState
+GOLDEN_SNAPSHOT_STATE_NONE: GoldenSnapshotState
+GOLDEN_SNAPSHOT_STATE_PENDING: GoldenSnapshotState
+GOLDEN_SNAPSHOT_STATE_READY: GoldenSnapshotState
+GOLDEN_SNAPSHOT_STATE_FAILED: GoldenSnapshotState
 
 class Template(_message.Message):
     __slots__ = ("name", "atespace")
@@ -99,6 +112,42 @@ class CreateEnvironmentResponse(_message.Message):
     ENVIRONMENT_FIELD_NUMBER: _ClassVar[int]
     environment: Environment
     def __init__(self, environment: _Optional[_Union[Environment, _Mapping]] = ...) -> None: ...
+
+class GetImageStatusRequest(_message.Message):
+    __slots__ = ("rootfs_image", "template", "atespace")
+    ROOTFS_IMAGE_FIELD_NUMBER: _ClassVar[int]
+    TEMPLATE_FIELD_NUMBER: _ClassVar[int]
+    ATESPACE_FIELD_NUMBER: _ClassVar[int]
+    rootfs_image: str
+    template: Template
+    atespace: str
+    def __init__(self, rootfs_image: _Optional[str] = ..., template: _Optional[_Union[Template, _Mapping]] = ..., atespace: _Optional[str] = ...) -> None: ...
+
+class EnsureImageTemplateRequest(_message.Message):
+    __slots__ = ("rootfs_image", "template", "atespace")
+    ROOTFS_IMAGE_FIELD_NUMBER: _ClassVar[int]
+    TEMPLATE_FIELD_NUMBER: _ClassVar[int]
+    ATESPACE_FIELD_NUMBER: _ClassVar[int]
+    rootfs_image: str
+    template: Template
+    atespace: str
+    def __init__(self, rootfs_image: _Optional[str] = ..., template: _Optional[_Union[Template, _Mapping]] = ..., atespace: _Optional[str] = ...) -> None: ...
+
+class ImageStatus(_message.Message):
+    __slots__ = ("rootfs_image", "template", "template_exists", "golden", "golden_tag", "golden_error")
+    ROOTFS_IMAGE_FIELD_NUMBER: _ClassVar[int]
+    TEMPLATE_FIELD_NUMBER: _ClassVar[int]
+    TEMPLATE_EXISTS_FIELD_NUMBER: _ClassVar[int]
+    GOLDEN_FIELD_NUMBER: _ClassVar[int]
+    GOLDEN_TAG_FIELD_NUMBER: _ClassVar[int]
+    GOLDEN_ERROR_FIELD_NUMBER: _ClassVar[int]
+    rootfs_image: str
+    template: Template
+    template_exists: bool
+    golden: GoldenSnapshotState
+    golden_tag: str
+    golden_error: str
+    def __init__(self, rootfs_image: _Optional[str] = ..., template: _Optional[_Union[Template, _Mapping]] = ..., template_exists: _Optional[bool] = ..., golden: _Optional[_Union[GoldenSnapshotState, str]] = ..., golden_tag: _Optional[str] = ..., golden_error: _Optional[str] = ...) -> None: ...
 
 class GetEnvironmentRequest(_message.Message):
     __slots__ = ("id", "atespace")

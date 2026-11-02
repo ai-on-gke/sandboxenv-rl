@@ -110,7 +110,11 @@ kubectl-ate get actor-template --atespace ate-env
 ```
 
 A fresh template shows `Failed` in that listing for a few seconds while its
-golden bakes, then `Ready`. Environments can be created in the meantime.
+golden bakes, then `Ready`. Environments can be created in the meantime. The API
+answers the same question per image: `ate-env image-status <image>` reports the
+derived template and `golden: none|pending|ready|failed`, and `--ensure` creates
+the template without creating an environment, so a job can start the bakes for
+its whole image set up front and wait for `ready` before it measures first boots.
 
 ## A second runtime
 

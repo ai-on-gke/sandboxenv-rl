@@ -130,6 +130,33 @@ class EnvironmentInfo:
     worker_selector: Mapping[str, str] = field(default_factory=dict)
 
 
+class GoldenSnapshotState(enum.IntEnum):
+    """State of a derived template's golden snapshot."""
+
+    UNSPECIFIED = env_pb2.GOLDEN_SNAPSHOT_STATE_UNSPECIFIED
+    NONE = env_pb2.GOLDEN_SNAPSHOT_STATE_NONE
+    PENDING = env_pb2.GOLDEN_SNAPSHOT_STATE_PENDING
+    READY = env_pb2.GOLDEN_SNAPSHOT_STATE_READY
+    FAILED = env_pb2.GOLDEN_SNAPSHOT_STATE_FAILED
+
+
+@dataclass(frozen=True)
+class ImageStatus:
+    """The template derived for a rootfs image and its golden snapshot's state.
+
+    ``golden`` is NONE while no template exists, PENDING while the golden
+    bakes (environments created now boot from the image), READY once it is
+    tagged, FAILED when the bake gave up (``golden_error`` says why).
+    """
+
+    rootfs_image: str
+    template: Template
+    template_exists: bool
+    golden: GoldenSnapshotState
+    golden_tag: str = ""
+    golden_error: str = ""
+
+
 @dataclass(frozen=True)
 class ServerInfo:
     """Identity, version and optional features of the ate-env-api server.
@@ -197,6 +224,17 @@ def _environment_info_from_pb(pb: env_pb2.Environment) -> EnvironmentInfo:
         status=EnvironmentStatus(pb.status),
         node=pb.node,
         worker_selector=dict(pb.worker_selector),
+    )
+
+
+def _image_status_from_pb(pb: env_pb2.ImageStatus) -> ImageStatus:
+    return ImageStatus(
+        rootfs_image=pb.rootfs_image,
+        template=_template_from_pb(pb.template),
+        template_exists=pb.template_exists,
+        golden=GoldenSnapshotState(pb.golden),
+        golden_tag=pb.golden_tag,
+        golden_error=pb.golden_error,
     )
 
 

@@ -42,6 +42,7 @@ async def _require_env(context: grpc.aio.ServicerContext) -> tuple[str, str]:
 
 class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
     def __init__(self):
+        self.image_templates: dict = {}
         self.environments: dict[tuple[str, str], env_pb2.Environment] = {}
         self.last_create_request: env_pb2.CreateEnvironmentRequest | None = None
 
@@ -92,6 +93,42 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
         await self._lookup(request, context)
         del self.environments[(request.atespace or "ate-env", request.id)]
         return env_pb2.DeleteEnvironmentResponse()
+
+    def _image_status(self, request):
+        template = env_pb2.Template(name="default-template", atespace="ate-env")
+        if request.HasField("template"):
+            if request.template.name:
+                template.name = request.template.name
+            if request.template.atespace:
+                template.atespace = request.template.atespace
+        atespace = request.atespace or template.atespace
+        if "@sha256:" not in request.rootfs_image:
+            return None, atespace, template
+        digest = request.rootfs_image.split("@sha256:", 1)[1]
+        derived = env_pb2.Template(name=f"{template.name}-{digest[:12]}", atespace=atespace)
+        return (atespace, derived.name), atespace, derived
+
+    async def GetImageStatus(self, request, context):
+        key, atespace, derived = self._image_status(request)
+        if key is None:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "image is not pinned by digest")
+        golden = self.image_templates.get(key)
+        if golden is None:
+            return env_pb2.ImageStatus(
+                rootfs_image=request.rootfs_image, template=derived, template_exists=False,
+                golden=env_pb2.GOLDEN_SNAPSHOT_STATE_NONE,
+            )
+        return env_pb2.ImageStatus(
+            rootfs_image=request.rootfs_image, template=derived, template_exists=True,
+            golden=golden.golden, golden_tag=golden.golden_tag, golden_error=golden.golden_error,
+        )
+
+    async def EnsureImageTemplate(self, request, context):
+        key, _, _ = self._image_status(request)
+        if key is None:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "image is not pinned by digest")
+        self.image_templates.setdefault(key, env_pb2.ImageStatus(golden=env_pb2.GOLDEN_SNAPSHOT_STATE_PENDING))
+        return await self.GetImageStatus(request, context)
 
     async def GetServerInfo(self, request, context):
         return env_pb2.GetServerInfoResponse(

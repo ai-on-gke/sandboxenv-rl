@@ -19,11 +19,13 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +34,7 @@ import (
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/benchmarking/measure"
 	"github.com/agent-substrate/env/internal/benchmarking/schema"
+	"github.com/agent-substrate/env/internal/benchmarking/swebench"
 	"github.com/agent-substrate/env/internal/internaltest/fakecontrol"
 	"github.com/agent-substrate/env/internal/internaltest/fakerouter"
 	ateenvpb "github.com/agent-substrate/env/proto/ateenv/v1alpha"
@@ -324,6 +327,7 @@ jobs:
 	if code := execute([]string{"validate", "-report", filepath.Join(runDir, "report.json"), "-schedule", filepath.Join(runDir, "schedule.json"), "-footing", "warm"}, &out, &errBuf); code != 0 {
 		t.Fatalf("bench validate failed (code=%d): %s", code, errBuf.String())
 	}
+	assertTraceCaptured(t, runDir, false, 0)
 
 	// Test A/B overlay comparison (`bench run -overlay pool-off,pool-on`)
 	abDir := filepath.Join(dir, "ab-out")
@@ -381,6 +385,82 @@ jobs:
 	}
 	if strings.Contains(mdStr, "## 4. Convergence Info") {
 		t.Fatalf("expected RL Convergence Info section to be omitted when -scopes=user-sandbox, got:\n%s", mdStr)
+	}
+	assertTraceCaptured(t, scopedDir, true, 1)
+	if !strings.Contains(mdStr, "**Trace captured**: yes (1 trace files") {
+		t.Fatalf("expected report.md to say the trace was captured, got:\n%s", mdStr)
+	}
+}
+
+// assertTraceCaptured checks report.json and run_window.json agree on trace capture.
+func assertTraceCaptured(t *testing.T, dir string, want bool, wantFiles int) {
+	t.Helper()
+	rep, err := swebench.LoadOrSummarizeReport(filepath.Join(dir, "report.json"))
+	if err != nil {
+		t.Fatalf("load report.json: %v", err)
+	}
+	if rep.TraceCaptured != want || rep.TraceFileCount != wantFiles {
+		t.Fatalf("report.json: trace_captured=%t trace_file_count=%d, want %t/%d", rep.TraceCaptured, rep.TraceFileCount, want, wantFiles)
+	}
+	rawRep, err := os.ReadFile(filepath.Join(dir, "report.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rawRep), fmt.Sprintf(`"trace_captured": %t`, want)) {
+		t.Fatalf("report.json must always spell out trace_captured, got:\n%s", rawRep)
+	}
+	rw, err := swebench.ReadRunWindow(filepath.Join(dir, "run_window.json"))
+	if err != nil {
+		t.Fatalf("read run_window.json: %v", err)
+	}
+	if got := rw.Metadata[swebench.TraceCapturedMetadataKey]; got != strconv.FormatBool(want) {
+		t.Fatalf("run_window.json metadata.trace_captured=%q, want %t (metadata=%v)", got, want, rw.Metadata)
+	}
+	if wantFiles > 0 {
+		if got := rw.Metadata[swebench.TraceFileCountMetadataKey]; got != strconv.Itoa(wantFiles) {
+			t.Fatalf("run_window.json metadata.trace_file_count=%q, want %d", got, wantFiles)
+		}
+	} else if _, ok := rw.Metadata[swebench.TraceFileCountMetadataKey]; ok {
+		t.Fatalf("run_window.json should not carry trace_file_count without trace files, got %v", rw.Metadata)
+	}
+}
+
+func TestEnsureRunWindowFileMergesMetadata(t *testing.T) {
+	dir := t.TempDir()
+	if err := swebench.WriteRunWindow(filepath.Join(dir, "run_window.json"), schema.RunWindow{
+		SchemaVersion: schema.SchemaVersion,
+		RunID:         "loader-run",
+		TestName:      "swebench-steps",
+		StartTS:       "2026-10-28T18:00:00Z",
+		EndTS:         "2026-10-28T18:05:00Z",
+		Metadata:      map[string]string{"harness": "swe-perf", swebench.TraceCapturedMetadataKey: "false"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureRunWindowFile(dir, "ignored", "ignored", time.Time{}, time.Time{}, (&swebench.Report{TraceCaptured: true, TraceFileCount: 2}).TraceMetadata()); err != nil {
+		t.Fatal(err)
+	}
+	rw, err := swebench.ReadRunWindow(filepath.Join(dir, "run_window.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rw.RunID != "loader-run" || rw.TestName != "swebench-steps" || rw.StartTS != "2026-10-28T18:00:00Z" {
+		t.Fatalf("existing run_window fields were clobbered: %+v", rw)
+	}
+	if rw.Metadata["harness"] != "swe-perf" || rw.Metadata[swebench.TraceCapturedMetadataKey] != "true" || rw.Metadata[swebench.TraceFileCountMetadataKey] != "2" {
+		t.Fatalf("unexpected merged metadata %v", rw.Metadata)
+	}
+
+	fresh := t.TempDir()
+	if err := ensureRunWindowFile(fresh, "new-run", "c1", time.Time{}, time.Time{}, (&swebench.Report{}).TraceMetadata()); err != nil {
+		t.Fatal(err)
+	}
+	rw, err = swebench.ReadRunWindow(filepath.Join(fresh, "run_window.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rw.RunID != "new-run" || rw.Metadata[swebench.TraceCapturedMetadataKey] != "false" {
+		t.Fatalf("unexpected fresh run_window %+v", rw)
 	}
 }
 
@@ -483,7 +563,7 @@ func (f *fakeUploadRunner) UploadDir(_ context.Context, srcDir, destGCSURI strin
 
 func TestBenchValidateBundleAndUpload(t *testing.T) {
 	dir := t.TempDir()
-	bundleDir := filepath.Join(dir, "2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed")
+	bundleDir := filepath.Join(dir, "2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed_traced")
 	if err := os.MkdirAll(filepath.Join(bundleDir, "overlay"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -590,6 +670,52 @@ func TestBenchValidateBundleAndUpload(t *testing.T) {
 	if !strings.Contains(out.String(), `"valid": true`) {
 		t.Fatalf("expected '\"valid\": true' in stdout, got: %s", out.String())
 	}
+	if !strings.Contains(out.String(), `"trace_captured": true`) || !strings.Contains(out.String(), `"trace.jsonl"`) {
+		t.Fatalf("expected bundle validation to surface trace_captured and the trace file, got: %s", out.String())
+	}
+	assertTraceCaptured(t, bundleDir, true, 1)
+
+	// A traced bundle must be archived under a _traced folder name.
+	out.Reset()
+	errBuf.Reset()
+	if code := execute([]string{"validate", "-dest", bundleDir, "-folder", "2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed"}, &out, &errBuf); code == 0 || !strings.Contains(out.String(), "must end in _traced") {
+		t.Fatalf("expected validate -folder without _traced to fail, code=%d stdout: %s", code, out.String())
+	}
+	out.Reset()
+	errBuf.Reset()
+	if code := execute([]string{"validate", "-dest", bundleDir, "-folder", filepath.Base(bundleDir)}, &out, &errBuf); code != 0 {
+		t.Fatalf("validate -folder %s failed: %s\n%s", filepath.Base(bundleDir), errBuf.String(), out.String())
+	}
+
+	// run_window.json denying the captured trace fails validation; `bench report` refreshes it.
+	rwPath := filepath.Join(bundleDir, "run_window.json")
+	rw, err := swebench.ReadRunWindow(rwPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rw.Metadata[swebench.TraceCapturedMetadataKey] = "false"
+	if err := swebench.WriteRunWindow(rwPath, *rw); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errBuf.Reset()
+	if code := execute([]string{"validate", "-dest", bundleDir}, &out, &errBuf); code == 0 {
+		t.Fatalf("expected bench validate -dest to fail when run_window.json denies a captured trace, stdout: %s", out.String())
+	}
+	if !strings.Contains(out.String(), `but the bundle holds 1 trace file`) {
+		t.Fatalf("expected a trace_captured contradiction reason, got: %s", out.String())
+	}
+	out.Reset()
+	errBuf.Reset()
+	if code := execute([]string{"report", "-dest", bundleDir}, &out, &errBuf); code != 0 {
+		t.Fatalf("bench report failed (code=%d): %s", code, errBuf.String())
+	}
+	assertTraceCaptured(t, bundleDir, true, 1)
+	out.Reset()
+	errBuf.Reset()
+	if code := execute([]string{"validate", "-dest", bundleDir}, &out, &errBuf); code != 0 {
+		t.Fatalf("bench validate -dest failed after report refreshed run metadata (code=%d): %s\nstdout: %s", code, errBuf.String(), out.String())
+	}
 
 	// Verify that missing base_recipe_hash in overlay/overlay.json causes validation to fail.
 	badManifest := strings.ReplaceAll(overlayManifest, `"base_recipe_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",`, `"base_recipe_hash": "",`)
@@ -613,11 +739,13 @@ func TestBenchValidateBundleAndUpload(t *testing.T) {
 		t.Fatal("expected bench upload without -bucket to fail")
 	}
 
-	// Test `bench upload` with invalid folder name fails.
-	out.Reset()
-	errBuf.Reset()
-	if code := execute([]string{"upload", "-dest", bundleDir, "-bucket", "gs://example-bench-bucket", "-folder", "BadFolderName"}, &out, &errBuf); code == 0 {
-		t.Fatal("expected bench upload with invalid -folder name to fail")
+	// Invalid or un-suffixed folder names fail, even with -skip-validate.
+	for _, folder := range []string{"BadFolderName", "2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed"} {
+		out.Reset()
+		errBuf.Reset()
+		if code := execute([]string{"upload", "-dest", bundleDir, "-bucket", "gs://example-bench-bucket", "-skip-validate", "-folder", folder}, &out, &errBuf); code == 0 {
+			t.Fatalf("expected bench upload -folder %s to fail", folder)
+		}
 	}
 
 	// Test `bench upload` with valid -bucket and mock runner succeeds.
@@ -634,7 +762,7 @@ func TestBenchValidateBundleAndUpload(t *testing.T) {
 	if len(fakeUp.calls) != 1 {
 		t.Fatalf("expected 1 UploadDir call, got %d", len(fakeUp.calls))
 	}
-	wantTarget := "gs://example-bench-bucket/2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed/"
+	wantTarget := "gs://example-bench-bucket/2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed_traced/"
 	if fakeUp.calls[0][1] != wantTarget {
 		t.Fatalf("expected upload target %q, got %q", wantTarget, fakeUp.calls[0][1])
 	}

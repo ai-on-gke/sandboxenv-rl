@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 # Runs in both pods of job-fully-async.yaml.
-#   ROLE=worker : install, download the model, join the Ray head, block until the head stops Ray.
+#   ROLE=worker : install, download the model, build the datasets, join the Ray head, block until the head stops Ray.
 #   ROLE=head   : install, download the model, build the datasets, probe ate-env-api, start Ray, wait for
 #                 the worker node, then train with verl v1 separate_async:
 #                 Megatron trainer (TP2 EP8, whole node) + vLLM rollout engines (whole other node),
@@ -28,13 +28,23 @@ export PYTHONUNBUFFERED=1 HF_HOME=/workspace/hf HF_HUB_ENABLE_HF_TRANSFER=1 CUDA
 : "${MODEL_REVISION:=59d61f3c}"   # Hugging Face commit of MODEL_ID
 : "${ENV_PREFIX:=verl-qwen3p5-35b}"
 : "${MODEL_ID:=Qwen/Qwen3.5-35B-A3B}"
-: "${TRAIN_SOURCE:=r2e_gym_easy}"; : "${TRAIN_SPLIT:=train}"; : "${TRAIN_INSTANCES:=64}"; : "${TRAIN_DATASET:=}"
+: "${TRAIN_SOURCE:=r2e_gym_easy}"; : "${TRAIN_SPLIT:=train}"; : "${TRAIN_INSTANCES:=192}"; : "${TRAIN_DATASET:=}"   # >= TOTAL_STEPS x TRAIN_BATCH, else the one-epoch run ends early
 : "${VAL_TASKS:=20}"
 : "${TRAIN_BATCH:=16}"; : "${ROLLOUT_N:=8}"; : "${MINI_BATCH:=8}"; : "${SYNC_STEP:=2}"
-: "${SESSIONS:=24}"; : "${GATEWAYS:=2}"; : "${AGENT_WORKERS:=2}"; : "${TOTAL_STEPS:=2}"
+# One session per trajectory, so a whole step (TRAIN_BATCH x ROLLOUT_N) starts at once instead of queueing on the cap.
+# If the sandbox system cannot hold that many environments, set SESSIONS to its maximum capacity instead.
+: "${SESSIONS:=$((TRAIN_BATCH * ROLLOUT_N))}"; : "${SANDBOX_STARTUP_CONCURRENCY:=$SESSIONS}"
+: "${GATEWAYS:=2}"; : "${AGENT_WORKERS:=2}"
+# TOTAL_STEPS: 2 = smoke (plumbing: one cold step, one steady step). 12 = performance numbers (1 warmup + 11 measured; step
+# time varies ~17% step to step, so 11 steps put the mean within ~10%). Full = epochs x floor(TRAIN_INSTANCES / TRAIN_BATCH):
+# 43 per epoch on the whole 700-instance slice, 86 for the archived 2-epoch run (trainer.total_epochs is 1 below).
+: "${TOTAL_STEPS:=12}"
 : "${PROMPT_LENGTH:=8192}"; : "${RESPONSE_LENGTH:=32768}"; : "${TRAIN_TP:=2}"; : "${TRAIN_CP:=1}"; : "${TRAIN_EP:=8}"; : "${ROLLOUT_TP:=2}"
 : "${ROLLOUT_HYBRID_FLAGS:=1}"           # vLLM flags for the hybrid (GDN) model; set 0 if your vLLM rejects them
 : "${ATE_ENV_ENDPOINT:=ate-env-api.ate-env.svc:7777}"; : "${ATE_TEMPLATE:=swe-2c6g}"
+# Ray CPU slots per node. Every session is a Ray task holding 1 CPU and the engines reserve 24 per node, so
+# 2 x (RAY_CPUS - 24) must cover SESSIONS; 40 capped a 128-session step at 32 concurrent sessions.
+: "${RAY_CPUS:=96}"
 MAX_MODEL_LEN=$((PROMPT_LENGTH + RESPONSE_LENGTH))
 mkdir -p /workspace/results /workspace/agent /workspace/data
 cd /workspace/results   # neutral cwd: the image's working directory holds a docker/ folder that shadows the docker package
@@ -91,24 +101,25 @@ snapshot_download(repo_id="$MODEL_ID", revision="$MODEL_REVISION", local_dir="$M
 print("model ready: $MODEL_PATH")
 PY
 
-# Both pods: the uni-agent task runners are Ray tasks and run on either node, so every node needs the
-# task config and the image digest map at the same paths.
+# Both pods: the uni-agent task runners are Ray tasks and the verl trainer actor is placed by Ray, so either node may
+# run them; every node needs the task config, the image digest map and the datasets at the same paths.
 cp /workspace/cfg/images.json /workspace/agent/images.json
 export ATE_ENV_IMAGE_DIGESTS=/workspace/agent/images.json
 sed -e "s|\${ATE_ENV_ENDPOINT}|$ATE_ENV_ENDPOINT|g" -e "s|\${ATE_TEMPLATE}|$ATE_TEMPLATE|g" /workspace/cfg/task_config.yaml > /workspace/agent/task_config.yaml
-
-if [ "$ROLE" = "worker" ]; then
-  echo "=== Phase 3 (worker): join Ray head $RAY_HEAD_HOST:$RAY_PORT ==="
-  for i in $(seq 1 360); do getent hosts "$RAY_HEAD_HOST" >/dev/null && break || sleep 10; done
-  ray start --address="$RAY_HEAD_HOST:$RAY_PORT" --num-gpus=8 --num-cpus=40 --block || true   # returns when the head stops Ray
-  echo "=== worker done ==="; exit 0
-fi
-
-echo "=== Phase 3 (head): datasets, ate-env-api probe ==="
+echo "=== Phase 3 (both pods): datasets ==="
 python3 -m uni_agent_substrate.datasets --source "$TRAIN_SOURCE" --split "$TRAIN_SPLIT" ${TRAIN_DATASET:+--dataset "$TRAIN_DATASET"} \
     --max-instances "$TRAIN_INSTANCES" --image-digests /workspace/agent/images.json --out /workspace/data/train.parquet
 python3 -m uni_agent_substrate.datasets --source swe_bench --max-instances "$VAL_TASKS" --exclude-file /workspace/cfg/offline-exclusions.txt \
     --image-digests /workspace/agent/images.json --out /workspace/data/val.parquet
+
+if [ "$ROLE" = "worker" ]; then
+  echo "=== Phase 4 (worker): join Ray head $RAY_HEAD_HOST:$RAY_PORT ==="
+  for i in $(seq 1 360); do getent hosts "$RAY_HEAD_HOST" >/dev/null && break || sleep 10; done
+  ray start --address="$RAY_HEAD_HOST:$RAY_PORT" --num-gpus=8 --num-cpus="$RAY_CPUS" --block || true   # returns when the head stops Ray
+  echo "=== worker done ==="; exit 0
+fi
+
+echo "=== Phase 3 (head): ate-env-api probe ==="
 export ENV_PREFIX ATE_TEMPLATE
 python3 - <<PY
 import asyncio, os, uuid
@@ -126,7 +137,7 @@ asyncio.run(probe())
 PY
 
 echo "=== Phase 4: Ray head + wait for $NNODES GPU nodes ==="
-ray start --head --port="$RAY_PORT" --num-gpus=8 --num-cpus=40 --disable-usage-stats
+ray start --head --port="$RAY_PORT" --num-gpus=8 --num-cpus="$RAY_CPUS" --disable-usage-stats
 export RAY_ADDRESS="127.0.0.1:$RAY_PORT"
 python3 - <<'WAIT'
 import os, time, ray
@@ -158,7 +169,7 @@ OVERRIDES=(
   '+ray_kwargs.ray_init.runtime_env.env_vars.HF_HUB_OFFLINE="1"'
   "${NCCL_IF[@]}"
   "${AUTH_ENV[@]}"
-  '+ray_kwargs.ray_init.runtime_env.env_vars.SANDBOX_STARTUP_CONCURRENCY="32"'
+  "+ray_kwargs.ray_init.runtime_env.env_vars.SANDBOX_STARTUP_CONCURRENCY=\"$SANDBOX_STARTUP_CONCURRENCY\""
   "+ray_kwargs.ray_init.runtime_env.env_vars.ATE_ENV_IMAGE_DIGESTS=$ATE_ENV_IMAGE_DIGESTS"
   '+ray_kwargs.ray_init.runtime_env.env_vars.VLLM_DISABLE_COMPILE_CACHE="1"'
   '+ray_kwargs.ray_init.runtime_env.env_vars.CUDA_DEVICE_MAX_CONNECTIONS="1"'

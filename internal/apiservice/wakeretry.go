@@ -40,10 +40,12 @@ import (
 // control plane reports RUNNING only after the template's wakeup probe
 // passes, so the budget must also cover that probe's timeout: 120 s for a
 // template with a sidecar readiness URL (ate-env manifest template
-// --wakeup-timeout). Four minutes is that timeout plus the two minutes
-// this budget gave image pulls and snapshot reads before. A crashed or
-// deleted environment still fails at once, not after the budget.
-const DefaultWakeBudget = 4 * time.Minute
+// --wakeup-timeout). A cold restore of a 9 GB image on a node that is
+// unpacking other images takes more than two minutes while still making
+// progress, so the budget is five minutes: that restore, or the probe
+// timeout plus the pull. A crashed or deleted environment still fails at
+// once, not after the budget.
+const DefaultWakeBudget = 5 * time.Minute
 
 // DefaultWakeRunningBudget bounds the wait when the control plane already
 // reports the environment RUNNING but the router still answers Unavailable.

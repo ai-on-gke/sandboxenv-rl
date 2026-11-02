@@ -405,7 +405,8 @@ subcommand communicates through a single artifact directory (`-dest "$ARTIFACT_D
 | `bench measure` | Collect K8s (`-k8s`), Substrate (`-ate-endpoint`), Prometheus (`-prom-url`), node cache (`-sample-node-cache`), and restore timings (`-restore-log`) into `measurements.json` and `system_description.json` |
 | `bench reap` | Verify zero orphaned environments remain post-run and emit `events/reap.jsonl` |
 | `bench report` | Ingest `events/*.jsonl`, `traces/*.jsonl`, `train.log`, `measurements.json`, and `system_description.json` into `report.json` and `report.md` |
-| `bench validate` | Validate `report.json`, `measurements.json`, and `system_description.json` against strict `v1` schemas |
+| `bench validate` | Validate `report.json`, `measurements.json`, and `system_description.json` against strict `v1` schemas, and with `-folder` the archive folder name |
+| `bench upload` | Validate, then copy `$ARTIFACT_DIR` to `gs://<bucket>/<folder>/` |
 | `bench compare` | Diff two or more `report.json` files or artifact directories side-by-side |
 
 ### 1. Synthetic / Scenario-Driven Run
@@ -450,10 +451,12 @@ go run ./cmd/benchmarking/bench validate -dest "$ARTIFACT_DIR"
 ### 3. Archiving Results & Further Guides
 
 Archive completed `$ARTIFACT_DIR` directories to object storage under a
-consistent 4-part folder name:
+consistent folder name, with `_traced` iff the run captured an SDK trace
+(`report.json` `trace_captured: true`; traced latencies include trace overhead):
 
 ```text
 gs://<YOUR_BENCHMARK_BUCKET>/<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>/
+gs://<YOUR_BENCHMARK_BUCKET>/<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>_traced/
 ```
 
 - **Telemetry scopes & feature debug plugins**: [`internal/benchmarking/TELEMETRY_GUIDE.md`](../../internal/benchmarking/TELEMETRY_GUIDE.md)

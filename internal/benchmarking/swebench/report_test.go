@@ -285,8 +285,10 @@ func TestWriteComparison(t *testing.T) {
 	if !strings.Contains(flat, "cluster east -") {
 		t.Errorf("label row: want \"cluster east -\" in:\n%s", text)
 	}
-	if !strings.Contains(flat, "mode steps eval reps 1 1") || strings.Count(flat, "mode ") != 1 {
-		t.Errorf("want one mode row (the label repeats it) and a reps row in:\n%s", text)
+	// trace_captured sits beside mode: a traced run's latencies include SDK
+	// trace overhead, so the comparison must say which runs were traced.
+	if !strings.Contains(flat, "mode steps eval trace_captured false false reps 1 1") || strings.Count(flat, "mode ") != 1 {
+		t.Errorf("want one mode row (the label repeats it), a trace_captured row and a reps row in:\n%s", text)
 	}
 	// An operator label named like a built-in row keeps its own row, prefixed.
 	if !strings.Contains(flat, "label.tasks - operator") || strings.Count(flat, " tasks ") != 2 {

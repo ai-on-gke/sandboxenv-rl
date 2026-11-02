@@ -183,27 +183,28 @@ go run ./cmd/benchmarking/bench validate -dest "$ARTIFACT_DIR"
 
 | Category | Required Artifacts & Schema Checks |
 | :--- | :--- |
-| **Always Required (Every Bundle)** | <ul><li>`report.json` — valid `v1` report + passes semantic validity rules (`reap_seen: true`, `orphan_count: 0`, error rate `< 5%`).</li><li>`report.md` — non-empty rendered Markdown report.</li><li>`system_description.json` — strict `v1` schema with populated `load` (`max_concurrent > 0`, `trajectories_per_step > 0`), `max_concurrent_sandboxes_cap > 0`, and `lifecycle_policy.mode`.</li><li>`measurements.json` — strict `v1` schema.</li><li>`run_window.json` — strict `v1` schema (`start_ts`, `end_ts`, `run_id`).</li><li>`events/*.jsonl` (or `events.jsonl`) — non-empty `v1` `Event` stream.</li></ul> |
+| **Always Required (Every Bundle)** | <ul><li>`report.json` — valid `v1` report + passes semantic validity rules (`reap_seen: true`, `orphan_count: 0`, error rate `< 5%`); `trace_captured` says whether an SDK trace was captured (Rule 6).</li><li>`report.md` — non-empty rendered Markdown report.</li><li>`system_description.json` — strict `v1` schema with populated `load` (`max_concurrent > 0`, `trajectories_per_step > 0`), `max_concurrent_sandboxes_cap > 0`, and `lifecycle_policy.mode`.</li><li>`measurements.json` — strict `v1` schema.</li><li>`run_window.json` — strict `v1` schema (`start_ts`, `end_ts`, `run_id`); `metadata.trace_captured` must not contradict the bundle's trace files (`bench report -dest` refreshes it).</li><li>`events/*.jsonl` (or `events.jsonl`) — non-empty `v1` `Event` stream.</li></ul> |
 | **Cluster RL Runs** *(when `verl-head.log` / `train.log` is present)* | <ul><li>`traces/*.jsonl` — non-empty `v1` `TraceEvent` streams from Ray workers.</li><li>`configmap.yaml` & `job.yaml` (in root or `logs/`) — exact K8s manifests executed.</li><li>`cache_before.{prom,json}` & `cache_after.{prom,json}` — node image-cache snapshots.</li></ul> |
 | **Warm / `suspend`-`restore` Runs** *(when `park_mode == "suspend"` or `footing == "warm"`)* | <ul><li>`restore_timings.jsonl` — non-empty `v1` `RestoreSample` sub-phase timings harvested from `atelet`.</li><li>`overlay/` — non-empty directory containing the plain-text feature overlay (`README.md`, Kustomize patch, `.patch` diff, and modified runtime scripts/modules).</li></ul> |
 | **Synthetic Scenario Runs** *(`bench run`)* | <ul><li>`schedule.json` — strict `v1` `Schedule`.</li><li>`sut-manifest.yaml` — rendered SUT manifest.</li></ul> |
 
 ### 5.2 Validating and Uploading to GCS (`bench upload`)
 
-Pass the target GCS bucket via `-bucket` (never hardcode a bucket name in scripts or code) and use the 4-part folder naming convention `<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>`:
+Pass the target GCS bucket via `-bucket` (never hardcode a bucket name in scripts or code) and name the folder `<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>[_traced]`:
 ```bash
-# 1. Validate bundle completeness, v1 schemas, and 4-part folder name offline:
+# 1. Validate bundle completeness, v1 schemas, and the folder name offline:
 go run ./cmd/benchmarking/bench validate \
   -dest "$ARTIFACT_DIR" \
-  -folder "2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed"
+  -folder "2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed_traced"
 
 # 2. Upload to GCS (validates the bundle first unless -skip-validate is set):
 go run ./cmd/benchmarking/bench upload \
   -dest "$ARTIFACT_DIR" \
   -bucket "$GCS_BENCHMARK_BUCKET" \
-  -folder "2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed"
+  -folder "2026-10-28_qwen3.5-35b_r2e-gym-easy_prewarmed_traced"
 ```
+- **`_traced`**: required iff `report.json` has `trace_captured: true` (the bundle holds `trace.jsonl` / `traces/*.jsonl`, as every cluster RL run from section 1 does). Trace instrumentation adds per-call latency, so the name keeps traced and untraced runs from being compared unknowingly; `bench validate -folder` and `bench upload` reject a mismatch.
 - **LLM RL runs**: `<model-family>-<size>` = e.g. `qwen3.5-35b`, `qwen3-1.7b`; `<dataset>` = e.g. `r2e-gym-easy`, `swebench-verified`, `lighteval-math`; `<nickname>` = e.g. `baseline`, `prewarmed`, `c36-cap`.
-- **Synthetic runs**: `<model-family>-<size>` = `synthetic-w<N>` (where `<N>` is concurrent trajectories/step); `<dataset>` = `<trajectory-type>-<7char-sha256>` of the trajectory YAML (e.g. `math-bb4dcec`); `<nickname>` = e.g. `suspend-sync`, `baseline`.
+- **Synthetic runs** (untraced, e.g. `2026-10-27_synthetic-w4_math-bb4dcec_suspend-sync`): `<model-family>-<size>` = `synthetic-w<N>` (where `<N>` is concurrent trajectories/step); `<dataset>` = `<trajectory-type>-<7char-sha256>` of the trajectory YAML (e.g. `math-bb4dcec`); `<nickname>` = e.g. `suspend-sync`, `baseline`.
 
 For scoping telemetry to specific subsystems (`-scopes rl,user-sandbox,substrate,k8s`) or adding custom feature debug metrics (`-plugin-prom`, `-plugin-log`, `-plugin-metric`, `-plugin-cmd`), see [`internal/benchmarking/TELEMETRY_GUIDE.md`](../internal/benchmarking/TELEMETRY_GUIDE.md).

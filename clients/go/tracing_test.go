@@ -109,6 +109,27 @@ func (f *tracingFixture) client(t *testing.T, opts env.ClientOptions) *env.Clien
 	return c
 }
 
+// waitForServerSpan polls f.server.Ended() until match returns true or the
+// timeout expires. Server-side otelgrpc spans end asynchronously after the RPC
+// response has already returned to the client, so reading f.server.Ended()
+// immediately after a client call can race the server recorder.
+func (f *tracingFixture) waitForServerSpan(t *testing.T, match func(sdktrace.ReadOnlySpan) bool) sdktrace.ReadOnlySpan {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		for _, s := range f.server.Ended() {
+			if match(s) {
+				return s
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for server span")
+			return nil
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // exercise runs every traced operation once on environment id.
 func exercise(t *testing.T, c *env.Client, id string) {
 	t.Helper()
@@ -221,21 +242,14 @@ func TestTracingSpansWithProvider(t *testing.T) {
 		clientSpanIDs[s.SpanContext().SpanID().String()] = true
 	}
 	traceID := spans["ate-env-go-client.create_environment"].SpanContext().TraceID()
-	found := false
-	for _, s := range f.server.Ended() {
-		if s.Name() != "ateenv.v1alpha.EnvironmentService/CreateEnvironment" {
-			continue
-		}
-		found = true
-		if s.SpanContext().TraceID() != traceID {
-			t.Errorf("server span trace %s, want the client's %s", s.SpanContext().TraceID(), traceID)
-		}
-		if !clientSpanIDs[s.Parent().SpanID().String()] {
-			t.Errorf("server span parent %s is not a client span", s.Parent().SpanID())
-		}
+	serverSpan := f.waitForServerSpan(t, func(s sdktrace.ReadOnlySpan) bool {
+		return s.Name() == "ateenv.v1alpha.EnvironmentService/CreateEnvironment"
+	})
+	if serverSpan.SpanContext().TraceID() != traceID {
+		t.Errorf("server span trace %s, want the client's %s", serverSpan.SpanContext().TraceID(), traceID)
 	}
-	if !found {
-		t.Error("no server CreateEnvironment span")
+	if !clientSpanIDs[serverSpan.Parent().SpanID().String()] {
+		t.Errorf("server span parent %s is not a client span", serverSpan.Parent().SpanID())
 	}
 }
 
@@ -282,6 +296,9 @@ func TestTracingOffWithoutProvider(t *testing.T) {
 	if otel.GetTracerProvider() != globalTP {
 		t.Error("the client replaced the global tracer provider")
 	}
+	f.waitForServerSpan(t, func(s sdktrace.ReadOnlySpan) bool {
+		return s.Name() == "ateenv.v1alpha.EnvironmentService/DeleteEnvironment"
+	})
 	for _, s := range f.server.Ended() {
 		if s.Parent().IsValid() {
 			t.Errorf("server span %s has a parent %s; the client sent trace context", s.Name(), s.Parent().SpanID())
@@ -312,15 +329,12 @@ func TestTracingWithCallerConnPropagates(t *testing.T) {
 	if create == nil {
 		t.Fatal("no create_environment span")
 	}
-	for _, s := range f.server.Ended() {
-		if s.Name() == "ateenv.v1alpha.EnvironmentService/CreateEnvironment" {
-			if s.Parent().SpanID() != create.SpanContext().SpanID() {
-				t.Errorf("server parent %s, want the create_environment span %s", s.Parent().SpanID(), create.SpanContext().SpanID())
-			}
-			return
-		}
+	serverSpan := f.waitForServerSpan(t, func(s sdktrace.ReadOnlySpan) bool {
+		return s.Name() == "ateenv.v1alpha.EnvironmentService/CreateEnvironment"
+	})
+	if serverSpan.Parent().SpanID() != create.SpanContext().SpanID() {
+		t.Errorf("server parent %s, want the create_environment span %s", serverSpan.Parent().SpanID(), create.SpanContext().SpanID())
 	}
-	t.Error("no server CreateEnvironment span")
 }
 
 // NewTracerProvider builds the OTLP default without connecting.

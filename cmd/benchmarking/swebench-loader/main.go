@@ -688,6 +688,8 @@ func runCmd(args []string) (retErr error) {
 			StartTS:       startTS.Format(time.RFC3339Nano),
 			EndTS:         endTS.Format(time.RFC3339Nano),
 			SUTEndpoint:   *endpoint,
+			// The Go loader captures no SDK trace; say so explicitly.
+			Metadata: map[string]string{swebench.TraceCapturedMetadataKey: "false"},
 		}
 		if wErr := swebench.WriteRunWindow(*runWindow, rw); wErr != nil {
 			return wErr
@@ -762,7 +764,7 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 		minTasks       = fs.Int("min-tasks", 0, "Minimum task count for Validity Rule 3.")
 		maxFailCr      = fs.Float64("max-failed-create-ratio", -1, "Maximum failed create ratio for Validity Rule 4.")
 		schedPath      = fs.String("schedule", "", "Optional schedule.json path for Validity Rule 5.")
-		traceMode      = fs.Bool("trace-mode", false, "Mark scenario as having a trace-mode job (Validity Rule 6).")
+		traceMode      = fs.Bool("trace-mode", false, "Record that an SDK trace was captured (Validity Rule 6).")
 		orphanCount    = fs.Int("orphan-count", 0, "Remaining orphan count after reap (Validity Rule 7).")
 		compareFlag    = fs.String("compare", "", "Comma-separated events.jsonl or report.json files to compare against.")
 		thresholds     = fs.String("thresholds", "", "Optional thresholds.yaml path for regression gating.")
@@ -907,6 +909,12 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 
 	rep := reps[0]
 	if rw != nil {
+		if *traceMode {
+			if rw.Metadata == nil {
+				rw.Metadata = map[string]string{}
+			}
+			rw.Metadata[swebench.TraceCapturedMetadataKey] = "true"
+		}
 		rep.RunWindow = rw
 		if rep.RunID == "" {
 			rep.RunID = rw.RunID
@@ -952,7 +960,7 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 			MinRewardRate:   *minReward,
 			CheckRewardRate: *minReward > 0,
 			MinTasks:        *minTasks,
-			HasTraceJob:     *traceMode,
+			TraceCaptured:   *traceMode,
 			OrphanCount:     *orphanCount,
 			CacheBeforePath: *cacheBefore,
 			CacheAfterPath:  *cacheAfter,

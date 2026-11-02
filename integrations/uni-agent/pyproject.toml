@@ -50,3 +50,21 @@ select = ["E4", "E7", "E9", "F", "I", "UP"]  # same set as clients/python
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[dependency-groups]
+# uni-agent at the pinned commit plus the dependencies its CI installs next to
+# it (its pyproject.toml declares none). A dependency group, not a dependency:
+# groups are not published, and a git URL can't be in published metadata.
+# Upstream declares requires-python <3.13, hence the marker; the tests run on
+# 3.12.
+uni-agent = [
+  "uni-agent; python_version < '3.13'",
+  "pyyaml",
+  "httpx",
+  "jsonschema",
+  "openai",
+]
+
+[tool.uv.sources]
+ate-env-client = { workspace = true }
+uni-agent = { git = "https://github.com/verl-project/uni-agent", rev = "174b040e541f70234a22930a3f2ff8d1e2be5399" }

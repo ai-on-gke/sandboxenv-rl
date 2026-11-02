@@ -91,10 +91,10 @@ const DefaultHandshakeTimeout = 2 * time.Minute
 // refuses with 503. Substrate v0.6.0's router refuses a CONNECT only at the
 // Envoy level, for example when overloaded: it accepts the tunnel for any
 // actor state and resumes the actor for the request inside it, which it
-// holds itself (see modifyResponse). The same four minutes as ate-env-api's
+// holds itself (see modifyResponse). The same five minutes as ate-env-api's
 // guest calls (apiservice.DefaultWakeBudget), which share the --wake-budget
 // flag.
-const DefaultWakeBudget = 4 * time.Minute
+const DefaultWakeBudget = 5 * time.Minute
 
 // Idle tunnels: each one is a TCP stream from the API to an actor, held open
 // by the router and the worker. Keep few, and not for long, so an idle

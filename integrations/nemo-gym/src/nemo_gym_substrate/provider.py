@@ -440,8 +440,10 @@ class SubstrateSandboxProvider:
         starts next to itself (see README). The endpoint is ate-env-api's port
         proxy; its headers route each plain HTTP request through the Substrate
         router to ``port`` in this sandbox. Nothing here touches the guest: a
-        parked sandbox is resumed by the first request through the proxy,
-        which waits for the wake (ate-env-api's ``--wake-budget``). Only the
+        parked sandbox is resumed by the first request through the proxy. The
+        router holds that request up to about 10 s while the sandbox wakes; a
+        longer wake, usually only the first one on a new image, gets 503 with
+        ``Retry-After`` and ``X-Env-State``, and the caller retries. Only the
         sandbox's existence is checked, from the control plane, so a deleted
         or crashed sandbox raises ``RuntimeError`` here rather than on the
         first request.

@@ -272,6 +272,24 @@ their layers against GC, cost no worker capacity, and are released after the run
 coverage pass from a trainer before its first step. `FleetConfig.node_selector` is
 already declared and reserved (`config.py:201-205`); it becomes this.
 
+## What this replaces or changes
+
+Nothing is removed. One thing is subsumed, two change behaviour, the rest is additive.
+
+| Existing | Where | What happens to it |
+|---|---|---|
+| `bench prewarm` and `EnvBackend.Prewarm`: one probe create + delete per image | `cmd/benchmarking/bench/main.go:191-281`, `internal/benchmarking/swebench/backend.go:73-77, 165-179` | **Subsumed.** It is step 1 of the PreflightWarmer without the golden wait and without coverage. `bench prewarm` stays as the templates-only mode of the warmer (same flags, same `events/prewarm.jsonl`), so existing scenarios keep working. |
+| `bench run` with `footing: warm` appends a synthetic `prewarm` event for image `prewarmed-image` so Validity Rule 1 passes | `cmd/benchmarking/bench/run.go:270-285, 303-317`; `internal/benchmarking/DESIGN.md:447-450` | **Changed.** When a `preflight:` step ran, the rule reads the real coverage events; the synthetic event remains only for scenarios without one, and the report says which. |
+| `FleetConfig.node_selector`, `tolerations`, `worker_family`: declared "reserved", never plumbed | `clients/python/src/ate_env/config.py:201-205`, `backend/substrate.py:262-265` | **Changed.** `node_selector` gets its meaning (the per-environment `worker_selector`), fed by `FleetConfig.placement`. Unset keeps today's behaviour. |
+| `SandboxFleet.preflight()` and the run report's `preflight` phase: connectivity checks (a `Get` on a random id) | `backend/substrate.py:237-254`, `docs/observability.md:205-210` | **Kept, name collision noted.** The warmer is a class, `ate_env.PreflightWarmer`, and records its work under its own phases (`preflight_warm.golden`, `preflight_warm.coverage`), so the existing `preflight` phase keeps its meaning. |
+| `swebench-loader run -prefetch`, `WorkingSet.Prewarm`: one parked sandbox per image of the next step | `internal/benchmarking/swebench/workingset.go:437-520` | **Kept.** Instances, not caches; with `-placement` it passes the image's selector so the parked sandbox lands on a warm node. |
+| `swebench-loader resolve` and `schedule.json` (`prefetch_images`, `TasksPerImage`) | `cmd/benchmarking/swebench-loader/main.go:315-359`, `schedule.go:245-266` | **Kept.** The planner reads the schedule for demand; the schedule format does not change. |
+| `make-dataset.py` manifest | `benchmarking/swebench/make-dataset.py:133-149` | **Additive.** One field per instance, the unpacked image size. |
+| `ate-env-api`: `CreateEnvironment`, `GetEnvironment` | `proto/ateenv/v1alpha/env.proto` | **Additive.** `worker_selector` on create, `node` on get, a new `GetImageStatus` RPC. Callers that set neither see no change; the template-level selector stays the default. |
+| `ate-env manifest`: one WorkerPool with `ate-env/workerpool=<name>` | `cmd/ate-env/manifest.go:71, 749, 783` | **Additive.** Pools can carry a second, domain label; a flag to render N domain pools is optional. Existing manifests are unchanged. |
+| Pre-run checklist item 3, counting goldens with `kubectl-ate get actor-templates` | `benchmarking/swebench/SKILL.md:30-36` | **Replaced in practice** by `GetImageStatus`; the checklist points at it. |
+| `DESIGN.md:346-351` ("prewarm … cached across nodes"), `:256-258`, `benchmarking/swebench/README.md:99-107` ("placement is image-blind") | docs | **Made true, then updated.** |
+
 ## How this differs from `LookaheadWarmer`
 
 `LookaheadWarmer` keeps **instances** ready: for the next steps' `{image: claims}` it

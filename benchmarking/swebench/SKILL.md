@@ -98,6 +98,27 @@ wrong:
   per-restore cost. 0.65 unpacks per 8-vCPU node gave 15.8 s median; 13 per node gave 50 s; 160
   per 16-vCPU node gave 243 s. Choose the per-node concurrency on purpose and state it.
 
+### The reference cluster
+
+The baselines below were measured on this setup, and section 1's checks confirm it is still so:
+
+- Substrate v1.0.0-rc.1, installed with `--cordon-system-infra-components`; ate-api-server at 6
+  replicas for runs and 12 while goldens bake; the bundled Postgres at the default footprint with
+  `max_connections` raised to 500 and a 64-connection pool per replica; atelet with
+  `--image-cache-gc-period=30s --image-cache-high-percent=70 --image-cache-low-percent=60`.
+- System components on 3 x e2-standard-16, Postgres on 1 x n2-standard-16, both tainted off the
+  sandbox pools.
+- Sandbox pool A (the standard run): 40 x n2-standard-8, 200 GB pd-balanced, 8 workers per node.
+  Pool B (the image-delivery and high-cardinality runs): e2-standard-8, one CPU family, 500 GB
+  pd-balanced, about 2.5 workers per node. The WorkerPool's worker container sets no requests, so
+  each worker registers the node's allocatable; templates declare 2 CPU / 4 GiB, so a worker
+  admits 3 running actors. gVisor; golden snapshots on; the snapshots bucket and the image
+  registry in the cluster's region; plain containerd pulls unless the arm says otherwise.
+- ate-env-api at 4 replicas with `-wake-budget=5m`; the loader as a Job in the same cluster.
+
+A different node type, disk, workers per node or GC setting is a different baseline: label it
+and do not pool it with these.
+
 ### Named runs
 
 Two runs are the standard: ask for them by name and change nothing but the thing under test.

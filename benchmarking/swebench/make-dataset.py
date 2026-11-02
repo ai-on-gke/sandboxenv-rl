@@ -56,7 +56,6 @@ import argparse
 import datetime
 import hashlib
 import json
-import hashlib
 import subprocess
 import sys
 
@@ -149,6 +148,24 @@ def pin_ref(ref: str) -> str | None:
     return resolve_digest(ref)
 
 
+def image_bytes_compressed(pinned: str, platform: str = "linux/amd64") -> int | None:
+    """Sum of the compressed layer sizes of pinned (repo@sha256:...) for
+    platform, from the registry manifest, or None when crane cannot see it or
+    the manifest has no layers. An index is resolved to its platform manifest.
+    The unpacked size on a node is about 2 to 2.5 times this (SKILL.md)."""
+    try:
+        proc = subprocess.run(["crane", "manifest", "--platform", platform, pinned], check=False, capture_output=True, text=True)
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        layers = json.loads(proc.stdout).get("layers")
+        return sum(int(layer["size"]) for layer in layers)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
 def instance_id_from_ref(ref: str, pinned: str) -> str:
     """A stable id for an image-only record: the last path segment, the tag if
     one was given, and the first 12 hex digits of the digest, so two digest-
@@ -162,7 +179,8 @@ def instance_id_from_ref(ref: str, pinned: str) -> str:
     return "".join(c if c.isalnum() or c in "._-" else "-" for c in raw.lower())
 
 
-def write_image_only(images_file: str, out: str, limit: int = 0) -> int:
+def write_image_only(images_file: str, out: str, limit: int = 0, sizes: bool = True,
+                     platform: str = "linux/amd64") -> int:
     """Manifest for image-delivery workloads: one record per image reference,
     no grading material. References may be tags (resolved to a digest with
     crane) or already pinned by digest. A reference whose digest an earlier
@@ -170,8 +188,9 @@ def write_image_only(images_file: str, out: str, limit: int = 0) -> int:
     derives one template per digest and refuses a second reference to it, so
     the duplicate could only fail at create time. Two different images whose
     ids would still collide get a hash of the full reference appended.
-    limit > 0 stops after that many records."""
-    written = missing = 0
+    limit > 0 stops after that many records. With sizes, each record carries
+    image_bytes_compressed from the registry manifest when crane can read it."""
+    written = missing = unsized = 0
     digest_seen: dict[str, str] = {}
     ids: set[str] = set()
     with open(images_file) as src, open(out, "w") as dst:
@@ -195,15 +214,23 @@ def write_image_only(images_file: str, out: str, limit: int = 0) -> int:
             if iid in ids:
                 iid = f"{iid}-{hashlib.sha256(pinned.encode()).hexdigest()[:8]}"
             ids.add(iid)
-            dst.write(json.dumps({"instance_id": iid, "repo": "", "image": pinned,
-                                  "patch": "", "test_patch": "", "eval_script": "",
-                                  "fail_to_pass": [], "pass_to_pass": [], "log_parser": "", "eval_type": ""}) + "\n")
+            rec = {"instance_id": iid, "repo": "", "image": pinned,
+                   "patch": "", "test_patch": "", "eval_script": "",
+                   "fail_to_pass": [], "pass_to_pass": [], "log_parser": "", "eval_type": ""}
+            if sizes:
+                size = image_bytes_compressed(pinned, platform)
+                if size is None:
+                    unsized += 1
+                else:
+                    rec["image_bytes_compressed"] = size
+            dst.write(json.dumps(rec) + "\n")
             written += 1
     with open(out + ".meta.json", "w") as f:
         json.dump({"source": images_file, "instances": written, "missing_images": missing, "grading": False,
-                   "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}, f, indent=2)
+                   "image_sizes": sizes, "platform": platform if sizes else None, "unsized_images": unsized,
+                   "generated_at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")}, f, indent=2)
         f.write("\n")
-    print(f"wrote {written} image-only instances to {out}; {missing} missing images", file=sys.stderr)
+    print(f"wrote {written} image-only instances to {out}; {missing} missing images; {unsized} without a size", file=sys.stderr)
     return 1 if missing else 0
 
 
@@ -218,10 +245,12 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="Stop after N instances (0 = all).")
     ap.add_argument("--instances", default="", help="Comma-separated instance ids to include; default all.")
     ap.add_argument("--out", required=True, help="JSONL manifest to write.")
+    ap.add_argument("--no-image-sizes", action="store_true", help="Do not record image_bytes_compressed (one crane manifest call per image).")
+    ap.add_argument("--platform", default="linux/amd64", help="Platform whose manifest the image size comes from when the reference is an index.")
     args = ap.parse_args()
 
     if args.images_file:
-        return write_image_only(args.images_file, args.out, args.limit)
+        return write_image_only(args.images_file, args.out, args.limit, sizes=not args.no_image_sizes, platform=args.platform)
     if not args.registry:
         ap.error("--registry is required unless --images-file is given")
 
@@ -253,7 +282,7 @@ def main() -> int:
     swebench_version = getattr(swebench, "__version__", "unknown")
     want = {s for s in args.instances.split(",") if s}
 
-    written = missing = 0
+    written = missing = unsized = 0
     with open(args.out, "w") as out:
         for row in rows:
             iid = row["instance_id"]
@@ -290,6 +319,12 @@ def main() -> int:
                 "log_parser": row["log_parser"],
                 "eval_type": row["eval_type"],
             }
+            if not args.no_image_sizes:
+                size = image_bytes_compressed(pinned, args.platform)
+                if size is None:
+                    unsized += 1
+                else:
+                    rec["image_bytes_compressed"] = size
             out.write(json.dumps(rec) + "\n")
             written += 1
     meta = {
@@ -302,12 +337,15 @@ def main() -> int:
         "image_ref": args.image_ref,
         "instances": written,
         "missing_images": missing,
-        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "image_sizes": not args.no_image_sizes,
+        "platform": None if args.no_image_sizes else args.platform,
+        "unsized_images": unsized,
+        "generated_at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
     }
     with open(args.out + ".meta.json", "w") as f:
         json.dump(meta, f, indent=2)
         f.write("\n")
-    print(f"wrote {written} instances to {args.out}; {missing} missing images; provenance in {args.out}.meta.json", file=sys.stderr)
+    print(f"wrote {written} instances to {args.out}; {missing} missing images; {unsized} without a size; provenance in {args.out}.meta.json", file=sys.stderr)
     return 1 if missing else 0
 
 

@@ -56,7 +56,7 @@ available on Substrate main, not the whole answer.
 | 4 | `download`: golden snapshot not in the node's file cache | snapshot size / GCS throughput | same pass fills it (shared tag snapshots are node-cached); upstream: hard links instead of copies (#2948) | this plan |
 | 5 | `worker_restore`: memory restore of the golden | 0.1–1 s; a boot if the CPU family differs | one CPU family per domain; small guest memory; MEMORY fidelity | domains |
 | 6 | Wake moved to a cold node because the pinned node was full | 36 k of 105 k wakes in one density run (#3482) | per-environment selector keeps the detach inside the domain; upstream #3482, #3528 | PR 1 |
-| 7 | Task setup after boot (clone, install, test harness) repeated per rollout | seconds to minutes, × rollouts per task | a **task-level tag**: suspend the first rollout after setup, `CreateTag`, seed the other rollouts from it (`CreateActor --tag`); needs tag support in `ate-env-api` | out of scope here; the next plan |
+| 7 | Task setup after boot (clone, install, test harness) repeated per rollout | seconds to minutes, × rollouts per task | a **task-level tag**: suspend the first rollout after setup, `CreateTag`, seed the other rollouts from it (`CreateActor --tag`); needs tag support in `ate-env-api` | follow-up: sandboxenv-rl issue #206 |
 
 Read the restore timing breakdown before choosing: if `oci_unpack` dominates, this
 plan pays; if cold boots dominate, bakes do; if `worker_restore` dominates, the

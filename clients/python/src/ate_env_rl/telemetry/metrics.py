@@ -197,6 +197,22 @@ SUBPHASE_FAMILIES: dict[str, tuple[str, str]] = {
         "ate_env_client_ready_to_first_command_seconds",
         "Time from environment acquire ready until the first command begins",
     ),
+    "ttfi": (
+        "ate_env_client_ttfi_seconds",
+        "Time from sandbox request until the first command begins execution",
+    ),
+    "grade": (
+        "ate_env_client_grade_seconds",
+        "Time to execute a grading command in an environment",
+    ),
+    "read_file": (
+        "ate_env_client_read_file_seconds",
+        "Time to read a file from an environment",
+    ),
+    "write_file": (
+        "ate_env_client_write_file_seconds",
+        "Time to write a file into an environment",
+    ),
 }
 
 _ALLOWED_SOURCES = frozenset({"warm_pool", "cold_create", "mock", "direct"})

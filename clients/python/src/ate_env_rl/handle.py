@@ -68,8 +68,18 @@ class SandboxHandle:
     default_timeout_s: float = 120.0
     tracer: Any = field(default=None, repr=False, compare=False)
     claim_source: str = field(default="direct", repr=False, compare=False)
-    _first_command_started: bool = field(default=False, init=False, repr=False, compare=False)
     _acquired_at: float = field(default_factory=time.monotonic, init=False, repr=False, compare=False)
+    _acquire_started_at: float | None = field(default=None, repr=False, compare=False)
+    _first_command_started: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._acquire_started_at is None:
+            self._acquire_started_at = self._acquired_at
+
+    @staticmethod
+    def _is_grade_command(command: str | list[str]) -> bool:
+        parts = [command] if isinstance(command, str) else [str(c) for c in command]
+        return any("run_tests.sh" in p or "/eval.sh" in p for p in parts)
 
     def _span_ids(self) -> dict[str, Any]:
         return {
@@ -84,12 +94,20 @@ class SandboxHandle:
         first = not self._first_command_started
         if first:
             self._first_command_started = True
+            now = time.monotonic()
             metrics.observe_subphase(
                 "ready_to_first_command",
-                max(0.0, time.monotonic() - self._acquired_at),
+                max(0.0, now - self._acquired_at),
                 status="ok",
                 source=self.claim_source,
             )
+            if self._acquire_started_at is not None:
+                metrics.observe_subphase(
+                    "ttfi",
+                    max(0.0, now - self._acquire_started_at),
+                    status="ok",
+                    source=self.claim_source,
+                )
         return first
 
     def _exec_span(self, command: str | list[str], *, first: bool) -> Any:
@@ -152,6 +170,8 @@ class SandboxHandle:
         first = self._note_first_command()
         to_s = self.default_timeout_s if timeout_s is None else timeout_s
         token = in_handle_span.set(True)
+        cmd_t0 = time.monotonic()
+        status = "ok"
         try:
             with self._exec_span(command, first=first) as span, metrics.timed("exec"):
                 annotate_span(
@@ -164,9 +184,21 @@ class SandboxHandle:
                     run_id=self.run_id,
                 )
                 res = self.runtime.exec(command, cwd=cwd, env=env, timeout_s=to_s)
+                if check and (res.timed_out or res.exit_code != 0):
+                    status = "error"
                 self._exec_result_attrs(span, res, check)
+        except BaseException:
+            status = "error"
+            raise
         finally:
             in_handle_span.reset(token)
+            if self._is_grade_command(command):
+                metrics.observe_subphase(
+                    "grade",
+                    max(0.0, time.monotonic() - cmd_t0),
+                    status=status,
+                    source=self.claim_source,
+                )
         if check and res.timed_out:
             raise CommandTimeoutError(
                 f"Command '{command}' timed out after {to_s:g}s:\n"
@@ -193,6 +225,8 @@ class SandboxHandle:
         first = self._note_first_command()
         to_s = self.default_timeout_s if timeout_s is None else timeout_s
         token = in_handle_span.set(True)
+        cmd_t0 = time.monotonic()
+        status = "ok"
         try:
             with self._exec_span(command, first=first) as span, metrics.timed("exec"):
                 annotate_span(
@@ -205,9 +239,21 @@ class SandboxHandle:
                     run_id=self.run_id,
                 )
                 res = await self.runtime.exec_async(command, cwd=cwd, env=env, timeout_s=to_s)
+                if check and (res.timed_out or res.exit_code != 0):
+                    status = "error"
                 self._exec_result_attrs(span, res, check)
+        except BaseException:
+            status = "error"
+            raise
         finally:
             in_handle_span.reset(token)
+            if self._is_grade_command(command):
+                metrics.observe_subphase(
+                    "grade",
+                    max(0.0, time.monotonic() - cmd_t0),
+                    status=status,
+                    source=self.claim_source,
+                )
         if check and res.timed_out:
             raise CommandTimeoutError(
                 f"Command '{command}' timed out after {to_s:g}s:\n"
@@ -225,6 +271,8 @@ class SandboxHandle:
     def write_file(self, path: str, content: bytes | str) -> None:
         """Write file content directly into sandbox filesystem."""
         token = in_handle_span.set(True)
+        t0 = time.monotonic()
+        status = "ok"
         try:
             with self._file_span("write_file", path, content) as span:
                 annotate_span(
@@ -238,12 +286,23 @@ class SandboxHandle:
                     run_id=self.run_id,
                 )
                 self.runtime.write_file(path, content)
+        except BaseException:
+            status = "error"
+            raise
         finally:
+            metrics.observe_subphase(
+                "write_file",
+                max(0.0, time.monotonic() - t0),
+                status=status,
+                source=self.claim_source,
+            )
             in_handle_span.reset(token)
 
     async def write_file_async(self, path: str, content: bytes | str) -> None:
         """Asynchronously write file content directly into sandbox filesystem."""
         token = in_handle_span.set(True)
+        t0 = time.monotonic()
+        status = "ok"
         try:
             with self._file_span("write_file", path, content) as span:
                 annotate_span(
@@ -257,12 +316,23 @@ class SandboxHandle:
                     run_id=self.run_id,
                 )
                 await self.runtime.write_file_async(path, content)
+        except BaseException:
+            status = "error"
+            raise
         finally:
+            metrics.observe_subphase(
+                "write_file",
+                max(0.0, time.monotonic() - t0),
+                status=status,
+                source=self.claim_source,
+            )
             in_handle_span.reset(token)
 
     def read_file_bytes(self, path: str) -> bytes:
         """Read binary file content from sandbox filesystem."""
         token = in_handle_span.set(True)
+        t0 = time.monotonic()
+        status = "ok"
         try:
             with self._file_span("read_file", path) as span:
                 annotate_span(
@@ -278,12 +348,23 @@ class SandboxHandle:
                 set_attributes(span, {"ate_env.file.size": len(data)})
                 annotate_span(span, bytes=len(data))
                 return data
+        except BaseException:
+            status = "error"
+            raise
         finally:
+            metrics.observe_subphase(
+                "read_file",
+                max(0.0, time.monotonic() - t0),
+                status=status,
+                source=self.claim_source,
+            )
             in_handle_span.reset(token)
 
     async def read_file_bytes_async(self, path: str) -> bytes:
         """Asynchronously read binary file content from sandbox filesystem."""
         token = in_handle_span.set(True)
+        t0 = time.monotonic()
+        status = "ok"
         try:
             with self._file_span("read_file", path) as span:
                 annotate_span(
@@ -299,7 +380,16 @@ class SandboxHandle:
                 set_attributes(span, {"ate_env.file.size": len(data)})
                 annotate_span(span, bytes=len(data))
                 return data
+        except BaseException:
+            status = "error"
+            raise
         finally:
+            metrics.observe_subphase(
+                "read_file",
+                max(0.0, time.monotonic() - t0),
+                status=status,
+                source=self.claim_source,
+            )
             in_handle_span.reset(token)
 
     def initialize(

@@ -2029,6 +2029,7 @@ func (rep *Report) AttachClusterTelemetry(sys *schema.SystemDescription, meas *s
 	if rep == nil || (sys == nil && meas == nil) {
 		return
 	}
+	rep.ApplyMetricsPrimaryWithTraceFallback(meas)
 	hc := &HardwareCostSummary{}
 	if meas != nil && meas.ServerSummary != nil {
 		ss := meas.ServerSummary

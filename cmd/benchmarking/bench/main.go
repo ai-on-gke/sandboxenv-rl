@@ -861,7 +861,6 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 			rep.CustomMetrics[k] = v
 		}
 	}
-	rep.WriteText(stdout)
 
 	outRep := benchArtifactReport{Report: rep}
 	measPath := filepath.Join(destDir, "measurements.json")
@@ -915,6 +914,7 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 	rep.AttachClusterTelemetry(sysDescPtr, outRep.Measurements)
 	swebench.NormalizeLegacyReport(rep)
 	rep.RecordTraceCapture(false, len(swebench.FindTraceFiles(destDir)))
+	rep.WriteText(stdout)
 	if sysDescPtr != nil {
 		_ = sut.WriteSystemDescription(sysPath, *sysDescPtr)
 	}

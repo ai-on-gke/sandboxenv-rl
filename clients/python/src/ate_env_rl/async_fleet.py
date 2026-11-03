@@ -280,6 +280,7 @@ class AsyncSandboxFleet:
             return await self._acquire_task(task_obj, timeout_s)
 
     async def _acquire_task(self, task_obj: Task, timeout_s: float | None) -> SandboxHandle:
+        acquire_started_at = time.monotonic()
         if task_obj.template:
             template_id = task_obj.template
             rootfs_image = None
@@ -356,6 +357,7 @@ class AsyncSandboxFleet:
             default_timeout_s=self.config.step_timeout_s,
             tracer=self._fleet._tracer,
             claim_source=claim_source,
+            _acquire_started_at=acquire_started_at,
         )
 
     async def acquire_batch(

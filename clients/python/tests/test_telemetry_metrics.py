@@ -150,3 +150,36 @@ def test_metric_cache_does_not_outlive_a_custom_registry():
         gc.collect()
     # CPython reuses the freed id almost every time, so the loop hit the reuse case.
     assert len(seen_ids) < 50
+
+
+def test_subphase_families_and_handle_recording(monkeypatch):
+    from ate_env import FleetConfig, SandboxFleet, Task
+
+    for phase in (
+        "slot_wait",
+        "wire_claim",
+        "ready_to_first_command",
+        "ttfi",
+        "grade",
+        "read_file",
+        "write_file",
+    ):
+        assert phase in metrics.SUBPHASE_FAMILIES
+
+    metrics.reset_recorded_metrics()
+    monkeypatch.setattr(metrics, "is_measure_mode", lambda: True)
+
+    handle = SandboxFleet(FleetConfig(backend="mock")).acquire(Task(id="t1", image="img"))
+    handle.exec("echo hi", check=False)
+    handle.exec("bash /testbed/run_tests.sh", check=False)
+    handle.write_file("/tmp/a.txt", "hello")
+    assert handle.read_file_bytes("/tmp/a.txt") == b"hello"
+    handle.release()
+
+    sub = metrics.get_recorded_summary()["subphases"]
+    assert sub["ttfi:mock"]["count"] == 1
+    assert sub["ready_to_first_command:mock"]["count"] == 1
+    assert sub["grade:mock"]["count"] == 1
+    assert sub["write_file:mock"]["count"] == 1
+    assert sub["read_file:mock"]["count"] == 1
+

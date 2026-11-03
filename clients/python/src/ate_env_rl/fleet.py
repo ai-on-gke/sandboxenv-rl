@@ -19,6 +19,7 @@ import contextvars
 import dataclasses
 import logging
 import threading
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -503,6 +504,7 @@ class SandboxFleet:
             return self._acquire_task(task_obj, timeout_s)
 
     def _acquire_task(self, task_obj: Task, timeout_s: float | None) -> SandboxHandle:
+        acquire_started_at = time.monotonic()
         if task_obj.template:
             template_id = task_obj.template
             rootfs_image = None
@@ -559,6 +561,7 @@ class SandboxFleet:
             default_timeout_s=self.config.step_timeout_s,
             tracer=self._tracer,
             claim_source=claim_source,
+            _acquire_started_at=acquire_started_at,
         )
 
     def _build_runtime(

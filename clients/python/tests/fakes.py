@@ -44,6 +44,7 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
     def __init__(self):
         self.environments: dict[tuple[str, str], env_pb2.Environment] = {}
         self.last_create_request: env_pb2.CreateEnvironmentRequest | None = None
+        self.last_suspend_request: env_pb2.SuspendEnvironmentRequest | None = None
 
     async def CreateEnvironment(self, request, context):
         self.last_create_request = request
@@ -85,7 +86,28 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
 
     async def SuspendEnvironment(self, request, context):
         environment = await self._lookup(request, context)
-        environment.status = env_pb2.ENVIRONMENT_STATUS_SUSPENDED
+        self.last_suspend_request = request
+        # Mirror ate-env-api: an unknown mode is INVALID_ARGUMENT; a suspended
+        # or paused environment is left as it is, because Substrate's
+        # SuspendActor returns at once on it; a local suspend of a running one
+        # is PAUSED until its upload lands, a durable one SUSPENDED.
+        if request.mode not in (
+            env_pb2.SUSPEND_MODE_UNSPECIFIED,
+            env_pb2.SUSPEND_MODE_DURABLE,
+            env_pb2.SUSPEND_MODE_LOCAL,
+        ):
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, f"mode {request.mode} is not a SuspendMode"
+            )
+        if environment.status in (
+            env_pb2.ENVIRONMENT_STATUS_SUSPENDED,
+            env_pb2.ENVIRONMENT_STATUS_PAUSED,
+        ):
+            return env_pb2.SuspendEnvironmentResponse()
+        if request.mode == env_pb2.SUSPEND_MODE_LOCAL:
+            environment.status = env_pb2.ENVIRONMENT_STATUS_PAUSED
+        else:
+            environment.status = env_pb2.ENVIRONMENT_STATUS_SUSPENDED
         return env_pb2.SuspendEnvironmentResponse()
 
     async def DeleteEnvironment(self, request, context):
@@ -98,7 +120,7 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
             server="sandboxenv-rl",
             version="v0.0.0-fake",
             substrate_version="unknown",
-            features=["rootfs_image", "pty"],
+            features=["rootfs_image", "pty", "suspend_mode"],
         )
 
     async def _lookup(self, request, context):
@@ -141,8 +163,20 @@ class FakeProc:
     exited: bool = False
 
 
+async def _start_failure(context, failure):
+    """Answer like ate-env-api for an environment that cannot start: the
+    ate-env-start-failure trailer, then the status. failure is
+    (grpc.StatusCode, message, reason)."""
+    code, message, reason = failure
+    context.set_trailing_metadata((("ate-env-start-failure", reason),))
+    await context.abort(code, message)
+
+
 class FakeProcessService(guest_pb2_grpc.ProcessServiceServicer):
     def __init__(self):
+        # (code, message, reason): fail every call as an environment that
+        # cannot start (see _start_failure).
+        self.start_failure: tuple[grpc.StatusCode, str, str] | None = None
         self.next_procs: list[FakeProc] = []  # scripts for upcoming StartProcess calls
         self.procs: dict[str, FakeProc] = {}
         self.last_env: tuple[str, str] | None = None
@@ -163,6 +197,8 @@ class FakeProcessService(guest_pb2_grpc.ProcessServiceServicer):
 
     async def StartProcess(self, request, context):
         self.last_env = await _require_env(context)
+        if self.start_failure:
+            await _start_failure(context, self.start_failure)
         if not request.command:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "command cannot be empty")
         proc = self.next_procs.pop(0) if self.next_procs else FakeProc()
@@ -279,6 +315,7 @@ class FakeProcessService(guest_pb2_grpc.ProcessServiceServicer):
 
 class FakeFileSystemService(guest_pb2_grpc.FileSystemServiceServicer):
     def __init__(self):
+        self.start_failure: tuple[grpc.StatusCode, str, str] | None = None
         self.files: dict[str, bytes] = {}
         self.modes: dict[str, int] = {}
         self.last_env: tuple[str, str] | None = None
@@ -294,6 +331,8 @@ class FakeFileSystemService(guest_pb2_grpc.FileSystemServiceServicer):
 
     async def ReadFile(self, request, context):
         self.last_env = await _require_env(context)
+        if self.start_failure:
+            await _start_failure(context, self.start_failure)
         await self._validate_path(request.path, context)
         data = self.files.get(request.path)
         if data is None:
@@ -312,6 +351,10 @@ class FakeFileSystemService(guest_pb2_grpc.FileSystemServiceServicer):
         chunk_sizes = []
         async for request in request_iterator:
             if path is None:
+                # ate-env-api wakes the environment once the first message
+                # arrives, so a start failure answers after it.
+                if self.start_failure:
+                    await _start_failure(context, self.start_failure)
                 if not request.path:
                     await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "path is required")
                 await self._validate_path(request.path, context)

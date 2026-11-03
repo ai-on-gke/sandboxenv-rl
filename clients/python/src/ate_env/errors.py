@@ -32,6 +32,9 @@ __all__ = [
     "SandboxProtocolError",
     "CommandStartError",
     "SandboxStartError",
+    "START_FAILURE_CRASHED",
+    "START_FAILURE_KEY",
+    "START_FAILURE_NO_CAPACITY",
     "CommandExecutionError",
     "CommandTimeoutError",
     "PreflightError",
@@ -70,15 +73,48 @@ class RpcError(EnvError):
         self.code = code
 
 
+# Trailing metadata key ate-env-api sets on a guest call that failed because
+# the environment cannot start (internal/apiservice.StartFailureKey). Its
+# value is a START_FAILURE_* reason.
+START_FAILURE_KEY = "ate-env-start-failure"
+# The control plane moved the environment to CRASHED while it was waking.
+START_FAILURE_CRASHED = "crashed"
+# No worker had room to run the environment for ate-env-api's
+# --wake-no-capacity-grace.
+START_FAILURE_NO_CAPACITY = "no-capacity"
+
+
+def _start_failure_reason(err: grpc.RpcError) -> str | None:
+    """The START_FAILURE_KEY trailer of a failed call, if it carries one."""
+    trailing = getattr(err, "trailing_metadata", None)
+    if not callable(trailing):
+        return None
+    try:
+        items = trailing() or ()
+        for key, value in items:
+            if key == START_FAILURE_KEY:
+                return value.decode() if isinstance(value, bytes) else str(value)
+    except Exception:
+        return None
+    return None
+
+
 def map_rpc_error(err: BaseException) -> BaseException:
     """Convert a grpc.RpcError (including grpc.aio.AioRpcError) into an EnvError.
 
+    A call that ate-env-api marked with START_FAILURE_KEY (the environment
+    crashed while waking, or no worker had room for it) becomes a retryable
+    SandboxStartError carrying the reason, whatever its status code.
     Non-RPC exceptions pass through unchanged.
     """
     if not isinstance(err, grpc.RpcError):
         return err
     code = err.code()
     details = err.details() or str(err)
+    reason = _start_failure_reason(err)
+    if reason:
+        status = f"grpc {code.name}" if code is not None else None
+        return SandboxStartError(details, status=status, reason=reason)
     if code == grpc.StatusCode.NOT_FOUND:
         return NotFoundError(details)
     if code == grpc.StatusCode.INVALID_ARGUMENT:
@@ -172,9 +208,44 @@ class CommandStartError(InfrastructureError):
 
 
 class SandboxStartError(InfrastructureError):
-    """Raised when sandbox instantiation, template lookup, or boot fails."""
+    """Raised when sandbox instantiation, template lookup, or boot fails.
+
+    Attributes:
+        reason: Why, when ate-env-api said so: START_FAILURE_CRASHED or
+            START_FAILURE_NO_CAPACITY; None otherwise.
+    """
 
     default_retryable = True
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        sandbox_id: str | None = None,
+        status: str | None = None,
+        retryable: bool | None = None,
+        reason: str | None = None,
+    ):
+        super().__init__(message, sandbox_id=sandbox_id, status=status, retryable=retryable)
+        self.reason = reason
+
+    def __reduce__(self):
+        return (
+            _rebuild_start_error,
+            (str(self), self.sandbox_id, self.status, self.retryable, self.reason),
+        )
+
+
+def _rebuild_start_error(
+    message: str,
+    sandbox_id: str | None,
+    status: str | None,
+    retryable: bool,
+    reason: str | None,
+) -> SandboxStartError:
+    return SandboxStartError(
+        message, sandbox_id=sandbox_id, status=status, retryable=retryable, reason=reason
+    )
 
 
 class PreflightError(InfrastructureError):

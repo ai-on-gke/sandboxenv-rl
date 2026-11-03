@@ -24,6 +24,7 @@ from ate_env import (
     NotFoundError,
     RpcError,
     ServerInfo,
+    SuspendMode,
 )
 from ate_env._gen.ateenv.v1alpha import env_pb2, env_pb2_grpc, guest_pb2_grpc
 from ate_env.client import _auth_interceptors, _normalize_target
@@ -45,6 +46,8 @@ def test_normalize_target():
 def test_enum_values_match_proto():
     for member in EnvironmentStatus:
         assert env_pb2.EnvironmentStatus.Value(f"ENVIRONMENT_STATUS_{member.name}") == member
+    for member in SuspendMode:
+        assert env_pb2.SuspendMode.Value(f"SUSPEND_MODE_{member.name}") == member
 
 
 async def test_create_uses_server_defaults(fake_stack):
@@ -129,6 +132,36 @@ async def test_lifecycle_roundtrip(fake_stack):
         await client.get("dev1")
 
 
+async def test_suspend_mode(fake_stack):
+    client, fakes = fake_stack
+    await client.create("dev1")
+
+    # The default carries no mode on the wire, so an ate-env-api that predates
+    # the field serves it as the durable suspend it always did.
+    await client.suspend("dev1")
+    assert fakes.environments.last_suspend_request.mode == env_pb2.SUSPEND_MODE_UNSPECIFIED
+    await client.suspend("dev1", mode=SuspendMode.DURABLE)
+    assert fakes.environments.last_suspend_request.mode == env_pb2.SUSPEND_MODE_UNSPECIFIED
+    assert (await client.get("dev1")).status == EnvironmentStatus.SUSPENDED
+
+    # The mode applies to a running environment: a suspended one is left as
+    # it is, whatever the request asks for.
+    await client.suspend("dev1", mode=SuspendMode.LOCAL)
+    assert fakes.environments.last_suspend_request.mode == env_pb2.SUSPEND_MODE_LOCAL
+    assert (await client.get("dev1")).status == EnvironmentStatus.SUSPENDED
+
+    await client.create("dev2")
+    await client.env("dev2").suspend(mode=SuspendMode.LOCAL)
+    assert fakes.environments.last_suspend_request.mode == env_pb2.SUSPEND_MODE_LOCAL
+    assert (await client.get("dev2")).status == EnvironmentStatus.PAUSED
+    # A durable suspend of a paused environment does not wait for the upload.
+    await client.suspend("dev2")
+    assert (await client.get("dev2")).status == EnvironmentStatus.PAUSED
+
+    with pytest.raises(ValueError):
+        await client.suspend("dev1", mode=7)
+
+
 async def test_get_missing_raises_not_found(fake_stack):
     client, _ = fake_stack
     with pytest.raises(NotFoundError, match='environment "nope" not found'):
@@ -146,7 +179,7 @@ async def test_server_info(fake_stack):
         server="sandboxenv-rl",
         version="v0.0.0-fake",
         substrate_version="unknown",
-        features=("rootfs_image", "pty"),
+        features=("rootfs_image", "pty", "suspend_mode"),
     )
     assert "pty" in info.features
 

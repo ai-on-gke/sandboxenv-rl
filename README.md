@@ -284,8 +284,21 @@ be longer than the image pull plus the template's wakeup-probe timeout (`ate-env
 --wakeup-timeout`), because the control plane reports RUNNING only after the probe passes. The 5m
 default covers the 120 s timeout of a `--sidecar-readyz` template plus three minutes for the pull;
 raise it if you set a longer `--wakeup-timeout`. Otherwise the first guest call after a slow wake
-fails with `Unavailable`, and a retry succeeds once the environment is up. A crashed or deleted
-environment fails a guest call at once. Port-proxy requests wait on the router instead (see
+fails with `Unavailable`, and a retry succeeds once the environment is up. A deleted environment
+fails a guest call at once with `NotFound`.
+
+Two start failures also end the wait at once, because waiting cannot fix them, and mark the call's
+trailing metadata with `ate-env-start-failure`, so a client can retry the work on a fresh
+environment instead of scoring it:
+
+| Failure | Status | `ate-env-start-failure` | When |
+|---|---|---|---|
+| The control plane moved the environment to CRASHED while it was waking | `FailedPrecondition`, with the control plane's crash reason | `crashed` | always |
+| No worker has room to run the environment | `ResourceExhausted` | `no-capacity` | only with `--wake-no-capacity-grace`, after the router has said so for that long |
+
+`--wake-no-capacity-grace` defaults to 0: a full fleet keeps waiting for the whole `--wake-budget`,
+since capacity can come back as nodes scale up or other environments stop. Port-proxy requests
+wait on the router instead (see
 [Reaching a service inside an environment](#reaching-a-service-inside-an-environment)).
 
 `ate-env-api` can export traces and serve Prometheus metrics; both are off by default:

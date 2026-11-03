@@ -67,6 +67,11 @@ type Server struct {
 	// WakeRunningBudget bounds the wait once the control plane reports the
 	// environment RUNNING; see ensureAwake. Zero means DefaultWakeRunningBudget.
 	WakeRunningBudget time.Duration
+	// WakeNoCapacityGrace, when positive, fails a guest call with
+	// ResourceExhausted once the router has said for this long that no
+	// worker has room for the environment; see ensureAwake. Zero (the
+	// default) keeps waiting for the whole WakeBudget.
+	WakeNoCapacityGrace time.Duration
 	// Info is the build and configuration GetServerInfo reports.
 	Info ServerInfo
 	// RouterTLS, when set, is the client TLS configuration for the router's

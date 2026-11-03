@@ -297,7 +297,8 @@ environment instead of scoring it:
 | No worker has room to run the environment | `ResourceExhausted` | `no-capacity` | only with `--wake-no-capacity-grace`, after the router has said so for that long |
 
 `--wake-no-capacity-grace` defaults to 0: a full fleet keeps waiting for the whole `--wake-budget`,
-since capacity can come back as nodes scale up or other environments stop. Port-proxy requests
+since capacity can come back as nodes scale up or other environments stop. The Python SDK turns
+both into a retryable `SandboxStartError` whose `reason` is the trailer's value. Port-proxy requests
 wait on the router instead (see
 [Reaching a service inside an environment](#reaching-a-service-inside-an-environment)).
 

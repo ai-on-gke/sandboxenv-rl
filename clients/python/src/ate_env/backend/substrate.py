@@ -152,10 +152,12 @@ class SubstrateBackendDriver(BackendDriver):
         self._lock = threading.Lock()
         self._owned_actors: dict[str, RawSandboxInstance] = {}
         self._warm_paused_pool: _WarmPoolDict = _WarmPoolDict()
-        # Bumped when a reap starts and when it ends. A recycle, warm_pool or
-        # warm-claim put-back that awaited across a reap deletes its actor
-        # instead of pooling it after the teardown.
+        # Bumped when a reap starts and when it ends; _reaping counts the reaps
+        # in progress. A recycle, warm_pool or warm-claim put-back that awaited
+        # across a reap, or finishes during one, deletes its actor instead of
+        # pooling it (_may_pool).
         self._teardowns = 0
+        self._reaping = 0
         # Actors that warm_pool calls are still creating, per (pool key,
         # _teardowns), so overlapping calls do not each provision the full
         # shortfall. A reap drops every reservation with its generation.
@@ -418,12 +420,14 @@ class SubstrateBackendDriver(BackendDriver):
                     # counted it out of the warm pool, so count it back in.
                     # After a reap the pool is gone: delete the actor instead.
                     with self._lock:
-                        put_back = self._teardowns == teardowns
+                        put_back = self._may_pool(teardowns)
                         if put_back:
                             self._warm_paused_pool.setdefault(pool_key, []).append(actor_id)
                             stale = None
                         else:
-                            stale = self._owned_actors.pop(actor_id, None)
+                            # Still owned (a claim does not pop it): the delete
+                            # below removes it, and a reap can still see it.
+                            stale = self._owned_actors.get(actor_id)
                     if put_back:
                         self._observe("warm_add", 1)
                     elif stale is not None:
@@ -632,31 +636,26 @@ class SubstrateBackendDriver(BackendDriver):
         created = [r for r in results if isinstance(r, str)]
         # The reservation turns into pool entries under one lock, so a
         # concurrent warm_pool always counts these actors in one of the two.
+        instances = [
+            self._make_instance(aid, template_id, run_id=effective_run_id, rootfs_image=rootfs_image)
+            for aid in created
+        ]
         with self._lock:
             _release_reservation()
-            torn_down = self._teardowns != teardowns
-            if not torn_down:
-                for aid in created:
-                    self._warm_paused_pool.setdefault(pool_key, []).append(aid)
-                    self._owned_actors[aid] = self._make_instance(
-                        aid, template_id, run_id=effective_run_id, rootfs_image=rootfs_image
-                    )
+            torn_down = not self._may_pool(teardowns)
+            for inst in instances:
+                # Owned either way, so a cancelled delete below leaves them
+                # for the next reap.
+                self._owned_actors[inst.instance_id] = inst
+                if not torn_down:
+                    self._warm_paused_pool.setdefault(pool_key, []).append(inst.instance_id)
         if torn_down:
             logger.info(
                 "Teardown ran while warming %d actors for template %s; deleting them",
                 len(created),
                 template_id,
             )
-            await asyncio.gather(
-                *(
-                    self._delete_after_teardown(
-                        self._make_instance(
-                            aid, template_id, run_id=effective_run_id, rootfs_image=rootfs_image
-                        )
-                    )
-                    for aid in created
-                )
-            )
+            await asyncio.gather(*(self._delete_after_teardown(inst) for inst in instances))
         else:
             self._observe("warm_add", len(created))
 
@@ -666,11 +665,17 @@ class SubstrateBackendDriver(BackendDriver):
             if isinstance(res, Exception):
                 logger.warning("Error provisioning warm actor: %s", res)
 
+    def _may_pool(self, teardowns: int) -> bool:
+        """Whether an actor may enter the pool: no reap ran since the caller
+        read ``teardowns`` and none is running. Caller holds self._lock."""
+        return self._reaping == 0 and self._teardowns == teardowns
+
     async def _delete_after_teardown(self, instance: RawSandboxInstance) -> None:
         """Delete an actor that a reap could not see.
 
-        A failed delete is counted as a release failure and the actor stays
-        owned, so the next reap retries it and raises if it still fails.
+        The caller has put the actor in _owned_actors, and it leaves only once
+        the delete succeeds: a failed delete is counted as a release failure,
+        and a failed or cancelled one leaves the actor for the next reap.
         """
         actor_id = instance.instance_id
         try:
@@ -678,10 +683,11 @@ class SubstrateBackendDriver(BackendDriver):
         except NotFoundError:
             pass
         except Exception as e:
-            with self._lock:
-                self._owned_actors.setdefault(actor_id, instance)
             self._observe("release_failed")
             logger.warning("Failed deleting actor %s after teardown: %s", actor_id, e)
+            return
+        with self._lock:
+            self._owned_actors.pop(actor_id, None)
 
     def warm_pool(
         self,
@@ -844,7 +850,7 @@ class SubstrateBackendDriver(BackendDriver):
                 await self._client_for(instance_id).suspend(instance_id, atespace=self.atespace)
                 pool_key = (instance.template_id, instance.rootfs_image)
                 with self._lock:
-                    pooled = self._teardowns == teardowns
+                    pooled = self._may_pool(teardowns)
                     if pooled:
                         self._warm_paused_pool.setdefault(pool_key, []).append(instance_id)
                         self._owned_actors[instance_id] = instance
@@ -859,6 +865,11 @@ class SubstrateBackendDriver(BackendDriver):
                 logger.warning(
                     "Failed to suspend actor %s for recycle, deleting: %s", instance_id, e
                 )
+            except BaseException:
+                # Cancelled during suspend(): keep it owned for the run's reap.
+                with self._lock:
+                    self._owned_actors.setdefault(instance_id, instance)
+                raise
 
         try:
             await self._client_for(instance_id).delete(instance_id, atespace=self.atespace)
@@ -882,19 +893,22 @@ class SubstrateBackendDriver(BackendDriver):
             return await self._reap_internal(run_id)
 
     async def _reap_internal(self, run_id: str) -> int:
+        with self._lock:
+            self._reaping += 1
+            self._teardowns += 1
+            self._warm_inflight.clear()
         try:
             return await self._reap_actors(run_id)
         finally:
             # Work that started during the reap's own awaits also sees a
             # teardown, so nothing is pooled before the fleet resets the gauge.
             with self._lock:
+                self._reaping -= 1
                 self._teardowns += 1
                 self._warm_inflight.clear()
 
     async def _reap_actors(self, run_id: str) -> int:
         with self._lock:
-            self._teardowns += 1
-            self._warm_inflight.clear()
             warm_actors: list[str] = []
             for tid, actors in list(self._warm_paused_pool.items()):
                 warm_actors.extend(actors)

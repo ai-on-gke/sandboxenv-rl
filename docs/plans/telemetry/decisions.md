@@ -71,8 +71,8 @@ Append-only. Each entry: date, who, what, why.
 - 2026-10-29, recorded from #109: client histograms are
   `ate_env_client_{acquire,exec,suspend,warm_claim,release}_seconds{status}` plus the claim
   sub-phases `ate_env_client_{slot_wait,wire_claim,ready_to_first_command}_seconds{status,source}`.
-  The planned `ate_env_client_wake_seconds` was not added; wake is an `ate_env_client.wake` span and
-  a GRPO phase.
+  The planned `ate_env_client_wake_seconds` was not added; wake is the warm claim's
+  `ate_env_client.get_environment` span and a GRPO phase.
 - 2026-10-29, recorded from #114: `internal/telemetry` has no `Instrumenter` interface. otelgrpc's
   server and client handlers cover every boundary, so `SetupOTel(ctx, serviceName)` returns a
   shutdown func only and `telemetry.Untraced(ctx)` keeps the scrape-time `ListActors` out of traces.
@@ -134,9 +134,11 @@ Append-only. Each entry: date, who, what, why.
   reworded to match `main` at `9b2148a`.
 - 2026-10-22, recorded from #93: the run id is `ate_env.run_id`, on every step-level span (`exec`,
   `read_file`, `write_file`) as well as the driver's `acquire` and `reap` spans, so a run's steps
-  are selectable without walking parents.
+  are selectable without walking parents. As shipped on `main`, the driver's `warm_pool` span has it
+  too. `Client.create_environment` has no `ate_env.run_id` attribute: inside a fleet task the trace
+  recorder takes the run id from `task_context` for its JSONL event, not for the OTel span.
 - 2026-10-22, recorded from #93: the first exec started on each acquired sandbox carries
-  `ate_env.first_command=true`. It holds the wake and readiness wait and ends the time-to-first-
+  `ate_env.first_command=true`. It holds the wake and readiness wait and ends the time to first
   command window, which `ate_env_client_ready_to_first_command_seconds` also records.
 - 2026-10-23, spec author: AC-9. A Dafny model of `repo_family` (not in the repository) failed the
   property "`other` only on overflow" with a repo literally named `other`: it got the overflow

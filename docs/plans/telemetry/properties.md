@@ -178,10 +178,10 @@ execs started concurrently from several threads, exactly one `ate_env_client.exe
 - Proposed test: Hypothesis `test_first_command_exactly_once`.
 - Example coverage on `main`: `test_first_command_marks_only_the_first_exec_per_sandbox` (sequential
   execs only).
-- **Fails on `main` (open, not addressed by #221).** A run of this property against the series'
-  code, with execs started concurrently on one handle, marked a span that was not the first started
-  in 9 of 12 runs. No run marked more than one span, so "exactly one" held and "the first started"
-  did not. The cause is in `clients/python/src/ate_env/handle.py`: `exec` and `exec_async` call
+- Fails on `main` (open, not addressed by #221). A run of this property against the series' code,
+  with execs started concurrently on one handle, marked a span that was not the first started in 9
+  of 12 runs. No run marked more than one span, so "exactly one" held and "the first started" did
+  not. The cause is in `clients/python/src/ate_env/handle.py`: `exec` and `exec_async` call
   `_note_first_command()` before `_exec_span` starts the span. `_note_first_command` is also a
   check-and-set without a lock. The fix belongs in the code; the property stays as written.
 
@@ -292,7 +292,7 @@ with only documented `ate.*` and `ate_env.*` attribute keys plus, on CLIENT span
 ## Warm-pool accounting under concurrency (AC-15)
 
 `SubstrateBackendDriver` coroutines share one event loop and interleave at every `await`. P-9 to
-P-11 share the Hypothesis **stateful** test `test_warm_pool_accounting` in
+P-11 share the Hypothesis stateful test `test_warm_pool_accounting` in
 `clients/python/tests/test_warm_pool_accounting.py` (#221). Its rules are `acquire_new`,
 `acquire_warm`, `start_recycle` and `finish_recycle` (paused inside `await suspend()`),
 `start_warm_pool` and `finish_warm_pools` (paused inside `await create()`), `start_teardown` and
@@ -465,7 +465,7 @@ document stated. Reproduced: `add_phase("acquire", 2.0); add_phase("acquire", -5
 
 **P-1, the bound.** The property first said `MAX_FAMILIES + 1`. A Hypothesis run found 65 distinct
 repos plus one unparseable input give 66 values (64 families, `other`, `unknown`). The spec was
-wrong, not the code.
+wrong.
 
 **P-19, one span per event.** The property first described interleaved start and done pairs. The
 code writes each event when its operation finishes and records one span per event, back-dated by

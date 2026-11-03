@@ -16,7 +16,7 @@ Conventions:
 - "Properties (proposed)" names the properties in [properties.md](./properties.md) that would
   validate a criterion over generated inputs. Those tests are not in the repository.
 
-| ID    | Title                                                                               | PR      | Status at `3b03b03`                                                                                           |
+| ID    | Title                                                                               | PR      | Status at `c0c41ac`                                                                                           |
 | ----- | ----------------------------------------------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------- |
 | AC-1  | Base install carries no telemetry dependency and imports clean                      | 1, 2    | pass: `pyproject.toml`, `test_registry_import_does_not_load_prometheus`                                       |
 | AC-2  | Telemetry enabled without the extras is a logged no-op                              | 1, 2    | pass: `test_missing_extra_logs_one_error`, `test_observer_without_layers_is_report_only`                      |
@@ -122,7 +122,9 @@ Conventions:
   `0 <= max_s <= total_s <= count * max_s`; each `add_release_error()` adds 1 to `release_errors`,
   and `summary()` prints a `release_errors=N` line while it is nonzero; `write()` produces the
   `.txt` and `.json` pair without overwriting.
-- Pass rule: assertions hold. No test on `main` checks the `release_errors=N` summary line.
+- Pass rule: assertions hold.
+  `test_release_errors.py::test_failed_delete_does_not_raise_and_is_counted` checks the
+  `release_errors=N` summary line.
 - Properties (proposed): P-8, P-16.
 
 ## AC-8: Prometheus series register lazily with the documented labels

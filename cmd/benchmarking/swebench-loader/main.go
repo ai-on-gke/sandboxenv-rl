@@ -667,6 +667,7 @@ func runCmd(args []string) (retErr error) {
 		groupSize     = fs.Int("group-size", 0, "steps: group size per sampled task when resolving a schedule (0 uses -rollouts).")
 		stepPause     = fs.Duration("step-pause", 0, "steps: simulated trainer pause between steps.")
 		prefetch      = fs.Bool("prefetch", false, "steps: asynchronously prewarm next step's prefetch_images off the critical path.")
+		placementPath = fs.String("placement", "", "image-placement.json from plan-placement: each create carries the worker selector of one of its image's domains, round-robin, so environments land where the pre-flight put the image. ate-env API backend only.")
 		createTimeout = fs.Duration("create-timeout", 5*time.Minute, "Deadline for one create call.")
 		stepTimeout   = fs.Duration("step-timeout", 10*time.Minute, "Default deadline for a run step without its own timeout.")
 		wakeBudget    = fs.Duration("wake-budget", 3*time.Minute, "How long a task's first command is retried while the environment is still waking or its image is still being baked.")
@@ -843,6 +844,13 @@ func runCmd(args []string) (retErr error) {
 	if testBackendOverride != nil {
 		backend = testBackendOverride
 	} else {
+		var placement *schema.ImagePlacement
+		if *placementPath != "" {
+			if placement, err = swebench.ReadImagePlacement(*placementPath); err != nil {
+				return err
+			}
+			log.Info("placement", slog.String("plan", *placementPath), slog.Int("images", len(placement.Images)), slog.Int("domains", len(placement.Domains)), slog.Int("unplaced", len(placement.Unplaced)))
+		}
 		drv, closer, err := swebench.NewBackendDriver(swebench.BackendDriverOptions{
 			Backend:      *backendFlag,
 			Access:       *accessFlag,
@@ -854,6 +862,7 @@ func runCmd(args []string) (retErr error) {
 			WarmPool:     *warmPool,
 			Connections:  *connections,
 			AuthToken:    authToken,
+			Placement:    placement,
 		})
 		if err != nil {
 			return err
@@ -1036,6 +1045,7 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 		tag            = fs.String("tag", "", "Optional tag for stats.jsonl.")
 		validate       = fs.Bool("validate", false, "Evaluate Validity Rules 1-7 and exit non-zero on failure.")
 		footing        = fs.String("footing", "", "Expected footing for Validity Rule 1 (warm | cold).")
+		preflightCov   = fs.String("preflight-coverage", "", "preflight-coverage.json of the pre-flight that ran before the run; Rule 1 takes a complete pre-flight as prewarm evidence on warm footing and fails on an incomplete one.")
 		minReward      = fs.Float64("min-reward-rate", 0, "Minimum reward rate for Validity Rule 2.")
 		minTasks       = fs.Int("min-tasks", 0, "Minimum task count for Validity Rule 3.")
 		maxFailCr      = fs.Float64("max-failed-create-ratio", -1, "Maximum failed create ratio for Validity Rule 4.")
@@ -1240,6 +1250,8 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 			OrphanCount:     *orphanCount,
 			CacheBeforePath: *cacheBefore,
 			CacheAfterPath:  *cacheAfter,
+
+			PreflightCoveragePath: *preflightCov,
 		}
 		if *maxFailCr >= 0 {
 			valOpts.MaxFailedCreateRatio = *maxFailCr

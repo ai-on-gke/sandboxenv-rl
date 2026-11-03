@@ -7,6 +7,11 @@ user needs to know across them.
 ## Unreleased
 
 ### Added
+- `swebench-loader run -placement image-placement.json`: each create carries
+  the worker selector of one of its image's domains, round-robin per image
+  (`EnvBackend` `WithPlacement`); `report -preflight-coverage` feeds the
+  pre-flight's result to Validity Rule 1, which takes a complete pre-flight
+  as prewarm evidence on warm footing and fails on an incomplete one.
 - `swebench-loader preflight`, the PreflightWarmer: from an image placement
   plan, ensures each image's derived template, waits for its golden, then
   probes every node of every domain with the image (creates placed by the

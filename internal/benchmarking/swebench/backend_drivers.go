@@ -31,6 +31,7 @@ import (
 	env "github.com/agent-substrate/env/clients/go"
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/ate"
+	"github.com/agent-substrate/env/internal/benchmarking/schema"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
@@ -52,6 +53,9 @@ type BackendDriverOptions struct {
 	WarmPool     string
 	Connections  int
 	AuthToken    string
+	// Placement, when set, steers each image's environments into the domains
+	// an image placement plan assigns it (EnvBackend only).
+	Placement *schema.ImagePlacement
 }
 
 type nopCloser struct{}
@@ -86,6 +90,9 @@ func NewBackendDriver(opts BackendDriverOptions) (Backend, io.Closer, error) {
 	if err := ValidateBackendDriverFlags(opts.Backend, opts.Access); err != nil {
 		return nil, nil, err
 	}
+	if opts.Placement != nil && (opts.Backend == "agent-sandbox" || opts.Access == "direct") {
+		return nil, nil, fmt.Errorf("a placement plan needs the ate-env API backend (-backend substrate -access ate-env-api); %s/%s cannot place environments", opts.Backend, opts.Access)
+	}
 	switch opts.Backend {
 	case "agent-sandbox":
 		b, err := NewAgentSandboxBackend(AgentSandboxOptions{
@@ -119,7 +126,11 @@ func NewBackendDriver(opts BackendDriverOptions) (Backend, io.Closer, error) {
 			}
 			return b, b, nil
 		}
-		b, err := NewEnvBackend(opts.Endpoint, opts.Atespace, opts.BaseTemplate, opts.Connections, opts.AuthToken)
+		var envOpts []EnvBackendOption
+		if opts.Placement != nil {
+			envOpts = append(envOpts, WithPlacement(opts.Placement))
+		}
+		b, err := NewEnvBackend(opts.Endpoint, opts.Atespace, opts.BaseTemplate, opts.Connections, opts.AuthToken, envOpts...)
 		if err != nil {
 			return nil, nil, err
 		}

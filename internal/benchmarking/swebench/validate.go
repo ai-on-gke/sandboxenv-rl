@@ -174,6 +174,13 @@ type ValidateOptions struct {
 
 	// Optional raw event slice if not already summarized into Report.
 	Events []Event
+
+	// Rule 1: the pre-flight's preflight-coverage.json, when a PreflightWarmer
+	// ran before the run. A complete pre-flight is prewarm evidence on warm
+	// footing; an incomplete one fails warm footing with its shortfall; any
+	// pre-flight contradicts cold footing.
+	PreflightCoverage     *schema.PreflightCoverage
+	PreflightCoveragePath string
 }
 
 // Validate evaluates all 7 validity rules from DESIGN.md §6 against rep and opts,
@@ -259,10 +266,23 @@ func Validate(rep *Report, opts ValidateOptions) schema.ReportValidity {
 		hasCacheDelta = true
 	}
 
-	// Rule 1: Warm or cold footing matches prewarm events and node cache delta.
+	coverage := opts.PreflightCoverage
+	if coverage == nil && opts.PreflightCoveragePath != "" {
+		if c, err := ReadPreflightCoverage(opts.PreflightCoveragePath); err != nil {
+			reasons = append(reasons, fmt.Sprintf("rule 1: %v", err))
+		} else {
+			coverage = c
+		}
+	}
+
+	// Rule 1: Warm or cold footing matches prewarm events, the pre-flight and
+	// the node cache delta.
 	switch opts.Footing {
 	case "warm":
-		if prewarmCount == 0 {
+		if coverage != nil && !coverage.Complete {
+			reasons = append(reasons, "rule 1 (footing=warm): the pre-flight is incomplete: "+preflightShortfall(coverage))
+		}
+		if prewarmCount == 0 && (coverage == nil || !coverage.Complete) {
 			reasons = append(reasons, "rule 1 (footing=warm): expected prewarm events, found 0")
 		}
 		if hasCacheDelta && hitsDelta <= 0 {
@@ -274,6 +294,9 @@ func Validate(rep *Report, opts ValidateOptions) schema.ReportValidity {
 	case "cold":
 		if prewarmCount > 0 {
 			reasons = append(reasons, fmt.Sprintf("rule 1 (footing=cold): expected 0 prewarm events, found %d", prewarmCount))
+		}
+		if coverage != nil {
+			reasons = append(reasons, "rule 1 (footing=cold): a pre-flight ran before the run ("+opts.PreflightCoveragePath+")")
 		}
 		if hasCacheDelta && hitsDelta > 0 {
 			reasons = append(reasons, fmt.Sprintf("rule 1 (footing=cold): expected 0 node cache hit delta on cold footing, got hits_delta=%d", hitsDelta))

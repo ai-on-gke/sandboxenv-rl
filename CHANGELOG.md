@@ -7,6 +7,13 @@ user needs to know across them.
 ## Unreleased
 
 ### Added
+- `swebench-loader preflight`, the PreflightWarmer: from an image placement
+  plan, ensures each image's derived template, waits for its golden, then
+  probes every node of every domain with the image (creates placed by the
+  domain's worker selector, node read back) until each node has run it;
+  `events/preflight.jsonl` and `preflight-coverage.json`; `-pin` leaves the
+  probes suspended. `EnvBackend` gains `CreatePlaced`, `Node`,
+  `ImageStatus` and `EnsureImageTemplate` (the `ImageWarmer` interface).
 - ate-env-api: `GetImageStatus` and `EnsureImageTemplate`, the ActorTemplate
   derived for a `rootfs_image` and the state of its golden snapshot (`NONE`,
   `PENDING`, `READY` with the tag, `FAILED` with the reason); ensure creates

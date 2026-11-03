@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-on-gke.github.io/sandboxenv-rl/schema/v1/preflight_coverage.schema.json",
+  "title": "PreflightCoverage",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "started_at", "finished_at", "pinned", "goldens", "domains", "complete"],
+  "properties": {
+    "schema_version": { "type": "string", "enum": ["v1"] },
+    "run_id": { "type": "string", "minLength": 1 },
+    "started_at": { "type": "string", "format": "date-time" },
+    "finished_at": { "type": "string", "format": "date-time" },
+    "plan": { "type": "string" },
+    "pinned": { "type": "boolean" },
+    "goldens": { "type": "array", "items": { "$ref": "#/$defs/GoldenRecord" } },
+    "domains": { "type": "array", "items": { "$ref": "#/$defs/DomainCoverage" } },
+    "complete": { "type": "boolean" }
+  },
+  "$defs": {
+    "GoldenRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "state", "wait_ms"],
+      "properties": {
+        "image": { "type": "string", "minLength": 1 },
+        "template": { "type": "string" },
+        "state": { "type": "string", "enum": ["none", "pending", "ready", "failed", "skipped"] },
+        "tag": { "type": "string" },
+        "error": { "type": "string" },
+        "wait_ms": { "type": "number", "minimum": 0 }
+      }
+    },
+    "DomainCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "nodes", "nodes_seen", "images", "complete"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "nodes": { "type": "integer", "minimum": 1 },
+        "nodes_seen": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "images": { "type": "array", "items": { "$ref": "#/$defs/ImageCoverage" } },
+        "complete": { "type": "boolean" }
+      }
+    },
+    "ImageCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "nodes", "wanted", "probes", "failed", "rounds", "complete"],
+      "properties": {
+        "image": { "type": "string", "minLength": 1 },
+        "nodes": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "wanted": { "type": "integer", "minimum": 1 },
+        "probes": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "rounds": { "type": "integer", "minimum": 0 },
+        "complete": { "type": "boolean" },
+        "pinned": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 } },
+        "error": { "type": "string" }
+      }
+    }
+  }
+}

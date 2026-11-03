@@ -237,6 +237,33 @@ staying the source of truth so a run does not depend on a collector.
    the pre-flight fills the node caches from it and the run steers each
    create into its image's domain.
 
+5. Optional: warm the nodes from the plan. The PreflightWarmer ensures each
+   image's derived template and waits for its golden snapshot (the bake
+   throughput is 5 per ateapi replica, about two minutes each: scale
+   `ate-api-server` for a large image set, or run a first pass with
+   `-skip-golden-wait` to pull the layers while the bakes run and a second
+   without it), then per (image, domain) creates probe environments with the
+   domain's worker selector, round after round, until every node of the
+   domain has run the image once; each probe's first command returns when
+   the layers and the golden snapshot are on its node, and the node is read
+   back from `ate-env-api`:
+
+   ```bash
+   swebench-loader preflight -plan image-placement.json -events-dir runs/pf-$(date +%s) \
+     -endpoint 127.0.0.1:7777 -auth-token-file token -probes-per-node 2 -max-rounds 3
+   ```
+
+   It writes `events/preflight.jsonl` (a `prewarm` event per image, which
+   Validity Rule 1 and the report count, a `preflight_golden` per image and a
+   `preflight_probe` per probe with its node) and `preflight-coverage.json`
+   (`schema_version: v1`): per domain the nodes seen and per image the nodes
+   covered, probes, rounds and failures. It exits non-zero when a golden is
+   not ready or a pair is short of its nodes, and says which. `-pin` leaves
+   the probes suspended instead of deleting them: their local snapshots pin
+   them to their nodes and keep the layers referenced, so nothing changes
+   before the run; delete them after it (`ate-env delete`, they are named
+   `<run-id>-<domain>-<image>-<round>-<slot>`).
+
 ## Run
 
 From a machine with a port-forward (fine for the smoke test and the step

@@ -337,12 +337,18 @@ func WriteImagePlacement(path string, p *schema.ImagePlacement) error {
 	if err := p.Validate(); err != nil {
 		return err
 	}
+	return writeJSONFile(path, p)
+}
+
+// writeJSONFile writes v as indented JSON with a trailing newline, creating
+// the directory.
+func writeJSONFile(path string, v any) error {
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
 	}
-	data, err := json.MarshalIndent(p, "", "  ")
+	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}

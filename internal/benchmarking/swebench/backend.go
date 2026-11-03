@@ -76,6 +76,45 @@ type Prewarmer interface {
 	Prewarm(ctx context.Context, images []string) error
 }
 
+// GoldenState is the state of a derived template's golden snapshot as the
+// pre-flight sees it: none while the template does not exist, pending while
+// it bakes, ready once tagged, failed when the bake gave up.
+type GoldenState string
+
+const (
+	GoldenNone    GoldenState = "none"
+	GoldenPending GoldenState = "pending"
+	GoldenReady   GoldenState = "ready"
+	GoldenFailed  GoldenState = "failed"
+)
+
+// ImageState is what ate-env-api reports for a rootfs image: its derived
+// template and that template's golden snapshot.
+type ImageState struct {
+	Template string
+	Exists   bool
+	Golden   GoldenState
+	Tag      string
+	Error    string
+}
+
+// ImageWarmer is the optional interface the pre-flight needs from a
+// backend: the golden state of an image's derived template, creates placed
+// with a worker selector, and the node an environment landed on. EnvBackend
+// implements it.
+type ImageWarmer interface {
+	// EnsureImageTemplate creates the derived template when it is missing,
+	// which starts its golden bake, and reports it; no environment is created.
+	EnsureImageTemplate(ctx context.Context, image string) (ImageState, error)
+	// ImageStatus reports the derived template without creating anything.
+	ImageStatus(ctx context.Context, image string) (ImageState, error)
+	// CreatePlaced is Create with a per-environment worker selector, which
+	// Substrate ANDs with the template's.
+	CreatePlaced(ctx context.Context, id, image string, selector map[string]string) (Sandbox, error)
+	// Node is the node the environment is on, or "" before its placement.
+	Node(ctx context.Context, id string) (string, error)
+}
+
 // Backend creates sandboxes. The loader is written against this interface so
 // tests run it against an in-memory fake and a second SDK or backend can be
 // compared with the same workload.
@@ -182,16 +221,77 @@ func (b *EnvBackend) Prewarm(ctx context.Context, images []string) error {
 // Create implements Backend. The environment keeps the connection it was
 // created on for the rest of its life.
 func (b *EnvBackend) Create(ctx context.Context, id, image string) (Sandbox, error) {
+	return b.CreatePlaced(ctx, id, image, nil)
+}
+
+// CreatePlaced implements ImageWarmer: Create with a worker selector.
+func (b *EnvBackend) CreatePlaced(ctx context.Context, id, image string, selector map[string]string) (Sandbox, error) {
 	e, err := b.pick().Create(ctx, &ateenvv1alpha.CreateEnvironmentRequest{
-		Id:          id,
-		Atespace:    b.atespace,
-		Template:    &ateenvv1alpha.Template{Name: b.baseTemplate, Atespace: b.atespace},
-		RootfsImage: image,
+		Id:             id,
+		Atespace:       b.atespace,
+		Template:       &ateenvv1alpha.Template{Name: b.baseTemplate, Atespace: b.atespace},
+		RootfsImage:    image,
+		WorkerSelector: selector,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create %s: %w", id, err)
 	}
 	return envSandbox{e: e, minPoll: b.minPoll, maxPoll: b.maxPoll}, nil
+}
+
+// Node implements ImageWarmer.
+func (b *EnvBackend) Node(ctx context.Context, id string) (string, error) {
+	e, err := b.pick().Get(ctx, b.atespace, id)
+	if err != nil {
+		return "", fmt.Errorf("get %s: %w", id, err)
+	}
+	return e.GetNode(), nil
+}
+
+// EnsureImageTemplate implements ImageWarmer.
+func (b *EnvBackend) EnsureImageTemplate(ctx context.Context, image string) (ImageState, error) {
+	st, err := b.pick().EnsureImageTemplate(ctx, &ateenvv1alpha.EnsureImageTemplateRequest{
+		RootfsImage: image,
+		Template:    &ateenvv1alpha.Template{Name: b.baseTemplate, Atespace: b.atespace},
+		Atespace:    b.atespace,
+	})
+	if err != nil {
+		return ImageState{}, fmt.Errorf("ensure image template %s: %w", image, err)
+	}
+	return imageStateFrom(st), nil
+}
+
+// ImageStatus implements ImageWarmer.
+func (b *EnvBackend) ImageStatus(ctx context.Context, image string) (ImageState, error) {
+	st, err := b.pick().ImageStatus(ctx, &ateenvv1alpha.GetImageStatusRequest{
+		RootfsImage: image,
+		Template:    &ateenvv1alpha.Template{Name: b.baseTemplate, Atespace: b.atespace},
+		Atespace:    b.atespace,
+	})
+	if err != nil {
+		return ImageState{}, fmt.Errorf("image status %s: %w", image, err)
+	}
+	return imageStateFrom(st), nil
+}
+
+func imageStateFrom(st *ateenvv1alpha.ImageStatus) ImageState {
+	out := ImageState{
+		Template: st.GetTemplate().GetName(),
+		Exists:   st.GetTemplateExists(),
+		Tag:      st.GetGoldenTag(),
+		Error:    st.GetGoldenError(),
+	}
+	switch st.GetGolden() {
+	case ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_PENDING:
+		out.Golden = GoldenPending
+	case ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_READY:
+		out.Golden = GoldenReady
+	case ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_FAILED:
+		out.Golden = GoldenFailed
+	default:
+		out.Golden = GoldenNone
+	}
+	return out
 }
 
 type envSandbox struct {

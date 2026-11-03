@@ -1,0 +1,27 @@
+{
+  "schema_version": "v1",
+  "run_id": "pf-20261102",
+  "started_at": "2026-11-02T20:00:00Z",
+  "finished_at": "2026-11-02T20:41:12Z",
+  "plan": "image-placement.json",
+  "pinned": false,
+  "goldens": [
+    {"image": "registry.example/swebench/django@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "template": "default-template-0123456789ab", "state": "ready", "tag": "golden-7", "wait_ms": 118342.5},
+    {"image": "registry.example/swebench/sympy@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210", "template": "default-template-fedcba987654", "state": "failed", "error": "GoldenActorCrashed: golden actor crashed before its snapshot was taken", "wait_ms": 2000}
+  ],
+  "domains": [
+    {
+      "name": "d0", "nodes": 2, "nodes_seen": ["gke-c4-d0-1", "gke-c4-d0-2"], "complete": true,
+      "images": [
+        {"image": "registry.example/swebench/django@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "nodes": ["gke-c4-d0-1", "gke-c4-d0-2"], "wanted": 2, "probes": 2, "failed": 0, "rounds": 1, "complete": true}
+      ]
+    },
+    {
+      "name": "d1", "nodes": 2, "nodes_seen": ["gke-c4-d1-1"], "complete": false,
+      "images": [
+        {"image": "registry.example/swebench/sympy@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210", "nodes": ["gke-c4-d1-1"], "wanted": 2, "probes": 6, "failed": 1, "rounds": 3, "complete": false, "error": "create pf-3-2-1: rpc error: code = Unavailable desc = no worker has room"}
+      ]
+    }
+  ],
+  "complete": false
+}

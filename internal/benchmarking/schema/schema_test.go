@@ -92,6 +92,21 @@ func TestFixturesValidateAndRoundTrip(t *testing.T) {
 		roundTripJSON(t, "schedule.schema.json", v)
 	})
 
+	t.Run("preflight_coverage.json", func(t *testing.T) {
+		raw := mustRead(t, "testdata/preflight_coverage.json")
+		if err := ValidateAgainstJSONSchema("preflight_coverage.schema.json", raw); err != nil {
+			t.Fatalf("schema validate: %v", err)
+		}
+		v, err := DecodeJSONStrict[PreflightCoverage](bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("DecodeJSONStrict: %v", err)
+		}
+		if err := v.Validate(); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+		roundTripJSON(t, "preflight_coverage.schema.json", v)
+	})
+
 	t.Run("image_placement.json", func(t *testing.T) {
 		raw := mustRead(t, "testdata/image_placement.json")
 		if err := ValidateAgainstJSONSchema("image_placement.schema.json", raw); err != nil {

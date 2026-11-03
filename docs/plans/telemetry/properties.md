@@ -20,13 +20,14 @@ a minimal counter-example, which then becomes an `@example` regression.
 
 State on `main` with #221:
 
-| Item            | Requirement  | State                                                                                                                                                                                                 |
-| --------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P-9, P-10, P-11 | AC-15        | Fixed by #221. Before it, a recycle or `warm_pool` that awaited across a reap pooled its actor after the teardown, and overlapping `warm_pool` calls each provisioned the full shortfall.             |
-| P-14            | AC-3.4       | Open. `SandboxHandle.exec` and `exec_async` (`clients/python/src/ate_env/handle.py`) call `_note_first_command()` before `_exec_span` starts the span, so another thread's exec span can start first. |
-| P-24            | AC-15.7      | Open. A warm claim pops an actor and awaits `get()`; if a reap deletes the actor meanwhile and `get()` still succeeds, `acquire` returns a deleted environment. See the findings.                     |
-| P-10            | AC-15.8      | Open. A `warm_pool` call cancelled during its `create()` calls leaks the actors already created: they are neither pooled nor tracked.                                                                 |
-| P-21, P-22      | AC-17, AC-18 | Partial. Example tests only; the Go tests copy the Python tables by hand.                                                                                                                             |
+| Item            | Requirement  | State                                                                                                                                                                                                     |
+| --------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P-9, P-10, P-11 | AC-15        | Fixed by #221. Before it, a recycle or `warm_pool` that awaited across a reap pooled its actor after the teardown, and overlapping `warm_pool` calls each provisioned the full shortfall.                 |
+| P-14            | AC-3.4       | Open. `SandboxHandle.exec` and `exec_async` (`clients/python/src/ate_env/handle.py`) call `_note_first_command()` before `_exec_span` starts the span, so another thread's exec span can start first.     |
+| P-24            | AC-15.7      | Open. A warm claim pops an actor and awaits `get()`; if a reap deletes the actor meanwhile and `get()` still succeeds, `acquire` returns a deleted environment. See the findings.                         |
+| P-10            | AC-15.8      | Open. A `warm_pool` call cancelled during its `create()` calls leaks the actors already created: they are neither pooled nor tracked.                                                                     |
+| P-10            | AC-15.9      | Open. A delete cancelled after the run's reap, or a `release` whose delete fails or is cancelled while a reap runs, leaves the actor under the reaped run id; no later reap deletes it. See the findings. |
+| P-21, P-22      | AC-17, AC-18 | Partial. Example tests only; the Go tests copy the Python tables by hand.                                                                                                                                 |
 
 ## Labels and cardinality (AC-9)
 
@@ -353,6 +354,8 @@ the findings) are covered by the plain tests
 Dafny: `WarmPool` in [verify/warm_pool.dfy](./verify/warm_pool.dfy) and
 [verify/warm_pool_generations.dfy](./verify/warm_pool_generations.dfy) prove the #221 design keeps
 P-9 to P-11 for every interleaving within the model.
+[verify/warm_pool_drain.dfy](./verify/warm_pool_drain.dfy) adds `unwarm_pool`, `resize_pool` and run
+ids, from #221's third review round (AC-15.4, AC-15.5, AC-15.9).
 
 ### P-9: The warm-replica gauge tells the truth
 
@@ -374,7 +377,7 @@ driver's warm pool.
 _For any_ such sequence, once teardown has run and every paused call has resumed, no environment
 from the run is alive on Substrate or tracked by the driver.
 
-**Validates: AC-15.2, AC-15.5, AC-15.8**
+**Validates: AC-15.2, AC-15.5, AC-15.8, AC-15.9**
 
 - Test: `test_warm_pool_accounting`, invariant `nothing_survives_teardown`;
   `test_recycle_paused_across_teardown_deletes_the_environment`,
@@ -389,6 +392,8 @@ from the run is alive on Substrate or tracked by the driver.
 - Open (AC-15.8): a `warm_pool` call cancelled while `asyncio.gather` waits on its `create()` calls
   drops the ids of the actors already created, so they are neither pooled nor owned and no reap
   finds them. The stateful machine cancels nothing, so it does not reach this case.
+- Open (AC-15.9): two paths still leave an actor under a run id that was already reaped. See "Run-id
+  gaps" in the findings.
 - Fixed by #221. Before it, the stateful test shrank it to two minimal counter-examples (recorded
   when one `fleet_teardown` rule ran the whole reap):
 
@@ -491,6 +496,7 @@ The requirement numbers the properties validate. Each refines the criterion of t
 | AC-15.6 | A direct `reap` leaves the gauge equal to the pool.                                                                                |
 | AC-15.7 | A warm claim returns a live environment (open).                                                                                    |
 | AC-15.8 | A `warm_pool` cancelled during `create()` leaves no live actor untracked (open).                                                   |
+| AC-15.9 | A delete cancelled after a reap, or a release's delete that fails during one, leaves the actor for any later reap (open).          |
 | AC-16.1 | A test collects every span name and attribute key the client and driver operations emit.                                           |
 | AC-16.2 | The collected set equals the documented table; CI fails on a difference.                                                           |
 | AC-17.1 | Shared operations have the same span `<op>` in both clients.                                                                       |
@@ -603,6 +609,22 @@ deletes it, since it is still owned. If `get()` returns before the delete lands,
 hands the caller a deleted environment. #221 re-checks `_teardowns` only on the failure path. No
 property in this file covers it: P-10 holds (nothing survives the teardown); what breaks is that
 `acquire` returns a live environment, which no property states. No test covers it.
+
+Run-id gaps, open (AC-15.9). `warm_pool_drain.dfy` states ORPHAN: every owned actor with no delete
+pending carries a run id some later reap still matches (`WARM_POOL_RUN_ID`, or a run not reaped
+yet). A fleet reaps its run once, so an actor left under a reaped run id outlives every later
+teardown. The re-tag #221 ships keeps ORPHAN for failed cleanup deletes; two paths still break it,
+and a scratch test against `main` (`c0c41ac`) reproduced both:
+
+- `DeleteCancelledSafe`: a `warm_pool` call with `run_id="run-1"` paused in `create()`;
+  `reap("run-1")`; the creates return and the call starts deleting its actors; the call is
+  cancelled. The three actors stay owned under `run-1`, and `reap("run-2")` leaves them alive.
+  `_delete_unpooled` catches `Exception`, so a cancellation skips the re-tag.
+- `ReleaseDeleteFailSafe`: `release("sb-1")` pops the actor and awaits `delete()`; `reap("run-1")`
+  runs and cannot see it; the delete fails. `_release_internal` puts the actor back under `run-1`
+  (`missed_by_reap` is set only by a recycle whose `suspend()` returned after a teardown), and
+  `reap("run-2")` leaves it alive. `ReleaseDeleteFailProposedSafe` verifies a fix: re-tag whenever
+  `_teardowns` changed since the pop.
 
 **How the concurrency model works.** Each piece of code between two `await`s is one atomic action on
 shared state (`Acquire`, `RecycleStart`, `RecycleFinish`, `WarmPlan`, `WarmCommit`, `Reap`). The

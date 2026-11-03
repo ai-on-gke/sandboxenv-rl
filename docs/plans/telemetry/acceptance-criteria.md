@@ -32,7 +32,7 @@ Conventions:
 | AC-12 | Docs: `docs/observability.md`, generated `docs/metrics.md`, CI freshness check      | 5         | pass: CI step `docs/metrics.md is generated from internal/telemetry`                                          |
 | AC-13 | CI runs the suites with and without the extras; lint and boilerplate pass           | 1, 2, 5   | pass: `.github/workflows/ci.yaml`                                                                             |
 | AC-14 | Blast radius: existing tests pass unchanged; telemetry-off overhead under 2%        | all       | partial: suites green; overhead not measured                                                                  |
-| AC-15 | Warm-pool accounting under concurrent acquire, recycle, `warm_pool` and teardown    | #221      | partial: 15.1 to 15.6 pass (`test_warm_pool_accounting.py`, `verify/*.dfy`); 15.7, 15.8 open                  |
+| AC-15 | Warm-pool accounting under concurrent acquire, recycle, `warm_pool` and teardown    | #221      | partial: 15.1 to 15.6 pass (`test_warm_pool_accounting.py`, `verify/*.dfy`); 15.7 to 15.9 open                |
 | AC-16 | The span and attribute inventory in `interfaces.md` matches the code, checked in CI | follow-up | not met: the table is hand-written; last checked against `c0c41ac`                                            |
 | AC-17 | The Go and Python clients emit the same span names and keys for shared operations   | follow-up | partial: mirrored tables in `attrs_test.go`, `executable_test.go`; no shared fixture                          |
 | AC-18 | No command line, secret or file content in any span attribute value                 | follow-up | partial: example tests in both clients; no property test                                                      |
@@ -229,16 +229,23 @@ Conventions:
   `warm_pool` calls in flight for that pool: they delete the actors they create instead of pooling
   them, and a `warm_pool` call after the cancel is not counted against the cancelled ones.
 - 15.5: an actor whose delete fails after a teardown, or after `unwarm_pool` or `resize_pool`
-  drained it, stays tracked by the driver, and the next `reap` of any run deletes it.
+  drained it, stays tracked by the driver, and the next `reap` of any run deletes it. This covers
+  the deletes that start after the teardown (`warm_pool`, a failed warm claim, a recycle that saw
+  the teardown, a drain); 15.9 covers the rest.
 - 15.6: a direct `reap` (outside a fleet, with no `warm_reset`) leaves the gauge equal to the pool.
 - 15.7 (open): a warm claim returns a live environment; today a claim whose `get()` succeeds after
   an overlapping reap deleted the actor returns a deleted one (`ClaimOkReturnsLive`).
 - 15.8 (open): a `warm_pool` call cancelled during its `create()` calls leaves no live actor
   untracked; today the actors already created are leaked.
+- 15.9 (open): a delete that is cancelled after the run's reap, or a `release` whose delete fails or
+  is cancelled while a reap runs, also leaves the actor for the next `reap` of any run. Today both
+  keep the reaped run id, so no later reap deletes the actor (`DeleteCancelledSafe`,
+  `ReleaseDeleteFailSafe`).
 - Commands: in `$VENV_BASE` (the `dev` extra carries `hypothesis`):
   `python -m pytest clients/python/tests/test_warm_pool_accounting.py`; with Dafny 4.11:
-  `dafny verify docs/plans/telemetry/verify/warm_pool.dfy` and
-  `dafny verify docs/plans/telemetry/verify/warm_pool_generations.dfy`.
+  `dafny verify docs/plans/telemetry/verify/warm_pool.dfy`,
+  `dafny verify docs/plans/telemetry/verify/warm_pool_generations.dfy` and
+  `dafny verify docs/plans/telemetry/verify/warm_pool_drain.dfy`.
 - Expected: the pytest run passes (18 plain tests and the stateful `test_warm_pool_accounting`).
   15.4: `test_unwarm_cancels_a_warm_pool_in_flight`,
   `test_shrinking_resize_cancels_a_warm_pool_in_flight`,
@@ -249,10 +256,14 @@ Conventions:
   `test_direct_reap_moves_the_gauge_with_the_pool`. `warm_pool.dfy`: 16 verified, 3 errors, all in
   `WarmPoolBefore` (the code before #221). `warm_pool_generations.dfy`: 24 verified, 3 errors, in
   `PlanFirstCovers` and `ClaimFailPutBackSafe` (#221's first version) and `ClaimOkReturnsLive` (the
-  open claim/reap gap). [verify/README.md](./verify/README.md) explains each.
+  open claim/reap gap). `warm_pool_drain.dfy`: 49 verified, 5 errors, in `CommitStaleBeforeSafe`,
+  `ResizeBeforeSafe` and `DeleteFailBeforeSafe` (the code before 15.4 and 15.5) and
+  `DeleteCancelledSafe` and `ReleaseDeleteFailSafe` (15.9). [verify/README.md](./verify/README.md)
+  explains each.
 - Pass rule: pytest green; Dafny output matches. CI runs the pytest file, not Dafny.
-- Status: 15.1 to 15.6 pass; 15.7 and 15.8 are open, with no test on `main`.
-- Properties: P-9 (15.1, 15.6), P-10 (15.2, 15.5, 15.8), P-11 (15.3, 15.4), P-24 (15.7).
+- Status: 15.1 to 15.6 pass; 15.7 to 15.9 are open, with no test on `main`. A scratch test against
+  `c0c41ac` reproduced both 15.9 paths.
+- Properties: P-9 (15.1, 15.6), P-10 (15.2, 15.5, 15.8, 15.9), P-11 (15.3, 15.4), P-24 (15.7).
 
 ## AC-16: The span inventory matches the code
 
@@ -311,6 +322,7 @@ Conventions:
 - 20.1: a CI step runs `dafny verify` on each file in [verify/](./verify/) with the version the
   README names, and fails unless the verified and error counts, and the failing lemmas, are the ones
   [verify/README.md](./verify/README.md) lists.
-- Status: not met. Run by hand with Dafny 4.11.0 on `ef307ed`: `telemetry.dfy` 14 verified, 0
-  errors; `warm_pool.dfy` 16 verified, 3 errors; `warm_pool_generations.dfy` 24 verified, 3 errors.
-  The Ubuntu release zip needs no .NET install, and the three files verify in a few seconds.
+- Status: not met. Run by hand with Dafny 4.11.0: `telemetry.dfy` 14 verified, 0 errors;
+  `warm_pool.dfy` 16 verified, 3 errors; `warm_pool_generations.dfy` 24 verified, 3 errors;
+  `warm_pool_drain.dfy` 49 verified, 5 errors. The Ubuntu release zip needs no .NET install, and the
+  four files verify in a few seconds.

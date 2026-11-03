@@ -132,7 +132,7 @@ families, so a W3C `traceparent` in gRPC metadata continues a trace into the con
 [acceptance-criteria.md](./acceptance-criteria.md) maps each criterion to the test or evidence
 behind it.
 
-## 6. Open questions, as of 2026-11-02
+## 6. Open questions, as of 2026-11-03
 
 - Closed on 2026-10-30: Substrate's resume and suspend workflows already join the client trace
   through the router and `ateapi` (section 4, item 1). What remains is deployment: Substrate's
@@ -147,6 +147,9 @@ behind it.
   deleted environment (AC-15.7, P-24, `ClaimOkReturnsLive` in [verify/](./verify/README.md)).
 - Open: a `warm_pool` cancelled during its `create()` calls can leak the actors already created
   (AC-15.8).
+- Open: a delete cancelled after the run's reap, or a `release` whose delete fails or is cancelled
+  while a reap runs, leaves the actor under the reaped run id, so no later reap deletes it (AC-15.9,
+  `DeleteCancelledSafe` and `ReleaseDeleteFailSafe` in [verify/](./verify/README.md)).
 - Open: with execs started concurrently on one handle, `ate_env.first_command=true` is not always on
   the first-started exec span (AC-3.4, P-14).
 - Follow-ups with criteria but no work yet: a CI-checked span inventory (AC-16), Go and Python span

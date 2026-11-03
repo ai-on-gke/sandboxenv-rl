@@ -129,3 +129,83 @@ Append-only. Each entry: date, who, what, why.
 - 2026-11-02, orchestrator: #186 merged as `9c30be1`; the series is complete. #202 (`5fc65b1`,
   2026-11-02) raised the default wake budget from two minutes to five; no document in this directory
   cites the figure.
+- 2026-11-02, orchestrator: the entries below copy, after the fact, decisions from the plan's
+  working log that the 2026-10-29 revision left out. Each carries the date it was made. They are
+  reworded to match `main` at `9b2148a`.
+- 2026-10-22, recorded from #93: the run id is `ate_env.run_id`, on every step-level span (`exec`,
+  `read_file`, `write_file`) as well as the driver's `acquire` and `reap` spans, so a run's steps
+  are selectable without walking parents.
+- 2026-10-22, recorded from #93: the first exec started on each acquired sandbox carries
+  `ate_env.first_command=true`. It holds the wake and readiness wait and ends the time-to-first-
+  command window, which `ate_env_client_ready_to_first_command_seconds` also records.
+- 2026-10-23, spec author: AC-9. A Dafny model of `repo_family` (not in the repository) failed the
+  property "`other` only on overflow" with a repo literally named `other`: it got the overflow
+  label, so dashboards could not tell the two apart, and it used a registry slot although reserved
+  names do not count toward the cap. Reproduced against the #109 code. This is why a reserved name
+  is labelled `<name>_repo` (the #109 and #113 entry above). `main` now escapes every `other` or
+  `unknown` followed by any number of `_repo`, so the mapping stays one-to-one.
+- 2026-10-23, spec author: AC-7. The same model proved `0 <= max_s <= total_s` only with the
+  unstated precondition `dur >= 0`; `add_phase("acquire", 2.0)` then `add_phase("acquire", -5.0)`
+  gave `total_s=-3.0, max_s=2.0`. Every caller uses `time.monotonic()`, so this was latent. This is
+  why `add_phase` and `task_done` clamp negative durations to 0.
+- 2026-10-23, recorded from #109: `status` has a third value, `cancelled`, from `metrics.status_of`:
+  `asyncio.CancelledError` and `KeyboardInterrupt` give `cancelled`, other exceptions `error`. It
+  applies to phases, tasks, claims and client timings, so a trainer that cancels stragglers does not
+  inflate the error count.
+- 2026-10-23, recorded from #109: `ate_env_client_warm_claim_seconds` replaces the planned
+  `ate_env_client_wake_seconds`. It times only the `get()` check on a claimed warm actor. The resume
+  happens on the first guest request and lands in the first `ate_env_client_exec_seconds`
+  observation, so "wake" misnamed it.
+- 2026-10-23, recorded from #109: AC-14 exception. #109 replaced three #93 tests in
+  `test_telemetry_tracing.py`, which asserted that the caller's span is the direct parent of
+  `ate_env_client.exec` and `.release`, with `test_nests_*` tests. The `ate_env_fleet.*` spans now
+  sit between them by design. `test_nests_user_span_parents_the_run` keeps "the caller's span
+  parents the run", and `test_nests_context_manager_fleet_deletes_every_environment` restores the
+  `delete_environment` count and the `with SandboxFleet(...)` path.
+- 2026-10-23, recorded from #109: two files outside the deliverables list changed.
+  `backend/mock.py`: `MockBackendDriver` sets `backend_name = "mock"`, calls the observer's `claim`
+  and `warm_add` / `warm_remove`, so a mock run fills the report and the series like a Substrate
+  run. `tests/test_substrate_driver.py` gained tests only: warm-pool accounting
+  (`test_recycle_counts_the_actor_back_into_the_warm_pool`,
+  `test_failed_warm_check_counts_the_put_back`) and `test_cancelled_claim_has_status_cancelled`.
+- 2026-10-24, spec author: AC-15 proposed. A Dafny model of `SubstrateBackendDriver`'s warm-pool
+  bookkeeping (not in the repository), with each stretch between two `await`s as one atomic step,
+  found two interleaving bugs, both reproduced against the driver: a recycle paused in `suspend()`
+  while `reap()` runs leaves the VM alive and back in the pool after teardown, with the gauge at 0
+  while the pool holds 1 (P-10, P-9); two overlapping `warm_pool(replicas=3)` calls create 6 actors
+  (P-11). Proposed fix: a teardown counter re-checked after the await, and an in-flight reservation
+  per pool key. The fix is not on `main`; AC-15 is open.
+- 2026-10-27, spec author: the acceptance criteria were refined into numbered requirements (AC-n.m)
+  with `For any …` properties P-1 to P-20, each tagged with the requirements it validates and meant
+  to run as Hypothesis or `rapid` tests. Fixed-artifact and cluster requirements stay example or
+  integration checks. A stateful Hypothesis test of AC-15 found the P-10 and P-11 bugs on the driver
+  and shrank them to 3- and 4-step counter-examples. Neither the tests nor the tooling are in the
+  repository.
+- 2026-10-27, spec author (property run): running the properties against the series' code found four
+  places where the spec was behind the code, now matched: `RunReport.release_errors` and the
+  `release_errors=N` summary line (#115); `ate_env_fleet_release_failures_total{backend}` (#115);
+  one swebench span per event, back-dated by `dur_ms` (#168); and the `family` bound
+  `MAX_FAMILIES + 2`, since `unknown` sits outside the cap as well as `other`. It found one code
+  race: P-14, with concurrent execs on one handle the span marked `ate_env.first_command=true` is
+  not always the first started, because the flag is set before the span starts. P-14 stays as
+  written.
+- 2026-10-28, recorded from #150: the Go client's `Attr*` constants are the Python keys for every
+  field the Go client has, including `ate.template.atespace`. Not in Go: `ate_env.run_id` and
+  `ate_env.first_command`, which describe the Python fleet's run and acquired sandbox, and
+  `ate_env.timed_out`, which the Go client cannot know because the guest API returns an exit status
+  and no timeout field. Adding it needs a guest API field first.
+- 2026-10-28, recorded from #150: the Go client matches the Python client on span kind (CLIENT with
+  `rpc.*` and `server.*` only for a single-RPC span on a caller-supplied connection, INTERNAL
+  otherwise), empty values (not recorded), `ate_env.rootfs_image` (tag dropped) and
+  `get_server_info` (traced). The Python handle's exec and file spans record `ate.atespace` when the
+  runtime has one, as the Go client does. Left open: the span-name prefix, fixed `ate_env_client.`
+  in Python and `<TraceServiceName>.` in Go.
+- 2026-11-02, orchestrator: on `main` at `9b2148a`, P-9, P-10 and P-11 (AC-15) and P-14 still fail.
+  `_release_internal` re-pools after awaiting `suspend()` with no teardown counter,
+  `_warm_pool_internal` sizes the pool with no in-flight reservation, and `SandboxHandle.exec`
+  claims the first-command flag before the span starts. A scripted reproduction against `main`
+  printed the leaked VM and the 6-actor pool for `replicas=3`. Added
+  [properties.md](./properties.md), AC-15 (open) and property links in
+  [acceptance-criteria.md](./acceptance-criteria.md), the proposed warm-pool contract in
+  [interfaces.md](./interfaces.md), and test-plan section 8. No property tests, Dafny models or
+  result files were added; `hypothesis` is not a dependency.

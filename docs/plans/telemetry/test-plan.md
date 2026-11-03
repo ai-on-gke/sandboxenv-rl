@@ -140,6 +140,37 @@ kubectl get ns -o name | sort | diff /tmp/before-namespaces.txt -           # on
 kubectl -n ate-system get deploy -o name | sort | diff /tmp/before-ate-system.txt -
 ```
 
+## 8. Property-based tests and proofs (proposed)
+
+Not in the repository. [properties.md](./properties.md) specifies P-1 to P-20; none of the
+Hypothesis or `rapid` tests it names exist on `main`, and `hypothesis`, `pgregory.net/rapid` and
+Dafny are not dependencies. A change that adds them would:
+
+- Install `hypothesis` in the full venv (`/tmp/ate-full/bin/pip install hypothesis`) or add it to
+  the `dev` extra.
+- Run the Python properties with Hypothesis' default profile (100 examples) in CI and a larger
+  `max_examples` locally or nightly. Each shrunk counter-example goes into the PR's Tests section
+  and becomes an `@example` regression.
+- Run the AC-15 stateful test (P-9, P-10, P-11) as:
+
+  ```bash
+  /tmp/ate-full/bin/python -m pytest clients/python/tests/test_substrate_driver.py -k warm_pool_accounting -q
+  ```
+
+  On `main` it is expected to fail P-9, P-10 and P-11 until the driver gains the teardown counter
+  and in-flight reservation ([interfaces.md](./interfaces.md#warm-pool-accounting-ac-15-proposed)),
+  so it lands either with that fix or marked `xfail`.
+
+- Run P-14 (`test_first_command_exactly_once`) with concurrent execs on one handle; it is expected
+  to fail on `main` until `SandboxHandle.exec` claims the first-command flag inside the span.
+- Run the Go properties (P-19, P-20) with
+  `go test ./internal/benchmarking/swebench/... ./clients/go/... -run 'TracingIsTransparent|SpansFollowProvider'`
+  after adding `pgregory.net/rapid` to `go.mod`.
+
+Dafny models of `inject_metadata`, `repo_family`, `RunReport.add_phase` and the warm pool informed
+the properties ([properties.md](./properties.md), "Findings that changed the spec"). They are not in
+the repository, and CI has no Dafny step.
+
 ## What to write in the pull request
 
 Date, branch and head, venv contents (`pip freeze | grep -iE 'opentelemetry|prometheus|grpcio'`),

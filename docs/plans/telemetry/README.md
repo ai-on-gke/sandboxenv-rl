@@ -7,7 +7,8 @@ records the names, flags and families that shipped and where they differ from th
 
 Companion documents in this directory: [prd.md](./prd.md), [execution-plan.md](./execution-plan.md),
 [interfaces.md](./interfaces.md) (the shipped contracts),
-[acceptance-criteria.md](./acceptance-criteria.md), [test-plan.md](./test-plan.md) and
+[acceptance-criteria.md](./acceptance-criteria.md), [test-plan.md](./test-plan.md),
+[properties.md](./properties.md) (proposed property-based tests, not in the repository) and
 [decisions.md](./decisions.md). The user-facing result is
 [docs/observability.md](../../observability.md) and [docs/metrics.md](../../metrics.md).
 
@@ -130,7 +131,7 @@ families, so a W3C `traceparent` in gRPC metadata continues a trace into the con
 [acceptance-criteria.md](./acceptance-criteria.md) maps each criterion to the test or evidence
 behind it.
 
-## 6. Open questions, as of 2026-10-30
+## 6. Open questions, as of 2026-11-02
 
 - Closed on 2026-10-30: Substrate's resume and suspend workflows already join the client trace
   through the router and `ateapi` (section 4, item 1). What remains is deployment: Substrate's
@@ -140,3 +141,8 @@ behind it.
   [docs/observability.md](../../observability.md#phase-glossary).
 - No overhead measurement for telemetry off against on is recorded in the series' pull requests;
   [test-plan.md](./test-plan.md) section 7 keeps the procedure.
+- Open on `main` at `9b2148a` (2026-11-02): AC-15, warm-pool accounting under concurrency. A recycle
+  or `warm_pool` paused across teardown leaks its environment, and overlapping `warm_pool` calls
+  over-provision ([properties.md](./properties.md) P-9 to P-11).
+- Open on `main`: with execs started concurrently on one handle, `ate_env.first_command=true` is not
+  always on the first-started exec span (P-14).

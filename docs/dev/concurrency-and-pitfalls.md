@@ -136,3 +136,22 @@ Record release errors in `RunReport` and retry unreleased actors during `fleet.t
 - **Mechanism**: `SubstrateBackendDriver` records failed deletions in `RunReport.release_errors` and
   retains the actor in `_owned_actors`. When `fleet.teardown()` runs, it retries deletion for all
   unreleased actors and raises `InfrastructureError` if any environment cannot be reclaimed.
+
+### 9. Python warm-pool bookkeeping across awaits
+
+Re-check for a teardown after each await that ends in pooling an actor, and reserve warm-pool slots
+before creating actors.
+
+- **Location**: `clients/python/src/ate_env/backend/substrate.py` (`_release_internal`,
+  `_warm_pool_internal`, the warm-claim put-back in `_acquire_internal`, `_reap_internal`).
+- **Why**: A recycle pops the actor from `_owned_actors` and awaits `suspend()`; `reap` cannot see
+  it during that await. Pooling it afterwards leaves a live environment that outlives the teardown,
+  with the warm-replica gauge already reset. Two overlapping `warm_pool` calls that each read the
+  pool before creating provision the shortfall twice.
+- **Mechanism**: `reap` increments `_teardowns` when it starts and when it ends. A recycle,
+  `warm_pool` or failed warm claim reads the counter before its await and, if it changed, deletes
+  its actor instead of pooling it; a failed delete keeps the actor owned for the next `reap`.
+  `_warm_inflight` counts the actors `warm_pool` calls are still creating, per pool key and
+  `_teardowns` value, so a `reap` drops them. `warm_pool` subtracts them from the shortfall, so an
+  overlapping call can return before the pool is full. `tests/test_warm_pool_accounting.py` checks
+  these interleavings with a Hypothesis state machine.

@@ -67,6 +67,11 @@ type Server struct {
 	// WakeRunningBudget bounds the wait once the control plane reports the
 	// environment RUNNING; see ensureAwake. Zero means DefaultWakeRunningBudget.
 	WakeRunningBudget time.Duration
+	// WakeNoCapacityGrace, when positive, fails a guest call with
+	// ResourceExhausted once the router has said for this long that no
+	// worker has room for the environment; see ensureAwake. Zero (the
+	// default) keeps waiting for the whole WakeBudget.
+	WakeNoCapacityGrace time.Duration
 	// Info is the build and configuration GetServerInfo reports.
 	Info ServerInfo
 	// RouterTLS, when set, is the client TLS configuration for the router's
@@ -243,12 +248,14 @@ func (s *Server) ensureImageTemplate(ctx context.Context, atespace, base, image 
 }
 
 // getOrCreateImageTemplate returns the derived template name, creating it
-// from base when it does not exist.
+// from base when it does not exist. A template that runs the same digest
+// under another repository path is reused: the digest pins the bytes, and
+// datasets list one image under many paths.
 func (s *Server) getOrCreateImageTemplate(ctx context.Context, atespace, base, name, image string) (*ateapipb.ActorTemplate, error) {
 	existing, err := s.client.GetActorTemplate(ctx, atespace, name)
 	switch {
 	case err == nil:
-		if got := firstContainerImage(existing); got != image {
+		if got := firstContainerImage(existing); !sameImageDigest(got, image) {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"actor template %q exists but runs %q, not %q; delete it or use another base template", name, got, image)
 		}
@@ -287,6 +294,21 @@ func firstContainerImage(t *ateapipb.ActorTemplate) string {
 		return ""
 	}
 	return t.GetContainers()[0].GetImage()
+}
+
+// sameImageDigest reports whether two digest-pinned references name the same
+// image, whatever their repository paths. An unpinned reference matches
+// nothing.
+func sameImageDigest(a, b string) bool {
+	da, err := ImageDigest(a)
+	if err != nil {
+		return false
+	}
+	db, err := ImageDigest(b)
+	if err != nil {
+		return false
+	}
+	return da == db
 }
 
 // GetEnvironment retrieves the status and configuration of an existing environment.

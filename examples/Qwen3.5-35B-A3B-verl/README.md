@@ -120,8 +120,10 @@ after the last step whatever the length.
   the slice is the first `TRAIN_INSTANCES` by instance id. SWE-bench Verified is
   validation only, minus the 55 instances that need network access.
 - Environments have no egress: agents cannot `pip install`, and the shell handle
-  persists `cd`/exports without tmux. Thinking stays on (model default); unfinished
-  episodes (step or token limits) are masked.
+  persists `cd`/exports without tmux. Thinking stays on (model default). Unfinished
+  episodes (step or token limits) keep their tokens (`mask_unfinished_episode=False`): most
+  episodes in the early steps are unfinished (105 of 126 in step 1 of validation), and a
+  step with every episode masked leaves verl no trainable token and crashes it.
 - Only the WorkerPool is configured (node selector, capacity, replicas); the pool's
   `ate.dev/sandboxClass` taint is the one Substrate handles itself. Re-apply the patch
   after a Substrate reinstall.

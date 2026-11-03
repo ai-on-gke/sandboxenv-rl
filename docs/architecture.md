@@ -1,6 +1,6 @@
 # sandboxenv-rl architecture
 
-Status: describes `main` at `23c3647`. Re-check the claims in §Components when `internal/ate` or
+Status: describes `main` at `3a67f2b`. Re-check the claims in §Components when `internal/ate` or
 `internal/apiservice` changes. Companion to [README.md](../README.md) (how to use it) and
 [docs/glossary.md](./glossary.md).
 
@@ -109,8 +109,10 @@ child processes, and serves `ProcessService` and `FileSystemService`.
 - **`internal/mcp`**: Serves the Model Context Protocol endpoint at `POST /v1alpha/envs/{id}/mcp`.
   Translates tool calls into guest RPCs using pooled `ate.Client.DialGuest` connections.
 - **`internal/portproxy`**: Forwards HTTP/1.1 and WebSocket requests to arbitrary TCP ports inside
-  the actor by dialing `atenet`'s HTTP `CONNECT` listener (`:8444`). Pools tunnels per actor and
-  port, strips `X-Env-Authorization`, and validates `Origin` headers on path routes.
+  the actor by dialing `atenet`'s HTTP `CONNECT` listener (`:8444`). Scoped to configured atespaces
+  (`-port-proxy-atespaces`), pools tunnels per actor and port, validates port capabilities
+  (`internal/portproxy/capability.go`) for headerless WebSocket clients, strips auth and capability
+  headers, and validates `Origin` headers on path routes.
 
 ### CLI, SDKs, and integrations
 
@@ -121,6 +123,8 @@ child processes, and serves `ProcessService` and `FileSystemService`.
 - **`clients/python`**: Published as `ate-env-client` (import name `ate_env`). Low-level modules
   expose async `Client` and `Env`. High-level modules expose synchronous `SandboxFleet` (backed by a
   shared `LoopRunner` thread) and asynchronous `AsyncSandboxFleet`.
+- **`integrations/harbor`**: Published as `ate-env-harbor`. Implements Harbor's environment provider
+  on `ate-env`.
 - **`integrations/nemo-gym`**: Published as `nemo-gym-substrate`. Implements NeMo Gym's
   `SubstrateSandboxProvider`.
 - **`integrations/openhands`**: Published as `ate-env-openhands`. Implements OpenHands'
@@ -226,7 +230,7 @@ Key non-obvious points:
 
 - `s.guestConn` opens a connection per request and runs `ensureAwake`. If the actor is suspended,
   traffic through `atenet` initiates restoration. `ensureAwake` polls
-  `GetProcess("ate-env-wake-probe")` across two budgets: `DefaultWakeBudget` (2 minutes bounds the
+  `GetProcess("ate-env-wake-probe")` across two budgets: `DefaultWakeBudget` (5 minutes bounds the
   whole wait) and `DefaultWakeRunningBudget` (20 seconds bounds the wait once `RUNNING` is
   observed).
 - The connection closes with `defer conn.Close()` when the RPC completes.

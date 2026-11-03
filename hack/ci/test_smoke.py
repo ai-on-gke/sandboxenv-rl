@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Portable 7-subtest end-to-end smoke test for ate-env and ate-env-api.
+"""Portable 9-subtest end-to-end smoke test for ate-env and ate-env-api.
 
 What it does:
   1. Discovers kubectl context and resolves ate-env-api endpoint (or starts port-forward).
@@ -20,7 +20,10 @@ What it does:
   3. Tests remote shell execution (`uname -a`) and stdin stream piping (`tr a-z A-Z`).
   4. Tests file write and read round-trip (`/tmp/smoke.txt`).
   5. Validates built-in MCP server: invokes tools/list and calls `read_file` via HTTP JSON-RPC.
-  6. Tests suspend and transparent wake-on-request resume; deletes environment during teardown.
+  6. Tests suspend and transparent wake-on-request resume.
+  7. Validates caller token authentication and port proxy atespace allowlist.
+  8. Scrapes Prometheus metrics exposition at /metrics.
+  9. Deletes environment during teardown.
 
 When it runs:
   - CI: Executed as final verification stage of `e2e-kind` job in .github/workflows/ci.yaml.
@@ -41,21 +44,24 @@ Prerequisites:
   - `ate-env` CLI binary (built or found on PATH; auto-built if missing) and `kubectl`.
 
 Environment variables:
-  SUBSTRATE_ENV_API   127.0.0.1:<LOCAL_PORT>  Host and port address of target ate-env-api service
-  ATE_ENV_API_TARGET  (fallback)              Alternative host and port target address for API
-  LOCAL_PORT          17777                   Local port on host for port-forwarding ate-env-api
-  NAMESPACE           ate-env                 Kubernetes namespace where ate-env-api is deployed
-  KUBECTL_CONTEXT     (auto-detected)         Target kubectl context for cluster operations
-  PROJECT_ID          (unset)                 GKE project ID for context derivation (with loc/name)
-  CLUSTER_LOCATION    (unset)                 GKE cluster location for context derivation
-  CLUSTER_NAME        (unset)                 GKE cluster name for context derivation
-  KIND_CLUSTER_NAME   (unset)                 Kind cluster name for context derivation (kind-<name>)
-  ATE_ENV_BIN         (auto: bin/ate-env)     Path to ate-env CLI binary (auto-built if not found)
+  SUBSTRATE_ENV_API         127.0.0.1:<LOCAL_PORT>  Host and port address of target ate-env-api service
+  ATE_ENV_API_TARGET        (fallback)              Alternative host and port target address for API
+  SUBSTRATE_ENV_AUTH_TOKEN  (unset)                 Bearer token required by ate-env-api
+  ATE_ENV_EXPECT_METRICS    (unset)                 Set to 1 to require /metrics exposition check
+  ATE_ENV_EXPECT_PORT_PROXY_ALLOWLIST (unset)       Set to 1 to require port-proxy atespace allowlist check
+  LOCAL_PORT                17777                   Local port on host for port-forwarding ate-env-api
+  NAMESPACE                 ate-env                 Kubernetes namespace where ate-env-api is deployed
+  KUBECTL_CONTEXT           (auto-detected)         Target kubectl context for cluster operations
+  PROJECT_ID                (unset)                 GKE project ID for context derivation (with loc/name)
+  CLUSTER_LOCATION          (unset)                 GKE cluster location for context derivation
+  CLUSTER_NAME              (unset)                 GKE cluster name for context derivation
+  KIND_CLUSTER_NAME         (unset)                 Kind cluster name for context derivation (kind-<name>)
+  ATE_ENV_BIN               (auto: bin/ate-env)     Path to ate-env CLI binary (auto-built if not found)
 
 Outputs / exit codes:
   - Pytest logs and subtest results printed to stdout.
   - Side effects: creates, suspends, and deletes an ephemeral test environment actor.
-  - Exit code 0 if all 7 subtests pass; non-zero if any assertion or command fails.
+  - Exit code 0 if all executed subtests pass (up to 9; auth and /metrics subtests run when configured).
 
 Troubleshooting:
   - See docs/chores/troubleshooting.md for port conflict resolution and router SPIFFE
@@ -69,9 +75,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -123,11 +132,12 @@ def ate_env():
 @pytest.fixture
 def smoke_env(ate_env: str, api_addr: str):
     smoke_id = f"smoke-env-{int(time.time())}"
-    lib.run(ate_env, "create", smoke_id, "--api", api_addr)
+    ns = os.environ.get("NAMESPACE", "ate-env")
+    lib.run(ate_env, "create", smoke_id, "--api", api_addr, "--atespace", ns)
     try:
         yield smoke_id
     finally:
-        lib.run(ate_env, "delete", smoke_id, "--api", api_addr, check=False)
+        lib.run(ate_env, "delete", smoke_id, "--api", api_addr, "--atespace", ns, check=False)
 
 
 def _mcp_request(url: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -135,25 +145,35 @@ def _mcp_request(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     if token := os.environ.get("SUBSTRATE_ENV_AUTH_TOKEN"):
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         body = resp.read().decode()
     data = [line[5:].strip() for line in body.splitlines() if line.strip().startswith("data:")]
     return json.loads("\n".join(data) if data else body)
 
 
+def _metric_sum(bodies: list[str], pattern: str) -> float:
+    total = 0.0
+    for body in bodies:
+        for m in re.finditer(pattern, body, re.MULTILINE):
+            total += float(m.group(1))
+    return total
+
+
 def test_smoke(smoke_env: str, ate_env: str, api_addr: str, subtests: Any):
+    ns = os.environ.get("NAMESPACE", "ate-env")
+    ctx = _detect_kubectl_context()
     payload = f"smoke-{int(time.time())}"
-    mcp_url = f"http://{api_addr}/v1alpha/envs/{smoke_env}/mcp"
+    mcp_url = f"http://{api_addr}/v1alpha/envs/{smoke_env}/mcp?{urllib.parse.urlencode({'atespace': ns})}"
 
     with subtests.test("shell"):
-        assert "smoke-shell-ok" in lib.run(ate_env, smoke_env, "--api", api_addr, "shell", "uname -a && echo smoke-shell-ok").stdout
+        assert "smoke-shell-ok" in lib.run(ate_env, smoke_env, "--api", api_addr, "--atespace", ns, "shell", "uname -a && echo smoke-shell-ok").stdout
 
     with subtests.test("stdin"):
-        assert lib.run(ate_env, smoke_env, "--api", api_addr, "shell", "--stdin", "--timeout", "30s", "tr a-z A-Z", input="smoke-stdin").stdout.strip() == "SMOKE-STDIN"
+        assert lib.run(ate_env, smoke_env, "--api", api_addr, "--atespace", ns, "shell", "--stdin", "--timeout", "30s", "tr a-z A-Z", input="smoke-stdin").stdout.strip() == "SMOKE-STDIN"
 
     with subtests.test("file round-trip"):
-        lib.run(ate_env, smoke_env, "--api", api_addr, "write", "/tmp/smoke.txt", input=payload)
-        assert lib.run(ate_env, smoke_env, "--api", api_addr, "read", "/tmp/smoke.txt").stdout == payload
+        lib.run(ate_env, smoke_env, "--api", api_addr, "--atespace", ns, "write", "/tmp/smoke.txt", input=payload)
+        assert lib.run(ate_env, smoke_env, "--api", api_addr, "--atespace", ns, "read", "/tmp/smoke.txt").stdout == payload
 
     with subtests.test("mcp tools/list"):
         tools = _mcp_request(mcp_url, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).get("result", {}).get("tools", [])
@@ -165,8 +185,109 @@ def test_smoke(smoke_env: str, ate_env: str, api_addr: str, subtests: Any):
         assert any(c.get("text") == payload for c in res.get("content", []) if isinstance(c, dict) and c.get("type") == "text")
 
     with subtests.test("suspend + wake-on-request"):
-        lib.run(ate_env, "suspend", smoke_env, "--api", api_addr)
-        assert lib.run(ate_env, smoke_env, "--api", api_addr, "read", "/tmp/smoke.txt").stdout == payload
+        lib.run(ate_env, "suspend", smoke_env, "--api", api_addr, "--atespace", ns)
+        assert lib.run(ate_env, smoke_env, "--api", api_addr, "--atespace", ns, "read", "/tmp/smoke.txt").stdout == payload
+
+    if token := os.environ.get("SUBSTRATE_ENV_AUTH_TOKEN"):
+        with subtests.test("caller auth + port-proxy atespace allowlist"):
+            unauth_env = dict(os.environ, SUBSTRATE_ENV_AUTH_TOKEN="")
+            res = lib.run(
+                ate_env, smoke_env, "--api", api_addr, "--atespace", ns, "shell", "echo unauth",
+                env=unauth_env, check=False,
+            )
+            assert res.returncode != 0
+            assert "Unauthenticated" in (res.stderr or "")
+
+            bad_req = urllib.request.Request(
+                f"http://{api_addr}/v1alpha/atespaces/{ns}/envs/{smoke_env}/ports/8080/",
+                headers={"Authorization": "Bearer invalid-smoke-token"},
+            )
+            with pytest.raises(urllib.error.HTTPError) as bad_exc:
+                urllib.request.urlopen(bad_req, timeout=15)
+            assert bad_exc.value.code == 401
+
+            expect_allowlist = os.environ.get("ATE_ENV_EXPECT_PORT_PROXY_ALLOWLIST") == "1"
+            if not expect_allowlist:
+                args_res = lib.run(
+                    "kubectl", f"--context={ctx}", "-n", ns, "get", "deploy/ate-env-api",
+                    "-o", "jsonpath={.spec.template.spec.containers[0].args[*]}",
+                    check=False, capture=True,
+                )
+                if (
+                    args_res.returncode == 0
+                    and "-port-proxy-atespaces=*" not in args_res.stdout.split()
+                ):
+                    expect_allowlist = True
+
+            if expect_allowlist:
+                foreign_ns = "foreign-ns" if ns != "foreign-ns" else "other-ns"
+                req = urllib.request.Request(
+                    f"http://{api_addr}/v1alpha/atespaces/{foreign_ns}/envs/{smoke_env}/ports/8080/",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                with pytest.raises(urllib.error.HTTPError) as exc_info:
+                    urllib.request.urlopen(req, timeout=15)
+                assert exc_info.value.code == 403
+
+    expect_metrics = os.environ.get("ATE_ENV_EXPECT_METRICS") == "1"
+    if not expect_metrics:
+        svc_chk = lib.run(
+            "kubectl", f"--context={ctx}", "-n", ns, "get", "svc/ate-env-api",
+            "-o", "jsonpath={.spec.ports[*].name}", check=False, capture=True,
+        )
+        expect_metrics = svc_chk.returncode == 0 and "metrics" in svc_chk.stdout.split()
+
+    if expect_metrics:
+        with subtests.test("/metrics"):
+            pods_res = lib.run(
+                "kubectl", f"--context={ctx}", "-n", ns, "get", "pods",
+                "-l", "app=ate-env-api", "-o", "json",
+                check=True, capture=True,
+            )
+            pods = json.loads(pods_res.stdout).get("items", [])
+            ready_pods = [
+                pod for pod in pods
+                if not pod.get("metadata", {}).get("deletionTimestamp")
+                and any(
+                    c.get("type") == "Ready" and c.get("status") == "True"
+                    for c in pod.get("status", {}).get("conditions", [])
+                )
+            ]
+            assert ready_pods, f"no ready app=ate-env-api pods found in namespace {ns}"
+
+            bodies: list[str] = []
+            for pod in ready_pods:
+                pod_name = pod["metadata"]["name"]
+                metrics_port = next(
+                    (
+                        p["containerPort"]
+                        for c in pod.get("spec", {}).get("containers", [])
+                        for p in c.get("ports", [])
+                        if p.get("name") == "metrics"
+                    ),
+                    9090,
+                )
+                res = lib.run(
+                    "kubectl", f"--context={ctx}", "get", "--raw",
+                    f"/api/v1/namespaces/{ns}/pods/{pod_name}:{metrics_port}/proxy/metrics",
+                    check=True, capture=True,
+                )
+                body = res.stdout
+                assert "ate_env_api_build_info{" in body
+                assert "ate_env_api_environments{" in body
+                bodies.append(body)
+
+            assert _metric_sum(
+                bodies,
+                r'^ate_env_api_requests_total\{(?=[^}]*code="OK")'
+                r'(?=[^}]*method="/ateenv\.v1alpha\.EnvironmentService/CreateEnvironment")'
+                r'[^}]*\}\s+([0-9.eE+-]+)$',
+            ) >= 1.0
+            assert _metric_sum(
+                bodies,
+                rf'^ate_env_api_create_to_ready_seconds_count\{{'
+                rf'(?=[^}}]*atespace="{re.escape(ns)}")(?=[^}}]*status="ok")[^}}]*\}}\s+([0-9.eE+-]+)$',
+            ) >= 1.0
 
     with subtests.test("delete"):
-        lib.run(ate_env, "delete", smoke_env, "--api", api_addr)
+        lib.run(ate_env, "delete", smoke_env, "--api", api_addr, "--atespace", ns)

@@ -21,8 +21,8 @@ What it does:
   3. Provisions target cluster (Kind by default with local registry, or reuses existing).
   4. Deploys Agent Substrate control plane components (if provisioning fresh cluster).
   5. Compiles container images (ateworker-gvisor, ate-env-api, ate-env-guest) using ko to target registry.
-  6. Applies Kubernetes manifests (atespace, access policy, WorkerPool, and ate-env-api).
-  7. Registers ActorTemplate with target snapshot bucket and waits for golden snapshot.
+  6. Applies Kubernetes manifests (atespace, access policy, caller auth Secret, WorkerPool, and ate-env-api with metrics).
+  7. Registers ActorTemplate with target snapshot bucket, environment marker, and waits for golden snapshot.
   8. Forwards a free local port and runs portable smoke test and Python SDK full-stack tests.
 
 When it runs:
@@ -73,8 +73,10 @@ See also:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import re
 import shutil
 import socket
 import sys
@@ -83,6 +85,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lib
 from targets import KindTarget
+
+TEMPLATE_MARKER = "injected"
 
 
 def locate_substrate(root: Path) -> Path:
@@ -128,7 +132,7 @@ def deploy_manifests(
     ns: str,
     tmpl: str,
     imgs: dict[str, str],
-) -> None:
+) -> str:
     ctl_str, env_str = str(ate_ctl), str(ate_env)
     lib.step("Ensuring atespace and access-policy in Substrate...")
     lib.run(ctl_str, f"--context={target.context}", "create", "atespace", ns, check=False)
@@ -148,6 +152,34 @@ def deploy_manifests(
         if res.returncode != 0 and "AlreadyExists" not in (res.stderr or ""):
             raise RuntimeError(f"Failed to create access-policy: {res.stderr}")
 
+    lib.step(f"Ensuring ate-env-api-token secret in namespace {ns}...")
+    lib.pipe(
+        ["kubectl", "create", "namespace", ns, "--dry-run=client", "-o", "yaml"],
+        ["kubectl", f"--context={target.context}", "apply", "-f", "-"],
+        check=True,
+    )
+    tok_res = lib.run(
+        "kubectl", f"--context={target.context}", "-n", ns, "get", "secret",
+        "ate-env-api-token", "-o", "jsonpath={.data.token}", check=False, capture=True,
+    )
+    raw_tok = tok_res.stdout.strip() if tok_res.returncode == 0 else ""
+    if not raw_tok:
+        lib.pipe(
+            [env_str, "manifest", "auth-secret", "--namespace", ns],
+            ["kubectl", f"--context={target.context}", "apply", "-f", "-"],
+            check=True,
+        )
+        tok_res = lib.run(
+            "kubectl", f"--context={target.context}", "-n", ns, "get", "secret",
+            "ate-env-api-token", "-o", "jsonpath={.data.token}", check=True, capture=True,
+        )
+        raw_tok = tok_res.stdout.strip()
+    if not raw_tok:
+        raise RuntimeError(f"Secret ate-env-api-token in namespace {ns} has no token")
+    auth_token = base64.b64decode(raw_tok).decode().strip()
+    if not auth_token:
+        raise RuntimeError(f"Decoded token from secret ate-env-api-token in namespace {ns} is empty")
+
     lib.step(f"Applying Kubernetes manifests (namespace/{ns}, WorkerPool, Deployment/ate-env-api)...")
     lib.pipe(
         [
@@ -163,11 +195,10 @@ def deploy_manifests(
             imgs["worker"],
             "--replicas",
             "2",
-            # `ate-env manifest` requires a caller token by default (#104). The
-            # Kind cluster is private to this run, so deploy without one rather
-            # than create and plumb a token Secret; exercising caller auth in
-            # E2E is a follow-up.
-            "--insecure-no-auth",
+            "--metrics-port",
+            "9090",
+            "--port-proxy-atespaces",
+            ns,
         ],
         ["kubectl", f"--context={target.context}", "apply", "-f", "-"],
         check=True,
@@ -185,8 +216,21 @@ def deploy_manifests(
             capture=False,
         )
 
-    lib.step(f"Registering {tmpl} ActorTemplate in Substrate...")
-    lib.run(ctl_str, f"--context={target.context}", "delete", "actor-template", "-a", ns, tmpl, check=False)
+    lib.step(f"Cleaning stale templates and registering {tmpl} ActorTemplate in Substrate...")
+    list_res = lib.run(
+        ctl_str, f"--context={target.context}", "get", "actor-template", "-a", ns, "-o", "json",
+        check=True, capture=True,
+    )
+    templates = json.loads(list_res.stdout or "{}").get("actorTemplates", [])
+    derived_re = re.compile(rf"{re.escape(tmpl)}-[0-9a-f]{{12}}")
+    for item in templates:
+        name = item.get("metadata", {}).get("name")
+        if name and (name == tmpl or derived_re.fullmatch(name)):
+            lib.run(
+                ctl_str, f"--context={target.context}", "delete", "actor-template",
+                "-a", ns, name, check=True,
+            )
+
     lib.pipe(
         [
             env_str,
@@ -196,10 +240,14 @@ def deploy_manifests(
             ns,
             "--template",
             tmpl,
+            "--workerpool",
+            f"{tmpl}-workerpool",
             "--guest-image",
             imgs["guest"],
             "--snapshots-bucket",
             target.bucket_url,
+            "--env",
+            f"E2E_TEMPLATE_MARKER={TEMPLATE_MARKER}",
         ],
         [ctl_str, f"--context={target.context}", "create", "actor-template", "-f", "-"],
         check=True,
@@ -228,6 +276,7 @@ def deploy_manifests(
 
     tag = lib.wait_until(check_golden, timeout=180.0, interval=2.0, what=f"{tmpl} golden snapshot")
     lib.step(f"Golden snapshot ready: {tag}")
+    return auth_token
 
 
 def pick_port() -> int:
@@ -251,6 +300,7 @@ def run_tests(
     ns: str,
     tmpl: str,
     port: int,
+    auth_token: str,
 ) -> None:
     lib.step(f"Running test suites under port-forward on 127.0.0.1:{port}...")
     with lib.port_forward(target.context, ns, "svc/ate-env-api", port):
@@ -264,15 +314,16 @@ def run_tests(
             ATE_ENV_TEMPLATE=tmpl,
             ATE_ENV_BIN=str(ate_env),
             ATE_ENV_ROOTFS_IMAGE=target.rootfs_image or "",
+            SUBSTRATE_ENV_AUTH_TOKEN=auth_token,
+            ATE_ENV_EXPECT_METRICS="1",
+            ATE_ENV_EXPECTED_MARKER=TEMPLATE_MARKER,
+            ATE_ENV_EXPECT_PORT_PROXY_ALLOWLIST="1",
         )
-        # The Kind API runs without caller auth (--insecure-no-auth above); never
-        # send a token from the shell, which may belong to another cluster.
-        test_env.pop("SUBSTRATE_ENV_AUTH_TOKEN", None)
         py = [
             os.environ.get("PYTEST_BIN") or shutil.which("pytest") or sys.executable,
             *([] if os.environ.get("PYTEST_BIN") or shutil.which("pytest") else ["-m", "pytest"]),
         ]
-        lib.step("Running portable smoke test (7 subtests)...")
+        lib.step("Running portable smoke test (9 subtests)...")
         lib.run(*py, str(root / "hack/ci/test_smoke.py"), "-v", env=test_env, capture=False)
         lib.step("Running live Python SDK integration tests...")
         lib.run(*py, str(root / "clients/python/tests/e2e/test_full_stack.py"), "-v", env=test_env, capture=False)
@@ -298,8 +349,8 @@ def main() -> None:
         target.provision()
         ate_ctl, ate_env = build_cli_tools(root, sub_dir)
         imgs = build_images(root, sub_dir, target)
-        deploy_manifests(target, ate_ctl, ate_env, ns, tmpl, imgs)
-        run_tests(root, target, ate_env, ns, tmpl, port)
+        auth_token = deploy_manifests(target, ate_ctl, ate_env, ns, tmpl, imgs)
+        run_tests(root, target, ate_env, ns, tmpl, port, auth_token)
         lib.step("PASS: E2E Kind pipeline succeeded!")
     finally:
         target.teardown()

@@ -59,6 +59,7 @@ class GatedClient:
         self.creates = 0
         self.delete_gate: asyncio.Event | None = None
         self.delete_error: Exception | None = None
+        self.delete_failures = 0  # fail this many delete() calls, then succeed
         self.get_gate: asyncio.Event | None = None
         self.get_error: Exception | None = None
 
@@ -80,6 +81,9 @@ class GatedClient:
             await self.delete_gate.wait()
         if self.delete_error is not None:
             raise self.delete_error
+        if self.delete_failures > 0:
+            self.delete_failures -= 1
+            raise RuntimeError("unavailable")
         self.live.discard(actor_id)
 
     async def get(self, actor_id: str, **kw: object) -> None:
@@ -308,6 +312,136 @@ async def test_recycle_cancelled_in_suspend_keeps_the_actor_owned() -> None:
     assert client.live == set()
 
 
+async def test_failed_delete_after_teardown_leaves_warm_actors_for_any_later_reap() -> None:
+    client = GatedClient()
+    driver, obs = _driver(client)
+    client.create_gate = asyncio.Event()
+
+    warm = asyncio.create_task(driver.warm_pool_async("tmpl", R, run_id="run-1"))
+    await _spin()  # paused in create()
+    await driver.reap_async("run-1")
+    obs.warm_reset()
+    client.delete_failures = R
+    client.create_gate.set()
+    await warm
+    assert len(client.live) == R
+
+    # The next run's reap, not run-1's, finds them.
+    await driver.reap_async("run-2")
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+async def test_failed_recycle_delete_after_teardown_leaves_the_actor_for_any_later_reap() -> None:
+    client = GatedClient()
+    driver, obs = _driver(client)
+    client.live.add("sb-1")
+    handle = driver._make_instance("sb-1", "tmpl", run_id="run-1")
+    driver._owned_actors["sb-1"] = handle
+    client.suspend_gates["sb-1"] = asyncio.Event()
+
+    recycle = asyncio.create_task(driver.release_async("sb-1", recycle=True))
+    await _spin()  # paused in suspend()
+    await driver.reap_async("run-1")
+    obs.warm_reset()
+    client.delete_failures = 1
+    client.suspend_gates["sb-1"].set()
+    await recycle
+    assert client.live == {"sb-1"}
+    assert handle.run_id == "run-1"  # the caller's handle is not changed
+
+    await driver.reap_async("run-2")
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+async def test_direct_reap_moves_the_gauge_with_the_pool() -> None:
+    client = GatedClient()
+    driver, obs = _driver(client)
+    await driver.warm_pool_async("tmpl", R)
+    assert sum(obs._warm.values()) == R
+
+    await driver.reap_async("run-1")  # no fleet, so no warm_reset()
+
+    assert _pool(driver) == []
+    assert sum(obs._warm.values()) == 0
+
+
+async def test_unwarm_cancels_a_warm_pool_in_flight() -> None:
+    client = GatedClient()
+    driver, obs = _driver(client)
+    client.create_gate = asyncio.Event()
+
+    warm = asyncio.create_task(driver.warm_pool_async("tmpl", R))
+    await _spin()  # paused in create()
+    await driver.unwarm_pool_async("tmpl")
+    client.create_gate.set()
+    await warm
+
+    assert _pool(driver) == []
+    assert client.live == set()
+    assert driver._owned_actors == {}
+    assert sum(obs._warm.values()) == 0
+
+
+async def test_warm_pool_after_unwarm_ignores_the_cancelled_call() -> None:
+    client = GatedClient()
+    driver, obs = _driver(client)
+    client.create_gate = asyncio.Event()
+
+    old = asyncio.create_task(driver.warm_pool_async("tmpl", R))
+    await _spin()  # paused in create()
+    await driver.unwarm_pool_async("tmpl", rootfs_image=None)
+    new = asyncio.create_task(driver.warm_pool_async("tmpl", R))
+    await _spin()
+    client.create_gate.set()
+    await asyncio.gather(old, new)
+
+    assert len(_pool(driver)) == R
+    assert client.live == set(_pool(driver))
+    assert sum(obs._warm.values()) == R
+
+
+async def test_shrinking_resize_cancels_a_warm_pool_in_flight() -> None:
+    client = GatedClient()
+    driver, obs = _driver(client)
+    client.create_gate = asyncio.Event()
+
+    warm = asyncio.create_task(driver.warm_pool_async("tmpl", R))
+    await _spin()  # paused in create()
+    resize = asyncio.create_task(driver.resize_pool_async("tmpl", 1))
+    await _spin()
+    client.create_gate.set()
+    await asyncio.gather(warm, resize)
+
+    assert len(_pool(driver)) == 1
+    assert client.live == set(_pool(driver))
+    assert set(driver._owned_actors) == client.live
+    assert sum(obs._warm.values()) == 1
+
+
+@pytest.mark.parametrize("shrink", ["unwarm", "resize"])
+async def test_failed_delete_of_drained_actors_keeps_them_for_the_next_reap(shrink: str) -> None:
+    client = GatedClient()
+    driver, obs = _driver(client)
+    failures: list[str] = []
+    obs.release_failed = failures.append  # type: ignore[method-assign]
+    await driver.warm_pool_async("tmpl", R, run_id="run-1")
+    client.delete_failures = R
+
+    if shrink == "unwarm":
+        await driver.unwarm_pool_async("tmpl")
+    else:
+        await driver.resize_pool_async("tmpl", 0)
+
+    assert failures == ["substrate"] * R
+    assert len(client.live) == R
+    assert set(driver._owned_actors) == client.live
+    await driver.reap_async("run-2")
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
 class WarmPoolMachine(RuleBasedStateMachine):
     owned = Bundle("owned")
     recycling = Bundle("recycling")
@@ -380,8 +514,12 @@ class WarmPoolMachine(RuleBasedStateMachine):
     @precondition(lambda self: not self.torn_down)
     @rule(target=recycling, aid=consumes(owned))
     def start_recycle(self, aid: str) -> str:
-        if aid not in self.driver._owned_actors or aid in self.inflight:
-            return aid  # already reaped, released or recycling
+        if (
+            aid not in self.driver._owned_actors
+            or aid in self.inflight
+            or aid in _pool(self.driver)
+        ):
+            return aid  # already reaped, released, recycling or back in the pool
         self.client.suspend_gates[aid] = asyncio.Event()
         self.inflight[aid] = self.loop.create_task(self.driver.release_async(aid, recycle=True))
         self._spin()  # paused in suspend()
@@ -426,6 +564,13 @@ class WarmPoolMachine(RuleBasedStateMachine):
         self.client.delete_gate = None
         self.loop.run_until_complete(self.reap)
         self.reap = None
+        self._spin()
+
+    # unwarm_pool while warm_pool calls may be paused in create().
+    @precondition(lambda self: self._quiet())
+    @rule()
+    def unwarm(self) -> None:
+        self.loop.run_until_complete(self.driver.unwarm_pool_async("tmpl"))
         self._spin()
 
     @rule()

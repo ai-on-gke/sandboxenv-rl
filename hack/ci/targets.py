@@ -42,7 +42,7 @@ def _check_inotify_limit() -> None:
             pass
 
 
-# Digest resolved 2026-10-26, the test only needs an image with sh, refresh manually; see docs/chores/check-pins.md
+# Digest resolved 2026-10-26, the test needs an image with sh and python3, refresh manually; see docs/chores/check-pins.md
 DEFAULT_KIND_ROOTFS_IMAGE = (
     "docker.io/library/python:3.13-slim@sha256:d3449c0493345868b09708d7056dce5edda3a75233ea86008fc80c934d355a10"
 )
@@ -91,7 +91,7 @@ class KindTarget:
         self.platform = f"linux/{goarch}"
 
         # Rootfs image used by test_create_from_image.
-        # Digest resolved 2026-10-26, the test only needs an image with sh, refresh manually; see docs/chores/check-pins.md
+        # Digest resolved 2026-10-26, the test needs an image with sh and python3, refresh manually; see docs/chores/check-pins.md
         if "ATE_ENV_ROOTFS_IMAGE" in os.environ:
             self.rootfs_image = os.environ["ATE_ENV_ROOTFS_IMAGE"] or None
         else:

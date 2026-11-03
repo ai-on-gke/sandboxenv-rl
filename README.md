@@ -172,9 +172,14 @@ the template is named. Pass it when you deploy with another `--template` or `--w
 `snapshotConfig` and `wakeupProbe` and declare CPU and memory limits, and `--worker-image` must be the
 `ateworker-gvisor` image built from the Substrate version on the cluster.
 
-`ate-env-api` suspends synchronously: a suspend returns once the snapshot is in object storage, thus a
+`ate-env-api` suspends durably by default: a suspend returns once the snapshot is in object storage, thus a
 suspended environment survives the loss of its node. Substrate's own default became asynchronous in
-[`b40d34f1`](https://github.com/agent-substrate/substrate/commit/b40d34f1).
+[`b40d34f1`](https://github.com/agent-substrate/substrate/commit/b40d34f1). `SuspendEnvironment` takes a
+`mode`: `SUSPEND_MODE_LOCAL` (`ate-env suspend --mode local`, `Client.suspend(mode=SuspendMode.LOCAL)`,
+`Client.SuspendLocal` in Go) returns once the snapshot is on the node and leaves the upload in the
+background; the environment resumes on that node until the upload lands and reports `PAUSED` meanwhile.
+One park-and-resume cycle is cheaper this way, which is what a loop that parks a sandbox between every
+command wants; a node lost before the upload lands takes the snapshot with it.
 
 Substrate enforces authorization by default. `ate-env-api` runs as its own ServiceAccount
 (`ate-env/ate-env-api`) and needs the editor role on each atespace it creates environments in; the
@@ -198,6 +203,11 @@ When you upgrade an existing cluster across these changes:
   again: Substrate cannot update an ActorTemplate in place, thus each template `ate-env-api` derives
   from it fails with `resources: Required`. Delete the base and its derived templates (named
   `<base>-<12 hex digits>`) with `kubectl-ate delete actor-template`, then register the base again.
+- A base registered before `--wakeup-timeout` keeps Substrate's 30 s wakeup-probe timeout, and so
+  does each template `ate-env-api` derived from it: `ate-env-api` reuses a derived template as it
+  is, thus registering the base again does not change it. To give a `--sidecar-readyz` template
+  the 120 s default, delete the base and its derived templates (`<base>-<12 hex digits>`), then
+  register the base again; `ate-env-api` derives each image template again from the new base.
 
 ### 1. Deploy the Kubernetes Resources
 
@@ -274,7 +284,28 @@ kubectl get pods -n ate-env
 `--wake-budget` (default 5m; cold image pulls and cross-region snapshot reads exceed the router's own
 parking budget) and, once the control plane reports the environment RUNNING, up to
 `--wake-running-budget` (default 20s). Both are flags of the `ate-env-api` binary; `ate-env manifest`
-does not set them, thus add them to the Deployment's arguments to change them.
+does not set them, thus add them to the Deployment's arguments to change them. `--wake-budget` must
+be longer than the image pull plus the template's wakeup-probe timeout (`ate-env manifest template
+--wakeup-timeout`), because the control plane reports RUNNING only after the probe passes. The 5m
+default covers the 120 s timeout of a `--sidecar-readyz` template plus three minutes for the pull;
+raise it if you set a longer `--wakeup-timeout`. Otherwise the first guest call after a slow wake
+fails with `Unavailable`, and a retry succeeds once the environment is up. A deleted environment
+fails a guest call at once with `NotFound`.
+
+Two start failures also end the wait at once, because waiting cannot fix them, and mark the call's
+trailing metadata with `ate-env-start-failure`, so a client can retry the work on a fresh
+environment instead of scoring it:
+
+| Failure | Status | `ate-env-start-failure` | When |
+|---|---|---|---|
+| The control plane moved the environment to CRASHED while it was waking | `FailedPrecondition`, with the control plane's crash reason | `crashed` | always |
+| No worker has room to run the environment | `ResourceExhausted` | `no-capacity` | only with `--wake-no-capacity-grace`, after the router has said so for that long |
+
+`--wake-no-capacity-grace` defaults to 0: a full fleet keeps waiting for the whole `--wake-budget`,
+since capacity can come back as nodes scale up or other environments stop. The Python SDK turns
+both into a retryable `SandboxStartError` whose `reason` is the trailer's value. Port-proxy requests
+wait on the router instead (see
+[Reaching a service inside an environment](#reaching-a-service-inside-an-environment)).
 
 `ate-env-api` can export traces and serve Prometheus metrics; both are off by default:
 
@@ -338,8 +369,12 @@ ate-env manifest template --template py312 \
 
 A second runtime rides along the same way: `--layer` mounts its image read-only next to the
 guest, `--sidecar` has the guest start and supervise a process from it, and `--sidecar-readyz`
-holds the actor's readiness until that process answers. Here a static busybox stands in for a
-runtime daemon and serves HTTP on port 44772 inside the environment:
+holds the actor's readiness until that process answers. With `--sidecar-readyz`, Substrate's
+wakeup probe waits up to 120 s instead of its default 30 s, because a runtime that boots in 20 s
+alone takes longer when many environments start on one node; `--wakeup-timeout` sets another
+value. Keep `ate-env-api --wake-budget` longer than the image pull plus this timeout (see step 1).
+Templates registered before this flag keep 30 s (see the upgrade notes above). Here a static
+busybox stands in for a runtime daemon and serves HTTP on port 44772 inside the environment:
 
 ```bash
 ate-env manifest template --template layered \
@@ -534,9 +569,9 @@ Manages the lifecycle of isolated execution environments (defined in [`proto/ate
 | --- | ----------- |
 | `CreateEnvironment` | Creates and starts a new environment actor from an ActorTemplate, or from a digest-pinned `rootfs_image` on top of one: the template becomes the base, the image the container, and the guest is mounted in as a read-only image volume |
 | `GetEnvironment` | Retrieves environment details and status |
-| `SuspendEnvironment` | Suspends and checkpoints the environment to snapshot storage |
+| `SuspendEnvironment` | Suspends and checkpoints the environment: to snapshot storage by default, or to its node first with `mode: SUSPEND_MODE_LOCAL` (the upload follows in the background) |
 | `DeleteEnvironment` | Deletes the environment permanently |
-| `GetServerInfo` | Reports the server implementation (`sandboxenv-rl`), its version, the version of the `go.ate.dev/substrate` module it was built against, and its optional features (`rootfs_image`, `pty`, and `port_proxy` when enabled); answered by `ate-env-api` itself. The Substrate version is a build fact, not the version of the control plane the server talks to; Substrate has no RPC that reports that. `ate-env server-info --json` prints the four fields as one JSON object |
+| `GetServerInfo` | Reports the server implementation (`sandboxenv-rl`), its version, the version of the `go.ate.dev/substrate` module it was built against, and its optional features (`rootfs_image`, `pty`, `suspend_mode`, and `port_proxy` when enabled); answered by `ate-env-api` itself. The Substrate version is a build fact, not the version of the control plane the server talks to; Substrate has no RPC that reports that. `ate-env server-info --json` prints the four fields as one JSON object |
 
 ### ProcessService
 
@@ -569,9 +604,18 @@ A daemon that listens on a port inside an environment, such as one a runtime lay
 the guest ([docs/rootfs-images/RUNTIMES.md](docs/rootfs-images/RUNTIMES.md)), is reachable through
 the API's listener. A plain HTTP request that carries `X-Env-Id` and `X-Env-Port` (and
 `X-Env-Atespace` outside `ate-env`) is forwarded through the Substrate router to that port, whatever
-its path; the API strips the three headers. The router resumes a suspended environment first,
-and the proxy waits for the wake up to `--wake-budget` (the same wait as a guest call) before it
-answers 503.
+its path; the API strips the three headers. The router accepts the tunnel and resumes a suspended
+environment for the request, which it holds while the environment wakes, up to about 10 s in
+Substrate v0.6.0 (its `--parked-request-budget`, 5 s by default, plus 5 s). A longer wake, usually
+only the first wake of an environment on a new image (15 to 31 s measured; a resume after a suspend
+takes 1 to 2 s), gets 503 with `Retry-After: 1` and `X-Env-State: RESUMING` or `SUSPENDED`, and the
+wake goes on: the client must retry, or wait for a health check before other requests.
+`--wake-budget` bounds guest gRPC calls, and the port proxy only when the router refuses the tunnel
+itself, for example when it is overloaded. For the router's errors, the proxy reads the
+environment's state: a crashed environment gets 410 Gone with `X-Env-State: CRASHED`, after the
+router's 5 s hold; one that is being deleted gets 404 with `X-Env-State: DELETING`; one that is
+deleted gets 404. A client stops on 410, because only a new environment helps. The daemon's own
+answers, its 503, 404 and 504 included, pass unchanged.
 
 ```bash
 curl -H 'X-Env-Id: dev1' -H 'X-Env-Port: 6000' \

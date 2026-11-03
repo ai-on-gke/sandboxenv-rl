@@ -76,6 +76,32 @@ func TestCommandRouting(t *testing.T) {
 		}
 	})
 
+	t.Run("suspend --mode", func(t *testing.T) {
+		args := []string{"suspend", "dev1", "--mode", "local"}
+		root := newRootCommand(args)
+		cmd, remaining, err := root.Find(args)
+		if err != nil {
+			t.Fatalf("root.Find failed: %v", err)
+		}
+		if err := cmd.ParseFlags(remaining); err != nil {
+			t.Fatalf("cmd.ParseFlags failed: %v", err)
+		}
+		if got := cmd.Flags().Lookup("mode").Value.String(); got != "local" {
+			t.Errorf("--mode = %q, want local", got)
+		}
+		if got := newSuspendCommand().Flags().Lookup("mode").DefValue; got != "durable" {
+			t.Errorf("--mode default = %q, want durable", got)
+		}
+		// A mode that is neither is refused before anything is dialed.
+		bad := newRootCommand(nil)
+		bad.SetArgs([]string{"suspend", "dev1", "--mode", "async"})
+		bad.SetOut(io.Discard)
+		bad.SetErr(io.Discard)
+		if err := bad.Execute(); err == nil || !strings.Contains(err.Error(), "--mode must be durable or local") {
+			t.Errorf("invalid --mode: got %v, want the usage error", err)
+		}
+	})
+
 	t.Run("top-level delete command", func(t *testing.T) {
 		args := []string{"delete", "dev1"}
 		root := newRootCommand(args)
@@ -360,7 +386,7 @@ func TestServerInfoCommand(t *testing.T) {
 		"server: sandboxenv-rl\n",
 		"version: v9.9.9\n",
 		"substrate_version: ",
-		"features: rootfs_image, pty, port_proxy\n",
+		"features: rootfs_image, pty, suspend_mode, port_proxy\n",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("server-info output missing %q:\n%s", want, out.String())
@@ -398,7 +424,7 @@ func TestServerInfoCommandJSON(t *testing.T) {
 		t.Fatalf("output is not one JSON object: %v\n%s", err, out.String())
 	}
 	if got.Server != "sandboxenv-rl" || got.Version != "v9.9.9" || got.SubstrateVersion == "" ||
-		strings.Join(got.Features, ",") != "rootfs_image,pty,port_proxy" {
+		strings.Join(got.Features, ",") != "rootfs_image,pty,suspend_mode,port_proxy" {
 		t.Errorf("server-info --json = %+v", got)
 	}
 }

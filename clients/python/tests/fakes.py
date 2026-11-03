@@ -86,7 +86,23 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
     async def SuspendEnvironment(self, request, context):
         environment = await self._lookup(request, context)
         self.last_suspend_request = request
-        # Mirror ate-env-api: a local suspend is PAUSED until its upload lands.
+        # Mirror ate-env-api: an unknown mode is INVALID_ARGUMENT; a suspended
+        # or paused environment is left as it is, because Substrate's
+        # SuspendActor returns at once on it; a local suspend of a running one
+        # is PAUSED until its upload lands, a durable one SUSPENDED.
+        if request.mode not in (
+            env_pb2.SUSPEND_MODE_UNSPECIFIED,
+            env_pb2.SUSPEND_MODE_DURABLE,
+            env_pb2.SUSPEND_MODE_LOCAL,
+        ):
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, f"mode {request.mode} is not a SuspendMode"
+            )
+        if environment.status in (
+            env_pb2.ENVIRONMENT_STATUS_SUSPENDED,
+            env_pb2.ENVIRONMENT_STATUS_PAUSED,
+        ):
+            return env_pb2.SuspendEnvironmentResponse()
         if request.mode == env_pb2.SUSPEND_MODE_LOCAL:
             environment.status = env_pb2.ENVIRONMENT_STATUS_PAUSED
         else:

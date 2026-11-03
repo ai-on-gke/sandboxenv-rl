@@ -22,6 +22,9 @@ pip install ./clients/python './integrations/openhands[examples]'   # from the r
 
 [`convo_with_ate_env.py`](convo_with_ate_env.py) is OpenHands' agent-sandbox example 17
 with the workspace line changed: a command, a conversation, a pause and resume, a second message.
+The conversation stays usable across `pause()` and `resume()`, but because it stays open, the
+environment does not stay suspended during the pause (see the integration's
+[Limits](../../integrations/openhands/README.md#limits)).
 
 ```bash
 SESSION_KEY=<key> LLM_API_KEY=<key> [LLM_MODEL=<litellm model>] [LLM_BASE_URL=<url>] \
@@ -132,9 +135,10 @@ IMAGES="docker.io/library/ubuntu@sha256:<digest> docker.io/library/node@sha256:<
 examples/openhands/demo.sh
 ```
 
-It also takes `PORT`, `AGENT_SERVER_ENV` (extra `NAME=VALUE` settings), `COMMAND`, `WORKDIR`,
-`API_TOKEN` (when ate-env-api runs with `-auth-token-file`) and `KEEP=1` (leave the environments up
-for the SDK scripts); see its header. It exits 1 if any agent-server did not answer.
+It also takes `BASE_IMAGE` (the glibc image the base template runs in, default a pinned
+`debian:bookworm-slim`), `PORT`, `AGENT_SERVER_ENV` (extra `NAME=VALUE` settings), `COMMAND`,
+`WORKDIR`, `API_TOKEN` (when ate-env-api runs with `-auth-token-file`) and `KEEP=1` (leave the
+environments up for the SDK scripts); see its header. It exits 1 if any agent-server did not answer.
 
 Templates are immutable and the session key is in them, also in the per-image templates that
 creates derive (`<base>-<12 hex digits of the image digest>`). The demo reuses an existing base

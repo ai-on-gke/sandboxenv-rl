@@ -440,10 +440,11 @@ benchmark of its own.
 
 ## Record with every run
 
-Substrate and env commits, cluster shape (machine type, node count, disk,
-sandbox class), bucket region, the dataset manifest's digest, and the loader
-flags. Pass them as `run -label` values so they travel with the events file. The
-loader records its own flags itself: mode, width, images, trajectory,
+The bundle built with `bench measure -k8s` records the cluster, node pools,
+Kubernetes and Substrate versions and the loader commit; pass the arm as a
+`run -label` and record by hand what neither records: boot disk type and size,
+CPU family, workers per node, bucket region. The loader records its own flags
+itself: mode, width, images, trajectory,
 dataset, tasks per image or rollouts, steps and park, connections, base
 template, exclude file, instances, and the create, step, wake-budget and
 wake-backoff timeouts. The report alone is not reproducible without them.

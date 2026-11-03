@@ -34,6 +34,9 @@ const (
 	FeatureRootfsImage = "rootfs_image"
 	// FeaturePTY: StartProcess accepts tty, and ResizeProcess is served.
 	FeaturePTY = "pty"
+	// FeatureSuspendMode: SuspendEnvironment accepts mode, so a caller can ask
+	// for a local suspend (SUSPEND_MODE_LOCAL).
+	FeatureSuspendMode = "suspend_mode"
 	// FeaturePortProxy: the listener forwards HTTP to ports in environments.
 	FeaturePortProxy = "port_proxy"
 	// FeatureImageStatus: GetImageStatus and EnsureImageTemplate are served.
@@ -68,7 +71,7 @@ func (s *Server) GetServerInfo(ctx context.Context, req *ateenvv1alpha.GetServer
 
 // features lists the optional features this server serves, in a fixed order.
 func (s *Server) features() []string {
-	f := []string{FeatureRootfsImage, FeaturePTY, FeatureImageStatus}
+	f := []string{FeatureRootfsImage, FeaturePTY, FeatureSuspendMode, FeatureImageStatus}
 	if s.Info.PortProxy {
 		f = append(f, FeaturePortProxy)
 	}

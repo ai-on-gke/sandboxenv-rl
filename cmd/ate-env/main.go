@@ -255,7 +255,8 @@ func newCreateCommand() *cobra.Command {
 }
 
 // parseWorkerSelector turns key=value items into the labels a worker pool
-// must carry. A later item overrides an earlier one with the same key.
+// must carry. A key given twice is an error, whatever the values: a
+// selector has one value per key, and a repeat is a typo to surface.
 func parseWorkerSelector(items []string) (map[string]string, error) {
 	if len(items) == 0 {
 		return nil, nil
@@ -265,6 +266,9 @@ func parseWorkerSelector(items []string) (map[string]string, error) {
 		key, value, ok := strings.Cut(item, "=")
 		if !ok || key == "" {
 			return nil, fmt.Errorf("--worker-selector %q: want key=value", item)
+		}
+		if prev, dup := selector[key]; dup {
+			return nil, fmt.Errorf("--worker-selector %s is given twice (%q and %q)", key, prev, value)
 		}
 		selector[key] = value
 	}

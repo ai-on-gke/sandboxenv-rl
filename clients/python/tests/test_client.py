@@ -354,6 +354,14 @@ async def test_create_omits_worker_selector_when_not_given(fake_stack):
     assert (await client.get("dev1")).worker_selector == {}
 
 
+async def test_environment_info_stays_hashable(fake_stack):
+    client, _ = fake_stack
+    await client.create("dev1", worker_selector={"ate-env/domain": "d0"})
+    info = await client.get("dev1")
+    assert hash(info) == hash(await client.get("dev1"))
+    assert len({info, await client.get("dev1")}) == 1
+
+
 async def test_get_reports_node(fake_stack):
     client, fakes = fake_stack
     await client.create("dev1")

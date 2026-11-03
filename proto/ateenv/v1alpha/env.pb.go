@@ -53,9 +53,12 @@ const (
 	EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDING EnvironmentStatus = 3
 	// Environment is suspended and checkpointed.
 	EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDED EnvironmentStatus = 4
-	// Environment is in the process of pausing.
+	// Environment is in the process of pausing. Not produced: Substrate
+	// reports one SUSPENDING state whatever the suspend mode.
 	EnvironmentStatus_ENVIRONMENT_STATUS_PAUSING EnvironmentStatus = 5
-	// Environment is paused.
+	// Environment is paused: suspended with SUSPEND_MODE_LOCAL, its snapshot
+	// on its node and the upload to object storage not landed yet. It resumes
+	// on that node; once the upload lands it is SUSPENDED like any other.
 	EnvironmentStatus_ENVIRONMENT_STATUS_PAUSED EnvironmentStatus = 6
 	// Environment process crashed.
 	EnvironmentStatus_ENVIRONMENT_STATUS_CRASHED EnvironmentStatus = 7
@@ -116,6 +119,69 @@ func (EnvironmentStatus) EnumDescriptor() ([]byte, []int) {
 	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{0}
 }
 
+// How SuspendEnvironment treats the snapshot before it returns. The mode
+// applies when the call checkpoints a running environment. On an environment
+// that is already SUSPENDED, or PAUSED with its upload still pending,
+// Substrate's SuspendActor returns at once and the call changes nothing: a
+// DURABLE request on a PAUSED environment does not wait for the upload.
+type SuspendMode int32
+
+const (
+	// Unset: SUSPEND_MODE_DURABLE, what ate-env always did.
+	SuspendMode_SUSPEND_MODE_UNSPECIFIED SuspendMode = 0
+	// Return once the snapshot is in object storage. The environment survives
+	// the loss of its node and resumes on any node.
+	SuspendMode_SUSPEND_MODE_DURABLE SuspendMode = 1
+	// Return once the snapshot is on the worker's node; the upload to object
+	// storage goes on in the background. Until it lands the environment
+	// resumes on that node only, reports ENVIRONMENT_STATUS_PAUSED, and a node
+	// lost before then takes the snapshot with it. One park-and-resume cycle is
+	// cheaper this way, which is what a loop that parks an environment between
+	// every command wants.
+	SuspendMode_SUSPEND_MODE_LOCAL SuspendMode = 2
+)
+
+// Enum value maps for SuspendMode.
+var (
+	SuspendMode_name = map[int32]string{
+		0: "SUSPEND_MODE_UNSPECIFIED",
+		1: "SUSPEND_MODE_DURABLE",
+		2: "SUSPEND_MODE_LOCAL",
+	}
+	SuspendMode_value = map[string]int32{
+		"SUSPEND_MODE_UNSPECIFIED": 0,
+		"SUSPEND_MODE_DURABLE":     1,
+		"SUSPEND_MODE_LOCAL":       2,
+	}
+)
+
+func (x SuspendMode) Enum() *SuspendMode {
+	p := new(SuspendMode)
+	*p = x
+	return p
+}
+
+func (x SuspendMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SuspendMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_ateenv_v1alpha_env_proto_enumTypes[1].Descriptor()
+}
+
+func (SuspendMode) Type() protoreflect.EnumType {
+	return &file_proto_ateenv_v1alpha_env_proto_enumTypes[1]
+}
+
+func (x SuspendMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SuspendMode.Descriptor instead.
+func (SuspendMode) EnumDescriptor() ([]byte, []int) {
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{1}
+}
+
 // State of a derived template's golden snapshot, the snapshot every
 // environment on the image restores from instead of booting.
 type GoldenSnapshotState int32
@@ -165,11 +231,11 @@ func (x GoldenSnapshotState) String() string {
 }
 
 func (GoldenSnapshotState) Descriptor() protoreflect.EnumDescriptor {
-	return file_proto_ateenv_v1alpha_env_proto_enumTypes[1].Descriptor()
+	return file_proto_ateenv_v1alpha_env_proto_enumTypes[2].Descriptor()
 }
 
 func (GoldenSnapshotState) Type() protoreflect.EnumType {
-	return &file_proto_ateenv_v1alpha_env_proto_enumTypes[1]
+	return &file_proto_ateenv_v1alpha_env_proto_enumTypes[2]
 }
 
 func (x GoldenSnapshotState) Number() protoreflect.EnumNumber {
@@ -178,7 +244,7 @@ func (x GoldenSnapshotState) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use GoldenSnapshotState.Descriptor instead.
 func (GoldenSnapshotState) EnumDescriptor() ([]byte, []int) {
-	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{1}
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{2}
 }
 
 // Template represents an ActorTemplate used to instantiate environments.
@@ -803,7 +869,13 @@ type SuspendEnvironmentRequest struct {
 	// Unique identifier of the environment to suspend. Required.
 	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
 	// Substrate atespace of the environment (defaults to "ate-env").
-	Atespace      string `protobuf:"bytes,2,opt,name=atespace,proto3" json:"atespace,omitempty"`
+	Atespace string `protobuf:"bytes,2,opt,name=atespace,proto3" json:"atespace,omitempty"`
+	// How the suspend treats the snapshot; unset means SUSPEND_MODE_DURABLE.
+	// An ate-env-api that predates this field refuses a request that sets it
+	// (INVALID_ARGUMENT), because it rejects fields it does not know; a durable
+	// suspend leaves it unset and works against either. GetServerInfo lists
+	// "suspend_mode" once the server serves it.
+	Mode          SuspendMode `protobuf:"varint,3,opt,name=mode,proto3,enum=ateenv.v1alpha.SuspendMode" json:"mode,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -850,6 +922,13 @@ func (x *SuspendEnvironmentRequest) GetAtespace() string {
 		return x.Atespace
 	}
 	return ""
+}
+
+func (x *SuspendEnvironmentRequest) GetMode() SuspendMode {
+	if x != nil {
+		return x.Mode
+	}
+	return SuspendMode_SUSPEND_MODE_UNSPECIFIED
 }
 
 // Response returned after suspending an environment.
@@ -1035,8 +1114,8 @@ type GetServerInfoResponse struct {
 	// module, whose version the binary does not record.
 	SubstrateVersion string `protobuf:"bytes,3,opt,name=substrate_version,json=substrateVersion,proto3" json:"substrate_version,omitempty"`
 	// Optional features the server serves, e.g. "rootfs_image", "pty",
-	// "port_proxy". Clients must ignore names they do not know. A name keeps its
-	// meaning once published.
+	// "suspend_mode", "port_proxy". Clients must ignore names they do not know.
+	// A name keeps its meaning once published.
 	Features      []string `protobuf:"bytes,4,rep,name=features,proto3" json:"features,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1149,10 +1228,11 @@ const file_proto_ateenv_v1alpha_env_proto_rawDesc = "" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
 	"\batespace\x18\x02 \x01(\tR\batespace\"W\n" +
 	"\x16GetEnvironmentResponse\x12=\n" +
-	"\venvironment\x18\x01 \x01(\v2\x1b.ateenv.v1alpha.EnvironmentR\venvironment\"G\n" +
+	"\venvironment\x18\x01 \x01(\v2\x1b.ateenv.v1alpha.EnvironmentR\venvironment\"x\n" +
 	"\x19SuspendEnvironmentRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
-	"\batespace\x18\x02 \x01(\tR\batespace\"\x1c\n" +
+	"\batespace\x18\x02 \x01(\tR\batespace\x12/\n" +
+	"\x04mode\x18\x03 \x01(\x0e2\x1b.ateenv.v1alpha.SuspendModeR\x04mode\"\x1c\n" +
 	"\x1aSuspendEnvironmentResponse\"F\n" +
 	"\x18DeleteEnvironmentRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
@@ -1173,7 +1253,11 @@ const file_proto_ateenv_v1alpha_env_proto_rawDesc = "" +
 	"\x1aENVIRONMENT_STATUS_PAUSING\x10\x05\x12\x1d\n" +
 	"\x19ENVIRONMENT_STATUS_PAUSED\x10\x06\x12\x1e\n" +
 	"\x1aENVIRONMENT_STATUS_CRASHED\x10\a\x12\x1f\n" +
-	"\x1bENVIRONMENT_STATUS_DELETING\x10\b*\xc2\x01\n" +
+	"\x1bENVIRONMENT_STATUS_DELETING\x10\b*]\n" +
+	"\vSuspendMode\x12\x1c\n" +
+	"\x18SUSPEND_MODE_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14SUSPEND_MODE_DURABLE\x10\x01\x12\x16\n" +
+	"\x12SUSPEND_MODE_LOCAL\x10\x02*\xc2\x01\n" +
 	"\x13GoldenSnapshotState\x12%\n" +
 	"!GOLDEN_SNAPSHOT_STATE_UNSPECIFIED\x10\x00\x12\x1e\n" +
 	"\x1aGOLDEN_SNAPSHOT_STATE_NONE\x10\x01\x12!\n" +
@@ -1201,60 +1285,62 @@ func file_proto_ateenv_v1alpha_env_proto_rawDescGZIP() []byte {
 	return file_proto_ateenv_v1alpha_env_proto_rawDescData
 }
 
-var file_proto_ateenv_v1alpha_env_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_proto_ateenv_v1alpha_env_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_proto_ateenv_v1alpha_env_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_proto_ateenv_v1alpha_env_proto_goTypes = []any{
 	(EnvironmentStatus)(0),             // 0: ateenv.v1alpha.EnvironmentStatus
-	(GoldenSnapshotState)(0),           // 1: ateenv.v1alpha.GoldenSnapshotState
-	(*Template)(nil),                   // 2: ateenv.v1alpha.Template
-	(*Environment)(nil),                // 3: ateenv.v1alpha.Environment
-	(*CreateEnvironmentRequest)(nil),   // 4: ateenv.v1alpha.CreateEnvironmentRequest
-	(*CreateEnvironmentResponse)(nil),  // 5: ateenv.v1alpha.CreateEnvironmentResponse
-	(*GetImageStatusRequest)(nil),      // 6: ateenv.v1alpha.GetImageStatusRequest
-	(*EnsureImageTemplateRequest)(nil), // 7: ateenv.v1alpha.EnsureImageTemplateRequest
-	(*ImageStatus)(nil),                // 8: ateenv.v1alpha.ImageStatus
-	(*GetEnvironmentRequest)(nil),      // 9: ateenv.v1alpha.GetEnvironmentRequest
-	(*GetEnvironmentResponse)(nil),     // 10: ateenv.v1alpha.GetEnvironmentResponse
-	(*SuspendEnvironmentRequest)(nil),  // 11: ateenv.v1alpha.SuspendEnvironmentRequest
-	(*SuspendEnvironmentResponse)(nil), // 12: ateenv.v1alpha.SuspendEnvironmentResponse
-	(*DeleteEnvironmentRequest)(nil),   // 13: ateenv.v1alpha.DeleteEnvironmentRequest
-	(*DeleteEnvironmentResponse)(nil),  // 14: ateenv.v1alpha.DeleteEnvironmentResponse
-	(*GetServerInfoRequest)(nil),       // 15: ateenv.v1alpha.GetServerInfoRequest
-	(*GetServerInfoResponse)(nil),      // 16: ateenv.v1alpha.GetServerInfoResponse
-	nil,                                // 17: ateenv.v1alpha.Environment.WorkerSelectorEntry
-	nil,                                // 18: ateenv.v1alpha.CreateEnvironmentRequest.WorkerSelectorEntry
+	(SuspendMode)(0),                   // 1: ateenv.v1alpha.SuspendMode
+	(GoldenSnapshotState)(0),           // 2: ateenv.v1alpha.GoldenSnapshotState
+	(*Template)(nil),                   // 3: ateenv.v1alpha.Template
+	(*Environment)(nil),                // 4: ateenv.v1alpha.Environment
+	(*CreateEnvironmentRequest)(nil),   // 5: ateenv.v1alpha.CreateEnvironmentRequest
+	(*CreateEnvironmentResponse)(nil),  // 6: ateenv.v1alpha.CreateEnvironmentResponse
+	(*GetImageStatusRequest)(nil),      // 7: ateenv.v1alpha.GetImageStatusRequest
+	(*EnsureImageTemplateRequest)(nil), // 8: ateenv.v1alpha.EnsureImageTemplateRequest
+	(*ImageStatus)(nil),                // 9: ateenv.v1alpha.ImageStatus
+	(*GetEnvironmentRequest)(nil),      // 10: ateenv.v1alpha.GetEnvironmentRequest
+	(*GetEnvironmentResponse)(nil),     // 11: ateenv.v1alpha.GetEnvironmentResponse
+	(*SuspendEnvironmentRequest)(nil),  // 12: ateenv.v1alpha.SuspendEnvironmentRequest
+	(*SuspendEnvironmentResponse)(nil), // 13: ateenv.v1alpha.SuspendEnvironmentResponse
+	(*DeleteEnvironmentRequest)(nil),   // 14: ateenv.v1alpha.DeleteEnvironmentRequest
+	(*DeleteEnvironmentResponse)(nil),  // 15: ateenv.v1alpha.DeleteEnvironmentResponse
+	(*GetServerInfoRequest)(nil),       // 16: ateenv.v1alpha.GetServerInfoRequest
+	(*GetServerInfoResponse)(nil),      // 17: ateenv.v1alpha.GetServerInfoResponse
+	nil,                                // 18: ateenv.v1alpha.Environment.WorkerSelectorEntry
+	nil,                                // 19: ateenv.v1alpha.CreateEnvironmentRequest.WorkerSelectorEntry
 }
 var file_proto_ateenv_v1alpha_env_proto_depIdxs = []int32{
-	2,  // 0: ateenv.v1alpha.Environment.template:type_name -> ateenv.v1alpha.Template
+	3,  // 0: ateenv.v1alpha.Environment.template:type_name -> ateenv.v1alpha.Template
 	0,  // 1: ateenv.v1alpha.Environment.status:type_name -> ateenv.v1alpha.EnvironmentStatus
-	17, // 2: ateenv.v1alpha.Environment.worker_selector:type_name -> ateenv.v1alpha.Environment.WorkerSelectorEntry
-	2,  // 3: ateenv.v1alpha.CreateEnvironmentRequest.template:type_name -> ateenv.v1alpha.Template
-	18, // 4: ateenv.v1alpha.CreateEnvironmentRequest.worker_selector:type_name -> ateenv.v1alpha.CreateEnvironmentRequest.WorkerSelectorEntry
-	3,  // 5: ateenv.v1alpha.CreateEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
-	2,  // 6: ateenv.v1alpha.GetImageStatusRequest.template:type_name -> ateenv.v1alpha.Template
-	2,  // 7: ateenv.v1alpha.EnsureImageTemplateRequest.template:type_name -> ateenv.v1alpha.Template
-	2,  // 8: ateenv.v1alpha.ImageStatus.template:type_name -> ateenv.v1alpha.Template
-	1,  // 9: ateenv.v1alpha.ImageStatus.golden:type_name -> ateenv.v1alpha.GoldenSnapshotState
-	3,  // 10: ateenv.v1alpha.GetEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
-	4,  // 11: ateenv.v1alpha.EnvironmentService.CreateEnvironment:input_type -> ateenv.v1alpha.CreateEnvironmentRequest
-	9,  // 12: ateenv.v1alpha.EnvironmentService.GetEnvironment:input_type -> ateenv.v1alpha.GetEnvironmentRequest
-	11, // 13: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:input_type -> ateenv.v1alpha.SuspendEnvironmentRequest
-	13, // 14: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:input_type -> ateenv.v1alpha.DeleteEnvironmentRequest
-	15, // 15: ateenv.v1alpha.EnvironmentService.GetServerInfo:input_type -> ateenv.v1alpha.GetServerInfoRequest
-	6,  // 16: ateenv.v1alpha.EnvironmentService.GetImageStatus:input_type -> ateenv.v1alpha.GetImageStatusRequest
-	7,  // 17: ateenv.v1alpha.EnvironmentService.EnsureImageTemplate:input_type -> ateenv.v1alpha.EnsureImageTemplateRequest
-	5,  // 18: ateenv.v1alpha.EnvironmentService.CreateEnvironment:output_type -> ateenv.v1alpha.CreateEnvironmentResponse
-	10, // 19: ateenv.v1alpha.EnvironmentService.GetEnvironment:output_type -> ateenv.v1alpha.GetEnvironmentResponse
-	12, // 20: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:output_type -> ateenv.v1alpha.SuspendEnvironmentResponse
-	14, // 21: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:output_type -> ateenv.v1alpha.DeleteEnvironmentResponse
-	16, // 22: ateenv.v1alpha.EnvironmentService.GetServerInfo:output_type -> ateenv.v1alpha.GetServerInfoResponse
-	8,  // 23: ateenv.v1alpha.EnvironmentService.GetImageStatus:output_type -> ateenv.v1alpha.ImageStatus
-	8,  // 24: ateenv.v1alpha.EnvironmentService.EnsureImageTemplate:output_type -> ateenv.v1alpha.ImageStatus
-	18, // [18:25] is the sub-list for method output_type
-	11, // [11:18] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	18, // 2: ateenv.v1alpha.Environment.worker_selector:type_name -> ateenv.v1alpha.Environment.WorkerSelectorEntry
+	3,  // 3: ateenv.v1alpha.CreateEnvironmentRequest.template:type_name -> ateenv.v1alpha.Template
+	19, // 4: ateenv.v1alpha.CreateEnvironmentRequest.worker_selector:type_name -> ateenv.v1alpha.CreateEnvironmentRequest.WorkerSelectorEntry
+	4,  // 5: ateenv.v1alpha.CreateEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
+	3,  // 6: ateenv.v1alpha.GetImageStatusRequest.template:type_name -> ateenv.v1alpha.Template
+	3,  // 7: ateenv.v1alpha.EnsureImageTemplateRequest.template:type_name -> ateenv.v1alpha.Template
+	3,  // 8: ateenv.v1alpha.ImageStatus.template:type_name -> ateenv.v1alpha.Template
+	2,  // 9: ateenv.v1alpha.ImageStatus.golden:type_name -> ateenv.v1alpha.GoldenSnapshotState
+	4,  // 10: ateenv.v1alpha.GetEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
+	1,  // 11: ateenv.v1alpha.SuspendEnvironmentRequest.mode:type_name -> ateenv.v1alpha.SuspendMode
+	5,  // 12: ateenv.v1alpha.EnvironmentService.CreateEnvironment:input_type -> ateenv.v1alpha.CreateEnvironmentRequest
+	10, // 13: ateenv.v1alpha.EnvironmentService.GetEnvironment:input_type -> ateenv.v1alpha.GetEnvironmentRequest
+	12, // 14: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:input_type -> ateenv.v1alpha.SuspendEnvironmentRequest
+	14, // 15: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:input_type -> ateenv.v1alpha.DeleteEnvironmentRequest
+	16, // 16: ateenv.v1alpha.EnvironmentService.GetServerInfo:input_type -> ateenv.v1alpha.GetServerInfoRequest
+	7,  // 17: ateenv.v1alpha.EnvironmentService.GetImageStatus:input_type -> ateenv.v1alpha.GetImageStatusRequest
+	8,  // 18: ateenv.v1alpha.EnvironmentService.EnsureImageTemplate:input_type -> ateenv.v1alpha.EnsureImageTemplateRequest
+	6,  // 19: ateenv.v1alpha.EnvironmentService.CreateEnvironment:output_type -> ateenv.v1alpha.CreateEnvironmentResponse
+	11, // 20: ateenv.v1alpha.EnvironmentService.GetEnvironment:output_type -> ateenv.v1alpha.GetEnvironmentResponse
+	13, // 21: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:output_type -> ateenv.v1alpha.SuspendEnvironmentResponse
+	15, // 22: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:output_type -> ateenv.v1alpha.DeleteEnvironmentResponse
+	17, // 23: ateenv.v1alpha.EnvironmentService.GetServerInfo:output_type -> ateenv.v1alpha.GetServerInfoResponse
+	9,  // 24: ateenv.v1alpha.EnvironmentService.GetImageStatus:output_type -> ateenv.v1alpha.ImageStatus
+	9,  // 25: ateenv.v1alpha.EnvironmentService.EnsureImageTemplate:output_type -> ateenv.v1alpha.ImageStatus
+	19, // [19:26] is the sub-list for method output_type
+	12, // [12:19] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_proto_ateenv_v1alpha_env_proto_init() }
@@ -1267,7 +1353,7 @@ func file_proto_ateenv_v1alpha_env_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_ateenv_v1alpha_env_proto_rawDesc), len(file_proto_ateenv_v1alpha_env_proto_rawDesc)),
-			NumEnums:      2,
+			NumEnums:      3,
 			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   1,

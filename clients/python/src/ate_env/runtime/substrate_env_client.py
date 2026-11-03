@@ -35,6 +35,7 @@ from ..errors import (
     NotFoundError,
     RpcError,
     SandboxProtocolError,
+    SandboxStartError,
     SandboxUnavailableError,
 )
 from ..loop_runner import LoopRunner
@@ -129,6 +130,12 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
                     self._loop_runner = None
             elif self._owns_client and self._client:
                 self._sync(self._client.close())
+
+    def _own(self, err: SandboxStartError) -> SandboxStartError:
+        """err with this environment's id, for a start failure ate-env-api reported."""
+        if err.sandbox_id is None:
+            err.sandbox_id = self.env_id
+        return err
 
     def _check_open(self) -> None:
         if self._closed:
@@ -225,6 +232,8 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
                 duration_s=duration,
                 timed_out=timed_out,
             )
+        except SandboxStartError as e:
+            raise self._own(e)
         except InvalidArgumentError as e:
             raise SandboxProtocolError(str(e), sandbox_id=self.env_id) from e
         except NotFoundError as e:
@@ -275,6 +284,8 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
                     yield chunk.stdout.decode("utf-8", errors="replace")
                 elif chunk.stderr is not None:
                     yield chunk.stderr.decode("utf-8", errors="replace")
+        except SandboxStartError as e:
+            raise self._own(e)
         except (InvalidArgumentError, NotFoundError, RpcError) as e:
             raise SandboxUnavailableError(str(e), sandbox_id=self.env_id) from e
         except Exception as e:
@@ -316,6 +327,8 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
         raw = content.encode("utf-8") if isinstance(content, str) else content
         try:
             await self.env.write_file(path, raw)
+        except SandboxStartError as e:
+            raise self._own(e)
         except InvalidArgumentError as e:
             raise SandboxProtocolError(str(e), sandbox_id=self.env_id) from e
         except (NotFoundError, RpcError) as e:
@@ -331,6 +344,8 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
         self._check_open()
         try:
             return await self.env.read_file_bytes(path)
+        except SandboxStartError as e:
+            raise self._own(e)
         except NotFoundError:
             raise FileNotFoundError(f"File not found in sandbox: {path}")
         except InvalidArgumentError as e:

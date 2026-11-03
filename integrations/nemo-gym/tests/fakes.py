@@ -76,6 +76,9 @@ class FakeAteEnv:
     delete_code: grpc.StatusCode | None = None
     ready_after_probes: int = 0  # fail this many `true` probes with UNAVAILABLE first
     hang: set[str] = field(default_factory=set)  # shell commands whose process never exits
+    # Shell commands whose StartProcess the fake refuses with this status, as
+    # a guest the API cannot reach would.
+    refuse_starts: dict[str, grpc.StatusCode] = field(default_factory=dict)
     # Bearer token each call must carry, as ate-env-api's -auth-token-file;
     # None accepts any call. auth_seen records (method, authorization values).
     require_token: str | None = None
@@ -178,6 +181,8 @@ class FakeProcessService(guest_pb2_grpc.ProcessServiceServicer):
         if shell_cmd == "true" and s._probes < s.ready_after_probes:
             s._probes += 1
             await context.abort(grpc.StatusCode.UNAVAILABLE, "guest not up yet")
+        if shell_cmd in s.refuse_starts:
+            await context.abort(s.refuse_starts[shell_cmd], "guest unreachable")
         s._seq += 1
         pid = f"p{s._seq}"
         proc = FakeProc(env_id=env_id, argv=argv, timeout_s=timeout_s)

@@ -69,3 +69,20 @@ user needs to know across them.
   per-event JSONL for one more release.
 - `benchmarking/telemetry_report`: builds a self-contained HTML report from run
   reports, OTLP/JSON spans and Prometheus or collector metrics.
+
+### Changed
+
+- Python client: `warm_pool` pools the actors it created before it raises
+  `SandboxStartError`. An overlapping `warm_pool(wait=True)` counts the actors
+  another call is still creating and can return before the pool is full.
+- Python client: `unwarm_pool`, and a `resize_pool` that shrinks the pool,
+  cancel `warm_pool` calls in flight for that pool: those calls delete the
+  actors they create instead of pooling them.
+
+### Fixed
+
+- Python client: environments no longer outlive `teardown()`. A recycle,
+  `warm_pool` call or failed warm claim that overlaps a teardown deletes its
+  environment instead of pooling it, and the warm-replica gauge stays equal to
+  the warm pool. An environment whose delete fails stays owned, so the next
+  `reap` deletes it.

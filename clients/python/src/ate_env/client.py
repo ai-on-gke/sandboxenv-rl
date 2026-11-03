@@ -48,6 +48,7 @@ from .types import (
     EnvironmentInfo,
     ImageStatus,
     ServerInfo,
+    SuspendMode,
     _environment_info_from_pb,
     _image_status_from_pb,
     _server_info_from_pb,
@@ -337,9 +338,33 @@ class Client:
                 raise map_rpc_error(e) from e
         return _environment_info_from_pb(resp.environment)
 
-    async def suspend(self, id: str, *, atespace: str = DEFAULT_ATESPACE) -> None:
-        """Checkpoint and stop the environment."""
+    async def suspend(
+        self,
+        id: str,
+        *,
+        atespace: str = DEFAULT_ATESPACE,
+        mode: SuspendMode = SuspendMode.DURABLE,
+    ) -> None:
+        """Checkpoint and stop the environment.
+
+        ``mode`` says when the call returns: ``SuspendMode.DURABLE`` (the
+        default) once the snapshot is in object storage, ``SuspendMode.LOCAL``
+        once it is on the node, with the upload in the background (see
+        ``SuspendMode``). The request carries the mode only for ``LOCAL``, so
+        a durable suspend works against an ate-env-api that predates the
+        field; such a server refuses ``LOCAL`` with ``InvalidArgumentError``,
+        because it rejects fields it does not know. ``server_info().features``
+        lists ``suspend_mode`` once the server serves it.
+
+        The mode applies when the call checkpoints a running environment. An
+        environment that is already SUSPENDED, or PAUSED with its upload still
+        pending, is left as it is: a DURABLE suspend of a PAUSED environment
+        returns at once and does not wait for the upload.
+        """
+        mode = SuspendMode(mode)
         req = env_pb2.SuspendEnvironmentRequest(id=id, atespace=atespace)
+        if mode is SuspendMode.LOCAL:
+            req.mode = env_pb2.SUSPEND_MODE_LOCAL
         with (
             self._rpc_span(
                 "suspend_environment",

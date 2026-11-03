@@ -162,8 +162,20 @@ class FakeProc:
     exited: bool = False
 
 
+async def _start_failure(context, failure):
+    """Answer like ate-env-api for an environment that cannot start: the
+    ate-env-start-failure trailer, then the status. failure is
+    (grpc.StatusCode, message, reason)."""
+    code, message, reason = failure
+    context.set_trailing_metadata((("ate-env-start-failure", reason),))
+    await context.abort(code, message)
+
+
 class FakeProcessService(guest_pb2_grpc.ProcessServiceServicer):
     def __init__(self):
+        # (code, message, reason): fail every call as an environment that
+        # cannot start (see _start_failure).
+        self.start_failure: tuple[grpc.StatusCode, str, str] | None = None
         self.next_procs: list[FakeProc] = []  # scripts for upcoming StartProcess calls
         self.procs: dict[str, FakeProc] = {}
         self.last_env: tuple[str, str] | None = None
@@ -184,6 +196,8 @@ class FakeProcessService(guest_pb2_grpc.ProcessServiceServicer):
 
     async def StartProcess(self, request, context):
         self.last_env = await _require_env(context)
+        if self.start_failure:
+            await _start_failure(context, self.start_failure)
         if not request.command:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "command cannot be empty")
         proc = self.next_procs.pop(0) if self.next_procs else FakeProc()
@@ -300,6 +314,7 @@ class FakeProcessService(guest_pb2_grpc.ProcessServiceServicer):
 
 class FakeFileSystemService(guest_pb2_grpc.FileSystemServiceServicer):
     def __init__(self):
+        self.start_failure: tuple[grpc.StatusCode, str, str] | None = None
         self.files: dict[str, bytes] = {}
         self.modes: dict[str, int] = {}
         self.last_env: tuple[str, str] | None = None
@@ -315,6 +330,8 @@ class FakeFileSystemService(guest_pb2_grpc.FileSystemServiceServicer):
 
     async def ReadFile(self, request, context):
         self.last_env = await _require_env(context)
+        if self.start_failure:
+            await _start_failure(context, self.start_failure)
         await self._validate_path(request.path, context)
         data = self.files.get(request.path)
         if data is None:
@@ -333,6 +350,10 @@ class FakeFileSystemService(guest_pb2_grpc.FileSystemServiceServicer):
         chunk_sizes = []
         async for request in request_iterator:
             if path is None:
+                # ate-env-api wakes the environment once the first message
+                # arrives, so a start failure answers after it.
+                if self.start_failure:
+                    await _start_failure(context, self.start_failure)
                 if not request.path:
                     await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "path is required")
                 await self._validate_path(request.path, context)

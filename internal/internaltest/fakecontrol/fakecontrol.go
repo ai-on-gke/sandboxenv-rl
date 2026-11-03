@@ -283,6 +283,22 @@ func (s *Server) SetState(name string, state ateapipb.ActorState) {
 	a.Status.State = state
 }
 
+// Crash moves an actor to CRASHED with the control plane's crash reason, as
+// a resume that cannot complete does.
+func (s *Server) Crash(name, message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a := s.find(name)
+	if a == nil {
+		return
+	}
+	if a.Status == nil {
+		a.Status = &ateapipb.ActorStatus{}
+	}
+	a.Status.State = ateapipb.ActorState_ACTOR_STATE_CRASHED
+	a.Status.Crash = &ateapipb.ActorCrash{Message: message}
+}
+
 // find returns the actor with the given name, whichever atespace holds it, or
 // nil when no actor has that name. The helpers above address actors by name
 // alone so tests do not have to know which atespace a client placed them in.

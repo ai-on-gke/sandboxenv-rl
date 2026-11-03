@@ -60,28 +60,48 @@ class Template(_message.Message):
     def __init__(self, name: _Optional[str] = ..., atespace: _Optional[str] = ...) -> None: ...
 
 class Environment(_message.Message):
-    __slots__ = ("id", "atespace", "template", "status")
+    __slots__ = ("id", "atespace", "template", "status", "node", "worker_selector")
+    class WorkerSelectorEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
     ID_FIELD_NUMBER: _ClassVar[int]
     ATESPACE_FIELD_NUMBER: _ClassVar[int]
     TEMPLATE_FIELD_NUMBER: _ClassVar[int]
     STATUS_FIELD_NUMBER: _ClassVar[int]
+    NODE_FIELD_NUMBER: _ClassVar[int]
+    WORKER_SELECTOR_FIELD_NUMBER: _ClassVar[int]
     id: str
     atespace: str
     template: Template
     status: EnvironmentStatus
-    def __init__(self, id: _Optional[str] = ..., atespace: _Optional[str] = ..., template: _Optional[_Union[Template, _Mapping]] = ..., status: _Optional[_Union[EnvironmentStatus, str]] = ...) -> None: ...
+    node: str
+    worker_selector: _containers.ScalarMap[str, str]
+    def __init__(self, id: _Optional[str] = ..., atespace: _Optional[str] = ..., template: _Optional[_Union[Template, _Mapping]] = ..., status: _Optional[_Union[EnvironmentStatus, str]] = ..., node: _Optional[str] = ..., worker_selector: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class CreateEnvironmentRequest(_message.Message):
-    __slots__ = ("id", "atespace", "template", "rootfs_image")
+    __slots__ = ("id", "atespace", "template", "rootfs_image", "worker_selector")
+    class WorkerSelectorEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
     ID_FIELD_NUMBER: _ClassVar[int]
     ATESPACE_FIELD_NUMBER: _ClassVar[int]
     TEMPLATE_FIELD_NUMBER: _ClassVar[int]
     ROOTFS_IMAGE_FIELD_NUMBER: _ClassVar[int]
+    WORKER_SELECTOR_FIELD_NUMBER: _ClassVar[int]
     id: str
     atespace: str
     template: Template
     rootfs_image: str
-    def __init__(self, id: _Optional[str] = ..., atespace: _Optional[str] = ..., template: _Optional[_Union[Template, _Mapping]] = ..., rootfs_image: _Optional[str] = ...) -> None: ...
+    worker_selector: _containers.ScalarMap[str, str]
+    def __init__(self, id: _Optional[str] = ..., atespace: _Optional[str] = ..., template: _Optional[_Union[Template, _Mapping]] = ..., rootfs_image: _Optional[str] = ..., worker_selector: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class CreateEnvironmentResponse(_message.Message):
     __slots__ = ("environment",)

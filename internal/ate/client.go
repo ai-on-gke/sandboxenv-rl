@@ -31,6 +31,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"strings"
 	"sync"
@@ -287,6 +288,10 @@ type CreateOptions struct {
 	ID       string
 	Template string
 	Atespace string
+	// WorkerSelector, when non-empty, is the actor's own worker selector:
+	// labels the worker pool must carry, matched by exact equality and ANDed
+	// by Substrate with the template's selector.
+	WorkerSelector map[string]string
 }
 
 // Create registers a new actor from opts and starts it. ID and Template are
@@ -316,6 +321,9 @@ func (c *Client) Create(ctx context.Context, opts CreateOptions) error {
 			Atespace: atespace,
 			Name:     opts.Template,
 		},
+	}
+	if len(opts.WorkerSelector) > 0 {
+		actor.WorkerSelector = &ateapipb.Selector{MatchLabels: maps.Clone(opts.WorkerSelector)}
 	}
 	if _, err := c.control.CreateActor(ctx, &ateapipb.CreateActorRequest{Actor: actor}); err != nil {
 		return fmt.Errorf("ate: creating %q: %w", opts.ID, wrapGRPCError(err))

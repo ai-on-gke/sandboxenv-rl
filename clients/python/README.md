@@ -156,6 +156,10 @@ is created on first use and shared by every environment on that image:
 
 ```python
 env = await client.create("py1", rootfs_image="docker.io/library/python@sha256:…")
+# Keep it on the worker pools that carry a label (ANDed with the template's selector);
+# info.node is the node it is on once placed, info.worker_selector what it asked for.
+env = await client.create("t1", rootfs_image="…@sha256:…", worker_selector={"ate-env/domain": "d0"})
+info = await client.get("t1")
 print((await env.info()).template.name)   # default-template-<12 hex of the digest>
 ```
 

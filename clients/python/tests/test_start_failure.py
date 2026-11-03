@@ -120,6 +120,22 @@ async def test_read_file_when_no_worker_has_room(fake_stack):
     assert exc.value.sandbox_id == "dev1"
 
 
+async def test_write_file_when_no_worker_has_room(fake_stack):
+    client, fakes = fake_stack
+    await client.create("dev1")
+    fakes.filesystem.start_failure = (
+        grpc.StatusCode.RESOURCE_EXHAUSTED,
+        "environment ate-env/dev1 cannot start: no worker has had room for it",
+        START_FAILURE_NO_CAPACITY,
+    )
+    rt = SubstrateEnvClientRuntime(client=client, env_id="dev1")
+    with pytest.raises(SandboxStartError) as exc:
+        await rt.write_file_async("/x", "data")
+    assert exc.value.reason == START_FAILURE_NO_CAPACITY
+    assert exc.value.sandbox_id == "dev1"
+    assert "x" not in fakes.filesystem.files and "/x" not in fakes.filesystem.files
+
+
 async def test_stream_process_raises_the_start_error(fake_stack):
     client, fakes = fake_stack
     await client.create("dev1")

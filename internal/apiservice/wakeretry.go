@@ -143,12 +143,17 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 	if runningBudget <= 0 {
 		runningBudget = DefaultWakeRunningBudget
 	}
-	var runningSince time.Time    // first attempt that saw the actor RUNNING
-	var noCapacitySince time.Time // first attempt of the current run of no-room answers
+	var runningSince time.Time // first attempt that saw the actor RUNNING
+	// When the first probe of the current run of no-room answers started:
+	// the router parks a probe for its parking budget before it answers
+	// no-room, so that wait counts toward the grace.
+	var noCapacitySince time.Time
 	probe := ateenvv1alpha.NewProcessServiceClient(conn)
 	backoff := wakeRetryInitialBackoff
 	for attempt := 1; ; attempt++ {
+		probeStart := time.Now()
 		_, err := probe.GetProcess(ctx, &ateenvv1alpha.GetProcessRequest{ProcessId: "ate-env-wake-probe"})
+		probeDone := time.Now()
 		if status.Code(err) != codes.Unavailable {
 			// Anything else, NotFound for the probe id included, came from
 			// the guest itself.
@@ -189,12 +194,14 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 		}
 		if routerNoCapacity(err) && state != ateapipb.ActorState_ACTOR_STATE_RUNNING {
 			if noCapacitySince.IsZero() {
-				noCapacitySince = time.Now()
+				noCapacitySince = probeStart
 			}
 		} else {
 			noCapacitySince = time.Time{}
 		}
-		if grace := s.WakeNoCapacityGrace; grace > 0 && !noCapacitySince.IsZero() && time.Since(noCapacitySince) >= grace {
+		// Measured to the probe's answer, so the state read above does not
+		// count toward the grace.
+		if grace := s.WakeNoCapacityGrace; grace > 0 && !noCapacitySince.IsZero() && probeDone.Sub(noCapacitySince) >= grace {
 			setStartFailure(ctx, StartFailureNoCapacity)
 			return status.Errorf(codes.ResourceExhausted, "environment %s/%s cannot start: no worker has had room for it for the no-capacity grace of %s (%d attempts): %v",
 				atespace, id, grace, attempt, err)

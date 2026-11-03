@@ -16,6 +16,7 @@ package apiservice_test
 
 import (
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -114,6 +115,30 @@ func TestNoCapacityFailsAfterTheGrace(t *testing.T) {
 	}
 	if elapsed < 500*time.Millisecond || elapsed > 3*time.Second {
 		t.Errorf("took %s, want about the 500ms grace", elapsed)
+	}
+}
+
+// The router parks a probe for its parking budget before it answers no-room.
+// That wait counts toward the grace, so a park longer than the grace fails
+// the call after one probe instead of a second full park.
+func TestNoCapacityGraceCountsTheRoutersPark(t *testing.T) {
+	te := newFullTestEnv(t)
+	te.srv.WakeNoCapacityGrace = 300 * time.Millisecond
+	var probes atomic.Int32
+	te.router.NotRunningBody = func(id string) string {
+		probes.Add(1)
+		time.Sleep(500 * time.Millisecond) // the router's parking budget
+		return strings.Replace(noRoom, "%s", id, 1)
+	}
+	envCtx := registerGuest(t, te, "full-parked")
+	te.control.SetState("full-parked", ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
+
+	_, err := te.procClient.StartProcess(envCtx, &ateenvv1alpha.StartProcessRequest{Command: []string{"true"}})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("code %v (%v), want ResourceExhausted", status.Code(err), err)
+	}
+	if n := probes.Load(); n != 1 {
+		t.Errorf("%d parked probes, want 1: the first park already exceeds the grace", n)
 	}
 }
 

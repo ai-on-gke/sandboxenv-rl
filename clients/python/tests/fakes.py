@@ -328,6 +328,10 @@ class FakeFileSystemService(guest_pb2_grpc.FileSystemServiceServicer):
         chunk_sizes = []
         async for request in request_iterator:
             if path is None:
+                # ate-env-api wakes the environment once the first message
+                # arrives, so a start failure answers after it.
+                if self.start_failure:
+                    await _start_failure(context, self.start_failure)
                 if not request.path:
                     await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "path is required")
                 await self._validate_path(request.path, context)

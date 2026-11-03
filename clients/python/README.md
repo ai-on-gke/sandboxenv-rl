@@ -169,7 +169,7 @@ A freshly created (or suspended) environment starts serving on first
 contact. Gate on readiness by retrying a trivial command:
 
 ```python
-from ate_env import EnvError
+from ate_env import EnvError, SandboxStartError
 
 async def wait_until_serving(env, timeout=180):
     async with asyncio.timeout(timeout):
@@ -177,6 +177,8 @@ async def wait_until_serving(env, timeout=180):
             try:
                 if (await env.shell("true")).exit_code == 0:
                     return
+            except SandboxStartError:
+                raise  # crashed, or no room: waiting will not help
             except EnvError:
                 pass
             await asyncio.sleep(2)
@@ -304,6 +306,7 @@ All failures raise subclasses of `ate_env.EnvError`:
 | `PermissionDeniedError` | `PERMISSION_DENIED` | file path escapes the workspace sandbox |
 | `FailedPreconditionError` | `FAILED_PRECONDITION` | stdin not opened or already closed |
 | `ProcessExitedError` | `FAILED_PRECONDITION` | signal or stdin write to a process that has exited (subclass of `FailedPreconditionError`) |
+| `SandboxStartError` | any, with the `ate-env-start-failure` trailer | the environment cannot start: it crashed while waking (`.reason == "crashed"`, `FAILED_PRECONDITION`) or no worker had room for it (`"no-capacity"`, `RESOURCE_EXHAUSTED`); retryable, on a fresh environment |
 | `RpcError` | anything else | transport failures, `ALREADY_EXISTS`, actor still waking, … (`.code` holds the status) |
 
 ```python

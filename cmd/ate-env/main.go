@@ -293,7 +293,7 @@ func newSuspendCommand() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&endpoint, "api", envOr("SUBSTRATE_ENV_API", "127.0.0.1:7777"), "address of the ate-env-api service (e.g. localhost:7777)")
 	cmd.Flags().StringVar(&atespace, "atespace", apiservice.DefaultAtespace, "Substrate atespace")
-	cmd.Flags().StringVar(&mode, "mode", "durable", "durable: return once the snapshot is in object storage; local: return once it is on the node, with the upload in the background (the environment resumes on that node until it lands and shows PAUSED meanwhile)")
+	cmd.Flags().StringVar(&mode, "mode", "durable", "durable: return once the snapshot is in object storage; local: return once it is on the node, with the upload in the background (the environment resumes on that node until it lands and shows PAUSED meanwhile). The mode applies to a running environment; a suspended or paused one is left as it is")
 	auth.register(cmd, false)
 	return cmd
 }

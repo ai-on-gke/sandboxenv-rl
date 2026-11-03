@@ -135,7 +135,7 @@ Operator requirements:
 | Threat | Current mitigation | Gap |
 |---|---|---|
 | A reader of the bucket gets the memory, files and credentials of environments | The operator's bucket settings. | ate-env does not check the access control, the encryption or the retention of the bucket. |
-| A reader of a worker node gets the snapshot of a locally suspended environment before its upload lands | The snapshot sits where the running environment's memory sat; the node's own access control. The default suspend is durable and leaves nothing new on the node. | A node lost before the upload lands loses the environment (availability, not confidentiality). |
+| A reader of a worker node gets the snapshot of a locally suspended environment before its upload lands | The snapshot sits where the running environment's memory sat; the node's own access control. A durable suspend uploads before it returns, but atelet keeps a local copy of the snapshot on the node until the actor detaches, thus both modes leave snapshot files on the worker node. | A node lost before the upload lands loses the environment (availability, not confidentiality). |
 
 ## On-demand rootfs images
 

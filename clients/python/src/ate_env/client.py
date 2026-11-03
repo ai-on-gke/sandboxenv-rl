@@ -344,6 +344,11 @@ class Client:
         field; such a server refuses ``LOCAL`` with ``InvalidArgumentError``,
         because it rejects fields it does not know. ``server_info().features``
         lists ``suspend_mode`` once the server serves it.
+
+        The mode applies when the call checkpoints a running environment. An
+        environment that is already SUSPENDED, or PAUSED with its upload still
+        pending, is left as it is: a DURABLE suspend of a PAUSED environment
+        returns at once and does not wait for the upload.
         """
         mode = SuspendMode(mode)
         req = env_pb2.SuspendEnvironmentRequest(id=id, atespace=atespace)

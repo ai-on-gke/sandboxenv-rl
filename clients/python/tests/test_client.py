@@ -144,12 +144,19 @@ async def test_suspend_mode(fake_stack):
     assert fakes.environments.last_suspend_request.mode == env_pb2.SUSPEND_MODE_UNSPECIFIED
     assert (await client.get("dev1")).status == EnvironmentStatus.SUSPENDED
 
+    # The mode applies to a running environment: a suspended one is left as
+    # it is, whatever the request asks for.
     await client.suspend("dev1", mode=SuspendMode.LOCAL)
     assert fakes.environments.last_suspend_request.mode == env_pb2.SUSPEND_MODE_LOCAL
-    assert (await client.get("dev1")).status == EnvironmentStatus.PAUSED
+    assert (await client.get("dev1")).status == EnvironmentStatus.SUSPENDED
 
-    await client.env("dev1").suspend(mode=SuspendMode.LOCAL)
+    await client.create("dev2")
+    await client.env("dev2").suspend(mode=SuspendMode.LOCAL)
     assert fakes.environments.last_suspend_request.mode == env_pb2.SUSPEND_MODE_LOCAL
+    assert (await client.get("dev2")).status == EnvironmentStatus.PAUSED
+    # A durable suspend of a paused environment does not wait for the upload.
+    await client.suspend("dev2")
+    assert (await client.get("dev2")).status == EnvironmentStatus.PAUSED
 
     with pytest.raises(ValueError):
         await client.suspend("dev1", mode=7)

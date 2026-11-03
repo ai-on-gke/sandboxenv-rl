@@ -119,7 +119,11 @@ func (EnvironmentStatus) EnumDescriptor() ([]byte, []int) {
 	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{0}
 }
 
-// How SuspendEnvironment treats the snapshot before it returns.
+// How SuspendEnvironment treats the snapshot before it returns. The mode
+// applies when the call checkpoints a running environment. On an environment
+// that is already SUSPENDED, or PAUSED with its upload still pending,
+// Substrate's SuspendActor returns at once and the call changes nothing: a
+// DURABLE request on a PAUSED environment does not wait for the upload.
 type SuspendMode int32
 
 const (

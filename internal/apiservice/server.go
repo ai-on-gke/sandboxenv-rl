@@ -186,9 +186,10 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 	}
 
 	opts := ate.CreateOptions{
-		ID:       req.GetId(),
-		Template: templateName,
-		Atespace: atespace,
+		ID:             req.GetId(),
+		Template:       templateName,
+		Atespace:       atespace,
+		WorkerSelector: req.GetWorkerSelector(),
 	}
 	if err := s.client.Create(ctx, opts); err != nil {
 		return nil, toGRPCError(err)
@@ -202,7 +203,8 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 				Name:     templateName,
 				Atespace: atespace,
 			},
-			Status: ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_UNSPECIFIED,
+			Status:         ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_UNSPECIFIED,
+			WorkerSelector: req.GetWorkerSelector(),
 		},
 	}, nil
 }
@@ -670,8 +672,21 @@ func ActorToEnvironment(actor *ateapipb.Actor) *ateenvv1alpha.Environment {
 			Name:     templateName,
 			Atespace: templateAtespace,
 		},
-		Status: ActorStatusToEnvStatus(actor.GetStatus()),
+		Status:         ActorStatusToEnvStatus(actor.GetStatus()),
+		Node:           actorNode(actor.GetStatus()),
+		WorkerSelector: actor.GetWorkerSelector().GetMatchLabels(),
 	}
+}
+
+// actorNode is the node an actor is on: the one hosting its worker, or its
+// local snapshot while it is suspended (assigned_node), which the worker
+// assignment confirms while it runs. Empty before the first placement and
+// after a detach.
+func actorNode(st *ateapipb.ActorStatus) string {
+	if node := st.GetAssignedNode(); node != "" {
+		return node
+	}
+	return st.GetWorkerAssignment().GetNodeName()
 }
 
 // ActorStatusToEnvStatus maps an ateapipb ActorStatus to an ateenvv1alpha EnvironmentStatus.

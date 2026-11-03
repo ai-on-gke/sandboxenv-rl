@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net"
 	"sync"
@@ -1058,4 +1059,79 @@ func TestCreateFromImageRejects(t *testing.T) {
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("conflicting derived template: code = %v (%v), want FailedPrecondition", status.Code(err), err)
 	}
+}
+
+func TestCreatePassesWorkerSelectorAndGetReportsNode(t *testing.T) {
+	client, control := newTestEnv(t)
+	ctx := context.Background()
+	selector := map[string]string{"ate-env/domain": "d0"}
+
+	resp, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "placed", WorkerSelector: selector})
+	if err != nil {
+		t.Fatalf("CreateEnvironment: %v", err)
+	}
+	if got := resp.GetEnvironment().GetWorkerSelector(); !maps.Equal(got, selector) {
+		t.Errorf("create response worker_selector = %v, want %v", got, selector)
+	}
+	if got := resp.GetEnvironment().GetNode(); got != "" {
+		t.Errorf("create response node = %q, want empty before placement", got)
+	}
+
+	// The selector reaches the actor; the node comes back from its status.
+	var actorSelector map[string]string
+	control.MutateActor("placed", func(a *ateapipb.Actor) {
+		actorSelector = a.GetWorkerSelector().GetMatchLabels()
+		a.Status.AssignedNode = "gke-pool-a-7"
+	})
+	if !maps.Equal(actorSelector, selector) {
+		t.Errorf("actor worker_selector = %v, want %v", actorSelector, selector)
+	}
+	got, err := client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "placed"})
+	if err != nil {
+		t.Fatalf("GetEnvironment: %v", err)
+	}
+	if n := got.GetEnvironment().GetNode(); n != "gke-pool-a-7" {
+		t.Errorf("node = %q, want gke-pool-a-7", n)
+	}
+	if sel := got.GetEnvironment().GetWorkerSelector(); !maps.Equal(sel, selector) {
+		t.Errorf("get worker_selector = %v, want %v", sel, selector)
+	}
+
+	// A running actor without assigned_node reports the worker assignment's node.
+	control.MutateActor("placed", func(a *ateapipb.Actor) {
+		a.Status.AssignedNode = ""
+		a.Status.WorkerAssignment = &ateapipb.WorkerAssignment{NodeName: "gke-pool-a-8"}
+	})
+	got, err = client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "placed"})
+	if err != nil {
+		t.Fatalf("GetEnvironment: %v", err)
+	}
+	if n := got.GetEnvironment().GetNode(); n != "gke-pool-a-8" {
+		t.Errorf("node = %q, want gke-pool-a-8 from the worker assignment", n)
+	}
+
+	// A detach clears assigned_node, and Substrate unsets the worker
+	// assignment whenever the actor has no worker: both clear, no node.
+	control.MutateActor("placed", func(a *ateapipb.Actor) {
+		a.Status.AssignedNode = ""
+		a.Status.WorkerAssignment = nil
+	})
+	got, err = client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "placed"})
+	if err != nil {
+		t.Fatalf("GetEnvironment: %v", err)
+	}
+	if n := got.GetEnvironment().GetNode(); n != "" {
+		t.Errorf("node = %q after a detach, want empty", n)
+	}
+
+	// No selector in the request: the actor carries none, so the template's
+	// selection stands.
+	if _, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "plain"}); err != nil {
+		t.Fatalf("CreateEnvironment: %v", err)
+	}
+	control.MutateActor("plain", func(a *ateapipb.Actor) {
+		if a.GetWorkerSelector() != nil {
+			t.Errorf("plain actor has worker_selector %v, want none", a.GetWorkerSelector())
+		}
+	})
 }

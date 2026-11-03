@@ -247,9 +247,10 @@ type Environment struct {
 	// Current lifecycle status of the environment.
 	Status EnvironmentStatus `protobuf:"varint,4,opt,name=status,proto3,enum=ateenv.v1alpha.EnvironmentStatus" json:"status,omitempty"`
 	// Kubernetes node hosting the environment's actor, or its local snapshot
-	// while it is suspended; empty before its first placement and after
-	// Substrate detaches it from a full node. Substrate's
-	// Actor.status.assigned_node, or the worker assignment's node.
+	// while it is suspended. Substrate's Actor.status.assigned_node, which a
+	// detach or revert clears, else the worker assignment's node, which
+	// Substrate unsets whenever the actor has no worker; empty when both are
+	// clear: before the first placement, and after a detach.
 	Node string `protobuf:"bytes,5,opt,name=node,proto3" json:"node,omitempty"`
 	// The per-environment worker selector the environment was created with
 	// (CreateEnvironmentRequest.worker_selector); empty when none was given.

@@ -149,9 +149,10 @@ the first cold steps; wake 2.1 s p50 / 5.5 s p95, step 6.6 s, no retries. The im
 nodes, so from about step 10 every start is warm: this run does not measure image delivery.
 
 **The image-delivery run** (streaming, disks, registries, anything that changes a cold start).
-The first 94 images of the Prime Intellect SWE-RL manifest plus three of its 9 GB images
-(`make-dataset.py --images-file` over the mirrored set, then `head -94` and the three largest
-appended), `prime-swe-rl-94.jsonl`, one task per image. Width 3 on a two-node pool (1.5 starts per node), 30
+The first 91 images of the Prime Intellect SWE-RL manifest plus three of its 9 GB images, 94
+rows (`make-dataset.py --images-file` over the mirrored set, then `head -91` and the three largest
+appended; `-images 94` takes the first 94 rows, so the large ones must be inside them),
+`prime-swe-rl-94.jsonl`, one task per image. Width 3 on a two-node pool (1.5 starts per node), 30
 on a cluster of hundreds of nodes (0.04 per node). Two arms, 10 to 17 minutes each, bounded by
 the large images:
 
@@ -172,8 +173,8 @@ per-start cost without contention; a width of 160 per node measures contention i
 on ttfi.
 
 For iterating on a delivery change, a smoke tier: `prime-swe-rl-30.jsonl`, the first 30 images
-without the large ones, `-images 30 -width 10` (3 on two nodes), about four minutes, the median
-within about 10% and nothing else. Confirm on the 94 before comparing or publishing.
+without the large ones, `-images 30 -tasks-per-image 1 -width 3` on two nodes (width 10 on a
+cluster of hundreds of nodes), about four minutes, the median within about 10% and nothing else. Confirm on the 94 before comparing or publishing.
 
 Bundle names: `<date>_simulated_swebench-verified_fast-<arm>` and
 `<date>_simulated_prime-swe-rl-94_delivery-<arm>`, the layout `benchmarking/SKILL.md` section 5

@@ -198,6 +198,11 @@ type Instance struct {
 	// Image is the task image, pinned by digest (repo@sha256:...). Substrate
 	// requires pinned images because changing the image invalidates snapshots.
 	Image string `json:"image"`
+	// ImageBytesCompressed is the sum of the image's compressed layer sizes
+	// from the registry manifest, as make-dataset.py records it; 0 when it
+	// was not recorded. The unpacked size on a node is about 2 to 2.5 times
+	// this.
+	ImageBytesCompressed int64 `json:"image_bytes_compressed,omitempty"`
 	// Kind identifies the dataset adapter; when omitted in JSON it stays ""
 	// and AdapterFor("") resolves to DefaultKind.
 	Kind string `json:"kind,omitempty"`
@@ -247,6 +252,8 @@ func (in Instance) Validate() error {
 		return fmt.Errorf("%s: image is required", in.InstanceID)
 	case !digestPinned.MatchString(in.Image):
 		return fmt.Errorf("%s: image %q is not digest-pinned", in.InstanceID, in.Image)
+	case in.ImageBytesCompressed < 0:
+		return fmt.Errorf("%s: image_bytes_compressed %d must be >= 0", in.InstanceID, in.ImageBytesCompressed)
 	}
 	a := AdapterFor(in.Kind)
 	if a == nil {

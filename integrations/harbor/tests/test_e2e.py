@@ -20,6 +20,7 @@ Skipped unless SUBSTRATE_E2E_API_URL points at a reachable ate-env-api (e.g.
 SUBSTRATE_ENV_AUTH_TOKEN is the caller token when the API requires one.
 HB_E2E_TEMPLATE names the fallback base template (default `default-template`);
 the class template `harbor-c1-m512` is used when it is registered.
+HB_E2E_ATESPACE names the target atespace when set.
 
 Runs Harbor's trial runner on the echo task with the oracle agent: the
 cluster pulls the pinned alpine image, the verifier gives reward 1, and the
@@ -31,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -41,6 +43,7 @@ from .conftest import ECHO_TASK
 
 API_URL = os.environ.get("SUBSTRATE_E2E_API_URL")
 TEMPLATE = os.environ.get("HB_E2E_TEMPLATE", "default-template")
+ATESPACE = os.environ.get("HB_E2E_ATESPACE")
 
 pytestmark = pytest.mark.skipif(
     not API_URL, reason="SUBSTRATE_E2E_API_URL not set; e2e needs a live ate-env-api"
@@ -50,11 +53,18 @@ pytestmark = pytest.mark.skipif(
 async def test_oracle_trial_live(tmp_path: Path) -> None:
     jobs = tmp_path / "jobs"
     jobs.mkdir()
+    adjacent_harbor = Path(sys.executable).parent / "harbor"
+    harbor_bin = (
+        str(adjacent_harbor)
+        if adjacent_harbor.is_file()
+        else (shutil.which("harbor") or str(adjacent_harbor))
+    )
     cmd = [
-        str(Path(sys.executable).parent / "harbor"), "run",
+        harbor_bin, "run",
         "-p", str(ECHO_TASK), "-a", "oracle",
         "-e", "ate_env_harbor:AteEnvEnvironment",
         "--ek", f"api_url={API_URL}", "--ek", f"template={TEMPLATE}", "--ek", "build=none",
+        *(["--ek", f"atespace={ATESPACE}"] if ATESPACE else []),
         "-n", "1", "--jobs-dir", str(jobs), "-q", "-y",
     ]
     env = {**os.environ, "HARBOR_TELEMETRY": "off"}

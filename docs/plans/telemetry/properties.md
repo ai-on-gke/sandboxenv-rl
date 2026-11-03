@@ -20,11 +20,13 @@ a minimal counter-example, which then becomes an `@example` regression.
 
 State on `main` with #221:
 
-| Item            | Requirement | State                                                                                                                                                                                                    |
-| --------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P-9, P-10, P-11 | AC-15       | Fixed by #221. Before it, a recycle or `warm_pool` that awaited across a reap pooled its actor after the teardown, and overlapping `warm_pool` calls each provisioned the full shortfall.                |
-| P-14            | AC-3.4      | Open. `SandboxHandle.exec` and `exec_async` (`clients/python/src/ate_env/handle.py`) call `_note_first_command()` before `_exec_span` starts the span, so another thread's exec span can start first.    |
-| claim/reap gap  | none        | Open. A warm claim pops an actor and awaits `get()`; if a reap deletes the actor meanwhile and `get()` still succeeds, `acquire` returns a deleted environment. No property covers it; see the findings. |
+| Item            | Requirement  | State                                                                                                                                                                                                 |
+| --------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P-9, P-10, P-11 | AC-15        | Fixed by #221. Before it, a recycle or `warm_pool` that awaited across a reap pooled its actor after the teardown, and overlapping `warm_pool` calls each provisioned the full shortfall.             |
+| P-14            | AC-3.4       | Open. `SandboxHandle.exec` and `exec_async` (`clients/python/src/ate_env/handle.py`) call `_note_first_command()` before `_exec_span` starts the span, so another thread's exec span can start first. |
+| P-24            | AC-15.7      | Open. A warm claim pops an actor and awaits `get()`; if a reap deletes the actor meanwhile and `get()` still succeeds, `acquire` returns a deleted environment. See the findings.                     |
+| P-10            | AC-15.8      | Open. A `warm_pool` call cancelled during its `create()` calls leaks the actors already created: they are neither pooled nor tracked.                                                                 |
+| P-21, P-22      | AC-17, AC-18 | Partial. Example tests only; the Go tests copy the Python tables by hand.                                                                                                                             |
 
 ## Labels and cardinality (AC-9)
 
@@ -157,7 +159,7 @@ one `ate_env_fleet.run` span. Every other span of the run reaches it through its
 span of the same task. Every span name and attribute key is documented in
 [interfaces.md](./interfaces.md).
 
-**Validates: AC-3.1, AC-3.2, AC-3.3, AC-3.5**
+**Validates: AC-3.1, AC-3.2, AC-3.3, AC-3.5, AC-16.1, AC-16.2**
 
 - Generators: a `workload()` composite of `st.integers(1, 20)` tasks, `st.integers(1, 8)`
   concurrency, `st.sampled_from(["sync", "async"])`, `st.sampled_from(STRATEGIES)`, and per task a
@@ -289,6 +291,51 @@ with only documented `ate.*` and `ate_env.*` attribute keys plus, on CLIENT span
 - Example coverage on `main`: `TestTracingSpansWithProvider`, `TestTracingOffWithoutProvider`,
   `TestTracingServiceNamePrefix`, `TestTracingSpanKinds` in `clients/go/tracing_test.go`.
 
+### P-21: No secret or content in an attribute value
+
+_For any_ command line built from leading `NAME=value` or `NAME+=value` assignments, quoted words,
+`sh -c` strings and arguments holding a generated token, and any file content and image reference:
+no span attribute value either client records contains an assignment value, an argument, the file
+content or an image tag. `ate_env.command.executable` is the executable's base name or absent.
+
+**Validates: AC-18.1, AC-18.2**
+
+- Generators: `st.lists(assignment | word)` with
+  `assignment = st.from_regex(r"[A-Za-z_]\w*\+?=\S+")`, a random token planted in one argument,
+  `st.binary()` for content; `rapid` equivalents in Go.
+- Proposed test: Hypothesis `test_attribute_values_hold_no_secret`; Go `rapid`
+  `TestAttributeValuesHoldNoSecret`.
+- Example coverage on `main`: `test_executable_attr_skips_env_assignments`,
+  `TestExecutableNeverRecordsAssignments`, `TestExecutableMatchesPythonClient`.
+
+### P-22: The Go and Python clients agree
+
+_For any_ operation both clients have and any inputs to it, and any `OTEL_SEMCONV_STABILITY_OPT_IN`
+value: the two clients' spans have the same `<op>` and the same attribute keys and values, except
+the Python-only keys in [decisions.md](./decisions.md).
+
+**Validates: AC-17.1, AC-17.2, AC-17.3, AC-17.4**
+
+- Generators: operations sampled from the shared list, generated ids, paths and command lines, the
+  three semconv values; written to one fixture both test suites read.
+- Proposed test: a shared `testdata/span_parity.json` checked by `TestSpanParity` (Go) and
+  `test_span_parity` (Python).
+- Example coverage on `main`: `TestRPCAttrsFollowTheSemconvMode` and
+  `test_rpc_attrs_follow_the_semconv_mode`, `TestExecutableMatchesPythonClient` and
+  `test_executable_attr_skips_env_assignments`, each pair with a hand-copied table.
+
+### P-23: The warm-replica gauge adds up across fleets
+
+_For any_ number of `Observer`s in one process and any sequence of `warm_add`, `warm_remove` and
+`warm_reset` calls on them: `ate_env_fleet_warm_replicas{backend}` equals the sum of the observers'
+own counts, never goes below zero, and `warm_reset` on one observer leaves the others' shares.
+
+**Validates: AC-19.1, AC-19.2**
+
+- Generators: `st.integers(1, 4)` observers, `st.lists` of `(observer, op, n)`.
+- Proposed test: Hypothesis `test_warm_gauge_is_the_sum_of_observers`.
+- Example coverage on `main`: `test_warm_gauge_adds_up_across_observers_and_resets_only_own_share`.
+
 ## Warm-pool accounting under concurrency (AC-15)
 
 `SubstrateBackendDriver` coroutines share one event loop and interleave at every `await`. P-9 to
@@ -313,7 +360,7 @@ _For any_ sequence of acquire, recycle, `warm_pool` and teardown operations, int
 awaits, after every step `ate_env_fleet_warm_replicas{backend}` equals the number of actors in the
 driver's warm pool.
 
-**Validates: AC-15.1**
+**Validates: AC-15.1, AC-15.6**
 
 - Test: `test_warm_pool_accounting`, invariant `gauge_equals_pool`;
   `test_direct_reap_moves_the_gauge_with_the_pool`.
@@ -327,7 +374,7 @@ driver's warm pool.
 _For any_ such sequence, once teardown has run and every paused call has resumed, no environment
 from the run is alive on Substrate or tracked by the driver.
 
-**Validates: AC-15.2**
+**Validates: AC-15.2, AC-15.5, AC-15.8**
 
 - Test: `test_warm_pool_accounting`, invariant `nothing_survives_teardown`;
   `test_recycle_paused_across_teardown_deletes_the_environment`,
@@ -339,6 +386,9 @@ from the run is alive on Substrate or tracked by the driver.
 - An actor that must be deleted stays owned until the delete succeeds. If the delete fails after the
   run's reap already ran, the driver re-tags it with `WARM_POOL_RUN_ID`, so whichever run reaps next
   deletes it.
+- Open (AC-15.8): a `warm_pool` call cancelled while `asyncio.gather` waits on its `create()` calls
+  drops the ids of the actors already created, so they are neither pooled nor owned and no reap
+  finds them. The stateful machine cancels nothing, so it does not reach this case.
 - Fixed by #221. Before it, the stateful test shrank it to two minimal counter-examples (recorded
   when one `fleet_teardown` rule ran the whole reap):
 
@@ -358,7 +408,7 @@ from the run is alive on Substrate or tracked by the driver.
 _For any_ such sequence, the warm pool never holds more than `R` actors created by `warm_pool` for
 one pool key.
 
-**Validates: AC-15.3**
+**Validates: AC-15.3, AC-15.4**
 
 - Test: `test_warm_pool_accounting`, invariant `warm_pool_never_over_provisions`;
   `test_overlapping_warm_pool_calls_provision_once`, `test_unwarm_cancels_a_warm_pool_in_flight`,
@@ -374,6 +424,18 @@ one pool key.
   state.start_warm_pool()
   state.finish_warm_pools()                  # -> 6 warm actors pooled, asked for 3
   ```
+
+### P-24: A warm claim returns a live environment
+
+_For any_ such sequence that also lets a reap run while a warm claim awaits `get()`: every
+environment `acquire` returns is alive on Substrate when `acquire` returns.
+
+**Validates: AC-15.7**
+
+- Open on `main`. `ClaimOkReturnsLive` in `verify/warm_pool_generations.dfy` fails on it, and the
+  stateful machine never runs a reap during a claim. See "Claim/reap gap" in the findings.
+- Proposed test: a plain test that pauses `get()`, reaps, lets `get()` succeed, and asserts the
+  claim fails or retries; then a machine rule for it.
 
 ## Requirement index
 
@@ -424,6 +486,21 @@ The requirement numbers the properties validate. Each refines the criterion of t
 | AC-15.1 | The `ate_env_fleet_warm_replicas` gauge equals the driver's warm pool after every step of any interleaving.                        |
 | AC-15.2 | A recycle or `warm_pool` paused across teardown deletes its actor on resume; nothing from the run survives teardown.               |
 | AC-15.3 | Overlapping `warm_pool(template, replicas=R)` calls create at most `R` warm actors for one pool key.                               |
+| AC-15.4 | `unwarm_pool` and a shrinking `resize_pool` cancel the `warm_pool` calls in flight for that pool.                                  |
+| AC-15.5 | An actor whose delete fails after a teardown or a drain is deleted by the next `reap` of any run.                                  |
+| AC-15.6 | A direct `reap` leaves the gauge equal to the pool.                                                                                |
+| AC-15.7 | A warm claim returns a live environment (open).                                                                                    |
+| AC-15.8 | A `warm_pool` cancelled during `create()` leaves no live actor untracked (open).                                                   |
+| AC-16.1 | A test collects every span name and attribute key the client and driver operations emit.                                           |
+| AC-16.2 | The collected set equals the documented table; CI fails on a difference.                                                           |
+| AC-17.1 | Shared operations have the same span `<op>` in both clients.                                                                       |
+| AC-17.2 | Same inputs give the same `ate.*` and `ate_env.*` keys and values, except the Python-only keys.                                    |
+| AC-17.3 | Same `rpc.*` and `server.*` keys and values under each semconv value.                                                              |
+| AC-17.4 | `executable` and `executable_attr` agree on one shared table.                                                                      |
+| AC-18.1 | `ate_env.command.executable` never holds an argument or an assignment value.                                                       |
+| AC-18.2 | No attribute value holds file content, a token or an image tag.                                                                    |
+| AC-19.1 | The gauge is the sum of every `Observer`'s pool.                                                                                   |
+| AC-19.2 | `warm_reset` removes only that `Observer`'s share.                                                                                 |
 
 ## Requirements without a property
 
@@ -439,6 +516,7 @@ artifact or environment rather than a range of inputs:
 | AC-8.4              | One HTTP endpoint                                                    |
 | AC-10.1             | Byte-for-byte compatibility with a fixed output (golden file)        |
 | AC-12, AC-13, AC-14 | Docs, the CI configuration and timings                               |
+| AC-20               | A CI step                                                            |
 
 ## Findings that changed the spec
 

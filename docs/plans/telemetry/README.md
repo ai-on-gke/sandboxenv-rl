@@ -142,10 +142,13 @@ behind it.
   [docs/observability.md](../../observability.md#phase-glossary).
 - No overhead measurement for telemetry off against on is recorded in the series' pull requests;
   [test-plan.md](./test-plan.md) section 7 keeps the procedure.
-- Closed by #221: AC-15, warm-pool accounting under concurrency (P-9 to P-11).
+- Closed by #221: AC-15.1 to AC-15.6, warm-pool accounting under concurrency (P-9 to P-11).
 - Open: a warm claim whose `get()` succeeds after an overlapping reap deleted the actor returns a
-  deleted environment ([properties.md](./properties.md), `ClaimOkReturnsLive` in
-  [verify/](./verify/README.md)).
-- Open: a `warm_pool` cancelled during its `create()` calls can leak the actors already created.
+  deleted environment (AC-15.7, P-24, `ClaimOkReturnsLive` in [verify/](./verify/README.md)).
+- Open: a `warm_pool` cancelled during its `create()` calls can leak the actors already created
+  (AC-15.8).
 - Open: with execs started concurrently on one handle, `ate_env.first_command=true` is not always on
-  the first-started exec span (P-14).
+  the first-started exec span (AC-3.4, P-14).
+- Follow-ups with criteria but no work yet: a CI-checked span inventory (AC-16), Go and Python span
+  parity from one shared fixture (AC-17), a property test that no attribute value holds a secret or
+  content (AC-18), and Dafny in CI (AC-20). AC-14 now has a pass threshold.

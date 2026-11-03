@@ -4,6 +4,7 @@ coverage/
 .coverage
 .coverage.*
 !.coveragerc
+.hypothesis/
 result
 result*
 node_modules/

@@ -80,7 +80,7 @@ Always verify actor readiness within wake budgets, and evict pooled guest connec
   (`Delete`, `evictGuest`).
 - **Wake budgets**: Sending traffic to a suspended actor causes `atenet` to trigger restoration.
   `ensureAwake` polls `GetProcess("ate-env-wake-probe")` across two budgets:
-  - `DefaultWakeBudget` (2 minutes): bounds the entire wait from the start of the probe sequence.
+  - `DefaultWakeBudget` (5 minutes): bounds the entire wait from the start of the probe sequence.
   - `DefaultWakeRunningBudget` (20 seconds): bounds wait time starting from the first poll attempt
     that observes the actor in `RUNNING` state (giving the guest daemon time to initialize).
 - **Delete sequence**: Substrate `DeleteActor` takes an actor in any state (including `CRASHED` or

@@ -66,7 +66,7 @@ for control-plane terms.
 - **Suspend**: Checkpointing a running actor to durable storage with
   `SuspendOptions{Mode: DURABILITY_MODE_SYNCHRONOUS}` and releasing its worker slot.
 - **Wake** / **`ensureAwake`**: Automatic restoration of a suspended actor when `ate-env-api` routes
-  traffic through `atenet`. Bounded by `DefaultWakeBudget` (2 minutes bounds the entire wait) and
+  traffic through `atenet`. Bounded by `DefaultWakeBudget` (5 minutes bounds the entire wait) and
   `DefaultWakeRunningBudget` (20 seconds bounds the wait once `RUNNING`).
 - **Park**: The between-step action in multi-step RL rollouts (`suspend`, `delete`, or `none`).
 - **TTFE**: Time To First Execution, measuring total initialization and run latency

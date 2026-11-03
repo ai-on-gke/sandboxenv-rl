@@ -8,7 +8,7 @@ pull requests below are merged.
 ## Where the code lives
 
 - `ai-on-gke/sandboxenv-rl`: the reporter (`cmd/ate-env-reporter`), the snapshot schema
-  (`internal/fleet/v1`), the site (`cmd/ate-env-fleet-site`), the collector and PodMonitoring
+  (`internal/inventory`), the site (`cmd/ate-env-fleet-site`), the collector and PodMonitoring
   manifests (`manifests/telemetry/`), the Terraform for the central project (`deploy/fleet-site/`),
   and `docs/fleet-site.md`. The reporter reuses `internal/ate`; the site reuses the schema package.
   A separate repository is the alternative if the maintainers want the public repo to stay code that
@@ -24,7 +24,7 @@ pull requests below are merged.
 | 0     | Parameters from the owner: central project, bucket name, Google group, cluster list with projects, tenancy rule. Verify the Substrate `viewer` role on a test atespace.                                    | none       |
 | 1     | Central project by Terraform: bucket with lifecycle rules, Pub/Sub topic with BigQuery and Cloud Storage subscriptions, BigQuery dataset, service accounts, Cloud Run service skeleton behind IAP.         | 0          |
 | 2     | Events phase 1: a Cloud Logging sink per cluster project from `ateapi` stdout to the topic; verify records in BigQuery within a minute.                                                                    | 1          |
-| 3     | Reporter: `cmd/ate-env-reporter`, schema `internal/fleet/v1`, `ate-env manifest reporter`, AccessPolicy `viewer`, Workload Identity. Verify `latest.json` every 5 s from one cluster.                      | 1          |
+| 3     | Reporter: `cmd/ate-env-reporter`, schema `internal/inventory`, `ate-env manifest reporter`, AccessPolicy `viewer`, Workload Identity. Verify `latest.json` every 5 s from one cluster.                     | 1          |
 | 4     | Telemetry manifests: `PodMonitoring` from `ate-env manifest --metrics-port`; collector deployment with Cloud Trace and GCS exporters. Verify 5 s samples in Cloud Monitoring and span files in the bucket. | 1          |
 | 5     | Site pages Fleet, Cluster, Actor, Live and the JSON API; IAP JWT verification; PromQL proxy with an allow-list of queries.                                                                                 | 2, 3, 4    |
 | 6     | Runs page: run reports and span files by `run_id`; one-run waterfall from the span file.                                                                                                                   | 4, 5       |
@@ -38,7 +38,7 @@ Phases 2, 3 and 4 run in parallel after phase 1.
 
 | #   | Scope                                                                                                                                                              | Size   |
 | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------ |
-| 1   | `internal/fleet/v1`: snapshot and index schemas, JSON tags, a golden file                                                                                          | small  |
+| 1   | `internal/inventory`: snapshot and index schemas, JSON tags, a golden file                                                                                         | small  |
 | 2   | `cmd/ate-env-reporter` and `ate-env manifest reporter`: poll loop, diffing on `uid` and `update_time`, atomic writes, health endpoint, tests against `fakecontrol` | medium |
 | 3   | `manifests/telemetry/`: collector deployment and `PodMonitoring`; `ate-env manifest --pod-monitoring`                                                              | small  |
 | 4   | `cmd/ate-env-fleet-site`: HTTP server, IAP verification, GCS and BigQuery readers, Fleet and Cluster pages, JSON API                                               | large  |

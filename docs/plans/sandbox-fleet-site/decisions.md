@@ -51,3 +51,7 @@ Append-only. Each entry: date, who, what, why.
 - 2026-11-02, orchestrator: the plan is proposed to `ai-on-gke/sandboxenv-rl` under
   `docs/plans/sandbox-fleet-site/`, as the telemetry plan was in #189, so maintainers can object to
   the design before the first code pull request. The notes repository keeps the 2026-10-30 draft.
+- 2026-11-03, orchestrator: the schema package is `internal/inventory`, not the planned
+  `internal/fleet/v1`. "Fleet" already names the Python `SandboxFleet` and the trainer-side
+  `ate_env_fleet_*` series; the snapshot is an inventory of a cluster. The package landed as pull
+  request 1 of the execution plan.

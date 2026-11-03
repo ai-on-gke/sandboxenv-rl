@@ -16,7 +16,7 @@ gs://<bucket>/v1/runs/<run_id>/                                      RunReport .
 The site discovers clusters by listing `v1/inventory/*/*/latest.json`. There is no shared index
 object, so no two writers touch one object.
 
-## Snapshot schema, `internal/fleet/v1`
+## Snapshot schema, `internal/inventory`
 
 ```json
 {

@@ -399,7 +399,7 @@ func newImageStatusCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&endpoint, "api", envOr("SUBSTRATE_ENV_API", "127.0.0.1:7777"), "address of the ate-env-api service (e.g. localhost:7777)")
-	cmd.Flags().StringVar(&atespace, "atespace", apiservice.DefaultAtespace, "Substrate atespace of the templates")
+	cmd.Flags().StringVar(&atespace, "atespace", "", "Substrate atespace of the templates (defaults to --template-atespace, else "+apiservice.DefaultAtespace+")")
 	auth.register(cmd, false)
 	cmd.Flags().StringVar(&template, "template", "", "base ActorTemplate name (defaults to server default)")
 	cmd.Flags().StringVar(&templateAtespace, "template-atespace", "", "Substrate atespace of the base ActorTemplate (defaults to --atespace)")

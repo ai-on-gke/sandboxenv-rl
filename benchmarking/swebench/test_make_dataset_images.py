@@ -21,6 +21,8 @@ import importlib.util
 import json
 import pathlib
 
+import pytest
+
 _SPEC = importlib.util.spec_from_file_location(
     "make_dataset", pathlib.Path(__file__).with_name("make-dataset.py"))
 md = importlib.util.module_from_spec(_SPEC)
@@ -61,6 +63,8 @@ def test_instance_id_distinct_per_digest():
 
 def _write(tmp_path, lines, monkeypatch, limit=0):
     monkeypatch.setattr(md, "resolve_digest", lambda ref: None)
+    # No registry calls from these tests: sizes are the subject of their own test.
+    monkeypatch.setattr(md, "image_bytes_compressed", lambda pinned, platform="linux/amd64": None)
     src = tmp_path / "images.txt"
     src.write_text("".join(l + "\n" for l in lines))
     out = tmp_path / "images.jsonl"
@@ -129,6 +133,19 @@ def test_image_bytes_compressed_sums_layers(monkeypatch):
     assert md.image_bytes_compressed("reg.io/p/img@" + D1) is None
     monkeypatch.setattr(md.subprocess, "run", lambda *a, **k: _Proc(0, json.dumps({"manifests": []})))
     assert md.image_bytes_compressed("reg.io/p/img@" + D1) is None
+    # No layer, or no bytes: unknown, not zero (the Go side reads 0 as unrecorded).
+    monkeypatch.setattr(md.subprocess, "run", lambda *a, **k: _Proc(0, json.dumps({"layers": []})))
+    assert md.image_bytes_compressed("reg.io/p/img@" + D1) is None
+    monkeypatch.setattr(md.subprocess, "run", lambda *a, **k: _Proc(0, json.dumps({"layers": [{"size": 0}]})))
+    assert md.image_bytes_compressed("reg.io/p/img@" + D1) is None
+
+    # A missing crane binary fails loudly, as resolve_digest does.
+    def missing(*a, **k):
+        raise FileNotFoundError("crane")
+
+    monkeypatch.setattr(md.subprocess, "run", missing)
+    with pytest.raises(FileNotFoundError):
+        md.image_bytes_compressed("reg.io/p/img@" + D1)
 
 
 def test_write_image_only_records_image_bytes(tmp_path, monkeypatch):

@@ -308,3 +308,28 @@ func TestCommandAdapterValidationRenderingAndGrading(t *testing.T) {
 		t.Fatalf("CommandGrader stdout mismatch = (%v, %q, %v)", r, detail, err)
 	}
 }
+
+func TestParseDatasetImageBytesCompressed(t *testing.T) {
+	img := "registry.example/swebench/a@sha256:" + strings.Repeat("a", 64)
+	row := func(bytes string) string {
+		return `{"instance_id":"a","repo":"","image":"` + img + `"` + bytes + `,"patch":"","test_patch":"","eval_script":"","fail_to_pass":[],"pass_to_pass":[],"log_parser":"","eval_type":""}` + "\n"
+	}
+	write := func(body string) string {
+		p := filepath.Join(t.TempDir(), "tasks.jsonl")
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	got, err := LoadDataset(write(row(`,"image_bytes_compressed":3000000000`)))
+	if err != nil || len(got) != 1 || got[0].ImageBytesCompressed != 3000000000 {
+		t.Fatalf("with a size: %v, %v", got, err)
+	}
+	got, err = LoadDataset(write(row(``)))
+	if err != nil || got[0].ImageBytesCompressed != 0 {
+		t.Fatalf("without a size: %v, %v", got, err)
+	}
+	if _, err := LoadDataset(write(row(`,"image_bytes_compressed":-1`))); err == nil || !strings.Contains(err.Error(), "image_bytes_compressed") {
+		t.Fatalf("a negative size was accepted: %v", err)
+	}
+}

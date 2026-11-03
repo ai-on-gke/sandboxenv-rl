@@ -252,6 +252,8 @@ func (in Instance) Validate() error {
 		return fmt.Errorf("%s: image is required", in.InstanceID)
 	case !digestPinned.MatchString(in.Image):
 		return fmt.Errorf("%s: image %q is not digest-pinned", in.InstanceID, in.Image)
+	case in.ImageBytesCompressed < 0:
+		return fmt.Errorf("%s: image_bytes_compressed %d must be >= 0", in.InstanceID, in.ImageBytesCompressed)
 	}
 	a := AdapterFor(in.Kind)
 	if a == nil {

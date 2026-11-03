@@ -11,7 +11,8 @@ user needs to know across them.
   derived for a `rootfs_image` and the state of its golden snapshot (`NONE`,
   `PENDING`, `READY` with the tag, `FAILED` with the reason); ensure creates
   the template, which starts the bake, with no environment. Feature
-  `image_status`; `ate-env image-status <image> [--ensure]`; the Python
+  `image_status`; `ate-env image-status <image> [--ensure]` (`image-status` joins
+  the reserved environment ids); the Python
   client's `image_status()` and `ImageStatus`; the Go client's `ImageStatus`
   and `EnsureImageTemplate`.
 - ate-env-api: `worker_selector` on `CreateEnvironment`, labels the worker pool

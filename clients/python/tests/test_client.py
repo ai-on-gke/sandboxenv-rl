@@ -147,7 +147,7 @@ async def test_server_info(fake_stack):
         server="sandboxenv-rl",
         version="v0.0.0-fake",
         substrate_version="unknown",
-        features=("rootfs_image", "pty"),
+        features=("rootfs_image", "pty", "image_status"),
     )
     assert "pty" in info.features
 

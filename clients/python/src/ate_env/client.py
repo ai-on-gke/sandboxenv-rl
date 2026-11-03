@@ -397,46 +397,52 @@ class Client:
         self,
         rootfs_image: str,
         *,
-        atespace: str = DEFAULT_ATESPACE,
+        atespace: str | None = None,
         template_name: str | None = None,
         template_atespace: str | None = None,
         ensure: bool = False,
     ) -> ImageStatus:
         """Report the template derived for a rootfs image and its golden snapshot.
 
-        The template and atespace default as in create(). With ensure=True the
+        The template defaults as in create(); the atespace defaults to the
+        template's, else to "ate-env", when left None. With ensure=True the
         derived template is created when it is missing, which starts the
         golden snapshot bake; no environment is created. Poll until
         ``status.golden`` is READY before measuring first boots: environments
-        created while it is PENDING boot from the image instead.
+        created while it is PENDING boot from the image instead; NONE with an
+        existing template means the template disables golden snapshots.
         """
         template = None
         if template_name or template_atespace:
             template = env_pb2.Template(name=template_name or "", atespace=template_atespace or "")
-        attrs = {
-            "ate_env.rootfs_image": image_ref_attr(rootfs_image),
-            "ate.template.name": template_name,
-            "ate.atespace": atespace,
-        }
-        try:
-            if ensure:
-                with self._rpc_span("ensure_image_template", "EnsureImageTemplate", lambda: attrs):
+        op, method = ("ensure_image_template", "EnsureImageTemplate") if ensure else ("get_image_status", "GetImageStatus")
+        with self._rpc_span(
+            op,
+            method,
+            lambda: {
+                "ate_env.rootfs_image": image_ref_attr(rootfs_image),
+                "ate.template.name": template_name,
+                "ate.template.atespace": template_atespace,
+                "ate.atespace": atespace,
+            },
+        ):
+            try:
+                if ensure:
                     resp = await self._environments.EnsureImageTemplate(
                         env_pb2.EnsureImageTemplateRequest(
-                            rootfs_image=rootfs_image, template=template, atespace=atespace
+                            rootfs_image=rootfs_image, template=template, atespace=atespace or ""
                         ),
                         metadata=self._auth_metadata(),
                     )
-            else:
-                with self._rpc_span("get_image_status", "GetImageStatus", lambda: attrs):
+                else:
                     resp = await self._environments.GetImageStatus(
                         env_pb2.GetImageStatusRequest(
-                            rootfs_image=rootfs_image, template=template, atespace=atespace
+                            rootfs_image=rootfs_image, template=template, atespace=atespace or ""
                         ),
                         metadata=self._auth_metadata(),
                     )
-        except grpc.RpcError as e:
-            raise map_rpc_error(e) from e
+            except grpc.RpcError as e:
+                raise map_rpc_error(e) from e
         return _image_status_from_pb(resp)
 
     def env(self, id: str, *, atespace: str = DEFAULT_ATESPACE) -> Env:

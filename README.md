@@ -427,8 +427,8 @@ $ ate-env suspend dev1
 $ ate-env delete dev1
 ```
 
-Subcommand names (`create`, `get`, `delete`, `suspend`, `manifest`, `server-info`, `help`,
-`completion`) are reserved: `ate-env create` rejects them as environment IDs, because `ate-env <id> ...` cannot reach
+Subcommand names (`create`, `get`, `image-status`, `delete`, `suspend`, `manifest`, `server-info`,
+`help`, `completion`) are reserved: `ate-env create` rejects them as environment IDs, because `ate-env <id> ...` cannot reach
 such an environment.
 
 `ate-env` provides help text:

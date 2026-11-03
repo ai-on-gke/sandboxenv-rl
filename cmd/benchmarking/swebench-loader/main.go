@@ -254,7 +254,7 @@ func planPlacementCmd(args []string, stderr io.Writer) error {
 	fs := flag.NewFlagSet("plan-placement", flag.ContinueOnError)
 	var (
 		dataset        = fs.String("dataset", "", "JSONL manifest of instances; a path or an https URL. Required. Image sizes come from its image_bytes_compressed (make-dataset.py).")
-		schedule       = fs.String("schedule", "", "schedule.json from resolve. When given, its images are placed, with each image's demand (the most environments one step asks for); otherwise every image of the manifest.")
+		schedule       = fs.String("schedule", "", "schedule.json from resolve. When given, its images are placed, with each image's demand (the most environments one step asks for), and the whole manifest supplies the sizes; -images, -instances and -exclude-file then do not apply. Otherwise every selected image of the manifest is placed.")
 		domainsFile    = fs.String("domains", "", "domains.json: the placement domains, each with the worker-pool labels its per-environment worker selector names, its node count and node_cache_bytes, the unpacked bytes one node may hold. Required.")
 		images         = fs.Int("images", 0, "Use the first N instances of the dataset; 0 means all.")
 		instances      = fs.String("instances", "", "Comma-separated instance ids to use instead of the first N.")
@@ -269,11 +269,17 @@ func planPlacementCmd(args []string, stderr io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("plan-placement takes no positional arguments, got %q", fs.Args())
+	}
 	if *dataset == "" || *domainsFile == "" {
 		return fmt.Errorf("-dataset and -domains are required")
 	}
 	if *hotDemand > 0 && *schedule == "" {
 		return fmt.Errorf("-hot-demand needs -schedule, which gives each image's demand")
+	}
+	if *schedule != "" && (*images != 0 || *instances != "" || *excludeFile != "") {
+		return fmt.Errorf("-schedule names the images to place; -images, -instances and -exclude-file apply only without it")
 	}
 	defaultBytes, err := swebench.ParseByteSize(*defaultSize)
 	if err != nil {
@@ -293,9 +299,13 @@ func planPlacementCmd(args []string, stderr io.Writer) error {
 			return err
 		}
 	}
-	selected, err := swebench.Select(all, ids, exclude, *images)
-	if err != nil {
-		return err
+	// With a schedule the whole manifest supplies the sizes, so a scheduled
+	// image is never left to the assumed size by a filter it did not go through.
+	selected := all
+	if *schedule == "" {
+		if selected, err = swebench.Select(all, ids, exclude, *images); err != nil {
+			return err
+		}
 	}
 	domains, err := swebench.ReadPlacementDomains(*domainsFile)
 	if err != nil {

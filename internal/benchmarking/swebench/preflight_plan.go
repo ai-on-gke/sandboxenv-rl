@@ -110,8 +110,8 @@ func PlanImagePlacement(opts PlanOptions) (*schema.ImagePlacement, error) {
 	if factor == 0 {
 		factor = DefaultUnpackFactor
 	}
-	if factor <= 0 {
-		return nil, fmt.Errorf("plan: unpack factor must be > 0, got %v", factor)
+	if factor <= 0 || math.IsNaN(factor) || math.IsInf(factor, 0) {
+		return nil, fmt.Errorf("plan: unpack factor must be a finite number > 0, got %v", factor)
 	}
 	replication := opts.Replication
 	if replication == 0 {
@@ -175,7 +175,11 @@ func PlanImagePlacement(opts PlanOptions) (*schema.ImagePlacement, error) {
 			}
 			bc, assumed = opts.DefaultBytesCompressed, true
 		}
-		unpacked := int64(math.Ceil(float64(bc) * factor))
+		scaled := math.Ceil(float64(bc) * factor)
+		if scaled >= math.MaxInt64 {
+			return nil, fmt.Errorf("plan: image %s: %d compressed bytes times the unpack factor %v overflows", img, bc, factor)
+		}
+		unpacked := int64(scaled)
 		want := replication
 		if opts.HotDemand > 0 && demand[img] >= opts.HotDemand {
 			want = opts.HotReplication
@@ -380,7 +384,7 @@ func ParseByteSize(s string) (int64, error) {
 	}
 	num, unit := s[:i], strings.ToLower(strings.TrimSpace(s[i:]))
 	value, err := strconv.ParseFloat(num, 64)
-	if err != nil || value < 0 {
+	if err != nil || value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
 		return 0, fmt.Errorf("size %q: want a number with an optional unit (K, M, G, T, KiB, MiB, GiB, TiB, KB, MB, GB, TB)", s)
 	}
 	var mult float64
@@ -406,7 +410,11 @@ func ParseByteSize(s string) (int64, error) {
 	default:
 		return 0, fmt.Errorf("size %q: unknown unit %q", s, unit)
 	}
-	return int64(math.Round(value * mult)), nil
+	total := math.Round(value * mult)
+	if total >= math.MaxInt64 {
+		return 0, fmt.Errorf("size %q: larger than %d bytes", s, int64(math.MaxInt64))
+	}
+	return int64(total), nil
 }
 
 // FormatByteSize prints n with the largest IEC unit that keeps one decimal,

@@ -15,6 +15,7 @@
 package swebench
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -262,6 +263,22 @@ func TestParseByteSize(t *testing.T) {
 		}
 	}
 	for _, bad := range []string{"", "GiB", "1X", "-1G", "1.2.3G"} {
+		if _, err := ParseByteSize(bad); err == nil {
+			t.Errorf("ParseByteSize(%q) accepted", bad)
+		}
+	}
+}
+
+func TestPlanImagePlacementRejectsNonFiniteFactorsAndOverflow(t *testing.T) {
+	for _, factor := range []float64{math.NaN(), math.Inf(1), -1} {
+		if _, err := PlanImagePlacement(PlanOptions{Instances: []Instance{{Image: imgA, ImageBytesCompressed: 1}}, Domains: twoDomains(0), UnpackFactor: factor}); err == nil {
+			t.Errorf("factor %v accepted", factor)
+		}
+	}
+	if _, err := PlanImagePlacement(PlanOptions{Instances: []Instance{{Image: imgA, ImageBytesCompressed: math.MaxInt64}}, Domains: twoDomains(0)}); err == nil || !strings.Contains(err.Error(), "overflows") {
+		t.Errorf("an overflowing unpacked size was accepted: %v", err)
+	}
+	for _, bad := range []string{"1e20GiB", "nan", "inf", "9223372036854775807KiB"} {
 		if _, err := ParseByteSize(bad); err == nil {
 			t.Errorf("ParseByteSize(%q) accepted", bad)
 		}

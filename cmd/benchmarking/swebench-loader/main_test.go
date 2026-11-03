@@ -649,6 +649,36 @@ func TestPlanPlacementCmd(t *testing.T) {
 	if err := planPlacementCmd([]string{"-dataset", manifest, "-domains", domains, "-hot-demand", "4"}, &stderr); err == nil {
 		t.Error("-hot-demand without -schedule accepted")
 	}
+	sched := filepath.Join(dir, "schedule.json")
+	all, err := swebench.LoadDataset(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := swebench.ResolveSingleJobSchedule("sched", 1, schema.ParkSuspendAsync, 1, 0, 1, all)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := swebench.WriteSchedule(sched, resolved); err != nil {
+		t.Fatal(err)
+	}
+	// A schedule names the images; the selection flags do not apply with it,
+	// and the whole manifest supplies the sizes.
+	if err := planPlacementCmd([]string{"-dataset", manifest, "-domains", domains, "-schedule", sched, "-images", "1", "-out", filepath.Join(dir, "p3.json")}, &stderr); err == nil {
+		t.Error("-schedule with -images accepted")
+	}
+	if err := planPlacementCmd([]string{"-dataset", manifest, "-domains", domains, "-schedule", sched, "-default-image-size", "0", "-out", filepath.Join(dir, "p3.json")}, &stderr); err != nil {
+		t.Fatalf("plan with schedule: %v\n%s", err, stderr.String())
+	}
+	withSched, err := swebench.ReadImagePlacement(filepath.Join(dir, "p3.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := withSched.Entry(imgA); e == nil || e.SizeAssumed || e.Demand != 1 {
+		t.Errorf("a with schedule = %+v, want its manifest size and demand 1", e)
+	}
+	if err := planPlacementCmd([]string{"-dataset", manifest, "-domains", domains, "stray"}, &stderr); err == nil {
+		t.Error("a positional argument was accepted")
+	}
 	if err := planPlacementCmd([]string{"-dataset", manifest}, &stderr); err == nil {
 		t.Error("missing -domains accepted")
 	}

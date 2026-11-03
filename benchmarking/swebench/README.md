@@ -460,5 +460,6 @@ gs://<YOUR_BENCHMARK_BUCKET>/<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickn
 gs://<YOUR_BENCHMARK_BUCKET>/<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>_traced/
 ```
 
+- **Mixed R2E-Gym + SWE-bench 200-concurrency recipe**: [`benchmarking/swebench/r2e-swebench-200.md`](./r2e-swebench-200.md)
 - **Telemetry scopes & feature debug plugins**: [`internal/benchmarking/TELEMETRY_GUIDE.md`](../../internal/benchmarking/TELEMETRY_GUIDE.md)
 - **Agent integration & execution playbook**: [`benchmarking/SKILL.md`](../SKILL.md)

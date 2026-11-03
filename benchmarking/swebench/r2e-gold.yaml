@@ -1,0 +1,46 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Simulated R2E-Gym oracle rollout trajectory for CommandAdapter ("kind": "command")
+# manifests built by benchmarking/swebench/make-r2e-dataset.py.
+#
+# Setup archives /r2e_tests out of sight and commits a clean git baseline once
+# per environment. Reset restores /testbed between steps. Each step simulates
+# exploration and file reads with policy think pauses, then applies the gold
+# patch, unpacks /r2e_tests, runs run_tests.sh, and grades pytest's summary
+# table against expected_output_json.
+name: r2e-gold
+setup:
+  - name: baseline
+    run: "{{.SetupCommand}}"
+    timeout: 5m
+    expect_exit: 0
+reset:
+  - name: reset_repo
+    run: "{{.ResetCommand}}"
+    expect_exit: 0
+steps:
+  - name: explore
+    run: cd /testbed && git status --short | head -n 20; ls
+    think: 1s
+    expect_exit: 0
+  - name: read_files
+    run: cd /testbed && git diff --stat HEAD && git log -1 --format=%H
+    think: 2s
+    expect_exit: 0
+  - name: grade
+    run: "{{.Command}}"
+    think: 3s
+    timeout: 20m
+    reward: true

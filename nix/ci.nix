@@ -490,6 +490,7 @@ in
     harborShell
     pythonEnvBase
     uniAgentEnv
+    harborEnv
     ;
   coverage = ci-coverage;
 }

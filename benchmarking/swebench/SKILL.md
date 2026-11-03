@@ -112,9 +112,12 @@ The baselines below were measured on this setup, and section 1's checks confirm 
   `--image-cache-gc-period=30s --image-cache-high-percent=70 --image-cache-low-percent=60`.
 - System components on 3 x e2-standard-16, Postgres on 1 x n2-standard-16, both tainted off the
   sandbox pools.
-- Sandbox pool A (the standard run): 40 x n2-standard-8, 200 GB pd-balanced, 8 workers per node.
-  Pool B (the image-delivery and high-cardinality runs): e2-standard-8, one CPU family, 500 GB
-  pd-balanced, about 2.5 workers per node. The WorkerPool's worker container sets no requests, so
+- Sandbox pool A (the standard run): 40 x n2-standard-8, 200 GB pd-balanced, 8 workers per node,
+  its own WorkerPool selected by the template. Pool B (the image-delivery and high-cardinality
+  runs): 783 x e2-standard-8, one CPU family, 500 GB pd-balanced, about 2.5 workers per node,
+  its own WorkerPool. A template selects one pool through the WorkerPool label; a WorkerPool
+  whose node selector spans both pools mixes CPU families, and a golden baked on one family
+  boots instead of restoring on the other (check 5 in section 1). The WorkerPool's worker container sets no requests, so
   each worker registers the node's allocatable; templates declare 2 CPU / 4 GiB, so a worker
   admits 3 running actors. gVisor; golden snapshots on; the snapshots bucket and the image
   registry in the cluster's region; plain containerd pulls unless the arm says otherwise.

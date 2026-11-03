@@ -151,19 +151,20 @@ def pin_ref(ref: str) -> str | None:
 def image_bytes_compressed(pinned: str, platform: str = "linux/amd64") -> int | None:
     """Sum of the compressed layer sizes of pinned (repo@sha256:...) for
     platform, from the registry manifest, or None when crane cannot see it or
-    the manifest has no layers. An index is resolved to its platform manifest.
-    The unpacked size on a node is about 2 to 2.5 times this (SKILL.md)."""
-    try:
-        proc = subprocess.run(["crane", "manifest", "--platform", platform, pinned], check=False, capture_output=True, text=True)
-    except OSError:
-        return None
+    the manifest has no layer with a size. An index is resolved to its platform
+    manifest. A missing crane binary raises, like resolve_digest. The unpacked
+    size on a node is about 2 to 2.5 times this (SKILL.md)."""
+    proc = subprocess.run(["crane", "manifest", "--platform", platform, pinned], check=False, capture_output=True, text=True)
     if proc.returncode != 0:
         return None
     try:
         layers = json.loads(proc.stdout).get("layers")
-        return sum(int(layer["size"]) for layer in layers)
+        if not isinstance(layers, list) or not layers:
+            return None
+        total = sum(int(layer["size"]) for layer in layers)
     except (AttributeError, KeyError, TypeError, ValueError):
         return None
+    return total if total > 0 else None
 
 
 def instance_id_from_ref(ref: str, pinned: str) -> str:

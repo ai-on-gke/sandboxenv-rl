@@ -22,6 +22,7 @@ exercised against realistic behavior without a cluster.
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 
 import grpc
@@ -102,7 +103,7 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
             if request.template.atespace:
                 template.atespace = request.template.atespace
         atespace = request.atespace or template.atespace
-        if "@sha256:" not in request.rootfs_image:
+        if not re.search(r"@sha256:[0-9a-f]{64}$", request.rootfs_image):
             return None, atespace, template
         digest = request.rootfs_image.split("@sha256:", 1)[1]
         derived = env_pb2.Template(name=f"{template.name}-{digest[:12]}", atespace=atespace)
@@ -127,7 +128,11 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
         key, _, _ = self._image_status(request)
         if key is None:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "image is not pinned by digest")
-        self.image_templates.setdefault(key, env_pb2.ImageStatus(golden=env_pb2.GOLDEN_SNAPSHOT_STATE_PENDING))
+        # Mirror ate-env-api: a missing template is created and bakes; a
+        # template whose bake failed is recreated and bakes again.
+        existing = self.image_templates.get(key)
+        if existing is None or existing.golden == env_pb2.GOLDEN_SNAPSHOT_STATE_FAILED:
+            self.image_templates[key] = env_pb2.ImageStatus(golden=env_pb2.GOLDEN_SNAPSHOT_STATE_PENDING)
         return await self.GetImageStatus(request, context)
 
     async def GetServerInfo(self, request, context):
@@ -135,7 +140,7 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
             server="sandboxenv-rl",
             version="v0.0.0-fake",
             substrate_version="unknown",
-            features=["rootfs_image", "pty"],
+            features=["rootfs_image", "pty", "image_status"],
         )
 
     async def _lookup(self, request, context):

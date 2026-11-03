@@ -36,6 +36,8 @@ const (
 	FeaturePTY = "pty"
 	// FeaturePortProxy: the listener forwards HTTP to ports in environments.
 	FeaturePortProxy = "port_proxy"
+	// FeatureImageStatus: GetImageStatus and EnsureImageTemplate are served.
+	FeatureImageStatus = "image_status"
 )
 
 const substrateModule = "go.ate.dev/substrate"
@@ -66,7 +68,7 @@ func (s *Server) GetServerInfo(ctx context.Context, req *ateenvv1alpha.GetServer
 
 // features lists the optional features this server serves, in a fixed order.
 func (s *Server) features() []string {
-	f := []string{FeatureRootfsImage, FeaturePTY}
+	f := []string{FeatureRootfsImage, FeaturePTY, FeatureImageStatus}
 	if s.Info.PortProxy {
 		f = append(f, FeaturePortProxy)
 	}

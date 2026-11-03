@@ -122,7 +122,8 @@ type GoldenSnapshotState int32
 
 const (
 	GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_UNSPECIFIED GoldenSnapshotState = 0
-	// The derived template does not exist, thus no bake has started.
+	// No golden snapshot will come: the derived template does not exist, or
+	// its golden snapshots are disabled (golden_snapshot_config.mode).
 	GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_NONE GoldenSnapshotState = 1
 	// The template exists and its golden snapshot is baking; environments
 	// created now boot from the image.

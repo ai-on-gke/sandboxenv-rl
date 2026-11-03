@@ -186,6 +186,28 @@ async def wait_until_serving(env, timeout=180):
             await asyncio.sleep(2)
 ```
 
+### Ask about an image before creating from it
+
+`image_status` reports the ActorTemplate derived for a digest-pinned image and the
+state of its golden snapshot, the snapshot every environment on that image restores
+from instead of booting: `NONE` (no template, or the template disables golden
+snapshots), `PENDING` (baking; environments created now boot from the image),
+`READY` (with the tag) or `FAILED` (with the reason). `ensure=True` creates the
+template when it is missing, which starts the bake, and creates no environment.
+
+```python
+from ate_env import GoldenSnapshotState
+
+status = await client.image_status(image, ensure=True)   # starts the bake if needed
+while status.golden is GoldenSnapshotState.PENDING:
+    await asyncio.sleep(10)
+    status = await client.image_status(image)
+assert status.golden is GoldenSnapshotState.READY, status.golden_error
+```
+
+The template and atespace default as in `create`; `server_info().features` lists
+`image_status` when the server serves it.
+
 ### Run shell commands
 
 ```python

@@ -249,12 +249,17 @@ func (c *Client) ImageStatus(ctx context.Context, req *ateenvv1alpha.GetImageSta
 	ctx, span := c.tracer.startRPC(ctx, opGetImageStatus, "GetImageStatus",
 		AttrRootfsImage.String(imageRefAttr(req.GetRootfsImage())),
 		AttrTemplateName.String(req.GetTemplate().GetName()),
+		AttrTemplateAtespace.String(req.GetTemplate().GetAtespace()),
 		AttrAtespace.String(req.GetAtespace()))
 	defer func() { endSpan(span, err) }()
 	resp, err := c.grpc.GetImageStatus(c.withAuth(ctx), req)
 	if err != nil {
 		return nil, fromGRPCError(err)
 	}
+	// The server resolves the derived template; record what it chose.
+	setAttributes(span,
+		AttrTemplateName.String(resp.GetTemplate().GetName()),
+		AttrTemplateAtespace.String(resp.GetTemplate().GetAtespace()))
 	return resp, nil
 }
 
@@ -265,12 +270,16 @@ func (c *Client) EnsureImageTemplate(ctx context.Context, req *ateenvv1alpha.Ens
 	ctx, span := c.tracer.startRPC(ctx, opEnsureImageTemplate, "EnsureImageTemplate",
 		AttrRootfsImage.String(imageRefAttr(req.GetRootfsImage())),
 		AttrTemplateName.String(req.GetTemplate().GetName()),
+		AttrTemplateAtespace.String(req.GetTemplate().GetAtespace()),
 		AttrAtespace.String(req.GetAtespace()))
 	defer func() { endSpan(span, err) }()
 	resp, err := c.grpc.EnsureImageTemplate(c.withAuth(ctx), req)
 	if err != nil {
 		return nil, fromGRPCError(err)
 	}
+	setAttributes(span,
+		AttrTemplateName.String(resp.GetTemplate().GetName()),
+		AttrTemplateAtespace.String(resp.GetTemplate().GetAtespace()))
 	return resp, nil
 }
 

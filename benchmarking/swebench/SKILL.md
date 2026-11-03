@@ -167,9 +167,11 @@ and not disk contention; width 3 needs 2 nodes, width 13 needs 10. Caches must b
 recreate the node pool, or use at least 47 images per node, the full run's ratio, so a start never
 lands on a node that holds its image. A 500 GB disk holds about 290 unpacked Prime images under
 the 70% eviction mark. Goldens are baked once beforehand and not timed.
-Baseline, plain pull on pd-balanced: start 31 to 32 s p50 / 73 s p95 with unpack 97% of it, the
-three large images 200 to 600 s, the read step 4 to 5 s; 94 starts per arm, two reps when the p95 matters. It measures the
-per-start cost without contention; a width of 160 per node measures contention instead, and the two are not comparable
+Baseline, plain pull on pd-balanced, measured by this recipe at width 30 on a 783-node pool: start
+arm ttfi 28.7 s p50 / 101 s p95 / 275 s max, unpack 26.8 s p50, 0.99 pulls per start; read arm
+ttfi 28.9 s / 91.7 s with the read step 573 ms p50 / 1.1 s p95; the three large images 209, 215
+and 275 s. The smoke tier gave 29.8 s p50 in 94 s of wall time. 94 starts per arm, two reps when
+the p95 matters. It measures the per-start cost without contention; a width of 160 per node measures contention instead, and the two are not comparable
 on ttfi.
 
 For iterating on a delivery change, a smoke tier: `prime-swe-rl-30.jsonl`, the first 30 images

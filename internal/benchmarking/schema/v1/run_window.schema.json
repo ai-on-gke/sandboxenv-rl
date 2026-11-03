@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-on-gke.github.io/sandboxenv-rl/schema/v1/run_window.schema.json",
+  "title": "RunWindow",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "start_ts", "end_ts"],
+  "properties": {
+    "schema_version": { "type": "string", "enum": ["v1"] },
+    "run_id": { "type": "string", "minLength": 1 },
+    "test_name": { "type": "string" },
+    "tag": { "type": "string" },
+    "start_ts": { "type": "string", "minLength": 1 },
+    "end_ts": { "type": "string", "minLength": 1 },
+    "steady_start_ts": { "type": "string", "minLength": 1 },
+    "steady_end_ts": { "type": "string", "minLength": 1 },
+    "cluster": { "type": "string" },
+    "sut_endpoint": { "type": "string" },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  }
+}

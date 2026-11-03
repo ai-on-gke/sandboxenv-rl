@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -54,6 +55,31 @@ func isLoopbackAddr(addr string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+func splitCSV(s string) []string {
+	var out []string
+	for v := range strings.SplitSeq(s, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// portProxyAtespaces parses -port-proxy-atespaces; "*" allows any atespace and empty is an error.
+func portProxyAtespaces(v string) ([]string, error) {
+	if strings.TrimSpace(v) == "*" {
+		return nil, nil
+	}
+	out := splitCSV(v)
+	if len(out) == 0 {
+		return nil, errors.New("-port-proxy-atespaces is empty; name the atespaces, or * for any")
+	}
+	if slices.Contains(out, "*") {
+		return nil, errors.New("-port-proxy-atespaces cannot combine * with other names")
+	}
+	return out, nil
 }
 
 // Files that tell a pod its namespace and cluster domain.
@@ -94,7 +120,8 @@ func main() {
 		listen            = flag.String("listen", "0.0.0.0:7777", "address to serve the API on")
 		ateapi            = flag.String("ateapi", ate.DefaultControlAddr, "address of the ateapi gRPC control plane")
 		atenet            = flag.String("atenet", ate.DefaultRouterAddr, "address of the atenet router for the guest's gRPC: its HTTPS listener (443) with -atenet-client-cert, else the plaintext one, which only the test fakes serve")
-		atenetConn        = flag.String("atenet-connect", ate.DefaultRouterConnectAddr, "address of the atenet router's CONNECT listener: the TLS one (8444) with -atenet-client-cert, else the plaintext one, which only the test fakes serve; HTTP requests carrying X-Env-Id and X-Env-Port, or to /v1alpha/envs/{id}/ports/{port}/..., are forwarded through it to that port in the environment. Without -auth-token-file the forwarding does not authenticate callers, and it reaches any port of any actor the router serves. Empty disables it")
+		atenetConn        = flag.String("atenet-connect", ate.DefaultRouterConnectAddr, "address of the atenet router's CONNECT listener: the TLS one (8444) with -atenet-client-cert, else the plaintext one, which only the test fakes serve; HTTP requests carrying X-Env-Id and X-Env-Port, or to /v1alpha/envs/{id}/ports/{port}/..., are forwarded through it to that port in the environment. Without -auth-token-file the forwarding does not authenticate callers, and it reaches any port of any actor in the atespaces -port-proxy-atespaces names. Empty disables it")
+		ppAtespaces       = flag.String("port-proxy-atespaces", ate.DefaultAtespace, "comma-separated atespaces whose environments the port proxy forwards to, or * for any")
 		ppOrigins         = flag.String("port-proxy-trusted-origins", "", "comma-separated browser origins (scheme://host[:port]) whose pages may use the port proxy's path form, next to the listener's own origin")
 		ppHeaderTimeout   = flag.Duration("port-proxy-response-header-timeout", 0, "how long the port proxy waits for a daemon's response headers; 0 means no limit, and the caller's deadline applies")
 		hostSuffix        = flag.String("host-suffix", ate.DefaultHostSuffix, "atenet router host suffix for actor routing")
@@ -104,7 +131,7 @@ func main() {
 		skipVerify        = flag.Bool("skip-verify", true, "skip TLS certificate verification on the control plane connection")
 		tokenFile         = flag.String("ateapi-token-file", "", "file with a bearer token for the control plane, e.g. a projected ServiceAccount token with the ateapi audience")
 		authTokenFile     = flag.String("auth-token-file", "", "file with a bearer token required from gRPC, MCP and port-proxy callers; re-read when the file changes")
-		wakeBudget        = flag.Duration("wake-budget", apiservice.DefaultWakeBudget, "how long a guest call or a port-proxy request waits for a suspended environment to wake before failing; cold image pulls and cross-region snapshot reads exceed the router's own parking budget")
+		wakeBudget        = flag.Duration("wake-budget", apiservice.DefaultWakeBudget, "how long a guest gRPC call waits for a suspended environment to wake before failing; cold image pulls, cross-region snapshot reads and the template's wakeup probe exceed the router's own hold of about 10 s. A port-proxy request waits on the router instead and gets 503 with Retry-After while the wake goes on; this budget applies to it only when the router refuses the tunnel itself")
 		wakeRunningBudget = flag.Duration("wake-running-budget", apiservice.DefaultWakeRunningBudget, "how long a guest call waits when the environment is already RUNNING but the router still answers Unavailable (guest not yet listening vs. path down)")
 		allowedHosts      = flag.String("allowed-hosts", "", "comma-separated host names that HTTP callers may send in the Host header, next to IP addresses, localhost, names under .localhost and the names of --service-name, which are always allowed; a leading *. allows the names below it. Other names get 403, which blocks DNS rebinding against the listener, the MCP endpoint and the port proxy. gRPC requests are not checked")
 		serviceName       = flag.String("service-name", "ate-env-api", "name of the Kubernetes Service in front of ate-env-api; its in-cluster names are allowed hosts (<name>, <name>.<namespace>, <name>.<namespace>.svc and <name>.<namespace>.svc.<cluster domain>, with the namespace and cluster domain read from /etc/resolv.conf, else the namespace from POD_NAMESPACE). Empty allows none of them")
@@ -264,11 +291,10 @@ func main() {
 	// anything else, whatever their path: the path belongs to the daemon.
 	var handler http.Handler = mux
 	if *atenetConn != "" {
-		var origins []string
-		for o := range strings.SplitSeq(*ppOrigins, ",") {
-			if o = strings.TrimSpace(o); o != "" {
-				origins = append(origins, o)
-			}
+		origins := splitCSV(*ppOrigins)
+		atespaces, err := portProxyAtespaces(*ppAtespaces)
+		if err != nil {
+			log.Fatalf("port proxy: %v", err)
 		}
 		ppOpts := portproxy.Options{
 			ConnectAddr:           *atenetConn,
@@ -278,17 +304,16 @@ func main() {
 			ResponseHeaderTimeout: *ppHeaderTimeout,
 			TrustedOrigins:        origins,
 			WakeBudget:            *wakeBudget,
-		}
-		if callerAuth != nil {
-			ppOpts.Authenticate = callerAuth.Check
+			Atespaces:             atespaces,
 		}
 		if metrics != nil {
 			// A first contact through the port proxy ends create_to_ready too.
 			ppOpts.OnConnected = apisvc.ObserveFirstContact
+			ppOpts.OnCrashed = apisvc.ObserveCrashedContact
 		}
-		pp, err := portproxy.New(ppOpts)
+		pp, err := portproxy.New(portProxyOptions(ppOpts, apisvc, callerAuth))
 		if err != nil {
-			log.Fatalf("--port-proxy-trusted-origins: %v", err)
+			log.Fatalf("port proxy: %v", err)
 		}
 		// Header form and path form, /v1alpha/envs/{id}/ports/{port}/...
 		handler = portproxy.Dispatch(pp, mux, hosts.Wrap)
@@ -406,4 +431,16 @@ func newHTTPServer(addr string, handler http.Handler, maxStreams int) *http.Serv
 		srv.HTTP2 = &http.HTTP2Config{MaxConcurrentStreams: maxStreams}
 	}
 	return srv
+}
+
+// portProxyOptions adds what the port proxy takes from the API server to
+// base: the state read that makes a crashed or deleted environment fail at
+// once, and the caller check when -auth-token-file is set.
+func portProxyOptions(base portproxy.Options, apisvc *apiservice.Server, callerAuth *apiservice.BearerAuth) portproxy.Options {
+	base.ActorState = apisvc.ActorState
+	if callerAuth != nil {
+		base.Authenticate = callerAuth.Check
+		base.AuthenticateCapability = callerAuth.CheckCapability
+	}
+	return base
 }

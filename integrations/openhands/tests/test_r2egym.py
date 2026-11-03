@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from ate_env import CommandExecutionError, CommandTimeoutError
 
 import ate_env_openhands.r2egym as adapter
 
@@ -47,15 +48,27 @@ class _Handle:
         self.sandbox_id = sandbox_id
         self.task = SimpleNamespace(id="x", image=image, metadata=meta)
         self.execs: list[tuple[str, str, float | None]] = []
+        self.envs: list[dict | None] = []
         self.files: dict[str, bytes] = {}
         self.replies: dict[str, _ExecResult] = {}
 
-    def exec(self, command, cwd="", env=None, timeout_s=None):
+    def exec(self, command, cwd="", env=None, timeout_s=None, check=True):
+        # Mirrors SandboxHandle.exec: with check=True a timeout or a non-zero
+        # exit raises instead of returning the result.
         self.execs.append((command, cwd, timeout_s))
+        self.envs.append(env)
+        res = _ExecResult(0, stdout=f"ran: {command}\n")
         for needle, reply in self.replies.items():
             if needle in command:
-                return reply
-        return _ExecResult(0, stdout=f"ran: {command}\n")
+                res = reply
+                break
+        if check and res.timed_out:
+            raise CommandTimeoutError(f"Command {command!r} timed out", result=res)
+        if check and res.exit_code != 0:
+            raise CommandExecutionError(
+                f"Command {command!r} failed with exit code {res.exit_code}:\nSTDOUT: {res.stdout}", result=res
+            )
+        return res
 
     def write_file(self, path, content):
         self.files[path] = content if isinstance(content, bytes) else content.encode()
@@ -247,10 +260,66 @@ def test_copy_stages_a_tar_and_extracts_into_the_destination(fake_r2egym, tmp_pa
     with tarfile.open(fileobj=io.BytesIO(data)) as tar:
         assert tar.getnames() == ["renamed.py"]
     command = handle.execs[-1][0]
-    assert f"tar xmf {staged} -C /usr/local/bin" in command and f"rm -f {staged}" in command
-    handle.replies["tar xmf"] = _ExecResult(1, stderr="tar: no space")
+    assert f"tar --no-same-owner -xmf {staged} -C /usr/local/bin" in command and f"rm -f {staged}" in command
+    handle.replies["-xmf"] = _ExecResult(1, stderr="tar: no space")
     with pytest.raises(RuntimeError, match="no space"):
         env.runtime.copy_to_container(str(src), "/usr/local/bin/again.py")
+
+
+def test_copy_archives_members_as_root(fake_r2egym, tmp_path):
+    # F-AC4-1: a sandbox root cannot chown to the host uid, thus tar must
+    # neither carry the host owner nor try to restore it.
+    handle = _Handle()
+    env = adapter.make_fleet_repo_env(handle)
+    tree = tmp_path / "cmds"
+    tree.mkdir()
+    (tree / "a.sh").write_text("echo a\n")
+    env.runtime.copy_to_container(str(tree), "/usr/local/bin/cmds")
+    (_, data), = handle.files.items()
+    with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        members = tar.getmembers()
+    assert {m.name for m in members} == {"cmds", "cmds/a.sh"}
+    assert all((m.uid, m.gid, m.uname, m.gname) == (0, 0, "root", "root") for m in members)
+    assert "--no-same-owner" in handle.execs[-1][0]
+
+
+def test_failed_copy_surfaces_the_tar_error(fake_r2egym, tmp_path):
+    # The tar error must reach the caller, not a strict-mode exception that
+    # carries stdout only.
+    handle = _Handle()
+    env = adapter.make_fleet_repo_env(handle)
+    src = tmp_path / "x.patch"
+    src.write_text("diff\n")
+    handle.replies["-xmf"] = _ExecResult(
+        2, stdout="", stderr="tar: x.patch: Cannot change ownership to uid 804416, gid 0: Operation not permitted"
+    )
+    with pytest.raises(RuntimeError, match=r"exit 2\).*Cannot change ownership"):
+        env.runtime.copy_to_container(str(src), "/tmp/x.patch")
+
+
+def test_copy_timeout_says_so_and_removes_the_staged_tar(fake_r2egym, tmp_path):
+    # A timeout kills the shell before its own rm -f runs. The error must name
+    # the timeout, not "exit None", and a separate exec must remove the tar.
+    handle = _Handle()
+    env = adapter.make_fleet_repo_env(handle)
+    src = tmp_path / "x.patch"
+    src.write_text("diff\n")
+    handle.replies["-xmf"] = _ExecResult(None, timed_out=True)
+    with pytest.raises(RuntimeError, match=r"-> /tmp/x\.patch timed out after 120 s"):
+        env.runtime.copy_to_container(str(src), "/tmp/x.patch")
+    (staged, _), = handle.files.items()
+    assert handle.execs[-1][0] == f"rm -f {staged}"
+    # A failed cleanup must not hide the timeout.
+    scripted_exec = handle.exec
+
+    def exec_with_failing_cleanup(command, **kwargs):
+        if command.startswith("rm -f "):
+            raise ConnectionError("guest gone")
+        return scripted_exec(command, **kwargs)
+
+    handle.exec = exec_with_failing_cleanup
+    with pytest.raises(RuntimeError, match="timed out after 120 s"):
+        env.runtime.copy_to_container(str(src), "/tmp/x.patch")
 
 
 def test_bind_failure_raises(fake_r2egym):
@@ -296,3 +365,35 @@ def test_classes_are_built_once_under_concurrency(fake_r2egym):
         t.join()
     assert len({id(r[0]) for r in results}) == 1
     assert adapter.AteEnvRuntime is results[0][0] and adapter.AteEnvRepoEnv is results[0][1]
+
+
+def test_run_uses_the_r2e_path_and_docker_environment(fake_r2egym):
+    # F-AC4-2: commands run with R2E-Gym's PATH (the testbed venv first) plus
+    # docker_kwargs["environment"], which overrides PATH, as R2E-Gym's
+    # kubernetes backends do.
+    handle = _Handle()
+    env = adapter.make_fleet_repo_env(handle)
+    env.runtime.run("python --version")
+    assert handle.envs[-1] == {"PATH": adapter._R2E_DOCKER_PATH}
+    assert handle.envs[-1]["PATH"].startswith("/root/.venv/bin:")
+    fake_r2egym.DOCKER_PATH = "/custom/bin:/usr/bin"
+    adapter._CLASSES = None
+    rt = adapter._build_classes()[0](handle, environment={"PIP_NO_INDEX": 1})
+    rt.run("pip list")
+    assert handle.envs[-1] == {"PATH": "/custom/bin:/usr/bin", "PIP_NO_INDEX": "1"}
+
+
+def test_docker_environment_can_be_a_list_of_key_value_strings(fake_r2egym):
+    # The Docker SDK takes environment as a dict or as ["KEY=VALUE", ...].
+    handle = _Handle()
+    runtime_cls = adapter._build_classes()[0]
+    rt = runtime_cls(handle, environment=["PIP_NO_INDEX=1", "PATH=/opt/bin:/usr/bin", "OPTS=a=b"])
+    rt.run("pip list")
+    assert handle.envs[-1] == {"PATH": "/opt/bin:/usr/bin", "PIP_NO_INDEX": "1", "OPTS": "a=b"}
+    rt = runtime_cls(handle, environment={"PATH": "/opt/bin"})
+    rt.run("pip list")
+    assert handle.envs[-1] == {"PATH": "/opt/bin"}
+    with pytest.raises(TypeError, match="KEY=VALUE"):
+        runtime_cls(handle, environment=["NO_EQUALS_SIGN"])
+    with pytest.raises(TypeError, match="dict or a list"):
+        runtime_cls(handle, environment="A=1")

@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-substrate.github.io/env/schemas/v1/trace_event.schema.json",
+  "title": "TraceEvent",
+  "description": "Single raw SDK call trace record in trace.jsonl (ENV_BENCH_MODE=trace).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ts",
+    "env",
+    "op",
+    "dur_ms",
+    "ok"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "v1"
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "run": {
+      "type": "string",
+      "minLength": 1
+    },
+    "job": {
+      "type": "string",
+      "minLength": 1
+    },
+    "step": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "env": {
+      "type": "string",
+      "minLength": 1
+    },
+    "instance": {
+      "type": "string",
+      "minLength": 1
+    },
+    "image": {
+      "type": "string",
+      "minLength": 1
+    },
+    "op": {
+      "type": "string",
+      "enum": [
+        "create",
+        "get",
+        "suspend",
+        "delete",
+        "wake",
+        "exec",
+        "shell",
+        "start_process",
+        "write_file",
+        "read_file"
+      ]
+    },
+    "command": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string"
+      }
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "dur_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "exit": {
+      "type": "integer"
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "err": {
+      "type": "string"
+    }
+  }
+}

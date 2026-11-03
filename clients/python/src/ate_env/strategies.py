@@ -25,13 +25,18 @@ from typing import Any
 from .handle import SandboxHandle
 from .observability import null_observer, repo_family
 from .telemetry.metrics import status_of
+from .telemetry.trace_recorder import current_slot_wait_s, task_context
 from .types import Task
 
 logger = logging.getLogger("ate_env.strategies")
 
 
-def process_parallel(fleet: Any, tasks: list[Task], process_fn: Callable[[Task, SandboxHandle], Any],
-                     concurrency: int) -> list[Any]:
+def process_parallel(
+    fleet: Any,
+    tasks: list[Task],
+    process_fn: Callable[[Task, SandboxHandle], Any],
+    concurrency: int,
+) -> list[Any]:
     """Execute acquire -> process_fn -> release across tasks up to concurrency.
 
     process_fn runs in the fleet observer's ``process`` phase; each task's
@@ -41,27 +46,35 @@ def process_parallel(fleet: Any, tasks: list[Task], process_fn: Callable[[Task, 
     obs = getattr(fleet, "observer", None) or null_observer()
     backend = getattr(fleet, "backend_label", "-")
 
-    def _execute_single(task: Task) -> Any:
+    def _execute_single(task: Task, enqueued_at: float | None = None) -> Any:
         family = repo_family(task)
         start = time.monotonic()
+        slot_wait = max(0.0, start - enqueued_at) if enqueued_at is not None else 0.0
+        slot_token = current_slot_wait_s.set(slot_wait)
         status = "ok"
         try:
-            handle = fleet.acquire(task)
-            try:
-                with obs.phase("process", backend=backend, family=family):
-                    return process_fn(task, handle)
-            finally:
-                fleet.release(handle)
+            with task_context(
+                run_id=getattr(fleet, "run_id", None),
+                instance=task.id,
+                image=task.image,
+            ):
+                handle = fleet.acquire(task)
+                try:
+                    with obs.phase("process", backend=backend, family=family):
+                        return process_fn(task, handle)
+                finally:
+                    fleet.release(handle)
         except BaseException as e:
             status = status_of(e)
             raise
         finally:
+            current_slot_wait_s.reset(slot_token)
             obs.task_done(backend, family, status, time.monotonic() - start)
 
     if concurrency <= 1:
         for i, t in enumerate(tasks):
             try:
-                results[i] = _execute_single(t)
+                results[i] = _execute_single(t, time.monotonic())
             except Exception as e:
                 logger.error("Task %s failed: %s", t.id, e)
                 results[i] = e
@@ -71,7 +84,12 @@ def process_parallel(fleet: Any, tasks: list[Task], process_fn: Callable[[Task, 
         # Each worker runs in a copy of the caller's context, so spans started
         # per task nest under the caller's current span.
         futures = {
-            executor.submit(contextvars.copy_context().run, _execute_single, t): i
+            executor.submit(
+                contextvars.copy_context().run,
+                _execute_single,
+                t,
+                time.monotonic(),
+            ): i
             for i, t in enumerate(tasks)
         }
         for fut in as_completed(futures):
@@ -85,8 +103,12 @@ def process_parallel(fleet: Any, tasks: list[Task], process_fn: Callable[[Task, 
     return results
 
 
-def run_none(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
-             concurrency: int, teardown: bool = True) -> list[Any]:
+def run_none(
+    fleet: Any,
+    process_fn: Callable[[Task, SandboxHandle], Any],
+    concurrency: int,
+    teardown: bool = True,
+) -> list[Any]:
     """No pre-warming: on-demand 1:1 acquisition per task."""
     try:
         # fleet.tasks is a snapshot: tasks added during the run are not run.
@@ -96,8 +118,12 @@ def run_none(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
             fleet.teardown()
 
 
-def run_naive(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
-              concurrency: int, teardown: bool = True) -> list[Any]:
+def run_naive(
+    fleet: Any,
+    process_fn: Callable[[Task, SandboxHandle], Any],
+    concurrency: int,
+    teardown: bool = True,
+) -> list[Any]:
     """Pre-warm every image up front, process all tasks in parallel, tear down."""
     try:
         fleet.setup()
@@ -108,8 +134,12 @@ def run_naive(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
             fleet.teardown()
 
 
-def run_sliding(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
-                concurrency: int, teardown: bool = True) -> list[Any]:
+def run_sliding(
+    fleet: Any,
+    process_fn: Callable[[Task, SandboxHandle], Any],
+    concurrency: int,
+    teardown: bool = True,
+) -> list[Any]:
     """Keep only a sliding window of image pools warm at a time (bounded footprint)."""
     fleet.preflight()
     fleet.plan()
@@ -125,13 +155,18 @@ def run_sliding(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
     results: list[Any] = [None] * len(tasks)
     try:
         for start in range(0, len(images), window):
-            batch = images[start:start + window]
+            batch = images[start : start + window]
             fleet.warm_images(batch, wait=True)
             batch_pairs = [(i, t) for img in batch for (i, t) in by_image[img]]
             batch_tasks = [t for _i, t in batch_pairs]
 
-            logger.info("Sliding window [%d..%d): %d image(s), %d task(s)",
-                        start, start + len(batch), len(batch), len(batch_tasks))
+            logger.info(
+                "Sliding window [%d..%d): %d image(s), %d task(s)",
+                start,
+                start + len(batch),
+                len(batch),
+                len(batch_tasks),
+            )
             batch_results = process_parallel(fleet, batch_tasks, process_fn, concurrency)
             for (orig_idx, _t), r in zip(batch_pairs, batch_results):
                 results[orig_idx] = r
@@ -145,11 +180,14 @@ def run_sliding(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
     return results
 
 
-def run_pipelined(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
-                  concurrency: int, teardown: bool = True) -> list[Any]:
-    """
-    Double-buffered pipelined sliding window.
-    
+def run_pipelined(
+    fleet: Any,
+    process_fn: Callable[[Task, SandboxHandle], Any],
+    concurrency: int,
+    teardown: bool = True,
+) -> list[Any]:
+    """Double-buffered pipelined sliding window.
+
     While window N tasks run, prefetch window N+1 in the background to overlap
     image pull or snapshot restore with GPU rollout time.
     """
@@ -178,14 +216,20 @@ def run_pipelined(fleet: Any, process_fn: Callable[[Task, SandboxHandle], Any],
                 prefetch_executor.submit(
                     contextvars.copy_context().run, fleet.warm_images, batches[n + 1], wait=True
                 )
-                if n + 1 < len(batches) else None
+                if n + 1 < len(batches)
+                else None
             )
 
             batch_pairs = [(i, t) for img in batch for (i, t) in by_image[img]]
             batch_tasks = [t for _i, t in batch_pairs]
 
-            logger.info("Pipelined window [%d/%d]: %d image(s), %d task(s)",
-                        n + 1, len(batches), len(batch), len(batch_tasks))
+            logger.info(
+                "Pipelined window [%d/%d]: %d image(s), %d task(s)",
+                n + 1,
+                len(batches),
+                len(batch),
+                len(batch_tasks),
+            )
             batch_results = process_parallel(fleet, batch_tasks, process_fn, concurrency)
             for (orig_idx, _t), r in zip(batch_pairs, batch_results):
                 results[orig_idx] = r

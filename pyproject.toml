@@ -1,0 +1,41 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# uv workspace root (virtual: no [project]). One uv.lock pins every Python
+# dependency of the projects below; the Nix devShell builds its Python envs
+# from it (nix/python.nix, via uv2nix), and `uv sync` gives the same versions
+# without Nix. See docs/chores/check-pins.md.
+[tool.uv.workspace]
+members = [
+    "clients/python",
+    "integrations/nemo-gym",
+    "integrations/openhands",
+    "integrations/uni-agent",
+    "integrations/harbor",
+]
+
+[tool.uv]
+# The lock is written by the devShell's uv (nixpkgs). Only a floor: Dependabot
+# brings its own uv, and an upper bound would need an edit on every nixpkgs uv
+# bump.
+required-version = ">=0.13.1"
+
+# Lock against PyPI whatever index the machine's uv config names (a corporate
+# mirror, say): uv.lock records download URLs, and they have to work for
+# everyone, including CI and the Nix builds.
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true

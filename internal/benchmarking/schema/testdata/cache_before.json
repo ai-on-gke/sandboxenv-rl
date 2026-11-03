@@ -1,0 +1,16 @@
+{
+  "schema_version": "v1",
+  "run_id": "run-123",
+  "collected_at": "2026-10-22T01:20:00Z",
+  "nodes": [
+    {
+      "node": "node-1",
+      "ts": "2026-10-22T01:20:00Z",
+      "hits": 10,
+      "misses": 2,
+      "errors": 0,
+      "evictions": 0,
+      "bytes_used": 1048576
+    }
+  ]
+}

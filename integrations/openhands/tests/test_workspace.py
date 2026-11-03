@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 import os
 import sys
 import time
@@ -28,9 +29,9 @@ import pytest
 from ate_env import EnvError, EnvironmentStatus, NotFoundError
 from openhands.sdk.workspace import RemoteWorkspace
 
-from ate_env_openhands import AteEnvWorkspace, port_url
+from ate_env_openhands import AteEnvWorkspace, port_capability, port_url
 
-from .conftest import IMAGE, SESSION_KEY
+from .conftest import IMAGE, SESSION_KEY, _free_port
 from .fakes import DEFAULT_ATESPACE, FakeAteEnv, serve
 
 
@@ -286,6 +287,335 @@ def test_the_api_token_authenticates_at_the_proxy_and_never_reaches_the_sandbox(
     for request in state.proxied:
         assert "api-secret" not in str(request["headers"])
         assert not {"authorization", "x-env-authorization"} & {k.lower() for k in request["headers"]}
+
+
+# -- secrets ---------------------------------------------------------------------
+
+
+def _put_secret(ws: AteEnvWorkspace, name: str, value: str) -> None:
+    response = ws.client.put("/api/settings/secrets", json={"name": name, "value": value},
+                             headers=ws._headers)
+    response.raise_for_status()
+
+
+def test_secret_lookups_name_the_agent_server_loopback_and_carry_no_api_token(agent_server,
+                                                                                tmp_path):
+    """With the token required, each LookupSecret names the agent-server's own loopback
+    address, carries the session key only, and resolves there."""
+    port = int(agent_server.rsplit(":", 1)[1])
+    with serve(FakeAteEnv(upstreams={port: agent_server}, api_token="api-secret")) as (
+            api_url, state):
+        with make(api_url, state, tmp_path, api_token="api-secret", server_port=port) as ws:
+            _put_secret(ws, "GH_TOKEN", "s3cret-value")
+            lookup = ws.get_secrets(names=["GH_TOKEN"])["GH_TOKEN"]
+            assert lookup.url == f"http://127.0.0.1:{port}/api/settings/secrets/GH_TOKEN"
+            assert lookup.headers.get("X-Session-API-Key") == SESSION_KEY
+            assert "X-Env-Authorization" not in lookup.headers
+            exposed = lookup.model_dump_json(context={"expose_secrets": True})
+            assert "api-secret" not in exposed
+            # This process resolves the lookup over HTTP; the in-process path that the
+            # agent-server uses in the sandbox is in the next test.
+            assert lookup.get_value() == "s3cret-value"
+
+
+def test_secret_lookups_resolve_in_process_under_the_layer_start_command(tmp_path, monkeypatch):
+    """The agent-server resolves a lookup in process, without a request, when it runs as
+    the layer starts it (``python -m openhands.agent_server --host 0.0.0.0``)."""
+    pytest.importorskip("openhands.agent_server", reason="needs the [test] extra")
+    from openhands.agent_server.__main__ import _get_internal_server_url
+    from openhands.agent_server.config import Config
+    from openhands.agent_server.local_secret_resolver import local_secret_resolution
+    from openhands.agent_server.persistence import store
+    from openhands.sdk.secret import LookupSecret
+
+    port = _free_port()  # nothing listens here: a lookup that goes to HTTP fails
+    monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path / "persistence"))
+    # What __main__ sets for the layer's --host 0.0.0.0.
+    monkeypatch.setenv("OH_INTERNAL_SERVER_URL", _get_internal_server_url("0.0.0.0", port))
+    store.reset_stores()
+    try:
+        config = Config()
+        store.get_secrets_store(config).set_secret("GH_TOKEN", "s3cret-value")
+        workspace = SimpleNamespace(server_port=port)
+        url = AteEnvWorkspace.local_secret_url(workspace, "GH_TOKEN")  # type: ignore[arg-type]
+        with local_secret_resolution(config):
+            lookup = LookupSecret(url=url, headers={"X-Session-API-Key": SESSION_KEY})
+            assert lookup.get_value() == "s3cret-value"
+            other = LookupSecret(url=url.replace(f":{port}/", f":{port + 1}/"), headers={})
+            with pytest.raises(httpx.ConnectError):
+                other.get_value()
+    finally:
+        store.reset_stores()
+
+
+@pytest.mark.parametrize("name", ["", "1TOKEN", "GH-TOKEN", "GH%5FTOKEN", "a/b", "A" * 65])
+def test_local_secret_url_rejects_names_the_agent_server_refuses(name):
+    with pytest.raises(ValueError, match="secret name"):
+        AteEnvWorkspace.local_secret_url(SimpleNamespace(server_port=8000), name)  # type: ignore[arg-type]
+
+
+def test_secrets_sent_to_a_conversation_never_carry_the_api_token(agent_server, tmp_path):
+    """The agent-server receives the lookups in a conversation's secret update. No header
+    and no body that reaches it through the proxy contains the caller token."""
+    pytest.importorskip("openhands.tools")
+    from openhands.sdk import LLM, Conversation
+    from openhands.tools.preset.default import get_default_agent
+    from pydantic import SecretStr
+
+    port = int(agent_server.rsplit(":", 1)[1])
+    llm = LLM(usage_id="agent", model="openai/unused", api_key=SecretStr("x"),
+              base_url="http://127.0.0.1:9")  # never called: the conversation is not run
+    # The workspace holds api_token and sends it on each REST request. The test checks only
+    # what reaches the agent-server, thus this proxy does not require the token.
+    with serve(FakeAteEnv(upstreams={port: agent_server})) as (api_url, state):
+        with make(api_url, state, tmp_path, api_token="api-secret", server_port=port) as ws:
+            _put_secret(ws, "GH_TOKEN", "s3cret-value")
+            conversation = Conversation(agent=get_default_agent(llm=llm, cli_mode=True),
+                                        workspace=ws)
+            try:
+                conversation.update_secrets(ws.get_secrets())
+            finally:
+                conversation.close()
+    updates = [p for p in state.proxied
+               if p["method"] == "POST" and p["path"].endswith("/secrets")]
+    assert updates, "the secret update reached the agent-server through the proxy"
+    assert f"127.0.0.1:{port}/api/settings/secrets/GH_TOKEN".encode() in updates[0]["body"]
+    for request in state.proxied:
+        assert "api-secret" not in str(request["headers"])
+        assert b"api-secret" not in request["body"]
+
+
+def test_port_capability_matches_the_proxy_vector():
+    """The vector of ate-env-api's TestCapabilityVector, so the two stay in step."""
+    assert port_capability("s3cret", "ate-env", "env1", 8000, 1700000000) == (
+        "v1.1700000000.a2f01c6feececba10e18c15123f7f7124cd436d7ec370910c470f75325920f2f")
+
+
+def _open_conversation(ws):
+    pytest.importorskip("openhands.tools")
+    from openhands.sdk import LLM, Conversation, RemoteConversation
+    from openhands.tools.preset.default import get_default_agent
+    from pydantic import SecretStr
+
+    llm = LLM(usage_id="agent", model="openai/unused", api_key=SecretStr("x"),
+              base_url="http://127.0.0.1:9")  # never called: the conversation is not run
+    conversation = Conversation(agent=get_default_agent(llm=llm, cli_mode=True), workspace=ws)
+    assert isinstance(conversation, RemoteConversation)
+    return conversation
+
+
+def _websocket_upgrades(state):
+    return [p for p in state.proxied if p["headers"].get("Upgrade", "").lower() == "websocket"]
+
+
+def test_with_the_api_token_the_event_websocket_carries_a_capability_only(stack, tmp_path,
+                                                                         monkeypatch):
+    """The SDK's event WebSocket sends no headers; the host's capability lets it through."""
+    monkeypatch.setenv("OPENHANDS_REMOTE_WS_READY_TIMEOUT", "5")
+    api_url, state = stack
+    state.api_token = "api-secret"
+    with make(api_url, state, tmp_path, api_token="api-secret") as ws:
+        assert "ate-env-capability:v1." in ws.host and "api-secret" not in ws.host
+        conversation = _open_conversation(ws)
+        try:
+            assert conversation.state.id
+        finally:
+            conversation.close()
+    upgrades = _websocket_upgrades(state)
+    assert upgrades, "the event stream went through the proxy as a WebSocket"
+    for request in state.proxied:
+        assert "api-secret" not in str(request["headers"])
+        assert "ate-env-capability" not in str(request["headers"])
+        assert not {"authorization", "x-env-authorization"} & {k.lower() for k in request["headers"]}
+
+
+def test_an_expired_capability_does_not_open_the_websocket(stack, tmp_path, monkeypatch):
+    """Without a valid capability the SDK cannot subscribe, and the conversation fails."""
+    from openhands.sdk.conversation.exceptions import WebSocketConnectionError
+
+    monkeypatch.setenv("OPENHANDS_REMOTE_WS_READY_TIMEOUT", "3")
+    api_url, state = stack
+    state.api_token = "api-secret"
+    with make(api_url, state, tmp_path, api_token="api-secret", ws_capability_ttl=1) as ws:
+        time.sleep(1.5)
+        assert ws.execute_command("echo ok", timeout=30).stdout.strip() == "ok"  # the token
+        with pytest.raises(WebSocketConnectionError):
+            _open_conversation(ws)
+    assert not _websocket_upgrades(state), "the proxy refused the expired capability"
+
+
+def _capability_of(ws) -> str:
+    return ws.host.split("ate-env-capability:", 1)[1].split("@", 1)[0]
+
+
+def _is_upgrade(request) -> bool:
+    return request["headers"].get("Upgrade", "").lower() == "websocket"
+
+
+def test_rest_requests_never_carry_the_capability(stack, tmp_path, monkeypatch):
+    """Only the event WebSocket sends the capability: REST requests, as the proxy
+    receives them, carry no Authorization at all."""
+    monkeypatch.setenv("OPENHANDS_REMOTE_WS_READY_TIMEOUT", "5")
+    api_url, state = stack
+    state.api_token = "api-secret"
+    with make(api_url, state, tmp_path, api_token="api-secret") as ws:
+        assert ws.execute_command("echo ok", timeout=30).stdout.strip() == "ok"
+        assert ws.file_upload(b"x", str(tmp_path / "work" / "f")).success
+        assert ws.alive
+        conversation = _open_conversation(ws)
+        try:
+            assert conversation.state.id
+        finally:
+            conversation.close()
+    rest = [r for r in state.received if not _is_upgrade(r)]
+    upgrades = [r for r in state.received if _is_upgrade(r)]
+    assert len(rest) >= 5 and upgrades
+    for request in rest:
+        assert "authorization" not in {k.lower() for k in request["headers"]}, request
+        assert request["headers"].get("X-Env-Authorization") == "Bearer api-secret"
+    for request in upgrades:
+        assert request["headers"].get("Authorization", "").startswith("Basic ")
+
+
+def test_repr_and_dumps_hide_the_token_and_the_capability(stack, tmp_path):
+    api_url, state = stack
+    state.api_token = "api-secret"
+    with make(api_url, state, tmp_path, api_token="api-secret") as ws:
+        capability = _capability_of(ws)
+        for text in (repr(ws), str(ws), str(ws.model_dump()), ws.model_dump_json()):
+            assert "api-secret" not in text
+            assert capability not in text
+        assert "ate-env-capability:***@" in repr(ws)
+        assert "api_token" not in ws.model_dump()
+        assert ws.model_dump()["host"].startswith("http://ate-env-capability:***@")
+
+
+def test_errors_do_not_contain_the_capability(stack, tmp_path, no_finalizer):
+    api_url, state = stack
+    state.api_token = "api-secret"
+    ws = make(api_url, state, tmp_path, api_token="api-secret")
+    capability = _capability_of(ws)
+    try:
+        state.refuse = (500, "boom")
+        with pytest.raises(httpx.HTTPStatusError) as status_error:
+            ws._check_session_key()
+        assert capability not in str(status_error.value)
+        assert capability not in str(status_error.value.request.url)
+        state.refuse = (400, "bad port")
+        with pytest.raises(ValueError) as bad_request:
+            ws._wait_for_health(timeout=5)
+        assert capability not in str(bad_request.value)
+        assert "ate-env-capability" not in str(bad_request.value)
+    finally:
+        state.refuse = None
+        ws.cleanup()
+
+
+def test_resume_renews_the_capability(stack, tmp_path, monkeypatch):
+    """A pause longer than ws_capability_ttl: the resume renews the capability, thus
+    a conversation reattached after it opens its event WebSocket."""
+    monkeypatch.setenv("OPENHANDS_REMOTE_WS_READY_TIMEOUT", "5")
+    api_url, state = stack
+    state.api_token = "api-secret"
+    with make(api_url, state, tmp_path, api_token="api-secret", ws_capability_ttl=1) as ws:
+        before = _capability_of(ws)
+        ws.pause()
+        time.sleep(1.5)  # the first capability expires during the pause
+        # The expiry is in whole seconds, thus a 1 s capability can expire before the
+        # conversation opens its WebSocket. The renewed one has time for that.
+        ws.ws_capability_ttl = 60
+        ws.resume()
+        assert _capability_of(ws) != before
+        conversation = _open_conversation(ws)
+        try:
+            assert conversation.state.id
+        finally:
+            conversation.close()
+    assert _websocket_upgrades(state)
+
+
+def test_renewing_the_capability_keeps_a_live_conversation_working(stack, tmp_path,
+                                                                  monkeypatch):
+    """renew_ws_capability() changes only host's user info, which REST requests do not
+    use, thus a live conversation keeps its HTTP client and can still send messages."""
+    monkeypatch.setenv("OPENHANDS_REMOTE_WS_READY_TIMEOUT", "5")
+    api_url, state = stack
+    state.api_token = "api-secret"
+    with make(api_url, state, tmp_path, api_token="api-secret") as ws:
+        conversation = _open_conversation(ws)
+        try:
+            before = _capability_of(ws)
+            time.sleep(1.1)  # a new expiry second gives a new capability
+            ws.renew_ws_capability()
+            assert _capability_of(ws) != before
+            conversation.send_message("still connected")
+        finally:
+            conversation.close()
+
+
+def test_capabilities_are_masked_in_logs(stack, tmp_path, caplog, monkeypatch):
+    """httpx logs show no capability (REST URLs have none), and the websockets
+    handshake log masks the Basic header."""
+    monkeypatch.setenv("OPENHANDS_REMOTE_WS_READY_TIMEOUT", "5")
+    api_url, state = stack
+    state.api_token = "api-secret"
+    caplog.set_level(logging.INFO, logger="httpx")
+    caplog.set_level(logging.DEBUG, logger="websockets.client")
+    with make(api_url, state, tmp_path, api_token="api-secret") as ws:
+        capability = _capability_of(ws)
+        ws.execute_command("echo ok", timeout=30)
+        conversation = _open_conversation(ws)
+        conversation.close()
+    assert "HTTP Request" in caplog.text
+    assert capability not in caplog.text
+    assert "YXRlLWVudi1jYXBhYmlsaXR5" not in caplog.text  # base64 of the capability user
+
+
+def test_the_log_filter_covers_child_loggers():
+    """A filter on "httpcore" would miss "httpcore.http11"; each logger is named."""
+    from ate_env_openhands import workspace as wsmod
+
+    wsmod._redact_capabilities_in_logs()
+    record = logging.LogRecord("httpcore.http11", logging.DEBUG, __file__, 1,
+                               "send_request url=%s", ("http://ate-env-capability:v1.9.ab@h/x",), None)
+    for name in ("httpcore.http11", "httpcore.connection", "websockets.client"):
+        assert wsmod._redact_filter in logging.getLogger(name).filters
+    wsmod._redact_filter.filter(record)
+    assert "v1.9.ab" not in record.getMessage()
+    header = logging.LogRecord("websockets.client", logging.DEBUG, __file__, 1, "> %s: %s",
+                               ("Authorization", "Basic YXRlLWVudi1jYXBhYmlsaXR5OnYxLjEuYQ=="), None)
+    wsmod._redact_filter.filter(header)
+    assert header.getMessage() == "> Authorization: ***"
+
+
+def test_capability_ttl_stays_below_the_proxy_maximum(stack, tmp_path):
+    from ate_env_openhands.workspace import CAPABILITY_CLOCK_MARGIN, MAX_CAPABILITY_TTL
+
+    api_url, state = stack
+    state.api_token = "api-secret"
+    with pytest.raises(ValueError):
+        make(api_url, state, tmp_path, api_token="api-secret",
+             ws_capability_ttl=MAX_CAPABILITY_TTL)
+    longest = MAX_CAPABILITY_TTL - CAPABILITY_CLOCK_MARGIN
+    with make(api_url, state, tmp_path, api_token="api-secret", ws_capability_ttl=longest) as ws:
+        expiry = int(_capability_of(ws).split(".")[1])
+        assert expiry <= time.time() + longest + 1
+
+
+def test_get_secrets_urls_carry_no_capability(monkeypatch, no_finalizer):
+    from openhands.sdk.secret import LookupSecret
+
+    url = "http://ate-env-capability:v1.9.ab@127.0.0.1:7777/v1alpha/atespaces/a/envs/e/ports/8000"
+    monkeypatch.setattr(RemoteWorkspace, "get_secrets", lambda self, names=None, **kw: {
+        "GH": LookupSecret(url=f"{url}/api/settings/secrets/GH", headers={})})
+    monkeypatch.setattr(AteEnvWorkspace, "model_post_init", lambda self, context: None)
+    ws = AteEnvWorkspace.model_construct(host=url)
+    secrets = ws.get_secrets()
+    # Only the property: the URL has no user info. Its host can change (the proxy here,
+    # the agent-server's loopback address with the in-process secret lookup).
+    assert "@" not in secrets["GH"].url
+    assert "ate-env-capability" not in secrets["GH"].url
+    assert secrets["GH"].url.endswith("/api/settings/secrets/GH")
 
 
 # -- answers that waiting cannot change ------------------------------------------
@@ -557,6 +887,38 @@ def test_a_conversation_runs_through_the_port_proxy(stack, tmp_path):
             conversation.close()
     assert any(p["headers"].get("Upgrade", "").lower() == "websocket" for p in state.proxied), (
         "the event stream went through the proxy as a WebSocket")
+
+
+def test_a_conversation_survives_pause_and_resume(stack, tmp_path):
+    """A live RemoteConversation holds the workspace's HTTP client; pause() and
+    resume() keep that client open, thus the conversation works afterwards."""
+    pytest.importorskip("openhands.tools")
+    from openhands.sdk import LLM, Conversation
+    from openhands.tools.preset.default import get_default_agent
+    from pydantic import SecretStr
+
+    api_url, state = stack
+    llm = LLM(usage_id="agent", model="openai/unused", api_key=SecretStr("x"),
+              base_url="http://127.0.0.1:9")  # never called: the conversation is not run
+    with make(api_url, state, tmp_path) as ws:
+        conversation = Conversation(agent=get_default_agent(llm=llm, cli_mode=True), workspace=ws)
+        try:
+            client = ws.client
+            ws.pause()
+            ws.resume()
+            assert ws.client is client and not client.is_closed
+            before = len(state.proxied)
+            conversation.send_message("still connected after resume")
+            events = f"/api/conversations/{conversation.state.id}/events"
+            sent = [p for p in state.proxied[before:]
+                    if p["method"] == "POST" and p["path"].split("?")[0] == events]
+            assert sent, "the message after the resume reached the agent-server"
+        finally:
+            conversation.close()
+        target = tmp_path / "work" / "after-resume.txt"
+        ws.execute_command(f"echo ok > {target}", timeout=30)
+        assert ws.execute_command(f"cat {target}", timeout=30).stdout.strip() == "ok"
+    assert client.is_closed, "cleanup() closes the client that pause and resume kept"
 
 
 def test_a_closed_conversation_lets_the_environment_stay_parked(stack, tmp_path):

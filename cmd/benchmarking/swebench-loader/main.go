@@ -46,33 +46,56 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/agent-substrate/env/internal/benchmarking/schema"
 	"github.com/agent-substrate/env/internal/benchmarking/swebench"
+	"github.com/agent-substrate/env/internal/benchmarking/trace"
+	"github.com/agent-substrate/env/internal/telemetry"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
+// tracingServiceName is the OpenTelemetry service.name of the loader's spans
+// and the prefix of its run span.
+const tracingServiceName = "swebench-loader"
+
 func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
+	os.Exit(runMain(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func runMain(args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		usage(stderr)
+		return 2
 	}
 	var err error
-	switch os.Args[1] {
+	switch args[0] {
 	case "run":
-		err = runCmd(os.Args[2:])
-	case "report":
-		err = reportCmd(os.Args[2:], os.Stdout)
+		err = runCmd(args[1:])
+	case "resolve":
+		err = resolveCmd(args[1:])
+	case "convert-trace":
+		err = convertTraceCmd(args[1:])
+	case "report", "compare":
+		err = reportCmdWithIO(args[1:], stdout, stderr)
 	case "trajectory-assets":
-		err = assetsCmd(os.Args[2:], os.Stdout)
+		err = assetsCmd(args[1:], stdout)
 	case "-h", "--help", "help":
-		usage()
-		return
+		usage(stderr)
+		return 0
 	default:
-		usage()
-		os.Exit(2)
+		if strings.HasPrefix(args[0], "-convert-trace") || strings.HasPrefix(args[0], "--convert-trace") {
+			err = runCmd(args)
+			break
+		}
+		usage(stderr)
+		return 2
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+		fmt.Fprintln(stderr, "error:", err)
+		return 1
 	}
+	return 0
 }
 
 // authTokenEnv names the environment variable that holds the bearer token,
@@ -218,8 +241,8 @@ func idsDigest(ids []string) string {
 	return hex.EncodeToString(sum[:4])
 }
 
-func usage() {
-	fmt.Fprintln(os.Stderr, "usage: swebench-loader run [flags] | swebench-loader report FILE... [-json OUT] | swebench-loader trajectory-assets FILE")
+func usage(w io.Writer) {
+	fmt.Fprintln(w, "usage: swebench-loader run [flags] | swebench-loader resolve [flags] | swebench-loader convert-trace [flags] | swebench-loader report FILE... [-json OUT] | swebench-loader trajectory-assets FILE")
 }
 
 // assetsCmd prints the files a trajectory's write steps name, one per line,
@@ -238,10 +261,112 @@ func assetsCmd(args []string, w io.Writer) error {
 	return nil
 }
 
+func convertTraceCmd(args []string) error {
+	files, rest := leadingFiles(args)
+	fs := flag.NewFlagSet("convert-trace", flag.ContinueOnError)
+	var (
+		in           = fs.String("in", "", "Input trace.jsonl path (or pass as first positional argument).")
+		traceFlag    = fs.String("convert-trace", "", "Alias for -in: input trace.jsonl path.")
+		outDir       = fs.String("out", "", "Output directory for schedule.json, placement.json, trajectory.yaml, and instances.jsonl.")
+		traceOutFlag = fs.String("trace-out", "", "Alias for -out: output directory for converted trace artifacts.")
+		scenarioName = fs.String("scenario", "", "Scenario name for converted schedule.json.")
+		defaultJob   = fs.String("job", "", "Default job name when trace events omit job.")
+		defaultImage = fs.String("default-image", "", "Default pinned digest image when trace events omit image.")
+	)
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	tracePath := *in
+	if tracePath == "" {
+		tracePath = *traceFlag
+	}
+	if tracePath == "" && len(files) > 0 {
+		tracePath = files[0]
+	}
+	if tracePath == "" && fs.NArg() > 0 {
+		tracePath = fs.Arg(0)
+	}
+	if tracePath == "" {
+		return fmt.Errorf("-in (or positional trace.jsonl) is required")
+	}
+	targetDir := *outDir
+	if targetDir == "" {
+		targetDir = *traceOutFlag
+	}
+	if targetDir == "" {
+		return fmt.Errorf("-out (or -trace-out) directory is required")
+	}
+	f, err := os.Open(tracePath)
+	if err != nil {
+		return fmt.Errorf("open trace %s: %w", tracePath, err)
+	}
+	defer f.Close()
+	conv, err := trace.ConvertTrace(f, trace.ConvertOptions{
+		ScenarioName: *scenarioName,
+		DefaultJob:   *defaultJob,
+		DefaultImage: *defaultImage,
+	})
+	if err != nil {
+		return err
+	}
+	return trace.WriteConvertedArtifacts(targetDir, conv)
+}
+
+func resolveCmd(args []string) error {
+	fs := flag.NewFlagSet("resolve", flag.ContinueOnError)
+	var (
+		dataset      = fs.String("dataset", "", "JSONL manifest of instances; a path or an https URL. Required.")
+		images       = fs.Int("images", 0, "Use the first N instances of the dataset; 0 means all.")
+		instances    = fs.String("instances", "", "Comma-separated instance ids to use instead of the first N.")
+		excludeFile  = fs.String("exclude-file", "", "File of instance ids to leave out, one per line.")
+		steps        = fs.Int("steps", 8, "Number of training steps.")
+		tasksPerStep = fs.Int("tasks-per-step", 0, "Tasks sampled per step; 0 means all selected instances.")
+		groupSize    = fs.Int("group-size", 2, "Group size (rollouts) per sampled instance.")
+		park         = fs.String("park", string(schema.ParkSuspendAsync), "Park policy: suspend-async, suspend-sync, suspend, fork, delete, or none.")
+		seed         = fs.Uint64("seed", 42, "Deterministic RNG seed for step sampling.")
+		runID        = fs.String("run-id", "swe-sched", "Job / schedule ID.")
+		out          = fs.String("out", "schedule.json", "Output path for the resolved schedule JSON.")
+	)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dataset == "" {
+		return fmt.Errorf("-dataset is required")
+	}
+	all, err := swebench.LoadDataset(*dataset)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	if *instances != "" {
+		ids = strings.Split(*instances, ",")
+	}
+	var exclude []string
+	if *excludeFile != "" {
+		if exclude, err = swebench.ReadIDList(*excludeFile); err != nil {
+			return err
+		}
+	}
+	selected, err := swebench.Select(all, ids, exclude, *images)
+	if err != nil {
+		return err
+	}
+	sched, err := swebench.ResolveSingleJobSchedule(*runID, *seed, schema.ParkPolicy(*park), *steps, *tasksPerStep, *groupSize, selected)
+	if err != nil {
+		return err
+	}
+	return swebench.WriteSchedule(*out, sched)
+}
+
 func runCmd(args []string) (retErr error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	var (
-		endpoint      = fs.String("endpoint", "localhost:7777", "ate-env API address (host:port).")
+		backendFlag   = fs.String("backend", "substrate", "Backend driver: substrate | agent-sandbox.")
+		accessFlag    = fs.String("access", "ate-env-api", "Access path: ate-env-api | direct | sdk.")
+		endpoint      = fs.String("endpoint", "localhost:7777", "ate-env API or Agent Sandbox gateway address (host:port or URL).")
+		controlAddr   = fs.String("control-addr", "", "Direct Substrate control plane address (defaults to -endpoint when -access=direct).")
+		routerAddr    = fs.String("router-addr", "", "Direct Substrate atenet router address (when -access=direct).")
+		warmPool      = fs.String("warm-pool", "", "SandboxWarmPool name (when -backend=agent-sandbox).")
 		connections   = fs.Int("connections", 4, "gRPC connections to the API, handed out round-robin per environment; a Service balances per connection, so use at least the number of API replicas.")
 		atespace      = fs.String("atespace", "ate-env", "Atespace the environments are created in.")
 		baseTemplate  = fs.String("base-template", "default-template", "Base ActorTemplate the per-image templates derive from (ate-env manifest template).")
@@ -250,34 +375,67 @@ func runCmd(args []string) (retErr error) {
 		instances     = fs.String("instances", "", "Comma-separated instance ids to use instead of the first N.")
 		excludeFile   = fs.String("exclude-file", "", "File of instance ids to leave out, one per line; text after the id is a comment.")
 		trajectory    = fs.String("trajectory", swebench.DefaultTrajectory, fmt.Sprintf("Trajectory file or built-in name (%s); a comma-separated list mixes them, one per environment, drawn with -seed.", strings.Join(swebench.Names(), ", ")))
-		seed          = fs.Int64("seed", 1, "Seed for the trajectory mix, so reps assign the same trajectory to the same environment.")
-		mode          = fs.String("mode", string(swebench.ModeEval), "eval (images x tasks-per-image, each create/replay/delete) or steps (images x rollouts kept across steps).")
+		seed          = fs.Int64("seed", 1, "Seed for the trajectory mix and schedule/open-loop RNG, so reps assign the same trajectory to the same environment.")
+		mode          = fs.String("mode", string(swebench.ModeEval), "eval, steps, or open-loop (Poisson arrivals at -arrival-rate).")
 		width         = fs.Int("width", 50, "Most tasks in flight at once.")
+		arrivalRate   = fs.Float64("arrival-rate", 0, "open-loop: Poisson task arrival rate in tasks/sec.")
 		tasksPerImage = fs.Int("tasks-per-image", 1, "eval: replays per image.")
 		rollouts      = fs.Int("rollouts", 2, "steps: environments per image.")
 		steps         = fs.Int("steps", 8, "steps: training steps.")
-		park          = fs.String("park", string(swebench.ParkSuspend), "steps: what happens between steps: suspend, delete or none.")
+		park          = fs.String("park", string(swebench.ParkSuspend), "steps: what happens between steps: suspend, suspend-sync, suspend-async, fork, delete or none.")
 		imagesPerStep = fs.Int("images-per-step", 0, "steps: each step takes the next N images (wrapping around the dataset) with fresh environments, retired after the step: the create-and-retire-pools-per-step shape; needs -park delete. 0 keeps one fleet across the steps.")
 		parkEach      = fs.Bool("park-each", false, "steps: park each environment as soon as its step ends instead of after the whole fleet's step, so at most -width are awake at once and the fleet can be larger than the running slots; the barrier then includes the parking.")
+		schedulePath  = fs.String("schedule", "", "steps: path to a pre-resolved schedule.json.")
+		resolveOut    = fs.String("resolve-out", "", "steps: write the resolved schedule.json to this path before running.")
+		tasksPerStep  = fs.Int("tasks-per-step", 0, "steps: tasks sampled per step when resolving a schedule (0 means all selected instances).")
+		groupSize     = fs.Int("group-size", 0, "steps: group size per sampled task when resolving a schedule (0 uses -rollouts).")
+		stepPause     = fs.Duration("step-pause", 0, "steps: simulated trainer pause between steps.")
+		prefetch      = fs.Bool("prefetch", false, "steps: asynchronously prewarm next step's prefetch_images off the critical path.")
 		createTimeout = fs.Duration("create-timeout", 5*time.Minute, "Deadline for one create call.")
 		stepTimeout   = fs.Duration("step-timeout", 10*time.Minute, "Default deadline for a run step without its own timeout.")
 		wakeBudget    = fs.Duration("wake-budget", 3*time.Minute, "How long a task's first command is retried while the environment is still waking or its image is still being baked.")
 		wakeBackoff   = fs.Duration("wake-backoff", swebench.DefaultWakeBackoff, "Initial pause between wake retries; doubles up to five times this.")
 		runID         = fs.String("run-id", "", "Run id, prefix of every environment name: lowercase letters, digits and '-', at most 20 characters; default swe-<unix time>.")
 		out           = fs.String("out", "", "JSONL events file; default <run-id>.jsonl in the working directory.")
+		eventsDir     = fs.String("events-dir", "", "Optional base directory for per-worker event shards (events/<worker>.jsonl).")
+		worker        = fs.String("worker", "", "Optional worker shard name stamped on emitted events.")
+		jobName       = fs.String("job", "", "Optional job name stamped on emitted events.")
+		runWindow     = fs.String("run-window", "", "Optional path to write run_window.json.")
+		statsOut      = fs.String("stats-out", "", "Optional path to write flat stats.jsonl rows after the run.")
+		testName      = fs.String("test-name", "", "Optional test_name for run_window.json and stats.jsonl.")
+		tag           = fs.String("tag", "", "Optional tag for run_window.json and stats.jsonl.")
+		validate      = fs.Bool("validate", false, "Evaluate Validity Rules 1-7 after the run and fail if invalid.")
+		convertTrace  = fs.String("convert-trace", "", "Convert a trace.jsonl file into schedule.json and trajectory.yaml before running (or exit if -dataset is omitted).")
+		traceOut      = fs.String("trace-out", "", "Output directory for -convert-trace artifacts.")
 		keep          = fs.Bool("keep", false, "Leave the environments in place when the run ends.")
 		dryRun        = fs.Bool("dry-run", false, "Load and render everything, print the plan and exit without touching the API.")
 		authTokenFile = fs.String("auth-token-file", "", "File that holds the bearer token for ate-env-api; surrounding whitespace is ignored. Without it, SUBSTRATE_ENV_AUTH_TOKEN is used when set.")
 		labels        = labelFlags{}
 		vars          = labelFlags{}
+		enableTracing = fs.Bool("enable-tracing", false, "Also export every event as an OpenTelemetry span over OTLP/gRPC, configured by OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_EXPORTER_OTLP_INSECURE, all under one swebench-loader.run span per run. The JSONL is the same either way.")
 	)
 	fs.Var(vars, "set", "KEY=VALUE for the trajectories' var function, repeatable, e.g. READ_FILE=/testbed/setup.py or COMPILE_DIR=/testbed; a workload's defaults are in its file. A key no trajectory reads is an error; each value is recorded as a set.KEY label.")
 	fs.Var(labels, "label", "KEY=VALUE recorded on the run event, repeatable: the Substrate commit, the cluster, the arm. The loader records its own flags itself (mode, width, images, trajectory, dataset, the shape flags, connections, base-template, exclude-file, instances and the timeouts); a -label with one of those keys is refused, so report -arm can trust them.")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if *convertTrace != "" {
+		targetDir := *traceOut
+		if targetDir == "" {
+			return fmt.Errorf("-trace-out is required with -convert-trace")
+		}
+		if err := convertTraceCmd([]string{"-in", *convertTrace, "-out", targetDir, "-job", *jobName}); err != nil {
+			return err
+		}
+		if *dataset == "" {
+			return nil
+		}
+	}
 	if *dataset == "" {
 		return fmt.Errorf("-dataset is required")
+	}
+	if err := swebench.ValidateBackendDriverFlags(*backendFlag, *accessFlag); err != nil {
+		return err
 	}
 	authToken, err := resolveAuthToken(*authTokenFile, os.Getenv)
 	if err != nil {
@@ -286,7 +444,13 @@ func runCmd(args []string) (retErr error) {
 	if *runID == "" {
 		*runID = fmt.Sprintf("swe-%d", time.Now().Unix())
 	}
-	if *out == "" {
+	if *eventsDir != "" {
+		wName := *worker
+		if wName == "" {
+			wName = "worker-0"
+		}
+		*out = swebench.ShardEventPath(*eventsDir, wName)
+	} else if *out == "" {
 		*out = *runID + ".jsonl"
 	}
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
@@ -361,6 +525,28 @@ func runCmd(args []string) (retErr error) {
 	}
 	traj := trajs[0]
 
+	var sched *schema.Schedule
+	if *schedulePath != "" {
+		sched, err = swebench.ReadSchedule(*schedulePath)
+		if err != nil {
+			return err
+		}
+	} else if *resolveOut != "" {
+		gs := *groupSize
+		if gs <= 0 {
+			gs = *rollouts
+		}
+		sched, err = swebench.ResolveSingleJobSchedule(*runID, uint64(*seed), schema.ParkPolicy(*park), *steps, *tasksPerStep, gs, selected)
+		if err != nil {
+			return err
+		}
+	}
+	if *resolveOut != "" && sched != nil {
+		if err := swebench.WriteSchedule(*resolveOut, sched); err != nil {
+			return err
+		}
+	}
+
 	fanout := *tasksPerImage
 	if swebench.Mode(*mode) == swebench.ModeSteps {
 		fanout = *rollouts
@@ -381,35 +567,82 @@ func runCmd(args []string) (retErr error) {
 	if testBackendOverride != nil {
 		backend = testBackendOverride
 	} else {
-		eb, err := swebench.NewEnvBackend(*endpoint, *atespace, *baseTemplate, *connections, authToken)
+		drv, closer, err := swebench.NewBackendDriver(swebench.BackendDriverOptions{
+			Backend:      *backendFlag,
+			Access:       *accessFlag,
+			Endpoint:     *endpoint,
+			ControlAddr:  *controlAddr,
+			RouterAddr:   *routerAddr,
+			Atespace:     *atespace,
+			BaseTemplate: *baseTemplate,
+			WarmPool:     *warmPool,
+			Connections:  *connections,
+			AuthToken:    authToken,
+		})
 		if err != nil {
 			return err
 		}
-		defer eb.Close()
-		backend = eb
+		defer closer.Close()
+		backend = drv
 	}
 
-	f, err := os.Create(*out)
-	if err != nil {
-		return err
+	var rec *swebench.Recorder
+	var f *os.File
+	if *eventsDir != "" {
+		rec, err = swebench.NewShardRecorder(*eventsDir, *runID, *worker)
+		if err != nil {
+			return err
+		}
+	} else {
+		f, err = os.Create(*out)
+		if err != nil {
+			return err
+		}
+		rec = swebench.NewRecorder(f)
+		if *worker != "" {
+			rec.SetWorker(*worker)
+		}
 	}
-	rec := swebench.NewRecorder(f)
+	if *jobName != "" {
+		rec.SetJob(*jobName)
+	}
+	if *enableTracing {
+		shutdown, err := telemetry.SetupOTel(context.Background(), tracingServiceName)
+		if err != nil {
+			return fmt.Errorf("-enable-tracing: %w", err)
+		}
+		// Deferred before the recorder close below, so it runs after it: the
+		// run span ends, then the exporter flushes.
+		defer shutdown()
+		// SetupOTel installed the global provider; the scope is the service
+		// name with '-' replaced by '_', as for ate-env-api.
+		tracer := otel.Tracer(strings.ReplaceAll(tracingServiceName, "-", "_"))
+		runCtx, runSpan := tracer.Start(context.Background(), tracingServiceName+".run",
+			oteltrace.WithAttributes(attribute.String("run", *runID), attribute.String("mode", *mode)))
+		defer runSpan.End()
+		rec.SetTracer(tracer, runCtx)
+		log.Info("tracing enabled", slog.String("otlp_endpoint", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")))
+	}
 	// Events lost to a write error, or a file that does not flush, must fail
 	// the run rather than produce a report with holes.
 	defer func() {
 		if rerr := rec.Close(); rerr != nil && retErr == nil {
 			retErr = fmt.Errorf("writing events to %s: %w", *out, rerr)
 		}
-		if cerr := f.Close(); cerr != nil && retErr == nil {
-			retErr = fmt.Errorf("closing %s: %w", *out, cerr)
+		if f != nil {
+			if cerr := f.Close(); cerr != nil && retErr == nil {
+				retErr = fmt.Errorf("closing %s: %w", *out, cerr)
+			}
 		}
 	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	startTS := time.Now().UTC()
 	sum, err := swebench.Run(ctx, swebench.Config{
 		RunID:         *runID,
+		Dataset:       *dataset,
 		Backend:       backend,
 		Instances:     selected,
 		Trajectory:    traj,
@@ -419,12 +652,18 @@ func runCmd(args []string) (retErr error) {
 		Logger:        log,
 		Mode:          swebench.Mode(*mode),
 		Width:         *width,
+		ArrivalRate:   *arrivalRate,
 		TasksPerImage: *tasksPerImage,
 		Rollouts:      *rollouts,
 		Steps:         *steps,
 		Park:          swebench.Park(*park),
 		ImagesPerStep: *imagesPerStep,
 		ParkEach:      *parkEach,
+		Schedule:      sched,
+		TasksPerStep:  *tasksPerStep,
+		GroupSize:     *groupSize,
+		StepPause:     *stepPause,
+		Prefetch:      *prefetch,
 		CreateTimeout: *createTimeout,
 		StepTimeout:   *stepTimeout,
 		WakeBudget:    *wakeBudget,
@@ -433,6 +672,48 @@ func runCmd(args []string) (retErr error) {
 		Labels:        labels,
 		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids, effective),
 	})
+	endTS := time.Now().UTC()
+	_ = rec.Flush()
+
+	if *runWindow != "" {
+		tName := *testName
+		if tName == "" {
+			tName = "swebench-" + *mode
+		}
+		rw := schema.RunWindow{
+			SchemaVersion: schema.SchemaVersion,
+			RunID:         *runID,
+			TestName:      tName,
+			Tag:           *tag,
+			StartTS:       startTS.Format(time.RFC3339Nano),
+			EndTS:         endTS.Format(time.RFC3339Nano),
+			SUTEndpoint:   *endpoint,
+			// The Go loader captures no SDK trace; say so explicitly.
+			Metadata: map[string]string{swebench.TraceCapturedMetadataKey: "false"},
+		}
+		if wErr := swebench.WriteRunWindow(*runWindow, rw); wErr != nil {
+			return wErr
+		}
+	}
+
+	if *statsOut != "" || *validate {
+		rep, sErr := swebench.SummarizeFile(*out)
+		if sErr != nil {
+			return sErr
+		}
+		if *statsOut != "" {
+			if wErr := swebench.WriteStatsJSONL(*statsOut, rep, *runID, *testName, *tag); wErr != nil {
+				return wErr
+			}
+		}
+		if *validate {
+			v := swebench.Validate(rep, swebench.ValidateOptions{})
+			if !v.Valid {
+				return fmt.Errorf("report validation failed: %s", strings.Join(v.Reasons, "; "))
+			}
+		}
+	}
+
 	if sum != nil {
 		log.Info("run finished", slog.Int("tasks", sum.Tasks), slog.Int("failed", sum.Failed),
 			slog.Int("rewarded", sum.Rewarded), slog.Duration("duration", sum.Duration))
@@ -447,21 +728,47 @@ func runCmd(args []string) (retErr error) {
 }
 
 func reportCmd(args []string, ws ...io.Writer) error {
-	var w io.Writer = os.Stdout
+	var stdout io.Writer = os.Stdout
 	if len(ws) > 0 && ws[0] != nil {
-		w = ws[0]
+		stdout = ws[0]
 	}
+	return reportCmdWithIO(args, stdout, os.Stderr)
+}
+
+func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 	files, rest := leadingFiles(args)
 	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	var arms armFlags
 	fs.Var(&arms, "arm", "NAME=FILE[,FILE...], repeatable: one column per arm, in flag order, its percentiles computed over the merged raw events of its files, the reps of one cluster or build, which must be complete runs of one workload (same loader labels, distinct run ids, a run in one arm only). A path may not contain a comma. No positional files with -arm.")
-	top := fs.Int("top", 0, "List the N slowest successful first commands and wakes by environment. One file only.")
-	jsonOut := fs.String("json", "", "Also write the summary as JSON to this path (an array when several files are given).")
-	unresolvedOut := fs.String("unresolved", "", "Write the unresolved instances to this path in -exclude-file format; one file only.")
-	unresolvedNote := fs.String("unresolved-note", "Instances graded unresolved", "First comment line of the -unresolved file.")
-	cacheBefore := fs.String("cache-before", "", "Node cache sample taken before the run (benchmarking/swebench/sample-node-cache.sh); with -cache-after, the report adds the run's cache misses. One file only.")
-	cacheAfter := fs.String("cache-after", "", "Node cache sample taken after the run.")
-	restoreLog := fs.String("restore-log", "", "atelet restore records for the run (benchmarking/swebench/harvest-restore-timings.sh); the report adds the restore phases per environment. One file only.")
+	var (
+		top            = fs.Int("top", 0, "List the N slowest successful first commands and wakes by environment. One file only.")
+		in             = fs.String("in", "", "Input events.jsonl file (alternative to positional FILE).")
+		eventsGlob     = fs.String("events-glob", "", "Glob pattern for multi-worker event shards (e.g. 'events/*.jsonl').")
+		jsonOut        = fs.String("json", "", "Also write the summary as JSON to this path (an array when several files are given).")
+		out            = fs.String("out", "", "Alias for -json: write the summary as JSON to this path.")
+		mdOut          = fs.String("md", "", "Optional path to write Markdown report (including ## Validity).")
+		unresolved     = fs.String("unresolved", "", "Write the unresolved instances to this path in -exclude-file format; one file only.")
+		unresNote      = fs.String("unresolved-note", "Instances graded unresolved", "First comment line of the -unresolved file.")
+		cacheBefore    = fs.String("cache-before", "", "Node cache sample taken before the run (benchmarking/swebench/sample-node-cache.sh); with -cache-after, the report adds the run's cache misses. One file only.")
+		cacheAfter     = fs.String("cache-after", "", "Node cache sample taken after the run.")
+		restoreLog     = fs.String("restore-log", "", "atelet restore records for the run (benchmarking/swebench/harvest-restore-timings.sh); the report adds the restore phases per environment. One file only.")
+		restoreTimings = fs.String("restore-timings", "", "Alias for -restore-log: restore records for the run.")
+		runWindow      = fs.String("run-window", "", "Optional path to run_window.json to validate and attach to the report.")
+		statsOut       = fs.String("stats-out", "", "Optional path to write flat stats.jsonl rows.")
+		testName       = fs.String("test-name", "", "Optional test_name for stats.jsonl (default: swebench-<mode>).")
+		tag            = fs.String("tag", "", "Optional tag for stats.jsonl.")
+		validate       = fs.Bool("validate", false, "Evaluate Validity Rules 1-7 and exit non-zero on failure.")
+		footing        = fs.String("footing", "", "Expected footing for Validity Rule 1 (warm | cold).")
+		minReward      = fs.Float64("min-reward-rate", 0, "Minimum reward rate for Validity Rule 2.")
+		minTasks       = fs.Int("min-tasks", 0, "Minimum task count for Validity Rule 3.")
+		maxFailCr      = fs.Float64("max-failed-create-ratio", -1, "Maximum failed create ratio for Validity Rule 4.")
+		schedPath      = fs.String("schedule", "", "Optional schedule.json path for Validity Rule 5.")
+		traceMode      = fs.Bool("trace-mode", false, "Record that an SDK trace was captured (Validity Rule 6).")
+		orphanCount    = fs.Int("orphan-count", 0, "Remaining orphan count after reap (Validity Rule 7).")
+		compareFlag    = fs.String("compare", "", "Comma-separated events.jsonl or report.json files to compare against.")
+		thresholds     = fs.String("thresholds", "", "Optional thresholds.yaml path for regression gating.")
+	)
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
@@ -473,43 +780,123 @@ func reportCmd(args []string, ws ...io.Writer) error {
 	if *top < 0 {
 		return fmt.Errorf("-top wants 0 or more, got %d", *top)
 	}
+	if *out != "" && *jsonOut == "" {
+		*jsonOut = *out
+	}
+	if *restoreTimings != "" && *restoreLog == "" {
+		*restoreLog = *restoreTimings
+	}
 	if len(arms) > 0 {
-		if len(files) > 0 {
+		if len(files) > 0 || *in != "" {
 			return fmt.Errorf("with -arm, give every events file inside an -arm value")
 		}
-		if *unresolvedOut != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" || *top > 0 {
+		if *unresolved != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" || *top > 0 {
 			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log and -top take one events file, not -arm")
 		}
-		return reportArms(arms, *jsonOut, w)
+		return reportArms(arms, *jsonOut, stdout)
 	}
-	if len(files) == 0 {
+	if *in != "" {
+		files = append(files, *in)
+	}
+
+	var compareFiles []string
+	if *compareFlag != "" {
+		for _, p := range strings.Split(*compareFlag, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				compareFiles = append(compareFiles, p)
+			}
+		}
+	}
+
+	if len(files) == 0 && *eventsGlob == "" && len(compareFiles) == 0 {
 		return fmt.Errorf("report needs at least one JSONL file, or -arm")
 	}
-	reps := make([]*swebench.Report, 0, len(files))
+
+	var rw *schema.RunWindow
+	if *runWindow != "" {
+		loadedRW, err := swebench.ReadRunWindow(*runWindow)
+		if err != nil {
+			return err
+		}
+		rw = loadedRW
+	}
+
+	var reps []*swebench.Report
+	var labels []string
 	var events []swebench.Event // of the single file, for the restore join
+
+	if *eventsGlob != "" {
+		rep, err := swebench.SummarizeGlob(*eventsGlob)
+		if err != nil {
+			return err
+		}
+		reps = append(reps, rep)
+		labels = append(labels, *eventsGlob)
+	}
+
 	for _, path := range files {
-		if (*restoreLog != "" || *top > 0) && len(files) == 1 {
+		if (*restoreLog != "" || *top > 0) && len(files) == 1 && *eventsGlob == "" && len(compareFiles) == 0 {
 			evs, err := readEventsFile(path)
 			if err != nil {
 				return fmt.Errorf("%s: %w", path, err)
 			}
 			events = evs
 			reps = append(reps, swebench.Build(evs))
+			labels = append(labels, path)
 			continue
 		}
-		rep, err := summarizeFile(path)
+		rep, err := loadOrSummarizeFile(path)
 		if err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
 		reps = append(reps, rep)
+		labels = append(labels, path)
 	}
+
+	// If -compare was provided along with a single primary report (-in / -events-glob / single file)
+	// and len(compareFiles) == 1, treat compareFiles[0] as baseline and the primary report as candidate.
+	if len(compareFiles) > 0 {
+		var compReps []*swebench.Report
+		for _, p := range compareFiles {
+			r, err := loadOrSummarizeFile(p)
+			if err != nil {
+				return fmt.Errorf("%s: %w", p, err)
+			}
+			compReps = append(compReps, r)
+		}
+		if len(reps) == 1 && len(compReps) == 1 {
+			reps = []*swebench.Report{compReps[0], reps[0]}
+			labels = []string{compareFiles[0], labels[0]}
+		} else {
+			reps = append(reps, compReps...)
+			labels = append(labels, compareFiles...)
+		}
+	}
+
 	if len(reps) > 1 {
 		// Several runs: one table, a column per run, for the same workload on
 		// different clusters or builds.
-		if *unresolvedOut != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" || *top > 0 {
+		if *unresolved != "" || (*cacheBefore != "" && !*validate) || (*cacheAfter != "" && !*validate) || *restoreLog != "" || *top > 0 {
 			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log and -top take one events file")
 		}
-		swebench.WriteComparison(w, reps, files)
+		swebench.WriteComparison(stdout, reps, labels)
+		if *thresholds != "" {
+			th, err := swebench.LoadThresholds(*thresholds)
+			if err != nil {
+				return err
+			}
+			res := swebench.Compare(reps[0], reps[len(reps)-1], th)
+			fmt.Fprintln(stdout)
+			fmt.Fprint(stdout, swebench.FormatComparisonMarkdown(res))
+			if *mdOut != "" {
+				if err := os.WriteFile(*mdOut, []byte(swebench.FormatComparisonMarkdown(res)), 0o644); err != nil {
+					return err
+				}
+			}
+			if !res.Passed {
+				return fmt.Errorf("threshold regression detected: %s", strings.Join(res.Regressions, "; "))
+			}
+		}
 		if *jsonOut != "" {
 			b, err := json.MarshalIndent(reps, "", "  ")
 			if err != nil {
@@ -519,21 +906,36 @@ func reportCmd(args []string, ws ...io.Writer) error {
 		}
 		return nil
 	}
+
 	rep := reps[0]
+	if rw != nil {
+		if *traceMode {
+			if rw.Metadata == nil {
+				rw.Metadata = map[string]string{}
+			}
+			rw.Metadata[swebench.TraceCapturedMetadataKey] = "true"
+		}
+		rep.RunWindow = rw
+		if rep.RunID == "" {
+			rep.RunID = rw.RunID
+		}
+	}
 	if (*cacheBefore == "") != (*cacheAfter == "") {
 		return fmt.Errorf("-cache-before and -cache-after go together")
 	}
 	if *cacheBefore != "" {
-		before, err := loadCacheSample(*cacheBefore)
-		if err != nil {
-			return err
+		before, errB := loadCacheSample(*cacheBefore)
+		after, errA := loadCacheSample(*cacheAfter)
+		if errB == nil && errA == nil {
+			d := before.Delta(after)
+			rep.Cache = &d
+			rep.PopulateCacheMissesPerFirstCmd()
+		} else if !*validate {
+			if errB != nil {
+				return errB
+			}
+			return errA
 		}
-		after, err := loadCacheSample(*cacheAfter)
-		if err != nil {
-			return err
-		}
-		d := before.Delta(after)
-		rep.Cache = &d
 	}
 	if *restoreLog != "" {
 		f, err := os.Open(*restoreLog)
@@ -550,25 +952,41 @@ func reportCmd(args []string, ws ...io.Writer) error {
 	if *top > 0 {
 		rep.Slowest = swebench.Slowest(events, *top)
 	}
-	rep.WriteText(w)
-	if *unresolvedOut != "" {
-		uf, err := os.Create(*unresolvedOut)
-		if err != nil {
-			return err
+
+	var valErr error
+	if *validate {
+		valOpts := swebench.ValidateOptions{
+			Footing:         *footing,
+			MinRewardRate:   *minReward,
+			CheckRewardRate: *minReward > 0,
+			MinTasks:        *minTasks,
+			TraceCaptured:   *traceMode,
+			OrphanCount:     *orphanCount,
+			CacheBeforePath: *cacheBefore,
+			CacheAfterPath:  *cacheAfter,
 		}
-		rep.WriteExclusions(uf, *unresolvedNote)
-		if err := uf.Close(); err != nil {
-			return err
+		if *maxFailCr >= 0 {
+			valOpts.MaxFailedCreateRatio = *maxFailCr
+			valOpts.CheckFailedCreates = true
+		}
+		if *schedPath != "" {
+			sched, sErr := swebench.ReadSchedule(*schedPath)
+			if sErr != nil {
+				return sErr
+			}
+			valOpts.Schedule = sched
+		}
+		validity := swebench.Validate(rep, valOpts)
+		if !validity.Valid {
+			valErr = fmt.Errorf("report validation failed: %s", strings.Join(validity.Reasons, "; "))
 		}
 	}
-	if *jsonOut != "" {
-		b, err := json.MarshalIndent(rep, "", "  ")
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(*jsonOut, b, 0o644)
+
+	rep.WriteText(stdout)
+	if err := swebench.WriteReportFiles(rep, *jsonOut, *mdOut, *unresolved, *unresNote, *statsOut, *testName, *tag); err != nil {
+		return err
 	}
-	return nil
+	return valErr
 }
 
 // leadingFiles splits report's arguments into the events files, which come
@@ -583,14 +1001,12 @@ func leadingFiles(args []string) (files, rest []string) {
 }
 
 func summarizeFile(path string) (*swebench.Report, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return swebench.Summarize(f)
+	return swebench.SummarizeFile(path)
 }
 
+func loadOrSummarizeFile(path string) (*swebench.Report, error) {
+	return swebench.LoadOrSummarizeReport(path)
+}
 func readEventsFile(path string) ([]swebench.Event, error) {
 	f, err := os.Open(path)
 	if err != nil {

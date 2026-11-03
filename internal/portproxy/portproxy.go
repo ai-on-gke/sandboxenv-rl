@@ -23,23 +23,30 @@
 // /v1alpha/atespaces/{atespace}/envs/{id}/ports/{port}/... . The proxy opens
 // an HTTP CONNECT tunnel through the atenet router's CONNECT listener, naming
 // the actor in ate-target-actor and the port in the CONNECT authority. The
-// router resumes a suspended actor before it answers, then forwards the tunnel
-// to that port. The proxy speaks HTTP/1.1 to the daemon through the tunnel and
-// keeps idle tunnels for reuse, one pool for each environment and port.
+// router (Substrate v0.6.0) accepts the tunnel at once and resumes a suspended
+// actor for each request inside it, holding the request while the actor wakes
+// (see modifyResponse). The proxy speaks HTTP/1.1 to the daemon through the
+// tunnel and keeps idle tunnels for reuse, one pool for each environment and
+// port.
 //
 // Trust model: without Options.Authenticate, the proxy does not authenticate
 // callers. Whoever can reach the listener it is served on can reach any TCP
-// port of any actor the router serves, in any atespace, including actors that
-// ate-env did not create. With it, a caller must present the API's bearer
-// token in EnvAuthorizationHeader or Authorization, and the token does not
-// reach the daemon. Either way, a daemon behind it must authenticate its own
-// clients. The path form refuses
+// port of any actor the router serves in the atespaces Options.Atespaces
+// allows (all of them when it is empty), including actors that ate-env did not
+// create: Substrate actors carry no label that tells them apart, thus a
+// dedicated atespace is the boundary. With Authenticate, a caller must present
+// the API's bearer token in EnvAuthorizationHeader or Authorization, and the
+// token does not reach the daemon. A WebSocket client that cannot set headers
+// presents a port capability instead (see CapabilityUser). Either way, a daemon
+// behind it must
+// authenticate its own clients. The path form refuses
 // requests that a browser sends from another origin (see Options.TrustedOrigins),
 // so a web page cannot drive a daemon through a port-forwarded listener.
 package portproxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -51,12 +58,17 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/agent-substrate/env/internal/ate"
 	"github.com/agent-substrate/env/internal/routertls"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // The routing headers. They match the x-env-id and x-env-atespace metadata
@@ -77,13 +89,14 @@ const EnvAuthorizationHeader = "X-Env-Authorization"
 // answer to CONNECT, which includes resuming a suspended actor.
 const DefaultHandshakeTimeout = 2 * time.Minute
 
-// DefaultWakeBudget bounds how long a request waits for a suspended
-// environment to wake. The router's CONNECT is what resumes a suspended
-// actor, and the router holds it only for its own parking budget, a few
-// seconds; a wake that pulls an image or reads a snapshot across a region
-// takes longer. The same two minutes as ate-env-api's guest calls
-// (apiservice.DefaultWakeBudget).
-const DefaultWakeBudget = 2 * time.Minute
+// DefaultWakeBudget bounds how long dial retries a CONNECT that the router
+// refuses with 503. Substrate v0.6.0's router refuses a CONNECT only at the
+// Envoy level, for example when overloaded: it accepts the tunnel for any
+// actor state and resumes the actor for the request inside it, which it
+// holds itself (see modifyResponse). The same five minutes as ate-env-api's
+// guest calls (apiservice.DefaultWakeBudget), which share the --wake-budget
+// flag.
+const DefaultWakeBudget = 5 * time.Minute
 
 // Idle tunnels: each one is a TCP stream from the API to an actor, held open
 // by the router and the worker. Keep few, and not for long, so an idle
@@ -130,10 +143,21 @@ type Options struct {
 	// TrustedOrigins are browser origins (scheme://host[:port]) allowed to use
 	// the path form from a page they serve, next to the listener's own origin.
 	TrustedOrigins []string
-	// WakeBudget bounds how long a request waits while the router answers
-	// 503 for an environment that is suspended or still waking. Zero means
+	// WakeBudget bounds how long dial retries a CONNECT that the router
+	// refuses with 503, which Substrate v0.6.0's router does only at the
+	// Envoy level (overload, drain), never for an actor state. Zero means
 	// DefaultWakeBudget.
 	WakeBudget time.Duration
+	// ActorState, when set, reads an environment's state from the control
+	// plane. The proxy calls it only for an answer that is the router's 503
+	// or 404 for the environment (see modifyResponse), never on the fast
+	// path, and at most once per stateCacheTTL for one environment. The
+	// router answers a CRASHED or DELETING actor with the same 503 as a
+	// passing state; with this read, a crashed environment gets 410 and a
+	// deleting one 404, each with EnvStateHeader. An error with code NotFound
+	// means the environment is gone (404). Other errors leave the router's
+	// answer unchanged.
+	ActorState func(ctx context.Context, atespace, id string) (ateapipb.ActorState, error)
 	// Authenticate, when set, checks the caller before a request is
 	// forwarded. It gets the value of EnvAuthorizationHeader, or of
 	// Authorization when the request has no EnvAuthorizationHeader. An error
@@ -141,23 +165,52 @@ type Options struct {
 	// daemon: the proxy drops EnvAuthorizationHeader, and drops Authorization
 	// when it carried the credential.
 	Authenticate func(credential string) error
+	// AuthenticateCapability, when set next to Authenticate, checks a port
+	// capability (see CapabilityUser) for the environment port of the
+	// request. The proxy calls it only for a WebSocket upgrade request whose
+	// Authorization is Basic with the user CapabilityUser and that has no
+	// EnvAuthorizationHeader. An error refuses the request with 401.
+	AuthenticateCapability func(capability, atespace, id string, port int) error
+
+	// Atespaces, when set, are the only atespaces whose environments the
+	// proxy forwards to; a request that names another gets 403, after
+	// Authenticate. Empty means any atespace the router serves.
+	// DefaultAtespace is not implied: list it to serve requests that name
+	// no atespace.
+	Atespaces []string
 	// OnConnected, when set, is called with the environment's atespace and
-	// id each time the router accepts a CONNECT to one of its ports, after
-	// any wait for a wake. ate-env-api uses it to end create_to_ready when a
-	// port is an environment's first contact.
+	// id when an answer from the environment's port reaches the caller: the
+	// daemon answered, after any wake. It is not called for the router's or
+	// Envoy's own answers, which stand for an environment that sleeps,
+	// crashed, is deleting or is gone (see modifyResponse). ate-env-api uses
+	// it to end create_to_ready when a port is an environment's first
+	// contact. It can be called more than once for one environment.
 	OnConnected func(atespace, id string)
+	// OnCrashed, when set, is called with the environment's atespace and id
+	// when the state read behind a router answer finds the environment
+	// CRASHED, as the caller gets 410. ate-env-api uses it to end
+	// create_to_ready with status crashed.
+	OnCrashed func(atespace, id string)
 }
 
 // Proxy is an http.Handler that forwards each request to the environment port
 // its headers name.
 type Proxy struct {
-	opts Options
-	rp   *httputil.ReverseProxy
-	tr   *http.Transport
-	cop  *http.CrossOriginProtection
+	opts      Options
+	atespaces map[string]bool // nil: any atespace
+	rp        *httputil.ReverseProxy
+	tr        *http.Transport
+	cop       *http.CrossOriginProtection
+
+	stateMu    sync.Mutex
+	states     map[string]*stateEntry // see actorState
+	stateLogAt time.Time              // last failed state read logged
+	// statePanicAt is when a panicking state read was last logged.
+	statePanicAt time.Time
 }
 
-// New returns a Proxy. It fails only on a malformed trusted origin.
+// New returns a Proxy. It fails only on a malformed trusted origin or
+// atespace.
 func New(opts Options) (*Proxy, error) {
 	if opts.HostSuffix == "" {
 		opts.HostSuffix = ate.DefaultHostSuffix
@@ -174,6 +227,16 @@ func New(opts Options) (*Proxy, error) {
 			return nil, fmt.Errorf("trusted origin: %w", err)
 		}
 	}
+	if len(opts.Atespaces) > 0 {
+		p.atespaces = map[string]bool{}
+		for _, a := range opts.Atespaces {
+			if !label.MatchString(a) {
+				return nil, fmt.Errorf("atespace %q is not valid", a)
+			}
+			p.atespaces[a] = true
+		}
+		p.opts.Atespaces = nil
+	}
 	p.tr = &http.Transport{
 		DialContext:           p.dial,
 		MaxIdleConnsPerHost:   idleTunnelsPerPort,
@@ -189,8 +252,9 @@ func New(opts Options) (*Proxy, error) {
 		Transport: p.tr,
 		// Flush each write at once, so streamed responses (server-sent events,
 		// chunked output) reach the caller as the daemon produces them.
-		FlushInterval: -1,
-		ErrorHandler:  p.handleError,
+		FlushInterval:  -1,
+		ErrorHandler:   p.handleError,
+		ModifyResponse: p.modifyResponse,
 	}
 	return p, nil
 }
@@ -354,7 +418,7 @@ func (p *Proxy) ServePath(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if !p.authenticate(w, r, &t) {
+	if !p.authenticate(w, r, &t) || !p.inScope(w, t) {
 		return
 	}
 	check := r
@@ -379,25 +443,62 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if !p.authenticate(w, r, &t) {
+	if !p.authenticate(w, r, &t) || !p.inScope(w, t) {
 		return
 	}
 	p.rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), targetKey{}, t)))
 }
 
-// authenticate checks the caller with Options.Authenticate and records in t
-// which header to drop upstream. It answers 401 and returns false when the
-// check fails.
+// inScope answers 403 and returns false when t's atespace is not one that
+// Options.Atespaces allows.
+func (p *Proxy) inScope(w http.ResponseWriter, t target) bool {
+	if p.atespaces == nil || p.atespaces[t.atespace] {
+		return true
+	}
+	http.Error(w, fmt.Sprintf("the port proxy does not forward to atespace %q", t.atespace), http.StatusForbidden)
+	return false
+}
+
+// authenticate checks the caller with Options.Authenticate, or a port
+// capability with Options.AuthenticateCapability, and records in t which
+// header to drop upstream. It answers 401 and returns false when the check
+// fails.
 func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request, t *target) bool {
+	capability, hasCapability, ambiguous := capabilityCredential(r)
+	if ambiguous {
+		// Refused whether or not the proxy checks callers: forwarding would
+		// hand the daemon a capability, and dropping all Authorization would
+		// silently drop the daemon's own credential.
+		http.Error(w, "a port capability must be the only Authorization credential", http.StatusBadRequest)
+		return false
+	}
+	if hasCapability {
+		// A capability is the API's credential, never the daemon's: drop it
+		// whether or not the proxy checks it.
+		t.dropAuthorization = true
+	}
 	if p.opts.Authenticate == nil {
 		return true
 	}
-	credential := r.Header.Get(EnvAuthorizationHeader)
-	if credential == "" {
-		credential = r.Header.Get("Authorization")
+	var err error
+	switch credential := r.Header.Get(EnvAuthorizationHeader); {
+	case credential != "":
+		err = p.opts.Authenticate(credential)
+	case hasCapability:
+		if p.opts.AuthenticateCapability == nil || !isWebSocketUpgrade(r) {
+			err = errCapability
+		} else {
+			err = p.opts.AuthenticateCapability(capability, t.atespace, t.id, t.port)
+		}
+	default:
 		t.dropAuthorization = true
+		err = p.opts.Authenticate(r.Header.Get("Authorization"))
 	}
-	if err := p.opts.Authenticate(credential); err != nil {
+	if err != nil {
+		if status.Code(err) == codes.Internal {
+			http.Error(w, status.Convert(err).Message(), http.StatusInternalServerError)
+			return false
+		}
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		http.Error(w, "missing or invalid bearer token; send it in "+EnvAuthorizationHeader+
 			" or Authorization", http.StatusUnauthorized)
@@ -496,10 +597,10 @@ func (p *Proxy) stopped(ctx context.Context, atespace, id string, attempts int, 
 }
 
 // dial opens a CONNECT tunnel to the environment port encoded in addr (see
-// rewrite). While the router answers 503, which is what a suspended actor
-// and one still waking both look like, it tries again with backoff until
-// WakeBudget is spent: the first CONNECT is what resumes the actor, and the
-// router holds it only for its own parking budget.
+// rewrite). While the router refuses the CONNECT with 503, it tries again
+// with backoff until WakeBudget is spent. Substrate v0.6.0's router refuses
+// only at the Envoy level (overload, drain); it accepts the tunnel for any
+// actor state and resumes the actor for the request inside it.
 func (p *Proxy) dial(ctx context.Context, _, addr string) (net.Conn, error) {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -514,9 +615,6 @@ func (p *Proxy) dial(ctx context.Context, _, addr string) (net.Conn, error) {
 		conn, err := p.connect(ctx, id, atespace, portStr)
 		if err != nil && ctx.Err() != nil {
 			return nil, p.stopped(ctx, atespace, id, attempt, err)
-		}
-		if err == nil && p.opts.OnConnected != nil {
-			p.opts.OnConnected(atespace, id)
 		}
 		var re *routerError
 		if !errors.As(err, &re) || re.status != http.StatusServiceUnavailable {
@@ -538,6 +636,261 @@ func (p *Proxy) dial(ctx context.Context, _, addr string) (net.Conn, error) {
 		case <-time.After(min(backoff, remaining)):
 		}
 		backoff = min(backoff*2, wakeRetryMaxBackoff)
+	}
+}
+
+// EnvStateHeader names the actor state on an answer for an environment that
+// will not wake, so a client can stop without matching the body.
+const EnvStateHeader = "X-Env-State"
+
+// stateReadLogEvery bounds how often a failed state read is logged.
+const stateReadLogEvery = 10 * time.Second
+
+// stateReadTimeout bounds one state read, so a stalled control plane does
+// not hold the answer. A variable for the tests.
+var stateReadTimeout = 10 * time.Second
+
+// stateCacheTTL is how long a state read answers for one environment: a
+// burst of router errors for it costs one control-plane read.
+const stateCacheTTL = 2 * time.Second
+
+// stateEntry is one state read, shared by the answers that need it while it
+// runs and for stateCacheTTL after. st, err and at are set before done is
+// closed.
+type stateEntry struct {
+	done chan struct{}
+	st   ateapipb.ActorState
+	err  error
+	at   time.Time
+}
+
+// modifyResponse turns the router's answers for an environment that is not
+// serving into answers a client can act on. Substrate v0.6.0's router accepts
+// every CONNECT and resumes the actor for the request inside the tunnel:
+//
+//   - a CRASHED or DELETING actor gets 503 "actor <atespace>/<id>
+//     unavailable: ..." after the router's 5 s park, the same as a passing
+//     state, and a deleted one 404 "actor ... not found", each a text/plain
+//     ext_proc answer with a Content-Length;
+//   - a wake that outlasts Envoy's ext_proc message timeout (the park budget
+//     plus 5 s, 10 s by default) gets Envoy's own 504 with an empty body; the
+//     wake goes on.
+//
+// For such an answer, and only for it, the proxy reads the actor state:
+// CRASHED gets 410 Gone, DELETING 404, a deleted actor 404, and, for the
+// empty 504 or 500, SUSPENDED or RESUMING gets 503 with Retry-After: 1, each
+// with EnvStateHeader. Otherwise the answer passes unchanged: the daemon's own
+// 503, 404, 504 or 500 included (a RUNNING actor), and when the read fails.
+// The proxy never sends a request again. A refused WebSocket upgrade comes
+// here too.
+func (p *Proxy) modifyResponse(resp *http.Response) error {
+	t, ok := resp.Request.Context().Value(targetKey{}).(target)
+	if !ok {
+		return nil
+	}
+	if p.opts.ActorState == nil {
+		// Without a state read the proxy cannot tell the router's 5xx from
+		// the daemon's; a lower status is the daemon's answer.
+		if resp.StatusCode < http.StatusInternalServerError {
+			p.connected(t)
+		}
+		return nil
+	}
+	head := resp.Request.Method == http.MethodHead
+	switch resp.StatusCode {
+	case http.StatusServiceUnavailable, http.StatusNotFound:
+		if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain") {
+			p.connected(t)
+			return nil
+		}
+		// HEAD has no body to match; status and content type decide, and
+		// the state read confirms.
+		if !head && !routerBody(resp, t) {
+			p.connected(t)
+			return nil
+		}
+	case http.StatusGatewayTimeout, http.StatusInternalServerError:
+		// Envoy's own answer when the wake outlasts its ext_proc timeout:
+		// no body. A daemon's error with a body is the daemon's.
+		if !head && resp.ContentLength != 0 {
+			p.connected(t)
+			return nil
+		}
+	default:
+		// The daemon answered, thus the environment is awake and serving.
+		p.connected(t)
+		return nil
+	}
+	st, err := p.actorState(resp.Request.Context(), t.atespace, t.id)
+	switch {
+	case status.Code(err) == codes.NotFound, errors.Is(err, ate.ErrNotFound):
+		if resp.StatusCode != http.StatusNotFound {
+			replaceAnswer(resp, t, http.StatusNotFound, "", "was not found")
+		}
+	case err != nil:
+		if resp.Request.Context().Err() == nil { // not a caller that left
+			p.logStateReadError(t.atespace, t.id, err)
+		}
+	case st == ateapipb.ActorState_ACTOR_STATE_CRASHED:
+		replaceAnswer(resp, t, http.StatusGone, "CRASHED", "has crashed (actor state CRASHED); delete it and create a new one")
+		p.crashed(t)
+	case st == ateapipb.ActorState_ACTOR_STATE_DELETING:
+		replaceAnswer(resp, t, http.StatusNotFound, "DELETING", "is being deleted (actor state DELETING)")
+	case resp.StatusCode == http.StatusGatewayTimeout || resp.StatusCode == http.StatusInternalServerError:
+		// A wake that ends after Envoy's timeout but before this read
+		// reads RUNNING, and the empty 504 passes unchanged: the proxy
+		// cannot tell it from a daemon's empty 504. The window is short,
+		// and a retry then reaches the daemon.
+		if name, waking := wakingStates[st]; waking {
+			replaceAnswer(resp, t, http.StatusServiceUnavailable, name, "is still waking; retry")
+			resp.Header.Set("Retry-After", "1")
+		}
+	}
+	return nil
+}
+
+// connected reports an answer the daemon served to Options.OnConnected.
+func (p *Proxy) connected(t target) {
+	if p.opts.OnConnected != nil {
+		p.opts.OnConnected(t.atespace, t.id)
+	}
+}
+
+// crashed reports a CRASHED environment to Options.OnCrashed.
+func (p *Proxy) crashed(t target) {
+	if p.opts.OnCrashed != nil {
+		p.opts.OnCrashed(t.atespace, t.id)
+	}
+}
+
+// wakingStates are the states in which a timed-out wake goes on.
+var wakingStates = map[ateapipb.ActorState]string{
+	ateapipb.ActorState_ACTOR_STATE_SUSPENDED: "SUSPENDED",
+	ateapipb.ActorState_ACTOR_STATE_RESUMING:  "RESUMING",
+}
+
+// routerBodyMax bounds the body read to match the router's text. The
+// router's errors are short and carry a Content-Length; a body without one,
+// such as a daemon's streamed answer, passes without a read, thus with no
+// delay.
+const routerBodyMax = 256
+
+// routerBody reports whether resp's body starts the way the router's errors
+// for this actor do (ingress/errors.go in Substrate v0.6.0): "actor
+// <atespace>/<id> ...", or `actor "<atespace>/<id>" unavailable: router at
+// capacity` (parkingFullErr gets actorRef.String(), ingress/resumer.go:301).
+// It reads the body only when its length is known and at most
+// routerBodyMax, and puts it back. A daemon's error does not match, so it
+// costs no state read; one that copies the text costs one read and passes
+// unchanged unless the actor really is crashed or deleting.
+func routerBody(resp *http.Response, t target) bool {
+	if resp.ContentLength <= 0 || resp.ContentLength > routerBodyMax {
+		return false
+	}
+	buf := make([]byte, resp.ContentLength)
+	n, _ := io.ReadFull(resp.Body, buf)
+	buf = buf[:n]
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(buf), resp.Body), resp.Body}
+	ref := t.atespace + "/" + t.id
+	body := string(buf)
+	return strings.HasPrefix(body, "actor "+ref+" ") || strings.HasPrefix(body, `actor "`+ref+`"`)
+}
+
+// replaceAnswer replaces resp with the proxy's own text answer.
+func replaceAnswer(resp *http.Response, t target, code int, state, cause string) {
+	resp.Body.Close()
+	body := fmt.Sprintf("environment %s/%s port %d %s\n", t.atespace, t.id, t.port, cause)
+	resp.StatusCode = code
+	resp.Status = fmt.Sprintf("%d %s", code, http.StatusText(code))
+	resp.Header = http.Header{}
+	resp.Header.Set("Content-Type", "text/plain; charset=utf-8")
+	resp.Header.Set("X-Content-Type-Options", "nosniff")
+	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	if state != "" {
+		resp.Header.Set(EnvStateHeader, state)
+	}
+	resp.ContentLength = int64(len(body))
+	resp.TransferEncoding = nil
+	resp.Body = io.NopCloser(strings.NewReader(body))
+}
+
+// actorState reads the actor's state, at most once per stateCacheTTL for one
+// environment: concurrent callers share the read in flight. The read gets
+// its own stateReadTimeout and does not end with the caller that started it,
+// so the callers that wait on it are not cut short.
+func (p *Proxy) actorState(ctx context.Context, atespace, id string) (st ateapipb.ActorState, err error) {
+	key := atespace + "/" + id
+	p.stateMu.Lock()
+	if e := p.states[key]; e != nil {
+		select {
+		case <-e.done:
+			if time.Since(e.at) < stateCacheTTL {
+				p.stateMu.Unlock()
+				return e.st, e.err
+			}
+		default:
+			p.stateMu.Unlock()
+			select {
+			case <-e.done:
+				return e.st, e.err
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+		}
+	}
+	e := &stateEntry{done: make(chan struct{})}
+	if p.states == nil {
+		p.states = make(map[string]*stateEntry)
+	}
+	if len(p.states) >= 1024 {
+		for k, old := range p.states {
+			select {
+			case <-old.done:
+				if time.Since(old.at) >= stateCacheTTL {
+					delete(p.states, k)
+				}
+			default:
+			}
+		}
+	}
+	p.states[key] = e
+	p.stateMu.Unlock()
+
+	defer func() {
+		if r := recover(); r != nil {
+			e.st, e.err = 0, fmt.Errorf("reading the state panicked: %v", r)
+			p.logStatePanic(atespace, id, r, debug.Stack())
+		}
+		e.at = time.Now()
+		close(e.done) // never leave the entry in flight
+		st, err = e.st, e.err
+	}()
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stateReadTimeout)
+	defer cancel()
+	e.st, e.err = p.opts.ActorState(rctx, atespace, id)
+	return e.st, e.err
+}
+
+// logStatePanic logs a panic in the state read with its stack, under its
+// own limit, so an earlier ordinary failure cannot hide it.
+func (p *Proxy) logStatePanic(atespace, id string, r any, stack []byte) {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	if now := time.Now(); now.Sub(p.statePanicAt) >= stateReadLogEvery {
+		p.statePanicAt = now
+		log.Printf("port proxy: reading the state of environment %s/%s panicked: %v\n%s", atespace, id, r, stack)
+	}
+}
+
+func (p *Proxy) logStateReadError(atespace, id string, err error) {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	if now := time.Now(); now.Sub(p.stateLogAt) >= stateReadLogEvery {
+		p.stateLogAt = now
+		log.Printf("port proxy: reading the state of environment %s/%s failed; its router error passes unchanged: %v", atespace, id, err)
 	}
 }
 

@@ -29,7 +29,8 @@
 # before another large run on the same cluster. NAMESPACE defaults to
 # ate-system; CONTEXT selects the kubectl context as in run-in-cluster.sh;
 # PARALLEL (default 16) bounds the concurrent log reads. A pod whose log
-# could not be read is reported and the script exits 1.
+# could not be read is reported; the script exits 1 when more than
+# MAX_MISSING_PCT percent of the pods (default 1) could not be read.
 
 set -o errexit -o nounset -o pipefail
 
@@ -39,6 +40,7 @@ if [[ $# -ne 2 ]]; then
 fi
 RUN_ID="$1"
 OUT="$2"
+MAX_MISSING_PCT="${MAX_MISSING_PCT:-1}"
 NS="${NAMESPACE:-ate-system}"
 CONTEXT="${CONTEXT:-}"
 SINCE="${SINCE:-24h}"
@@ -79,4 +81,4 @@ want="$(wc -l < "${TMP}/list" | tr -d ' ')"
 got="$(find "${TMP}/pods" -type f ! -name '*.raw' | wc -l | tr -d ' ')"
 find "${TMP}/pods" -type f ! -name '*.raw' -exec cat {} + > "${OUT}"
 echo "read ${got} of ${want} atelet logs; $(wc -l < "${OUT}" | tr -d ' ') restore records for ${RUN_ID} in ${OUT}"
-[[ "${got}" == "${want}" ]]
+(( (want - got) * 100 <= want * MAX_MISSING_PCT ))

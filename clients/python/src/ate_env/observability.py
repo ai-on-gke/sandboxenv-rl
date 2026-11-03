@@ -61,6 +61,7 @@ from .telemetry.metrics import (
     prometheus_available,
     status_of,
 )
+from .telemetry.trace_recorder import is_measure_mode, should_auto_enable_tracing
 from .telemetry.tracing import set_attributes, start_span, tracer_from_config
 
 __all__ = ["MAX_FAMILIES", "Observer", "RunReport", "repo_family", "serve_metrics"]
@@ -86,25 +87,57 @@ def _build_collectors(prom: Any, registry: Any) -> SimpleNamespace:
     reg = {} if registry is None else {"registry": registry}
     return SimpleNamespace(
         phase_latency=_metric(
-            prom.Histogram, "ate_env_fleet_phase_latency_seconds", "Fleet phase latency",
-            ["phase", "backend", "family", "strategy", "status"], buckets=SEC_BUCKETS, **reg),
+            prom.Histogram,
+            "ate_env_fleet_phase_latency_seconds",
+            "Fleet phase latency",
+            ["phase", "backend", "family", "strategy", "status"],
+            buckets=SEC_BUCKETS,
+            **reg,
+        ),
         task_latency=_metric(
-            prom.Histogram, "ate_env_fleet_task_latency_seconds",
+            prom.Histogram,
+            "ate_env_fleet_task_latency_seconds",
             "Per-task acquire+process+release latency",
-            ["strategy", "backend", "family", "status"], buckets=SEC_BUCKETS, **reg),
+            ["strategy", "backend", "family", "status"],
+            buckets=SEC_BUCKETS,
+            **reg,
+        ),
         run_latency=_metric(
-            prom.Histogram, "ate_env_fleet_run_latency_seconds", "Whole-run latency",
-            ["strategy", "status"], buckets=SEC_BUCKETS, **reg),
-        claims=_metric(prom.Counter, "ate_env_fleet_claims_total", "Environment claims started",
-                       ["backend", "status"], **reg),
-        tasks=_metric(prom.Counter, "ate_env_fleet_tasks_total", "Tasks processed",
-                      ["strategy", "status"], **reg),
+            prom.Histogram,
+            "ate_env_fleet_run_latency_seconds",
+            "Whole-run latency",
+            ["strategy", "status"],
+            buckets=SEC_BUCKETS,
+            **reg,
+        ),
+        claims=_metric(
+            prom.Counter,
+            "ate_env_fleet_claims_total",
+            "Environment claims started",
+            ["backend", "status"],
+            **reg,
+        ),
+        tasks=_metric(
+            prom.Counter,
+            "ate_env_fleet_tasks_total",
+            "Tasks processed",
+            ["strategy", "status"],
+            **reg,
+        ),
         release_failures=_metric(
-            prom.Counter, "ate_env_fleet_release_failures_total",
+            prom.Counter,
+            "ate_env_fleet_release_failures_total",
             "Environment releases (deletes) that failed; the environment may have leaked",
-            ["backend"], **reg),
-        warm_replicas=_metric(prom.Gauge, "ate_env_fleet_warm_replicas", "Current warm replicas",
-                              ["backend"], **reg),
+            ["backend"],
+            **reg,
+        ),
+        warm_replicas=_metric(
+            prom.Gauge,
+            "ate_env_fleet_warm_replicas",
+            "Current warm replicas",
+            ["backend"],
+            **reg,
+        ),
     )
 
 
@@ -127,14 +160,23 @@ def _ensure_metrics(registry: Any = None) -> SimpleNamespace | None:
             return _CUSTOM_COLLECTORS[registry]
         if not _METRICS_READY:
             c = _build_collectors(prom, None)
-            PHASE_LATENCY, TASK_LATENCY, RUN_LATENCY = c.phase_latency, c.task_latency, c.run_latency
+            PHASE_LATENCY, TASK_LATENCY, RUN_LATENCY = (
+                c.phase_latency,
+                c.task_latency,
+                c.run_latency,
+            )
             CLAIMS, TASKS, WARM_REPLICAS = c.claims, c.tasks, c.warm_replicas
             RELEASE_FAILURES = c.release_failures
             _METRICS_READY = True
         return SimpleNamespace(
-            phase_latency=PHASE_LATENCY, task_latency=TASK_LATENCY, run_latency=RUN_LATENCY,
-            claims=CLAIMS, tasks=TASKS, warm_replicas=WARM_REPLICAS,
-            release_failures=RELEASE_FAILURES)
+            phase_latency=PHASE_LATENCY,
+            task_latency=TASK_LATENCY,
+            run_latency=RUN_LATENCY,
+            claims=CLAIMS,
+            tasks=TASKS,
+            warm_replicas=WARM_REPLICAS,
+            release_failures=RELEASE_FAILURES,
+        )
 
 
 _FAMILY_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
@@ -224,8 +266,18 @@ class RunReport:
     peak_warm: int = 0
     environment: dict[str, dict[str, Any]] = field(default_factory=dict)
 
-    ORDER = ("preflight", "plan", "ensure_template", "warm_pool", "acquire", "process",
-             "recycle", "release", "reap", "teardown")
+    ORDER = (
+        "preflight",
+        "plan",
+        "ensure_template",
+        "warm_pool",
+        "acquire",
+        "process",
+        "recycle",
+        "release",
+        "reap",
+        "teardown",
+    )
 
     def add_phase(self, name: str, dur: float) -> None:
         """Add one ``name`` phase of ``dur`` seconds.
@@ -259,8 +311,10 @@ class RunReport:
         return {
             "strategy": self.strategy,
             "total_s": round(self.total_s, 2),
-            "phases": {p: {"count": int(c[0]), "total_s": round(c[1], 2), "max_s": round(c[2], 2)}
-                       for p, c in self._ordered()},
+            "phases": {
+                p: {"count": int(c[0]), "total_s": round(c[1], 2), "max_s": round(c[2], 2)}
+                for p, c in self._ordered()
+            },
             "claims": self.claims,
             "tasks_ok": self.tasks_ok,
             "tasks_err": self.tasks_err,
@@ -292,11 +346,15 @@ class RunReport:
             lines.append(f"  {name:<18} {total:8.2f}s  (n={int(count)}, max={mx:.2f}s)")
         lines.append("  " + "-" * 40)
         lines.append(f"  {'TOTAL':<18} {self.total_s:8.2f}s")
-        lines.append(f"  claims={self.claims}  tasks={self.tasks_ok}ok/{self.tasks_err}err"
-                     f"  warm_replicas total={self.warm_total} peak={self.peak_warm}")
+        lines.append(
+            f"  claims={self.claims}  tasks={self.tasks_ok}ok/{self.tasks_err}err"
+            f"  warm_replicas total={self.warm_total} peak={self.peak_warm}"
+        )
         if self.release_errors:
-            lines.append(f"  release_errors={self.release_errors}  (failed deletes; "
-                         "environments may have leaked)")
+            lines.append(
+                f"  release_errors={self.release_errors}  (failed deletes; "
+                "environments may have leaked)"
+            )
         return "\n".join(lines)
 
     def write(self, report_dir: str | pathlib.Path, n_tasks: int | None = None) -> pathlib.Path:
@@ -321,7 +379,8 @@ class RunReport:
             except FileExistsError:
                 continue
             base.with_name(base.name + ".json").write_text(
-                json.dumps(self.to_dict(), indent=2) + "\n")
+                json.dumps(self.to_dict(), indent=2) + "\n"
+            )
             return base
         raise FileExistsError(f"no free report name for {out / stem}")
 
@@ -354,13 +413,24 @@ class Observer:
             _client_metrics.enable_client_metrics()
             c = self._collectors
             self._phase_latency, self._task_latency, self._run_latency = (
-                c.phase_latency, c.task_latency, c.run_latency)
+                c.phase_latency,
+                c.task_latency,
+                c.run_latency,
+            )
             self._claims, self._tasks, self._warm_replicas = c.claims, c.tasks, c.warm_replicas
             self._release_failures = c.release_failures
-        self.tracer = tracer_from_config(TracerConfig(
-            enable_tracing=self.config.enable_tracing,
-            trace_service_name=self.config.trace_service_name,
-        ))
+        if isinstance(self, _NullObserver):
+            self.tracer = None
+        else:
+            tracing_on = bool(self.config.enable_tracing) or should_auto_enable_tracing(
+                self.config
+            )
+            self.tracer = tracer_from_config(
+                TracerConfig(
+                    enable_tracing=tracing_on,
+                    trace_service_name=self.config.trace_service_name,
+                )
+            )
         self.report: RunReport | None = None
         self._in_run = False
         self._strategy = "-"
@@ -378,7 +448,9 @@ class Observer:
         start = time.monotonic()
         status = "ok"
         with start_span(self.tracer, f"{FLEET_SPAN_PREFIX}.{name}") as span:
-            set_attributes(span, {"strategy": self._strategy, "backend": backend, "family": family})
+            set_attributes(
+                span, {"strategy": self._strategy, "backend": backend, "family": family}
+            )
             try:
                 yield span
             except BaseException as e:
@@ -387,8 +459,13 @@ class Observer:
             finally:
                 dur = time.monotonic() - start
                 if self.metrics:
-                    self._phase_latency.labels(phase=name, backend=backend, family=family,
-                                         strategy=self._strategy, status=status).observe(dur)
+                    self._phase_latency.labels(
+                        phase=name,
+                        backend=backend,
+                        family=family,
+                        strategy=self._strategy,
+                        status=status,
+                    ).observe(dur)
                 if self._in_run and self.report is not None:
                     with self._lock:
                         self.report.add_phase(name, dur)
@@ -426,6 +503,17 @@ class Observer:
                 self._in_run = False
             if self.metrics:
                 self._run_latency.labels(strategy=strategy, status=status).observe(report.total_s)
+            if is_measure_mode():
+                _client_metrics.flush_step_events()
+
+    def flush_step_events(
+        self,
+        step: int | None = None,
+        *,
+        events_path: str | pathlib.Path | None = None,
+    ) -> list[dict[str, Any]]:
+        """Flush aggregated step-boundary summary events for measure mode."""
+        return _client_metrics.flush_step_events(step=step, events_path=events_path)
 
     def task_done(self, backend: str, family: str, status: str, seconds: float) -> None:
         """Record one finished task that took ``seconds``.
@@ -435,8 +523,9 @@ class Observer:
         """
         seconds = max(0.0, seconds)
         if self.metrics:
-            self._task_latency.labels(strategy=self._strategy, backend=backend,
-                                family=family, status=status).observe(seconds)
+            self._task_latency.labels(
+                strategy=self._strategy, backend=backend, family=family, status=status
+            ).observe(seconds)
             self._tasks.labels(strategy=self._strategy, status=status).inc()
         if self._in_run and self.report is not None:
             with self._lock:

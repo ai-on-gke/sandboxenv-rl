@@ -1,0 +1,56 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+schema_version: v1
+name: multi-job-swebench
+description: >
+  Multi-job SWE-bench scenario combining a synchronous step-barrier trainer
+  job (closed-loop) with an asynchronous rollout stream (open-loop) sharing
+  a single ate-env cluster.
+seed: 101
+sut:
+  namespace: ate-bench
+  template: swebench-lite
+  server_addr: http://ate-env-server.ate-bench.svc.cluster.local:8080
+  storage_backend: gcs
+  pool_enabled: true
+  pool_size_per_image: 4
+  max_active_pods: 64
+jobs:
+  - name: swebench-ppo-trainer
+    mode: closed-loop
+    priority: 100
+    weight: 2.0
+    instances: 16
+    concurrency: 8
+    steps: 6
+    batch_size: 8
+    rollouts_per_task: 2
+    step_pause_ms: 500
+    park_policy: snapshot
+    lookahead_steps: 1
+    snapshot_loop: true
+  - name: swebench-async-eval
+    mode: open-loop
+    priority: 50
+    weight: 1.0
+    start_offset_ms: 250
+    instances: 8
+    concurrency: 4
+    arrival_rate: 4.0
+    duration_sec: 15.0
+    park_policy: release
+window:
+  warmup_steps: 1
+  cooldown_steps: 1

@@ -15,12 +15,15 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/hostcheck"
@@ -40,6 +43,18 @@ import (
 
 // apiName is the name of the API service Deployment and Service.
 const apiName = "ate-env-api"
+
+// defaultAuthTokenSecret is the Secret, key token, that holds the bearer
+// token ate-env-api requires from its callers unless --insecure-no-auth is
+// given. "ate-env manifest auth-secret" prints one.
+const (
+	defaultAuthTokenSecret = "ate-env-api-token"
+	authTokenSecretKey     = "token"
+	authTokenMountPath     = "/var/run/secrets/ate-env-auth"
+)
+
+// authTokenBytes is the size of a generated caller token before hex encoding.
+const authTokenBytes = 32
 
 // Where the API deployment mounts the credentials for the router's TLS
 // listeners: the pod identity credential bundle and the servicedns trust
@@ -94,17 +109,34 @@ const (
 	defaultActorMemory = "4Gi"
 )
 
+// Wakeup-probe timeouts. Substrate fails an actor start or resume whose
+// probe has not answered 200 within the template's timeout_seconds (1 to
+// 3600; 30 when unset). The guest's /readyz waits for each --sidecar-readyz
+// URL, so a template with one inherits its sidecar's boot time: an OpenHands
+// agent-server takes 20 to 26 s on a quiet node and 22 to 29 s with 3 to 4
+// boots per node (p50 27.9 s), and 7 boots per node exceed 30 s. RL groups
+// start this way, many rollouts of one new task image at once, thus such a
+// template gets four times Substrate's 30 s default: about twice the 60 to
+// 65 s that 8 boots on a 16-CPU node extrapolate to.
+const (
+	substrateWakeupTimeout = 30 * time.Second
+	sidecarWakeupTimeout   = 120 * time.Second
+	maxWakeupTimeout       = 3600 * time.Second
+)
+
 // manifestConfig holds configuration for generating Kubernetes deployment manifests.
 type manifestConfig struct {
-	namespace       string
-	template        string
-	workerPool      string
-	workerImage     string
-	replicas        int32
-	apiImage        string
-	apiReplicas     int32
-	apiPort         int32
-	authTokenSecret string
+	namespace          string
+	template           string
+	workerPool         string
+	workerImage        string
+	replicas           int32
+	apiImage           string
+	apiReplicas        int32
+	apiPort            int32
+	authTokenSecret    string
+	insecureNoAuth     bool
+	portProxyAtespaces string
 	// allowedHosts are host names, next to the Service's in-cluster names,
 	// that HTTP callers may send to ate-env-api (its -allowed-hosts).
 	allowedHosts []string
@@ -125,6 +157,22 @@ type manifestConfig struct {
 	otlpEndpoint  string
 	otlpInsecure  bool
 	metricsPort   int32
+}
+
+// resolveAuth applies --insecure-no-auth and rejects an empty --auth-token-secret.
+func (c *manifestConfig) resolveAuth(secretChanged bool) error {
+	if c.insecureNoAuth {
+		if secretChanged {
+			return errors.New("--auth-token-secret and --insecure-no-auth cannot be used together")
+		}
+		c.authTokenSecret = ""
+		return nil
+	}
+	c.authTokenSecret = strings.TrimSpace(c.authTokenSecret)
+	if c.authTokenSecret == "" {
+		return errors.New("--auth-token-secret is empty; pass --insecure-no-auth to deploy ate-env-api without a caller token")
+	}
+	return nil
 }
 
 // metricsPortName names the ate-env-api metrics port on the container and
@@ -188,10 +236,39 @@ type templateConfig struct {
 	// Empty means defaultActorCPU and defaultActorMemory.
 	cpu    string
 	memory string
+	// wakeupTimeout is the wakeup probe's timeout_seconds as a duration.
+	// Zero means sidecarWakeupTimeout with --sidecar-readyz and
+	// substrateWakeupTimeout without.
+	wakeupTimeout time.Duration
 	// env are extra container environment variables, each NAME=VALUE. The
 	// guest passes its environment to sidecars, so this is how a runtime
 	// layer's daemon is configured.
 	env []string
+}
+
+// wakeupTimeoutSeconds returns the probe timeout the template carries.
+func (c *templateConfig) wakeupTimeoutSeconds() int32 {
+	d := c.wakeupTimeout
+	if d == 0 {
+		d = substrateWakeupTimeout
+		if len(c.sidecarReadyz) > 0 {
+			d = sidecarWakeupTimeout
+		}
+	}
+	return int32(d / time.Second)
+}
+
+// validateWakeupTimeout checks --wakeup-timeout against Substrate's bounds:
+// whole seconds from 1 s to 1 h. Zero means the default.
+func (c *templateConfig) validateWakeupTimeout() error {
+	d := c.wakeupTimeout
+	if d == 0 {
+		return nil
+	}
+	if d < time.Second || d > maxWakeupTimeout || d%time.Second != 0 {
+		return fmt.Errorf("--wakeup-timeout %s: want whole seconds from 1s to %s", d, maxWakeupTimeout)
+	}
+	return nil
 }
 
 // runtimeLayer is a parsed --layer value.
@@ -324,10 +401,19 @@ a cluster that already runs the Agent Substrate system: the target
 namespace, a WorkerPool of pre-warmed workers, and the ate-env-api service.
 It prints YAML to stdout without touching the cluster; apply it with kubectl.
 
+ate-env-api requires a bearer token from its callers, read from the Secret
+--auth-token-secret names (key token). Create that Secret once, in the
+namespace this manifest creates, with
+"ate-env manifest auth-secret | kubectl create -f -"; ate-env-api starts when
+the Secret exists. --insecure-no-auth deploys without the token.
+
 To generate the Substrate ActorTemplate manifest (for kubectl-ate), use
 the "template" subcommand: ate-env manifest template`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := mCfg.resolveAuth(cmd.Flags().Changed("auth-token-secret")); err != nil {
+				return err
+			}
 			if mCfg.template == "" {
 				mCfg.template = apiservice.DefaultTemplate
 			}
@@ -364,7 +450,9 @@ the "template" subcommand: ate-env manifest template`,
 	cmd.Flags().StringVar(&mCfg.apiImage, "api-image", defaultAPIImage, imageDefaultHelp("digest-pinned ate-env-api image for the API service", defaultAPIImage))
 	cmd.Flags().Int32Var(&mCfg.apiReplicas, "api-replicas", 1, "number of API service replicas")
 	cmd.Flags().Int32Var(&mCfg.apiPort, "api-port", 7777, "port the ate-env-api service listens on")
-	cmd.Flags().StringVar(&mCfg.authTokenSecret, "auth-token-secret", "", "Kubernetes Secret name (with key 'token') to mount into ate-env-api and require as a caller bearer token")
+	cmd.Flags().StringVar(&mCfg.authTokenSecret, "auth-token-secret", defaultAuthTokenSecret, "Kubernetes Secret (key 'token') mounted into ate-env-api; its value is the bearer token ate-env-api requires from callers. Create it with 'ate-env manifest auth-secret'")
+	cmd.Flags().BoolVar(&mCfg.insecureNoAuth, "insecure-no-auth", false, "deploy ate-env-api without a caller token: anyone who can reach its Service can create environments, run commands in them and reach their ports")
+	cmd.Flags().StringVar(&mCfg.portProxyAtespaces, "port-proxy-atespaces", "", "comma-separated atespaces whose environments ate-env-api's port proxy forwards to, or * for any (defaults to ate-env)")
 	cmd.Flags().StringSliceVar(&mCfg.allowedHosts, "api-allowed-hosts", nil, "extra host names that HTTP clients may use to reach ate-env-api, e.g. an internal load balancer name (a leading *. allows the names below it); the Service's in-cluster names, in the cluster's own DNS domain, IP addresses and localhost are always allowed")
 	cmd.Flags().BoolVar(&mCfg.routerTLS, "api-router-tls", true, "mount the pod identity certificate and the servicedns trust bundle into ate-env-api and dial the atenet router's TLS listeners, the only ones Substrate serves since v0.6.0; the API's SPIFFE ID must then be in the router's --ingress-allowed-spiffe-ids. Off, the API dials the plaintext addresses, which only the test fakes serve")
 	cmd.Flags().StringVar(&mCfg.workerPool, "workerpool", "", "WorkerPool name (defaults to <template>-workerpool)")
@@ -376,8 +464,76 @@ the "template" subcommand: ate-env manifest template`,
 
 	cmd.AddCommand(newManifestTemplateCommand())
 	cmd.AddCommand(newManifestAccessPolicyCommand())
+	cmd.AddCommand(newManifestAuthSecretCommand())
 
 	return cmd
+}
+
+func newManifestAuthSecretCommand() *cobra.Command {
+	namespace := apiservice.DefaultNamespace
+	name := defaultAuthTokenSecret
+	cmd := &cobra.Command{
+		Use:   "auth-secret",
+		Short: "Generate the Secret with the bearer token ate-env-api requires from callers",
+		Long: `Auth-secret prints a Kubernetes Secret whose key token holds a new random
+bearer token (32 bytes, hex). ate-env manifest mounts it into ate-env-api, which
+then refuses gRPC, MCP and port-proxy calls without it. Each run prints a new
+token, thus create the Secret once and do not apply it again:
+
+  ate-env manifest auth-secret | kubectl create -f -
+
+Callers read the token back from the Secret:
+
+  export SUBSTRATE_ENV_AUTH_TOKEN="$(kubectl -n ate-env get secret ate-env-api-token -o jsonpath='{.data.token}' | base64 -d)"
+
+The ate-env CLI and swebench-loader read SUBSTRATE_ENV_AUTH_TOKEN (or
+--auth-token-file); the Python client takes Client(auth_token=...) or
+FleetConfig(auth_token=...). To rotate the token, replace the Secret's value;
+ate-env-api reads the new value once the kubelet updates the mounted file.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			namespace = strings.TrimSpace(namespace)
+			name = strings.TrimSpace(name)
+			if namespace == "" {
+				return errors.New("--namespace is empty")
+			}
+			if name == "" {
+				return errors.New("--name is empty")
+			}
+			token, err := newAuthToken()
+			if err != nil {
+				return err
+			}
+			return writeManifests(cmd.OutOrStdout(), []any{buildAuthSecret(namespace, name, token)})
+		},
+	}
+	cmd.Flags().StringVar(&namespace, "namespace", namespace, "Kubernetes namespace ate-env-api runs in")
+	cmd.Flags().StringVar(&name, "name", name, "Secret name; pass the same value to ate-env manifest --auth-token-secret")
+	return cmd
+}
+
+// newAuthToken returns a random caller token: authTokenBytes from
+// crypto/rand, hex encoded.
+func newAuthToken() (string, error) {
+	b := make([]byte, authTokenBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generating the token: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// buildAuthSecret returns the Secret that holds ate-env-api's caller token.
+func buildAuthSecret(namespace, name, token string) *corev1.Secret {
+	return &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    map[string]string{"app": apiName},
+		},
+		Type:       corev1.SecretTypeOpaque,
+		StringData: map[string]string{authTokenSecretKey: token},
+	}
 }
 
 func newManifestAccessPolicyCommand() *cobra.Command {
@@ -438,6 +594,9 @@ It prints YAML to stdout without touching the cluster.`,
 			if err := tCfg.validateResources(); err != nil {
 				return err
 			}
+			if err := tCfg.validateWakeupTimeout(); err != nil {
+				return err
+			}
 			if err := tCfg.validateEnv(); err != nil {
 				return err
 			}
@@ -462,6 +621,7 @@ It prints YAML to stdout without touching the cluster.`,
 	cmd.Flags().StringArrayVar(&tCfg.sidecarReadyz, "sidecar-readyz", nil, "URL the actor's readiness waits for, e.g. http://127.0.0.1:44772/ready (repeatable)")
 	cmd.Flags().StringVar(&tCfg.cpu, "cpu", defaultActorCPU, "CPU limit of each actor, a Kubernetes quantity such as 2 or 500m, at least 1m, rendered as whole millicores (rounded up); Substrate requires one")
 	cmd.Flags().StringVar(&tCfg.memory, "memory", defaultActorMemory, "memory limit of each actor, a Kubernetes quantity such as 4Gi, at least 1Mi, rendered as whole bytes (rounded up); Substrate requires one")
+	cmd.Flags().DurationVar(&tCfg.wakeupTimeout, "wakeup-timeout", 0, fmt.Sprintf("how long Substrate polls the guest's /readyz at each actor start and resume before it fails the actor, whole seconds from 1s to %s; 0 or unset means the default: %s with --sidecar-readyz, else Substrate's %s", maxWakeupTimeout, sidecarWakeupTimeout, substrateWakeupTimeout))
 	cmd.Flags().StringArrayVar(&tCfg.env, "env", nil, "environment variable for the actor's container as NAME=VALUE (repeatable); the guest passes it to sidecars, e.g. a layer daemon's API key")
 
 	return cmd
@@ -683,6 +843,7 @@ func buildActorTemplate(cfg templateConfig) *ateapipb.ActorTemplate {
 					Path: "/readyz",
 					Port: 80,
 				},
+				TimeoutSeconds: cfg.wakeupTimeoutSeconds(),
 			},
 		}},
 		SnapshotConfig: &ateapipb.SnapshotConfig{
@@ -824,10 +985,10 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 			}}})
 	}
 	if cfg.authTokenSecret != "" {
-		args = append(args, "-auth-token-file=/var/run/secrets/ate-env-auth/token")
+		args = append(args, "-auth-token-file="+authTokenMountPath+"/"+authTokenSecretKey)
 		mounts = append(mounts, corev1.VolumeMount{
 			Name:      "ate-env-auth",
-			MountPath: "/var/run/secrets/ate-env-auth",
+			MountPath: authTokenMountPath,
 			ReadOnly:  true,
 		})
 		volumes = append(volumes, corev1.Volume{
@@ -838,6 +999,9 @@ func buildAPIDeployment(cfg manifestConfig) *appsv1.Deployment {
 				},
 			},
 		})
+	}
+	if a := strings.TrimSpace(cfg.portProxyAtespaces); a != "" {
+		args = append(args, "-port-proxy-atespaces="+a)
 	}
 	ports := []corev1.ContainerPort{{ContainerPort: cfg.apiPort}}
 	var podAnnotations map[string]string

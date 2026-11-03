@@ -1,0 +1,140 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Restores or saves the Go build cache (~/.cache/go-build), module cache
+# (~/go/pkg/mod), and Substrate checkout cache (~/.cache/sandboxenv-rl). Go comes
+# from Nix, not actions/setup-go, so setup-go's built-in cache isn't available;
+# this is the same thing with actions/cache. The devShell leaves GOCACHE and
+# GOMODCACHE at their defaults, so these are the paths `go` and `ko` use on
+# GitHub's runners. Caching the Substrate checkout created by
+# hack/ci/ensure-substrate.sh (~/.cache/sandboxenv-rl/substrate-*) is safe
+# because ensure-substrate verifies the checkout's commit hash against go.mod's
+# pin before using it.
+#
+# Use `mode: restore` before the build and `mode: save` after it.
+#
+# Who saves
+#
+#   Pushes to main, and pull requests from branches of this repository, i.e.
+#   from people who can push here. GitHub scopes a pull request's cache to that
+#   pull request: its later pushes and reruns restore it, but main and other
+#   pull requests can't, so a pull request can't poison their caches. Pull
+#   requests from forks still restore, but don't save, so outside contributions
+#   don't use up the repository's cache quota (10 GB).
+#   https://docs.github.com/en/actions/using-workflows/caching-dependencies-to-speed-up-workflows#restrictions-for-accessing-a-cache
+#
+# What the key is
+#
+#   go-<scope>-<os>-<hash of go.mod, go.sum and flake.lock>. It deliberately
+#   leaves out the commit:
+#
+#   - What makes a cold build slow is compiling the dependencies (grpc,
+#     OpenTelemetry, the Kubernetes client, Substrate and its dependencies).
+#     Their compiled output only changes when go.mod or go.sum changes (a
+#     dependency bump, including the Substrate pin, or a Go minor version bump
+#     in go.mod) or when the Go toolchain changes. flake.lock stands in for the
+#     toolchain: it pins nixpkgs, which provides Go, so a Go patch bump moves
+#     the key instead of restoring a cache that would get no hits. go.mod is
+#     included in the hash because its `go` directive selects the Go minor
+#     version (pkgs.go_X_Y) via nix/ci.nix.
+#   - Our own packages change every commit, but recompiling them on top of a
+#     restored cache takes seconds.
+#   - Cache keys are immutable: saving under an existing key does nothing. A
+#     key with the commit in it would make every save a new multi-GB upload,
+#     adding upload time to each run and filling the quota quickly. With this
+#     key, each scope uploads once per dependency or toolchain change, and the
+#     save step skips the upload when the key already exists.
+#
+#   The cost is that the saved cache never contains our latest packages, only
+#   whatever the first run after a dependency or toolchain change compiled.
+#   If only flake.lock changed, the restore falls back to the newest cache with
+#   the same go.mod and go.sum, which still saves the module downloads.
+#
+# Why each job needs its own scope
+#
+#   The Go build cache is keyed by compiler flags and environment as well as by
+#   source (https://pkg.go.dev/cmd/go#hdr-Build_and_test_caching). The Go job
+#   builds with -race and cgo; the E2E job builds the ate-env and Substrate
+#   images with ko, which uses CGO_ENABLED=0 and -trimpath
+#   (https://ko.build/configuration/). A cache saved by one gives the other no
+#   hits. Substrate's own CI found the same thing and keeps a separate E2E cache:
+#   https://github.com/agent-substrate/substrate/blob/85e475fdd682c03dbb08a0e8a8398e6cb5990245/.github/workflows/pr-workflow.yaml#L217-L220
+name: Cache Go and Substrate builds
+description: Restore or save the Go build, Go module and Substrate checkout caches for one job scope.
+
+inputs:
+  mode:
+    description: "`restore` (before the build) or `save` (after it; only pushes to main and same-repository pull requests save)."
+    required: true
+  scope:
+    description: Cache namespace for the job, e.g. `go` or `e2e`. Jobs with different build flags must use different scopes.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Compute the cache key
+      id: key
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        SCOPE: ${{ inputs.scope }}
+        RUNNER_OS_NAME: ${{ runner.os }}
+      run: |
+        case "${MODE}" in
+          restore|save) ;;
+          *) echo "::error::cache-go-and-substrate: mode must be restore or save, got '${MODE}'"; exit 1 ;;
+        esac
+        gosum="$(sha256sum go.mod go.sum | sha256sum | cut -c1-16)"
+        lock="$(sha256sum flake.lock | cut -c1-16)"
+        prefix="go-${SCOPE}-${RUNNER_OS_NAME}-"
+        {
+          echo "key=${prefix}${gosum}-${lock}"
+          echo "restore-same-gosum=${prefix}${gosum}-"
+        } >>"${GITHUB_OUTPUT}"
+    - name: Restore the Go caches
+      if: inputs.mode == 'restore'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+          ~/.cache/sandboxenv-rl
+        key: ${{ steps.key.outputs.key }}
+        restore-keys: |
+          ${{ steps.key.outputs.restore-same-gosum }}
+    - name: Check whether this key is already saved
+      id: exists
+      if: >-
+        inputs.mode == 'save' && (
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+        )
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+          ~/.cache/sandboxenv-rl
+        key: ${{ steps.key.outputs.key }}
+        lookup-only: true
+    - name: Save the Go caches
+      if: steps.exists.outcome == 'success' && steps.exists.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+          ~/.cache/sandboxenv-rl
+        key: ${{ steps.key.outputs.key }}

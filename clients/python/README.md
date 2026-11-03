@@ -8,9 +8,11 @@ API (`ate-env-api`):
 1. **Single Environment Lifecycle & Guest Operations**: `Client` and `Env` for fine-grained gRPC control, process execution, and file streaming.
 2. **Fleet & Sandbox Orchestration**: `SandboxFleet` for managing batches of sandboxes with pool sizing, pre-warming, and execution strategies.
 
-Requires Python >= 3.10. Everything is `asyncio`-native: methods are
-coroutines, log/file streams are async iterators, and cancellation works
-through standard task cancellation and `asyncio.timeout()`.
+Requires Python >= 3.10, but only 3.12 and later are locked and tested: the
+repository's `uv.lock` resolves for 3.12+ (the OpenHands integration needs
+it), and CI runs the client's tests on 3.13. Everything is `asyncio`-native:
+methods are coroutines, log/file streams are async iterators, and cancellation
+works through standard task cancellation and `asyncio.timeout()`.
 
 ## How it works
 
@@ -451,10 +453,20 @@ idle paused actors only), reads them with `fleet.pool_size(img)` (None when the
 driver cannot tell) to trim recycled surplus, and counts claims with
 `fleet.acquired_count(img)`.
 
+### RL rollouts and benchmark adapters
+
+[USER_GUIDE.md](USER_GUIDE.md) covers what is specific to RL: overlapping
+sandbox claims with policy decoding (`AsyncSandboxFleet.acquire_batch`), and
+grading candidates with `ate_env.adapters` (`SweBenchAdapter`). The VeRL
+example in [`examples/verl_swebench`](../../examples/verl_swebench) uses both.
+
 ### Observability
 
 Three layers, all off the hot path when disabled. The base install has
-no telemetry dependency; the optional layers need extras:
+no telemetry dependency; the optional layers need extras. The
+repository-wide guide, with ate-env-api, the guest, collectors, Cloud
+Trace and the HTML report tool, is
+[docs/observability.md](../../docs/observability.md):
 
 ```bash
 pip install './clients/python[tracing,metrics]'

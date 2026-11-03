@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-on-gke.github.io/sandboxenv-rl/schema/v1/scenario.schema.json",
+  "title": "Scenario",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "name", "sut", "jobs"],
+  "properties": {
+    "schema_version": { "type": "string", "enum": ["v1"] },
+    "name": { "type": "string", "minLength": 1 },
+    "repeat": { "type": "integer", "minimum": 0 },
+    "sut": { "$ref": "#/$defs/SUTSpec" },
+    "jobs": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/JobSpec" }
+    },
+    "window_policy": { "$ref": "#/$defs/WindowPolicy" },
+    "telemetry": { "$ref": "#/$defs/TelemetrySpec" },
+    "variants": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/FeatureOverlay" }
+    }
+  },
+  "$defs": {
+    "TelemetrySpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scopes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["rl", "user-sandbox", "substrate", "k8s", "all", "trainer", "user", "client", "cluster"]
+          }
+        },
+        "collectors": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "plugins": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TelemetryPluginSpec" }
+        }
+      }
+    },
+    "TelemetryPluginSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "enum": ["prom_query", "k8s_logs", "regex_metric", "command", "custom"] },
+        "scope": { "type": "string" },
+        "expr": { "type": "string" },
+        "namespace": { "type": "string" },
+        "label_selector": { "type": "string" },
+        "container": { "type": "string" },
+        "grep": { "type": "string" },
+        "glob": { "type": "string" },
+        "regex": { "type": "string" },
+        "command": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "unit": { "type": "string" }
+      }
+    },
+    "SUTSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "backend": { "type": "string", "enum": ["substrate", "agent-sandbox"] },
+        "access": { "type": "string", "enum": ["sdk", "ate-env-api", "direct"] },
+        "endpoint": { "type": "string" },
+        "substrate": { "$ref": "#/$defs/SubstrateSUTSpec" },
+        "node_pool": { "type": "string" },
+        "runtime_class": { "type": "string" },
+        "replicas": { "type": "integer", "minimum": 0 },
+        "extra_args": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "SubstrateSUTSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "atespace": { "type": "string" },
+        "base_template": { "type": "string" }
+      }
+    },
+    "JobSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "enum": ["simulated", "real"] },
+        "loader_mode": { "type": "string", "enum": ["eval", "steps", "open-loop"] },
+        "real_mode": { "type": "string", "enum": ["measure", "trace"] },
+        "start_offset_ms": { "type": "number", "minimum": 0 },
+        "dataset": { "type": "string" },
+        "trajectory": { "type": "string" },
+        "park": {
+          "type": "string",
+          "enum": ["suspend-async", "suspend-sync", "fork", "delete", "none", "suspend"]
+        },
+        "images": { "type": "integer", "minimum": 0 },
+        "tasks_per_step": { "type": "integer", "minimum": 0 },
+        "group_size": { "type": "integer", "minimum": 0 },
+        "steps": { "type": "integer", "minimum": 0 },
+        "max_concurrent": { "type": "integer", "minimum": 0 },
+        "step_pause_ms": { "type": "number", "minimum": 0 },
+        "prefetch": { "type": "boolean" },
+        "seed": { "type": "integer" },
+        "schedule_mode": { "type": "string", "enum": ["fixed", "sampled", "explicit"] }
+      }
+    },
+    "WindowPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "steady_state_start_step": { "type": "integer", "minimum": 0 },
+        "steady_state_end_step": { "type": "integer", "minimum": 0 },
+        "warmup_steps": { "type": "integer", "minimum": 0 },
+        "max_duration_s": { "type": "number", "minimum": 0 }
+      }
+    },
+    "FeatureOverlay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "park": {
+          "type": "string",
+          "enum": ["suspend-async", "suspend-sync", "fork", "delete", "none", "suspend"]
+        },
+        "prefetch": { "type": "boolean" },
+        "env_vars": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "flags": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    }
+  }
+}

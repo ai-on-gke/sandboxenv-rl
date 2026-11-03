@@ -1,0 +1,45 @@
+{
+  "schema_version": "v1",
+  "run_id": "run-123",
+  "scenario_name": "swebench-multi-step",
+  "tag": "baseline",
+  "generated_at": "2026-10-22T01:26:00Z",
+  "system_description": {
+    "schema_version": "v1",
+    "cluster": "gke-rlbench-1",
+    "backend": "substrate",
+    "access": "ate-env-api"
+  },
+  "measurements_ref": "measurements.json",
+  "validity": {
+    "valid": true
+  },
+  "jobs": {
+    "sim-loop-1": {
+      "tasks": 4,
+      "failed": 0,
+      "rewarded": 4,
+      "reward_rate": 1.0,
+      "steps": 2,
+      "metrics": {
+        "ttfi_ms": {
+          "count": 4,
+          "p50": 3937.4,
+          "p90": 5937.9,
+          "p95": 5937.9,
+          "max": 5937.9,
+          "unit": "ms"
+        }
+      }
+    }
+  },
+  "custom_metrics": {
+    "overlay_prefetch_queue_depth": {
+      "count": 5,
+      "p50": 2.0,
+      "p95": 4.0,
+      "max": 4.0,
+      "unit": "items"
+    }
+  }
+}

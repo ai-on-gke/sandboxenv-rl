@@ -18,10 +18,14 @@ import (
 	"context"
 	"net"
 	"os"
+	"reflect"
 	"slices"
 	"testing"
 
 	"github.com/agent-substrate/env/internal/apiservice"
+	"github.com/agent-substrate/env/internal/ate"
+	"github.com/agent-substrate/env/internal/internaltest/fakecontrol"
+	"github.com/agent-substrate/env/internal/portproxy"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -30,6 +34,25 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protowire"
 )
+
+func TestPortProxyAtespaces(t *testing.T) {
+	for in, want := range map[string][]string{
+		"ate-env":            {"ate-env"},
+		" ate-env , team-a ": {"ate-env", "team-a"},
+		"*":                  nil,
+		" * ":                nil,
+	} {
+		if got, err := portProxyAtespaces(in); err != nil || !reflect.DeepEqual(got, want) {
+			t.Errorf("portProxyAtespaces(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	// An empty value must not mean "any atespace", and "*" cannot be combined with names.
+	for _, in := range []string{"", " ", ",", " , ", "ate-env,*", "*,ate-env"} {
+		if got, err := portProxyAtespaces(in); err == nil {
+			t.Errorf("portProxyAtespaces(%q) = %q, want an error", in, got)
+		}
+	}
+}
 
 func TestIsLoopbackAddr(t *testing.T) {
 	cases := []struct {
@@ -140,5 +163,43 @@ func TestServiceHostNames(t *testing.T) {
 		if !slices.Equal(got, tc.want) {
 			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// The port proxy reads actor states through the API server, so a crashed or
+// deleted environment fails at once, and checks callers with the API's
+// token.
+func TestPortProxyOptionsWiresStateReadAndAuth(t *testing.T) {
+	control := fakecontrol.New()
+	controlAddr, stop, err := control.Serve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(stop)
+	client, err := ate.New(ate.Options{ControlAddr: controlAddr, RouterAddr: "127.0.0.1:1", SkipVerify: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	auth, err := apiservice.NewBearerAuth("s3cret")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	opts := portProxyOptions(portproxy.Options{ConnectAddr: "router:8444"}, apiservice.New(client, "127.0.0.1:1", ""), auth)
+	if opts.ConnectAddr != "router:8444" {
+		t.Errorf("ConnectAddr = %q, want the base options kept", opts.ConnectAddr)
+	}
+	if opts.ActorState == nil {
+		t.Fatal("ActorState is not set: a crashed environment's port-proxy request would wait out the wake budget")
+	}
+	if _, err := opts.ActorState(context.Background(), "ate-env", "missing"); status.Code(err) != codes.NotFound {
+		t.Errorf("ActorState of a missing environment: %v, want NotFound from the control plane", err)
+	}
+	if opts.Authenticate == nil || opts.Authenticate("Bearer s3cret") != nil || opts.Authenticate("Bearer wrong") == nil {
+		t.Error("Authenticate does not check the API's token")
+	}
+	if noAuth := portProxyOptions(portproxy.Options{}, apiservice.New(client, "127.0.0.1:1", ""), nil); noAuth.Authenticate != nil {
+		t.Error("Authenticate set without -auth-token-file")
 	}
 }

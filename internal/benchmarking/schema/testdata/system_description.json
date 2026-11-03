@@ -1,0 +1,55 @@
+{
+  "schema_version": "v1",
+  "cluster": "gke-rlbench-1",
+  "backend": "substrate",
+  "access": "ate-env-api",
+  "kubernetes_version": "v1.32.1",
+  "sdk_version": "0.4.0",
+  "substrate_version": "v0.5.1",
+  "grader_version": "v1.2.0",
+  "dataset_revision": "swebench-verified@2026-10-01",
+  "swebench_harness_version": "1.1.0",
+  "exclusion_list_revision": "excl-2026-10",
+  "node_pools": {
+    "worker-pool": 3
+  },
+  "machine_types": {
+    "worker-pool": {
+      "machine_type": "n2-standard-32",
+      "count": 3,
+      "zone": "us-central1-a"
+    }
+  },
+  "zone_topology": "single-zone",
+  "bucket_region": "us-central1",
+  "runtime_class": "gvisor",
+  "sandbox_footprint": {
+    "cpu": 2.0,
+    "memory_gib": 8.0,
+    "disk_gib": 20.0
+  },
+  "api_image": "gcr.io/ate/ate-env-api:v0.5.1",
+  "guest_image": "gcr.io/ate/guest:v0.5.1",
+  "git_sha": "abc1234",
+  "dataset_digest": "sha256:deadbeef",
+  "scenario_hash": "sha256:cafebabe",
+  "overlays": [
+    {
+      "name": "async-park-prefetch",
+      "hash": "sha256:12345678",
+      "sut_overrides": {
+        "prefetch": "true"
+      }
+    }
+  ],
+  "load": {
+    "tasks": 8,
+    "group_size": 2,
+    "steps": 5,
+    "tasks_per_step": 4,
+    "trajectories_per_step": 8,
+    "repeat": 2,
+    "max_concurrent": 8,
+    "distinct_images": 4
+  }
+}

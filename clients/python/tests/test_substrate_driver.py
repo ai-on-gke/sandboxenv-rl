@@ -21,6 +21,7 @@ import pytest
 from ate_env import FleetConfig, SandboxFleet, Task
 from ate_env._gen.ateenv.v1alpha import env_pb2
 from ate_env.backend.substrate import SubstrateBackendDriver
+from ate_env.config import ValidationError
 from ate_env.errors import PreflightError
 from ate_env.types import EnvironmentSpec, PlacementSpec
 
@@ -339,3 +340,34 @@ def test_fleet_config_placement_reaches_the_driver():
     fleet = SandboxFleet(cfg)
     assert fleet.backend.worker_selector_for(PLACED) == {"ate-env/workerpool": "c4", "ate-env/domain": "d1"}
     assert fleet.backend.worker_selector_for(UNPLACED) == {"ate-env/workerpool": "c4"}
+
+
+async def test_placement_labels_override_the_fleet_labels_on_the_same_key(fake_stack):
+    client, fakes = fake_stack
+    driver = SubstrateBackendDriver(
+        client=client,
+        atespace="ate-env",
+        worker_selector={"ate-env/domain": "pool-wide", "tier": "hot"},
+        placement={PLACED: {"ate-env/domain": "d0"}},
+    )
+    assert driver.worker_selector_for(PLACED) == {"ate-env/domain": "d0", "tier": "hot"}
+    await driver.acquire_async("default-template", run_id="run-1", rootfs_image=PLACED)
+    assert dict(fakes.environments.last_create_request.worker_selector) == {
+        "ate-env/domain": "d0",
+        "tier": "hot",
+    }
+
+
+def test_fleet_config_validates_and_copies_placement():
+    labels = {"ate-env/domain": "d0"}
+    placement = {PLACED: labels}
+    cfg = FleetConfig(backend="mock", node_selector={"a": "b"}, placement=placement)
+    labels["ate-env/domain"] = "changed"
+    placement["other"] = {"x": "y"}
+    assert cfg.placement == {PLACED: {"ate-env/domain": "d0"}}
+    assert cfg.to_dict()["placement"] == {PLACED: {"ate-env/domain": "d0"}}
+    cfg.to_dict()["placement"][PLACED]["ate-env/domain"] = "mutated"
+    assert cfg.placement[PLACED]["ate-env/domain"] == "d0"
+    for bad in ({"": {"a": "b"}}, {PLACED: "d0"}, {PLACED: {"a": 1}}, {PLACED: {"": "v"}}):
+        with pytest.raises(ValidationError):
+            FleetConfig(backend="mock", placement=bad)

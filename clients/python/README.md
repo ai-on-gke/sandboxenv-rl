@@ -426,7 +426,10 @@ FleetConfig(
 ```
 
 Both are empty by default, which leaves the template's selection alone.
-`client.get(id).node` reports the node an environment landed on.
+`placement` applies to creates that carry a digest-pinned `rootfs_image`; a task
+routed through `image_templates` or `Task.template` sends no image, thus only
+`node_selector` applies to it. `client.get(id).node` reports the node an
+environment landed on.
 
 ### Follow a trainer's batch stream with `LookaheadWarmer`
 

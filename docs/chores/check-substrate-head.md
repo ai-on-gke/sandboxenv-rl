@@ -73,11 +73,11 @@ Verify that all automated checks in [`.github/workflows/ci.yaml`](../../.github/
 | `e2e-kind` (`ci-e2e`) | Kind cluster bootstrap, Substrate deployment, smoke, and full-stack SDK | Real control plane and guest lifecycle |
 
 Automated E2E coverage breakdown:
-- [`hack/ci/test_smoke.py`](../../hack/ci/test_smoke.py): an environment-creation fixture plus 7 subtests covering shell execution with stdout and stdin stream piping, file write/read roundtrip, built-in MCP server (`tools/list` and `read_file`), suspend and on-demand resume, and deletion.
-- [`clients/python/tests/e2e/test_full_stack.py`](../../clients/python/tests/e2e/test_full_stack.py): exercises async `Client` lifecycle, process streaming, signal delivery (`SIGTERM`), and image validation error cases.
+- [`hack/ci/test_smoke.py`](../../hack/ci/test_smoke.py): an environment-creation fixture plus 9 subtests covering shell execution with stdout and stdin stream piping, file write/read roundtrip, built-in MCP server (`tools/list` and `read_file`), suspend and on-demand resume, caller authentication and port-proxy atespace allowlist, Prometheus `/metrics` exposition, and deletion.
+- [`clients/python/tests/e2e/test_full_stack.py`](../../clients/python/tests/e2e/test_full_stack.py): exercises async `Client` lifecycle, process streaming, signal delivery (`SIGTERM`), image validation error cases, template environment variable inheritance, port-proxy HTTP/WebSocket capability routing, and transparent wake-on-request.
 
 Areas not covered by standard CI that should be manually verified:
-- Fleet execution (`SandboxFleet` and `AsyncSandboxFleet`) against a live cluster: `test_async_fleet.py` and `test_fleet_*.py` run in `ci-python` against fakes only. To exercise a real cluster, keep the port-forward from `make smoke` open (or run `kubectl -n ate-env port-forward svc/ate-env-api 17777:7777`) and drive a short `SandboxFleet` run (acquire, run a task, release) with `ATE_ENV_API_TARGET=127.0.0.1:17777`.
+- Fleet execution (`SandboxFleet` and `AsyncSandboxFleet`) against a live cluster: `test_async_fleet.py` and `test_fleet_*.py` run in `ci-python` against fakes only. To exercise a real cluster, keep the port-forward from `make smoke` open (or run `kubectl -n ate-env port-forward svc/ate-env-api 17777:7777`) and drive a short `SandboxFleet` run (acquire, run a task, release) with `ATE_ENV_API_TARGET=127.0.0.1:17777` and `SUBSTRATE_ENV_AUTH_TOKEN`.
 - Rootfs image injection: `test_create_from_image` in `test_full_stack.py` is exercised by default on Kind using a pinned python rootfs image (`docker.io/library/python:3.13-slim@sha256:...`). To test with a custom rootfs image or disable the test:
   ```bash
   ATE_ENV_ROOTFS_IMAGE="docker.io/library/python@sha256:..." make ci-e2e

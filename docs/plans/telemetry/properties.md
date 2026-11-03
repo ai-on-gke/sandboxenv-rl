@@ -476,10 +476,11 @@ still creating. The same reproduction printed, before #221:
 pool size=6 (asked for 3)  live actors=6  observer warm=6
 ```
 
-Fix for both, in #221: `reap` bumps a teardown counter (`_teardowns`) when it starts and ends, and a
-recycle, `warm_pool` or failed warm claim that awaited across it deletes its actor instead of
-pooling it. `warm_pool` reserves the actors it is creating in `_warm_inflight`, per pool key and
-`_teardowns` value ([interfaces.md](./interfaces.md#warm-pool-accounting-ac-15)).
+Fix for both, in #221: `reap` bumps a teardown counter (`_teardowns`) when it starts and ends and
+counts itself in `_reaping` while it runs, and a recycle, `warm_pool` or failed warm claim that
+awaited across a reap, or finishes during one, deletes its actor instead of pooling it. `warm_pool`
+reserves the actors it is creating in `_warm_inflight`, per pool key and `_teardowns` value
+([interfaces.md](./interfaces.md#warm-pool-accounting-ac-15)).
 
 **Hypothesis finds the same bugs.** The stateful test finds both bugs on the code before #221
 without being told where to look and shrinks each to the shortest operation sequence, shown under

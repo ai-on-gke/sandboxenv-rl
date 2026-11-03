@@ -66,5 +66,7 @@ To see a finding come back, revert its amendment in `telemetry.dfy` and run `daf
   keeps them) against it fails at that clause. It cannot express bug A's symptom (a `warm_pool`
   after the teardown) or bug B (its `Acquire` is one step with no await or put-back).
   `warm_pool_generations.dfy` was written after review found both.
-- No model covers a `warm_pool` cancelled during its `create()` calls, which can leak the actors
-  already created.
+- `Reap` is one atomic step in both warm-pool models, and no model has cancellation. So they cover
+  neither work that runs while `reap` waits on its deletes nor a cancelled delete, the two gaps a
+  second review of #221 found (`_reaping`, and actors owned until deleted), nor a `warm_pool`
+  cancelled during its `create()` calls, which can leak the actors already created.

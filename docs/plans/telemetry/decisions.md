@@ -224,3 +224,12 @@ Append-only. Each entry: date, who, what, why.
   are now in `verify/`; CI does not run them. Still open: a warm claim whose `get()` succeeds after
   an overlapping reap deleted the actor returns a deleted environment (`ClaimOkReturnsLive`), a
   `warm_pool` cancelled during its `create()` calls can leak the actors already created, and P-14.
+- 2026-11-03, recorded from #221: a second review of #221 found two more gaps, fixed in the same
+  pull request. (C) Work that starts and finishes while `reap` waits on its deletes saw an unchanged
+  `_teardowns` and pooled its actors, which `warm_reset` then hid; `_reaping` now counts reaps in
+  progress and blocks pooling. (D) A cancelled delete after a teardown (an `acquire_async` timeout,
+  say) dropped an actor that `_owned_actors` no longer held; the actor now stays owned until the
+  delete succeeds, and a recycle cancelled in `suspend()` keeps its actor owned. The Hypothesis
+  machine now pauses `delete()` and runs recycles and `warm_pool` calls inside a teardown; with the
+  `_reaping` check removed it fails in 6 of 6 runs. Neither Dafny model represents the awaits inside
+  `reap` or cancellation, so neither covers C or D.

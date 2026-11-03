@@ -116,19 +116,27 @@ This document is the canonical reference for common failure modes, diagnostic st
 
 ## 4. Flake & Dependency Pinning
 
-### Python dependency mismatches
+### `uv.lock` out of date
 - **Symptom:** `make check-pins` fails with:
   ```text
-  MISSING: Package <name> required by pyproject.toml is not installed in Nix Python environment
+  pin mismatch: uv.lock is out of date with the pyproject.toml files: ...
   ```
-- **Cause:** A package added to `clients/python/pyproject.toml` or `integrations/nemo-gym/pyproject.toml` is not packaged in the locked Nixpkgs revision, or the pinned version constraint cannot be satisfied. (Note: `integrations/uni-agent` [Python 3.12] and `integrations/openhands` [Python 3.13] run in virtual environments via `ci-venv` with floating PyPI dependencies rather than Nix-managed packages.)
-- **Fix:**
-  - If a newer Nixpkgs packages the dependency, update flake inputs:
-    ```bash
-    make update-pins ARGS=nixpkgs
-    ```
-  - If the package is only in an optional extra the tests don't need, add that extra to `skippedExtras` in [`nix/python.nix`](../../nix/python.nix). If the tests do need it, package it there, or move the project to a pip venv (`ci-venv`) like `integrations/uni-agent`.
-  - Otherwise, relax the version constraint in `pyproject.toml`.
+- **Cause:** A `pyproject.toml` of the uv workspace (the root one, `clients/python` or an `integrations/*` project) changed without re-locking. The Nix envs are built from `uv.lock` as it is, so they don't have the change either.
+- **Fix:** run `uv lock` in the devShell and commit `uv.lock` with the `pyproject.toml` change:
+  ```bash
+  nix develop -c uv lock
+  ```
+  It changes only what the edit requires. If uv can't resolve (for example a new `==` pin conflicts with another project's requirement), its error names the conflicting requirements; every project shares one lock, so they need versions that agree.
+
+### Python env fails to build
+- **Symptom:** `nix develop` (or `make ci`) fails building a Python package, with `No module named 'setuptools'` (or another build backend), or `autoPatchelfHook could not satisfy dependency <lib>.so`.
+- **Cause:** [`nix/python.nix`](../../nix/python.nix) builds the envs from `uv.lock` with uv2nix, from wheels. A package without a wheel for the platform (sdist only, or a git source) is built from source, and `uv.lock` doesn't say which build system it needs ([astral-sh/uv#5190](https://github.com/astral-sh/uv/issues/5190)). A wheel that links a system library outside the manylinux set needs that library.
+- **Fix:** in `buildSystemOverrides` in `nix/python.nix`, add the build system (`withBuildSystem "<name>" { setuptools = [ ]; }`), or add the library to the package's `buildInputs` with an `overrideAttrs`. See uv2nix's [overriding guide](https://pyproject-nix.github.io/uv2nix/overriding/index.html).
+
+### `ModuleNotFoundError: No module named 'ate_env'` from a Nix env
+- **Symptom:** a Python env's interpreter can't import one of this repository's packages (`ate_env`, `nemo_gym_substrate`, ...).
+- **Cause:** the envs install them editable, relative to `$REPO_ROOT`, which the devShell and the `ci-*` scripts set to the repository root. Running an env's `bin/python` some other way (for example from `nix build`'s `result`) leaves it unset.
+- **Fix:** `export REPO_ROOT="$(git rev-parse --show-toplevel)"`, or run the command through `nix develop -c`.
 
 ### Go toolchain directive vs. Nixpkgs
 - **Symptom:** Nix evaluation fails with:
@@ -140,7 +148,7 @@ This document is the canonical reference for common failure modes, diagnostic st
   ```bash
   make update-pins ARGS=nixpkgs
   ```
-  `update-pins` never evaluates the devShell (under Docker it uses the image's `update-pins` stage), so it works even while the devShell is broken.
+  `update-pins` never evaluates the devShell (under Docker it uses the image's `update-pins` stage), so it works even while the devShell is broken; its `uv lock --upgrade` step (which `ARGS=nixpkgs` skips anyway) runs uv through `nix shell`, not the devShell.
 
 ### GitHub Actions moving tags vs. immutable SHAs
 - **Symptom:** `make lint-actions-locally` fails with a `zizmor` `ref-version-mismatch` error:

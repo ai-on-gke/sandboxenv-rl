@@ -30,7 +30,7 @@ The focus moves from a general environment service to RL training and evaluation
 | Fleet SDK | `SandboxFleet` and `AsyncSandboxFleet` in [`clients/python`](clients/python/README.md): acquire sandboxes for tasks by image, run tasks with the `naive`, `sliding` or `pipelined` strategy, pre-warm images, release and recycle. |
 | Any task image | `rootfs_image` runs a digest-pinned image unmodified: `ate-env-api` derives an ActorTemplate per image and mounts the guest into it as an image volume. Runtime layers and sidecars add a second runtime to any image ([docs/rootfs-images](docs/rootfs-images/README.md)). |
 | Daemons inside an environment | A port proxy on `ate-env-api` reaches any port in an environment by header or by path, WebSockets included ([details](#reaching-a-service-inside-an-environment)). |
-| Framework integrations | A [NeMo Gym](integrations/nemo-gym/README.md) sandbox provider, a [uni-agent](integrations/uni-agent/README.md) sandbox provider with an R2E-Gym task graded by hidden tests in the same environment, an [OpenHands](integrations/openhands/README.md) workspace and a [GRPO](examples/grpo/README.md) training loop on TRL. |
+| Framework integrations | A [NeMo Gym](integrations/nemo-gym/README.md) sandbox provider, a [uni-agent](integrations/uni-agent/README.md) sandbox provider with an R2E-Gym task graded by hidden tests in the same environment, an [OpenHands](integrations/openhands/README.md) workspace, a [Harbor](integrations/harbor/README.md) environment provider and a [GRPO](examples/grpo/README.md) training loop on TRL. |
 | Benchmarks | A [SWE-bench Verified loader](benchmarking/swebench/README.md) that drives real task images the way an RL job does, and the [design](internal/benchmarking/DESIGN.md) of the benchmark system. |
 | Platform | Built against Substrate `475f49b0` (`ate.dev/v1` CRDs and `substrate.ateapi.v1.Control`): the WorkerPool chooses the sandbox, each template selects its pool by label, suspends are durable, and `ate-env-api` runs as its own identity under Substrate authorization. The guest runs as a PID 1 init that reaps orphans, and it allocates PTYs. The cluster must run Substrate at or after `48f5744c` (`ate.dev/v1` CRDs and `/substrate.ateapi.v1.Control` gRPC paths). `ate-env-api` reaches actors through the router's TLS listeners with its pod identity certificate (`ate-env manifest --api-router-tls`, on by default), so the install must list `spiffe://cluster.local/ns/ate-env/sa/ate-env-api` in the router's ingress allow-list. |
 
@@ -68,6 +68,7 @@ See [docs/architecture.md](./docs/architecture.md) for the full system design an
 |---|---|
 | [`examples/grpo`](examples/grpo/README.md) | A real RL loop: TRL's GRPOTrainer trains Qwen2.5-0.5B on MBPP, and each completion runs in an environment that computes the reward. Covers the park/wake pattern, with the fleet suspended after each step. CPU only. |
 | [`examples/runtime-layers`](examples/runtime-layers/README.md) | An unmodified rootfs image with a second runtime injected as a layer and supervised as a sidecar. |
+| [`examples/harbor`](examples/harbor/README.md) | Terminal-Bench 2.0 on ate-env through the Harbor provider: prebuilt images, resource class templates, `run-tb2.sh` around `harbor run`, and the comparison with Docker. |
 | [`examples/mcp`](examples/mcp/main.go) | Go: connect to an environment's MCP endpoint, list the tools and call them. |
 | [`examples/guest-daemon`](examples/guest-daemon/README.md) | Go: run the guest gRPC services standalone, without a cluster. |
 | [`examples/Qwen3.5-35B-A3B-verl`](examples/Qwen3.5-35B-A3B-verl/README.md) | Agentic GRPO on real SWE tasks: verl `separate_async` with a Megatron trainer and vLLM rollouts on separate nodes, a uni-agent ReAct agent whose tools and hidden-test grading run in environments. Two 8-GPU nodes. |
@@ -80,6 +81,7 @@ See [docs/architecture.md](./docs/architecture.md) for the full system design an
 | [`integrations/nemo-gym`](integrations/nemo-gym/README.md) | [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) | Sandbox provider `substrate`, registered through the `nemo_gym.sandbox_providers` entry point, with no change to NeMo Gym. `endpoint()` reaches a daemon inside the sandbox through the port proxy, and [`layer/`](integrations/nemo-gym/layer) is that daemon for NeMo: NeMo Skills' sandbox server and NeMo Gym's exec server injected into any task image. |
 | [`integrations/uni-agent`](integrations/uni-agent/README.md) | [uni-agent](https://github.com/verl-project/uni-agent) | Sandbox provider `ate_env` plus an `r2e_gym` task that hides the tests, lets the agent work, then grades in the same environment; dataset and image tooling for R2E-Gym, SWE-reBench and SWE-bench rows. Used by `examples/Qwen3.5-35B-A3B-verl`. |
 | [`integrations/openhands`](integrations/openhands/README.md) | [OpenHands](https://github.com/OpenHands/software-agent-sdk) | `AteEnvWorkspace`, an OpenHands `RemoteWorkspace` that mirrors OpenHands' `AgentSandboxWorkspace` and runs the agent-server in any unmodified task image (glibc 2.31 or newer). |
+| [`integrations/harbor`](integrations/harbor/README.md) | [Harbor](https://github.com/harbor-framework/harbor) | `AteEnvEnvironment`, a Harbor environment provider: `harbor run ... -e ate_env_harbor:AteEnvEnvironment` runs each trial in an ate-env environment from a digest-pinned task image, with no change to Harbor. |
 
 ## Benchmarks
 
@@ -201,6 +203,11 @@ When you upgrade an existing cluster across these changes:
   again: Substrate cannot update an ActorTemplate in place, thus each template `ate-env-api` derives
   from it fails with `resources: Required`. Delete the base and its derived templates (named
   `<base>-<12 hex digits>`) with `kubectl-ate delete actor-template`, then register the base again.
+- A base registered before `--wakeup-timeout` keeps Substrate's 30 s wakeup-probe timeout, and so
+  does each template `ate-env-api` derived from it: `ate-env-api` reuses a derived template as it
+  is, thus registering the base again does not change it. To give a `--sidecar-readyz` template
+  the 120 s default, delete the base and its derived templates (`<base>-<12 hex digits>`), then
+  register the base again; `ate-env-api` derives each image template again from the new base.
 
 ### 1. Deploy the Kubernetes Resources
 
@@ -274,10 +281,17 @@ kubectl get pods -n ate-env
 ```
 
 `ate-env-api` waits for a suspended environment to wake before forwarding a guest call, up to
-`--wake-budget` (default 2m; cold image pulls and cross-region snapshot reads exceed the router's own
+`--wake-budget` (default 5m; cold image pulls and cross-region snapshot reads exceed the router's own
 parking budget) and, once the control plane reports the environment RUNNING, up to
 `--wake-running-budget` (default 20s). Both are flags of the `ate-env-api` binary; `ate-env manifest`
-does not set them, thus add them to the Deployment's arguments to change them.
+does not set them, thus add them to the Deployment's arguments to change them. `--wake-budget` must
+be longer than the image pull plus the template's wakeup-probe timeout (`ate-env manifest template
+--wakeup-timeout`), because the control plane reports RUNNING only after the probe passes. The 5m
+default covers the 120 s timeout of a `--sidecar-readyz` template plus three minutes for the pull;
+raise it if you set a longer `--wakeup-timeout`. Otherwise the first guest call after a slow wake
+fails with `Unavailable`, and a retry succeeds once the environment is up. A crashed or deleted
+environment fails a guest call at once. Port-proxy requests wait on the router instead (see
+[Reaching a service inside an environment](#reaching-a-service-inside-an-environment)).
 
 `ate-env-api` can export traces and serve Prometheus metrics; both are off by default:
 
@@ -341,8 +355,12 @@ ate-env manifest template --template py312 \
 
 A second runtime rides along the same way: `--layer` mounts its image read-only next to the
 guest, `--sidecar` has the guest start and supervise a process from it, and `--sidecar-readyz`
-holds the actor's readiness until that process answers. Here a static busybox stands in for a
-runtime daemon and serves HTTP on port 44772 inside the environment:
+holds the actor's readiness until that process answers. With `--sidecar-readyz`, Substrate's
+wakeup probe waits up to 120 s instead of its default 30 s, because a runtime that boots in 20 s
+alone takes longer when many environments start on one node; `--wakeup-timeout` sets another
+value. Keep `ate-env-api --wake-budget` longer than the image pull plus this timeout (see step 1).
+Templates registered before this flag keep 30 s (see the upgrade notes above). Here a static
+busybox stands in for a runtime daemon and serves HTTP on port 44772 inside the environment:
 
 ```bash
 ate-env manifest template --template layered \
@@ -572,9 +590,18 @@ A daemon that listens on a port inside an environment, such as one a runtime lay
 the guest ([docs/rootfs-images/RUNTIMES.md](docs/rootfs-images/RUNTIMES.md)), is reachable through
 the API's listener. A plain HTTP request that carries `X-Env-Id` and `X-Env-Port` (and
 `X-Env-Atespace` outside `ate-env`) is forwarded through the Substrate router to that port, whatever
-its path; the API strips the three headers. The router resumes a suspended environment first,
-and the proxy waits for the wake up to `--wake-budget` (the same wait as a guest call) before it
-answers 503.
+its path; the API strips the three headers. The router accepts the tunnel and resumes a suspended
+environment for the request, which it holds while the environment wakes, up to about 10 s in
+Substrate v0.6.0 (its `--parked-request-budget`, 5 s by default, plus 5 s). A longer wake, usually
+only the first wake of an environment on a new image (15 to 31 s measured; a resume after a suspend
+takes 1 to 2 s), gets 503 with `Retry-After: 1` and `X-Env-State: RESUMING` or `SUSPENDED`, and the
+wake goes on: the client must retry, or wait for a health check before other requests.
+`--wake-budget` bounds guest gRPC calls, and the port proxy only when the router refuses the tunnel
+itself, for example when it is overloaded. For the router's errors, the proxy reads the
+environment's state: a crashed environment gets 410 Gone with `X-Env-State: CRASHED`, after the
+router's 5 s hold; one that is being deleted gets 404 with `X-Env-State: DELETING`; one that is
+deleted gets 404. A client stops on 410, because only a new environment helps. The daemon's own
+answers, its 503, 404 and 504 included, pass unchanged.
 
 ```bash
 curl -H 'X-Env-Id: dev1' -H 'X-Env-Port: 6000' \
@@ -611,6 +638,23 @@ otherwise. The token does not reach the daemon: the API strips `X-Env-Authorizat
 needs its own `Authorization`, such as an OpenAI-compatible server. A browser cannot add either
 header to a page load or a WebSocket handshake, thus with the token on, the path form serves
 scripted clients only.
+
+A WebSocket client that cannot set headers sends a port capability instead of the token:
+`ate-env-capability:<capability>@` in the user info of the URL, which the client sends as
+`Authorization: Basic`. The capability is `v1.<expiry>.<mac>`, where
+`mac` is the hex HMAC-SHA256, keyed with the API's token, of
+`"ate-env port capability v1\n<atespace>\n<id>\n<port>\n<expiry>"` and `expiry` is in Unix
+seconds, at most seven days ahead. It opens only WebSocket handshakes (a `GET` with
+`Connection: Upgrade` and exactly one `Upgrade` field whose whole value is `websocket`), only to
+that environment port, until it expires; a
+URL that lands in a log never shows the token. The capability must be the request's only
+`Authorization` credential: a second `Authorization` field or a comma-separated value next to it
+gets 400. The API never forwards a capability, also when it does not check it. Capabilities signed
+with a token stop working when the token rotates; a token rotation is also the only way to revoke a
+leaked capability before it expires. The capability names an atespace, an id and a port, not one
+environment instance: when the caller deletes the environment and creates a new one with the same id,
+the capability opens the new environment too, until it expires. Give a capability the shortest expiry
+the client needs, and do not reuse an environment id while a capability for it can still be valid.
 
 **Browsers.** The path form refuses a state-changing request or a WebSocket handshake that a browser
 sends from a page of another origin, so a web page cannot drive a daemon through a `kubectl
@@ -720,7 +764,7 @@ curl -X POST localhost:7777/v1alpha/envs/dev1/mcp \
 ```
 ## Local CI
 
-Maintainers run the CI checks locally using `make`, in a reproducible toolchain: tool versions come from `flake.lock`, `go.mod` (including the protobuf generators, via `tool` directives) and the `pyproject.toml` files, so a given commit gets the same toolchain on every host. The runs aren't hermetic: Kind E2E pulls `kindest/node`, Substrate images and `python:3.13-slim` by pinned digest at run time and clones Substrate at the `go.mod` pin.
+Maintainers run the CI checks locally using `make`, in a reproducible toolchain: tool versions come from `flake.lock`, `go.mod` (including the protobuf generators, via `tool` directives) and `uv.lock` (every Python package, for all the Python projects: one uv workspace at the repository root), so a given commit gets the same toolchain on every host. The runs aren't hermetic: Kind E2E pulls `kindest/node`, Substrate images and `python:3.13-slim` by pinned digest at run time and clones Substrate at the `go.mod` pin.
 
 Supported hosts: CI runs on `x86_64-linux` (GitHub's `ubuntu-24.04`) with Go from `go.mod` and Python 3.13 (the previous workflow used 3.12); the uni-agent integration runs on Python 3.12, because upstream uni-agent doesn't support 3.13 yet. The flake also provides `aarch64-linux` and `aarch64-darwin` devShells. CI checks that the `aarch64-darwin` (Apple Silicon macOS) devShell builds and runs the basic tools, but runs the test suites only on Linux, so treat both as best effort. Intel macOS isn't supported, because current nixpkgs dropped `x86_64-darwin`. The E2E suite needs Docker on any host.
 
@@ -735,6 +779,9 @@ make ci-go
 make ci-python
 make ci-openhands
 make ci-e2e
+
+# Run Go and Python test suites with coverage and generate reports (see docs/chores/coverage.md)
+make coverage
 
 # Preserve the Kind cluster after ci-e2e completes
 KEEP_CLUSTER=1 make ci-e2e
@@ -756,9 +803,13 @@ make lint-actions-locally
 # Enter the interactive development shell
 make dev-shell
 
-# Enter project-specific development shells with isolated virtual environments
+# Enter the integrations' development shells (their Python envs, from uv.lock)
 nix develop .#openhands
 nix develop .#uni-agent
+nix develop .#harbor
+
+# Without Nix: the same locked Python packages in .venv
+uv sync --all-packages --all-extras
 
 # Override the runner (auto [default: nix -> docker], nix, docker, or host)
 CI_RUNNER=docker make ci
@@ -767,9 +818,9 @@ CI_RUNNER=docker make ci
 ### Runners and Environment
 
 - **`auto` (default):** Runs via Nix (`nix develop -c <cmd>`) if `nix` is installed, else via Docker if `docker` is available.
-- **`nix`:** Runs impurely using `nix develop -c` without whitelisting or clearing the environment. In addition to the default devShell, project-specific devShells (`nix develop .#openhands` on Python 3.13 and `nix develop .#uni-agent` on Python 3.12) automatically create and activate isolated virtual environments with pinned native libraries (`LD_LIBRARY_PATH`) for integrations with floating PyPI dependencies.
-- **`docker`:** Automatically builds `sandboxenv-rl-ci:local` from a copy of the tree and runs the command in a container, with module caches in a named volume. Commands that write files (`make protos`, `make update-pins`) return a `git diff` that is applied on the host as you, so file ownership stays yours. Note that passing `--docker-socket` (used only by `make ci-e2e` in the Docker runner) mounts `/var/run/docker.sock`, which grants the container root-equivalent access to the host; `make smoke` uses `--host-network` instead. Both share the host network and mount the host kubeconfig read-only (a single file; a colon-separated `KUBECONFIG` isn't mounted), so `REUSE_CLUSTER` works under Docker too.
-- **`host`:** Executes the command directly on the host, with whatever is on `PATH`. Targets that only need Go and Python work without Nix or Docker: `make protos` needs Go (`GOTOOLCHAIN` fetches the version `go.mod` asks for) and `grpcio-tools` (`pip install -e 'clients/python[dev]'`); buf and the protoc plugins come from `go.mod` through `go tool`. The `ci-*`, `smoke`, `check-pins`, `update-pins`, `check-substrate-head` and `lint-actions-locally` commands are scripts the devShell provides, so with `host` they only work inside `nix develop`.
+- **`nix`:** Runs impurely using `nix develop -c` without whitelisting or clearing the environment. Every Python env is built by Nix from `uv.lock` ([`nix/python.nix`](nix/python.nix), with uv2nix), with this repository's projects installed editable; besides the default devShell, `nix develop .#openhands` (Python 3.13) and `nix develop .#uni-agent` (Python 3.12) carry the integrations' envs, and `ci-python` builds the base and uni-agent envs it needs (`nix build .#python-env-base .#python-env-uni-agent`) on first use, so other commands don't pay for them. After editing a `pyproject.toml`, run `uv lock` in the devShell and commit `uv.lock` (see [check-pins.md](docs/chores/check-pins.md)).
+- **`docker`:** Automatically builds `sandboxenv-rl-ci:local` from a copy of the tree and runs the command in a container. The Nix store and the Go and other caches live in named volumes (`sandboxenv-rl-nix`, `sandboxenv-rl-cache`), so like on a Nix host, the first run builds the devShell and later runs add only what changed. `docker volume rm sandboxenv-rl-nix` reclaims the space. Commands that write files (`make protos`, `make update-pins`) return a `git diff` that is applied on the host as you, so file ownership stays yours. Note that passing `--docker-socket` (used only by `make ci-e2e` in the Docker runner) mounts `/var/run/docker.sock`, which grants the container root-equivalent access to the host; `make smoke` uses `--host-network` instead. Both share the host network and mount the host kubeconfig read-only (a single file; a colon-separated `KUBECONFIG` isn't mounted), so `REUSE_CLUSTER` works under Docker too.
+- **`host`:** Executes the command directly on the host, with whatever is on `PATH`. Targets that only need Go and Python work without Nix or Docker: `make protos` needs Go (`GOTOOLCHAIN` fetches the version `go.mod` asks for) and `grpcio-tools` (`uv sync --package ate-env-client --extra dev`, or `pip install -e 'clients/python[dev]'`); buf and the protoc plugins come from `go.mod` through `go tool`. The `ci-*`, `smoke`, `check-pins`, `update-pins`, `check-substrate-head` and `lint-actions-locally` commands are scripts the devShell provides, so with `host` they only work inside `nix develop`.
 
 > [!NOTE]
 > Online GitHub Actions security audits (such as ref-version-mismatch and impostor-commit) are covered by the organization's required GitHub Actions scan on pull requests. `make lint-actions-locally` runs zizmor in `--offline` mode alongside actionlint.

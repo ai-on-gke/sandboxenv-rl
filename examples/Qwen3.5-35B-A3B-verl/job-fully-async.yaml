@@ -61,17 +61,19 @@ spec:
         # dataset (uni_agent_substrate.datasets): source + slice; images.json comes from the ConfigMap
         - {name: TRAIN_SOURCE, value: "r2e_gym_easy"}
         - {name: TRAIN_SPLIT, value: "train"}
-        - {name: TRAIN_INSTANCES, value: "64"}
+        - {name: TRAIN_INSTANCES, value: "192"}      # >= TOTAL_STEPS x TRAIN_BATCH
         - {name: VAL_TASKS, value: "20"}
-        # separate_async sizing: TRAIN_BATCH == SYNC_STEP * MINI_BATCH; SESSIONS x 2 CPU/6Gi must fit the sandbox pool
+        # separate_async sizing: TRAIN_BATCH == SYNC_STEP * MINI_BATCH. SESSIONS = TRAIN_BATCH x ROLLOUT_N so every
+        # trajectory of a step starts at once instead of queueing on the cap; SESSIONS x 2 CPU/6Gi (plus VAL_TASKS)
+        # must fit the sandbox pool. If the pool cannot hold that many, set SESSIONS to its maximum capacity instead.
         - {name: TRAIN_BATCH, value: "16"}
         - {name: ROLLOUT_N, value: "8"}
         - {name: MINI_BATCH, value: "8"}
         - {name: SYNC_STEP, value: "2"}
-        - {name: SESSIONS, value: "24"}
+        - {name: SESSIONS, value: "128"}
         - {name: GATEWAYS, value: "2"}
         - {name: AGENT_WORKERS, value: "2"}
-        - {name: TOTAL_STEPS, value: "2"}
+        - {name: TOTAL_STEPS, value: "12"}          # 2 smoke, 12 performance numbers, 43 per epoch full; see run_fully_async.sh
         - {name: PROMPT_LENGTH, value: "8192"}
         - {name: RESPONSE_LENGTH, value: "32768"}
         - {name: TRAIN_CP, value: "1"}                # 2 if the 40k-token step runs out of GPU memory

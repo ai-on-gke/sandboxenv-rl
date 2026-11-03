@@ -67,10 +67,9 @@ Follow these numbered steps to upgrade `go.ate.dev/substrate`:
 Verify that all automated checks in [`.github/workflows/ci.yaml`](../../.github/workflows/ci.yaml) pass:
 
 | Job | What it runs | Key assertions |
-|---|---|---|
 | `go` (`ci-go`) | Build, vet, unit tests, gofmt, docs formatting, boilerplate, proto verification | Zero compile errors, `-race` passes, proto stubs clean |
-| `python` (`ci-python`) | Ruff lint and pytest suites across Python packages, examples, integrations (NeMo Gym, and uni-agent via `ci-venv` on Python 3.12), and benchmarks | API client, mock runtime, telemetry, Qwen3 verl example, NeMo Gym and uni-agent integrations, and trajectories |
-| `openhands` (`ci-openhands`) | Ruff lint and pytest suite for OpenHands integration via `.#openhands` devShell (`ci-venv` on Python 3.13) | OpenHands workspace adapters and agent-server tests |
+| `python` (`ci-python`) | Ruff lint and pytest suites across Python packages, examples, integrations (NeMo Gym, and uni-agent on Python 3.12), and benchmarks | API client, mock runtime, telemetry, Qwen3 verl example, NeMo Gym and uni-agent integrations, and trajectories |
+| `openhands` (`ci-openhands`) | Ruff lint and pytest suite for OpenHands integration via `.#openhands` devShell (Python 3.13) | OpenHands workspace adapters and agent-server tests |
 | `e2e-kind` (`ci-e2e`) | Kind cluster bootstrap, Substrate deployment, smoke, and full-stack SDK | Real control plane and guest lifecycle |
 
 Automated E2E coverage breakdown:

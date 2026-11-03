@@ -42,4 +42,4 @@ where = ["src"]
 # ate-env-client is not published; resolve it from this checkout so
 # `uv run --extra test pytest` works without a prior pip install.
 [tool.uv.sources]
-ate-env-client = { path = "../../clients/python", editable = true }
+ate-env-client = { workspace = true }

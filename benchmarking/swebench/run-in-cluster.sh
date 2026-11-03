@@ -296,7 +296,9 @@ if [[ -z "${POD}" ]] || ! kc -n "${NS}" get pod "${POD}" -o jsonpath='{.status.c
 fi
 echo "pod ${POD}; following the loader log"
 if [[ -n "${RESTORE_LOG}" ]]; then
-  ( n=0; while sleep "$(( HARVEST_INTERVAL_MIN * 60 ))"; do n=$(( n + 1 )); harvest_part "${n}"; done ) &
+  # The loop outlives a killed sleep (a stray pkill on another run's loop
+  # must not end this one); cleanup ends it by killing the subshell itself.
+  ( n=0; while :; do sleep "$(( HARVEST_INTERVAL_MIN * 60 ))" || true; n=$(( n + 1 )); harvest_part "${n}"; done ) &
   HARVEST_PID=$!
 fi
 kc -n "${NS}" logs -f "${POD}" -c loader || true

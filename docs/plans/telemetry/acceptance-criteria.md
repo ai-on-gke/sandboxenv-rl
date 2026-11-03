@@ -219,7 +219,7 @@ Conventions:
   `python -m pytest clients/python/tests/test_warm_pool_accounting.py`; with Dafny 4.11:
   `dafny verify docs/plans/telemetry/verify/warm_pool.dfy` and
   `dafny verify docs/plans/telemetry/verify/warm_pool_generations.dfy`.
-- Expected: the pytest run passes (five plain tests and the stateful `test_warm_pool_accounting`).
+- Expected: the pytest run passes (18 plain tests and the stateful `test_warm_pool_accounting`).
   `warm_pool.dfy`: 16 verified, 3 errors, all in `WarmPoolBefore` (the code before #221).
   `warm_pool_generations.dfy`: 24 verified, 3 errors, in `PlanFirstCovers` and
   `ClaimFailPutBackSafe` (#221's first version) and `ClaimOkReturnsLive` (the open claim/reap gap).

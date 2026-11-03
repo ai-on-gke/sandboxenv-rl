@@ -233,3 +233,13 @@ Append-only. Each entry: date, who, what, why.
   machine now pauses `delete()` and runs recycles and `warm_pool` calls inside a teardown; with the
   `_reaping` check removed it fails in 6 of 6 runs. Neither Dafny model represents the awaits inside
   `reap` or cancellation, so neither covers C or D.
+- 2026-11-03, recorded from #221: a third review round, merged with #221 (`efca088`). (E) A delete
+  that failed after the run's reap already ran left the actor tagged with that run, which no later
+  reap would match; the driver now re-tags it with `WARM_POOL_RUN_ID` (a copy, so the caller's
+  handle keeps its run id) and every reap deletes those. (F) A direct `reap`, not through a fleet,
+  cleared the pool without moving the warm-replica gauge; `_reap_actors` now moves it (P-9). (G)
+  `unwarm_pool` and a shrinking `resize_pool` did not stop `warm_pool` calls in flight, which then
+  refilled the pool; a per-pool generation (`_pool_gens`, also in the `_warm_inflight` key) makes
+  them delete what they create. The plain tests grew to 18 and the stateful machine gained
+  `start_teardown` / `finish_teardown` and `unwarm`. The Dafny models cover none of E, F or G
+  ([verify/README.md](./verify/README.md)).

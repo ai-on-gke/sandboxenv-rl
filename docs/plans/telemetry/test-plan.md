@@ -145,7 +145,7 @@ kubectl -n ate-system get deploy -o name | sort | diff /tmp/before-ate-system.tx
 [properties.md](./properties.md) specifies P-1 to P-20. What exists:
 
 ```bash
-# AC-15 (P-9, P-10, P-11), #221: five plain tests and the stateful test_warm_pool_accounting.
+# AC-15 (P-9, P-10, P-11), #221: 18 plain tests and the stateful test_warm_pool_accounting.
 # hypothesis comes with the dev extra, so either venv works.
 /tmp/ate-base/bin/python -m pytest clients/python/tests/test_warm_pool_accounting.py -q
 

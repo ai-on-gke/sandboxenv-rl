@@ -70,3 +70,6 @@ To see a finding come back, revert its amendment in `telemetry.dfy` and run `daf
   neither work that runs while `reap` waits on its deletes nor a cancelled delete, the two gaps a
   second review of #221 found (`_reaping`, and actors owned until deleted), nor a `warm_pool`
   cancelled during its `create()` calls, which can leak the actors already created.
+- Neither warm-pool model has `unwarm_pool`, `resize_pool` or a pool generation (`_pool_gens`), nor
+  run ids: the re-tag of an actor whose delete failed after a teardown (`WARM_POOL_RUN_ID`) and the
+  gauge update inside `reap` are covered by the plain tests in `test_warm_pool_accounting.py` only.

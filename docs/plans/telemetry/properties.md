@@ -1,11 +1,11 @@
 # Properties: telemetry for sandboxenv-rl
 
-Status: checked against `main` at `9b2148a` (2026-11-02) plus #221, which fixes AC-15 and merges
-first. Most property tests here are proposed and not in the repository: `pgregory.net/rapid` is not
-in `go.mod`, and the Hypothesis tests named "Proposed test" do not exist. Two parts exist:
+Status: checked against `main` at `c0c41ac` (2026-11-03), which includes #221's fix for AC-15. Most
+property tests here are proposed and not in the repository: `pgregory.net/rapid` is not in `go.mod`,
+and the Hypothesis tests named "Proposed test" do not exist. Two parts exist:
 
 - `clients/python/tests/test_warm_pool_accounting.py` (#221): the P-9 to P-11 stateful test
-  `test_warm_pool_accounting` and five plain interleaving tests. `hypothesis` is in the `dev` extra
+  `test_warm_pool_accounting` and 18 plain interleaving tests. `hypothesis` is in the `dev` extra
   since #221.
 - [verify/](./verify/README.md): hand-written Dafny models of P-1 to P-11 and of the two bugs review
   found in #221's first version. CI does not run them.
@@ -295,10 +295,11 @@ with only documented `ate.*` and `ate_env.*` attribute keys plus, on CLIENT span
 P-11 share the Hypothesis **stateful** test `test_warm_pool_accounting` in
 `clients/python/tests/test_warm_pool_accounting.py` (#221). Its rules are `acquire_new`,
 `acquire_warm`, `start_recycle` and `finish_recycle` (paused inside `await suspend()`),
-`start_warm_pool` and `finish_warm_pools` (paused inside `await create()`), `fleet_teardown` and
-`idle`. A fake client pauses at those awaits, so Hypothesis generates the interleavings as well as
-the operations. The machine starts no `warm_pool` after a teardown and never makes `get()` fail, so
-bugs A and B (see the findings) are covered by the plain tests
+`start_warm_pool` and `finish_warm_pools` (paused inside `await create()`), `start_teardown` and
+`finish_teardown` (paused inside a reap's `await delete()`), `unwarm` and `idle`. A fake client
+pauses at those awaits, so Hypothesis generates the interleavings as well as the operations. The
+machine starts no `warm_pool` after a teardown and never makes `get()` fail, so bugs A and B (see
+the findings) are covered by the plain tests
 `test_warm_pool_after_teardown_ignores_the_old_reservation` and
 `test_failed_warm_claim_after_teardown_deletes_the_environment` in the same file.
 
@@ -314,7 +315,10 @@ driver's warm pool.
 
 **Validates: AC-15.1**
 
-- Test: `test_warm_pool_accounting`, invariant `gauge_equals_pool`.
+- Test: `test_warm_pool_accounting`, invariant `gauge_equals_pool`;
+  `test_direct_reap_moves_the_gauge_with_the_pool`.
+- A reap moves the gauge by the pool it clears, so P-9 holds for a direct `reap` too, not only
+  through a fleet, which also resets the gauge.
 - Fixed by #221. Before it, in the P-10 recycle interleaving, the pool held 1 actor and the gauge
   read 0.
 
@@ -328,8 +332,15 @@ from the run is alive on Substrate or tracked by the driver.
 - Test: `test_warm_pool_accounting`, invariant `nothing_survives_teardown`;
   `test_recycle_paused_across_teardown_deletes_the_environment`,
   `test_warm_pool_paused_across_teardown_deletes_its_actors`,
-  `test_failed_warm_claim_after_teardown_deletes_the_environment`.
-- Fixed by #221. Before it, the stateful test shrank it to two minimal counter-examples:
+  `test_failed_warm_claim_after_teardown_deletes_the_environment`,
+  `test_warm_pool_finishing_during_a_reap_deletes_its_actors`, and the failed and cancelled delete
+  tests (`test_failed_delete_after_teardown_*`, `test_cancelled_delete_after_teardown_*`,
+  `test_failed_recycle_delete_after_teardown_*`, `test_failed_delete_of_drained_actors_*`).
+- An actor that must be deleted stays owned until the delete succeeds. If the delete fails after the
+  run's reap already ran, the driver re-tags it with `WARM_POOL_RUN_ID`, so whichever run reaps next
+  deletes it.
+- Fixed by #221. Before it, the stateful test shrank it to two minimal counter-examples (recorded
+  when one `fleet_teardown` rule ran the whole reap):
 
   ```text
   state.start_warm_pool()                    # create() paused
@@ -350,7 +361,12 @@ one pool key.
 **Validates: AC-15.3**
 
 - Test: `test_warm_pool_accounting`, invariant `warm_pool_never_over_provisions`;
-  `test_overlapping_warm_pool_calls_provision_once`.
+  `test_overlapping_warm_pool_calls_provision_once`, `test_unwarm_cancels_a_warm_pool_in_flight`,
+  `test_warm_pool_after_unwarm_ignores_the_cancelled_call`,
+  `test_shrinking_resize_cancels_a_warm_pool_in_flight`.
+- `unwarm_pool`, and a `resize_pool` below what is pooled plus in flight, start a new generation of
+  the pool (`_pool_gens`). A `warm_pool` call still creating actors for the old generation deletes
+  them instead of pooling them, and later calls do not count its reservation.
 - Fixed by #221. Before it, the shrunk counter-example was:
 
   ```text
@@ -479,8 +495,8 @@ pool size=6 (asked for 3)  live actors=6  observer warm=6
 Fix for both, in #221: `reap` bumps a teardown counter (`_teardowns`) when it starts and ends and
 counts itself in `_reaping` while it runs, and a recycle, `warm_pool` or failed warm claim that
 awaited across a reap, or finishes during one, deletes its actor instead of pooling it. `warm_pool`
-reserves the actors it is creating in `_warm_inflight`, per pool key and `_teardowns` value
-([interfaces.md](./interfaces.md#warm-pool-accounting-ac-15)).
+reserves the actors it is creating in `_warm_inflight`, per pool key, `_teardowns` value and pool
+generation ([interfaces.md](./interfaces.md#warm-pool-accounting-ac-15)).
 
 **Hypothesis finds the same bugs.** The stateful test finds both bugs on the code before #221
 without being told where to look and shrinks each to the shortest operation sequence, shown under

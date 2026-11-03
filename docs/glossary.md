@@ -40,8 +40,10 @@ for control-plane terms.
 - **ActorTemplate**: The Substrate specification
   (`go.ate.dev/substrate/api/ateapi/v1.ActorTemplate`) defining container images, commands, OCI
   image volumes, millicore CPU and byte memory limits, snapshot buckets, and worker pools.
-- **Snapshot**: A filesystem and memory checkpoint stored in object storage when an actor suspends
-  (`SuspendOptions{Mode: DURABILITY_MODE_SYNCHRONOUS}`).
+- **Snapshot**: A filesystem and memory checkpoint taken when an actor suspends: stored in object
+  storage before the call returns (`SuspendOptions{Mode: DURABILITY_MODE_SYNCHRONOUS}`), or on the
+  worker's node first with the upload in the background (`DURABILITY_MODE_ASYNCHRONOUS`,
+  `SuspendLocal`).
 - **Worker** / **WorkerPool**: The Substrate pool of pre-started worker pods running
   `ateworker-gvisor` that execute actors inside gVisor (`runsc`).
 - **AccessPolicy**: The Substrate authorization record granting
@@ -63,8 +65,10 @@ for control-plane terms.
 - **`LoopRunner`**: A dedicated background thread running a permanent `asyncio` event loop
   (`clients/python/src/ate_env/loop_runner.py`), enabling synchronous Python facades to share gRPC
   channels safely.
-- **Suspend**: Checkpointing a running actor to durable storage with
-  `SuspendOptions{Mode: DURABILITY_MODE_SYNCHRONOUS}` and releasing its worker slot.
+- **Suspend**: Checkpointing a running actor and releasing its worker slot: durably with
+  `SuspendOptions{Mode: DURABILITY_MODE_SYNCHRONOUS}` (`Suspend`), or locally with
+  `DURABILITY_MODE_ASYNCHRONOUS` (`SuspendLocal`), after which the environment reports
+  `ENVIRONMENT_STATUS_PAUSED` until the upload lands.
 - **Wake** / **`ensureAwake`**: Automatic restoration of a suspended actor when `ate-env-api` routes
   traffic through `atenet`. Bounded by `DefaultWakeBudget` (5 minutes bounds the entire wait) and
   `DefaultWakeRunningBudget` (20 seconds bounds the wait once `RUNNING`).

@@ -239,7 +239,11 @@ Key non-obvious points:
 
 - **Suspend**: `internal/ate.Client.Suspend` calls Substrate's control plane with
   `SuspendOptions{Mode: DURABILITY_MODE_SYNCHRONOUS}`. This blocks until the memory and filesystem
-  checkpoint upload to object storage completes.
+  checkpoint upload to object storage completes. `internal/ate.Client.SuspendLocal`
+  (`SuspendEnvironment` with `SUSPEND_MODE_LOCAL`) uses `DURABILITY_MODE_ASYNCHRONOUS`: it returns
+  once the checkpoint is on the worker's node, the upload goes on in the background, and the
+  environment reports `ENVIRONMENT_STATUS_PAUSED` until it lands. Either call leaves an environment
+  that is already suspended or paused as it is.
 - **Delete**: `internal/ate.Client.Delete` calls `DeleteActor` directly (terminates the workload in
   any state, releases the worker, and deletes snapshots) and calls `evictGuest` to close and forget
   the pooled `guestPool` connection.

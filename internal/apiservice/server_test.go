@@ -1046,6 +1046,20 @@ func TestCreatePassesWorkerSelectorAndGetReportsNode(t *testing.T) {
 		t.Errorf("node = %q, want gke-pool-a-8 from the worker assignment", n)
 	}
 
+	// A detach clears assigned_node, and Substrate unsets the worker
+	// assignment whenever the actor has no worker: both clear, no node.
+	control.MutateActor("placed", func(a *ateapipb.Actor) {
+		a.Status.AssignedNode = ""
+		a.Status.WorkerAssignment = nil
+	})
+	got, err = client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "placed"})
+	if err != nil {
+		t.Fatalf("GetEnvironment: %v", err)
+	}
+	if n := got.GetEnvironment().GetNode(); n != "" {
+		t.Errorf("node = %q after a detach, want empty", n)
+	}
+
 	// No selector in the request: the actor carries none, so the template's
 	// selection stands.
 	if _, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "plain"}); err != nil {

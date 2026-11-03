@@ -7,14 +7,11 @@ user needs to know across them.
 ## Unreleased
 
 ### Added
-<<<<<<< HEAD
 - `swebench-loader plan-placement`: an image placement plan
   (`image-placement.json`) that assigns each task image to placement domains
   (worker pools a per-environment worker selector addresses) under each
   node's image-cache budget, largest image first, with replication and a hot
   rule from the schedule's demand; `domains.json` describes the domains.
-
-=======
 - ate-env-api: `worker_selector` on `CreateEnvironment`, labels the worker pool
   must carry, ANDed with the template's own selector (`Actor.worker_selector`,
   so it holds for wakes too); `node` and `worker_selector` on `Environment`.
@@ -22,7 +19,6 @@ user needs to know across them.
   the reserved environment ids);
   `worker_selector=` on the Python client's `create()` and `node`,
   `worker_selector` on `EnvironmentInfo`.
->>>>>>> origin/main
 - Observability across the stack, all off by default except the run report;
   see [docs/observability.md](docs/observability.md).
 - Python client: OpenTelemetry tracing behind the `tracing` extra

@@ -1,0 +1,512 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package inventory
+
+import (
+	"bytes"
+	"embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"path"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/jsonschema-go/jsonschema"
+	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
+)
+
+// SchemaVersion is the schema_version every v1 snapshot carries.
+const SchemaVersion = "v1"
+
+// SnapshotSchema is the embedded JSON Schema file for Snapshot.
+const SnapshotSchema = "snapshot.schema.json"
+
+const baseSchemaURI = "https://ai-on-gke.github.io/sandboxenv-rl/schema/inventory/v1/"
+
+// SchemaFS embeds the JSON Schema v1 files under v1/.
+//
+//go:embed v1/*.schema.json
+var SchemaFS embed.FS
+
+// Actor states: ateapi.ActorState lowercased without ACTOR_STATE_, the values
+// Substrate writes as ate.actor.state. Deleted appears on Substrate's
+// lifecycle records only; a snapshot never lists a deleted actor, but a reader
+// that merges events and snapshots shares the vocabulary. Unspecified is what
+// ActorStateValue returns for an enum value this package does not know, so a
+// newer control plane does not break a reader.
+const (
+	ActorStateUnspecified = "unspecified"
+	ActorStateResuming    = "resuming"
+	ActorStateRunning     = "running"
+	ActorStateSuspending  = "suspending"
+	ActorStateSuspended   = "suspended"
+	ActorStateCrashed     = "crashed"
+	ActorStateDeleting    = "deleting"
+	ActorStateReverting   = "reverting"
+	ActorStateDeleted     = "deleted"
+)
+
+// Worker states: ateapi.WorkerState lowercased without WORKER_STATE_.
+const (
+	WorkerStateUnspecified = "unspecified"
+	WorkerStateActive      = "active"
+	WorkerStateDraining    = "draining"
+	WorkerStateUnavailable = "unavailable"
+)
+
+// Golden snapshot states of a template, derived by GoldenState from
+// ActorTemplateStatus.golden_snapshot_status.
+const (
+	GoldenNone    = "none"
+	GoldenPending = "pending"
+	GoldenReady   = "ready"
+	GoldenFailed  = "failed"
+)
+
+var (
+	actorStates = map[string]bool{
+		ActorStateUnspecified: true, ActorStateResuming: true, ActorStateRunning: true,
+		ActorStateSuspending: true, ActorStateSuspended: true, ActorStateCrashed: true,
+		ActorStateDeleting: true, ActorStateReverting: true,
+	}
+	workerStates = map[string]bool{
+		WorkerStateUnspecified: true, WorkerStateActive: true, WorkerStateDraining: true,
+		WorkerStateUnavailable: true,
+	}
+	goldenStates = map[string]bool{
+		GoldenNone: true, GoldenPending: true, GoldenReady: true, GoldenFailed: true,
+	}
+)
+
+// Snapshot is one cluster's inventory at GeneratedAt.
+type Snapshot struct {
+	SchemaVersion string    `json:"schema_version"`
+	GeneratedAt   time.Time `json:"generated_at"`
+	// Project, Cluster and Location identify the cluster the reporter runs in;
+	// a reader lists snapshots across them.
+	Project  string   `json:"project"`
+	Cluster  string   `json:"cluster"`
+	Location string   `json:"location,omitempty"`
+	Reporter Reporter `json:"reporter"`
+
+	Atespaces   []Atespace   `json:"atespaces"`
+	Templates   []Template   `json:"templates"`
+	Tags        []Tag        `json:"tags,omitempty"`
+	WorkerPools []WorkerPool `json:"workerpools"`
+	Workers     []Worker     `json:"workers"`
+	Actors      []Actor      `json:"actors"`
+	Deployments []Deployment `json:"deployments"`
+	// Counts is derived from Actors; Validate checks that it matches.
+	Counts Counts `json:"counts"`
+}
+
+// Reporter identifies the writer and its interval, so a reader can tell a
+// stale snapshot from a slow one.
+type Reporter struct {
+	Version         string `json:"version"`
+	Commit          string `json:"commit,omitempty"`
+	IntervalSeconds int    `json:"interval_s"`
+}
+
+// Atespace is a Substrate tenant boundary.
+type Atespace struct {
+	Name       string    `json:"name"`
+	CreateTime time.Time `json:"create_time"`
+}
+
+// Template is an ActorTemplate. A derived per-image template names its base
+// and its rootfs image; a base template has neither.
+type Template struct {
+	Atespace    string    `json:"atespace"`
+	Name        string    `json:"name"`
+	Base        string    `json:"base,omitempty"`
+	RootfsImage string    `json:"rootfs_image,omitempty"`
+	GuestImage  string    `json:"guest_image,omitempty"`
+	WorkerPool  string    `json:"workerpool,omitempty"`
+	GoldenState string    `json:"golden_state,omitempty"`
+	CreateTime  time.Time `json:"create_time"`
+}
+
+// Tag is a named snapshot, for example a template's golden snapshot.
+type Tag struct {
+	Atespace    string    `json:"atespace"`
+	Name        string    `json:"name"`
+	SourceActor string    `json:"source_actor,omitempty"`
+	CreateTime  time.Time `json:"create_time"`
+}
+
+// WorkerPool is the Kubernetes WorkerPool object that owns worker pods.
+type WorkerPool struct {
+	Namespace     string `json:"namespace"`
+	Name          string `json:"name"`
+	Replicas      int32  `json:"replicas"`
+	ReadyReplicas int32  `json:"ready_replicas"`
+	SandboxClass  string `json:"sandbox_class,omitempty"`
+	SandboxConfig string `json:"sandbox_config,omitempty"`
+	WorkerImage   string `json:"worker_image,omitempty"`
+}
+
+// Resources are a worker's capacity or allocation, in the units
+// ateapi.WorkerResources uses.
+type Resources struct {
+	CPUMillicores int64 `json:"cpu_m"`
+	MemoryBytes   int64 `json:"memory_bytes"`
+}
+
+// Worker is one worker pod as the control plane registers it. Name is the
+// control plane's opaque worker name; never parse it.
+type Worker struct {
+	Name      string    `json:"name"`
+	Namespace string    `json:"namespace"`
+	Pool      string    `json:"pool"`
+	Pod       string    `json:"pod"`
+	Node      string    `json:"node,omitempty"`
+	State     string    `json:"state"`
+	Capacity  Resources `json:"capacity"`
+	Allocated Resources `json:"allocated"`
+}
+
+// Actor is one Substrate actor, the entity behind an ate-env environment.
+type Actor struct {
+	UID          string            `json:"uid"`
+	Atespace     string            `json:"atespace"`
+	Name         string            `json:"name"`
+	Template     string            `json:"template,omitempty"`
+	SourceTag    string            `json:"source_tag,omitempty"`
+	State        string            `json:"state"`
+	AssignedNode string            `json:"assigned_node,omitempty"`
+	Worker       string            `json:"worker,omitempty"`
+	CreateTime   time.Time         `json:"create_time"`
+	UpdateTime   time.Time         `json:"update_time"`
+	Crash        *Crash            `json:"crash,omitempty"`
+	Labels       map[string]string `json:"labels,omitempty"`
+}
+
+// Crash is the control plane's crash record for an actor in state crashed.
+type Crash struct {
+	Message   string    `json:"message"`
+	CrashTime time.Time `json:"crash_time"`
+}
+
+// Deployment is an ate-env-api Deployment found in the cluster.
+type Deployment struct {
+	Namespace   string `json:"namespace"`
+	Name        string `json:"name"`
+	Image       string `json:"image"`
+	Version     string `json:"version,omitempty"`
+	Ready       int32  `json:"ready"`
+	Tracing     bool   `json:"tracing"`
+	MetricsPort int32  `json:"metrics_port,omitempty"`
+}
+
+// Counts summarizes Actors so a reader can render a fleet page without
+// decoding every actor.
+type Counts struct {
+	ActorsByState    map[string]int `json:"actors_by_state"`
+	ActorsByAtespace map[string]int `json:"actors_by_atespace"`
+}
+
+// ActorStateValue returns the snapshot vocabulary for s.
+func ActorStateValue(s ateapipb.ActorState) string {
+	switch s {
+	case ateapipb.ActorState_ACTOR_STATE_RESUMING:
+		return ActorStateResuming
+	case ateapipb.ActorState_ACTOR_STATE_RUNNING:
+		return ActorStateRunning
+	case ateapipb.ActorState_ACTOR_STATE_SUSPENDING:
+		return ActorStateSuspending
+	case ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
+		return ActorStateSuspended
+	case ateapipb.ActorState_ACTOR_STATE_CRASHED:
+		return ActorStateCrashed
+	case ateapipb.ActorState_ACTOR_STATE_DELETING:
+		return ActorStateDeleting
+	case ateapipb.ActorState_ACTOR_STATE_REVERTING:
+		return ActorStateReverting
+	default:
+		return ActorStateUnspecified
+	}
+}
+
+// WorkerStateValue returns the snapshot vocabulary for s.
+func WorkerStateValue(s ateapipb.WorkerState) string {
+	switch s {
+	case ateapipb.WorkerState_WORKER_STATE_ACTIVE:
+		return WorkerStateActive
+	case ateapipb.WorkerState_WORKER_STATE_DRAINING:
+		return WorkerStateDraining
+	case ateapipb.WorkerState_WORKER_STATE_UNAVAILABLE:
+		return WorkerStateUnavailable
+	default:
+		return WorkerStateUnspecified
+	}
+}
+
+// GoldenState derives a template's golden snapshot state. configured says
+// whether the template asks for a golden snapshot at all; status is its
+// golden_snapshot_status, nil when the control plane reports none.
+func GoldenState(status *ateapipb.GoldenSnapshotStatus, configured bool) string {
+	switch {
+	case !configured:
+		return GoldenNone
+	case status.GetErrorMessage() != "":
+		return GoldenFailed
+	case status.GetGoldenTag().GetName() != "":
+		return GoldenReady
+	default:
+		return GoldenPending
+	}
+}
+
+// ComputeCounts derives Counts from actors.
+func ComputeCounts(actors []Actor) Counts {
+	c := Counts{ActorsByState: map[string]int{}, ActorsByAtespace: map[string]int{}}
+	for _, a := range actors {
+		c.ActorsByState[a.State]++
+		c.ActorsByAtespace[a.Atespace]++
+	}
+	return c
+}
+
+// Sort orders every list by its identity, so two snapshots of the same state
+// encode to the same bytes whatever order the control plane returned.
+func (s *Snapshot) Sort() {
+	sort.Slice(s.Atespaces, func(i, j int) bool { return s.Atespaces[i].Name < s.Atespaces[j].Name })
+	sort.Slice(s.Templates, func(i, j int) bool {
+		return key2(s.Templates[i].Atespace, s.Templates[i].Name) < key2(s.Templates[j].Atespace, s.Templates[j].Name)
+	})
+	sort.Slice(s.Tags, func(i, j int) bool {
+		return key2(s.Tags[i].Atespace, s.Tags[i].Name) < key2(s.Tags[j].Atespace, s.Tags[j].Name)
+	})
+	sort.Slice(s.WorkerPools, func(i, j int) bool {
+		return key2(s.WorkerPools[i].Namespace, s.WorkerPools[i].Name) < key2(s.WorkerPools[j].Namespace, s.WorkerPools[j].Name)
+	})
+	sort.Slice(s.Workers, func(i, j int) bool { return s.Workers[i].Name < s.Workers[j].Name })
+	sort.Slice(s.Actors, func(i, j int) bool { return s.Actors[i].UID < s.Actors[j].UID })
+	sort.Slice(s.Deployments, func(i, j int) bool {
+		return key2(s.Deployments[i].Namespace, s.Deployments[i].Name) < key2(s.Deployments[j].Namespace, s.Deployments[j].Name)
+	})
+}
+
+func key2(a, b string) string { return a + "\x00" + b }
+
+// Validate checks the invariants the JSON Schema cannot express: the version,
+// the identity of the snapshot and of each object, the state vocabularies,
+// unique actor uids, and Counts matching Actors.
+func (s *Snapshot) Validate() error {
+	if s.SchemaVersion != SchemaVersion {
+		return fmt.Errorf("inventory: unsupported schema_version %q (want %q)", s.SchemaVersion, SchemaVersion)
+	}
+	if s.GeneratedAt.IsZero() {
+		return errors.New("inventory: generated_at is required")
+	}
+	if s.Project == "" || s.Cluster == "" {
+		return errors.New("inventory: project and cluster are required")
+	}
+	if s.Reporter.Version == "" {
+		return errors.New("inventory: reporter.version is required")
+	}
+	if s.Reporter.IntervalSeconds <= 0 {
+		return fmt.Errorf("inventory: reporter.interval_s must be positive, got %d", s.Reporter.IntervalSeconds)
+	}
+	for i, a := range s.Atespaces {
+		if a.Name == "" {
+			return fmt.Errorf("inventory: atespaces[%d]: name is required", i)
+		}
+	}
+	for i, t := range s.Templates {
+		if t.Atespace == "" || t.Name == "" {
+			return fmt.Errorf("inventory: templates[%d]: atespace and name are required", i)
+		}
+		if t.GoldenState != "" && !goldenStates[t.GoldenState] {
+			return fmt.Errorf("inventory: templates[%d]: unknown golden_state %q", i, t.GoldenState)
+		}
+	}
+	for i, t := range s.Tags {
+		if t.Atespace == "" || t.Name == "" {
+			return fmt.Errorf("inventory: tags[%d]: atespace and name are required", i)
+		}
+	}
+	for i, p := range s.WorkerPools {
+		if p.Namespace == "" || p.Name == "" {
+			return fmt.Errorf("inventory: workerpools[%d]: namespace and name are required", i)
+		}
+		if p.Replicas < 0 || p.ReadyReplicas < 0 {
+			return fmt.Errorf("inventory: workerpools[%d]: replica counts must not be negative", i)
+		}
+	}
+	for i, w := range s.Workers {
+		if w.Name == "" || w.Namespace == "" || w.Pool == "" || w.Pod == "" {
+			return fmt.Errorf("inventory: workers[%d]: name, namespace, pool and pod are required", i)
+		}
+		if !workerStates[w.State] {
+			return fmt.Errorf("inventory: workers[%d]: unknown state %q", i, w.State)
+		}
+		if w.Capacity.CPUMillicores < 0 || w.Capacity.MemoryBytes < 0 || w.Allocated.CPUMillicores < 0 || w.Allocated.MemoryBytes < 0 {
+			return fmt.Errorf("inventory: workers[%d]: resources must not be negative", i)
+		}
+	}
+	uids := make(map[string]int, len(s.Actors))
+	for i, a := range s.Actors {
+		if a.UID == "" || a.Atespace == "" || a.Name == "" {
+			return fmt.Errorf("inventory: actors[%d]: uid, atespace and name are required", i)
+		}
+		if j, dup := uids[a.UID]; dup {
+			return fmt.Errorf("inventory: actors[%d]: uid %q repeats actors[%d]", i, a.UID, j)
+		}
+		uids[a.UID] = i
+		if !actorStates[a.State] {
+			return fmt.Errorf("inventory: actors[%d]: unknown state %q", i, a.State)
+		}
+		if a.CreateTime.IsZero() || a.UpdateTime.IsZero() {
+			return fmt.Errorf("inventory: actors[%d]: create_time and update_time are required", i)
+		}
+		if (a.State == ActorStateCrashed) != (a.Crash != nil) {
+			return fmt.Errorf("inventory: actors[%d]: crash is present exactly when state is %q", i, ActorStateCrashed)
+		}
+	}
+	for i, d := range s.Deployments {
+		if d.Namespace == "" || d.Name == "" || d.Image == "" {
+			return fmt.Errorf("inventory: deployments[%d]: namespace, name and image are required", i)
+		}
+	}
+	if want := ComputeCounts(s.Actors); !countsEqual(want, s.Counts) {
+		return errors.New("inventory: counts do not match actors")
+	}
+	return nil
+}
+
+func countsEqual(a, b Counts) bool {
+	return mapsEqual(a.ActorsByState, b.ActorsByState) && mapsEqual(a.ActorsByAtespace, b.ActorsByAtespace)
+}
+
+func mapsEqual(a, b map[string]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// Encode writes s as indented JSON with a trailing newline, the form the
+// reporter stores and the golden test pins.
+func (s *Snapshot) Encode(w io.Writer) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(s)
+}
+
+// DecodeSnapshot reads one snapshot from r. It rejects unknown fields, a
+// second JSON value after the first, and any snapshot Validate refuses.
+func DecodeSnapshot(r io.Reader) (*Snapshot, error) {
+	dec := json.NewDecoder(r)
+	dec.DisallowUnknownFields()
+	var s Snapshot
+	if err := dec.Decode(&s); err != nil {
+		return nil, fmt.Errorf("inventory: decode snapshot: %w", err)
+	}
+	if err := ensureEOF(dec); err != nil {
+		return nil, fmt.Errorf("inventory: decode snapshot: %w", err)
+	}
+	if err := s.Validate(); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+func ensureEOF(dec *json.Decoder) error {
+	var extra json.RawMessage
+	err := dec.Decode(&extra)
+	switch {
+	case errors.Is(err, io.EOF):
+		return nil
+	case err != nil:
+		return err
+	default:
+		return errors.New("trailing data after the JSON value")
+	}
+}
+
+var (
+	resolvedMu sync.Mutex
+	resolved   = map[string]*jsonschema.Resolved{}
+)
+
+// LoadJSONSchema resolves one of the embedded v1/*.schema.json files by name
+// ("snapshot.schema.json" or "v1/snapshot.schema.json").
+func LoadJSONSchema(name string) (*jsonschema.Resolved, error) {
+	name = strings.TrimPrefix(name, "v1/")
+	resolvedMu.Lock()
+	defer resolvedMu.Unlock()
+	if r, ok := resolved[name]; ok {
+		return r, nil
+	}
+	raw, err := SchemaFS.ReadFile(path.Join("v1", name))
+	if err != nil {
+		return nil, fmt.Errorf("inventory: read embedded schema %q: %w", name, err)
+	}
+	var s jsonschema.Schema
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return nil, fmt.Errorf("inventory: unmarshal schema %q: %w", name, err)
+	}
+	r, err := s.Resolve(&jsonschema.ResolveOptions{BaseURI: baseSchemaURI + name, Loader: loadEmbeddedSchema})
+	if err != nil {
+		return nil, fmt.Errorf("inventory: resolve schema %q: %w", name, err)
+	}
+	resolved[name] = r
+	return r, nil
+}
+
+func loadEmbeddedSchema(uri *url.URL) (*jsonschema.Schema, error) {
+	raw, err := SchemaFS.ReadFile(path.Join("v1", path.Base(uri.Path)))
+	if err != nil {
+		return nil, fmt.Errorf("inventory: load referenced schema %q: %w", uri.String(), err)
+	}
+	var s jsonschema.Schema
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return nil, fmt.Errorf("inventory: unmarshal referenced schema %q: %w", uri.String(), err)
+	}
+	return &s, nil
+}
+
+// ValidateAgainstJSONSchema validates raw JSON against the named embedded
+// schema. Readers in other languages run the same check from the schema file.
+func ValidateAgainstJSONSchema(schemaName string, data []byte) error {
+	r, err := LoadJSONSchema(schemaName)
+	if err != nil {
+		return err
+	}
+	var instance any
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&instance); err != nil {
+		return fmt.Errorf("inventory: decode instance for %s: %w", schemaName, err)
+	}
+	if err := ensureEOF(dec); err != nil {
+		return fmt.Errorf("inventory: decode instance for %s: %w", schemaName, err)
+	}
+	if err := r.Validate(instance); err != nil {
+		return fmt.Errorf("inventory: %s validation failed: %w", schemaName, err)
+	}
+	return nil
+}

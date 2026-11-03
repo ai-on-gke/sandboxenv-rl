@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-on-gke.github.io/sandboxenv-rl/schema/inventory/v1/snapshot.schema.json",
+  "title": "InventorySnapshot",
+  "description": "One cluster's ate-env inventory at one instant: atespaces, actor templates, tags, WorkerPools, workers, actors and ate-env-api Deployments. Written by the per-cluster reporter, read by the fleet site.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_at",
+    "project",
+    "cluster",
+    "reporter",
+    "atespaces",
+    "templates",
+    "workerpools",
+    "workers",
+    "actors",
+    "deployments",
+    "counts"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "enum": ["v1"] },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "project": { "type": "string", "minLength": 1 },
+    "cluster": { "type": "string", "minLength": 1 },
+    "location": { "type": "string" },
+    "reporter": { "$ref": "#/$defs/Reporter" },
+    "atespaces": { "type": "array", "items": { "$ref": "#/$defs/Atespace" } },
+    "templates": { "type": "array", "items": { "$ref": "#/$defs/Template" } },
+    "tags": { "type": "array", "items": { "$ref": "#/$defs/Tag" } },
+    "workerpools": { "type": "array", "items": { "$ref": "#/$defs/WorkerPool" } },
+    "workers": { "type": "array", "items": { "$ref": "#/$defs/Worker" } },
+    "actors": { "type": "array", "items": { "$ref": "#/$defs/Actor" } },
+    "deployments": { "type": "array", "items": { "$ref": "#/$defs/Deployment" } },
+    "counts": { "$ref": "#/$defs/Counts" }
+  },
+  "$defs": {
+    "Reporter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "interval_s"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1 },
+        "commit": { "type": "string" },
+        "interval_s": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "Atespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "create_time"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "create_time": { "type": "string", "format": "date-time" }
+      }
+    },
+    "Template": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["atespace", "name", "create_time"],
+      "properties": {
+        "atespace": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "base": { "type": "string" },
+        "rootfs_image": { "type": "string" },
+        "guest_image": { "type": "string" },
+        "workerpool": { "type": "string" },
+        "golden_state": { "type": "string", "enum": ["none", "pending", "ready", "failed"] },
+        "create_time": { "type": "string", "format": "date-time" }
+      }
+    },
+    "Tag": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["atespace", "name", "create_time"],
+      "properties": {
+        "atespace": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "source_actor": { "type": "string" },
+        "create_time": { "type": "string", "format": "date-time" }
+      }
+    },
+    "WorkerPool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "name", "replicas", "ready_replicas"],
+      "properties": {
+        "namespace": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "replicas": { "type": "integer", "minimum": 0 },
+        "ready_replicas": { "type": "integer", "minimum": 0 },
+        "sandbox_class": { "type": "string" },
+        "sandbox_config": { "type": "string" },
+        "worker_image": { "type": "string" }
+      }
+    },
+    "Resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu_m", "memory_bytes"],
+      "properties": {
+        "cpu_m": { "type": "integer", "minimum": 0 },
+        "memory_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "Worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "namespace", "pool", "pod", "state", "capacity", "allocated"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "namespace": { "type": "string", "minLength": 1 },
+        "pool": { "type": "string", "minLength": 1 },
+        "pod": { "type": "string", "minLength": 1 },
+        "node": { "type": "string" },
+        "state": { "type": "string", "enum": ["unspecified", "active", "draining", "unavailable"] },
+        "capacity": { "$ref": "#/$defs/Resources" },
+        "allocated": { "$ref": "#/$defs/Resources" }
+      }
+    },
+    "Actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uid", "atespace", "name", "state", "create_time", "update_time"],
+      "properties": {
+        "uid": { "type": "string", "minLength": 1 },
+        "atespace": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "template": { "type": "string" },
+        "source_tag": { "type": "string" },
+        "state": {
+          "type": "string",
+          "enum": [
+            "unspecified",
+            "resuming",
+            "running",
+            "suspending",
+            "suspended",
+            "crashed",
+            "deleting",
+            "reverting"
+          ]
+        },
+        "assigned_node": { "type": "string" },
+        "worker": { "type": "string" },
+        "create_time": { "type": "string", "format": "date-time" },
+        "update_time": { "type": "string", "format": "date-time" },
+        "crash": { "$ref": "#/$defs/Crash" },
+        "labels": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "Crash": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["message", "crash_time"],
+      "properties": {
+        "message": { "type": "string" },
+        "crash_time": { "type": "string", "format": "date-time" }
+      }
+    },
+    "Deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["namespace", "name", "image", "ready", "tracing"],
+      "properties": {
+        "namespace": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "image": { "type": "string", "minLength": 1 },
+        "version": { "type": "string" },
+        "ready": { "type": "integer", "minimum": 0 },
+        "tracing": { "type": "boolean" },
+        "metrics_port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "Counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actors_by_state", "actors_by_atespace"],
+      "properties": {
+        "actors_by_state": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "actors_by_atespace": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } }
+      }
+    }
+  }
+}

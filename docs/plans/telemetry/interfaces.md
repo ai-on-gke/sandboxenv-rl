@@ -198,16 +198,20 @@ Notes: the plan had one flag for both. The stripped binary grew by 2.6 MiB.
 | `ENABLE_TRACING`, `METRICS_PORT`, `REPORT_DIR`                                                                                                                 | `examples/grpo`, `rollout_bench.py`, #186's pipeline                                                  |
 | `ENV_BENCH_MODE`, `ENV_BENCH_TRACE_PATH`, `ARTIFACT_DIR`                                                                                                       | `ate_env.telemetry.trace_recorder` (#173)                                                             |
 
-## Warm-pool accounting (AC-15, proposed)
+## Warm-pool accounting (AC-15)
 
-Not shipped. `main` at `9b2148a` fails AC-15 ([acceptance-criteria.md](./acceptance-criteria.md)).
-`SubstrateBackendDriver` coroutines share one event loop and interleave at every `await`; the
-bookkeeping must hold under any interleaving:
+Shipped in #221 (`clients/python/src/ate_env/backend/substrate.py`). `SubstrateBackendDriver`
+coroutines share one event loop and interleave at every `await`; the bookkeeping holds under any
+interleaving:
 
-| Rule                  | Proposed contract                                                                                                                                                                                                                                                                 | On `main`                                                                                                      |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| gauge equals pool     | `ate_env_fleet_warm_replicas{backend}` equals the driver's warm-pool size after every step (P-9)                                                                                                                                                                                  | breaks when a recycle re-pools an actor after teardown                                                         |
-| teardown counter      | `reap(run_id)` increments a driver teardown counter under the lock. A recycle reads it before `await suspend()` and re-checks it under the lock afterwards; if it changed, the actor is deleted instead of pooled. `warm_pool` checks it before pooling each created actor (P-10) | no counter; `_release_internal` re-pools after the await and `_warm_pool_internal` pools after its `create()`s |
-| in-flight reservation | `warm_pool` reserves under the lock: `needed = replicas - len(pool) - in_flight[pool_key]`, then `in_flight[pool_key] += needed`, released as each `create()` finishes (P-11)                                                                                                     | `needed = replicas - len(current)`, no reservation                                                             |
+| Name or rule      | Contract                                                                                                                                                                                                                                                                                                            |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| gauge equals pool | `ate_env_fleet_warm_replicas{backend}` equals the driver's warm-pool size after every step (P-9)                                                                                                                                                                                                                    |
+| `_teardowns`      | an int that `reap` increments under the lock when it starts and when it ends. A recycle, `warm_pool` or failed warm claim reads it before its await; if it changed, the call deletes its actor instead of pooling it. A failed delete keeps the actor owned for the next `reap` and counts a release failure (P-10) |
+| `_warm_inflight`  | `dict[(pool key, _teardowns), int]`: actors `warm_pool` calls are still creating. A call computes `needed = replicas - len(pool) - inflight` and reserves `needed` under the lock; the reservation turns into pool entries under one lock. `reap` clears the dict (P-11)                                            |
+| overlapping calls | a `warm_pool` call counts the actors other calls are still creating and does not wait for them, so it can return before the pool is full (`warm_pool_async` docstring)                                                                                                                                              |
 
-[properties.md](./properties.md) has the counter-examples and the reproduction output.
+Open: a warm claim whose `get()` succeeds after an overlapping `reap` deleted the actor returns that
+actor, because `_teardowns` is re-checked only on the claim's failure path. A `warm_pool` cancelled
+during its `create()` calls releases its reservation but not the actors already created.
+[properties.md](./properties.md) and [verify/README.md](./verify/README.md) have the details.

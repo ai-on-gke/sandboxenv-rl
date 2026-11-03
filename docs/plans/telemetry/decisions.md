@@ -209,3 +209,18 @@ Append-only. Each entry: date, who, what, why.
   [acceptance-criteria.md](./acceptance-criteria.md), the proposed warm-pool contract in
   [interfaces.md](./interfaces.md), and test-plan section 8. No property tests, Dafny models or
   result files were added; `hypothesis` is not a dependency.
+- 2026-11-03, orchestrator: #221 fixes AC-15 and merges before this directory's update. `reap` bumps
+  `_teardowns` when it starts and ends; a recycle, `warm_pool` or failed warm claim that awaited
+  across it deletes its actor instead of pooling it; `_warm_inflight` reserves the actors
+  `warm_pool` calls are creating, per pool key and `_teardowns` value, and `reap` clears it.
+  `hypothesis` joins the `dev` extra for `test_warm_pool_accounting.py`. An adversarial review of
+  #221's first version found two more bugs: (A) a reservation outlived a teardown, so a `warm_pool`
+  started after it returned with an empty pool; (B) a failed warm claim put its actor back after a
+  teardown. The Hypothesis machine missed both (it starts no `warm_pool` after a teardown, and its
+  fake `get()` never fails). `warm_pool.dfy`'s invariant already required a reap to drop
+  reservations, which is A's fix, but its permanent teardown could not express A's symptom, and its
+  one-step acquire could not express B. `warm_pool_generations.dfy`, written after the review,
+  states both and fails on them. #221 fixed both and added a plain test for each. The Dafny models
+  are now in `verify/`; CI does not run them. Still open: a warm claim whose `get()` succeeds after
+  an overlapping reap deleted the actor returns a deleted environment (`ClaimOkReturnsLive`), a
+  `warm_pool` cancelled during its `create()` calls can leak the actors already created, and P-14.

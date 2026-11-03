@@ -8,9 +8,10 @@ records the names, flags and families that shipped and where they differ from th
 Companion documents in this directory: [prd.md](./prd.md), [execution-plan.md](./execution-plan.md),
 [interfaces.md](./interfaces.md) (the shipped contracts),
 [acceptance-criteria.md](./acceptance-criteria.md), [test-plan.md](./test-plan.md),
-[properties.md](./properties.md) (proposed property-based tests, not in the repository) and
-[decisions.md](./decisions.md). The user-facing result is
-[docs/observability.md](../../observability.md) and [docs/metrics.md](../../metrics.md).
+[properties.md](./properties.md) (property-based tests, mostly proposed),
+[verify/](./verify/README.md) (Dafny models, not run by CI) and [decisions.md](./decisions.md). The
+user-facing result is [docs/observability.md](../../observability.md) and
+[docs/metrics.md](../../metrics.md).
 
 ## 1. What shipped
 
@@ -141,8 +142,10 @@ behind it.
   [docs/observability.md](../../observability.md#phase-glossary).
 - No overhead measurement for telemetry off against on is recorded in the series' pull requests;
   [test-plan.md](./test-plan.md) section 7 keeps the procedure.
-- Open on `main` at `9b2148a` (2026-11-02): AC-15, warm-pool accounting under concurrency. A recycle
-  or `warm_pool` paused across teardown leaks its environment, and overlapping `warm_pool` calls
-  over-provision ([properties.md](./properties.md) P-9 to P-11).
-- Open on `main`: with execs started concurrently on one handle, `ate_env.first_command=true` is not
-  always on the first-started exec span (P-14).
+- Closed by #221: AC-15, warm-pool accounting under concurrency (P-9 to P-11).
+- Open: a warm claim whose `get()` succeeds after an overlapping reap deleted the actor returns a
+  deleted environment ([properties.md](./properties.md), `ClaimOkReturnsLive` in
+  [verify/](./verify/README.md)).
+- Open: a `warm_pool` cancelled during its `create()` calls can leak the actors already created.
+- Open: with execs started concurrently on one handle, `ate_env.first_command=true` is not always on
+  the first-started exec span (P-14).

@@ -140,36 +140,38 @@ kubectl get ns -o name | sort | diff /tmp/before-namespaces.txt -           # on
 kubectl -n ate-system get deploy -o name | sort | diff /tmp/before-ate-system.txt -
 ```
 
-## 8. Property-based tests and proofs (proposed)
+## 8. Property-based tests and proofs
 
-Not in the repository. [properties.md](./properties.md) specifies P-1 to P-20; none of the
-Hypothesis or `rapid` tests it names exist on `main`, and `hypothesis`, `pgregory.net/rapid` and
-Dafny are not dependencies. A change that adds them would:
+[properties.md](./properties.md) specifies P-1 to P-20. What exists:
 
-- Install `hypothesis` in the full venv (`/tmp/ate-full/bin/pip install hypothesis`) or add it to
-  the `dev` extra.
-- Run the Python properties with Hypothesis' default profile (100 examples) in CI and a larger
-  `max_examples` locally or nightly. Each shrunk counter-example goes into the PR's Tests section
-  and becomes an `@example` regression.
-- Run the AC-15 stateful test (P-9, P-10, P-11) as:
+```bash
+# AC-15 (P-9, P-10, P-11), #221: five plain tests and the stateful test_warm_pool_accounting.
+# hypothesis comes with the dev extra, so either venv works.
+/tmp/ate-base/bin/python -m pytest clients/python/tests/test_warm_pool_accounting.py -q
 
-  ```bash
-  /tmp/ate-full/bin/python -m pytest clients/python/tests/test_substrate_driver.py -k warm_pool_accounting -q
-  ```
+# Dafny 4.11 (not a repository dependency; CI does not run it)
+cd docs/plans/telemetry/verify
+dafny verify telemetry.dfy                # 14 verified, 0 errors
+dafny verify warm_pool.dfy                # 16 verified, 3 errors, all in WarmPoolBefore
+dafny verify warm_pool_generations.dfy    # 24 verified, 3 errors: PlanFirstCovers, ClaimFailPutBackSafe, ClaimOkReturnsLive
+```
 
-  On `main` it is expected to fail P-9, P-10 and P-11 until the driver gains the teardown counter
-  and in-flight reservation ([interfaces.md](./interfaces.md#warm-pool-accounting-ac-15-proposed)),
-  so it lands either with that fix or marked `xfail`.
+The Dafny errors are by design: each failing lemma models code before #221, #221's first version or
+the open claim/reap gap ([verify/README.md](./verify/README.md)). Paste the three summary lines in
+the PR when a change touches the modelled code, and say whether the models still match it.
 
-- Run P-14 (`test_first_command_exactly_once`) with concurrent execs on one handle; it is expected
-  to fail on `main` until `SandboxHandle.exec` claims the first-command flag inside the span.
-- Run the Go properties (P-19, P-20) with
+Still proposed, not in the repository:
+
+- The other Hypothesis properties (P-1 to P-8, P-12, P-13, P-15 to P-18). Run them with Hypothesis'
+  default profile (100 examples) in CI and a larger `max_examples` locally or nightly. Each shrunk
+  counter-example goes into the PR's Tests section and becomes an `@example` regression.
+- P-14 (`test_first_command_exactly_once`) with concurrent execs on one handle. It is expected to
+  fail on `main` until `SandboxHandle.exec` claims the first-command flag inside the span.
+- The Go properties (P-19, P-20), with
   `go test ./internal/benchmarking/swebench/... ./clients/go/... -run 'TracingIsTransparent|SpansFollowProvider'`
   after adding `pgregory.net/rapid` to `go.mod`.
-
-Dafny models of `inject_metadata`, `repo_family`, `RunReport.add_phase` and the warm pool informed
-the properties ([properties.md](./properties.md), "Findings that changed the spec"). They are not in
-the repository, and CI has no Dafny step.
+- A test for the claim/reap gap: a warm claim whose `get()` succeeds after an overlapping reap
+  deleted the actor. No test covers it; the gap is in the code on `main` with #221.
 
 ## What to write in the pull request
 

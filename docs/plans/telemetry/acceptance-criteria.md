@@ -32,7 +32,7 @@ Conventions:
 | AC-12 | Docs: `docs/observability.md`, generated `docs/metrics.md`, CI freshness check      | 5       | pass: CI step `docs/metrics.md is generated from internal/telemetry`                                          |
 | AC-13 | CI runs the suites with and without the extras; lint and boilerplate pass           | 1, 2, 5 | pass: `.github/workflows/ci.yaml`                                                                             |
 | AC-14 | Blast radius: existing tests unchanged pass; telemetry-off overhead recorded        | all     | partial: suites green; overhead not recorded                                                                  |
-| AC-15 | Warm-pool accounting under concurrent acquire, recycle, `warm_pool` and teardown    | none    | open: fails on `main` at `9b2148a` (P-9, P-10, P-11)                                                          |
+| AC-15 | Warm-pool accounting under concurrent acquire, recycle, `warm_pool` and teardown    | #221    | pass: `test_warm_pool_accounting.py`; `verify/warm_pool.dfy`, `verify/warm_pool_generations.dfy`              |
 
 ## AC-1: Base install carries no telemetry dependency
 
@@ -205,26 +205,27 @@ Conventions:
 
 `SubstrateBackendDriver` coroutines share one event loop and interleave at every `await`.
 
-- Status: open. Fails on `main` at `9b2148a`. Added after the series from a model of the driver's
-  warm-pool bookkeeping; no pull request of the series claimed it.
+- Status: met by #221. Added after the series from a model of the driver's warm-pool bookkeeping;
+  `main` at `9b2148a` failed it.
 - 15.1: after every step of any interleaving of acquire, recycle, `warm_pool` and teardown, the
   `ate_env_fleet_warm_replicas{backend}` gauge equals the number of actors in the driver's warm
   pool.
-- 15.2: a recycle or `warm_pool` call paused in an `await` while teardown runs deletes its actor
-  when it resumes; after teardown no environment from the run is alive on Substrate or tracked by
-  the driver.
+- 15.2: a recycle, `warm_pool` call or failed warm claim paused in an `await` while teardown runs
+  deletes its actor when it resumes; after teardown no environment from the run is alive on
+  Substrate or tracked by the driver.
 - 15.3: overlapping `warm_pool(template, replicas=R)` calls create at most `R` warm actors in total
   for one pool key.
-- Why it fails on `main`: `_release_internal` in `clients/python/src/ate_env/backend/substrate.py`
-  pops the actor, awaits `suspend()`, then re-pools it, with no record that teardown ran during the
-  await (15.2, and 15.1 with it). `_warm_pool_internal` computes `needed = replicas - len(current)`
-  with no reservation for actors other calls are still creating (15.3). The proposed design is in
-  [interfaces.md](./interfaces.md#warm-pool-accounting-ac-15-proposed).
-- Command: none on `main`. The check needs the proposed stateful test, run as
-  `pytest clients/python/tests/test_substrate_driver.py -k warm_pool_accounting` after installing
-  `hypothesis` ([test-plan.md](./test-plan.md) section 8).
-- Unit coverage on `main`, sequential only: `test_recycle_counts_the_actor_back_into_the_warm_pool`,
-  `test_failed_warm_check_counts_the_put_back`,
-  `test_substrate_fleet_setup_and_teardown_cleans_warm_pool`.
-- Pass rule: the stateful test passes, with no shrunk counter-example.
-- Properties (proposed): P-9 (15.1), P-10 (15.2), P-11 (15.3).
+- Commands: in `$VENV_BASE` (the `dev` extra carries `hypothesis`):
+  `python -m pytest clients/python/tests/test_warm_pool_accounting.py`; with Dafny 4.11:
+  `dafny verify docs/plans/telemetry/verify/warm_pool.dfy` and
+  `dafny verify docs/plans/telemetry/verify/warm_pool_generations.dfy`.
+- Expected: the pytest run passes (five plain tests and the stateful `test_warm_pool_accounting`).
+  `warm_pool.dfy`: 16 verified, 3 errors, all in `WarmPoolBefore` (the code before #221).
+  `warm_pool_generations.dfy`: 24 verified, 3 errors, in `PlanFirstCovers` and
+  `ClaimFailPutBackSafe` (#221's first version) and `ClaimOkReturnsLive` (the open claim/reap gap).
+  [verify/README.md](./verify/README.md) explains each.
+- Pass rule: pytest green; Dafny output matches. CI runs the pytest file, not Dafny.
+- Not covered: a warm claim whose `get()` succeeds after an overlapping reap deleted the actor
+  returns a deleted environment; a `warm_pool` cancelled during its `create()` calls can leak the
+  actors already created. Both are open.
+- Properties: P-9 (15.1), P-10 (15.2), P-11 (15.3).

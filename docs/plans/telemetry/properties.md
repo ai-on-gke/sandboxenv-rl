@@ -1,10 +1,16 @@
 # Properties: telemetry for sandboxenv-rl
 
-Status: proposed. Checked against `main` at `9b2148a` (2026-11-02). The property tests and the Dafny
-models below are **not in the repository**. `hypothesis` is not a dependency of `clients/python`,
-`pgregory.net/rapid` is not in `go.mod`, and no Dafny model or Dafny CI step exists. Every test
-named here as Hypothesis or `rapid` is a proposed test. The tests named as "example coverage on
-`main`" exist and run in CI.
+Status: checked against `main` at `9b2148a` (2026-11-02) plus #221, which fixes AC-15 and merges
+first. Most property tests here are proposed and not in the repository: `pgregory.net/rapid` is not
+in `go.mod`, and the Hypothesis tests named "Proposed test" do not exist. Two parts exist:
+
+- `clients/python/tests/test_warm_pool_accounting.py` (#221): the P-9 to P-11 stateful test
+  `test_warm_pool_accounting` and five plain interleaving tests. `hypothesis` is in the `dev` extra
+  since #221.
+- [verify/](./verify/README.md): hand-written Dafny models of P-1 to P-11 and of the two bugs review
+  found in #221's first version. CI does not run them.
+
+The tests named as "example coverage on `main`" exist and run in CI.
 
 Each property is a universal statement, _"For any …"_, over a range of generated inputs. It
 validates one or more requirements, tagged **Validates: AC-n.m**. The requirement numbers are listed
@@ -12,14 +18,13 @@ in the [requirement index](#requirement-index); they refine the criteria in
 [acceptance-criteria.md](./acceptance-criteria.md). A property-based test shrinks a failing input to
 a minimal counter-example, which then becomes an `@example` regression.
 
-Four properties fail on `main` today and stay open:
+State on `main` with #221:
 
-| Property | Requirement | Why it fails on `main`                                                                                                                                                                                                                                          |
-| -------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P-9      | AC-15.1     | Follows from P-10: an actor re-pooled after teardown is in the driver's pool but not in the `ate_env_fleet_warm_replicas` gauge.                                                                                                                                |
-| P-10     | AC-15.2     | `SubstrateBackendDriver._release_internal` (`clients/python/src/ate_env/backend/substrate.py`) pops the actor, awaits `suspend()`, then re-pools it. Nothing records that teardown ran during the await. A `warm_pool` paused in `create()` leaks the same way. |
-| P-11     | AC-15.3     | `_warm_pool_internal` (same file) computes `needed = replicas - len(current)` from the pool alone, with no reservation for actors other calls are still creating.                                                                                               |
-| P-14     | AC-3.4      | `SandboxHandle.exec` and `exec_async` (`clients/python/src/ate_env/handle.py`) call `_note_first_command()` before `_exec_span` starts the span, so another thread's exec span can start first.                                                                 |
+| Item            | Requirement | State                                                                                                                                                                                                    |
+| --------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P-9, P-10, P-11 | AC-15       | Fixed by #221. Before it, a recycle or `warm_pool` that awaited across a reap pooled its actor after the teardown, and overlapping `warm_pool` calls each provisioned the full shortfall.                |
+| P-14            | AC-3.4      | Open. `SandboxHandle.exec` and `exec_async` (`clients/python/src/ate_env/handle.py`) call `_note_first_command()` before `_exec_span` starts the span, so another thread's exec span can start first.    |
+| claim/reap gap  | none        | Open. A warm claim pops an actor and awaits `get()`; if a reap deletes the actor meanwhile and `get()` still succeeds, `acquire` returns a deleted environment. No property covers it; see the findings. |
 
 ## Labels and cardinality (AC-9)
 
@@ -173,12 +178,12 @@ execs started concurrently from several threads, exactly one `ate_env_client.exe
 - Proposed test: Hypothesis `test_first_command_exactly_once`.
 - Example coverage on `main`: `test_first_command_marks_only_the_first_exec_per_sandbox` (sequential
   execs only).
-- **Fails on `main` (open).** A run of this property against the series' code, with execs started
-  concurrently on one handle, marked a span that was not the first started in 9 of 12 runs. No run
-  marked more than one span, so "exactly one" held and "the first started" did not. The cause is in
-  `clients/python/src/ate_env/handle.py`: `exec` and `exec_async` call `_note_first_command()`
-  before `_exec_span` starts the span. `_note_first_command` is also a check-and-set without a lock.
-  The fix belongs in the code; the property stays as written.
+- **Fails on `main` (open, not addressed by #221).** A run of this property against the series'
+  code, with execs started concurrently on one handle, marked a span that was not the first started
+  in 9 of 12 runs. No run marked more than one span, so "exactly one" held and "the first started"
+  did not. The cause is in `clients/python/src/ate_env/handle.py`: `exec` and `exec_async` call
+  `_note_first_command()` before `_exec_span` starts the span. `_note_first_command` is also a
+  check-and-set without a lock. The fix belongs in the code; the property stays as written.
 
 ## Run report (AC-7)
 
@@ -287,19 +292,19 @@ with only documented `ate.*` and `ate_env.*` attribute keys plus, on CLIENT span
 ## Warm-pool accounting under concurrency (AC-15)
 
 `SubstrateBackendDriver` coroutines share one event loop and interleave at every `await`. P-9 to
-P-11 share one proposed Hypothesis **stateful** test. Its rules are `acquire_new`, `acquire_warm`,
-`start_recycle` and `finish_recycle` (paused inside `await suspend()`), `start_warm_pool` and
-`finish_warm_pools` (paused inside `await create()`), and `fleet_teardown`. A fake client pauses at
-those awaits, so Hypothesis generates the interleavings as well as the operations. The driver
-internals it needs (`_warm_paused_pool`, `_owned_actors`, `_make_instance`, `release_async`,
-`warm_pool_async`, `reap_async`, `Observer.warm_reset`) exist on `main`. On `main` the test is
-expected to fail P-9, P-10 and P-11, so it cannot enter CI before the driver fix unless it is marked
-`xfail`.
+P-11 share the Hypothesis **stateful** test `test_warm_pool_accounting` in
+`clients/python/tests/test_warm_pool_accounting.py` (#221). Its rules are `acquire_new`,
+`acquire_warm`, `start_recycle` and `finish_recycle` (paused inside `await suspend()`),
+`start_warm_pool` and `finish_warm_pools` (paused inside `await create()`), `fleet_teardown` and
+`idle`. A fake client pauses at those awaits, so Hypothesis generates the interleavings as well as
+the operations. The machine starts no `warm_pool` after a teardown and never makes `get()` fail, so
+bugs A and B (see the findings) are covered by the plain tests
+`test_warm_pool_after_teardown_ignores_the_old_reservation` and
+`test_failed_warm_claim_after_teardown_deletes_the_environment` in the same file.
 
-Example coverage on `main`, sequential only:
-`test_recycle_counts_the_actor_back_into_the_warm_pool`,
-`test_failed_warm_check_counts_the_put_back`,
-`test_substrate_fleet_setup_and_teardown_cleans_warm_pool` in `test_substrate_driver.py`.
+Dafny: `WarmPool` in [verify/warm_pool.dfy](./verify/warm_pool.dfy) and
+[verify/warm_pool_generations.dfy](./verify/warm_pool_generations.dfy) prove the #221 design keeps
+P-9 to P-11 for every interleaving within the model.
 
 ### P-9: The warm-replica gauge tells the truth
 
@@ -309,9 +314,9 @@ driver's warm pool.
 
 **Validates: AC-15.1**
 
-- Proposed test: the stateful test, invariant `p9_gauge_equals_pool`.
-- **Fails on `main` (open)**, in the P-10 recycle interleaving: the pool holds 1 actor and the gauge
-  reads 0.
+- Test: `test_warm_pool_accounting`, invariant `gauge_equals_pool`.
+- Fixed by #221. Before it, in the P-10 recycle interleaving, the pool held 1 actor and the gauge
+  read 0.
 
 ### P-10: Nothing survives teardown
 
@@ -320,8 +325,11 @@ from the run is alive on Substrate or tracked by the driver.
 
 **Validates: AC-15.2**
 
-- Proposed test: the stateful test, invariant `p10_nothing_survives_teardown`.
-- **Fails on `main` (open).** The stateful test shrank it to two minimal counter-examples:
+- Test: `test_warm_pool_accounting`, invariant `nothing_survives_teardown`;
+  `test_recycle_paused_across_teardown_deletes_the_environment`,
+  `test_warm_pool_paused_across_teardown_deletes_its_actors`,
+  `test_failed_warm_claim_after_teardown_deletes_the_environment`.
+- Fixed by #221. Before it, the stateful test shrank it to two minimal counter-examples:
 
   ```text
   state.start_warm_pool()                    # create() paused
@@ -341,8 +349,9 @@ one pool key.
 
 **Validates: AC-15.3**
 
-- Proposed test: the stateful test, invariant `p11_warm_pool_never_over_provisions`.
-- **Fails on `main` (open).** Shrunk counter-example:
+- Test: `test_warm_pool_accounting`, invariant `warm_pool_never_over_provisions`;
+  `test_overlapping_warm_pool_calls_provision_once`.
+- Fixed by #221. Before it, the shrunk counter-example was:
 
   ```text
   state.start_warm_pool()
@@ -417,11 +426,11 @@ artifact or environment rather than a range of inputs:
 
 ## Findings that changed the spec
 
-**P-3, reserved `other`.** A Dafny model of `repo_family` (not in the repository) without a rename
-step failed P-3 with the counter-example of a repo literally named `other`. That repo got the
-overflow label, so the two cases were indistinguishable on dashboards, and it used one of the 64
-slots although the code comment says reserved names do not count toward the cap. Reproduced against
-the code at the time:
+**P-3, reserved `other`.** The Dafny model of `repo_family`
+([verify/telemetry.dfy](./verify/telemetry.dfy)) without a rename step failed P-3 with the
+counter-example of a repo literally named `other`. That repo got the overflow label, so the two
+cases were indistinguishable on dashboards, and it used one of the 64 slots although the code
+comment says reserved names do not count toward the cap. Reproduced against the code at the time:
 
 ```text
 repo "acme/other", registry not full -> "other", registered, size 1
@@ -450,7 +459,7 @@ code writes each event when its operation finishes and records one span per even
 the owned actors, then awaits `suspend()`. If `reap()` runs during that await, it sees the actor in
 neither the owned actors nor the pool, so it skips it. When `suspend()` returns, the actor goes back
 into the pool. A scripted reproduction (not in the repository) that runs the real driver with a fake
-client paused at its awaits prints, on `main` at `9b2148a`:
+client paused at its awaits printed, on `main` at `9b2148a` before #221:
 
 ```text
 reaped=0  still live on Substrate=['sb-1']
@@ -461,26 +470,50 @@ The VM survives teardown, and the gauge says 0 while the pool holds 1 (P-9).
 
 **P-11, overlapping `warm_pool` calls double-provision.** `warm_pool` computes
 `needed = replicas - len(current)` before its awaits and does not count replicas other calls are
-still creating. The same reproduction prints, on `main`:
+still creating. The same reproduction printed, before #221:
 
 ```text
 pool size=6 (asked for 3)  live actors=6  observer warm=6
 ```
 
-Proposed fix for both, not on `main`: a teardown counter re-checked after each await, and an
-in-flight reservation per pool key
-([interfaces.md](./interfaces.md#warm-pool-accounting-ac-15-proposed)).
+Fix for both, in #221: `reap` bumps a teardown counter (`_teardowns`) when it starts and ends, and a
+recycle, `warm_pool` or failed warm claim that awaited across it deletes its actor instead of
+pooling it. `warm_pool` reserves the actors it is creating in `_warm_inflight`, per pool key and
+`_teardowns` value ([interfaces.md](./interfaces.md#warm-pool-accounting-ac-15)).
 
-**Hypothesis finds the same bugs.** The stateful test finds both bugs without being told where to
-look and shrinks each to the shortest operation sequence, shown under P-10 and P-11. It also finds a
-third variant the model predicted: a `warm_pool` paused in `create()` during teardown leaks its
-actors.
+**Hypothesis finds the same bugs.** The stateful test finds both bugs on the code before #221
+without being told where to look and shrinks each to the shortest operation sequence, shown under
+P-10 and P-11. It also finds a third variant the model predicted: a `warm_pool` paused in `create()`
+during teardown leaks its actors.
+
+**Bugs A and B, in #221's first version.** An adversarial code review of #221's first version found
+two more bugs. Neither Dafny nor Hypothesis found them first.
+
+- A: reap left the reservation counter alone, so a `warm_pool` started after the teardown counted
+  the old reservation and returned with an empty pool. Hypothesis missed it because the machine
+  starts no `warm_pool` after a teardown. `warm_pool.dfy`'s invariant `closed ==> pending == 0` and
+  `Reap`'s `pending := 0` already encode the fix: modelling the first version against it fails at
+  that clause. But that model makes a teardown permanent, so it cannot express the symptom.
+- B: a failed warm claim (pop, await `get()`, put back on error) put its actor back after a
+  teardown. Hypothesis missed it because the fake `get()` never failed. `warm_pool.dfy` cannot
+  express it: its `Acquire` is one step with no await or put-back.
+
+`warm_pool_generations.dfy` was written after the review, to state both: `PlanFirstCovers` (A) and
+`ClaimFailPutBackSafe` (B) fail, the fixed actions verify, and `BugAWitness` and `BugBWitness` check
+concrete traces. #221 fixed both and added a plain test for each.
+
+**Claim/reap gap, open.** Proving "claimed actors are live" in `warm_pool_generations.dfy` failed
+(`ClaimOkReturnsLive`). A warm claim pops an actor and awaits `get()`; a reap that runs meanwhile
+deletes it, since it is still owned. If `get()` returns before the delete lands, `_acquire_internal`
+hands the caller a deleted environment. #221 re-checks `_teardowns` only on the failure path. No
+property in this file covers it: P-10 holds (nothing survives the teardown); what breaks is that
+`acquire` returns a live environment, which no property states. No test covers it.
 
 **How the concurrency model works.** Each piece of code between two `await`s is one atomic action on
-shared state (`Acquire`, `RecycleStart`, `RecycleFinish`, `WarmPlan`, `WarmCommit`, `Reap`). A Dafny
-model of the warm pool (not in the repository) proves that every action of the fixed design
-preserves the invariant, so it holds for every interleaving of any number of concurrent calls and
-actors. The model of the code on `main` fails, and each failure is one of the interleavings above.
+shared state (`Acquire`, `RecycleStart`, `RecycleFinish`, `WarmPlan`, `WarmCommit`, `Reap`). The
+Dafny model proves that every action of the #221 design preserves the invariant, so it holds for
+every interleaving of any number of concurrent calls and actors. `WarmPoolBefore`, the code before
+#221, fails, and each failure is one of the interleavings above.
 
 ## Limits
 
@@ -488,6 +521,8 @@ actors. The model of the code on `main` fails, and each failure is one of the in
 - The `repo_family` model is sequential. `_bounded_family` uses double-checked locking; its
   concurrency is not covered.
 - The `repo_family` model covers parseable inputs only; the `unknown` label for unparseable input
-  adds one value to the P-1 bound.
-- The warm-pool model covers one pool key and one event loop (interleaving only at `await`s). Calls
-  into the same driver from two threads or two loops are outside it.
+  adds one value to the P-1 bound. It renames the bare reserved names only; `main` also escapes
+  their `_repo` forms.
+- The warm-pool models cover one pool key and one event loop (interleaving only at `await`s). Calls
+  into the same driver from two threads or two loops are outside them.
+- All models are hand-written and not tied to the code; see [verify/README.md](./verify/README.md).

@@ -162,6 +162,38 @@ def test_exec_nonzero_exit_returns_result_not_raise():
             handle = await provider.create(SandboxSpec())
             result = await provider.exec(handle, "exit 7")
             assert (result.return_code, result.stderr, result.stdout) == (7, "boom", "")
+            # A process exit status carries no error_type, whatever its value:
+            # Gym agents end a rollout on error_type, not on the code.
+            assert result.error_type is None
+
+    run(t())
+
+
+def test_exec_on_a_gone_sandbox_reports_a_sandbox_failure():
+    # Gym's contract for a sandbox that cannot run the command: a result with
+    # the runtime return code and error_type "sandbox", not an exception.
+    async def t():
+        async with stack() as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            await provider.close(handle)
+            result = await provider.exec(handle, "echo hi")
+            assert (result.return_code, result.error_type) == (125, "sandbox")
+            assert result.stdout is None
+            assert "does not exist" in result.stderr and "not found" in result.stderr
+
+    run(t())
+
+
+def test_exec_transport_failure_reports_a_sandbox_failure():
+    async def t():
+        async with stack() as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            fake.refuse_starts["make"] = grpc.StatusCode.UNAVAILABLE
+            result = await provider.exec(handle, "make")
+            assert (result.return_code, result.error_type) == (125, "sandbox")
+            assert "UNAVAILABLE" in result.stderr
+            # The sandbox is still there: the next command runs.
+            assert (await provider.exec(handle, "echo hi")).return_code == 0
 
     run(t())
 
@@ -228,7 +260,7 @@ def test_exec_client_timeout_returns_sentinel_and_kills(monkeypatch):
             handle = await provider.create(SandboxSpec())
             fake.hang.add("sleepy")
             result = await provider.exec(handle, "sleepy", timeout_s=0.01)
-            assert result.return_code == -1
+            assert (result.return_code, result.error_type) == (125, "timeout")
             assert result.stdout is None
             assert "timed out" in (result.stderr or "")
             hung = [p for p in fake.procs.values() if p.argv[-1] == "sleepy"]
@@ -239,7 +271,7 @@ def test_exec_client_timeout_returns_sentinel_and_kills(monkeypatch):
 
 def test_exec_guest_deadline_reports_timeout(monkeypatch):
     # The guest kills the process group at the deadline and reports a plain
-    # SIGKILL; the result keeps that exit code and says why on stderr.
+    # SIGKILL; the result reports the timeout it was, with the output kept.
     monkeypatch.setattr(provider_mod, "_MIN_GUEST_TIMEOUT_S", 0.05)
 
     async def t():
@@ -247,7 +279,8 @@ def test_exec_guest_deadline_reports_timeout(monkeypatch):
             handle = await provider.create(SandboxSpec())
             fake.hang.add("sleepy")
             result = await provider.exec(handle, "sleepy", timeout_s=0.05)
-            assert result.return_code == 137
+            assert (result.return_code, result.error_type) == (125, "timeout")
+            assert result.stdout == ""  # what the command got out, not None
             assert "timed out" in result.stderr and "guest" in result.stderr
             assert fake.starts[-1]["timeout"] == pytest.approx(0.05)
 
@@ -296,8 +329,12 @@ def test_status_running_stopped_unknown():
     ("env_status", "expected"),
     [
         (EnvironmentStatus.RESUMING, SandboxStatus.STARTING),
-        (EnvironmentStatus.SUSPENDED, SandboxStatus.RUNNING),  # parked is transparent
-        (EnvironmentStatus.PAUSED, SandboxStatus.RUNNING),
+        # Parked is alive and one call away; Gym has a status for it since 0.7
+        # (an older nemo-gym installed here has none, and gets RUNNING).
+        (EnvironmentStatus.SUSPENDING, provider_mod._PAUSED),
+        (EnvironmentStatus.SUSPENDED, provider_mod._PAUSED),
+        (EnvironmentStatus.PAUSING, provider_mod._PAUSED),
+        (EnvironmentStatus.PAUSED, provider_mod._PAUSED),
         (EnvironmentStatus.CRASHED, SandboxStatus.ERROR),
         (EnvironmentStatus.DELETING, SandboxStatus.STOPPED),
         (EnvironmentStatus.UNSPECIFIED, SandboxStatus.UNKNOWN),

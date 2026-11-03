@@ -30,6 +30,7 @@ from ._gen.ateenv.v1alpha import env_pb2, guest_pb2
 
 __all__ = [
     "EnvironmentStatus",
+    "SuspendMode",
     "ProcessState",
     "Signal",
     "Template",
@@ -62,6 +63,23 @@ class EnvironmentStatus(enum.IntEnum):
     PAUSED = 6
     CRASHED = 7
     DELETING = 8
+
+
+class SuspendMode(enum.IntEnum):
+    """How ``Client.suspend()`` treats the snapshot (ateenv.v1alpha.SuspendMode).
+
+    ``DURABLE`` returns once the snapshot is in object storage: the
+    environment survives the loss of its node and resumes on any node.
+    ``LOCAL`` returns once the snapshot is on the worker's node and leaves the
+    upload in the background: until it lands the environment resumes on that
+    node only, its status is ``PAUSED``, and a node lost before then takes the
+    snapshot with it. One park-and-resume cycle is cheaper with ``LOCAL``,
+    which is what a loop that parks a sandbox between every command wants.
+    """
+
+    UNSPECIFIED = 0
+    DURABLE = 1
+    LOCAL = 2
 
 
 class ProcessState(enum.IntEnum):

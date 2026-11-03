@@ -72,6 +72,7 @@ update this document in the same pull request. The pull request template asks fo
 | DNS rebinding: a page on an attacker's name resolves to the forwarded listener and becomes same-origin | None. | The listener does not check the `Host` header. The MCP handler sets `DisableLocalhostProtection: true`. |
 | The port proxy reaches the guest port | The port proxy refuses port 80, where the guest listens. | — |
 | Resource exhaustion | The port proxy bounds its idle tunnels with `idleTunnelsPerPort`, `idleTunnelsTotal` and `idleTunnelTimeout` in `internal/portproxy/portproxy.go`. Worker capacity bounds the running actors. | A token holder can create environments without a quota or a rate limit; suspended environments keep their snapshots in the bucket. The MCP handler keeps one server for each environment, and the client keeps one guest connection for each environment. Neither is evicted while the process runs. |
+| Control-plane detail in guest-call errors | A guest call to an environment that cannot start reports why: for one that the control plane moved to CRASHED while it was waking, the error carries Substrate's crash reason (`ActorStatus.crash.message`, at most 4096 characters), and with `--wake-no-capacity-grace` a call that no worker has room for carries the router's no-capacity text. Only a caller that may call that environment, thus one that has the token, gets it. The `ate-env-start-failure` trailer carries only `crashed` or `no-capacity`. | Some crash reasons include an atelet error verbatim, such as the error of a failed restore, and a message can name a node or a snapshot. A caller sees that detail for its own environments; it does not reveal other environments or credentials. |
 
 ## Boundary 2: ate-env-api to the Substrate control plane
 
@@ -99,6 +100,7 @@ OH_SESSION_API_KEYS_0=<key>`). The workspace reaches the agent-server through th
 |---|---|---|
 | A caller reads the session key from a template | Reading a template needs viewer access to the atespace. Substrate logs redact the values of environment variables. Use a dedicated atespace for these environments, as `integrations/openhands/README.md` says. | Each caller with viewer access to the atespace reads the key with `GetActorTemplate`: reads do not redact it. Each template that `ate-env-api` derives from the base copies it. A template cannot refer to a secret. |
 | A holder of the session key drives the agent-server | With `-auth-token-file`, the port proxy also asks for the caller token. Thus the key alone does not pass the port proxy. | The agent-server checks only the session key (`check_session_api_key` in `openhands/agent_server/dependencies.py`). Without `-auth-token-file`, each network peer of `ate-env-api` that has the key controls the agent-server of each environment whose id it knows. |
+| A secret lookup carries the caller token into the sandbox | `AteEnvWorkspace.get_secrets()` gives `LookupSecret` URLs on `127.0.0.1:<server_port>` that carry the session key only, and the agent-server answers them in process. Thus a secret lookup does not go through the port proxy and does not need the caller token. | — |
 | Code in one environment drives the agent-server of another environment | Each actor runs in gVisor. The agent-server removes the key from the environment of the commands that it starts. With `-auth-token-file`, the key alone does not pass the port proxy. | All environments of one base template share one key. The key is in the environment of the guest. Each command that the guest starts through `ate-env-api` inherits that environment (`guest/process/tracker.go`): `ate-env exec`, the Go and Python clients, the fleet's `handle.exec`, and the run and copy of the R2E-Gym adapter. Such a command reads the key with `env`; it does not need `/proc`. Thus on the OpenHands base template, each R2E-Gym agent action gets the key. The guest starts the agent-server with its full environment (`cmd/ate-env-guest/sidecar.go`). The commands that the agent-server starts do not get the key: the bash tool, the commands of the CodeAct agent, and the terminal steps of `run_trajectory.py`. They run in the same container, thus they can read the key from `/proc/<pid>/environ` of the agent-server when they run as the same user. This read is not verified on a cluster. In both cases, the code needs a route to `ate-env-api` to reach the agent-server of another environment. With that route, it needs nothing more when authentication is off, and a credential that the port proxy accepts when authentication is on. |
 | The workspace exposes the caller token to the agent-server or a log | With `api_token`, REST requests carry the token in `X-Env-Authorization`, which the port proxy removes before it forwards them. The event WebSocket carries only a port capability for the agent-server port of its environment, never the token; an ate-env-api with port capability support does not forward it. The client default for `ws_capability_ttl` is one day. `repr`, the model dumps, error messages and the workspace's loggers mask the capability. The agent-server is a FastAPI application on uvicorn, thus a capability opens only its WebSocket routes. | A leaked capability opens WebSocket handshakes to that port until it expires, at most seven days less five minutes after the workspace made it. |
 
@@ -116,6 +118,13 @@ What ate-env does not control: Substrate writes and reads the snapshots. The ope
 access control, the encryption and the retention of the bucket. What stays in the bucket after an
 environment or a template is deleted follows Substrate.
 
+A local suspend (`SuspendEnvironment` with `mode: SUSPEND_MODE_LOCAL`, `ate-env suspend --mode
+local`) returns before the upload: the snapshot sits on the worker's node, under Substrate's state
+directory, until atelet's background upload lands. That is the same data the bucket holds, for a
+shorter time, on the host that already ran the environment's memory; ate-env adds no reader to it,
+and the node's own access control applies. What a local suspend does trade is availability: a node
+lost before the upload lands takes the snapshot, and the environment, with it.
+
 Operator requirements:
 
 - Grant access to the bucket only to the Substrate identities that write and read snapshots. Block
@@ -127,6 +136,7 @@ Operator requirements:
 | Threat | Current mitigation | Gap |
 |---|---|---|
 | A reader of the bucket gets the memory, files and credentials of environments | The operator's bucket settings. | ate-env does not check the access control, the encryption or the retention of the bucket. |
+| A reader of a worker node gets the snapshot of a locally suspended environment before its upload lands | The snapshot sits where the running environment's memory sat; the node's own access control. A durable suspend uploads before it returns, but atelet keeps a local copy of the snapshot on the node until the actor detaches, thus both modes leave snapshot files on the worker node. | A node lost before the upload lands loses the environment (availability, not confidentiality). |
 
 ## On-demand rootfs images
 

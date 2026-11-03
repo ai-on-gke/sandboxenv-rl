@@ -104,8 +104,10 @@ wrong:
 
 The baselines below were measured on this setup, and section 1's checks confirm it is still so:
 
-- Substrate v1.0.0-rc.1, installed with `--cordon-system-infra-components`; ate-api-server at 6
-  replicas for runs and 12 while goldens bake; the bundled Postgres at the default footprint with
+- Substrate v1.0.0-rc.1: every component, ate-api-server included, built from that tag by
+  `ate-setup deploy` with ko at install time; the bundle's `system_description.json` records the
+  ate-api-server image digest as `substrate_version`. ate-api-server at 6 replicas for runs and
+  12 while goldens bake; the bundled Postgres at the default footprint with
   `max_connections` raised to 500 and a 64-connection pool per replica; atelet with
   `--image-cache-gc-period=30s --image-cache-high-percent=70 --image-cache-low-percent=60`.
 - System components on 3 x e2-standard-16, Postgres on 1 x n2-standard-16, both tainted off the
@@ -116,7 +118,9 @@ The baselines below were measured on this setup, and section 1's checks confirm 
   each worker registers the node's allocatable; templates declare 2 CPU / 4 GiB, so a worker
   admits 3 running actors. gVisor; golden snapshots on; the snapshots bucket and the image
   registry in the cluster's region; plain containerd pulls unless the arm says otherwise.
-- ate-env-api at 4 replicas with `-wake-budget=5m`; the loader as a Job in the same cluster.
+- ate-env-api built from this repository's main (the commit is `sdk_version` in the bundle),
+  4 replicas, `-wake-budget=5m`; the loader as a Job in the same cluster, built from the same
+  checkout.
 
 A different node type, disk, workers per node or GC setting is a different baseline: label it
 and do not pool it with these.

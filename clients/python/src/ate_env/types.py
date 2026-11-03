@@ -127,7 +127,8 @@ class EnvironmentInfo:
     # first placement.
     node: str = ""
     # The per-environment worker selector it was created with; {} when none.
-    worker_selector: Mapping[str, str] = field(default_factory=dict)
+    # Left out of the hash so EnvironmentInfo stays hashable, as before.
+    worker_selector: Mapping[str, str] = field(default_factory=dict, hash=False)
 
 
 @dataclass(frozen=True)

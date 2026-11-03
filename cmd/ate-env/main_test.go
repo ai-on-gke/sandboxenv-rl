@@ -448,8 +448,14 @@ func TestParseWorkerSelector(t *testing.T) {
 	if got, err := parseWorkerSelector(nil); err != nil || got != nil {
 		t.Errorf("parseWorkerSelector(nil) = %v, %v; want nil, nil", got, err)
 	}
-	if got, err := parseWorkerSelector([]string{"k=", "k=v2"}); err != nil || got["k"] != "v2" {
-		t.Errorf("later item must win: got %v, %v", got, err)
+	if got, err := parseWorkerSelector([]string{"k="}); err != nil || got["k"] != "" {
+		t.Errorf("an empty value is a value: got %v, %v", got, err)
+	}
+	if _, err := parseWorkerSelector([]string{"zone=a", "zone=b"}); err == nil || !strings.Contains(err.Error(), "given twice") {
+		t.Errorf("a repeated key must be an error, got %v", err)
+	}
+	if _, err := parseWorkerSelector([]string{"zone=a", "zone=a"}); err == nil {
+		t.Error("a repeated key with the same value must be an error too")
 	}
 	for _, bad := range []string{"novalue", "=v", ""} {
 		if _, err := parseWorkerSelector([]string{bad}); err == nil {

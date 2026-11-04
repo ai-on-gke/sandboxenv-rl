@@ -162,10 +162,13 @@ by `swebench-loader preflight -manifest tasks.jsonl -plan placement.json -events
    when a domain's footprint exceeds its budget, or when the node cache deltas show evictions during
    the pass.
 
-**Pin by parking (option).** Leave one suspended probe per (image, node) instead of deleting it: its
-local snapshot pins it to the node, its image layers stay referenced so GC cannot evict them, and
-suspended actors do not count against worker capacity (Substrate issue #3528). The job ends with
-`preflight -release`. This trades disk for certainty; decide per run.
+**Pin by parking (follow-up, sandboxenv-rl #229).** Leave one suspended probe per (image, node)
+instead of deleting it: its local snapshot pins it to the node, its image layers stay referenced so
+GC cannot evict them, and suspended actors do not count against worker capacity (Substrate issue
+#3528). The first cut deletes every probe: the planner keeps each node under atelet's GC low
+watermark, and a pinned probe costs a snapshot each (2,000 for SWE-bench Verified on four nodes per
+domain) unless it uses the local suspend mode (#147). Pick it up when a measured run shows evictions
+between the pre-flight and the run.
 
 ### The run
 
@@ -257,9 +260,9 @@ What each step costs for 500 images, with the example shape:
 Two things the diagram hides. Steps 1 and 2 overlap: a probe during the bake still fills the image
 cache (it cold-boots), and a second, cheap probe after the golden is `COMPLETED` fills the file
 cache; the warmer schedules the layer wave as soon as the bake queue is full and the snapshot wave
-as goldens complete, so the wall time is closer to max(step 1, step 2) than their sum. And with
-pin-by-parking the step 2 probes are not deleted: 2,000 suspended environments stay pinned to their
-nodes, hold their layers against GC, cost no worker capacity, and are released after the run.
+as goldens complete, so the wall time is closer to max(step 1, step 2) than their sum. The step 2
+probes are deleted; pin-by-parking (#229) would keep them as 2,000 suspended environments pinned to
+their nodes, holding their layers against GC, if cluster runs show evictions.
 
 ### API changes in `ate-env-api` (small, useful on their own)
 
@@ -329,7 +332,7 @@ concurrency run is the latest baseline record):
   DiskPressure threshold, so an overshoot evicts pods, not only layers (substrate#3478: 40 nodes in
   DiskPressure at step 2 with 32 new images per step); a plan that fills a node past the low
   watermark is undone. The planner budgets below it, the verify step checks evictions, and
-  pin-by-parking removes the window.
+  pin-by-parking (#229) would remove the window.
 - **Detach on wake still ignores images** (#3482). The per-environment selector narrows the detach
   to the domain, which holds the image; full fix is upstream.
 - **Golden bake throughput.** Thousands of images mean hours at 5 per replica; the pre-flight must

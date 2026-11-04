@@ -742,19 +742,24 @@ class SubstrateBackendDriver(BackendDriver):
             if self._may_pool(teardowns):
                 self._owned_actors.setdefault(actor_id, instance)
             else:
-                self._owned_actors[actor_id] = dataclasses.replace(
-                    instance, run_id=WARM_POOL_RUN_ID
-                )
+                self._own_for_any_reap(actor_id, instance)
 
-    def _keep_for_any_reap(self, actor_id: str, instance: RawSandboxInstance | None = None) -> None:
-        """Keep an actor owned under WARM_POOL_RUN_ID, which every reap deletes.
+    def _keep_for_any_reap(self, actor_id: str) -> None:
+        """Keep an owned actor under WARM_POOL_RUN_ID, which every reap deletes.
+
+        An actor a reap already popped is not added back.
+        """
+        with self._lock:
+            inst = self._owned_actors.get(actor_id)
+            if inst is not None:
+                self._own_for_any_reap(actor_id, inst)
+
+    def _own_for_any_reap(self, actor_id: str, instance: RawSandboxInstance) -> None:
+        """Own ``instance`` under WARM_POOL_RUN_ID. Caller holds self._lock.
 
         A copy, so the caller's handle keeps its run_id.
         """
-        with self._lock:
-            inst = self._owned_actors.get(actor_id, instance)
-            if inst is not None:
-                self._owned_actors[actor_id] = dataclasses.replace(inst, run_id=WARM_POOL_RUN_ID)
+        self._owned_actors[actor_id] = dataclasses.replace(instance, run_id=WARM_POOL_RUN_ID)
 
     def warm_pool(
         self,

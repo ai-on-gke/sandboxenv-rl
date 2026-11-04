@@ -441,8 +441,6 @@ module WarmPoolRunIds {
     ensures Inv(DeleteFailBefore(s, a))                               // fails
   {}
 
-  // Before AC-15.9's fix: a cancelled delete after the run's reap kept the
-  // reaped run id.
   // Before AC-15.9's fix: a warm_pool cancelled after a teardown, before its
   // deletes started, left its actors under the reaped run id.
   lemma WarmCommitDrainedBeforeSafe(s: State, a: Actor, r: Run)
@@ -457,6 +455,8 @@ module WarmPoolRunIds {
     ensures Inv(RecycleSuspendCancelledBefore(s, a))                  // fails
   {}
 
+  // Before AC-15.9's fix: a cancelled delete after the run's reap kept the
+  // reaped run id.
   lemma DeleteCancelledSafe(s: State, a: Actor)
     requires Inv(s) && a in s.deleting
     ensures Inv(DeleteCancelled(s, a))                                // fails

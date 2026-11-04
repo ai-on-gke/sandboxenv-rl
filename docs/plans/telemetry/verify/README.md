@@ -42,14 +42,14 @@ generation's reservations covers `R`"), `CommitCurrentSafe`, `CommitStaleFixedSa
 
 In `warm_pool_drain.dfy`, `PlanDrainSafe`, `CommitCurrentDrainSafe`, `CommitStaleDrainSafe`,
 `UnwarmFixedSafe` and `ResizeFixedSafe` verify the generations #221 ships; `ReapSafe`,
-`WarmCommitDrainedSafe`, `StartDeleteSafe`, `DeleteOkSafe`, `DeleteFailFixedSafe`,
-`ReleaseStartSafe`, `ReleaseDeleteOkSafe` and `AnyReapDeletesRetagged` verify the re-tag.
-`DeleteCancelledFixedSafe`, `WarmCommitDrainedSafe` and `ReturnPoppedSafe` verify #238's fix for
-AC-15.9: a cancelled delete re-tags, a torn-down or drained `warm_pool` owns its actors under
-`WARM_POOL_RUN_ID` from the start, and a release that pops an actor and does not delete it (failed
-or cancelled delete, or a recycle cancelled in `suspend()`) re-tags it whenever `_teardowns` changed
-since the pop (`_return_popped`, one atomic step under the lock). `UnwarmRefillWitness`,
-`ResizeOverfillWitness` and `ReleaseOrphanWitness` verify concrete traces.
+`StartDeleteSafe`, `DeleteOkSafe`, `DeleteFailFixedSafe`, `ReleaseStartSafe`, `ReleaseDeleteOkSafe`
+and `AnyReapDeletesRetagged` verify the re-tag. `DeleteCancelledFixedSafe`, `WarmCommitDrainedSafe`
+and `ReturnPoppedSafe` verify #238's fix for AC-15.9: a cancelled delete re-tags, a torn-down or
+drained `warm_pool` owns its actors under `WARM_POOL_RUN_ID` from the start, and a release that pops
+an actor and does not delete it (failed or cancelled delete, or a recycle cancelled in `suspend()`)
+re-tags it whenever `_teardowns` changed since the pop (`_return_popped`, one atomic step under the
+lock). `UnwarmRefillWitness`, `ResizeOverfillWitness` and `ReleaseOrphanWitness` verify concrete
+traces.
 
 ## Run
 

@@ -73,5 +73,5 @@ user needs to know across them.
 - Python client: environments no longer outlive `teardown()`. A recycle,
   `warm_pool` call or failed warm claim that overlaps a teardown deletes its
   environment instead of pooling it, and the warm-replica gauge stays equal to
-  the warm pool. An environment whose delete fails stays owned, so the next
-  `reap` deletes it.
+  the warm pool. An environment whose delete fails or is cancelled stays
+  owned, and the next `reap` of any run deletes it.

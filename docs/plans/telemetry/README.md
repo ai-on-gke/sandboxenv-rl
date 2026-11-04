@@ -1,9 +1,10 @@
 # Plan: telemetry and the OpenTelemetry adapter for sandboxenv-rl
 
-Status: executed. Contracts checked against `main` at `3b03b03` (2026-10-29); the series completed
-with #186 (`9c30be1`, 2026-11-02). All six pull requests are merged. The plan was written on
-2026-10-21 against `8ff5c3e` as a proposal to replicate agent-sandbox's telemetry; this revision
-records the names, flags and families that shipped and where they differ from the proposal.
+Status: executed. Contracts checked against `main` at `3b03b03` (2026-10-29), and the warm-pool
+contract in [interfaces.md](./interfaces.md) at `d0e4802` with #238; the series completed with #186
+(`9c30be1`, 2026-11-02). All six pull requests are merged. The plan was written on 2026-10-21
+against `8ff5c3e` as a proposal to replicate agent-sandbox's telemetry; this revision records the
+names, flags and families that shipped and where they differ from the proposal.
 
 Companion documents in this directory: [prd.md](./prd.md), [execution-plan.md](./execution-plan.md),
 [interfaces.md](./interfaces.md) (the shipped contracts),

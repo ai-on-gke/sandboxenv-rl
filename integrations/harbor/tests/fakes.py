@@ -36,7 +36,12 @@ from typing import Any, Protocol
 
 import grpc
 import grpc.aio
-from ate_env._gen.ateenv.v1alpha import env_pb2, env_pb2_grpc, guest_pb2, guest_pb2_grpc
+from ate_env_rl._gen.ateenv.v1alpha import (
+    env_pb2,
+    env_pb2_grpc,
+    guest_pb2,
+    guest_pb2_grpc,
+)
 
 from ate_env_harbor.environment import WHOAMI_COMMAND
 

@@ -54,7 +54,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-logger = logging.getLogger("ate_env.lookahead")
+logger = logging.getLogger("ate_env_rl.lookahead")
 
 
 @dataclass

@@ -18,11 +18,11 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock
 
-from ate_env import FleetConfig, SandboxFleet
-from ate_env.backend.substrate import SubstrateBackendDriver
-from ate_env.runtime.mock import MockRuntimeHook
-from ate_env.runtime.substrate_env_client import SubstrateEnvClientRuntime
-from ate_env.types import EnvironmentSpec
+from ate_env_rl import FleetConfig, SandboxFleet
+from ate_env_rl.backend.substrate import SubstrateBackendDriver
+from ate_env_rl.runtime.mock import MockRuntimeHook
+from ate_env_rl.runtime.substrate_env_client import SubstrateEnvClientRuntime
+from ate_env_rl.types import EnvironmentSpec
 
 
 def mock_client():

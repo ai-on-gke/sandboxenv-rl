@@ -15,7 +15,7 @@
 """Public dataclasses and enums mirroring the ateenv.v1alpha proto types.
 
 Generated protobuf classes stay out of the public API; the raw stubs remain
-reachable under ate_env._gen for callers that need them.
+reachable under ate_env_rl._gen for callers that need them.
 """
 
 from __future__ import annotations
@@ -292,7 +292,7 @@ def _process_output_from_pb(pb: guest_pb2.ProcessOutput) -> ProcessOutput:
         return ProcessOutput(stderr=pb.stderr)
     if which == "exit":
         return ProcessOutput(exit=_process_info_from_pb(pb.exit))
-    raise ValueError(f"ate_env: unexpected process output {pb!r}")
+    raise ValueError(f"ate_env_rl: unexpected process output {pb!r}")
 
 
 @dataclass(frozen=True)

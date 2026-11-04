@@ -231,7 +231,7 @@ def parse_python_coverage(
     def categorize(filepath: str) -> str:
         norm = filepath.replace("\\", "/")
         if "clients/python" in norm:
-            return "clients/python (ate_env)"
+            return "clients/python (ate_env_rl)"
         if "integrations/nemo-gym" in norm:
             return "integrations/nemo-gym"
         if "integrations/uni-agent" in norm:

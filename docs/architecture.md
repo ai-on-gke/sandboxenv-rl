@@ -1,6 +1,6 @@
 # sandboxenv-rl architecture
 
-Status: describes `main` at `3a67f2b`. Re-check the claims in §Components when `internal/ate` or
+Status: describes `main` at `39e8ad4`. Re-check the claims in §Components when `internal/ate` or
 `internal/apiservice` changes. Companion to [README.md](../README.md) (how to use it) and
 [docs/glossary.md](./glossary.md).
 
@@ -121,7 +121,7 @@ child processes, and serves `ProcessService` and `FileSystemService`.
   interactive shell (`shell`), file transfer (`read`, `write`), and manifest generation
   (`ate-env manifest`).
 - **`clients/go`**: Public Go SDK client (`Client`, `Env`, `Process`).
-- **`clients/python`**: Published as `ate-env-client` (import name `ate_env`). Low-level modules
+- **`clients/python`**: Published as `ate-env-rl` (import name `ate_env_rl`). Low-level modules
   expose async `Client` and `Env`. High-level modules expose synchronous `SandboxFleet` (backed by a
   shared `LoopRunner` thread) and asynchronous `AsyncSandboxFleet`.
 - **`integrations/harbor`**: Published as `ate-env-harbor`. Implements Harbor's environment provider

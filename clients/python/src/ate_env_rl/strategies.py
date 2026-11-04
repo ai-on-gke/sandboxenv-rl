@@ -28,7 +28,7 @@ from .telemetry.metrics import status_of
 from .telemetry.trace_recorder import current_slot_wait_s, task_context
 from .types import Task
 
-logger = logging.getLogger("ate_env.strategies")
+logger = logging.getLogger("ate_env_rl.strategies")
 
 
 def process_parallel(

@@ -13,7 +13,7 @@
 # limitations under the License.
 """Unit tests for ate_env_tool: the parts that do not need verl, a GPU or a cluster.
 
-verl, transformers and the ate_env client are replaced by small stand-ins so the module imports
+verl, transformers and the ate_env_rl client are replaced by small stand-ins so the module imports
 anywhere; the pool logic is exercised against a fake client that records creates and deletes.
 """
 
@@ -73,7 +73,7 @@ class FakeEnv:
 
 
 class FakeClient:
-    """Stand-in for ate_env.Client; one shared ledger across instances so atexit cleanup is observable."""
+    """Stand-in for ate_env_rl.Client; one shared ledger across instances so atexit cleanup is observable."""
 
     created: list[str] = []
     deleted: list[str] = []
@@ -101,9 +101,9 @@ class FakeClient:
 @pytest.fixture
 def tool_module(monkeypatch):
     _install_stubs()
-    ate_env = types.ModuleType("ate_env")
-    ate_env.Client = FakeClient
-    monkeypatch.setitem(sys.modules, "ate_env", ate_env)
+    ate_env_rl = types.ModuleType("ate_env_rl")
+    ate_env_rl.Client = FakeClient
+    monkeypatch.setitem(sys.modules, "ate_env_rl", ate_env_rl)
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     sys.modules.pop("ate_env_tool", None)
     import ate_env_tool

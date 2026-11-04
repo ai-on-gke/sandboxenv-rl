@@ -10,7 +10,7 @@ What this repository supports, and what that means.
 | [`cmd/ate-env-api`](../cmd/ate-env-api) | The API service. |
 | [`cmd/ate-env-guest`](../cmd/ate-env-guest), [`guest/`](../guest) | The daemon inside each environment and its services. |
 | [`clients/go`](../clients/go) | The Go client. |
-| [`clients/python`](../clients/python/README.md) | The Python client (`ate_env`), including the fleet SDK (`SandboxFleet`, `AsyncSandboxFleet`). |
+| [`clients/python`](../clients/python/README.md) | The Python client (`ate_env_rl`), including the fleet SDK (`SandboxFleet`, `AsyncSandboxFleet`). |
 | [`integrations/`](../integrations) | Framework integrations: today [`integrations/nemo-gym`](../integrations/nemo-gym/README.md). |
 | [`proto/ateenv/v1alpha`](../proto/ateenv/v1alpha) | The `ateenv.v1alpha` API. |
 

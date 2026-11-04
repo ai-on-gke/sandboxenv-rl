@@ -14,7 +14,7 @@
 
 """ate_env_openhands.agent_sandbox_rl: agent-sandbox-rl's names on ate-env.
 
-The mapping onto ate_env.FleetConfig, the run() signature, the handles'
+The mapping onto ate_env_rl.FleetConfig, the run() signature, the handles'
 cluster_name, and an agent-sandbox-rl program that runs against the fakes with
 only its imports changed. With AGENT_SANDBOX_RL_EXAMPLE set to agent-sandbox's
 run_openhands_fleet.py, the upstream file itself runs the same way.
@@ -31,11 +31,11 @@ import runpy
 from contextlib import redirect_stdout
 from pathlib import Path
 
-import ate_env
+import ate_env_rl
 import pydantic
 import pytest
-from ate_env import DEFAULT_ATESPACE
-from ate_env.backend.mock import MockBackendDriver
+from ate_env_rl import DEFAULT_ATESPACE
+from ate_env_rl.backend.mock import MockBackendDriver
 
 import ate_env_openhands.agent_sandbox_rl.adapters.openhands as compat_openhands
 from ate_env_openhands import fleet as oh_fleet
@@ -81,7 +81,7 @@ def test_fleet_config_maps_onto_ate_env():
                                           trace_service_name="rollouts"),
     )
     ate = config.to_ate_env()
-    assert isinstance(ate, ate_env.FleetConfig)
+    assert isinstance(ate, ate_env_rl.FleetConfig)
     assert (ate.backend, ate.endpoint, ate.tenancy, ate.template) == (
         "substrate", "api.example:7777", "team-a", "oh-agent-server")
     assert (ate.max_concurrent, ate.max_warmpool_replicas, ate.window_size) == (4, 6, 3)
@@ -315,7 +315,7 @@ def test_session_reuse_options_raise(kwargs):
 def test_handles_carry_the_cluster_name():
     fleet = _mock_fleet(FleetConfig(clusters=[ClusterConfig(name="c1")]))
     handle = fleet.acquire(Task(id="t1", image=IMAGE))
-    assert isinstance(handle, SandboxHandle) and isinstance(handle, ate_env.SandboxHandle)
+    assert isinstance(handle, SandboxHandle) and isinstance(handle, ate_env_rl.SandboxHandle)
     assert handle.cluster_name == "c1" and handle.sandbox_id
     [a, b] = fleet.acquire([Task(id="t2", image=IMAGE), Task(id="t3", image=IMAGE)])
     assert a.cluster_name == b.cluster_name == "c1"

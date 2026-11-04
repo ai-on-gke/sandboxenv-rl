@@ -42,6 +42,7 @@ import os
 from pathlib import Path
 
 import pytest
+from nemo_gym_substrate import provider as provider_mod
 from nemo_gym_substrate._compat import SandboxSpec, SandboxStatus
 from nemo_gym_substrate.provider import SubstrateSandboxProvider
 
@@ -104,6 +105,45 @@ def test_full_lifecycle(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_pause_policy_parks_and_the_next_command_wakes() -> None:
+    """Parking on a real actor: create() hands back a parked sandbox, a command
+    wakes it and parks it again, pause() and resume() do the same on demand."""
+
+    async def scenario() -> None:
+        provider = SubstrateSandboxProvider(
+            {
+                "connection": {"api_url": API_URL},
+                "create": {
+                    "suspend_policy": "pause_after_exec",
+                    "idle_before_suspend_s": 0,
+                    **({"atespace": ATESPACE} if ATESPACE else {}),
+                },
+            }
+        )
+        handle = None
+        try:
+            handle = await provider.create(
+                SandboxSpec(provider_options={"template": TEMPLATE}, ready_timeout_s=180)
+            )
+            assert await provider.status(handle) == provider_mod._PAUSED
+
+            result = await provider.exec(handle, "echo woke")
+            assert (result.return_code, result.error_type) == (0, None)
+            assert "woke" in (result.stdout or "")
+            assert await provider.status(handle) == provider_mod._PAUSED
+
+            await provider.resume(handle)
+            assert await provider.status(handle) == SandboxStatus.RUNNING
+            await provider.pause(handle)
+            assert await provider.status(handle) == provider_mod._PAUSED
+        finally:
+            if handle is not None:
+                await provider.close(handle)
+            await provider.aclose()
+
+    asyncio.run(scenario())
+
+
 RUNTIME_TEMPLATE = os.environ.get("SUBSTRATE_E2E_RUNTIME_TEMPLATE")
 RUNTIME_PORT = int(os.environ.get("SUBSTRATE_E2E_RUNTIME_PORT", "6000"))
 RUNTIME_IMAGE = os.environ.get("SUBSTRATE_E2E_RUNTIME_IMAGE")
@@ -138,7 +178,13 @@ def test_runtime_layer_endpoint() -> None:
         # task image is derived from it; a provider_options template would
         # select the base itself and skip the image.
         provider = SubstrateSandboxProvider(
-            {"connection": {"api_url": API_URL}, "create": {"template": RUNTIME_TEMPLATE}}
+            {
+                "connection": {"api_url": API_URL},
+                "create": {
+                    "template": RUNTIME_TEMPLATE,
+                    **({"atespace": ATESPACE} if ATESPACE else {}),
+                },
+            }
         )
         handle = None
         try:

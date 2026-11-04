@@ -7,6 +7,15 @@ user needs to know across them.
 ## Unreleased
 
 ### Added
+- Python client: `FleetConfig.node_selector` is sent as every environment's
+  `worker_selector`, and `FleetConfig.placement` adds labels per task image;
+  `SubstrateBackendDriver(worker_selector=, placement=)` and
+  `worker_selector_for(image)`.
+- `swebench-loader plan-placement`: an image placement plan
+  (`image-placement.json`) that assigns each task image to placement domains
+  (worker pools a per-environment worker selector addresses) under each
+  node's image-cache budget, largest image first, with replication and a hot
+  rule from the schedule's demand; `domains.json` describes the domains.
 - ate-env-api: `worker_selector` on `CreateEnvironment`, labels the worker pool
   must carry, ANDed with the template's own selector (`Actor.worker_selector`,
   so it holds for wakes too); `node` and `worker_selector` on `Environment`.

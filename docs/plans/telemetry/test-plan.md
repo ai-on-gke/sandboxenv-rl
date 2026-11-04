@@ -149,16 +149,22 @@ kubectl -n ate-system get deploy -o name | sort | diff /tmp/before-ate-system.tx
 # hypothesis comes with the dev extra, so either venv works.
 /tmp/ate-base/bin/python -m pytest clients/python/tests/test_warm_pool_accounting.py -q
 
-# Dafny 4.11 (not a repository dependency; CI does not run it)
+# Dafny 4.11, from the pinned nixpkgs. CI's `Dafny models` job runs `make ci-dafny`, which checks
+# these results against verify/README.md (hack/verify/dafny.py).
+make ci-dafny
+
+# Or by hand:
 cd docs/plans/telemetry/verify
 dafny verify telemetry.dfy                # 14 verified, 0 errors
 dafny verify warm_pool.dfy                # 16 verified, 3 errors, all in WarmPoolBefore
 dafny verify warm_pool_generations.dfy    # 24 verified, 3 errors: PlanFirstCovers, ClaimFailPutBackSafe, ClaimOkReturnsLive
+dafny verify warm_pool_drain.dfy          # 49 verified, 5 errors: CommitStaleBeforeSafe, ResizeBeforeSafe, DeleteFailBeforeSafe, DeleteCancelledSafe, ReleaseDeleteFailSafe
 ```
 
-The Dafny errors are by design: each failing lemma models code before #221, #221's first version or
-the open claim/reap gap ([verify/README.md](./verify/README.md)). Paste the three summary lines in
-the PR when a change touches the modelled code, and say whether the models still match it.
+The Dafny errors are by design: each failing lemma models code before #221 or one of its review
+rounds, or an open gap ([verify/README.md](./verify/README.md)). CI fails if a result changes and
+the README does not; when a change touches the modelled code, also say in the PR whether the models
+still match it.
 
 Still proposed, not in the repository:
 
@@ -172,6 +178,9 @@ Still proposed, not in the repository:
   after adding `pgregory.net/rapid` to `go.mod`.
 - A test for the claim/reap gap: a warm claim whose `get()` succeeds after an overlapping reap
   deleted the actor. No test covers it; the gap is in the code on `main` with #221.
+- Tests for the run-id gaps: a `warm_pool` cancelled while deleting its actors after the run's reap,
+  and a `release` whose delete fails while a reap runs; after each, `reap` of another run must leave
+  nothing alive. Both fail on `main`; they belong with the fix.
 
 ## What to write in the pull request
 

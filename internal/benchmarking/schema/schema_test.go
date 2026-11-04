@@ -92,6 +92,21 @@ func TestFixturesValidateAndRoundTrip(t *testing.T) {
 		roundTripJSON(t, "schedule.schema.json", v)
 	})
 
+	t.Run("image_placement.json", func(t *testing.T) {
+		raw := mustRead(t, "testdata/image_placement.json")
+		if err := ValidateAgainstJSONSchema("image_placement.schema.json", raw); err != nil {
+			t.Fatalf("schema validate: %v", err)
+		}
+		v, err := DecodeJSONStrict[ImagePlacement](bytes.NewReader(raw))
+		if err != nil {
+			t.Fatalf("DecodeJSONStrict: %v", err)
+		}
+		if err := v.Validate(); err != nil {
+			t.Fatalf("Validate: %v", err)
+		}
+		roundTripJSON(t, "image_placement.schema.json", v)
+	})
+
 	t.Run("placement.json", func(t *testing.T) {
 		raw := mustRead(t, "testdata/placement.json")
 		if err := ValidateAgainstJSONSchema("placement.schema.json", raw); err != nil {

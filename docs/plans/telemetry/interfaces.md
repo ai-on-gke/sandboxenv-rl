@@ -226,5 +226,7 @@ interleaving:
 
 Open: a warm claim whose `get()` succeeds after an overlapping `reap` deleted the actor returns that
 actor, because `_teardowns` is re-checked only on the claim's failure path. A `warm_pool` cancelled
-during its `create()` calls releases its reservation but not the actors already created.
+during its `create()` calls releases its reservation but not the actors already created. A cancelled
+`_delete_unpooled` after the run's reap, and a `release` whose delete fails or is cancelled while a
+reap runs, leave the actor under the reaped run id instead of `WARM_POOL_RUN_ID`.
 [properties.md](./properties.md) and [verify/README.md](./verify/README.md) have the details.

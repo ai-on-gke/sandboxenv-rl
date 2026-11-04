@@ -21,6 +21,7 @@ import pytest
 from ate_env_rl import FleetConfig, SandboxFleet, Task
 from ate_env_rl._gen.ateenv.v1alpha import env_pb2
 from ate_env_rl.backend.substrate import SubstrateBackendDriver
+from ate_env_rl.config import ValidationError
 from ate_env_rl.errors import PreflightError
 from ate_env_rl.types import EnvironmentSpec, PlacementSpec
 
@@ -299,3 +300,74 @@ async def test_cancelled_claim_has_status_cancelled(fake_stack, monkeypatch):
     get = reg.get_sample_value
     assert get("ate_env_fleet_claims_total", {"backend": "substrate", "status": "cancelled"}) == 1
     assert get("ate_env_fleet_claims_total", {"backend": "substrate", "status": "error"}) is None
+
+
+PLACED = "docker.io/library/python@sha256:" + "a" * 64
+UNPLACED = "docker.io/library/node@sha256:" + "b" * 64
+
+
+async def test_driver_sends_the_worker_selector_per_image(fake_stack):
+    client, fakes = fake_stack
+    driver = SubstrateBackendDriver(
+        client=client,
+        atespace="ate-env",
+        worker_selector={"ate-env/workerpool": "c4"},
+        placement={PLACED: {"ate-env/domain": "d0"}},
+    )
+    # A warm create for a placed image carries the fleet labels and the image's.
+    await driver.warm_pool_async("default-template", replicas=1, rootfs_image=PLACED)
+    assert dict(fakes.environments.last_create_request.worker_selector) == {
+        "ate-env/workerpool": "c4",
+        "ate-env/domain": "d0",
+    }
+    # A cold create for an image without a placement entry carries the fleet labels only.
+    await driver.acquire_async("default-template", run_id="run-1", rootfs_image=UNPLACED)
+    assert dict(fakes.environments.last_create_request.worker_selector) == {"ate-env/workerpool": "c4"}
+    # No labels at all: the request carries none and the template's selection stands.
+    plain = SubstrateBackendDriver(client=client, atespace="ate-env")
+    assert plain.worker_selector_for(PLACED) is None
+    await plain.acquire_async("default-template", run_id="run-1", rootfs_image=PLACED)
+    assert len(fakes.environments.last_create_request.worker_selector) == 0
+
+
+def test_fleet_config_placement_reaches_the_driver():
+    cfg = FleetConfig(
+        backend="substrate",
+        endpoint="127.0.0.1:1",
+        node_selector={"ate-env/workerpool": "c4"},
+        placement={PLACED: {"ate-env/domain": "d1"}},
+    )
+    fleet = SandboxFleet(cfg)
+    assert fleet.backend.worker_selector_for(PLACED) == {"ate-env/workerpool": "c4", "ate-env/domain": "d1"}
+    assert fleet.backend.worker_selector_for(UNPLACED) == {"ate-env/workerpool": "c4"}
+
+
+async def test_placement_labels_override_the_fleet_labels_on_the_same_key(fake_stack):
+    client, fakes = fake_stack
+    driver = SubstrateBackendDriver(
+        client=client,
+        atespace="ate-env",
+        worker_selector={"ate-env/domain": "pool-wide", "tier": "hot"},
+        placement={PLACED: {"ate-env/domain": "d0"}},
+    )
+    assert driver.worker_selector_for(PLACED) == {"ate-env/domain": "d0", "tier": "hot"}
+    await driver.acquire_async("default-template", run_id="run-1", rootfs_image=PLACED)
+    assert dict(fakes.environments.last_create_request.worker_selector) == {
+        "ate-env/domain": "d0",
+        "tier": "hot",
+    }
+
+
+def test_fleet_config_validates_and_copies_placement():
+    labels = {"ate-env/domain": "d0"}
+    placement = {PLACED: labels}
+    cfg = FleetConfig(backend="mock", node_selector={"a": "b"}, placement=placement)
+    labels["ate-env/domain"] = "changed"
+    placement["other"] = {"x": "y"}
+    assert cfg.placement == {PLACED: {"ate-env/domain": "d0"}}
+    assert cfg.to_dict()["placement"] == {PLACED: {"ate-env/domain": "d0"}}
+    cfg.to_dict()["placement"][PLACED]["ate-env/domain"] = "mutated"
+    assert cfg.placement[PLACED]["ate-env/domain"] == "d0"
+    for bad in ({"": {"a": "b"}}, {PLACED: "d0"}, {PLACED: {"a": 1}}, {PLACED: {"": "v"}}):
+        with pytest.raises(ValidationError):
+            FleetConfig(backend="mock", placement=bad)

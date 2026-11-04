@@ -55,7 +55,7 @@ from .errors import NotFoundError
 from .observability import Observer
 from .types import GoldenSnapshotState, ImageStatus
 
-logger = logging.getLogger("ate_env.preflight")
+logger = logging.getLogger("ate_env_rl.preflight")
 
 SCHEMA_VERSION = "v1"
 

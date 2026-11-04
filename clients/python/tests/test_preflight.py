@@ -22,8 +22,8 @@ import pathlib
 
 import pytest
 
-from ate_env import ImagePlacement, Observer, PreflightWarmer
-from ate_env._gen.ateenv.v1alpha import env_pb2
+from ate_env_rl import ImagePlacement, Observer, PreflightWarmer
+from ate_env_rl._gen.ateenv.v1alpha import env_pb2
 
 IMG_A = "registry.example/swebench/a@sha256:" + "a" * 64
 IMG_B = "registry.example/swebench/b@sha256:" + "b" * 64

@@ -19,7 +19,7 @@ user needs to know across them.
   `worker_selector`, and `FleetConfig.placement` adds labels per task image;
   `SubstrateBackendDriver(worker_selector=, placement=)` and
   `worker_selector_for(image)`.
-- Python client: `ate_env.PreflightWarmer` fills the node caches an image
+- Python client: `ate_env_rl.PreflightWarmer` fills the node caches an image
   placement plan (`ImagePlacement`, from `image-placement.json`) describes:
   ensures each image's derived template, then per domain, as each golden
   becomes ready, probes every node with the image and deletes the probes;

@@ -129,15 +129,26 @@ containers:
 harbor run -p ./tb2/terminal-bench -a oracle -n 10 -e docker
 ```
 
-For `oracle` the rewards must match task by task. Timing numbers for ate-env
-(create, exec latency, total wall time at `-n 50`) next to Docker's are
-recorded here once the plan's performance criterion has run.
+For `oracle` the rewards must match task by task. The numbers below are from
+2026-11-03 on `rl-testing-tomer` (GKE, us-central2, Substrate v0.6.0, five
+gVisor workers, `ate-env-api` through a port-forward): Harbor's `nop` agent
+on the `echo` task (`integrations/harbor/tests/tasks/echo`, a prebuilt alpine
+image), 10 and 50 trials at `-n 10` and `-n 50`, every environment deleted at
+the end. The durations are Harbor's own, from each trial's `result.json`:
+`environment_setup` is the create, the first guest answer and the
+`environment/` upload; the verifier phase is the `tests/` upload, five
+commands and the download of `/logs/verifier`.
 
-| Measure | ate-env, plain create | ate-env, warm pool | Docker |
-|---|---|---|---|
-| Create or adopt, p50 / p95 | to be measured | to be measured | to be measured |
-| `exec` latency, p50 / p95 | to be measured | to be measured | to be measured |
-| Wall time, 50 `hello-world` trials with `nop` | to be measured | to be measured | to be measured |
+| Measure | ate-env, plain create, `-n 10` | ate-env, plain create, `-n 50` | ate-env, warm pool | Docker |
+|---|---|---|---|---|
+| Environment setup, p50 / p95 | 2.6 s / 3.9 s | 2.2 s / 7.6 s | deferred (plan decision D-8) | not run: the measuring machine has no `docker compose` plugin |
+| Verifier phase, p50 / p95 | 1.7 s / 1.7 s | 1.7 s / 1.7 s | | |
+| Trial, p50 / p95 | 6.4 s / 7.7 s | 6.5 s / 11.5 s | | |
+| Job wall time | 7.9 s | 11.9 s | | |
+| Infrastructure errors | 0 of 10 | 0 of 50 | | |
+
+`hello-world` itself was not the task: its verifier downloads packages, and
+the actors on that cluster have no egress.
 
 ## Troubleshooting
 

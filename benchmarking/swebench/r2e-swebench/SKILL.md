@@ -241,37 +241,22 @@ top-level comparison artifacts land at `$ARTIFACT_DIR/`:
 
 ## 6. Write the benchmark report
 
-Copy [`./REPORT_TEMPLATE.md`](./REPORT_TEMPLATE.md) to `$ARTIFACT_DIR/BENCHMARK_REPORT.md` so the
-machine-validated `report.md` and `comparison.md` files stay intact, then populate every section:
+Copy [`./REPORT_TEMPLATE.md`](./REPORT_TEMPLATE.md) to `$ARTIFACT_DIR/BENCHMARK_REPORT.md` so
+`report.md` and `comparison.md` stay intact, then fill every section:
 
-1. **Collect system and orphan records when missing**: If the run did not invoke `bench measure` or
-   `bench reap`, capture cluster topology and verify zero leaked actors before finalizing the
-   report:
+1. **Capture `system_description.json`**: Run `bench measure -k8s` once into `$ARTIFACT_DIR` to
+   record cluster name, node pools, Kubernetes and Substrate versions, `WorkerPool` capacity, and
+   `sandboxenv-rl` commit:
    ```bash
    go -C "${ENV_REPO}" run ./cmd/benchmarking/bench measure -k8s \
      -atespace "${ATESPACE:-ate-env}" \
      -run-id "${RUN_PREFIX:-r2eswe}" \
      -dest "${ARTIFACT_DIR}"
-   go -C "${ENV_REPO}" run ./cmd/benchmarking/bench reap \
-     -ate-endpoint "${ATE_ENDPOINT}" \
-     -atespace "${ATESPACE:-ate-env}" \
-     -prefix "${RUN_PREFIX:-r2eswe}" \
-     -dest "${ARTIFACT_DIR}"
    ```
-2. **State the start footing and per-node concurrency**: Classify the run in `## Summary` and
-   section `1.2` as `cold boot` (no golden snapshot), `cold restore` (golden snapshot present,
-   `misses_per_first_cmd` near `1.0`), `warm restore` (golden snapshot and node image cached,
-   `misses_per_first_cmd` near `0.0`), or `wake` (resumed from local suspend snapshot). Record
-   `MAX_CONCURRENCY / sandbox_nodes` alongside node boot disk type, CPU family, worker pod density,
-   and `atelet` GC flags from [`../SKILL.md`](../SKILL.md) sections 1 and 4.
-3. **Fill latency, rollout, and cost tables from bundle JSON**: Populate section `4.1` from
-   `comparison.json` (or `report.json` on single-arm runs), section `4.2` from `report.json`
-   (`stats[]`, `headline_baseline`, `acquisition_sources`) and `measurements.json`, section `4.3`
-   from `restore_timings.jsonl` and `cache_{before,after}.prom`, section `4.4` from `steps[]`,
-   `rollout_breakdown[]`, `rl_step_breakdown`, `jobs`, and `interference`, and section `4.5` from
-   `measurements.json` and `system_description.json`.
-4. **Preserve zero-vs-missing semantics**: Write `not collected` when a telemetry scope or OTel
-   collector was disabled and `not applicable (simulated RL)` for GPU trainer fields. Never write
-   `0` for an uncollected metric.
-5. **Check all 7 validity gates**: Complete the checklist in section `6.2`
-   (`bench validate -dest "${ARTIFACT_DIR}"`) and list any comparison caveats in section `6.3`.
+2. **Populate setup and command (`## 1` and `## 2`)**: Fill workload flags and cluster footprint
+   from `report.json` (`labels`, `distinct_images`) and `system_description.json`, and state the
+   start footing (`cold boot`, `cold restore`, `warm restore`, or `wake`) in `## Summary`.
+3. **Populate results and findings (`## 3` and `## 4`)**: Copy the arm comparison rows from
+   `comparison.md` (or `report.json` on single-arm runs), fill `stats[]` and `rollout_breakdown[]`
+   for the reference arm, include the optional cache/restore bullet only when `SAMPLE_CACHE=1` or
+   `HARVEST_RESTORES=1` ran, and summarize findings and caveats.

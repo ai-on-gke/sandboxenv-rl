@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Regenerates the committed gRPC/protobuf stubs under src/ate_env/_gen.
+# Regenerates the committed gRPC/protobuf stubs under src/ate_env_rl/_gen.
 # Requires grpcio-tools: pip install -e 'clients/python[dev]'.
 set -o errexit -o nounset -o pipefail
 
@@ -23,7 +23,7 @@ ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${ROOT}"
 
 PYTHON="${PYTHON:-python3}"
-OUT_DIR="clients/python/src/ate_env/_gen"
+OUT_DIR="clients/python/src/ate_env_rl/_gen"
 
 # -I proto (not proto/ateenv/v1alpha) so descriptors register under the
 # collision-safe filenames ateenv/v1alpha/{env,guest}.proto.

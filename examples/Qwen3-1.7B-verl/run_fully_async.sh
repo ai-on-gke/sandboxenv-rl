@@ -15,7 +15,7 @@
 # Fully-async, disaggregated agentic GRPO (verl.experimental.fully_async_policy) across two
 # GPU nodes. ROLE=head: start Ray head, wait for NNODES Ray nodes, run the driver. ROLE=worker:
 # join the head and block. Needs the ate-env-api of this repository's main (Substrate v0.6.0 or later,
-# installed per the Quickstart); the Python client is installed from ATE_ENV_CLIENT_REF. Trainer pool and rollout pool are each one whole node, so verl's
+# installed per the Quickstart); the Python client is installed from the bundled checkout (or ATE_ENV_CLIENT_REF when set). Trainer pool and rollout pool are each one whole node, so verl's
 # STRICT_PACK placement groups put the FSDP trainer on one machine and the vLLM rollout engines
 # on the other. Rollouts stream into a queue with a staleness bound, partial rollout resumes
 # aborted generations after a weight sync, weights move trainer -> vLLM over NCCL.
@@ -37,7 +37,7 @@ export HF_HOME=/workspace/hf PYTHONUNBUFFERED=1 VLLM_USE_V1=1 NCCL_CUMEM_ENABLE=
                                       # epoch = floor(7489 MATH prompts / PPO_MINI_BATCH) = 468 local updates (234 logged steps)
 : "${SYNC_EVERY:=2}"                  # trigger_parameter_sync_step
 : "${STALENESS:=0.5}"
-: "${ATE_ENV_CLIENT_REF:=eedeb63}"      # ai-on-gke/sandboxenv-rl main (clients/python); move to the merge commit of this PR
+: "${ATE_ENV_CLIENT_REF:=}"           # optional ai-on-gke/sandboxenv-rl git ref; empty installs /workspace/cfg/ate-env-rl.tgz
 : "${MODEL_REVISION:=70d244cc86ccca08cf5af4e1e306ecf908b1ad5e}"   # Qwen/Qwen3-1.7B
 : "${MATH_REVISION:=a960589a2102b8434523fe247d6edadc12d56a05}"    # verl-team/lighteval-MATH-preprocessed
 export MODEL_ID MODEL_REVISION MATH_REVISION                       # read by the download step below
@@ -69,11 +69,18 @@ echo "=== Phase 3: tool + Substrate environment API client ==="
 cp /workspace/cfg/*.py /workspace/agent/ 2>/dev/null || true
 export PYTHONPATH=/workspace/agent:/workspace/verl:${PYTHONPATH:-}
 # Substrate environment API client (gRPC). Pulls grpcio>=1.84 / protobuf>=7.35, which this image tolerates.
-pip install -q -c /workspace/pins.txt "git+https://github.com/ai-on-gke/sandboxenv-rl.git@${ATE_ENV_CLIENT_REF}#subdirectory=clients/python" 2>&1 | tail -2
+if [ -n "$ATE_ENV_CLIENT_REF" ]; then
+  pip install -q -c /workspace/pins.txt "git+https://github.com/ai-on-gke/sandboxenv-rl.git@${ATE_ENV_CLIENT_REF}#subdirectory=clients/python" 2>&1 | tail -2
+elif [ -f /workspace/cfg/ate-env-rl.tgz ]; then
+  mkdir -p /workspace/agent/ate-env-rl && tar -C /workspace/agent/ate-env-rl -xzf /workspace/cfg/ate-env-rl.tgz
+  pip install -q -c /workspace/pins.txt /workspace/agent/ate-env-rl 2>&1 | tail -2
+else
+  pip install -q -c /workspace/pins.txt "git+https://github.com/ai-on-gke/sandboxenv-rl.git@main#subdirectory=clients/python" 2>&1 | tail -2
+fi
 cp /workspace/cfg/tool_config.yaml /workspace/agent/tool_config.yaml
 [ "$ROLE" = "head" ] && python3 - <<'PY'     # one probe per run, unique name (head only)
 import asyncio, os, socket, yaml
-from ate_env import Client
+from ate_env_rl import Client
 ep = yaml.safe_load(open("/workspace/agent/tool_config.yaml"))["tools"][0]["config"]["endpoint"]
 async def probe():
   cfg = yaml.safe_load(open("/workspace/agent/tool_config.yaml"))["tools"][0]["config"]

@@ -36,6 +36,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,6 +55,13 @@ type Router struct {
 	// text for a CRASHED actor or 404 "actor <ref> not found"; code 0 lets
 	// the request through. It applies before Running.
 	Deny func(id string) (code int, body string)
+	// NotRunningBody, when set, is the router's text for a gRPC request to
+	// an actor that is not running, such as "actor <ref> unavailable: no
+	// worker has room for the actor" while the scheduler cannot place it.
+	// The answer is what Envoy makes of the router's 503 for a gRPC caller:
+	// a trailers-only response with grpc-status UNAVAILABLE and the text as
+	// grpc-message. Without it the request gets a plain-text 503.
+	NotRunningBody func(id string) string
 	// EnvoyTimeout, when set, makes a request inside a tunnel to an actor
 	// that is not running wait like the real router's resume: it is served
 	// if the actor runs within EnvoyTimeout, else it gets Envoy's own 504
@@ -115,6 +123,10 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if r.Running != nil && !r.Running(id) {
+		if r.NotRunningBody != nil && strings.HasPrefix(req.Header.Get("Content-Type"), "application/grpc") {
+			grpcUnavailable(w, r.NotRunningBody(id))
+			return
+		}
 		http.Error(w, "actor "+id+" is not running", http.StatusServiceUnavailable)
 		return
 	}
@@ -320,3 +332,13 @@ func (l *oneConnListener) Close() error {
 	return nil
 }
 func (l *oneConnListener) Addr() net.Addr { return l.conn.LocalAddr() }
+
+// grpcUnavailable answers a gRPC request the way Envoy converts a local
+// reply for one: HTTP 200 with a trailers-only gRPC status, UNAVAILABLE (14),
+// and msg percent-encoded as grpc-message.
+func grpcUnavailable(w http.ResponseWriter, msg string) {
+	w.Header().Set("Content-Type", "application/grpc")
+	w.Header().Set("Grpc-Status", "14")
+	w.Header().Set("Grpc-Message", url.PathEscape(msg))
+	w.WriteHeader(http.StatusOK)
+}

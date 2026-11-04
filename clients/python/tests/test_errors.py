@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import grpc
 
-from ate_env import (
+from ate_env_rl import (
     EnvError,
     InvalidArgumentError,
     NotFoundError,

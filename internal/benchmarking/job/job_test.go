@@ -253,3 +253,36 @@ func TestIngestArtifactDirScopesAndPlugins(t *testing.T) {
 		t.Fatalf("expected ValScore=0.25 in convergence curve, got %+v", rep.Convergence)
 	}
 }
+
+func TestRealJobDriverVeRLBundlesClientsPython(t *testing.T) {
+	dir := t.TempDir()
+	eventsPath := filepath.Join(dir, "events.jsonl")
+	rec, err := swebench.NewFileRecorder(eventsPath, "run-verl-bundle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Close()
+
+	execFake := &fakeCmdExecutor{
+		out: "step:1 - timing_s/step:3.0 - critic/score/mean:0.5\n",
+	}
+	manifestPath := filepath.Join("..", "..", "..", "examples", "Qwen3-1.7B-verl", "job-fully-async.yaml")
+	drv := &RealJobDriver{
+		RunID:      "run-verl-bundle",
+		Namespace:  "default",
+		ServerAddr: "http://ate-env:8080",
+		OutDir:     dir,
+		Executor:   execFake,
+		Spec: schema.JobSpec{
+			Name:            "qwen3-1p7b-verl",
+			Mode:            schema.JobModeReal,
+			TrainerManifest: manifestPath,
+		},
+	}
+	if err := drv.Run(context.Background(), rec); err != nil {
+		t.Fatalf("RealJobDriver.Run: %v", err)
+	}
+	if len(execFake.calls) == 0 || !strings.Contains(execFake.calls[0], "--from-file=ate-env-rl.tgz=") {
+		t.Fatalf("expected ConfigMap command to bundle ate-env-rl.tgz, got calls: %v", execFake.calls)
+	}
+}

@@ -74,6 +74,8 @@ func runMain(args []string, stdout, stderr io.Writer) int {
 		err = runCmd(args[1:])
 	case "resolve":
 		err = resolveCmd(args[1:])
+	case "plan-placement":
+		err = planPlacementCmd(args[1:], stderr)
 	case "convert-trace":
 		err = convertTraceCmd(args[1:])
 	case "report", "compare":
@@ -242,7 +244,118 @@ func idsDigest(ids []string) string {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage: swebench-loader run [flags] | swebench-loader resolve [flags] | swebench-loader convert-trace [flags] | swebench-loader report FILE... [-json OUT] | swebench-loader trajectory-assets FILE")
+	fmt.Fprintln(w, "usage: swebench-loader run [flags] | swebench-loader resolve [flags] | swebench-loader plan-placement [flags] | swebench-loader convert-trace [flags] | swebench-loader report FILE... [-json OUT] | swebench-loader trajectory-assets FILE")
+}
+
+// planPlacementCmd writes image-placement.json: which placement domains hold
+// each task image, under each domain's per-node image-cache budget. The
+// pre-flight fills the caches from it and the run steers creates with it.
+func planPlacementCmd(args []string, stderr io.Writer) error {
+	fs := flag.NewFlagSet("plan-placement", flag.ContinueOnError)
+	var (
+		dataset        = fs.String("dataset", "", "JSONL manifest of instances; a path or an https URL. Required. Image sizes come from its image_bytes_compressed (make-dataset.py).")
+		schedule       = fs.String("schedule", "", "schedule.json from resolve. When given, its images are placed, with each image's demand (the most environments one step asks for), and the whole manifest supplies the sizes; -images, -instances and -exclude-file then do not apply. Otherwise every selected image of the manifest is placed.")
+		domainsFile    = fs.String("domains", "", "domains.json: the placement domains, each with the worker-pool labels its per-environment worker selector names, its node count and node_cache_bytes, the unpacked bytes one node may hold. Required.")
+		images         = fs.Int("images", 0, "Use the first N instances of the dataset; 0 means all.")
+		instances      = fs.String("instances", "", "Comma-separated instance ids to use instead of the first N.")
+		excludeFile    = fs.String("exclude-file", "", "File of instance ids to leave out, one per line.")
+		replication    = fs.Int("replication", 1, "Domains per image.")
+		hotDemand      = fs.Int("hot-demand", 0, "An image whose demand reaches this goes to -hot-replication domains; 0 disables. Needs -schedule.")
+		hotReplication = fs.Int("hot-replication", 2, "Domains per hot image.")
+		unpackFactor   = fs.Float64("unpack-factor", swebench.DefaultUnpackFactor, "Unpacked bytes on a node per compressed byte.")
+		defaultSize    = fs.String("default-image-size", "3GiB", "Compressed size assumed for an image the manifest gives none for (size_assumed in the plan); 0 leaves such images unplaced.")
+		out            = fs.String("out", "image-placement.json", "Output path.")
+	)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("plan-placement takes no positional arguments, got %q", fs.Args())
+	}
+	if *dataset == "" || *domainsFile == "" {
+		return fmt.Errorf("-dataset and -domains are required")
+	}
+	if *hotDemand > 0 && *schedule == "" {
+		return fmt.Errorf("-hot-demand needs -schedule, which gives each image's demand")
+	}
+	if *schedule != "" && (*images != 0 || *instances != "" || *excludeFile != "") {
+		return fmt.Errorf("-schedule names the images to place; -images, -instances and -exclude-file apply only without it")
+	}
+	defaultBytes, err := swebench.ParseByteSize(*defaultSize)
+	if err != nil {
+		return fmt.Errorf("-default-image-size: %w", err)
+	}
+	all, err := swebench.LoadDataset(*dataset)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	if *instances != "" {
+		ids = strings.Split(*instances, ",")
+	}
+	var exclude []string
+	if *excludeFile != "" {
+		if exclude, err = swebench.ReadIDList(*excludeFile); err != nil {
+			return err
+		}
+	}
+	// With a schedule the whole manifest supplies the sizes, so a scheduled
+	// image is never left to the assumed size by a filter it did not go through.
+	selected := all
+	if *schedule == "" {
+		if selected, err = swebench.Select(all, ids, exclude, *images); err != nil {
+			return err
+		}
+	}
+	domains, err := swebench.ReadPlacementDomains(*domainsFile)
+	if err != nil {
+		return err
+	}
+	opts := swebench.PlanOptions{
+		Instances:              selected,
+		Domains:                domains,
+		Replication:            *replication,
+		HotDemand:              *hotDemand,
+		HotReplication:         *hotReplication,
+		UnpackFactor:           *unpackFactor,
+		DefaultBytesCompressed: defaultBytes,
+	}
+	if *schedule != "" {
+		if opts.Schedule, err = swebench.ReadSchedule(*schedule); err != nil {
+			return err
+		}
+	}
+	plan, err := swebench.PlanImagePlacement(opts)
+	if err != nil {
+		return err
+	}
+	if err := swebench.WriteImagePlacement(*out, plan); err != nil {
+		return err
+	}
+	fmt.Fprintf(stderr, "placed %d images in %d domains; %d unplaced; wrote %s\n", len(plan.Images), len(plan.Domains), len(plan.Unplaced), *out)
+	for _, d := range plan.Domains {
+		fill := "no budget"
+		if d.NodeCacheBytes > 0 {
+			fill = fmt.Sprintf("%.0f%% of %s", 100*float64(d.AssignedBytes)/float64(d.NodeCacheBytes), swebench.FormatByteSize(d.NodeCacheBytes))
+		}
+		fmt.Fprintf(stderr, "  %s: %d images, %s unpacked per node (%s), %d nodes\n", d.Name, d.ImageCount, swebench.FormatByteSize(d.AssignedBytes), fill, d.Nodes)
+	}
+	assumed := 0
+	for _, e := range plan.Images {
+		if e.SizeAssumed {
+			assumed++
+		}
+	}
+	if assumed > 0 {
+		fmt.Fprintf(stderr, "  %d images had no size in the manifest; %s assumed for each (rebuild the manifest with make-dataset.py for real sizes)\n", assumed, *defaultSize)
+	}
+	if under := swebench.UnderReplicated(plan, *hotDemand, *hotReplication); len(under) > 0 {
+		fmt.Fprintf(stderr, "  %d images fit fewer domains than asked\n", len(under))
+	}
+	for _, u := range plan.Unplaced {
+		fmt.Fprintf(stderr, "  unplaced: %s: %s\n", u.Image, u.Reason)
+	}
+	return nil
 }
 
 // assetsCmd prints the files a trajectory's write steps name, one per line,

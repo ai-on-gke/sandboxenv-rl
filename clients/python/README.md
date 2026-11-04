@@ -1,4 +1,4 @@
-# ate-env-client — Python Client & Sandbox Fleet SDK
+# ate-env-rl — Python Client & Sandbox Fleet SDK
 
 > [!WARNING]
 > This is an alpha API and is likely to change until v1.0 is released.
@@ -20,7 +20,7 @@ The client talks to a single endpoint — the `ate-env-api` service — over
 plain gRPC (h2c). Behind that endpoint there are two distinct paths:
 
 ```
-       ate_env (this package)                                       cluster
+       ate_env_rl (this package)                                    cluster
  ╭────────────────────────────╮
  │ Client                     │ EnvironmentService ╭───────────────╮ lifecycle  ╭────────╮
  │  create() get() suspend()  │───────────────────▶│               │───────────▶│ ateapi │
@@ -101,8 +101,8 @@ From a repo checkout:
 pip install ./clients/python
 ```
 
-The distribution is named `ate-env-client`; the import package is
-`ate_env` (mirroring the Go client, which lives at `clients/go`).
+The distribution is named `ate-env-rl`; the import package is
+`ate_env_rl` (mirroring the Go client, which lives at `clients/go`).
 
 ### Connect
 
@@ -120,7 +120,7 @@ across tasks — for long-lived programs (servers, multi-agent
 orchestration), create one client, share it, and close it on shutdown:
 
 ```python
-from ate_env import Client
+from ate_env_rl import Client
 
 client = Client("localhost:7777")
 try:
@@ -156,6 +156,10 @@ is created on first use and shared by every environment on that image:
 
 ```python
 env = await client.create("py1", rootfs_image="docker.io/library/python@sha256:…")
+# Keep it on the worker pools that carry a label (ANDed with the template's selector);
+# info.node is the node it is on once placed, info.worker_selector what it asked for.
+env = await client.create("t1", rootfs_image="…@sha256:…", worker_selector={"ate-env/domain": "d0"})
+info = await client.get("t1")
 print((await env.info()).template.name)   # default-template-<12 hex of the digest>
 ```
 
@@ -169,7 +173,7 @@ A freshly created (or suspended) environment starts serving on first
 contact. Gate on readiness by retrying a trivial command:
 
 ```python
-from ate_env import EnvError
+from ate_env_rl import EnvError, SandboxStartError
 
 async def wait_until_serving(env, timeout=180):
     async with asyncio.timeout(timeout):
@@ -177,6 +181,8 @@ async def wait_until_serving(env, timeout=180):
             try:
                 if (await env.shell("true")).exit_code == 0:
                     return
+            except SandboxStartError:
+                raise  # crashed, or no room: waiting will not help
             except EnvError:
                 pass
             await asyncio.sleep(2)
@@ -286,16 +292,27 @@ await env.write_file("/workspace/data.bin", patch, seek_offset=4096)
 ### Suspend and delete
 
 ```python
-await env.suspend()   # checkpoint to a snapshot and free the worker
-await env.delete()    # remove permanently, in any state
+await env.suspend()                        # checkpoint to object storage and free the worker
+await env.suspend(mode=SuspendMode.LOCAL)  # checkpoint to the node and free the worker; the upload follows
+await env.delete()                         # remove permanently, in any state
 ```
 
 A suspended environment keeps its filesystem and can be woken again just
-by sending it guest traffic. Deletion is permanent.
+by sending it guest traffic. `SuspendMode.LOCAL` returns once the snapshot is
+on the worker's node and leaves the upload to object storage in the
+background: the environment resumes on that node until the upload lands, its
+status is `PAUSED` meanwhile, and a node lost before then takes the snapshot
+with it. One park-and-resume cycle is cheaper this way, which is what a loop
+that parks a sandbox between every command wants. The default,
+`SuspendMode.DURABLE`, returns once the snapshot is in object storage and puts
+no mode on the wire, so it works against an ate-env-api that predates the
+field; such a server refuses `LOCAL` with `InvalidArgumentError`, and
+`server_info().features` lists `suspend_mode` once a server serves it.
+Deletion is permanent.
 
 ### Handle errors
 
-All failures raise subclasses of `ate_env.EnvError`:
+All failures raise subclasses of `ate_env_rl.EnvError`:
 
 | Exception | gRPC code | Typical cause |
 | --- | --- | --- |
@@ -304,10 +321,11 @@ All failures raise subclasses of `ate_env.EnvError`:
 | `PermissionDeniedError` | `PERMISSION_DENIED` | file path escapes the workspace sandbox |
 | `FailedPreconditionError` | `FAILED_PRECONDITION` | stdin not opened or already closed |
 | `ProcessExitedError` | `FAILED_PRECONDITION` | signal or stdin write to a process that has exited (subclass of `FailedPreconditionError`) |
+| `SandboxStartError` | any, with the `ate-env-start-failure` trailer | the environment cannot start: it crashed while waking (`.reason == "crashed"`, `FAILED_PRECONDITION`) or no worker had room for it (`"no-capacity"`, `RESOURCE_EXHAUSTED`); retryable, on a fresh environment |
 | `RpcError` | anything else | transport failures, `ALREADY_EXISTS`, actor still waking, … (`.code` holds the status) |
 
 ```python
-from ate_env import NotFoundError
+from ate_env_rl import NotFoundError
 
 try:
     data = await env.read_file_bytes("/no/such/file")
@@ -405,6 +423,28 @@ FleetConfig(max_concurrent=64, max_warmpool_replicas=16, warm_per_task=True)
 once. A failed image does not stop the others: the first error is raised once
 every image was tried.
 
+### Keep environments on the worker pools that hold their image
+
+`FleetConfig.node_selector` is sent as the per-environment `worker_selector` on
+every create: labels the worker pool must carry, which Substrate ANDs with the
+template's own selector, so it narrows the template's pools and never widens
+them, and holds for the environment's wakes. `FleetConfig.placement` adds labels
+per task image, merged over `node_selector`: the placement plan that keeps an
+image's environments on the pools whose nodes already hold it.
+
+```python
+FleetConfig(
+    node_selector={"ate-env/workerpool": "c4"},
+    placement={"ghcr.io/org/django@sha256:…": {"ate-env/domain": "d0"}},
+)
+```
+
+Both are empty by default, which leaves the template's selection alone.
+`placement` applies to creates that carry a digest-pinned `rootfs_image`; a task
+routed through `image_templates` or `Task.template` sends no image, thus only
+`node_selector` applies to it. `client.get(id).node` reports the node an
+environment landed on.
+
 ### Follow a trainer's batch stream with `LookaheadWarmer`
 
 An RL trainer owns its step loop. It knows the next batch or two ahead, and
@@ -413,7 +453,7 @@ with off-policy staleness it may still be claiming for a batch it dispatched
 exactly the batches in flight:
 
 ```python
-from ate_env import LookaheadWarmer
+from ate_env_rl import LookaheadWarmer
 
 warmer = LookaheadWarmer(fleet, keep_finished=max_staleness)  # cap = max_warmpool_replicas
 warmer.add(0, {img: n * G for img, n in batch0}, wait=True)   # start-up barrier
@@ -446,7 +486,7 @@ driver cannot tell) to trim recycled surplus, and counts claims with
 
 [USER_GUIDE.md](USER_GUIDE.md) covers what is specific to RL: overlapping
 sandbox claims with policy decoding (`AsyncSandboxFleet.acquire_batch`), and
-grading candidates with `ate_env.adapters` (`SweBenchAdapter`). The VeRL
+grading candidates with `ate_env_rl.adapters` (`SweBenchAdapter`). The VeRL
 example in [`examples/verl_swebench`](../../examples/verl_swebench) uses both.
 
 ### Observability
@@ -516,11 +556,11 @@ records `ate_env_client_{acquire,exec,suspend,warm_claim,release}_seconds`
 happens on the first guest request, so it lands in the first `exec`).
 Collectors register on the first metrics-enabled `Observer`, never at
 import. Labels are limited to `phase`, `backend` (`substrate` or `mock`),
-`family` (the task's repo family, see `ate_env.observability.repo_family`),
+`family` (the task's repo family, see `ate_env_rl.observability.repo_family`),
 `strategy` and `status` (`ok`, `error`, or `cancelled` for a cancelled or
 interrupted block); environment ids, run ids, commands, paths and image
 tags never become labels. `family` has at most
-`ate_env.observability.MAX_FAMILIES` (64) values per process: the first 64
+`ate_env_rl.observability.MAX_FAMILIES` (64) values per process: the first 64
 repo families keep their name and later ones are reported as `other`, so a
 dataset with thousands of repos does not grow the series without limit.
 A repo whose family is `other` or `unknown` is labelled `other_repo` or
@@ -539,7 +579,7 @@ warning.
 Expose the series with:
 
 ```python
-from ate_env.observability import serve_metrics
+from ate_env_rl.observability import serve_metrics
 serve_metrics(9095, addr="127.0.0.1")  # /metrics on the default registry, local only
 ```
 
@@ -558,7 +598,7 @@ Either fleet switch turns on tracing for the whole fleet, under one
 service name:
 
 ```python
-from ate_env import Client, FleetConfig, ObservabilityConfig, TracerConfig
+from ate_env_rl import Client, FleetConfig, ObservabilityConfig, TracerConfig
 
 FleetConfig(observability=ObservabilityConfig(enable_tracing=True))   # service "ate-env-fleet"
 FleetConfig(tracing=TracerConfig(enable_tracing=True))                # service "ate-env-client"
@@ -602,7 +642,7 @@ ate_env_fleet.run
 - **Propagation.** Every gRPC call on a channel the client creates carries
   the W3C `traceparent` / `tracestate` (never baggage), so `ate-env-api`
   can continue the trace. A caller-owned `Client(channel=...)` gets spans
-  but not the header: add `ate_env.telemetry.TraceContextInterceptor`
+  but not the header: add `ate_env_rl.telemetry.TraceContextInterceptor`
   subclasses to your channel yourself.
 - **Nesting.** Client spans nest under the caller's current span, including
   across the fleet's worker threads and background event loop.
@@ -689,7 +729,7 @@ starts, so there are two cases:
 If neither applies (no provider and no OTLP endpoint), spans are created but
 not exported, and nothing is sent over the network.
 
-Without the extra, `import ate_env` never loads OpenTelemetry. Enabling
+Without the extra, `import ate_env_rl` never loads OpenTelemetry. Enabling
 tracing then logs one error naming the missing extra, and the client keeps
 working without spans.
 
@@ -726,7 +766,7 @@ python3 -m venv .venv
 
 ### Regenerating gRPC stubs
 
-Generated code under `src/ate_env/_gen/` is committed. After changing
+Generated code under `src/ate_env_rl/_gen/` is committed. After changing
 `proto/ateenv/v1alpha/*.proto`, regenerate from the repo root:
 
 ```bash

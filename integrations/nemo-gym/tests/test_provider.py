@@ -15,7 +15,7 @@
 """Contract tests for the substrate NeMo Gym provider.
 
 Runs against an in-process fake of ate-env-api (tests/fakes.py) reached
-through the real ``ate_env`` client over loopback gRPC, asserting the rules
+through the real ``ate_env_rl`` client over loopback gRPC, asserting the rules
 from the adding-a-provider contract: create returns only when the sandbox
 executes commands, exec never raises on nonzero exits, close is
 cleanup-safe, and provider_options are validated strictly.
@@ -31,7 +31,7 @@ from pathlib import Path
 
 import grpc
 import pytest
-from ate_env import Client, EnvironmentStatus, NotFoundError
+from ate_env_rl import Client, EnvironmentStatus, NotFoundError, SuspendMode
 
 from nemo_gym_substrate import provider as provider_mod
 from nemo_gym_substrate._compat import (
@@ -162,6 +162,38 @@ def test_exec_nonzero_exit_returns_result_not_raise():
             handle = await provider.create(SandboxSpec())
             result = await provider.exec(handle, "exit 7")
             assert (result.return_code, result.stderr, result.stdout) == (7, "boom", "")
+            # A process exit status carries no error_type, whatever its value:
+            # Gym agents end a rollout on error_type, not on the code.
+            assert result.error_type is None
+
+    run(t())
+
+
+def test_exec_on_a_gone_sandbox_reports_a_sandbox_failure():
+    # Gym's contract for a sandbox that cannot run the command: a result with
+    # the runtime return code and error_type "sandbox", not an exception.
+    async def t():
+        async with stack() as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            await provider.close(handle)
+            result = await provider.exec(handle, "echo hi")
+            assert (result.return_code, result.error_type) == (125, "sandbox")
+            assert result.stdout is None
+            assert "does not exist" in result.stderr and "not found" in result.stderr
+
+    run(t())
+
+
+def test_exec_transport_failure_reports_a_sandbox_failure():
+    async def t():
+        async with stack() as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            fake.refuse_starts["make"] = grpc.StatusCode.UNAVAILABLE
+            result = await provider.exec(handle, "make")
+            assert (result.return_code, result.error_type) == (125, "sandbox")
+            assert "UNAVAILABLE" in result.stderr
+            # The sandbox is still there: the next command runs.
+            assert (await provider.exec(handle, "echo hi")).return_code == 0
 
     run(t())
 
@@ -228,7 +260,7 @@ def test_exec_client_timeout_returns_sentinel_and_kills(monkeypatch):
             handle = await provider.create(SandboxSpec())
             fake.hang.add("sleepy")
             result = await provider.exec(handle, "sleepy", timeout_s=0.01)
-            assert result.return_code == -1
+            assert (result.return_code, result.error_type) == (125, "timeout")
             assert result.stdout is None
             assert "timed out" in (result.stderr or "")
             hung = [p for p in fake.procs.values() if p.argv[-1] == "sleepy"]
@@ -239,7 +271,7 @@ def test_exec_client_timeout_returns_sentinel_and_kills(monkeypatch):
 
 def test_exec_guest_deadline_reports_timeout(monkeypatch):
     # The guest kills the process group at the deadline and reports a plain
-    # SIGKILL; the result keeps that exit code and says why on stderr.
+    # SIGKILL; the result reports the timeout it was, with the output kept.
     monkeypatch.setattr(provider_mod, "_MIN_GUEST_TIMEOUT_S", 0.05)
 
     async def t():
@@ -247,7 +279,8 @@ def test_exec_guest_deadline_reports_timeout(monkeypatch):
             handle = await provider.create(SandboxSpec())
             fake.hang.add("sleepy")
             result = await provider.exec(handle, "sleepy", timeout_s=0.05)
-            assert result.return_code == 137
+            assert (result.return_code, result.error_type) == (125, "timeout")
+            assert result.stdout == ""  # what the command got out, not None
             assert "timed out" in result.stderr and "guest" in result.stderr
             assert fake.starts[-1]["timeout"] == pytest.approx(0.05)
 
@@ -296,8 +329,12 @@ def test_status_running_stopped_unknown():
     ("env_status", "expected"),
     [
         (EnvironmentStatus.RESUMING, SandboxStatus.STARTING),
-        (EnvironmentStatus.SUSPENDED, SandboxStatus.RUNNING),  # parked is transparent
-        (EnvironmentStatus.PAUSED, SandboxStatus.RUNNING),
+        # Parked is alive and one call away; Gym has a status for it since 0.7
+        # (an older nemo-gym installed here has none, and gets RUNNING).
+        (EnvironmentStatus.SUSPENDING, provider_mod._PAUSED),
+        (EnvironmentStatus.SUSPENDED, provider_mod._PAUSED),
+        (EnvironmentStatus.PAUSING, provider_mod._PAUSED),
+        (EnvironmentStatus.PAUSED, provider_mod._PAUSED),
         (EnvironmentStatus.CRASHED, SandboxStatus.ERROR),
         (EnvironmentStatus.DELETING, SandboxStatus.STOPPED),
         (EnvironmentStatus.UNSPECIFIED, SandboxStatus.UNKNOWN),
@@ -669,6 +706,348 @@ def test_an_empty_or_missing_token_file_is_a_config_error(tmp_path):
         SubstrateSandboxProvider({"connection": {"auth_token_file": str(tmp_path / "nope")}})
 
 
+# -- parking: an idle sandbox holds no worker ---------------------------------
+
+PAUSE = {"suspend_policy": "pause_after_exec", "idle_before_suspend_s": 0}
+# What each park puts on the wire: a local suspend names its mode; a durable
+# one sends none, so it works against an ate-env-api that predates the field.
+LOCAL = int(SuspendMode.LOCAL)
+DURABLE = int(SuspendMode.UNSPECIFIED)
+
+
+def _parks(fake: FakeAteEnv, env_id: str) -> list[int]:
+    return [mode for eid, mode in fake.suspends if eid == env_id]
+
+
+def _env_status(fake: FakeAteEnv, env_id: str) -> EnvironmentStatus:
+    return EnvironmentStatus(fake.envs[env_id]["status"])
+
+
+async def _eventually(predicate, *, timeout_s: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError("condition not met in time")
+        await asyncio.sleep(0.01)
+
+
+def test_never_policy_leaves_the_sandbox_running():
+    async def t():
+        async with stack({"idle_before_suspend_s": 0}) as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            await provider.exec(handle, "echo hi")
+            await asyncio.sleep(0.05)
+            assert fake.suspends == []
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.RUNNING
+
+    run(t())
+
+
+def test_pause_policy_parks_after_create_and_after_each_idle_call(tmp_path: Path):
+    async def t():
+        async with stack(PAUSE) as (provider, fake):
+            handle = await provider.create(SandboxSpec(files={"/task/a": "x"}))
+            # create() hands back a parked sandbox: it holds no worker through
+            # the policy's first think time. The park is a local suspend.
+            assert _parks(fake, handle.sandbox_id) == [LOCAL]
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+            assert await provider.status(handle) == provider_mod._PAUSED
+            # The next command wakes it (any guest call does), runs, and parks it again.
+            result = await provider.exec(handle, "echo hi")
+            assert (result.return_code, result.error_type) == (0, None)
+            assert len(_parks(fake, handle.sandbox_id)) == 2
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+            # Uploads and downloads park too.
+            src = tmp_path / "up.bin"
+            src.write_bytes(b"data")
+            await provider.upload_file(handle, src, "/task/up.bin")
+            await provider.download_file(handle, "/task/up.bin", tmp_path / "down.bin")
+            assert len(_parks(fake, handle.sandbox_id)) == 4
+
+    run(t())
+
+
+def test_suspend_policy_parks_durably():
+    async def t():
+        config = {"suspend_policy": "suspend_after_exec", "idle_before_suspend_s": 0}
+        async with stack(config) as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            assert _parks(fake, handle.sandbox_id) == [DURABLE]
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.SUSPENDED
+
+    run(t())
+
+
+def test_back_to_back_calls_pay_no_park_in_between():
+    async def t():
+        config = {"suspend_policy": "pause_after_exec", "idle_before_suspend_s": 0.2}
+        async with stack(config) as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            for _ in range(3):
+                assert (await provider.exec(handle, "echo hi")).return_code == 0
+            # Each call dropped the park the previous one scheduled.
+            assert fake.suspends == []
+            await _eventually(lambda: len(fake.suspends) == 1)
+            # One park per idle period, not one per call that found it idle.
+            await asyncio.sleep(0.3)
+            assert len(fake.suspends) == 1
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+
+    run(t())
+
+
+def test_a_call_waits_for_a_park_under_way():
+    async def t():
+        async with stack() as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            # Three state reads at 0.25 s each keep the sandbox SUSPENDING for
+            # a while; a guest call that lands in that window fails in the
+            # fake (as it does on the router), so a passing exec proves the
+            # provider waited for the park to settle.
+            fake.suspend_settle_polls = 3
+            pausing = asyncio.create_task(provider.pause(handle))
+            await asyncio.sleep(0.05)
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.SUSPENDING
+            result = await provider.exec(handle, "echo hi")
+            assert (result.return_code, result.error_type) == (0, None)
+            await pausing
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.RUNNING
+
+    run(t())
+
+
+def test_a_failed_park_logs_and_leaves_the_sandbox_running(caplog):
+    async def t():
+        async with stack(PAUSE) as (provider, fake):
+            fake.suspend_code = grpc.StatusCode.INTERNAL
+            with caplog.at_level(logging.WARNING, logger="nemo_gym_substrate.provider"):
+                handle = await provider.create(SandboxSpec())
+                result = await provider.exec(handle, "echo hi")
+            assert result.return_code == 0
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.RUNNING
+            assert sum("parking substrate env" in r.message and "INTERNAL" in r.message for r in caplog.records) == 2
+
+    run(t())
+
+
+def test_a_local_park_falls_back_to_durable_on_an_older_api(caplog):
+    async def t():
+        async with stack(PAUSE) as (provider, fake):
+            fake.reject_local = True
+            with caplog.at_level(logging.WARNING, logger="nemo_gym_substrate.provider"):
+                handle = await provider.create(SandboxSpec())
+                await provider.exec(handle, "echo hi")
+            # The first LOCAL was refused and retried durably; later parks go durable at once.
+            assert _parks(fake, handle.sandbox_id) == [LOCAL, DURABLE, DURABLE]
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.SUSPENDED
+            assert sum("does not serve suspend_mode" in r.message for r in caplog.records) == 1
+
+    run(t())
+
+
+def test_pause_and_resume():
+    async def t():
+        async with stack() as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            await provider.pause(handle)
+            assert _parks(fake, handle.sandbox_id) == [LOCAL]
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+            assert await provider.status(handle) == provider_mod._PAUSED
+            await provider.pause(handle)  # already parked: nothing sent
+            assert len(fake.suspends) == 1
+            probes = _probe_count(fake)
+            await provider.resume(handle)
+            assert _probe_count(fake) == probes + 1
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.RUNNING
+            # Under the `never` policy a resumed sandbox stays running.
+            await asyncio.sleep(0.05)
+            assert len(fake.suspends) == 1
+            await provider.close(handle)
+            with pytest.raises(RuntimeError, match="does not exist"):
+                await provider.pause(handle)
+            with pytest.raises(RuntimeError, match="does not exist"):
+                await provider.resume(handle)
+
+    run(t())
+
+
+def test_pause_parks_a_sandbox_that_proxy_traffic_woke():
+    """Requests through endpoint() reach the sandbox without a guest call
+    through the provider: the server wakes it while the provider still holds
+    it as parked. pause() must then park it again, not return early."""
+    async def t():
+        async with stack(PAUSE) as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            assert _parks(fake, handle.sandbox_id) == [LOCAL]
+            # What the router does for a request through the port proxy.
+            fake.envs[handle.sandbox_id]["status"] = int(EnvironmentStatus.RUNNING)
+            await provider.pause(handle)
+            assert _parks(fake, handle.sandbox_id) == [LOCAL, LOCAL]
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+            # Parked for real: a second pause() is a no-op.
+            await provider.pause(handle)
+            assert _parks(fake, handle.sandbox_id) == [LOCAL, LOCAL]
+
+    run(t())
+
+
+def test_pause_waits_for_a_command_in_flight(monkeypatch):
+    monkeypatch.setattr(provider_mod, "_EXEC_GRACE_S", 0.05)
+    monkeypatch.setattr(provider_mod, "_MIN_GUEST_TIMEOUT_S", 0.05)
+
+    async def t():
+        async with stack(connection={"request_timeout_s": 0.3}) as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            fake.hang.add("sleepy")
+            running = asyncio.create_task(provider.exec(handle, "sleepy", timeout_s=0.6))
+            await asyncio.sleep(0.05)
+            with pytest.raises(RuntimeError, match="in flight"):
+                await provider.pause(handle)
+            assert fake.suspends == []  # never under a running command
+            result = await running
+            assert result.error_type == "timeout"
+            await provider.pause(handle)
+            assert len(fake.suspends) == 1
+
+    run(t())
+
+
+def test_close_drops_a_pending_park_and_aclose_waits_for_one_under_way():
+    async def t():
+        async with stack({"suspend_policy": "pause_after_exec", "idle_before_suspend_s": 10}) as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            await provider.close(handle)
+            assert handle.sandbox_id not in fake.envs
+            assert fake.suspends == []
+        async with stack({"suspend_policy": "pause_after_exec", "idle_before_suspend_s": 0.05}) as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            await provider.exec(handle, "echo hi")
+            await provider.aclose()  # waits out the pending park instead of abandoning it
+            assert _parks(fake, handle.sandbox_id) == [LOCAL]
+
+    run(t())
+
+
+def test_ports_skip_automatic_idle_parking_while_explicit_pause_works(tmp_path: Path):
+    async def t():
+        async with stack(PAUSE) as (provider, fake):
+            handle = await provider.create(SandboxSpec(ports=(6000,)))
+            assert fake.suspends == []
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.RUNNING
+            assert (await provider.exec(handle, "echo hi")).return_code == 0
+            src = tmp_path / "up.bin"
+            src.write_bytes(b"ok")
+            await provider.upload_file(handle, src, "/task/up.bin")
+            await provider.download_file(handle, "/task/up.bin", tmp_path / "down.bin")
+            assert fake.suspends == []
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.RUNNING
+            # Explicit pause() and resume() still work between endpoint() turns.
+            await provider.pause(handle)
+            assert _parks(fake, handle.sandbox_id) == [LOCAL]
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+            await provider.resume(handle)
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.RUNNING
+
+    run(t())
+
+
+def test_failed_file_calls_still_schedule_idle_park(tmp_path: Path):
+    async def t():
+        async with stack(PAUSE) as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            assert len(_parks(fake, handle.sandbox_id)) == 1
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+            with pytest.raises(NotFoundError):
+                await provider.download_file(handle, "/no-such-remote", tmp_path / "out.bin")
+            assert len(_parks(fake, handle.sandbox_id)) == 2
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+            with pytest.raises(FileNotFoundError):
+                await provider.upload_file(handle, tmp_path / "no-such-local", "/task/dst")
+            assert len(_parks(fake, handle.sandbox_id)) == 3
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+
+    run(t())
+
+
+def test_pause_wraps_rpc_errors_and_timeouts_as_runtime_error(monkeypatch):
+    monkeypatch.setattr(provider_mod, "_PARK_SETTLE_S", 0.05)
+    monkeypatch.setattr(provider_mod, "_PARK_POLL_S", 0.01)
+
+    async def t():
+        async with stack(connection={"request_timeout_s": 0.05}) as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            fake.suspend_code = grpc.StatusCode.PERMISSION_DENIED
+            with pytest.raises(RuntimeError, match="PermissionDeniedError"):
+                await provider.pause(handle)
+            fake.suspend_code = None
+            fake.suspend_settle_polls = 10
+            fake.get_delay_s = 0.2
+            with pytest.raises(RuntimeError, match="no answer from"):
+                await provider.pause(handle)
+
+    run(t())
+
+
+def test_park_settle_loop_retries_transient_get_errors(monkeypatch):
+    monkeypatch.setattr(provider_mod, "_PARK_POLL_S", 0.02)
+
+    async def t():
+        async with stack() as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            fake.suspend_settle_polls = 2
+            fake.fail_gets = 2
+            await provider.pause(handle)
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+            assert fake.fail_gets == 0
+
+    run(t())
+
+
+def test_pause_under_never_remembers_local_refusal(caplog):
+    async def t():
+        async with stack() as (provider, fake):
+            fake.reject_local = True
+            h1 = await provider.create(SandboxSpec())
+            h2 = await provider.create(SandboxSpec())
+            with caplog.at_level(logging.WARNING, logger="nemo_gym_substrate.provider"):
+                await provider.pause(h1)
+                await provider.pause(h2)
+            assert _parks(fake, h1.sandbox_id) == [LOCAL, DURABLE]
+            assert _parks(fake, h2.sandbox_id) == [DURABLE]
+            assert provider._park_mode is None
+            assert sum("does not serve suspend_mode" in r.message for r in caplog.records) == 1
+
+    run(t())
+
+
+def test_aclose_waits_for_suspend_rpc_spawned_during_drain(monkeypatch):
+    monkeypatch.setattr(provider_mod, "_PARK_SETTLE_S", 0.02)
+    monkeypatch.setattr(provider_mod, "_PARK_POLL_S", 0.01)
+
+    async def t():
+        config = {"suspend_policy": "pause_after_exec", "idle_before_suspend_s": 0.03}
+        async with stack(config, connection={"request_timeout_s": 0.05}) as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            fake.suspend_delay_s = 0.2
+            assert (await provider.exec(handle, "echo hi")).return_code == 0
+            # _park_after wakes during aclose(), spawns the slow suspend RPC,
+            # and finishes after its 0.05 s wait while the RPC is still running.
+            await provider.aclose()
+            assert provider._park_tasks == set()
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+
+    run(t())
+
+
+def test_parking_config_is_validated():
+    with pytest.raises(ValueError, match="suspend_policy must be one of"):
+        SubstrateSandboxProvider({"create": {"suspend_policy": "sometimes"}})
+    with pytest.raises(ValueError, match="idle_before_suspend_s must be >= 0"):
+        SubstrateSandboxProvider({"create": {"idle_before_suspend_s": -1}})
+    cfg = provider_mod.CreateConfig.from_mapping({"suspend_policy": "suspend_after_exec"})
+    assert (cfg.suspend_policy, cfg.idle_before_suspend_s) == ("suspend_after_exec", 1.0)
+
+
 def test_provider_lifecycle_has_no_telemetry_side_effects():
     """A provider process never constructs an Observer: a create/exec/close
     cycle leaves prometheus_client unimported and the fleet collectors
@@ -680,7 +1059,7 @@ def test_provider_lifecycle_has_no_telemetry_side_effects():
     code = textwrap.dedent(
         """
         import asyncio, sys
-        from ate_env import observability
+        from ate_env_rl import observability
         from nemo_gym_substrate._compat import SandboxSpec
         from nemo_gym_substrate.provider import SubstrateSandboxProvider
         from tests.fakes import serve

@@ -65,7 +65,7 @@ let
   editableOverlay = workspace.mkEditablePyprojectOverlay { root = "$REPO_ROOT"; };
   # Each workspace project and its top-level package.
   members = {
-    ate-env-client = "ate_env";
+    ate-env-rl = "ate_env_rl";
     nemo-gym-substrate = "nemo_gym_substrate";
     ate-env-openhands = "ate_env_openhands";
     uni-agent-substrate = "uni_agent_substrate";
@@ -115,7 +115,7 @@ in
   # nemo-gym's `gym` (the real nemo-gym; its tests use local fallback types,
   # and it pulls in ray). This is the devShell's Python.
   pythonEnvFull = pythonSet.mkVirtualEnv "sandboxenv-rl-python" {
-    ate-env-client = allExtras "ate-env-client";
+    ate-env-rl = allExtras "ate-env-rl";
     nemo-gym-substrate = lib.remove "gym" (allExtras "nemo-gym-substrate");
   };
 
@@ -124,20 +124,20 @@ in
   # Flake package python-env-base; ci-python builds it on first use, so the
   # default devShell doesn't carry it.
   pythonEnvBase = pythonSet.mkVirtualEnv "sandboxenv-rl-python-base" {
-    ate-env-client = [ "dev" ];
+    ate-env-rl = [ "dev" ];
   };
 
   # integrations/openhands with its test extra (the agent-server the tests
   # start); the .#openhands devShell and `make ci-openhands`.
   openhandsEnv = pythonSet.mkVirtualEnv "sandboxenv-rl-python-openhands" {
-    ate-env-client = [ "dev" ];
+    ate-env-rl = [ "dev" ];
     ate-env-openhands = [ "test" ];
   };
 
   # integrations/harbor with its test extra (Harbor's own trial runner on this
   # provider); the .#harbor devShell and `make ci-harbor`.
   harborEnv = pythonSet.mkVirtualEnv "sandboxenv-rl-python-harbor" {
-    ate-env-client = [ "dev" ];
+    ate-env-rl = [ "dev" ];
     ate-env-harbor = [ "test" ];
   };
 
@@ -146,7 +146,7 @@ in
   # devShell, and ci-python's uni-agent suite (flake package
   # python-env-uni-agent, built on first use like python-env-base).
   uniAgentEnv = python312Set.mkVirtualEnv "sandboxenv-rl-python-uni-agent" {
-    ate-env-client = [ "dev" ];
+    ate-env-rl = [ "dev" ];
     uni-agent-substrate = [
       "test"
       "uni-agent"

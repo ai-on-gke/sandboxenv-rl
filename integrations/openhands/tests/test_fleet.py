@@ -23,7 +23,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from ate_env import FleetConfig, SandboxFleet, Task
+from ate_env_rl import FleetConfig, SandboxFleet, Task
 
 from ate_env_openhands import (
     AteEnvWorkspace,

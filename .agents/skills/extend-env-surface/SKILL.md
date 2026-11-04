@@ -75,18 +75,18 @@ Keep responsibilities strictly separated across layers:
 ### 5. Expose in Go and Python SDKs
 
 - **Go SDK** (`clients/go/env.go`): add helper methods on `*Env` or `*Process`.
-- **Python low-level SDK** (`clients/python/src/ate_env/env.py`): add async methods on `Env` or
+- **Python low-level SDK** (`clients/python/src/ate_env_rl/env.py`): add async methods on `Env` or
   `Process`.
-- **Python high-level fleet** (`clients/python/src/ate_env/handle.py`): add synchronous methods on
-  `SandboxHandle` (delegating through `self.runtime` or `self.backend`, which dispatch coroutines
+- **Python high-level fleet** (`clients/python/src/ate_env_rl/handle.py`): add synchronous methods
+  on `SandboxHandle` (delegating through `self.runtime` or `self.backend`, which dispatch coroutines
   via `LoopRunner.run(...)`) and asynchronous methods `..._async`.
 
 ### 6. Verify and test
 
 - Write Go unit tests using `internal/internaltest/fakecontrol` and
   `internal/internaltest/fakerouter`.
-- Write Python unit tests using `src/ate_env/backend/mock.py` (`MockBackendDriver`),
-  `src/ate_env/runtime/mock.py` (`MockRuntimeHook`), and `tests/fakes.py` (`Fake*Service` gRPC
+- Write Python unit tests using `src/ate_env_rl/backend/mock.py` (`MockBackendDriver`),
+  `src/ate_env_rl/runtime/mock.py` (`MockRuntimeHook`), and `tests/fakes.py` (`Fake*Service` gRPC
   fakes).
 - Run `make verify-boilerplate`, `make verify-gofmt`, `make vet`, `make test`, and
   `make python-test`.

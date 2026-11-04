@@ -70,18 +70,21 @@ Verify that all automated checks in [`.github/workflows/ci.yaml`](../../.github/
 | `go` (`ci-go`) | Build, vet, unit tests, gofmt, docs formatting, boilerplate, proto verification | Zero compile errors, `-race` passes, proto stubs clean |
 | `python` (`ci-python`) | Ruff lint and pytest suites across Python packages, examples, integrations (NeMo Gym, and uni-agent on Python 3.12), and benchmarks | API client, mock runtime, telemetry, Qwen3 verl example, NeMo Gym and uni-agent integrations, and trajectories |
 | `openhands` (`ci-openhands`) | Ruff lint and pytest suite for OpenHands integration via `.#openhands` devShell (Python 3.13) | OpenHands workspace adapters and agent-server tests |
-| `e2e-kind` (`ci-e2e`) | Kind cluster bootstrap, Substrate deployment, smoke, and full-stack SDK | Real control plane and guest lifecycle |
+| `e2e-kind` (`ci-e2e`) | Kind cluster bootstrap, Substrate deployment, smoke, full-stack SDK, warm pool, integrations, and loader | Real control plane, guest lifecycle, fleet warm pools, and integration providers |
 
 Automated E2E coverage breakdown:
-- [`hack/ci/test_smoke.py`](../../hack/ci/test_smoke.py): an environment-creation fixture plus 7 subtests covering shell execution with stdout and stdin stream piping, file write/read roundtrip, built-in MCP server (`tools/list` and `read_file`), suspend and on-demand resume, and deletion.
-- [`clients/python/tests/e2e/test_full_stack.py`](../../clients/python/tests/e2e/test_full_stack.py): exercises async `Client` lifecycle, process streaming, signal delivery (`SIGTERM`), and image validation error cases.
+- [`hack/ci/test_smoke.py`](../../hack/ci/test_smoke.py): an environment-creation fixture plus 9 subtests covering shell execution with stdout and stdin stream piping, file write/read roundtrip, built-in MCP server (`tools/list` and `read_file`), suspend and on-demand resume, caller authentication and port-proxy atespace allowlist, Prometheus `/metrics` exposition, and deletion.
+- [`clients/python/tests/e2e/test_full_stack.py`](../../clients/python/tests/e2e/test_full_stack.py): exercises async `Client` lifecycle, process streaming, signal delivery (`SIGTERM`), image validation error cases, template environment variable inheritance, port-proxy HTTP/WebSocket capability routing, transparent wake-on-request, and `SandboxFleet` with `LookaheadWarmer` warm-pool lifecycle.
+- [`integrations/nemo-gym/tests/test_e2e.py`](../../integrations/nemo-gym/tests/test_e2e.py): exercises NeMo Gym provider live end-to-end lifecycle.
+- [`cmd/benchmarking/swebench-loader`](../../cmd/benchmarking/swebench-loader): runs live smoke evaluation and report generation against an in-sandbox command task.
+- [`integrations/harbor/tests/test_e2e.py`](../../integrations/harbor/tests/test_e2e.py): runs Harbor provider oracle trial live test against ate-env-api.
 
 Areas not covered by standard CI that should be manually verified:
-- Fleet execution (`SandboxFleet` and `AsyncSandboxFleet`) against a live cluster: `test_async_fleet.py` and `test_fleet_*.py` run in `ci-python` against fakes only. To exercise a real cluster, keep the port-forward from `make smoke` open (or run `kubectl -n ate-env port-forward svc/ate-env-api 17777:7777`) and drive a short `SandboxFleet` run (acquire, run a task, release) with `ATE_ENV_API_TARGET=127.0.0.1:17777`.
-- Rootfs image injection: `test_create_from_image` in `test_full_stack.py` is exercised by default on Kind using a pinned python rootfs image (`docker.io/library/python:3.13-slim@sha256:...`). To test with a custom rootfs image or disable the test:
+- Multi-node and `AsyncSandboxFleet` scale runs: `SandboxFleet` warm-pool lifecycle runs in `e2e-kind`, but high-concurrency multi-node stress tests and `AsyncSandboxFleet` require manual cluster verification.
+- Rootfs image injection and loader smoke: `test_create_from_image` and `swebench-loader` are exercised by default on Kind using a pinned python rootfs image (`docker.io/library/python:3.13-slim@sha256:...`). Setting `ATE_ENV_ROOTFS_IMAGE=` skips both tests:
   ```bash
   ATE_ENV_ROOTFS_IMAGE="docker.io/library/python@sha256:..." make ci-e2e
-  ATE_ENV_ROOTFS_IMAGE= make ci-e2e  # disables the test
+  ATE_ENV_ROOTFS_IMAGE= make ci-e2e  # skips test_create_from_image and swebench-loader
   ```
 
 ## Troubleshooting

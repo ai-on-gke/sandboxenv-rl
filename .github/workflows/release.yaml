@@ -12,44 +12,68 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Publishes a release: the ate-env-api and ate-env-guest images and the
-# OpenHands runtime layer to GitHub Container Registry, pinned by digest and
-# signed, and the ate-env CLI with the two ate-env digests baked in as its
-# defaults, so a release binary deploys without naming any image of this repo.
-# Runs on a v* tag, or by hand from an existing tag (to republish; the run must
-# start from the tag ref). See docs/release.md.
+# Release workflow for Agent Substrate Environments (sandboxenv-rl).
 #
-# Actions are pinned by commit SHA (the version is in the trailing comment),
-# expressions reach shell only through env, and the Go module cache is off:
-# the organization's workflow security scan (zizmor) requires all three.
+# Deliverables:
+#  1. Container images: ate-env-api, ate-env-guest, and oh-agent-server-layer pushed to
+#     GitHub Container Registry (GHCR), pinned by digest and signed with Cosign keyless signatures.
+#  2. Go CLI: ate-env static binaries cross-compiled for Linux and macOS (amd64 / arm64), built
+#     into dist/ with baked-in image defaults, single SHA256SUMS_${TAG}.txt, and Cosign signatures,
+#     attached to the GitHub Release.
+#  3. Python client SDK: ate-env-rl (clients/python) published to PyPI via OIDC
+#     Trusted Publishing when the release is published and vars.PYPI_PUBLISH_ENABLED == 'true'
+#     (optional; cleanly skipped when PyPI credentials/Trusted Publishing are not yet configured).
+#  4. gRPC protos: Wire-compatible protocol buffers contracts tagged at vX.Y.Z.
+#
+# Triggers:
+#  - push tags (v*): Builds images, signs them, builds CLI, creates/updates draft GitHub Release.
+#  - release (published): Builds ate-env-rl and publishes to PyPI when vars.PYPI_PUBLISH_ENABLED == 'true'.
+#  - workflow_dispatch: Manual dispatch from a specific tag (republishes images/CLI by default, or
+#    backfills PyPI for an already-published release when publish_pypi=true and
+#    vars.PYPI_PUBLISH_ENABLED == 'true').
+#
+# Pull request validation of CLI cross-compilation and the Python client distribution
+# lives in ci.yaml.
+#
+# Security invariants (zizmor):
+#  - Actions pinned by commit SHA with trailing version comment.
+#  - Workflow expressions pass into shell only through env vars.
+#  - Release builds run with persist-credentials: false and clean caches.
 name: release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       tag:
         description: "Existing tag to publish images and assets for (e.g. v0.1.0)"
         required: true
         type: string
+      publish_pypi:
+        description: "Publish Python client to PyPI only (requires an already-published GitHub Release for the tag)"
+        required: false
+        default: false
+        type: boolean
 
-# One publish per tag at a time; a second run for the same tag waits.
 concurrency:
-  group: ${{ github.workflow }}-${{ inputs.tag || github.ref_name }}
+  group: ${{ github.workflow }}-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
   cancel-in-progress: false
 
 permissions: {}
 
 env:
-  # ghcr.io/<org>/<repo>/<image>; the images are linked to this repository.
   IMAGE_PREFIX: ghcr.io/${{ github.repository }}
   KO_DEFAULTPLATFORMS: linux/amd64,linux/arm64
 
 jobs:
   publish:
-    name: Publish images, CLI and release assets
-    runs-on: ubuntu-24.04 # pinned: ubuntu-latest moves to 26.04 from 2026-10-19; bump deliberately
+    name: Publish images, CLI and draft release assets
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.publish_pypi)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     permissions:
       contents: write # release assets and notes
       packages: write # ghcr.io
@@ -66,6 +90,10 @@ jobs:
         run: |
           set -euo pipefail
           tag="${INPUT_TAG:-$REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|a|beta|b|rc|c|dev)\.?[0-9]+)?$ ]]; then
+            echo "tag '$tag' is not a valid PEP 440-compatible semver tag (expected vX.Y.Z or vX.Y.Z-{alpha,beta,rc,dev}N)" >&2
+            exit 1
+          fi
           if [[ "${GITHUB_REF}" != "refs/tags/${tag}" ]]; then
             echo "run this workflow from the tag ${tag} (Use workflow from: ${tag}), not from ${GITHUB_REF}" >&2
             exit 1
@@ -78,12 +106,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
         with:
-          go-version-file: go.mod
-          cache: false # a release build must not consume a cache another run could seed
-
-      - uses: ko-build/setup-ko@61b4d1d396f5b2e7d6bb6fefdce3dc38d1a13445 # v0.10
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
@@ -115,8 +141,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # The tag carries the agent-server version the layer is locked to; the
-          # build checks that the installed agent-server, sdk and tools match it.
           version=$(sed -n 's/^openhands-agent-server==\([0-9][0-9.]*\)$/\1/p' integrations/openhands/layer/requirements.in)
           if [[ -z "${version}" ]]; then
             echo "no openhands-agent-server==<version> line in integrations/openhands/layer/requirements.in" >&2
@@ -141,18 +165,21 @@ jobs:
             exit 1
           fi
           layer="${IMAGE_PREFIX}/oh-agent-server-layer@${digest}"
-          echo "layer=${layer}" >> "$GITHUB_OUTPUT"
-          echo "layer_tag=${IMAGE_PREFIX}/oh-agent-server-layer:${version}-${TAG}" >> "$GITHUB_OUTPUT"
+          {
+            echo "layer=${layer}"
+            echo "layer_tag=${IMAGE_PREFIX}/oh-agent-server-layer:${version}-${TAG}"
+          } >> "$GITHUB_OUTPUT"
           echo "oh-agent-server-layer: ${layer}"
 
       - name: Build and push the images
         id: images
+        shell: nix develop -c bash -eo pipefail {0}
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          api=$(KO_DOCKER_REPO="${IMAGE_PREFIX}/ate-env-api" ko build --bare --tags "${TAG},latest" ./cmd/ate-env-api)
-          guest=$(KO_DOCKER_REPO="${IMAGE_PREFIX}/ate-env-guest" ko build --bare --tags "${TAG},latest" ./cmd/ate-env-guest)
+          api=$(./hack/release/ko-publish.sh "${TAG}" "${IMAGE_PREFIX}/ate-env-api" ./cmd/ate-env-api)
+          guest=$(./hack/release/ko-publish.sh "${TAG}" "${IMAGE_PREFIX}/ate-env-guest" ./cmd/ate-env-guest)
           echo "api=${api}" >> "$GITHUB_OUTPUT"
           echo "guest=${guest}" >> "$GITHUB_OUTPUT"
           echo "ate-env-api:   ${api}"
@@ -181,6 +208,7 @@ jobs:
           fi
 
       - name: Build the CLI with the image digests as defaults
+        shell: nix develop -c bash -eo pipefail {0}
         env:
           TAG: ${{ steps.tag.outputs.tag }}
           API_IMAGE: ${{ steps.images.outputs.api }}
@@ -201,21 +229,32 @@ jobs:
             echo "ate-env-guest=${GUEST_IMAGE}"
             echo "oh-agent-server-layer=${LAYER_IMAGE}"
           } > "dist/images_${TAG}.txt"
-          (cd dist && sha256sum ./* > "SHA256SUMS_${TAG}.txt")
+          (cd dist && sha256sum ate-env_* images_* > "SHA256SUMS_${TAG}.txt")
           ls -l dist
 
-      - name: Publish the release assets and record the digests in the notes
+      - name: Sign CLI binaries and checksums with Cosign
+        run: |
+          set -euo pipefail
+          for f in dist/ate-env_* dist/SHA256SUMS_* dist/images_*; do
+            if [[ -f "$f" && "$f" != *.sigstore.json ]]; then
+              cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
+            fi
+          done
+
+      - name: Attach assets to draft release and update image table
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
           API_IMAGE: ${{ steps.images.outputs.api }}
           GUEST_IMAGE: ${{ steps.images.outputs.guest }}
           LAYER_IMAGE: ${{ steps.layer.outputs.layer }}
+          LAYER_TAG: ${{ steps.layer.outputs.layer_tag }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # Check if release exists; if not, create draft release
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --title "$TAG" --generate-notes
+            gh release create "$TAG" --title "$TAG" --draft --generate-notes
           fi
           gh release upload "$TAG" dist/* --clobber
           # The API can hand the body back with CRLF line endings; strip them or the
@@ -223,11 +262,12 @@ jobs:
           existing=$(gh release view "$TAG" --json body --jq .body | tr -d '\r')
           # Replace a previous images block (republish) rather than append twice.
           existing=$(printf '%s\n' "$existing" | awk '/^## Images$/{skip=1} skip&&/^## /&&!/^## Images$/{skip=0} !skip')
+          sub_ver=$(awk '$1 == "go.ate.dev/substrate" {print $2; exit}' go.mod)
           {
             printf '%s\n\n' "$existing"
             echo "## Images"
             echo
-            echo "Pinned by digest and signed with cosign (keyless, GitHub Actions OIDC):"
+            echo "Pinned by digest and signed with Cosign (keyless, GitHub Actions OIDC):"
             echo
             echo "- \`${API_IMAGE}\`"
             echo "- \`${GUEST_IMAGE}\`"
@@ -235,6 +275,9 @@ jobs:
             echo
             echo "The \`ate-env\` binaries attached to this release default \`manifest --api-image\` and \`manifest template --guest-image\` to the first two digests."
             echo "The third is the OpenHands runtime layer, for \`ate-env manifest template --layer oh=${LAYER_IMAGE}=/opt/oh\` (see \`integrations/openhands/README.md\`)."
+            if [[ -n "${sub_ver}" ]]; then
+              echo "Built against \`go.ate.dev/substrate ${sub_ver}\`; deploy \`ate-system\` and \`--worker-image\` (\`ateworker-gvisor\`) from the matching Substrate revision."
+            fi
             echo
             echo '```bash'
             echo "cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
@@ -242,3 +285,70 @@ jobs:
             echo '```'
           } > notes.md
           gh release edit "$TAG" --notes-file notes.md
+
+  publish-pypi:
+    name: Publish Python client to PyPI
+    if: >-
+      vars.PYPI_PUBLISH_ENABLED == 'true' && (
+        (github.event_name == 'release' && github.event.action == 'published') ||
+        (github.event_name == 'workflow_dispatch' && inputs.publish_pypi)
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # PyPA Trusted Publishing
+    environment: pypi
+    steps:
+      - name: Resolve the tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$RELEASE_TAG}"
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|a|beta|b|rc|c|dev)\.?[0-9]+)?$ ]]; then
+            echo "tag '${tag}' is not a valid PEP 440-compatible semver tag (expected vX.Y.Z or vX.Y.Z-{alpha,beta,rc,dev}N)" >&2
+            exit 1
+          fi
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            if [[ "${GITHUB_REF}" != "refs/tags/${tag}" ]]; then
+              echo "run this workflow from the tag ${tag} (Use workflow from: ${tag}), not from ${GITHUB_REF}" >&2
+              exit 1
+            fi
+            is_draft=$(gh release view "${tag}" --repo "${REPO}" --json isDraft --jq .isDraft)
+            if [[ "${is_draft}" != "false" ]]; then
+              echo "release '${tag}' is still a draft (or missing); publish the GitHub Release before backfilling PyPI" >&2
+              exit 1
+            fi
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # 31.11.3
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build client distribution
+        shell: nix develop -c bash -eo pipefail {0}
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: ./hack/release/build-dists.sh pypi-dist "${RELEASE_TAG}"
+
+      - name: Publish client distribution to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: pypi-dist/
+          repository-url: ${{ vars.PYPI_REPOSITORY_URL || 'https://upload.pypi.org/legacy/' }}
+          verify-metadata: true
+          skip-existing: true

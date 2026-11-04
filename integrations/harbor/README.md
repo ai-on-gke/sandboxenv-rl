@@ -16,7 +16,7 @@ harbor run -p /path/to/task -a oracle -e ate_env_harbor:AteEnvEnvironment
 ```
 
 Harbor loads the class from the import path, so no change to Harbor is needed.
-Python 3.12 or newer (Harbor's floor); `ate-env-client` from this checkout.
+Python 3.12 or newer (Harbor's floor); `ate-env-rl` from this checkout.
 
 ## Settings
 
@@ -37,6 +37,8 @@ Each setting is a constructor kwarg and an `--ek key=value` flag (repeatable).
 | `workdir` | none | Working directory when neither the task nor the Dockerfile sets one |
 | `scratch_dir` | `/tmp` | Where tar archives are staged inside the environment |
 | `docker_bin`, `gcloud_bin` | `docker`, `gcloud` | The executables used for images |
+| `tool_paths` | none | Directories a runtime layer mounts into the environment, `:`-separated, put first on `PATH` for every command; `start` fails when one is missing. See [Tools as a second layer](#tools-as-a-second-layer) |
+| `tool_paths_profile` | `/etc/profile.d/zz-harbor-tools.sh` | The drop-in that gives login shells the tool paths; written at `start` when `tool_paths` is set, a warning when the image user cannot write it; empty disables it |
 
 `preflight()` checks `SUBSTRATE_ENV_API` (reachable, token accepted) before any
 trial is queued; an `api_url` kwarg is checked when the first trial starts.
@@ -114,6 +116,28 @@ applied) select the base:
    instead: it costs no worker, keeps its filesystem in the snapshot and wakes
    on the next call; the log names the `ate-env <id> shell '<command>'` form
    to inspect it.
+
+## Tools as a second layer
+
+Harbor's agents install their tools at the start of every trial (terminus-2:
+tmux and asciinema through the image's package manager). A runtime layer, a
+second digest-pinned image the template mounts read-only next to the guest
+(`ate-env manifest template --layer tools=<image@sha256:...>=/opt/harbor-tools`),
+can carry them instead. With `--ek tool_paths=/opt/harbor-tools/bin` the
+provider puts that directory first on `PATH` for every command it runs, the
+agent's, the verifier's and the user-switched ones alike, so the agents' own
+`command -v` checks find the tools and skip the install. Login shells do not
+inherit that prefix: `/etc/profile` on Debian, Ubuntu and Alpine images
+overwrites `PATH`, and terminus-2 runs its tmux session with `bash --login`,
+thus `start` also writes `/etc/profile.d/zz-harbor-tools.sh`
+(`tool_paths_profile`), a warning when the image user cannot. At `start` the
+provider checks that each path exists and fails with the `--layer` flag to add
+when the template lacks the layer. `trial_dir/ate_env.json` records the paths.
+An image without `sh` needs the directory on the template's own `PATH` as well
+(`ate-env manifest template --env PATH=...`): the guest resolves `sh` before
+any command runs.
+[`examples/harbor-tools-layer`](../../examples/harbor-tools-layer/README.md)
+builds a static tmux and asciinema layer and runs Terminal-Bench with it.
 
 ## Limits
 

@@ -1,6 +1,6 @@
 # sandboxenv-rl
 
-<!-- Last full audit: 2026-10-29 (commit 23c3647) -->
+<!-- Last full audit: 2026-11-03 (commit 39e8ad4) -->
 
 Sandboxed execution environments for reinforcement learning and evaluation on Agent Substrate. Each
 environment runs as an isolated Substrate actor inside gVisor, supporting on-demand rootfs image
@@ -58,8 +58,8 @@ high-throughput Python fleet scheduling. See [README.md](./README.md) for usage 
   idempotent across racing calls (not enforced).
 - `internal/mcp` and `internal/portproxy` own external protocol translation; `internal/mcp`
   translates tool calls to guest RPCs via `ate.Client.DialGuest` (bypassing `apiservice`), while
-  `internal/portproxy` tunnels ports; callers must not bypass these adapters; because external
-  clients need translation and origin filtering (not enforced).
+  `internal/portproxy` tunnels ports within allowed atespaces; callers must not bypass these
+  adapters; because external clients need translation and origin filtering (not enforced).
 - `internal/hostcheck` owns Host header validation for HTTP endpoints, and
   `internal/apiservice.BearerAuth` owns token authentication; HTTP handlers wrap with
   `hostcheck.(*Checker).Wrap` (and `BearerAuth` when `-auth-token-file` is configured) and must not
@@ -71,13 +71,12 @@ high-throughput Python fleet scheduling. See [README.md](./README.md) for usage 
   `wait4(-1, WNOHANG)` loop reaps orphaned grandchildren, and non-PTY process groups
   (`Setpgid: true`, PTY `Setsid: true`) must be signaled via negative PID (`-pid`) to prevent leaked
   child trees (enforced by `runIfPID1`, `supervise`, and `guest/process.Tracker`).
-- `clients/python/src/ate_env`'s `LoopRunner` owns sync-to-async bridging; synchronous callers
+- `clients/python/src/ate_env_rl`'s `LoopRunner` owns sync-to-async bridging; synchronous callers
   (`SubstrateBackendDriver`, `SubstrateEnvClientRuntime`, `SandboxFleet`, `SandboxHandle`) dispatch
   coroutines through `LoopRunner.run()` and must not call `asyncio.run()`; because `asyncio.run()`
   destroys the thread event loop and corrupts cached HTTP/2 gRPC channels (not enforced).
 
-Full architecture: [docs/architecture.md](./docs/architecture.md),
-[docs/glossary.md](./docs/glossary.md), and
+See [docs/architecture.md](./docs/architecture.md), [docs/glossary.md](./docs/glossary.md), and
 [docs/dev/concurrency-and-pitfalls.md](./docs/dev/concurrency-and-pitfalls.md).
 
 ## Repository layout
@@ -85,14 +84,16 @@ Full architecture: [docs/architecture.md](./docs/architecture.md),
 See [docs/dev/code-layout.md](./docs/dev/code-layout.md) for package responsibilities, decision
 rules, and directory layout. Agent skills in `.agents/skills/`:
 
+- [create-release](./.agents/skills/create-release/SKILL.md): Draft and cut releases, push tags,
+  create draft GitHub releases, and publish to PyPI and GHCR.
 - [extend-env-surface](./.agents/skills/extend-env-surface/SKILL.md): Add or extend an RPC, guest
   capability, MCP tool, or SDK method.
 - [maintain-docs](./.agents/skills/maintain-docs/SKILL.md): Author, update, and validate repository
   documentation against code.
 
-Python naming conventions: repository directory `clients/python`, distribution package
-`ate-env-client`, import module `ate_env`. The direct environment handle is `ate_env.Env`; the fleet
-handle is `ate_env.SandboxHandle`.
+Python naming conventions: repository directory `clients/python`, distribution package `ate-env-rl`,
+import module `ate_env_rl`. The direct environment handle is `ate_env_rl.Env`; the fleet handle is
+`ate_env_rl.SandboxHandle`.
 
 ## Build, test, verify
 
@@ -106,6 +107,7 @@ make vet
 make test
 make python-test
 make nemo-gym-test
+make harbor-test
 python -m pytest integrations/openhands/tests benchmarking/swebench benchmarking/telemetry_report internal/benchmarking/swebench/trajectories examples/Qwen3-1.7B-verl/tests
 ruff check clients/python examples/verl_swebench benchmarking/telemetry_report
 ruff check --config clients/python/pyproject.toml examples/Qwen3-1.7B-verl

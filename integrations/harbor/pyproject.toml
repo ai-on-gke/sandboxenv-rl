@@ -23,13 +23,13 @@ description = "Harbor environment provider on Agent Substrate environments (ate-
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.12"  # what harbor requires
-# ate-env-client is this repo's Python client (clients/python); it is not on
-# PyPI yet, so install it from the checkout first: pip install ./clients/python
+# ate-env-rl is this repo's Python client (clients/python); if not yet on
+# PyPI, install it from the checkout first: pip install ./clients/python
 # harbor releases often; it is pinned to one minor and bumped deliberately,
 # with tests/test_trial.py (Harbor's own trial runner on this provider) as
 # the gate.
 dependencies = [
-  "ate-env-client>=0.1.0",
+  "ate-env-rl",
   "harbor>=0.25,<0.26",
   "dockerfile-parse>=2.0.1",  # harbor's Dockerfile WORKDIR parser imports it lazily
 ]
@@ -41,7 +41,7 @@ test = ["pytest>=8", "pytest-asyncio>=1.0"]
 where = ["src"]
 
 [tool.uv.sources]
-ate-env-client = { workspace = true }
+ate-env-rl = { workspace = true }
 
 [tool.ruff]
 target-version = "py312"

@@ -7,14 +7,29 @@ user needs to know across them.
 ## Unreleased
 
 ### Added
-
+- Python client: `FleetConfig.node_selector` is sent as every environment's
+  `worker_selector`, and `FleetConfig.placement` adds labels per task image;
+  `SubstrateBackendDriver(worker_selector=, placement=)` and
+  `worker_selector_for(image)`.
+- `swebench-loader plan-placement`: an image placement plan
+  (`image-placement.json`) that assigns each task image to placement domains
+  (worker pools a per-environment worker selector addresses) under each
+  node's image-cache budget, largest image first, with replication and a hot
+  rule from the schedule's demand; `domains.json` describes the domains.
+- ate-env-api: `worker_selector` on `CreateEnvironment`, labels the worker pool
+  must carry, ANDed with the template's own selector (`Actor.worker_selector`,
+  so it holds for wakes too); `node` and `worker_selector` on `Environment`.
+  `ate-env create --worker-selector key=value`, `ate-env get <id>` (`get` joins
+  the reserved environment ids);
+  `worker_selector=` on the Python client's `create()` and `node`,
+  `worker_selector` on `EnvironmentInfo`.
 - Observability across the stack, all off by default except the run report;
   see [docs/observability.md](docs/observability.md).
 - Python client: OpenTelemetry tracing behind the `tracing` extra
   (`TracerConfig`, `FleetConfig.tracing`, `ObservabilityConfig.enable_tracing`).
   `ate_env_client.*` and `ate_env_fleet.*` spans, W3C `traceparent` on every gRPC
   call, context carried across `LoopRunner` threads and `process_parallel`.
-- Python client: `ate_env.observability`. `fleet.report` is a `RunReport`
+- Python client: `ate_env_rl.observability`. `fleet.report` is a `RunReport`
   (per-phase count, total and max, claims, task outcomes, warm replicas) with
   `summary()`, `to_dict()` and `write(report_dir)`; `ate_env_fleet_*` and
   `ate_env_client_*` Prometheus series behind the `metrics` extra, served by
@@ -37,3 +52,26 @@ user needs to know across them.
   per-event JSONL for one more release.
 - `benchmarking/telemetry_report`: builds a self-contained HTML report from run
   reports, OTLP/JSON spans and Prometheus or collector metrics.
+- Release publishing for `ate-env-rl`: `clients/python` derives its version
+  from the Git tag (`setuptools-scm`) and is published to PyPI via OIDC Trusted
+  Publishing when a GitHub Release is published; `hack/release/create-release.py`
+  drafts release notes and cuts draft releases (see [docs/release.md](docs/release.md)).
+
+### Changed
+
+- Python client: renamed distribution package from `ate-env-client` to
+  `ate-env-rl` and import module from `ate_env` to `ate_env_rl`.
+- Python client: `warm_pool` pools the actors it created before it raises
+  `SandboxStartError`. An overlapping `warm_pool(wait=True)` counts the actors
+  another call is still creating and can return before the pool is full.
+- Python client: `unwarm_pool`, and a `resize_pool` that shrinks the pool,
+  cancel `warm_pool` calls in flight for that pool: those calls delete the
+  actors they create instead of pooling them.
+
+### Fixed
+
+- Python client: environments no longer outlive `teardown()`. A recycle,
+  `warm_pool` call or failed warm claim that overlaps a teardown deletes its
+  environment instead of pooling it, and the warm-replica gauge stays equal to
+  the warm pool. An environment whose delete fails stays owned, so the next
+  `reap` deletes it.

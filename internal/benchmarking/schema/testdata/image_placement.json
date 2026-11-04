@@ -1,0 +1,16 @@
+{
+  "schema_version": "v1",
+  "unpack_factor": 2.5,
+  "replication": 1,
+  "domains": [
+    {"name": "d0", "selector": {"ate-env/domain": "d0"}, "nodes": 4, "node_cache_bytes": 400000000000, "assigned_bytes": 7500000000, "image_count": 1},
+    {"name": "d1", "selector": {"ate-env/domain": "d1"}, "nodes": 4, "node_cache_bytes": 400000000000, "assigned_bytes": 5000000000, "image_count": 1}
+  ],
+  "images": [
+    {"image": "registry.example/swebench/django@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "domains": ["d0"], "bytes_compressed": 3000000000, "bytes_unpacked": 7500000000, "demand": 16},
+    {"image": "registry.example/swebench/sympy@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210", "domains": ["d1"], "bytes_compressed": 2000000000, "bytes_unpacked": 5000000000, "size_assumed": true, "demand": 8}
+  ],
+  "unplaced": [
+    {"image": "registry.example/swebench/huge@sha256:1111111111111111111111111111111111111111111111111111111111111111", "reason": "no domain has 900000000000 bytes free on a node"}
+  ]
+}

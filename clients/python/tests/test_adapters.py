@@ -26,14 +26,14 @@ from typing import Any
 
 import pytest
 
-from ate_env.adapters import BenchmarkAdapter, EvalResult, SweBenchAdapter
-from ate_env.adapters.base import MAX_LOG_CHARS, truncate_logs
-from ate_env.adapters.swebench import EvalSetupError, diff_paths
-from ate_env.backend.mock import MockBackendDriver
-from ate_env.errors import InfrastructureError, SandboxUnavailableError
-from ate_env.handle import SandboxHandle
-from ate_env.runtime.mock import MockRuntimeHook
-from ate_env.types import ExecResult, Task
+from ate_env_rl.adapters import BenchmarkAdapter, EvalResult, SweBenchAdapter
+from ate_env_rl.adapters.base import MAX_LOG_CHARS, truncate_logs
+from ate_env_rl.adapters.swebench import EvalSetupError, diff_paths
+from ate_env_rl.backend.mock import MockBackendDriver
+from ate_env_rl.errors import InfrastructureError, SandboxUnavailableError
+from ate_env_rl.handle import SandboxHandle
+from ate_env_rl.runtime.mock import MockRuntimeHook
+from ate_env_rl.types import ExecResult, Task
 
 OK = ExecResult(exit_code=0, stdout="", stderr="", duration_s=0.01)
 FAIL = ExecResult(exit_code=1, stdout="", stderr="failed", duration_s=0.01)

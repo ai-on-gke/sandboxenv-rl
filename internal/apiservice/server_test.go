@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net"
 	"sync"
@@ -302,6 +303,56 @@ func TestSuspendEnvironment(t *testing.T) {
 	}
 	if getResp.GetEnvironment().GetStatus() != ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDED {
 		t.Errorf("got status %v, want SUSPENDED", getResp.GetEnvironment().GetStatus())
+	}
+	// No mode on the request is a durable suspend, what ate-env always did.
+	if got := control.SuspendModes; len(got) != 1 || got[0] != ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS {
+		t.Errorf("suspend modes = %v, want one SYNCHRONOUS", got)
+	}
+}
+
+func TestSuspendEnvironmentLocal(t *testing.T) {
+	client, control := newTestEnv(t)
+	ctx := context.Background()
+
+	if _, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "env-local"}); err != nil {
+		t.Fatalf("CreateEnvironment failed: %v", err)
+	}
+	envStatus := func() ateenvv1alpha.EnvironmentStatus {
+		t.Helper()
+		resp, err := client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "env-local"})
+		if err != nil {
+			t.Fatalf("GetEnvironment failed: %v", err)
+		}
+		return resp.GetEnvironment().GetStatus()
+	}
+
+	_, err := client.SuspendEnvironment(ctx, &ateenvv1alpha.SuspendEnvironmentRequest{
+		Id:   "env-local",
+		Mode: ateenvv1alpha.SuspendMode_SUSPEND_MODE_LOCAL,
+	})
+	if err != nil {
+		t.Fatalf("SuspendEnvironment(local) failed: %v", err)
+	}
+	if got := control.SuspendModes; len(got) != 1 || got[0] != ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS {
+		t.Fatalf("suspend modes = %v, want one ASYNCHRONOUS", got)
+	}
+	// PAUSED while the snapshot is on the node only, SUSPENDED once the
+	// background upload lands.
+	if got := envStatus(); got != ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_PAUSED {
+		t.Errorf("status after a local suspend = %v, want PAUSED", got)
+	}
+	control.CompleteUpload("env-local")
+	if got := envStatus(); got != ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDED {
+		t.Errorf("status after the upload landed = %v, want SUSPENDED", got)
+	}
+
+	// A mode the server does not know is refused, not treated as durable.
+	_, err = client.SuspendEnvironment(ctx, &ateenvv1alpha.SuspendEnvironmentRequest{
+		Id:   "env-local",
+		Mode: ateenvv1alpha.SuspendMode(7),
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("unknown mode: got %v, want InvalidArgument", err)
 	}
 }
 
@@ -696,6 +747,20 @@ func TestCreateFromImageDerivesTemplate(t *testing.T) {
 	if n := control.TemplateCount(); n != 2 {
 		t.Errorf("template count = %d, want 2 (base + one derived)", n)
 	}
+
+	// Another repository path with the same digest is the same image and
+	// reuses the template too.
+	samePath := "example.com/mirror/python@sha256:" + testRootfsImage[len(testRootfsImage)-64:]
+	resp, err = envClient.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "img3", RootfsImage: samePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.GetEnvironment().GetTemplate().GetName(); got != want {
+		t.Errorf("same-digest template = %q, want %q", got, want)
+	}
+	if n := control.TemplateCount(); n != 2 {
+		t.Errorf("template count after same-digest create = %d, want 2", n)
+	}
 }
 
 func TestCreateFromImageUsesNamedBaseAndAtespace(t *testing.T) {
@@ -994,4 +1059,79 @@ func TestCreateFromImageRejects(t *testing.T) {
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("conflicting derived template: code = %v (%v), want FailedPrecondition", status.Code(err), err)
 	}
+}
+
+func TestCreatePassesWorkerSelectorAndGetReportsNode(t *testing.T) {
+	client, control := newTestEnv(t)
+	ctx := context.Background()
+	selector := map[string]string{"ate-env/domain": "d0"}
+
+	resp, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "placed", WorkerSelector: selector})
+	if err != nil {
+		t.Fatalf("CreateEnvironment: %v", err)
+	}
+	if got := resp.GetEnvironment().GetWorkerSelector(); !maps.Equal(got, selector) {
+		t.Errorf("create response worker_selector = %v, want %v", got, selector)
+	}
+	if got := resp.GetEnvironment().GetNode(); got != "" {
+		t.Errorf("create response node = %q, want empty before placement", got)
+	}
+
+	// The selector reaches the actor; the node comes back from its status.
+	var actorSelector map[string]string
+	control.MutateActor("placed", func(a *ateapipb.Actor) {
+		actorSelector = a.GetWorkerSelector().GetMatchLabels()
+		a.Status.AssignedNode = "gke-pool-a-7"
+	})
+	if !maps.Equal(actorSelector, selector) {
+		t.Errorf("actor worker_selector = %v, want %v", actorSelector, selector)
+	}
+	got, err := client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "placed"})
+	if err != nil {
+		t.Fatalf("GetEnvironment: %v", err)
+	}
+	if n := got.GetEnvironment().GetNode(); n != "gke-pool-a-7" {
+		t.Errorf("node = %q, want gke-pool-a-7", n)
+	}
+	if sel := got.GetEnvironment().GetWorkerSelector(); !maps.Equal(sel, selector) {
+		t.Errorf("get worker_selector = %v, want %v", sel, selector)
+	}
+
+	// A running actor without assigned_node reports the worker assignment's node.
+	control.MutateActor("placed", func(a *ateapipb.Actor) {
+		a.Status.AssignedNode = ""
+		a.Status.WorkerAssignment = &ateapipb.WorkerAssignment{NodeName: "gke-pool-a-8"}
+	})
+	got, err = client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "placed"})
+	if err != nil {
+		t.Fatalf("GetEnvironment: %v", err)
+	}
+	if n := got.GetEnvironment().GetNode(); n != "gke-pool-a-8" {
+		t.Errorf("node = %q, want gke-pool-a-8 from the worker assignment", n)
+	}
+
+	// A detach clears assigned_node, and Substrate unsets the worker
+	// assignment whenever the actor has no worker: both clear, no node.
+	control.MutateActor("placed", func(a *ateapipb.Actor) {
+		a.Status.AssignedNode = ""
+		a.Status.WorkerAssignment = nil
+	})
+	got, err = client.GetEnvironment(ctx, &ateenvv1alpha.GetEnvironmentRequest{Id: "placed"})
+	if err != nil {
+		t.Fatalf("GetEnvironment: %v", err)
+	}
+	if n := got.GetEnvironment().GetNode(); n != "" {
+		t.Errorf("node = %q after a detach, want empty", n)
+	}
+
+	// No selector in the request: the actor carries none, so the template's
+	// selection stands.
+	if _, err := client.CreateEnvironment(ctx, &ateenvv1alpha.CreateEnvironmentRequest{Id: "plain"}); err != nil {
+		t.Fatalf("CreateEnvironment: %v", err)
+	}
+	control.MutateActor("plain", func(a *ateapipb.Actor) {
+		if a.GetWorkerSelector() != nil {
+			t.Errorf("plain actor has worker_selector %v, want none", a.GetWorkerSelector())
+		}
+	})
 }

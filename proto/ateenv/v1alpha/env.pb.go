@@ -53,9 +53,12 @@ const (
 	EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDING EnvironmentStatus = 3
 	// Environment is suspended and checkpointed.
 	EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDED EnvironmentStatus = 4
-	// Environment is in the process of pausing.
+	// Environment is in the process of pausing. Not produced: Substrate
+	// reports one SUSPENDING state whatever the suspend mode.
 	EnvironmentStatus_ENVIRONMENT_STATUS_PAUSING EnvironmentStatus = 5
-	// Environment is paused.
+	// Environment is paused: suspended with SUSPEND_MODE_LOCAL, its snapshot
+	// on its node and the upload to object storage not landed yet. It resumes
+	// on that node; once the upload lands it is SUSPENDED like any other.
 	EnvironmentStatus_ENVIRONMENT_STATUS_PAUSED EnvironmentStatus = 6
 	// Environment process crashed.
 	EnvironmentStatus_ENVIRONMENT_STATUS_CRASHED EnvironmentStatus = 7
@@ -114,6 +117,69 @@ func (x EnvironmentStatus) Number() protoreflect.EnumNumber {
 // Deprecated: Use EnvironmentStatus.Descriptor instead.
 func (EnvironmentStatus) EnumDescriptor() ([]byte, []int) {
 	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{0}
+}
+
+// How SuspendEnvironment treats the snapshot before it returns. The mode
+// applies when the call checkpoints a running environment. On an environment
+// that is already SUSPENDED, or PAUSED with its upload still pending,
+// Substrate's SuspendActor returns at once and the call changes nothing: a
+// DURABLE request on a PAUSED environment does not wait for the upload.
+type SuspendMode int32
+
+const (
+	// Unset: SUSPEND_MODE_DURABLE, what ate-env always did.
+	SuspendMode_SUSPEND_MODE_UNSPECIFIED SuspendMode = 0
+	// Return once the snapshot is in object storage. The environment survives
+	// the loss of its node and resumes on any node.
+	SuspendMode_SUSPEND_MODE_DURABLE SuspendMode = 1
+	// Return once the snapshot is on the worker's node; the upload to object
+	// storage goes on in the background. Until it lands the environment
+	// resumes on that node only, reports ENVIRONMENT_STATUS_PAUSED, and a node
+	// lost before then takes the snapshot with it. One park-and-resume cycle is
+	// cheaper this way, which is what a loop that parks an environment between
+	// every command wants.
+	SuspendMode_SUSPEND_MODE_LOCAL SuspendMode = 2
+)
+
+// Enum value maps for SuspendMode.
+var (
+	SuspendMode_name = map[int32]string{
+		0: "SUSPEND_MODE_UNSPECIFIED",
+		1: "SUSPEND_MODE_DURABLE",
+		2: "SUSPEND_MODE_LOCAL",
+	}
+	SuspendMode_value = map[string]int32{
+		"SUSPEND_MODE_UNSPECIFIED": 0,
+		"SUSPEND_MODE_DURABLE":     1,
+		"SUSPEND_MODE_LOCAL":       2,
+	}
+)
+
+func (x SuspendMode) Enum() *SuspendMode {
+	p := new(SuspendMode)
+	*p = x
+	return p
+}
+
+func (x SuspendMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SuspendMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_ateenv_v1alpha_env_proto_enumTypes[1].Descriptor()
+}
+
+func (SuspendMode) Type() protoreflect.EnumType {
+	return &file_proto_ateenv_v1alpha_env_proto_enumTypes[1]
+}
+
+func (x SuspendMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SuspendMode.Descriptor instead.
+func (SuspendMode) EnumDescriptor() ([]byte, []int) {
+	return file_proto_ateenv_v1alpha_env_proto_rawDescGZIP(), []int{1}
 }
 
 // Template represents an ActorTemplate used to instantiate environments.
@@ -181,9 +247,18 @@ type Environment struct {
 	// ActorTemplate configuration the environment is instantiated from.
 	Template *Template `protobuf:"bytes,3,opt,name=template,proto3" json:"template,omitempty"`
 	// Current lifecycle status of the environment.
-	Status        EnvironmentStatus `protobuf:"varint,4,opt,name=status,proto3,enum=ateenv.v1alpha.EnvironmentStatus" json:"status,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Status EnvironmentStatus `protobuf:"varint,4,opt,name=status,proto3,enum=ateenv.v1alpha.EnvironmentStatus" json:"status,omitempty"`
+	// Kubernetes node hosting the environment's actor, or its local snapshot
+	// while it is suspended. Substrate's Actor.status.assigned_node, which a
+	// detach or revert clears, else the worker assignment's node, which
+	// Substrate unsets whenever the actor has no worker; empty when both are
+	// clear: before the first placement, and after a detach.
+	Node string `protobuf:"bytes,5,opt,name=node,proto3" json:"node,omitempty"`
+	// The per-environment worker selector the environment was created with
+	// (CreateEnvironmentRequest.worker_selector); empty when none was given.
+	WorkerSelector map[string]string `protobuf:"bytes,6,rep,name=worker_selector,json=workerSelector,proto3" json:"worker_selector,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Environment) Reset() {
@@ -244,6 +319,20 @@ func (x *Environment) GetStatus() EnvironmentStatus {
 	return EnvironmentStatus_ENVIRONMENT_STATUS_UNSPECIFIED
 }
 
+func (x *Environment) GetNode() string {
+	if x != nil {
+		return x.Node
+	}
+	return ""
+}
+
+func (x *Environment) GetWorkerSelector() map[string]string {
+	if x != nil {
+		return x.WorkerSelector
+	}
+	return nil
+}
+
 // Request to create and start a new environment.
 type CreateEnvironmentRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -263,9 +352,15 @@ type CreateEnvironmentRequest struct {
 	// "<base>-<first 12 hex digits of the digest>" in the base's atespace; it
 	// is created on first use and reused afterwards, and the response reports
 	// it.
-	RootfsImage   string `protobuf:"bytes,4,opt,name=rootfs_image,json=rootfsImage,proto3" json:"rootfs_image,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	RootfsImage string `protobuf:"bytes,4,opt,name=rootfs_image,json=rootfsImage,proto3" json:"rootfs_image,omitempty"`
+	// Labels the worker pool that runs this environment must carry, matched by
+	// exact equality. Optional. Substrate ANDs it with the template's own
+	// worker selector, thus it narrows the template's pools and never widens
+	// them; an empty map keeps the template's selection. It is set on the
+	// actor as Actor.worker_selector, which also applies to its later wakes.
+	WorkerSelector map[string]string `protobuf:"bytes,5,rep,name=worker_selector,json=workerSelector,proto3" json:"worker_selector,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CreateEnvironmentRequest) Reset() {
@@ -324,6 +419,13 @@ func (x *CreateEnvironmentRequest) GetRootfsImage() string {
 		return x.RootfsImage
 	}
 	return ""
+}
+
+func (x *CreateEnvironmentRequest) GetWorkerSelector() map[string]string {
+	if x != nil {
+		return x.WorkerSelector
+	}
+	return nil
 }
 
 // Response returned after creating an environment.
@@ -479,7 +581,13 @@ type SuspendEnvironmentRequest struct {
 	// Unique identifier of the environment to suspend. Required.
 	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
 	// Substrate atespace of the environment (defaults to "ate-env").
-	Atespace      string `protobuf:"bytes,2,opt,name=atespace,proto3" json:"atespace,omitempty"`
+	Atespace string `protobuf:"bytes,2,opt,name=atespace,proto3" json:"atespace,omitempty"`
+	// How the suspend treats the snapshot; unset means SUSPEND_MODE_DURABLE.
+	// An ate-env-api that predates this field refuses a request that sets it
+	// (INVALID_ARGUMENT), because it rejects fields it does not know; a durable
+	// suspend leaves it unset and works against either. GetServerInfo lists
+	// "suspend_mode" once the server serves it.
+	Mode          SuspendMode `protobuf:"varint,3,opt,name=mode,proto3,enum=ateenv.v1alpha.SuspendMode" json:"mode,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -526,6 +634,13 @@ func (x *SuspendEnvironmentRequest) GetAtespace() string {
 		return x.Atespace
 	}
 	return ""
+}
+
+func (x *SuspendEnvironmentRequest) GetMode() SuspendMode {
+	if x != nil {
+		return x.Mode
+	}
+	return SuspendMode_SUSPEND_MODE_UNSPECIFIED
 }
 
 // Response returned after suspending an environment.
@@ -711,8 +826,8 @@ type GetServerInfoResponse struct {
 	// module, whose version the binary does not record.
 	SubstrateVersion string `protobuf:"bytes,3,opt,name=substrate_version,json=substrateVersion,proto3" json:"substrate_version,omitempty"`
 	// Optional features the server serves, e.g. "rootfs_image", "pty",
-	// "port_proxy". Clients must ignore names they do not know. A name keeps its
-	// meaning once published.
+	// "suspend_mode", "port_proxy". Clients must ignore names they do not know.
+	// A name keeps its meaning once published.
 	Features      []string `protobuf:"bytes,4,rep,name=features,proto3" json:"features,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -783,27 +898,37 @@ const file_proto_ateenv_v1alpha_env_proto_rawDesc = "" +
 	"\x1eproto/ateenv/v1alpha/env.proto\x12\x0eateenv.v1alpha\":\n" +
 	"\bTemplate\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1a\n" +
-	"\batespace\x18\x02 \x01(\tR\batespace\"\xaa\x01\n" +
+	"\batespace\x18\x02 \x01(\tR\batespace\"\xdb\x02\n" +
 	"\vEnvironment\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
 	"\batespace\x18\x02 \x01(\tR\batespace\x124\n" +
 	"\btemplate\x18\x03 \x01(\v2\x18.ateenv.v1alpha.TemplateR\btemplate\x129\n" +
-	"\x06status\x18\x04 \x01(\x0e2!.ateenv.v1alpha.EnvironmentStatusR\x06status\"\x9f\x01\n" +
+	"\x06status\x18\x04 \x01(\x0e2!.ateenv.v1alpha.EnvironmentStatusR\x06status\x12\x12\n" +
+	"\x04node\x18\x05 \x01(\tR\x04node\x12X\n" +
+	"\x0fworker_selector\x18\x06 \x03(\v2/.ateenv.v1alpha.Environment.WorkerSelectorEntryR\x0eworkerSelector\x1aA\n" +
+	"\x13WorkerSelectorEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xc9\x02\n" +
 	"\x18CreateEnvironmentRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
 	"\batespace\x18\x02 \x01(\tR\batespace\x124\n" +
 	"\btemplate\x18\x03 \x01(\v2\x18.ateenv.v1alpha.TemplateR\btemplate\x12!\n" +
-	"\frootfs_image\x18\x04 \x01(\tR\vrootfsImage\"Z\n" +
+	"\frootfs_image\x18\x04 \x01(\tR\vrootfsImage\x12e\n" +
+	"\x0fworker_selector\x18\x05 \x03(\v2<.ateenv.v1alpha.CreateEnvironmentRequest.WorkerSelectorEntryR\x0eworkerSelector\x1aA\n" +
+	"\x13WorkerSelectorEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"Z\n" +
 	"\x19CreateEnvironmentResponse\x12=\n" +
 	"\venvironment\x18\x01 \x01(\v2\x1b.ateenv.v1alpha.EnvironmentR\venvironment\"C\n" +
 	"\x15GetEnvironmentRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
 	"\batespace\x18\x02 \x01(\tR\batespace\"W\n" +
 	"\x16GetEnvironmentResponse\x12=\n" +
-	"\venvironment\x18\x01 \x01(\v2\x1b.ateenv.v1alpha.EnvironmentR\venvironment\"G\n" +
+	"\venvironment\x18\x01 \x01(\v2\x1b.ateenv.v1alpha.EnvironmentR\venvironment\"x\n" +
 	"\x19SuspendEnvironmentRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
-	"\batespace\x18\x02 \x01(\tR\batespace\"\x1c\n" +
+	"\batespace\x18\x02 \x01(\tR\batespace\x12/\n" +
+	"\x04mode\x18\x03 \x01(\x0e2\x1b.ateenv.v1alpha.SuspendModeR\x04mode\"\x1c\n" +
 	"\x1aSuspendEnvironmentResponse\"F\n" +
 	"\x18DeleteEnvironmentRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1a\n" +
@@ -824,7 +949,11 @@ const file_proto_ateenv_v1alpha_env_proto_rawDesc = "" +
 	"\x1aENVIRONMENT_STATUS_PAUSING\x10\x05\x12\x1d\n" +
 	"\x19ENVIRONMENT_STATUS_PAUSED\x10\x06\x12\x1e\n" +
 	"\x1aENVIRONMENT_STATUS_CRASHED\x10\a\x12\x1f\n" +
-	"\x1bENVIRONMENT_STATUS_DELETING\x10\b2\x94\x04\n" +
+	"\x1bENVIRONMENT_STATUS_DELETING\x10\b*]\n" +
+	"\vSuspendMode\x12\x1c\n" +
+	"\x18SUSPEND_MODE_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14SUSPEND_MODE_DURABLE\x10\x01\x12\x16\n" +
+	"\x12SUSPEND_MODE_LOCAL\x10\x022\x94\x04\n" +
 	"\x12EnvironmentService\x12h\n" +
 	"\x11CreateEnvironment\x12(.ateenv.v1alpha.CreateEnvironmentRequest\x1a).ateenv.v1alpha.CreateEnvironmentResponse\x12_\n" +
 	"\x0eGetEnvironment\x12%.ateenv.v1alpha.GetEnvironmentRequest\x1a&.ateenv.v1alpha.GetEnvironmentResponse\x12k\n" +
@@ -844,44 +973,50 @@ func file_proto_ateenv_v1alpha_env_proto_rawDescGZIP() []byte {
 	return file_proto_ateenv_v1alpha_env_proto_rawDescData
 }
 
-var file_proto_ateenv_v1alpha_env_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_ateenv_v1alpha_env_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_proto_ateenv_v1alpha_env_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_proto_ateenv_v1alpha_env_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_proto_ateenv_v1alpha_env_proto_goTypes = []any{
 	(EnvironmentStatus)(0),             // 0: ateenv.v1alpha.EnvironmentStatus
-	(*Template)(nil),                   // 1: ateenv.v1alpha.Template
-	(*Environment)(nil),                // 2: ateenv.v1alpha.Environment
-	(*CreateEnvironmentRequest)(nil),   // 3: ateenv.v1alpha.CreateEnvironmentRequest
-	(*CreateEnvironmentResponse)(nil),  // 4: ateenv.v1alpha.CreateEnvironmentResponse
-	(*GetEnvironmentRequest)(nil),      // 5: ateenv.v1alpha.GetEnvironmentRequest
-	(*GetEnvironmentResponse)(nil),     // 6: ateenv.v1alpha.GetEnvironmentResponse
-	(*SuspendEnvironmentRequest)(nil),  // 7: ateenv.v1alpha.SuspendEnvironmentRequest
-	(*SuspendEnvironmentResponse)(nil), // 8: ateenv.v1alpha.SuspendEnvironmentResponse
-	(*DeleteEnvironmentRequest)(nil),   // 9: ateenv.v1alpha.DeleteEnvironmentRequest
-	(*DeleteEnvironmentResponse)(nil),  // 10: ateenv.v1alpha.DeleteEnvironmentResponse
-	(*GetServerInfoRequest)(nil),       // 11: ateenv.v1alpha.GetServerInfoRequest
-	(*GetServerInfoResponse)(nil),      // 12: ateenv.v1alpha.GetServerInfoResponse
+	(SuspendMode)(0),                   // 1: ateenv.v1alpha.SuspendMode
+	(*Template)(nil),                   // 2: ateenv.v1alpha.Template
+	(*Environment)(nil),                // 3: ateenv.v1alpha.Environment
+	(*CreateEnvironmentRequest)(nil),   // 4: ateenv.v1alpha.CreateEnvironmentRequest
+	(*CreateEnvironmentResponse)(nil),  // 5: ateenv.v1alpha.CreateEnvironmentResponse
+	(*GetEnvironmentRequest)(nil),      // 6: ateenv.v1alpha.GetEnvironmentRequest
+	(*GetEnvironmentResponse)(nil),     // 7: ateenv.v1alpha.GetEnvironmentResponse
+	(*SuspendEnvironmentRequest)(nil),  // 8: ateenv.v1alpha.SuspendEnvironmentRequest
+	(*SuspendEnvironmentResponse)(nil), // 9: ateenv.v1alpha.SuspendEnvironmentResponse
+	(*DeleteEnvironmentRequest)(nil),   // 10: ateenv.v1alpha.DeleteEnvironmentRequest
+	(*DeleteEnvironmentResponse)(nil),  // 11: ateenv.v1alpha.DeleteEnvironmentResponse
+	(*GetServerInfoRequest)(nil),       // 12: ateenv.v1alpha.GetServerInfoRequest
+	(*GetServerInfoResponse)(nil),      // 13: ateenv.v1alpha.GetServerInfoResponse
+	nil,                                // 14: ateenv.v1alpha.Environment.WorkerSelectorEntry
+	nil,                                // 15: ateenv.v1alpha.CreateEnvironmentRequest.WorkerSelectorEntry
 }
 var file_proto_ateenv_v1alpha_env_proto_depIdxs = []int32{
-	1,  // 0: ateenv.v1alpha.Environment.template:type_name -> ateenv.v1alpha.Template
+	2,  // 0: ateenv.v1alpha.Environment.template:type_name -> ateenv.v1alpha.Template
 	0,  // 1: ateenv.v1alpha.Environment.status:type_name -> ateenv.v1alpha.EnvironmentStatus
-	1,  // 2: ateenv.v1alpha.CreateEnvironmentRequest.template:type_name -> ateenv.v1alpha.Template
-	2,  // 3: ateenv.v1alpha.CreateEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
-	2,  // 4: ateenv.v1alpha.GetEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
-	3,  // 5: ateenv.v1alpha.EnvironmentService.CreateEnvironment:input_type -> ateenv.v1alpha.CreateEnvironmentRequest
-	5,  // 6: ateenv.v1alpha.EnvironmentService.GetEnvironment:input_type -> ateenv.v1alpha.GetEnvironmentRequest
-	7,  // 7: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:input_type -> ateenv.v1alpha.SuspendEnvironmentRequest
-	9,  // 8: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:input_type -> ateenv.v1alpha.DeleteEnvironmentRequest
-	11, // 9: ateenv.v1alpha.EnvironmentService.GetServerInfo:input_type -> ateenv.v1alpha.GetServerInfoRequest
-	4,  // 10: ateenv.v1alpha.EnvironmentService.CreateEnvironment:output_type -> ateenv.v1alpha.CreateEnvironmentResponse
-	6,  // 11: ateenv.v1alpha.EnvironmentService.GetEnvironment:output_type -> ateenv.v1alpha.GetEnvironmentResponse
-	8,  // 12: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:output_type -> ateenv.v1alpha.SuspendEnvironmentResponse
-	10, // 13: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:output_type -> ateenv.v1alpha.DeleteEnvironmentResponse
-	12, // 14: ateenv.v1alpha.EnvironmentService.GetServerInfo:output_type -> ateenv.v1alpha.GetServerInfoResponse
-	10, // [10:15] is the sub-list for method output_type
-	5,  // [5:10] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	14, // 2: ateenv.v1alpha.Environment.worker_selector:type_name -> ateenv.v1alpha.Environment.WorkerSelectorEntry
+	2,  // 3: ateenv.v1alpha.CreateEnvironmentRequest.template:type_name -> ateenv.v1alpha.Template
+	15, // 4: ateenv.v1alpha.CreateEnvironmentRequest.worker_selector:type_name -> ateenv.v1alpha.CreateEnvironmentRequest.WorkerSelectorEntry
+	3,  // 5: ateenv.v1alpha.CreateEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
+	3,  // 6: ateenv.v1alpha.GetEnvironmentResponse.environment:type_name -> ateenv.v1alpha.Environment
+	1,  // 7: ateenv.v1alpha.SuspendEnvironmentRequest.mode:type_name -> ateenv.v1alpha.SuspendMode
+	4,  // 8: ateenv.v1alpha.EnvironmentService.CreateEnvironment:input_type -> ateenv.v1alpha.CreateEnvironmentRequest
+	6,  // 9: ateenv.v1alpha.EnvironmentService.GetEnvironment:input_type -> ateenv.v1alpha.GetEnvironmentRequest
+	8,  // 10: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:input_type -> ateenv.v1alpha.SuspendEnvironmentRequest
+	10, // 11: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:input_type -> ateenv.v1alpha.DeleteEnvironmentRequest
+	12, // 12: ateenv.v1alpha.EnvironmentService.GetServerInfo:input_type -> ateenv.v1alpha.GetServerInfoRequest
+	5,  // 13: ateenv.v1alpha.EnvironmentService.CreateEnvironment:output_type -> ateenv.v1alpha.CreateEnvironmentResponse
+	7,  // 14: ateenv.v1alpha.EnvironmentService.GetEnvironment:output_type -> ateenv.v1alpha.GetEnvironmentResponse
+	9,  // 15: ateenv.v1alpha.EnvironmentService.SuspendEnvironment:output_type -> ateenv.v1alpha.SuspendEnvironmentResponse
+	11, // 16: ateenv.v1alpha.EnvironmentService.DeleteEnvironment:output_type -> ateenv.v1alpha.DeleteEnvironmentResponse
+	13, // 17: ateenv.v1alpha.EnvironmentService.GetServerInfo:output_type -> ateenv.v1alpha.GetServerInfoResponse
+	13, // [13:18] is the sub-list for method output_type
+	8,  // [8:13] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_proto_ateenv_v1alpha_env_proto_init() }
@@ -894,8 +1029,8 @@ func file_proto_ateenv_v1alpha_env_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_ateenv_v1alpha_env_proto_rawDesc), len(file_proto_ateenv_v1alpha_env_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   12,
+			NumEnums:      2,
+			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

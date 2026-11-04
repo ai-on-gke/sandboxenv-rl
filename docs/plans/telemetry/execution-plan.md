@@ -73,14 +73,14 @@ Tests section of each pull request and CI. [decisions.md](./decisions.md) record
 ## Deliverables (target repository paths, as merged)
 
 ```
-clients/python/src/ate_env/telemetry/__init__.py     public names re-exported
-clients/python/src/ate_env/telemetry/tracing.py      start_span, TracerManager, interceptors, rpc_attrs
-clients/python/src/ate_env/telemetry/metrics.py      ate_env_client_* histograms (lazy)
-clients/python/src/ate_env/telemetry/trace_recorder.py   JSONL trace events on the client spans (#173, benchmark series)
-clients/python/src/ate_env/observability.py          RunReport, Observer, repo_family, serve_metrics
-clients/python/src/ate_env/config.py                 TracerConfig, ObservabilityConfig, FleetConfig.tracing / .observability
-clients/python/src/ate_env/{client,fleet,async_fleet,strategies,loop_runner,handle}.py   hooks
-clients/python/src/ate_env/backend/{substrate,mock}.py, runtime/substrate_env_client.py           hooks
+clients/python/src/ate_env_rl/telemetry/__init__.py     public names re-exported
+clients/python/src/ate_env_rl/telemetry/tracing.py      start_span, TracerManager, interceptors, rpc_attrs
+clients/python/src/ate_env_rl/telemetry/metrics.py      ate_env_client_* histograms (lazy)
+clients/python/src/ate_env_rl/telemetry/trace_recorder.py   JSONL trace events on the client spans (#173, benchmark series)
+clients/python/src/ate_env_rl/observability.py          RunReport, Observer, repo_family, serve_metrics
+clients/python/src/ate_env_rl/config.py                 TracerConfig, ObservabilityConfig, FleetConfig.tracing / .observability
+clients/python/src/ate_env_rl/{client,fleet,async_fleet,strategies,loop_runner,handle}.py   hooks
+clients/python/src/ate_env_rl/backend/{substrate,mock}.py, runtime/substrate_env_client.py           hooks
 clients/python/tests/test_telemetry_tracing.py, test_observability.py, test_telemetry_metrics.py
 clients/python/pyproject.toml                        extras tracing, metrics
 clients/python/README.md                             Observability section
@@ -134,15 +134,15 @@ The lead is the arbiter between developer and reviewer. A disputed finding is se
 
 ## PR sequence, as merged
 
-| #   | Branch                                    | Pull request     | Scope                                                                                                                                                                                              | Depends on |
-| --- | ----------------------------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| 1   | `telemetry-pr1`                           | #93              | `ate_env.telemetry.tracing`, `TracerConfig`, the `tracing` extra, spans on `Client`, runtime, handle, driver; `TraceContextInterceptor`; context across `LoopRunner`; tests                        | none       |
-| 2   | `telemetry-pr2`, `telemetry-pr2-ac-fixes` | #109, #113, #115 | `ate_env.observability`, `ObservabilityConfig`, the `metrics` extra, `ate_env.telemetry.metrics`, hooks in fleet, async fleet, `process_parallel`, drivers; `serve_metrics`; README section; tests | 1          |
-| 3   | `telemetry-pr3`                           | #114             | `internal/telemetry`, `-enable-tracing`, `-metrics-listen-addr`, otelgrpc server and client handlers, `ate_env_api_*`, `x-ate-env-requested-at`, manifest flags; tests                             | none       |
-| 4   | `telemetry-pr4`                           | #150             | `ClientOptions.TracerProvider` and `TraceServiceName`, `Attr*`, client handler, `Client.Get`; guest `-enable-tracing` and `-enable-metrics`; tests                                                 | 3          |
-| f   | `python-rpc-semconv`                      | #164             | otelgrpc's `rpc.system.name` and full `rpc.method` on Python `Client` spans; `OTEL_SEMCONV_STABILITY_OPT_IN`                                                                                       | 1, 4       |
-| 5   | `telemetry-pr5`                           | #168             | swebench event spans, GRPO and NeMo Gym on the `Observer`, `REPORT_DIR`, HTML report tool, `docs/observability.md`, `hack/metrics-docs` CI step, CHANGELOG, Python extras run in CI                | 2, 3, 4    |
-| 6   | `telemetry-pr6`                           | #186, `9c30be1`  | VeRL SWE-bench example: one run report per RayJob, one trace per iteration, `run-telemetry-e2e.sh` against the acceptance collector                                                                | 5          |
+| #   | Branch                                    | Pull request     | Scope                                                                                                                                                                                                    | Depends on |
+| --- | ----------------------------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| 1   | `telemetry-pr1`                           | #93              | `ate_env_rl.telemetry.tracing`, `TracerConfig`, the `tracing` extra, spans on `Client`, runtime, handle, driver; `TraceContextInterceptor`; context across `LoopRunner`; tests                           | none       |
+| 2   | `telemetry-pr2`, `telemetry-pr2-ac-fixes` | #109, #113, #115 | `ate_env_rl.observability`, `ObservabilityConfig`, the `metrics` extra, `ate_env_rl.telemetry.metrics`, hooks in fleet, async fleet, `process_parallel`, drivers; `serve_metrics`; README section; tests | 1          |
+| 3   | `telemetry-pr3`                           | #114             | `internal/telemetry`, `-enable-tracing`, `-metrics-listen-addr`, otelgrpc server and client handlers, `ate_env_api_*`, `x-ate-env-requested-at`, manifest flags; tests                                   | none       |
+| 4   | `telemetry-pr4`                           | #150             | `ClientOptions.TracerProvider` and `TraceServiceName`, `Attr*`, client handler, `Client.Get`; guest `-enable-tracing` and `-enable-metrics`; tests                                                       | 3          |
+| f   | `python-rpc-semconv`                      | #164             | otelgrpc's `rpc.system.name` and full `rpc.method` on Python `Client` spans; `OTEL_SEMCONV_STABILITY_OPT_IN`                                                                                             | 1, 4       |
+| 5   | `telemetry-pr5`                           | #168             | swebench event spans, GRPO and NeMo Gym on the `Observer`, `REPORT_DIR`, HTML report tool, `docs/observability.md`, `hack/metrics-docs` CI step, CHANGELOG, Python extras run in CI                      | 2, 3, 4    |
+| 6   | `telemetry-pr6`                           | #186, `9c30be1`  | VeRL SWE-bench example: one run report per RayJob, one trace per iteration, `run-telemetry-e2e.sh` against the acceptance collector                                                                      | 5          |
 
 ## Risks and outcomes
 

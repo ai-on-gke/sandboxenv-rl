@@ -17,12 +17,12 @@ import time
 
 import pytest
 
-from ate_env.async_fleet import AsyncSandboxFleet
-from ate_env.backend.mock import MockBackendDriver
-from ate_env.config import FleetConfig, ValidationError
-from ate_env.fleet import SandboxFleet
-from ate_env.sizing import compute_replicas, plan_replicas
-from ate_env.types import Task
+from ate_env_rl.async_fleet import AsyncSandboxFleet
+from ate_env_rl.backend.mock import MockBackendDriver
+from ate_env_rl.config import FleetConfig, ValidationError
+from ate_env_rl.fleet import SandboxFleet
+from ate_env_rl.sizing import compute_replicas, plan_replicas
+from ate_env_rl.types import Task
 
 
 @pytest.mark.parametrize("args, kwargs, want", [

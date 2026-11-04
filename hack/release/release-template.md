@@ -61,7 +61,7 @@ cosign verify \
 <!-- Include the PyPI snippet below ONLY when PyPI publishing is enabled (`vars.PYPI_PUBLISH_ENABLED=true`) and not skipped for this release: -->
 Install the async Python client SDK from PyPI (`$VERSION` is the PEP 440 version, e.g. `0.1.0` for `v0.1.0` or `0.1.0rc1` for `v0.1.0-rc1`):
 ```bash
-pip install "ate-env-client==$VERSION"
+pip install "ate-env-rl==$VERSION"
 ```
 <!-- When PyPI publishing is skipped or not yet configured (`vars.PYPI_PUBLISH_ENABLED` unset/false), replace the PyPI block above with this Git-tag install snippet instead:
 Install the async Python client SDK from the release tag (PyPI package publishing is not enabled for this release):

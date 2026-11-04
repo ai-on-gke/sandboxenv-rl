@@ -85,7 +85,7 @@ if [[ -z "${PYTHON:-}" ]]; then
   fi
 fi
 
-DIFF_TARGETS=("proto/" "clients/python/src/ate_env/_gen/")
+DIFF_TARGETS=("proto/" "clients/python/src/ate_env_rl/_gen/")
 if [[ $# -gt 0 ]]; then
   DIFF_TARGETS=("$@")
 fi
@@ -123,7 +123,7 @@ DIFF_OPTS=(
 
 FIX_HINT="To fix: run \`make protos\` (regenerates the Go and Python stubs with the
 pinned toolchains), then commit the changes under proto/ and
-clients/python/src/ate_env/_gen/."
+clients/python/src/ate_env_rl/_gen/."
 
 diff_failed=0
 for target in "${DIFF_TARGETS[@]}"; do

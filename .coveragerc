@@ -19,7 +19,7 @@ disable_warnings =
     module-not-imported
     no-data-collected
 source_pkgs =
-    ate_env
+    ate_env_rl
     nemo_gym_substrate
     uni_agent_substrate
 source =
@@ -37,9 +37,9 @@ skip_empty = True
 show_missing = True
 
 [paths]
-ate_env =
-    clients/python/src/ate_env
-    src/ate_env
+ate_env_rl =
+    clients/python/src/ate_env_rl
+    src/ate_env_rl
 nemo_gym_substrate =
     integrations/nemo-gym/src/nemo_gym_substrate
     src/nemo_gym_substrate

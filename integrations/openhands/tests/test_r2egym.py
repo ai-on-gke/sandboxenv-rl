@@ -28,7 +28,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from ate_env import CommandExecutionError, CommandTimeoutError
+from ate_env_rl import CommandExecutionError, CommandTimeoutError
 
 import ate_env_openhands.r2egym as adapter
 

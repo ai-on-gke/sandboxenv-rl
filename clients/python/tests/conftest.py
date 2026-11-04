@@ -19,8 +19,8 @@ from dataclasses import dataclass
 import grpc.aio
 import pytest
 
-from ate_env import Client
-from ate_env._gen.ateenv.v1alpha import env_pb2_grpc, guest_pb2_grpc
+from ate_env_rl import Client
+from ate_env_rl._gen.ateenv.v1alpha import env_pb2_grpc, guest_pb2_grpc
 
 from .fakes import FakeEnvironmentService, FakeFileSystemService, FakeProcessService
 

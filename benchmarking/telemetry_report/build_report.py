@@ -20,7 +20,7 @@ Inputs are the three telemetry layers, any subset of them:
                   (a file or a directory; every ``*.json`` in it is read)
   * ``--spans``   OpenTelemetry spans in OTLP/JSON, one export request per line,
                   as written by the collector's ``file`` exporter or by
-                  ``ate_env.telemetry.tracing`` test exporters (a file or directory)
+                  ``ate_env_rl.telemetry.tracing`` test exporters (a file or directory)
   * ``--metrics`` Prometheus text scrapes (``curl .../metrics > x.prom``) of the
                   trainer process and/or ate-env-api, or the collector's ``file``
                   exporter metrics output (OTLP/JSON lines, e.g. the

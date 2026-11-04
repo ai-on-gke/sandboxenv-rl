@@ -15,7 +15,7 @@
 """Contract tests for the substrate NeMo Gym provider.
 
 Runs against an in-process fake of ate-env-api (tests/fakes.py) reached
-through the real ``ate_env`` client over loopback gRPC, asserting the rules
+through the real ``ate_env_rl`` client over loopback gRPC, asserting the rules
 from the adding-a-provider contract: create returns only when the sandbox
 executes commands, exec never raises on nonzero exits, close is
 cleanup-safe, and provider_options are validated strictly.
@@ -31,7 +31,7 @@ from pathlib import Path
 
 import grpc
 import pytest
-from ate_env import Client, EnvironmentStatus, NotFoundError, SuspendMode
+from ate_env_rl import Client, EnvironmentStatus, NotFoundError, SuspendMode
 
 from nemo_gym_substrate import provider as provider_mod
 from nemo_gym_substrate._compat import (
@@ -1059,7 +1059,7 @@ def test_provider_lifecycle_has_no_telemetry_side_effects():
     code = textwrap.dedent(
         """
         import asyncio, sys
-        from ate_env import observability
+        from ate_env_rl import observability
         from nemo_gym_substrate._compat import SandboxSpec
         from nemo_gym_substrate.provider import SubstrateSandboxProvider
         from tests.fakes import serve

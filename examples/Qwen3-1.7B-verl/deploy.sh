@@ -32,6 +32,7 @@
 #   ENV_PREFIX        environment name prefix, must match env_prefix in tool_config.yaml (default verl-qwen3-1p7b)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
 if [ -z "${KUBE_CONTEXT:-}" ]; then
   : "${PROJECT_ID:?set KUBE_CONTEXT, or PROJECT_ID+ZONE+CLUSTER}"; : "${ZONE:?set ZONE}"; : "${CLUSTER:?set CLUSTER}"
   KUBE_CONTEXT="gke_${PROJECT_ID}_${ZONE}_${CLUSTER}"
@@ -68,10 +69,13 @@ check_substrate() {
   $K -n ate-env rollout status deploy/ate-env-api --timeout=120s
 }
 up_job() {
+  local tmp; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
+  tar --exclude='__pycache__' --exclude='*.pyc' -C "$REPO/clients/python" -czf "$tmp/ate-env-rl.tgz" pyproject.toml README.md src
   $K -n default create configmap "$JOB" \
       --from-file=run_fully_async.sh="$HERE/run_fully_async.sh" \
       --from-file=tool_config.yaml="$HERE/tool_config.yaml" \
       --from-file=ate_env_tool.py="$HERE/ate_env_tool.py" \
+      --from-file=ate-env-rl.tgz="$tmp/ate-env-rl.tgz" \
       --dry-run=client -o yaml | $K -n default apply -f -
   render_job "$JOB_YAML" | $K -n default apply -f -
 }

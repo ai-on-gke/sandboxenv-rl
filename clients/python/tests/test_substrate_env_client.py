@@ -20,7 +20,7 @@ from unittest.mock import patch
 import grpc
 import pytest
 
-from ate_env.errors import (
+from ate_env_rl.errors import (
     CommandStartError,
     InvalidArgumentError,
     NotFoundError,
@@ -28,7 +28,7 @@ from ate_env.errors import (
     SandboxProtocolError,
     SandboxUnavailableError,
 )
-from ate_env.runtime.substrate_env_client import SubstrateEnvClientRuntime
+from ate_env_rl.runtime.substrate_env_client import SubstrateEnvClientRuntime
 
 from .fakes import FakeProc
 

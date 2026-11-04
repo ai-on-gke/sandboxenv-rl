@@ -185,7 +185,7 @@ class Client:
             self._owns_channel = False
         else:
             if not endpoint:
-                raise ValueError("ate_env: endpoint is required when channel is not given")
+                raise ValueError("ate_env_rl: endpoint is required when channel is not given")
             interceptors = _auth_interceptors(auth_token) if auth_token else []
             if self.tracer:
                 # After auth, so the trace context rides on the final metadata.

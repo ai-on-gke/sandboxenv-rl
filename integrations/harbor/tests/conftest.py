@@ -199,6 +199,8 @@ def make_env(fake, tmp_path, task_dir):
             "build": "none",
             "create_timeout_sec": 10,
             "scratch_dir": str(tmp_path / "scratch"),
+            # The local fake runs on this machine: never write under /etc.
+            "tool_paths_profile": str(tmp_path / f"profile-{n}" / "zz-harbor-tools.sh"),
         }
         options.update(kwargs)
         return AteEnvEnvironment(

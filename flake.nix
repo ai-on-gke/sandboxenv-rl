@@ -63,6 +63,7 @@
                 ci-go
                 ci-python
                 ci-coverage
+                ci-release
                 ci-e2e
                 smoke
                 check-substrate-head
@@ -109,6 +110,7 @@
                 '';
               };
 
+              dafny = ci.dafnyShell;
               openhands = ci.openhandsShell;
               uni-agent = ci.uniAgentShell;
               harbor = ci.harborShell;

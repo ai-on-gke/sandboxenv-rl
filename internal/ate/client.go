@@ -36,6 +36,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/agent-substrate/env/internal/routertls"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
@@ -225,7 +226,7 @@ func (c *Client) DialGuest(atespace, id string) (*grpc.ClientConn, error) {
 	targetActor := atespace + "/" + id
 	routerCreds := insecure.NewCredentials()
 	if c.opts.RouterTLS != nil {
-		routerCreds = credentials.NewTLS(c.opts.RouterTLS)
+		routerCreds = routertls.TransportCredentials(c.opts.RouterTLS)
 	}
 	dialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(routerCreds),

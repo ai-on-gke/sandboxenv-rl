@@ -327,7 +327,6 @@ wheels = [
 
 [[package]]
 name = "ate-env-client"
-version = "0.1.0"
 source = { editable = "clients/python" }
 dependencies = [
     { name = "grpcio" },

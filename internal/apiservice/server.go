@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/env/internal/ate"
+	"github.com/agent-substrate/env/internal/routertls"
 	"github.com/agent-substrate/env/internal/telemetry"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
@@ -723,7 +724,7 @@ func (s *Server) guestConn(ctx context.Context, atespace, id string) (*grpc.Clie
 // the pod identity certificate when RouterTLS is set, else plaintext.
 func (s *Server) routerCredentials() credentials.TransportCredentials {
 	if s.RouterTLS != nil {
-		return credentials.NewTLS(s.RouterTLS)
+		return routertls.TransportCredentials(s.RouterTLS)
 	}
 	return insecure.NewCredentials()
 }

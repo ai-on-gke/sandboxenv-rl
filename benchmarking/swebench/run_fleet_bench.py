@@ -48,39 +48,14 @@ if _PY_SDK_SRC.is_dir() and str(_PY_SDK_SRC) not in sys.path:
 
 
 def load_sdk() -> tuple[types.ModuleType, type[BaseException], Any]:
-    """Import the repository's Python SDK (ate_env_rl or ate_env) on demand."""
-    if (_PY_SDK_SRC / "ate_env_rl" / "__init__.py").is_file():
-        import ate_env_rl as sdk_mod
-        from ate_env_rl.errors import InfrastructureError as infra_err
-        from ate_env_rl.telemetry.trace_recorder import (
-            current_slot_wait_s as slot_wait_var,
-        )
+    """Import the repository's Python SDK (ate_env_rl) on demand."""
+    import ate_env_rl as sdk_mod
+    from ate_env_rl.errors import InfrastructureError as infra_err
+    from ate_env_rl.telemetry.trace_recorder import (
+        current_slot_wait_s as slot_wait_var,
+    )
 
-        return sdk_mod, infra_err, slot_wait_var
-    if (_PY_SDK_SRC / "ate_env" / "__init__.py").is_file():
-        import ate_env as sdk_mod  # type: ignore[no-redef]
-        from ate_env.errors import InfrastructureError as infra_err  # type: ignore[no-redef]
-        from ate_env.telemetry.trace_recorder import (
-            current_slot_wait_s as slot_wait_var,  # type: ignore[no-redef]
-        )
-
-        return sdk_mod, infra_err, slot_wait_var
-    try:
-        import ate_env_rl as sdk_mod
-        from ate_env_rl.errors import InfrastructureError as infra_err
-        from ate_env_rl.telemetry.trace_recorder import (
-            current_slot_wait_s as slot_wait_var,
-        )
-
-        return sdk_mod, infra_err, slot_wait_var
-    except ModuleNotFoundError:
-        import ate_env as sdk_mod  # type: ignore[no-redef]
-        from ate_env.errors import InfrastructureError as infra_err  # type: ignore[no-redef]
-        from ate_env.telemetry.trace_recorder import (
-            current_slot_wait_s as slot_wait_var,  # type: ignore[no-redef]
-        )
-
-        return sdk_mod, infra_err, slot_wait_var
+    return sdk_mod, infra_err, slot_wait_var
 
 
 AUTH_TOKEN_ENV = "SUBSTRATE_ENV_AUTH_TOKEN"

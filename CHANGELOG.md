@@ -36,7 +36,6 @@ user needs to know across them.
   (worker pools a per-environment worker selector addresses) under each
   node's image-cache budget, largest image first, with replication and a hot
   rule from the schedule's demand; `domains.json` describes the domains.
-
 - Observability across the stack, all off by default except the run report;
   see [docs/observability.md](docs/observability.md).
 - Python client: OpenTelemetry tracing behind the `tracing` extra

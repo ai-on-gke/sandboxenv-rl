@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import collections
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
@@ -47,6 +47,7 @@ from .telemetry.tracing import (
 from .types import (
     EnvironmentInfo,
     ServerInfo,
+    SuspendMode,
     _environment_info_from_pb,
     _server_info_from_pb,
 )
@@ -245,6 +246,7 @@ class Client:
         template_name: str | None = None,
         template_atespace: str | None = None,
         rootfs_image: str | None = None,
+        worker_selector: Mapping[str, str] | None = None,
     ) -> Env:
         """Register and start a new environment; returns a handle to it.
 
@@ -257,10 +259,18 @@ class Client:
         image as the container and the ate-env-guest mounted into it as an
         image volume. The derived template is created on first use and reused
         for later environments on the same image; info() reports its name.
+
+        worker_selector names labels the worker pool must carry (exact
+        equality). Substrate ANDs it with the template's own selector, so it
+        narrows the pools the environment can run on and never widens them;
+        it also applies to the environment's later wakes. get() reports it,
+        with the node the environment runs on.
         """
         req = env_pb2.CreateEnvironmentRequest(
             id=id, atespace=atespace, rootfs_image=rootfs_image or ""
         )
+        if worker_selector:
+            req.worker_selector.update(worker_selector)
         if template_name or template_atespace:
             req.template.name = template_name or ""
             req.template.atespace = template_atespace or ""
@@ -326,9 +336,33 @@ class Client:
                 raise map_rpc_error(e) from e
         return _environment_info_from_pb(resp.environment)
 
-    async def suspend(self, id: str, *, atespace: str = DEFAULT_ATESPACE) -> None:
-        """Checkpoint and stop the environment."""
+    async def suspend(
+        self,
+        id: str,
+        *,
+        atespace: str = DEFAULT_ATESPACE,
+        mode: SuspendMode = SuspendMode.DURABLE,
+    ) -> None:
+        """Checkpoint and stop the environment.
+
+        ``mode`` says when the call returns: ``SuspendMode.DURABLE`` (the
+        default) once the snapshot is in object storage, ``SuspendMode.LOCAL``
+        once it is on the node, with the upload in the background (see
+        ``SuspendMode``). The request carries the mode only for ``LOCAL``, so
+        a durable suspend works against an ate-env-api that predates the
+        field; such a server refuses ``LOCAL`` with ``InvalidArgumentError``,
+        because it rejects fields it does not know. ``server_info().features``
+        lists ``suspend_mode`` once the server serves it.
+
+        The mode applies when the call checkpoints a running environment. An
+        environment that is already SUSPENDED, or PAUSED with its upload still
+        pending, is left as it is: a DURABLE suspend of a PAUSED environment
+        returns at once and does not wait for the upload.
+        """
+        mode = SuspendMode(mode)
         req = env_pb2.SuspendEnvironmentRequest(id=id, atespace=atespace)
+        if mode is SuspendMode.LOCAL:
+            req.mode = env_pb2.SUSPEND_MODE_LOCAL
         with (
             self._rpc_span(
                 "suspend_environment",

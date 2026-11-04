@@ -13,12 +13,12 @@
 # limitations under the License.
 
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ate-env-client"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Async Python client for the Agent Substrate Environment API (ate-env-api)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,10 +30,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8",
+    "pytest>=9",
     "pytest-asyncio>=1.0",
-    "grpcio-tools>=1.84",
-    "ruff==0.17.2",
+    # Generates the committed stubs in src/ate_env/_gen, which refuse to run on
+    # a grpcio older than the generator: keep it at the grpcio floor above, and
+    # move both together, then `make protos`.
+    "grpcio-tools==1.84.0",
+    "ruff~=0.17.2", # exact version in uv.lock; a minor bump changes the rules, so it is a deliberate edit
+    "coverage>=7.10",
+    # Stateful property tests (tests/test_warm_pool_accounting.py).
+    "hypothesis>=6.100",
 ]
 # OpenTelemetry tracing (ate_env.telemetry.tracing). 1.43 is the first release
 # whose opentelemetry-proto accepts protobuf 7. Only the OTLP/gRPC span
@@ -50,7 +56,11 @@ metrics = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/agent-substrate/env"
+Homepage = "https://github.com/ai-on-gke/sandboxenv-rl"
+
+[tool.setuptools_scm]
+root = "../.."
+fallback_version = "0.1.0"
 
 [tool.setuptools.packages.find]
 where = ["src"]

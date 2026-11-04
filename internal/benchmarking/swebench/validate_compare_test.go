@@ -288,9 +288,9 @@ func TestValidityRules1Through7(t *testing.T) {
 					},
 				},
 			},
-			HasTraceJob: false,
-			OrphanCount: 0,
-			CheckReap:   true,
+			TraceCaptured: false,
+			OrphanCount:   0,
+			CheckReap:     true,
 		}
 		return rep, opts
 	}
@@ -386,12 +386,69 @@ func TestValidityRules1Through7(t *testing.T) {
 		}
 	})
 
-	t.Run("Rule 6 trace mode fails", func(t *testing.T) {
+	t.Run("Rule 6 records trace capture without failing", func(t *testing.T) {
 		rep, opts := makeValidFixture()
-		opts.HasTraceJob = true
-		v := Validate(rep, opts)
-		if v.Valid || !strings.Contains(strings.Join(v.Reasons, "; "), "rule 6 (trace_mode)") {
-			t.Fatalf("expected Rule 6 failure, got %+v", v)
+		if v := Validate(rep, opts); !v.Valid || rep.TraceCaptured {
+			t.Fatalf("untraced: valid=%t captured=%t", v.Valid, rep.TraceCaptured)
+		}
+		if md := rep.TraceMetadata(); md[TraceCapturedMetadataKey] != "false" || len(md) != 1 {
+			t.Fatalf("untraced metadata %v", md)
+		}
+
+		rep, opts = makeValidFixture()
+		opts.TraceCaptured, opts.TraceFileCount = true, 3
+		if v := Validate(rep, opts); !v.Valid || !rep.TraceCaptured || rep.TraceFileCount != 3 {
+			t.Fatalf("traced: %+v captured=%t files=%d", v, rep.TraceCaptured, rep.TraceFileCount)
+		}
+		if md := rep.TraceMetadata(); md[TraceCapturedMetadataKey] != "true" || md[TraceFileCountMetadataKey] != "3" {
+			t.Fatalf("traced metadata %v", md)
+		}
+		var md bytes.Buffer
+		rep.WriteMarkdown(&md)
+		if !strings.Contains(md.String(), "**Trace captured**: yes (3 trace files") {
+			t.Fatalf("report.md lacks the trace line:\n%s", md.String())
+		}
+
+		// A trace-mode run event, or a report that already says so, is evidence too.
+		rep, opts = makeValidFixture()
+		opts.Events = append(opts.Events, Event{Event: EventRun, Name: "trace", OK: true})
+		if v := Validate(rep, opts); !v.Valid || !rep.TraceCaptured {
+			t.Fatalf("from events: valid=%t captured=%t reasons=%v", v.Valid, rep.TraceCaptured, v.Reasons)
+		}
+		rep, opts = makeValidFixture()
+		rep.TraceCaptured = true
+		if v := Validate(rep, opts); !v.Valid || !rep.TraceCaptured {
+			t.Fatalf("persisted: valid=%t captured=%t", v.Valid, rep.TraceCaptured)
+		}
+	})
+
+	t.Run("FindTraceFiles discovers every trace layout", func(t *testing.T) {
+		dir := t.TempDir()
+		for _, rel := range []string{
+			"trace.jsonl",
+			"verl-live-trace.jsonl",
+			filepath.Join("traces", "worker-0.jsonl"),
+			filepath.Join("traces", "verl-job", "worker-1.jsonl"),
+			filepath.Join("results", "traces", "worker-2.jsonl"),
+			filepath.Join("traces", "empty.jsonl"), // empty: not evidence
+			"events.jsonl",                         // not a trace
+		} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, rel)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			content := []byte("{}\n")
+			if strings.HasPrefix(filepath.Base(rel), "empty") {
+				content = nil
+			}
+			if err := os.WriteFile(filepath.Join(dir, rel), content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := FindTraceFiles(dir); len(got) != 5 {
+			t.Fatalf("expected 5 trace files, got %v", got)
+		}
+		if FindTraceFiles(t.TempDir()) != nil {
+			t.Fatal("expected no trace files in an empty dir")
 		}
 	})
 

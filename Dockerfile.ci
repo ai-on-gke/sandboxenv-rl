@@ -1,0 +1,40 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+FROM nixos/nix:latest@sha256:f159a58f390677f41e8e900a74b6e2f9c7f27b364122ae6acf7a652ce6c551c0
+
+ENV NIX_CONFIG="experimental-features = nix-command flakes"
+# Go's module cache in the cache volume hack/ci-compat.sh mounts, next to its
+# build cache (~/.cache/go-build), so modules download once.
+ENV GOMODCACHE=/root/.cache/go/mod
+
+# Symlink Nix profile utilities into /bin for tests executing /bin/echo and similar standard FHS paths.
+RUN for f in /root/.nix-profile/bin/*; do [ -e "/bin/${f##*/}" ] || ln -s "$f" /bin/; done
+
+# Don't stay in the root directory for this.
+# https://github.com/NixOS/nix/issues/11217
+WORKDIR /workspace
+
+# Only the tree: the devShell and everything else build on first use into the
+# /nix volume hack/ci-compat.sh mounts, and stay there, like on a Nix host. That
+# also keeps `make update-pins` working when the devShell doesn't evaluate.
+COPY . .
+
+# Initialize a clean baseline git repository so root-owned git commands
+# (verify-gofmt, verify-protos, go build VCS stamping) work cleanly without
+# dubious ownership errors or depending on host git state.
+RUN git init -q && git add -A && git -c user.email=ci@local -c user.name=ci commit -qm baseline
+
+ENTRYPOINT ["nix", "develop", "path:///workspace", "-c"]
+CMD ["ci"]

@@ -40,11 +40,11 @@ clients/
     src/ate_env/backend/ # Fleet drivers: SubstrateBackendDriver, MockBackendDriver
     src/ate_env/runtime/ # Guest hooks: SubstrateEnvClientRuntime, MockRuntimeHook
     src/ate_env/telemetry/ # Telemetry: Prometheus metric collectors and OpenTelemetry tracer
-integrations/            # Framework integrations: nemo-gym (NeMo Gym), openhands, uni-agent (R2E-Gym)
+integrations/            # Framework integrations: harbor (Harbor), nemo-gym (NeMo Gym), openhands, uni-agent (R2E-Gym)
 benchmarking/            # Benchmark scenarios (scenarios/), SWE-bench (swebench/), telemetry report (telemetry_report/)
 docs/                    # Architecture, glossary, release, rootfs images, security, dev guides
-examples/                # Examples: grpo, openhands, verl_swebench, Qwen3-1.7B-verl, Qwen3.5-35B-A3B-verl, runtime-layers, guest-daemon, mcp
-hack/                    # Repository maintenance: license boilerplate verification
+examples/                # Examples: grpo, harbor, openhands, verl_swebench, Qwen3-1.7B-verl, Qwen3.5-35B-A3B-verl, runtime-layers, guest-daemon, mcp
+hack/                    # Repository scripts: CI runners (ci/), verification (verify/, boilerplate/)
 ```
 
 ## Decision rules
@@ -108,6 +108,9 @@ HTTP and `CONNECT` router), and `testcerts` (dynamic SPIFFE client certificates)
 
 ### Agent workflows in `.agents/skills/`
 
+- Cutting releases: follow
+  [.agents/skills/create-release/SKILL.md](../../.agents/skills/create-release/SKILL.md) for
+  generating release notes, pushing tags, attaching signed assets, and publishing to PyPI and GHCR.
 - Adding a new RPC: follow
   [.agents/skills/extend-env-surface/SKILL.md](../../.agents/skills/extend-env-surface/SKILL.md) for
   proto definition, stubs, guest execution, `s.guestConn` with `ensureAwake`, and SDK methods.

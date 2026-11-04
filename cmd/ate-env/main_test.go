@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -73,6 +74,32 @@ func TestCommandRouting(t *testing.T) {
 		}
 		if len(remaining) != 1 || remaining[0] != "dev1" {
 			t.Errorf("expected 1 remaining arg [dev1], got %v", remaining)
+		}
+	})
+
+	t.Run("suspend --mode", func(t *testing.T) {
+		args := []string{"suspend", "dev1", "--mode", "local"}
+		root := newRootCommand(args)
+		cmd, remaining, err := root.Find(args)
+		if err != nil {
+			t.Fatalf("root.Find failed: %v", err)
+		}
+		if err := cmd.ParseFlags(remaining); err != nil {
+			t.Fatalf("cmd.ParseFlags failed: %v", err)
+		}
+		if got := cmd.Flags().Lookup("mode").Value.String(); got != "local" {
+			t.Errorf("--mode = %q, want local", got)
+		}
+		if got := newSuspendCommand().Flags().Lookup("mode").DefValue; got != "durable" {
+			t.Errorf("--mode default = %q, want durable", got)
+		}
+		// A mode that is neither is refused before anything is dialed.
+		bad := newRootCommand(nil)
+		bad.SetArgs([]string{"suspend", "dev1", "--mode", "async"})
+		bad.SetOut(io.Discard)
+		bad.SetErr(io.Discard)
+		if err := bad.Execute(); err == nil || !strings.Contains(err.Error(), "--mode must be durable or local") {
+			t.Errorf("invalid --mode: got %v, want the usage error", err)
 		}
 	})
 
@@ -360,7 +387,7 @@ func TestServerInfoCommand(t *testing.T) {
 		"server: sandboxenv-rl\n",
 		"version: v9.9.9\n",
 		"substrate_version: ",
-		"features: rootfs_image, pty, port_proxy\n",
+		"features: rootfs_image, pty, suspend_mode, port_proxy\n",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("server-info output missing %q:\n%s", want, out.String())
@@ -398,7 +425,7 @@ func TestServerInfoCommandJSON(t *testing.T) {
 		t.Fatalf("output is not one JSON object: %v\n%s", err, out.String())
 	}
 	if got.Server != "sandboxenv-rl" || got.Version != "v9.9.9" || got.SubstrateVersion == "" ||
-		strings.Join(got.Features, ",") != "rootfs_image,pty,port_proxy" {
+		strings.Join(got.Features, ",") != "rootfs_image,pty,suspend_mode,port_proxy" {
 		t.Errorf("server-info --json = %+v", got)
 	}
 }
@@ -415,6 +442,50 @@ func TestCreateRejectsSubcommandID(t *testing.T) {
 		err := root.Execute()
 		if err == nil || !strings.Contains(err.Error(), "reserved") {
 			t.Errorf("create %s: err = %v, want a reserved-id error", id, err)
+		}
+	}
+}
+
+func TestCreateWorkerSelectorFlag(t *testing.T) {
+	args := []string{"create", "dev1", "--worker-selector", "ate-env/domain=d0,tier=hot", "--worker-selector", "zone=us-central1-a"}
+	root := newRootCommand(args)
+	cmd, _, err := root.Find(args[:2])
+	if err != nil {
+		t.Fatalf("root.Find failed: %v", err)
+	}
+	if cmd.Flags().Lookup("worker-selector") == nil {
+		t.Fatal("create has no --worker-selector flag")
+	}
+	if err := cmd.ParseFlags(args[2:]); err != nil {
+		t.Fatalf("parsing --worker-selector: %v", err)
+	}
+	items, _ := cmd.Flags().GetStringSlice("worker-selector")
+	got, err := parseWorkerSelector(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"ate-env/domain": "d0", "tier": "hot", "zone": "us-central1-a"}
+	if !maps.Equal(got, want) {
+		t.Errorf("parseWorkerSelector(%q) = %v, want %v", items, got, want)
+	}
+}
+
+func TestParseWorkerSelector(t *testing.T) {
+	if got, err := parseWorkerSelector(nil); err != nil || got != nil {
+		t.Errorf("parseWorkerSelector(nil) = %v, %v; want nil, nil", got, err)
+	}
+	if got, err := parseWorkerSelector([]string{"k="}); err != nil || got["k"] != "" {
+		t.Errorf("an empty value is a value: got %v, %v", got, err)
+	}
+	if _, err := parseWorkerSelector([]string{"zone=a", "zone=b"}); err == nil || !strings.Contains(err.Error(), "given twice") {
+		t.Errorf("a repeated key must be an error, got %v", err)
+	}
+	if _, err := parseWorkerSelector([]string{"zone=a", "zone=a"}); err == nil {
+		t.Error("a repeated key with the same value must be an error too")
+	}
+	for _, bad := range []string{"novalue", "=v", ""} {
+		if _, err := parseWorkerSelector([]string{bad}); err == nil {
+			t.Errorf("parseWorkerSelector(%q) accepted, want an error", bad)
 		}
 	}
 }

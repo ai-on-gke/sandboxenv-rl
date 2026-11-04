@@ -19,6 +19,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
 
 	"github.com/agent-substrate/env/internal/benchmarking/schema"
 )
@@ -160,8 +163,10 @@ type ValidateOptions struct {
 	// Rule 5: resolved schedule that all jobs must have completed.
 	Schedule *schema.Schedule
 
-	// Rule 6: whether any job in the scenario ran in trace mode.
-	HasTraceJob bool
+	// Rule 6: trace capture evidence (trace-mode job, trace files on disk).
+	// Recorded in the report, never a validity failure.
+	TraceCaptured  bool
+	TraceFileCount int
 
 	// Rule 7: remaining orphan count after reap (must be 0).
 	OrphanCount int
@@ -185,7 +190,7 @@ func Validate(rep *Report, opts ValidateOptions) schema.ReportValidity {
 	prewarmCount := rep.PrewarmCount
 	createHits := rep.CreateCacheHits
 	createMisses := rep.CreateCacheMisses
-	hasTrace := rep.HasTraceEvents || rep.Mode == "trace"
+	hasTrace := false
 	reapSeen := rep.ReapSeen
 	reapFailed := rep.ReapFailed
 	orphanCount := rep.OrphanCount
@@ -356,10 +361,9 @@ func Validate(rep *Report, opts ValidateOptions) schema.ReportValidity {
 		}
 	}
 
-	// Rule 6: No job in the scenario ran in trace mode.
-	if opts.HasTraceJob || hasTrace {
-		reasons = append(reasons, "rule 6 (trace_mode): scenario contains job running in trace mode")
-	}
+	// Rule 6: trace capture is recorded, not rejected. Tracing adds per-call
+	// latency, so the report must say whether these numbers include it.
+	rep.RecordTraceCapture(opts.TraceCaptured || hasTrace, opts.TraceFileCount)
 
 	// Rule 7: Reap reached zero remaining sandboxes/resources (orphan_count == 0).
 	effectiveOrphans := orphanCount
@@ -382,6 +386,66 @@ func Validate(rep *Report, opts ValidateOptions) schema.ReportValidity {
 	}
 	rep.Validity = &validity
 	return validity
+}
+
+// RecordTraceCapture merges trace evidence into rep. It only widens, so
+// evidence from events, flags, and the artifact directory can arrive in any order.
+func (rep *Report) RecordTraceCapture(captured bool, files int) {
+	rep.TraceCaptured = rep.TraceCaptured || captured || files > 0 || rep.HasTraceEvents || rep.Mode == "trace"
+	rep.TraceFileCount = max(rep.TraceFileCount, files)
+}
+
+// TraceCapturedLabel is the human-readable trace capture fact.
+func (rep *Report) TraceCapturedLabel() string {
+	switch {
+	case !rep.TraceCaptured:
+		return "no"
+	case rep.TraceFileCount > 0:
+		return fmt.Sprintf("yes (%d trace files; latencies include trace overhead)", rep.TraceFileCount)
+	default:
+		return "yes (latencies include trace overhead)"
+	}
+}
+
+// run_window.json metadata keys for trace capture.
+const (
+	TraceCapturedMetadataKey  = "trace_captured"
+	TraceFileCountMetadataKey = "trace_file_count"
+)
+
+// TraceMetadata returns the run_window.json metadata for rep's trace capture.
+// trace_captured is always present so "no trace" is explicit.
+func (rep *Report) TraceMetadata() map[string]string {
+	md := map[string]string{TraceCapturedMetadataKey: strconv.FormatBool(rep.TraceCaptured)}
+	if rep.TraceFileCount > 0 {
+		md[TraceFileCountMetadataKey] = strconv.Itoa(rep.TraceFileCount)
+	}
+	return md
+}
+
+// Trace JSONL locations: the SDK's trace.jsonl / verl-live-trace.jsonl,
+// RealJobDriver's traces/<job>/, and traces gathered from Ray workers.
+var traceFilePatterns = []string{
+	"trace.jsonl",
+	"verl-live-trace.jsonl",
+	filepath.Join("traces", "*.jsonl"),
+	filepath.Join("traces", "*", "*.jsonl"),
+	filepath.Join("results", "traces", "*.jsonl"),
+}
+
+// FindTraceFiles returns the non-empty trace JSONL files under dir, sorted.
+func FindTraceFiles(dir string) []string {
+	var out []string
+	for _, pat := range traceFilePatterns {
+		matches, _ := filepath.Glob(filepath.Join(dir, pat))
+		for _, m := range matches {
+			if st, err := os.Stat(m); err == nil && !st.IsDir() && st.Size() > 0 {
+				out = append(out, m)
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // ValidateReportOrEvents loads a Report from reportPath (or summarizes eventsPath,

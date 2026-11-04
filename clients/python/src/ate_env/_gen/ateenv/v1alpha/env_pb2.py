@@ -38,7 +38,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18\x61teenv/v1alpha/env.proto\x12\x0e\x61teenv.v1alpha\"*\n\x08Template\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x10\n\x08\x61tespace\x18\x02 \x01(\t\"\x8a\x01\n\x0b\x45nvironment\x12\n\n\x02id\x18\x01 \x01(\t\x12\x10\n\x08\x61tespace\x18\x02 \x01(\t\x12*\n\x08template\x18\x03 \x01(\x0b\x32\x18.ateenv.v1alpha.Template\x12\x31\n\x06status\x18\x04 \x01(\x0e\x32!.ateenv.v1alpha.EnvironmentStatus\"z\n\x18\x43reateEnvironmentRequest\x12\n\n\x02id\x18\x01 \x01(\t\x12\x10\n\x08\x61tespace\x18\x02 \x01(\t\x12*\n\x08template\x18\x03 \x01(\x0b\x32\x18.ateenv.v1alpha.Template\x12\x14\n\x0crootfs_image\x18\x04 \x01(\t\"M\n\x19\x43reateEnvironmentResponse\x12\x30\n\x0b\x65nvironment\x18\x01 \x01(\x0b\x32\x1b.ateenv.v1alpha.Environment\"5\n\x15GetEnvironmentRequest\x12\n\n\x02id\x18\x01 \x01(\t\x12\x10\n\x08\x61tespace\x18\x02 \x01(\t\"J\n\x16GetEnvironmentResponse\x12\x30\n\x0b\x65nvironment\x18\x01 \x01(\x0b\x32\x1b.ateenv.v1alpha.Environment\"9\n\x19SuspendEnvironmentRequest\x12\n\n\x02id\x18\x01 \x01(\t\x12\x10\n\x08\x61tespace\x18\x02 \x01(\t\"\x1c\n\x1aSuspendEnvironmentResponse\"8\n\x18\x44\x65leteEnvironmentRequest\x12\n\n\x02id\x18\x01 \x01(\t\x12\x10\n\x08\x61tespace\x18\x02 \x01(\t\"\x1b\n\x19\x44\x65leteEnvironmentResponse\"\x16\n\x14GetServerInfoRequest\"e\n\x15GetServerInfoResponse\x12\x0e\n\x06server\x18\x01 \x01(\t\x12\x0f\n\x07version\x18\x02 \x01(\t\x12\x19\n\x11substrate_version\x18\x03 \x01(\t\x12\x10\n\x08\x66\x65\x61tures\x18\x04 \x03(\t*\xbd\x02\n\x11\x45nvironmentStatus\x12\"\n\x1e\x45NVIRONMENT_STATUS_UNSPECIFIED\x10\x00\x12\x1f\n\x1b\x45NVIRONMENT_STATUS_RESUMING\x10\x01\x12\x1e\n\x1a\x45NVIRONMENT_STATUS_RUNNING\x10\x02\x12!\n\x1d\x45NVIRONMENT_STATUS_SUSPENDING\x10\x03\x12 \n\x1c\x45NVIRONMENT_STATUS_SUSPENDED\x10\x04\x12\x1e\n\x1a\x45NVIRONMENT_STATUS_PAUSING\x10\x05\x12\x1d\n\x19\x45NVIRONMENT_STATUS_PAUSED\x10\x06\x12\x1e\n\x1a\x45NVIRONMENT_STATUS_CRASHED\x10\x07\x12\x1f\n\x1b\x45NVIRONMENT_STATUS_DELETING\x10\x08\x32\x94\x04\n\x12\x45nvironmentService\x12h\n\x11\x43reateEnvironment\x12(.ateenv.v1alpha.CreateEnvironmentRequest\x1a).ateenv.v1alpha.CreateEnvironmentResponse\x12_\n\x0eGetEnvironment\x12%.ateenv.v1alpha.GetEnvironmentRequest\x1a&.ateenv.v1alpha.GetEnvironmentResponse\x12k\n\x12SuspendEnvironment\x12).ateenv.v1alpha.SuspendEnvironmentRequest\x1a*.ateenv.v1alpha.SuspendEnvironmentResponse\x12h\n\x11\x44\x65leteEnvironment\x12(.ateenv.v1alpha.DeleteEnvironmentRequest\x1a).ateenv.v1alpha.DeleteEnvironmentResponse\x12\\\n\rGetServerInfo\x12$.ateenv.v1alpha.GetServerInfoRequest\x1a%.ateenv.v1alpha.GetServerInfoResponseBCZAgithub.com/agent-substrate/env/proto/ateenv/v1alpha;ateenvv1alphab\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18\x61teenv/v1alpha/env.proto\x12\x0e\x61teenv.v1alpha\"*\n\x08Template\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x10\n\x08\x61tespace\x18\x02 \x01(\t\"\x99\x02\n\x0b\x45nvironment\x12\n\n\x02id\x18\x01 \x01(\t\x12\x10\n\x08\x61tespace\x18\x02 \x01(\t\x12*\n\x08template\x18\x03 \x01(\x0b\x32\x18.ateenv.v1alpha.Template\x12\x31\n\x06status\x18\x04 \x01(\x0e\x32!.ateenv.v1alpha.EnvironmentStatus\x12\x0c\n\x04node\x18\x05 \x01(\t\x12H\n\x0fworker_selector\x18\x06 \x03(\x0b\x32/.ateenv.v1alpha.Environment.WorkerSelectorEntry\x1a\x35\n\x13WorkerSelectorEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x88\x02\n\x18\x43reateEnvironmentRequest\x12\n\n\x02id\x18\x01 \x01(\t\x12\x10\n\x08\x61tespace\x18\x02 \x01(\t\x12*\n\x08template\x18\x03 \x01(\x0b\x32\x18.ateenv.v1alpha.Template\x12\x14\n\x0crootfs_image\x18\x04 \x01(\t\x12U\n\x0fworker_selector\x18\x05 \x03(\x0b\x32<.ateenv.v1alpha.CreateEnvironmentRequest.WorkerSelectorEntry\x1a\x35\n\x13WorkerSelectorEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"M\n\x19\x43reateEnvironmentResponse\x12\x30\n\x0b\x65nvironment\x18\x01 \x01(\x0b\x32\x1b.ateenv.v1alpha.Environment\"5\n\x15GetEnvironmentRequest\x12\n\n\x02id\x18\x01 \x01(\t\x12\x10\n\x08\x61tespace\x18\x02 \x01(\t\"J\n\x16GetEnvironmentResponse\x12\x30\n\x0b\x65nvironment\x18\x01 \x01(\x0b\x32\x1b.ateenv.v1alpha.Environment\"d\n\x19SuspendEnvironmentRequest\x12\n\n\x02id\x18\x01 \x01(\t\x12\x10\n\x08\x61tespace\x18\x02 \x01(\t\x12)\n\x04mode\x18\x03 \x01(\x0e\x32\x1b.ateenv.v1alpha.SuspendMode\"\x1c\n\x1aSuspendEnvironmentResponse\"8\n\x18\x44\x65leteEnvironmentRequest\x12\n\n\x02id\x18\x01 \x01(\t\x12\x10\n\x08\x61tespace\x18\x02 \x01(\t\"\x1b\n\x19\x44\x65leteEnvironmentResponse\"\x16\n\x14GetServerInfoRequest\"e\n\x15GetServerInfoResponse\x12\x0e\n\x06server\x18\x01 \x01(\t\x12\x0f\n\x07version\x18\x02 \x01(\t\x12\x19\n\x11substrate_version\x18\x03 \x01(\t\x12\x10\n\x08\x66\x65\x61tures\x18\x04 \x03(\t*\xbd\x02\n\x11\x45nvironmentStatus\x12\"\n\x1e\x45NVIRONMENT_STATUS_UNSPECIFIED\x10\x00\x12\x1f\n\x1b\x45NVIRONMENT_STATUS_RESUMING\x10\x01\x12\x1e\n\x1a\x45NVIRONMENT_STATUS_RUNNING\x10\x02\x12!\n\x1d\x45NVIRONMENT_STATUS_SUSPENDING\x10\x03\x12 \n\x1c\x45NVIRONMENT_STATUS_SUSPENDED\x10\x04\x12\x1e\n\x1a\x45NVIRONMENT_STATUS_PAUSING\x10\x05\x12\x1d\n\x19\x45NVIRONMENT_STATUS_PAUSED\x10\x06\x12\x1e\n\x1a\x45NVIRONMENT_STATUS_CRASHED\x10\x07\x12\x1f\n\x1b\x45NVIRONMENT_STATUS_DELETING\x10\x08*]\n\x0bSuspendMode\x12\x1c\n\x18SUSPEND_MODE_UNSPECIFIED\x10\x00\x12\x18\n\x14SUSPEND_MODE_DURABLE\x10\x01\x12\x16\n\x12SUSPEND_MODE_LOCAL\x10\x02\x32\x94\x04\n\x12\x45nvironmentService\x12h\n\x11\x43reateEnvironment\x12(.ateenv.v1alpha.CreateEnvironmentRequest\x1a).ateenv.v1alpha.CreateEnvironmentResponse\x12_\n\x0eGetEnvironment\x12%.ateenv.v1alpha.GetEnvironmentRequest\x1a&.ateenv.v1alpha.GetEnvironmentResponse\x12k\n\x12SuspendEnvironment\x12).ateenv.v1alpha.SuspendEnvironmentRequest\x1a*.ateenv.v1alpha.SuspendEnvironmentResponse\x12h\n\x11\x44\x65leteEnvironment\x12(.ateenv.v1alpha.DeleteEnvironmentRequest\x1a).ateenv.v1alpha.DeleteEnvironmentResponse\x12\\\n\rGetServerInfo\x12$.ateenv.v1alpha.GetServerInfoRequest\x1a%.ateenv.v1alpha.GetServerInfoResponseBCZAgithub.com/agent-substrate/env/proto/ateenv/v1alpha;ateenvv1alphab\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -46,32 +46,42 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'ateenv.v1alpha.env_pb2', _g
 if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
   _globals['DESCRIPTOR']._serialized_options = b'ZAgithub.com/agent-substrate/env/proto/ateenv/v1alpha;ateenvv1alpha'
-  _globals['_ENVIRONMENTSTATUS']._serialized_start=867
-  _globals['_ENVIRONMENTSTATUS']._serialized_end=1184
+  _globals['_ENVIRONMENT_WORKERSELECTORENTRY']._loaded_options = None
+  _globals['_ENVIRONMENT_WORKERSELECTORENTRY']._serialized_options = b'8\001'
+  _globals['_CREATEENVIRONMENTREQUEST_WORKERSELECTORENTRY']._loaded_options = None
+  _globals['_CREATEENVIRONMENTREQUEST_WORKERSELECTORENTRY']._serialized_options = b'8\001'
+  _globals['_ENVIRONMENTSTATUS']._serialized_start=1196
+  _globals['_ENVIRONMENTSTATUS']._serialized_end=1513
+  _globals['_SUSPENDMODE']._serialized_start=1515
+  _globals['_SUSPENDMODE']._serialized_end=1608
   _globals['_TEMPLATE']._serialized_start=44
   _globals['_TEMPLATE']._serialized_end=86
   _globals['_ENVIRONMENT']._serialized_start=89
-  _globals['_ENVIRONMENT']._serialized_end=227
-  _globals['_CREATEENVIRONMENTREQUEST']._serialized_start=229
-  _globals['_CREATEENVIRONMENTREQUEST']._serialized_end=351
-  _globals['_CREATEENVIRONMENTRESPONSE']._serialized_start=353
-  _globals['_CREATEENVIRONMENTRESPONSE']._serialized_end=430
-  _globals['_GETENVIRONMENTREQUEST']._serialized_start=432
-  _globals['_GETENVIRONMENTREQUEST']._serialized_end=485
-  _globals['_GETENVIRONMENTRESPONSE']._serialized_start=487
-  _globals['_GETENVIRONMENTRESPONSE']._serialized_end=561
-  _globals['_SUSPENDENVIRONMENTREQUEST']._serialized_start=563
-  _globals['_SUSPENDENVIRONMENTREQUEST']._serialized_end=620
-  _globals['_SUSPENDENVIRONMENTRESPONSE']._serialized_start=622
-  _globals['_SUSPENDENVIRONMENTRESPONSE']._serialized_end=650
-  _globals['_DELETEENVIRONMENTREQUEST']._serialized_start=652
-  _globals['_DELETEENVIRONMENTREQUEST']._serialized_end=708
-  _globals['_DELETEENVIRONMENTRESPONSE']._serialized_start=710
-  _globals['_DELETEENVIRONMENTRESPONSE']._serialized_end=737
-  _globals['_GETSERVERINFOREQUEST']._serialized_start=739
-  _globals['_GETSERVERINFOREQUEST']._serialized_end=761
-  _globals['_GETSERVERINFORESPONSE']._serialized_start=763
-  _globals['_GETSERVERINFORESPONSE']._serialized_end=864
-  _globals['_ENVIRONMENTSERVICE']._serialized_start=1187
-  _globals['_ENVIRONMENTSERVICE']._serialized_end=1719
+  _globals['_ENVIRONMENT']._serialized_end=370
+  _globals['_ENVIRONMENT_WORKERSELECTORENTRY']._serialized_start=317
+  _globals['_ENVIRONMENT_WORKERSELECTORENTRY']._serialized_end=370
+  _globals['_CREATEENVIRONMENTREQUEST']._serialized_start=373
+  _globals['_CREATEENVIRONMENTREQUEST']._serialized_end=637
+  _globals['_CREATEENVIRONMENTREQUEST_WORKERSELECTORENTRY']._serialized_start=317
+  _globals['_CREATEENVIRONMENTREQUEST_WORKERSELECTORENTRY']._serialized_end=370
+  _globals['_CREATEENVIRONMENTRESPONSE']._serialized_start=639
+  _globals['_CREATEENVIRONMENTRESPONSE']._serialized_end=716
+  _globals['_GETENVIRONMENTREQUEST']._serialized_start=718
+  _globals['_GETENVIRONMENTREQUEST']._serialized_end=771
+  _globals['_GETENVIRONMENTRESPONSE']._serialized_start=773
+  _globals['_GETENVIRONMENTRESPONSE']._serialized_end=847
+  _globals['_SUSPENDENVIRONMENTREQUEST']._serialized_start=849
+  _globals['_SUSPENDENVIRONMENTREQUEST']._serialized_end=949
+  _globals['_SUSPENDENVIRONMENTRESPONSE']._serialized_start=951
+  _globals['_SUSPENDENVIRONMENTRESPONSE']._serialized_end=979
+  _globals['_DELETEENVIRONMENTREQUEST']._serialized_start=981
+  _globals['_DELETEENVIRONMENTREQUEST']._serialized_end=1037
+  _globals['_DELETEENVIRONMENTRESPONSE']._serialized_start=1039
+  _globals['_DELETEENVIRONMENTRESPONSE']._serialized_end=1066
+  _globals['_GETSERVERINFOREQUEST']._serialized_start=1068
+  _globals['_GETSERVERINFOREQUEST']._serialized_end=1090
+  _globals['_GETSERVERINFORESPONSE']._serialized_start=1092
+  _globals['_GETSERVERINFORESPONSE']._serialized_end=1193
+  _globals['_ENVIRONMENTSERVICE']._serialized_start=1611
+  _globals['_ENVIRONMENTSERVICE']._serialized_end=2143
 # @@protoc_insertion_point(module_scope)

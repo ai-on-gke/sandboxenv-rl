@@ -112,6 +112,7 @@ or later, and ate-env-api's SPIFFE ID (`spiffe://cluster.local/ns/<namespace>/sa
 
 ```bash
 ate-env manifest template --template oh-agent-server \
+  --rootfs-image   docker.io/library/debian@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 \
   --guest-image    <registry>/ate-env-guest@sha256:<digest> \
   --layer          oh=<registry>/oh-agent-server-layer@sha256:<digest>=/opt/oh \
   --sidecar        '/opt/oh/python/bin/python3 -m openhands.agent_server --host 0.0.0.0 --port 8000' \
@@ -124,6 +125,19 @@ This is the counterpart of agent-sandbox's SandboxTemplate and warm pool. Furthe
 settings are more `--env` flags. The first environment created from an image derives a template
 for it (layer, sidecar and settings included); later ones reuse it.
 
+The base template runs in a glibc image of its own (`--rootfs-image`), because its golden actor
+starts the layer too. Without it, the container image is the guest image, which has no C library for
+the layer's CPython, and the golden actor crashes. `debian:bookworm-slim` (glibc 2.36, `/bin/sh`
+and `bash`, 26 MB compressed for amd64) is the smallest common image that meets the glibc 2.31
+floor; any image that meets the floor works. An environment created without `image=` runs in this
+base image. A template derived for a task image replaces only the image: the guest volume, the layer
+and the sidecar stay. A base registered earlier without `--rootfs-image` keeps a crashed golden
+actor: delete it and register it again with the same session key. Its `<base>-<12 hex digits>`
+templates can stay, because a template derived from the new base is identical to one derived from
+the old base. Delete them only to make Substrate bake their golden snapshots again, or when the
+session key changes, because each derived template copies the key. The cluster runs under
+[Verified](#verified) came before this base image and do not test it.
+
 ## 4. Use `AteEnvWorkspace`
 
 `AteEnvWorkspace(template=..., image=...)` creates an environment, waits until the agent-server
@@ -135,7 +149,7 @@ caller.
 | Field | Default | Meaning | `AgentSandboxWorkspace` |
 |---|---|---|---|
 | `template` | required to create | base template with the agent-server layer | `warmpool` |
-| `image` | the template's image | task image, `repo@sha256:…` | none (fixed in the SandboxTemplate) |
+| `image` | the base template's image (`debian:bookworm-slim` in section 3) | task image, `repo@sha256:…` | none (fixed in the SandboxTemplate) |
 | `atespace` | `ate-env` | atespace of the environment; the port proxy must list it in `--port-proxy-atespaces` | `namespace` |
 | `template_atespace` | the server default | atespace of `template` | none |
 | `api_url` | `127.0.0.1:7777` | ate-env-api, host:port or URL | `host` in `direct` mode |
@@ -164,8 +178,20 @@ caller.
   ws.resume()
   conversation = Conversation(agent=agent, workspace=ws, conversation_id=conversation_id)
   ```
+
+  `pause()` and `resume()` keep the HTTP client open, thus a conversation that stays open across
+  them can still send messages after `resume()`. The environment then does not stay suspended (see
+  [Limits](#limits)).
 - `port_url(port)` is the proxy URL of another port in the same environment. A request to it from
   outside the SDK adds `proxy_headers()` (empty without `api_token`).
+- `get_secrets()` returns `LookupSecret` references that the agent-server answers itself: each names
+  `http://127.0.0.1:<server_port>/api/settings/secrets/<name>` and carries the session key only.
+  Thus a lookup never goes through the port proxy, and `api_token` never enters the sandbox. The
+  agent-server resolves these URLs in process when it runs as `python -m openhands.agent_server`,
+  as the layer starts it: that start sets `OH_INTERNAL_SERVER_URL`. Started another way, it falls
+  back to an HTTP request to its own loopback address, authenticated by the session key, which can
+  stall its own event loop. Secret names follow the agent-server's rule
+  (`^[a-zA-Z][a-zA-Z0-9_]{0,63}$`).
 - A rejected session key fails the constructor with `PermissionError`; a version difference between
   `openhands-sdk` and the agent-server is logged as a warning.
 - The health wait stops at once on an answer that waiting cannot change: 401 or 403 from the proxy
@@ -380,6 +406,7 @@ does: 400 for port 80, and with a bearer token 401 for a request without it, and
 the answers that stop it at once (400, 401, 403, 404), cleanup after each failure (lost create answer,
 a create that lands after its timeout, refused create, health timeout, wrong session key), ownership
 (a failed attach or validation error deletes nothing, a copy never deletes), the token at the proxy,
+secret lookups that the agent-server answers in process without the token, invalid secret names,
 attach, pause and resume, exit ordering, files, the shared loop (`close_all`, the call timeout, a
 fork), and a `RemoteConversation` whose event WebSocket goes through the proxy. With the token,
 they cover the port capability: the proxy's test vector, the event WebSocket with a capability only,

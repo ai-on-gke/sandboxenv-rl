@@ -699,7 +699,7 @@ def handle_draft(args: argparse.Namespace) -> None:
     print("  2. Review the draft release in GitHub UI and click 'Publish release'.")
     if pypi_enabled:
         print("     Publishing the release automatically triggers PyPI publication via")
-        print("     OIDC Trusted Publishing for ate-env-client (clients/python).")
+        print("     OIDC Trusted Publishing for ate-env-rl (clients/python).")
     else:
         print("     PyPI publishing is currently disabled/skipped (vars.PYPI_PUBLISH_ENABLED != 'true'),")
         print("     so publishing the release will officiate the GitHub Release, CLI binaries, and GHCR")

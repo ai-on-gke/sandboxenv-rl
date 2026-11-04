@@ -5,7 +5,7 @@ the contract the developer started from; [decisions.md](./decisions.md) lists ea
 between it and the code. Where a planned name differs from the shipped one, the planned name is in
 the Notes column.
 
-## Python: `ate_env.telemetry.tracing` (#93, #164)
+## Python: `ate_env_rl.telemetry.tracing` (#93, #164)
 
 | Name                                                                                       | Signature or shape                                                                                                                                                                      | Behavior                                                                                                                                                                                                                                                                                      |
 | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -21,11 +21,11 @@ the Notes column.
 | `set_attributes`, `image_ref_attr`, `executable_attr`, `mark_error`                        | helpers                                                                                                                                                                                 | `executable_attr` keeps the executable name only (never the command line); `image_ref_attr` drops an image tag and keeps the repository and digest.                                                                                                                                           |
 | context across threads                                                                     |                                                                                                                                                                                         | `LoopRunner.run` and `submit` run the coroutine in a copy of the caller's `contextvars` context; `process_parallel` copies the context into its pool threads. Notes: the plan had a `run_with_context` helper.                                                                                |
 
-Without the extra, nothing in `ate_env.telemetry` imports OpenTelemetry at module load; the module
-resolves names lazily (`_load_otel`, module `__getattr__`). Notes: the plan had
+Without the extra, nothing in `ate_env_rl.telemetry` imports OpenTelemetry at module load; the
+module resolves names lazily (`_load_otel`, module `__getattr__`). Notes: the plan had
 `OPENTELEMETRY_AVAILABLE` and `Mock*` classes.
 
-### Config (`ate_env.config`)
+### Config (`ate_env_rl.config`)
 
 Frozen dataclasses with the existing unknown-field rejection:
 
@@ -79,7 +79,7 @@ client does not set it. Notes: the plan had an `env.*` vocabulary and `atefleet.
 Rule: no command line, file content, token or image tag in any attribute value beyond the executable
 name, sizes, references and ids.
 
-## Python: `ate_env.observability` (#109, #113, #115)
+## Python: `ate_env_rl.observability` (#109, #113, #115)
 
 | Name                                                         | Contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -112,7 +112,7 @@ happens on the first metrics-enabled `Observer` or on `enable_client_metrics()`,
 idempotent `_metric` helper keyed by registry; never at import. Notes: the plan had `atefleet_*` and
 an `ate_env_client_wake_seconds` histogram.
 
-`ate_env.telemetry.metrics` also exports `observe(op, seconds, status)`, `observe_subphase`,
+`ate_env_rl.telemetry.metrics` also exports `observe(op, seconds, status)`, `observe_subphase`,
 `timed(op)`, `render_prometheus()`, `get_recorded_summary()`, `reset_recorded_metrics()` and
 `flush_step_events(...)`; the last three serve the benchmark harness.
 
@@ -207,11 +207,11 @@ Notes: the plan had one flag for both. The stripped binary grew by 2.6 MiB.
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_INSECURE`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT` | every exporter: Python client, `ate-env-api`, guest, Go client's `NewTracerProvider`, swebench loader |
 | `OTEL_SEMCONV_STABILITY_OPT_IN`                                                                                                                                | Python `Client` spans (`rpc/old`, `rpc/dup`)                                                          |
 | `ENABLE_TRACING`, `METRICS_PORT`, `REPORT_DIR`                                                                                                                 | `examples/grpo`, `rollout_bench.py`, #186's pipeline                                                  |
-| `ENV_BENCH_MODE`, `ENV_BENCH_TRACE_PATH`, `ARTIFACT_DIR`                                                                                                       | `ate_env.telemetry.trace_recorder` (#173)                                                             |
+| `ENV_BENCH_MODE`, `ENV_BENCH_TRACE_PATH`, `ARTIFACT_DIR`                                                                                                       | `ate_env_rl.telemetry.trace_recorder` (#173)                                                          |
 
 ## Warm-pool accounting (AC-15)
 
-Shipped in #221 (`clients/python/src/ate_env/backend/substrate.py`). `SubstrateBackendDriver`
+Shipped in #221 (`clients/python/src/ate_env_rl/backend/substrate.py`). `SubstrateBackendDriver`
 coroutines share one event loop and interleave at every `await`; the bookkeeping holds under any
 interleaving:
 

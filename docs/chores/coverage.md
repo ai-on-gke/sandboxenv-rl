@@ -108,7 +108,7 @@ The script `hack/ci/coverage-summary.py` merges unit test counter files (`covera
 ### Python Coverage Path Mapping
 [`.coveragerc`](../../.coveragerc) at the repository root configures `coverage.py` with:
 - `branch = true` under `[run]` for branch coverage measurement.
-- `[paths]` entries mapping `clients/python/src/ate_env` and the integration packages so coverage data recorded from different working directories (`clients/python`, `integrations/nemo-gym`, `integrations/uni-agent`) merge into canonical repository-relative paths.
+- `[paths]` entries mapping `clients/python/src/ate_env_rl` and the integration packages so coverage data recorded from different working directories (`clients/python`, `integrations/nemo-gym`, `integrations/uni-agent`) merge into canonical repository-relative paths.
 - Unique `COVERAGE_FILE` paths per parallel pytest suite under `coverage/py/`, combined by `coverage combine`.
 
 ### Guest Daemon Graceful Stop

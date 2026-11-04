@@ -33,13 +33,13 @@ proto/ateenv/v1alpha/
   *.pb.go, *_grpc.pb.go  # [generated] Go protobuf and gRPC stubs; never hand-edit
 clients/
   go/                    # Go SDK client: package env (Client, Env, Process)
-  python/                # Python SDK: distribution package ate-env-client, import name ate_env
-    src/ate_env/         # Core library: Client, Env, Process, SandboxFleet, AsyncSandboxFleet
-    src/ate_env/_gen/    # [generated] Python protobuf and gRPC stubs; never hand-edit
-    src/ate_env/adapters/ # Benchmark task converters and reward evaluation adapters (SweBenchAdapter)
-    src/ate_env/backend/ # Fleet drivers: SubstrateBackendDriver, MockBackendDriver
-    src/ate_env/runtime/ # Guest hooks: SubstrateEnvClientRuntime, MockRuntimeHook
-    src/ate_env/telemetry/ # Telemetry: Prometheus metric collectors and OpenTelemetry tracer
+  python/                # Python SDK: distribution package ate-env-rl, import name ate_env_rl
+    src/ate_env_rl/      # Core library: Client, Env, Process, SandboxFleet, AsyncSandboxFleet
+    src/ate_env_rl/_gen/ # [generated] Python protobuf and gRPC stubs; never hand-edit
+    src/ate_env_rl/adapters/ # Benchmark task converters and reward evaluation adapters (SweBenchAdapter)
+    src/ate_env_rl/backend/ # Fleet drivers: SubstrateBackendDriver, MockBackendDriver
+    src/ate_env_rl/runtime/ # Guest hooks: SubstrateEnvClientRuntime, MockRuntimeHook
+    src/ate_env_rl/telemetry/ # Telemetry: Prometheus metric collectors and OpenTelemetry tracer
 integrations/            # Framework integrations: harbor (Harbor), nemo-gym (NeMo Gym), openhands, uni-agent (R2E-Gym)
 benchmarking/            # Benchmark scenarios (scenarios/), SWE-bench (swebench/), telemetry report (telemetry_report/)
 docs/                    # Architecture, glossary, release, rootfs images, security, dev guides
@@ -84,14 +84,14 @@ Define in-guest services (`ProcessService`, `FileSystemService`) in
 `proto/ateenv/v1alpha/guest.proto` and lifecycle services (`EnvironmentService`) in
 `proto/ateenv/v1alpha/env.proto`. Never hand-edit `*.pb.go`, `*_grpc.pb.go`, or Python `*_pb2*.py*`
 files. Run `buf generate` for Go stubs and `make python-protos`
-(`clients/python/scripts/gen-protos.sh`) for Python stubs in `clients/python/src/ate_env/_gen/`.
+(`clients/python/scripts/gen-protos.sh`) for Python stubs in `clients/python/src/ate_env_rl/_gen/`.
 
 ### Python SDK: low-level vs. fleet
 
-Put low-level gRPC wrappers in `clients/python/src/ate_env/{client,env,handle}.py`. Put pool
+Put low-level gRPC wrappers in `clients/python/src/ate_env_rl/{client,env,handle}.py`. Put pool
 scheduling algorithms, warm pool maintenance, and batch rollout drivers in
-`clients/python/src/ate_env/{fleet,async_fleet,strategies}.py`. Synchronous fleet methods must run
-coroutines through `LoopRunner.run()` to preserve shared HTTP/2 channels.
+`clients/python/src/ate_env_rl/{fleet,async_fleet,strategies}.py`. Synchronous fleet methods must
+run coroutines through `LoopRunner.run()` to preserve shared HTTP/2 channels.
 
 ### Benchmarking: `cmd/benchmarking` vs. `internal/benchmarking` vs. `benchmarking/`
 

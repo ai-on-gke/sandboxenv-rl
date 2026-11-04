@@ -16,10 +16,10 @@ import threading
 
 import pytest
 
-from ate_env.async_fleet import AsyncSandboxFleet
-from ate_env.config import FleetConfig
-from ate_env.fleet import SandboxFleet
-from ate_env.types import Task
+from ate_env_rl.async_fleet import AsyncSandboxFleet
+from ate_env_rl.config import FleetConfig
+from ate_env_rl.fleet import SandboxFleet
+from ate_env_rl.types import Task
 
 
 def _fleet() -> SandboxFleet:

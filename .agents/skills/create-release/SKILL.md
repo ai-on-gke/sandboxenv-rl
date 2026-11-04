@@ -18,7 +18,7 @@ Every `sandboxenv-rl` release produces four core deliverables:
 | :----------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------- |
 | **Go CLI (`ate-env`)**                                                         | GitHub Release static binaries (`ate-env_<tag>_<os>_<arch>`, `chmod +x`)                                                                                                         | `SHA256SUMS_${TAG}.txt` & Cosign Sigstore bundles (`.sigstore.json`)                       |
 | **Container Images** (`ate-env-api`, `ate-env-guest`, `oh-agent-server-layer`) | GitHub Container Registry (`ghcr.io/ai-on-gke/sandboxenv-rl/*`)                                                                                                                  | Multi-arch (`linux/amd64`, `linux/arm64`), pinned by digest, and signed with Cosign OIDC   |
-| **Python Client SDK (`ate-env-client`)**                                       | PyPI when `vars.PYPI_PUBLISH_ENABLED=true`, or Git tag install when PyPI is skipped (`clients/python`; packages under `integrations/` are in-repo examples and are not released) | `setuptools-scm>=8` & PyPA OIDC Trusted Publishing (`id-token: write`, environment `pypi`) |
+| **Python Client SDK (`ate-env-rl`)**                                           | PyPI when `vars.PYPI_PUBLISH_ENABLED=true`, or Git tag install when PyPI is skipped (`clients/python`; packages under `integrations/` are in-repo examples and are not released) | `setuptools-scm>=8` & PyPA OIDC Trusted Publishing (`id-token: write`, environment `pypi`) |
 | **gRPC Contracts & Protos**                                                    | Git repository tags & GitHub Release notes                                                                                                                                       | Protocol buffer wire compatibility                                                         |
 
 ## Release Procedure Overview
@@ -44,7 +44,7 @@ artifacts while the human inspects those artifacts and stamps approval at two ex
 7. Human (Checkpoint 2 — Officiate Release): Inspect the Draft Release on GitHub and click **Publish
    release**.
 8. CI (optional PyPI step): If `vars.PYPI_PUBLISH_ENABLED == 'true'`, automatically runs
-   `publish-pypi` on release publication to build and publish `ate-env-client` (`clients/python`) to
+   `publish-pypi` on release publication to build and publish `ate-env-rl` (`clients/python`) to
    PyPI via OIDC Trusted Publishing. If `vars.PYPI_PUBLISH_ENABLED` is unset/false (or PyPI is
    skipped for this release), `publish-pypi` is cleanly skipped without failing the workflow.
 
@@ -127,7 +127,7 @@ This command:
      blocks (adjusting `ai-on-gke/sandboxenv-rl` to `<owner>/<repo>` if cutting a release on a
      fork). For `#### Python Client SDK`:
      - **When PyPI publishing is enabled** (`vars.PYPI_PUBLISH_ENABLED=true` and not skipped):
-       substitute `$VERSION` into `pip install "ate-env-client==$VERSION"`.
+       substitute `$VERSION` into `pip install "ate-env-rl==$VERSION"`.
      - **When PyPI publishing is skipped or not configured** (the user asked to skip PyPI or
        `release-context.md` shows `PyPI Publishing` is disabled/skipped): replace the PyPI `pip`
        snippet with the Git-tag installation snippet from `hack/release/release-template.md`
@@ -202,9 +202,9 @@ gh run list --workflow release.yaml
 ## PyPI Publishing Operations (Optional)
 
 Both `ci-release` (in `nix/ci.nix`) and `publish-pypi` (in `.github/workflows/release.yaml`) run
-`hack/release/build-dists.sh` to build only `clients/python` (`ate-env-client`), deriving its
-version from the Git tag via `setuptools-scm>=8` (`root = "../.."`). Packages under `integrations/`
-are in-repo reference integrations/examples and are not published to PyPI.
+`hack/release/build-dists.sh` to build only `clients/python` (`ate-env-rl`), deriving its version
+from the Git tag via `setuptools-scm>=8` (`root = "../.."`). Packages under `integrations/` are
+in-repo reference integrations/examples and are not published to PyPI.
 
 PyPI publishing is **optional** and gated on repository variable `PYPI_PUBLISH_ENABLED=true`. While
 `PYPI_PUBLISH_ENABLED` is unset or `false`, releases publish GHCR images and `ate-env` CLI binaries
@@ -218,7 +218,7 @@ cleanly without running `publish-pypi`.
      reviewers** enabled.
 2. **Trusted Publisher Registration (`pypi.org`) & Enabling Automatic Uploads**: Register a GitHub
    Trusted Publisher (or a **Pending Publisher** prior to the very first PyPI upload) for
-   `ate-env-client` on [pypi.org](https://pypi.org) under **Publishing**:
+   `ate-env-rl` on [pypi.org](https://pypi.org) under **Publishing**:
    - **Owner**: `ai-on-gke`
    - **Repository**: `sandboxenv-rl`
    - **Workflow name**: `release.yaml`
@@ -230,7 +230,7 @@ cleanly without running `publish-pypi`.
    the `pypi` Environment are configured and `PYPI_PUBLISH_ENABLED=true` is set, trigger
    `release.yaml` manually via **Actions -> release -> Run workflow** with **Use workflow from: Tag
    `vX.Y.Z`**, `tag: vX.Y.Z`, and `publish_pypi: true`. The workflow verifies that the GitHub
-   Release is no longer a draft and publishes `ate-env-client` from `refs/tags/vX.Y.Z` without
+   Release is no longer a draft and publishes `ate-env-rl` from `refs/tags/vX.Y.Z` without
    rebuilding container images.
 4. **Staging / TestPyPI Rehearsals**: Set repository variables `PYPI_PUBLISH_ENABLED=true` and
    `PYPI_REPOSITORY_URL=https://test.pypi.org/legacy/` on a staging repository or fork to route

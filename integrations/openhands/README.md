@@ -49,7 +49,7 @@ pip install ./clients/python ./integrations/openhands            # the workspace
 pip install './integrations/openhands[examples]'                 # + openhands-tools, for the agent examples
 ```
 
-`ate-env-client` (this repo's Python client) is not on PyPI yet, thus install it from the checkout.
+`ate-env-rl` (this repo's Python client) is not on PyPI yet, thus install it from the checkout.
 The package pins `openhands-sdk` to the agent-server version in the layer (see
 [Versions](#versions)). Python 3.12 or newer, as openhands-sdk requires.
 
@@ -251,11 +251,11 @@ the repository's other examples:
 ## 6. Fleet adapters
 
 `ate_env_openhands.fleet` has the two helpers of `agent_sandbox_rl.adapters.openhands`, with the
-same names and ownership: the **fleet** (`ate_env.SandboxFleet`) acquires and releases sandboxes;
+same names and ownership: the **fleet** (`ate_env_rl.SandboxFleet`) acquires and releases sandboxes;
 the workspace only binds one and never creates or deletes an environment.
 
 ```python
-from ate_env import FleetConfig, SandboxFleet, Task
+from ate_env_rl import FleetConfig, SandboxFleet, Task
 from ate_env_openhands import make_handle_workspace
 
 fleet = SandboxFleet(FleetConfig(backend="substrate", endpoint="127.0.0.1:7777",
@@ -323,7 +323,7 @@ stubs that during construction, so no Kubernetes access is needed.
 
 `ate_env_openhands.agent_sandbox_rl` has agent-sandbox-rl's fleet API (`ClusterConfig`,
 `FleetConfig`, `ResourceSpec`, `TemplateSpec`, `ObservabilityConfig`, `SandboxFleet`, `Task`, and
-`adapters.openhands`) on top of `ate_env`. A program written for agent-sandbox-rl, such as
+`adapters.openhands`) on top of `ate_env_rl`. A program written for agent-sandbox-rl, such as
 agent-sandbox's `examples/agent-sandbox-rl/examples/run_openhands_fleet.py`, runs on ate-env when
 its imports change and nothing else:
 
@@ -354,12 +354,12 @@ the token, so that it is not in the program; surrounding white space is removed 
 | agent-sandbox-rl | on ate-env |
 |---|---|
 | `ClusterConfig.namespace` | the atespace (`"default"`: see the table above) |
-| `max_concurrent`, `window_size`, `run_id` | the same `ate_env.FleetConfig` fields |
+| `max_concurrent`, `window_size`, `run_id` | the same `ate_env_rl.FleetConfig` fields |
 | `window_size=None` | `run()` derives the sliding and pipelined window as agent-sandbox-rl does (`recommended_window()`): the leading images whose warm replicas fit in `max_concurrent`, half that for pipelined; without `warm_per_task` and the disk caps, which are ignored |
 | `max_warmpool_size` | `max_warmpool_replicas` |
 | `ready_timeout` | `acquire_timeout_s` and `ready_timeout_s` |
-| `observability` | `ate_env.ObservabilityConfig` (metrics, tracing, service name); `enable_metrics=True`, the default, maps to `None`: metrics when `prometheus_client` is installed, as in agent-sandbox-rl |
-| `run(fn, strategy, concurrency, epochs=)` | `ate_env`'s strategy of the same name; an unknown name (also `""`) raises `ValueError`. With `epochs > 1`, the warm pools stay between passes, the fleet tears down once after the last pass, and `fleet.report` covers all passes |
+| `observability` | `ate_env_rl.ObservabilityConfig` (metrics, tracing, service name); `enable_metrics=True`, the default, maps to `None`: metrics when `prometheus_client` is installed, as in agent-sandbox-rl |
+| `run(fn, strategy, concurrency, epochs=)` | `ate_env_rl`'s strategy of the same name; an unknown name (also `""`) raises `ValueError`. With `epochs > 1`, the warm pools stay between passes, the fleet tears down once after the last pass, and `fleet.report` covers all passes |
 | `handle.cluster_name` | the name of the `ClusterConfig` |
 | `make_handle_workspace`, `make_fleet_workspace` | section 6; the token comes from the fleet |
 

@@ -258,7 +258,7 @@ class Env:
                         exit_info = out.exit
                 if exit_info is None:
                     raise RuntimeError(
-                        "ate_env: output stream ended before the process exited"
+                        "ate_env_rl: output stream ended before the process exited"
                     )
                 if span is not None:
                     set_attributes(span, {"ate_env.exit_code": exit_info.exit_code})
@@ -348,7 +348,7 @@ class Env:
         """
         _validate_byte_source(data, "write_file")
         if seek_offset < 0:
-            raise ValueError(f"ate_env: seek_offset must be >= 0, got {seek_offset}")
+            raise ValueError(f"ate_env_rl: seek_offset must be >= 0, got {seek_offset}")
         outer = not in_handle_span.get() and not in_env_span.get()
         tracer = self._client.tracer if outer else None
         span_cm = (
@@ -480,7 +480,7 @@ class Process:
         ):
             if out.exit is not None:
                 return out.exit
-        raise RuntimeError("ate_env: output stream ended before the process exited")
+        raise RuntimeError("ate_env_rl: output stream ended before the process exited")
 
     async def write_input(self, data: _ByteSource, *, close: bool = False) -> int:
         """Write to the process's stdin; returns the number of bytes written.
@@ -545,9 +545,9 @@ def _validate_byte_source(data: object, what: str) -> None:
     # Validate eagerly: errors raised inside a request generator are
     # swallowed by grpc.aio and surface as an opaque CancelledError.
     if isinstance(data, str):
-        raise TypeError(f"ate_env: {what} expects bytes, not str; encode it first")
+        raise TypeError(f"ate_env_rl: {what} expects bytes, not str; encode it first")
     if not isinstance(data, (bytes, bytearray, memoryview, Iterable, AsyncIterable)):
-        raise TypeError(f"ate_env: unsupported {what} data type: {type(data)!r}")
+        raise TypeError(f"ate_env_rl: unsupported {what} data type: {type(data)!r}")
 
 
 async def _chunk_stream(data: _ByteSource) -> AsyncIterator[bytes]:
@@ -562,4 +562,4 @@ async def _chunk_stream(data: _ByteSource) -> AsyncIterator[bytes]:
         for chunk in data:
             yield bytes(chunk)
     else:
-        raise TypeError(f"ate_env: unsupported data type: {type(data)!r}")
+        raise TypeError(f"ate_env_rl: unsupported data type: {type(data)!r}")

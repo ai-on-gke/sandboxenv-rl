@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prometheus histograms for the ate_env client, behind the ``metrics`` extra.
+"""Prometheus histograms for the ate_env_rl client, behind the ``metrics`` extra.
 
 ``prometheus_client`` is imported and the ``ate_env_client_*`` collectors are
 registered lazily: nothing touches the default registry at import. Client
 timings are recorded once :func:`enable_client_metrics` has been called (a
-metrics-enabled ``ate_env.observability.Observer`` calls it); each histogram
+metrics-enabled ``ate_env_rl.observability.Observer`` calls it); each histogram
 registers on its first observation.
 """
 
@@ -38,14 +38,14 @@ from typing import Any
 
 from .trace_recorder import get_bench_context, is_measure_mode
 
-logger = logging.getLogger("ate_env.telemetry.metrics")
+logger = logging.getLogger("ate_env_rl.telemetry.metrics")
 
 # One bucket set, in seconds, for every ate_env histogram.
 SEC_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600)
 
 _MISSING_EXTRA_MSG = (
     "prometheus_client not installed; metrics disabled. "
-    "Install the metrics extra: pip install 'ate-env-client[metrics]'"
+    "Install the metrics extra: pip install 'ate-env-rl[metrics]'"
 )
 
 _LOCK = threading.Lock()

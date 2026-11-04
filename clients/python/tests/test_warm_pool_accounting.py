@@ -40,10 +40,10 @@ from hypothesis.stateful import (
     rule,
 )
 
-from ate_env.backend.substrate import SubstrateBackendDriver
-from ate_env.config import ObservabilityConfig
-from ate_env.errors import NotFoundError, SandboxStartError
-from ate_env.observability import Observer
+from ate_env_rl.backend.substrate import SubstrateBackendDriver
+from ate_env_rl.config import ObservabilityConfig
+from ate_env_rl.errors import NotFoundError, SandboxStartError
+from ate_env_rl.observability import Observer
 
 R = 3  # replicas asked for by every warm_pool call
 

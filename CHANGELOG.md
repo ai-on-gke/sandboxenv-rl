@@ -19,6 +19,13 @@ user needs to know across them.
   `worker_selector`, and `FleetConfig.placement` adds labels per task image;
   `SubstrateBackendDriver(worker_selector=, placement=)` and
   `worker_selector_for(image)`.
+- Python client: `ate_env.PreflightWarmer` fills the node caches an image
+  placement plan (`ImagePlacement`, from `image-placement.json`) describes:
+  ensures each image's derived template, then per domain, as each golden
+  becomes ready, probes every node with the image and deletes the probes;
+  `PreflightCoverage` writes `preflight-coverage.json` in the loader's schema.
+  `Observer.record_phase()` and the phases `preflight_golden`,
+  `preflight_probe`.
 - ate-env-api: `worker_selector` on `CreateEnvironment`, labels the worker pool
   must carry, ANDed with the template's own selector (`Actor.worker_selector`,
   so it holds for wakes too); `node` and `worker_selector` on `Environment`.

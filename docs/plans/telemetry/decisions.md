@@ -254,3 +254,9 @@ Append-only. Each entry: date, who, what, why.
   its delete). A scratch test against `c0c41ac` reproduced both: `reap` of a later run left the
   actors alive. Recorded as open criterion AC-15.9, not fixed here; the model verifies one fix for
   the release path (re-tag whenever `_teardowns` changed since the pop).
+- 2026-11-04, orchestrator: AC-20. The models fail on purpose, so the CI check compares results with
+  `verify/README.md` (counts from its Run block, failing lemmas from its table) instead of requiring
+  `dafny verify` to exit 0; the README stays the one list. Dafny comes from the pinned nixpkgs
+  (4.11.0, the version the models were checked with) in a `.#dafny` devShell and a job of its own,
+  not the default devShell: it brings the .NET SDK and Z3, which no other check needs. A download of
+  the GitHub release zip would have been a second, unpinned source.

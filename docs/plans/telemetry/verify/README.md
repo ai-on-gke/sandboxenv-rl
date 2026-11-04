@@ -2,8 +2,9 @@
 
 Hand-written [Dafny](https://dafny.org) models of the telemetry code's pure functions and of
 `SubstrateBackendDriver`'s warm-pool bookkeeping. They back the properties in
-[../properties.md](../properties.md). CI does not run them, and nothing ties them to the Python
-code: a change to `substrate.py` or `observability.py` does not fail a model.
+[../properties.md](../properties.md). CI's `Dafny models` job runs them (`make ci-dafny` locally)
+and checks the results against this file. Nothing ties them to the Python code: a change to
+`substrate.py` or `observability.py` does not fail a model.
 
 ## Models
 
@@ -54,8 +55,19 @@ dafny verify warm_pool_generations.dfy    # 24 verified, 3 errors: the three lem
 dafny verify warm_pool_drain.dfy          # 49 verified, 5 errors: the five lemmas above
 ```
 
-Checked with Dafny 4.11.0. The GitHub release zip for Ubuntu is self-contained and runs without a
-separate .NET install; nixpkgs also packages `dafny`. Dafny is not a dependency of the repository.
+## CI
+
+[hack/verify/dafny.py](../../../../hack/verify/dafny.py) runs `dafny verify` on every `.dfy` file
+here and fails unless each file is in the Run block above, its verified and error counts match that
+block, and its errors fall in exactly the lemmas the "Lemmas that fail by design" table lists for
+it. So a change that makes a listed lemma verify (a fix), or breaks one that verified, has to update
+this file in the same pull request. CI runs it in the `.#dafny` devShell, whose Dafny comes from the
+pinned nixpkgs; `make ci-dafny` does the same locally, and `hack/verify/dafny.py --dafny <path>`
+uses any other Dafny binary.
+
+Checked with Dafny 4.11.0, the version the pinned nixpkgs packages. The GitHub release zip for
+Ubuntu is self-contained and runs without a separate .NET install; nixpkgs also packages `dafny`.
+Dafny is not a dependency of the repository.
 
 To see a finding come back, revert its amendment in `telemetry.dfy` and run `dafny verify` again:
 

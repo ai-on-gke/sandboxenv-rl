@@ -149,7 +149,11 @@ kubectl -n ate-system get deploy -o name | sort | diff /tmp/before-ate-system.tx
 # hypothesis comes with the dev extra, so either venv works.
 /tmp/ate-base/bin/python -m pytest clients/python/tests/test_warm_pool_accounting.py -q
 
-# Dafny 4.11 (not a repository dependency; CI does not run it)
+# Dafny 4.11, from the pinned nixpkgs. CI's `Dafny models` job runs `make ci-dafny`, which checks
+# these results against verify/README.md (hack/verify/dafny.py).
+make ci-dafny
+
+# Or by hand:
 cd docs/plans/telemetry/verify
 dafny verify telemetry.dfy                # 14 verified, 0 errors
 dafny verify warm_pool.dfy                # 16 verified, 3 errors, all in WarmPoolBefore
@@ -158,8 +162,9 @@ dafny verify warm_pool_drain.dfy          # 49 verified, 5 errors: CommitStaleBe
 ```
 
 The Dafny errors are by design: each failing lemma models code before #221 or one of its review
-rounds, or an open gap ([verify/README.md](./verify/README.md)). Paste the four summary lines in the
-PR when a change touches the modelled code, and say whether the models still match it.
+rounds, or an open gap ([verify/README.md](./verify/README.md)). CI fails if a result changes and
+the README does not; when a change touches the modelled code, also say in the PR whether the models
+still match it.
 
 Still proposed, not in the repository:
 

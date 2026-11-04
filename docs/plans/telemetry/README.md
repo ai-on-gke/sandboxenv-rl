@@ -9,7 +9,7 @@ Companion documents in this directory: [prd.md](./prd.md), [execution-plan.md](.
 [interfaces.md](./interfaces.md) (the shipped contracts),
 [acceptance-criteria.md](./acceptance-criteria.md), [test-plan.md](./test-plan.md),
 [properties.md](./properties.md) (property-based tests, mostly proposed),
-[verify/](./verify/README.md) (Dafny models, not run by CI) and [decisions.md](./decisions.md). The
+[verify/](./verify/README.md) (Dafny models, checked in CI) and [decisions.md](./decisions.md). The
 user-facing result is [docs/observability.md](../../observability.md) and
 [docs/metrics.md](../../metrics.md).
 
@@ -154,4 +154,5 @@ behind it.
   the first-started exec span (AC-3.4, P-14).
 - Follow-ups with criteria but no work yet: a CI-checked span inventory (AC-16), Go and Python span
   parity from one shared fixture (AC-17), a property test that no attribute value holds a secret or
-  content (AC-18), and Dafny in CI (AC-20). AC-14 now has a pass threshold.
+  content (AC-18). AC-14 now has a pass threshold.
+- Closed: the Dafny models verify in CI (AC-20).

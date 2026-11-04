@@ -37,7 +37,7 @@ Conventions:
 | AC-17 | The Go and Python clients emit the same span names and keys for shared operations   | follow-up | partial: mirrored tables in `attrs_test.go`, `executable_test.go`; no shared fixture                          |
 | AC-18 | No command line, secret or file content in any span attribute value                 | follow-up | partial: example tests in both clients; no property test                                                      |
 | AC-19 | Several fleets in one process share the warm-replica gauge                          | 2         | pass: `test_warm_gauge_adds_up_across_observers_and_resets_only_own_share`                                    |
-| AC-20 | CI verifies the Dafny models with the documented counts                             | follow-up | not met: run by hand (Dafny 4.11.0, `ef307ed`)                                                                |
+| AC-20 | CI verifies the Dafny models with the documented counts                             | follow-up | pass: `Dafny models` job, `hack/verify/dafny.py`                                                              |
 
 ## AC-1: Base install carries no telemetry dependency
 
@@ -260,7 +260,7 @@ Conventions:
   `ResizeBeforeSafe` and `DeleteFailBeforeSafe` (the code before 15.4 and 15.5) and
   `DeleteCancelledSafe` and `ReleaseDeleteFailSafe` (15.9). [verify/README.md](./verify/README.md)
   explains each.
-- Pass rule: pytest green; Dafny output matches. CI runs the pytest file, not Dafny.
+- Pass rule: pytest green; Dafny output matches. CI runs both (the Dafny check is AC-20).
 - Status: 15.1 to 15.6 pass; 15.7 to 15.9 are open, with no test on `main`. A scratch test against
   `c0c41ac` reproduced both 15.9 paths.
 - Properties: P-9 (15.1, 15.6), P-10 (15.2, 15.5, 15.8, 15.9), P-11 (15.3, 15.4), P-24 (15.7).
@@ -322,7 +322,11 @@ Conventions:
 - 20.1: a CI step runs `dafny verify` on each file in [verify/](./verify/) with the version the
   README names, and fails unless the verified and error counts, and the failing lemmas, are the ones
   [verify/README.md](./verify/README.md) lists.
-- Status: not met. Run by hand with Dafny 4.11.0: `telemetry.dfy` 14 verified, 0 errors;
-  `warm_pool.dfy` 16 verified, 3 errors; `warm_pool_generations.dfy` 24 verified, 3 errors;
-  `warm_pool_drain.dfy` 49 verified, 5 errors. The Ubuntu release zip needs no .NET install, and the
-  four files verify in a few seconds.
+- Command: `make ci-dafny` (the `.#dafny` devShell runs `hack/verify/dafny.py`).
+- Expected: `telemetry.dfy` 14 verified, 0 errors; `warm_pool.dfy` 16 verified, 3 errors;
+  `warm_pool_generations.dfy` 24 verified, 3 errors; `warm_pool_drain.dfy` 49 verified, 5 errors;
+  the failing lemmas are the ones the README's table lists; the script prints
+  `All 4 Dafny models match docs/plans/telemetry/verify/README.md.`
+- Status: pass. CI's `Dafny models` job runs the check with the pinned nixpkgs' Dafny 4.11.0.
+  Changing a README count, making a listed lemma verify, or adding an unlisted `.dfy` file each
+  fails it (checked locally on copies of the directory).

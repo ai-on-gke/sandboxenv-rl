@@ -8,7 +8,7 @@ and the Hypothesis tests named "Proposed test" do not exist. Two parts exist:
   `test_warm_pool_accounting` and 18 plain interleaving tests. `hypothesis` is in the `dev` extra
   since #221.
 - [verify/](./verify/README.md): hand-written Dafny models of P-1 to P-11 and of the two bugs review
-  found in #221's first version. CI does not run them.
+  found in #221's first version. CI checks their results (AC-20).
 
 The tests named as "example coverage on `main`" exist and run in CI.
 

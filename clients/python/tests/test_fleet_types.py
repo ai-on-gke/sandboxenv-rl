@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ate_env.types import EnvironmentSpec, PlacementSpec, Task
+from ate_env_rl.types import EnvironmentSpec, PlacementSpec, Task
 
 
 def test_environment_spec_template_key_hashing():

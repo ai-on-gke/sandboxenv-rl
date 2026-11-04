@@ -29,10 +29,10 @@ import urllib.request
 
 import pytest
 
-from ate_env import AsyncSandboxFleet, FleetConfig, SandboxFleet, Task, observability
-from ate_env.config import ObservabilityConfig, ValidationError
-from ate_env.observability import Observer, RunReport, repo_family, serve_metrics
-from ate_env.telemetry import metrics as client_metrics
+from ate_env_rl import AsyncSandboxFleet, FleetConfig, SandboxFleet, Task, observability
+from ate_env_rl.config import ObservabilityConfig, ValidationError
+from ate_env_rl.observability import Observer, RunReport, repo_family, serve_metrics
+from ate_env_rl.telemetry import metrics as client_metrics
 
 REPORT_KEYS = {
     "strategy", "total_s", "phases", "claims", "tasks_ok", "tasks_err", "release_errors",
@@ -246,7 +246,7 @@ def test_missing_metrics_extra_logs_one_warning(monkeypatch, caplog):
     assert fleet.report.tasks_ok == 2
     warnings = [r for r in caplog.records if "metrics" in r.getMessage().lower()]
     assert len(warnings) == 1
-    assert "ate-env-client[metrics]" in warnings[0].getMessage()
+    assert "ate-env-rl[metrics]" in warnings[0].getMessage()
     with pytest.raises(RuntimeError, match="metrics"):
         serve_metrics(0)
 
@@ -281,7 +281,7 @@ def test_registry_untouched_at_import():
         import sys
         import prometheus_client
         before = set(prometheus_client.REGISTRY._names_to_collectors)
-        import ate_env, ate_env.observability, ate_env.telemetry, ate_env.telemetry.metrics
+        import ate_env_rl, ate_env_rl.observability, ate_env_rl.telemetry, ate_env_rl.telemetry.metrics
         after = set(prometheus_client.REGISTRY._names_to_collectors)
         assert after == before, sorted(after - before)
         print("registered at import:", sorted(after - before))
@@ -292,7 +292,7 @@ def test_registry_untouched_at_import():
 
 
 def test_registry_import_does_not_load_prometheus():
-    code = "import sys, ate_env, ate_env.observability; assert 'prometheus_client' not in sys.modules"
+    code = "import sys, ate_env_rl, ate_env_rl.observability; assert 'prometheus_client' not in sys.modules"
     subprocess.run([sys.executable, "-c", code], check=True)
 
 
@@ -351,7 +351,7 @@ _CARDINALITY_SCRIPT = textwrap.dedent(
     """
     import json
     import prometheus_client
-    from ate_env import FleetConfig, SandboxFleet, Task
+    from ate_env_rl import FleetConfig, SandboxFleet, Task
 
     FAMILIES = ("django", "astropy", "sympy", "requests", "flask")
     images = [f"sweb.eval.x86_64.{FAMILIES[i % 5]}__{FAMILIES[i % 5]}-{1000 + i}:latest"
@@ -611,15 +611,15 @@ def test_metric_helper_checks_type_and_labels():
 
 def test_service_name_precedence_is_logged(caplog):
     """Finding 9: both tracing switches on logs which service name wins."""
-    from ate_env import TracerConfig
+    from ate_env_rl import TracerConfig
 
-    caplog.set_level(logging.DEBUG, logger="ate_env.fleet")
+    caplog.set_level(logging.DEBUG, logger="ate_env_rl.fleet")
     SandboxFleet(FleetConfig(
         backend="mock",
         tracing=TracerConfig(enable_tracing=True, trace_service_name="trainer"),
         observability=ObservabilityConfig(enable_metrics=False, enable_tracing=True),
     ))
-    msgs = [r.getMessage() for r in caplog.records if r.name == "ate_env.fleet"]
+    msgs = [r.getMessage() for r in caplog.records if r.name == "ate_env_rl.fleet"]
     assert any("'ate-env-fleet'" in m and "'trainer'" in m for m in msgs), msgs
 
 
@@ -637,11 +637,11 @@ def test_default_metrics_without_extra_logs_info_not_warning(monkeypatch, caplog
 
 def test_shared_driver_logs_a_warning(caplog):
     """Finding 12: a second fleet on one driver warns that it takes over the events."""
-    from ate_env.backend.mock import MockBackendDriver
+    from ate_env_rl.backend.mock import MockBackendDriver
 
     driver = MockBackendDriver()
     cfg = FleetConfig(backend="mock", observability=ObservabilityConfig(enable_metrics=False))
-    caplog.set_level(logging.WARNING, logger="ate_env.fleet")
+    caplog.set_level(logging.WARNING, logger="ate_env_rl.fleet")
     first = SandboxFleet(cfg, driver=driver)
     assert not caplog.records
     second = SandboxFleet(cfg, driver=driver)
@@ -651,7 +651,7 @@ def test_shared_driver_logs_a_warning(caplog):
 
 async def test_async_run_releases_without_blocking_the_loop(monkeypatch):
     """Finding 13: AsyncSandboxFleet.run releases with release_async, never the sync release."""
-    from ate_env.handle import SandboxHandle
+    from ate_env_rl.handle import SandboxHandle
 
     def no_sync_release(self):
         raise AssertionError("sync release() called on the event loop")
@@ -691,7 +691,7 @@ def test_cancelled_task_has_status_cancelled():
     """An interrupted task in process_parallel is labeled cancelled, not error."""
     from types import SimpleNamespace
 
-    from ate_env.strategies import process_parallel
+    from ate_env_rl.strategies import process_parallel
 
     _, reg = _custom_registry()
     obs = Observer(ObservabilityConfig(enable_metrics=True), registry=reg)

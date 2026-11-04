@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Verified models of pure functions in ate_env telemetry.
+// Verified models of pure functions in ate_env_rl telemetry.
 // Spec: ../interfaces.md, ../acceptance-criteria.md (AC-4, AC-7, AC-9), ../properties.md.
 // Each `ensures` is tagged with the spec property it proves (P-n).
 

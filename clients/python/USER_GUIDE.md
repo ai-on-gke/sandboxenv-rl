@@ -1,6 +1,6 @@
 # RL Rollouts & Benchmark Adapters Guide
 
-This guide covers what is specific to Reinforcement Learning with `ate_env`: overlapping sandbox claims with policy decoding in **VeRL** / **Ray** rollouts on **Agent Substrate** and **GKE**, and grading candidates with the benchmark adapters (`ate_env.adapters`).
+This guide covers what is specific to Reinforcement Learning with `ate_env_rl`: overlapping sandbox claims with policy decoding in **VeRL** / **Ray** rollouts on **Agent Substrate** and **GKE**, and grading candidates with the benchmark adapters (`ate_env_rl.adapters`).
 
 For everything else (installing and connecting, `FleetConfig`, concurrency and pool sizing, run ids, errors, and observability), see the client [README](README.md).
 
@@ -12,7 +12,7 @@ In RL post-training (e.g., GRPO), candidate generation overlaps with sandbox cla
 
 ```python
 import asyncio
-from ate_env import AsyncSandboxFleet, FleetConfig, Task
+from ate_env_rl import AsyncSandboxFleet, FleetConfig, Task
 
 async def run_rollouts():
     config = FleetConfig(
@@ -60,7 +60,7 @@ asyncio.run(run_rollouts())
 The SDK has three layers:
 - **Layer 1 (`Client` / `Env`)**: Direct asyncio gRPC client talking to `ate-env-api` for lifecycle (create, get, suspend, delete) and guest daemon execution (streaming processes and chunked filesystem I/O).
 - **Layer 2 (`SandboxFleet` / `AsyncSandboxFleet`)**: Fleet management, sizing, pre-warming, pooling, and automated lifecycle with task-bound `SandboxHandle`.
-- **Layer 3 (`ate_env.adapters`)**: Zero-dependency benchmark task converters and in-sandbox reward evaluators (such as `SweBenchAdapter`) returning typed `EvalResult` outcomes.
+- **Layer 3 (`ate_env_rl.adapters`)**: Zero-dependency benchmark task converters and in-sandbox reward evaluators (such as `SweBenchAdapter`) returning typed `EvalResult` outcomes.
 
 ### Execution Contract:
 - `sb.exec(cmd)` and `sb.exec_async(cmd)` return an `ExecResult(exit_code, stdout, stderr, duration_s, timed_out)`.
@@ -77,12 +77,12 @@ The warm pool does not significantly decrease the time to first command because 
 
 ---
 
-## 3. Benchmark Adapters (`ate_env.adapters`)
+## 3. Benchmark Adapters (`ate_env_rl.adapters`)
 
 `SweBenchAdapter` converts SWE-bench records into `Task`s and grades candidate patches the way the official harness does:
 
 ```python
-from ate_env import SweBenchAdapter
+from ate_env_rl import SweBenchAdapter
 
 record = {...}  # a Hugging Face SWE-bench row
 record["test_cmd"] = SweBenchAdapter.pytest_test_cmd(record, pytest_bin="/opt/miniconda3/envs/testbed/bin/pytest")

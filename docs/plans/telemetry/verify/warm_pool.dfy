@@ -22,7 +22,7 @@
 //
 // Spec: ../properties.md (P-9..P-11), ../acceptance-criteria.md (AC-15).
 // warm_pool_generations.dfy extends it to teardowns that do not end the driver.
-// Code: clients/python/src/ate_env/backend/substrate.py (fixed in #221).
+// Code: clients/python/src/ate_env_rl/backend/substrate.py (fixed in #221).
 
 module WarmPool {
 

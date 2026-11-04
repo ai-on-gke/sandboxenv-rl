@@ -27,10 +27,10 @@ from typing import Any
 import grpc.aio
 import pytest
 
-from ate_env import AsyncSandboxFleet, Client, FleetConfig, SandboxFleet, Task
-from ate_env._gen.ateenv.v1alpha import env_pb2_grpc, guest_pb2_grpc
-from ate_env.loop_runner import LoopRunner
-from ate_env.telemetry import (
+from ate_env_rl import AsyncSandboxFleet, Client, FleetConfig, SandboxFleet, Task
+from ate_env_rl._gen.ateenv.v1alpha import env_pb2_grpc, guest_pb2_grpc
+from ate_env_rl.loop_runner import LoopRunner
+from ate_env_rl.telemetry import (
     CANONICAL_TRACE_OPS,
     TraceFileSpanProcessor,
     build_trace_event,
@@ -42,7 +42,7 @@ from ate_env.telemetry import (
     reset_recorded_metrics,
     set_bench_context,
 )
-from ate_env.telemetry.trace_recorder import resolve_trace_path
+from ate_env_rl.telemetry.trace_recorder import resolve_trace_path
 
 from .fakes import FakeEnvironmentService, FakeFileSystemService, FakeProcessService
 

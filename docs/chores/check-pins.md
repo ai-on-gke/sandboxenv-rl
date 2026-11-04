@@ -18,7 +18,7 @@ This repository pins development toolchains, language runtimes, package dependen
 | GitHub Actions commit SHAs | [`.github/workflows/*.yaml`](../../.github/workflows), [`.github/actions/*/action.yml`](../../.github/actions) | Dependabot (`github-actions`) | [`hack/ci/lint-actions-locally.sh`](../../hack/ci/lint-actions-locally.sh), org zizmor scan |
 | CI Docker base image digest | [`Dockerfile.ci`](../../Dockerfile.ci) | Manual or `make update-pins` (crane digest resolution) | [`hack/ci/check-pins.py`](../../hack/ci/check-pins.py) (`@sha256:` digest check) |
 | Guest container base image | [`.ko.yaml`](../../.ko.yaml) | Manual (`baseImageOverrides`) | Nothing automated |
-| Generated protobuf stubs | [`proto/`](../../proto), [`clients/python/src/ate_env/_gen`](../../clients/python/src/ate_env/_gen) | `make protos` (Go stubs embed the generator versions pinned in `go.mod`; Python stubs embed the `grpcio-tools` version pinned in `clients/python/pyproject.toml` and `uv.lock`) | [`hack/verify/protos.sh`](../../hack/verify/protos.sh) (`make ci-go`) |
+| Generated protobuf stubs | [`proto/`](../../proto), [`clients/python/src/ate_env_rl/_gen`](../../clients/python/src/ate_env_rl/_gen) | `make protos` (Go stubs embed the generator versions pinned in `go.mod`; Python stubs embed the `grpcio-tools` version pinned in `clients/python/pyproject.toml` and `uv.lock`) | [`hack/verify/protos.sh`](../../hack/verify/protos.sh) (`make ci-go`) |
 | Protobuf tools and generator plugins | [`go.mod`](../../go.mod), [`go.sum`](../../go.sum) | Dependabot (`gomod`; `tool` directives) | [`hack/verify/protos.sh`](../../hack/verify/protos.sh) (`make verify-protos`) |
 | Substrate platform version | [`README.md`](../../README.md) ("Built against Substrate vX.Y.Z") | Manual (see [check-substrate-head.md](check-substrate-head.md)) | Manual verification |
 | E2E rootfs test image | [`hack/ci/targets.py`](../../hack/ci/targets.py) | Manual (refresh digest with `crane digest docker.io/library/python:3.13-slim`) | E2E (`test_create_from_image`) |
@@ -74,7 +74,7 @@ git commit -a -m "chore: align pins and stubs"
   ```bash
   make protos
   ```
-  This invokes `make python-protos` ([`clients/python/scripts/gen-protos.sh`](../../clients/python/scripts/gen-protos.sh)) and `go tool buf generate` ([`buf.gen.yaml`](../../buf.gen.yaml)). Commit the updated stubs in `proto/` and `clients/python/src/ate_env/_gen/`.
+  This invokes `make python-protos` ([`clients/python/scripts/gen-protos.sh`](../../clients/python/scripts/gen-protos.sh)) and `go tool buf generate` ([`buf.gen.yaml`](../../buf.gen.yaml)). Commit the updated stubs in `proto/` and `clients/python/src/ate_env_rl/_gen/`.
 - Refreshing Dockerfile.ci digest: Run `make update-pins`. It uses `crane` to resolve `nixos/nix:latest` and updates [`Dockerfile.ci`](../../Dockerfile.ci).
 - Bumping go.mod go directive: When upgrading the `go` directive in [`go.mod`](../../go.mod), [`nix/ci.nix`](../../nix/ci.nix) maps the major and minor version to `pkgs.go_X_Y`. If the locked `nixpkgs` lacks that Go release, evaluation aborts with:
   ```text

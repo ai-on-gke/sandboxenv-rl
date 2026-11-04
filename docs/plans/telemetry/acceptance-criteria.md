@@ -42,7 +42,7 @@ Conventions:
 ## AC-1: Base install carries no telemetry dependency
 
 - Commands: in `$VENV_BASE`: `pip list | grep -iE 'opentelemetry|prometheus'` and
-  `python -c "import ate_env, ate_env.observability, ate_env.telemetry; print('ok')"`.
+  `python -c "import ate_env_rl, ate_env_rl.observability, ate_env_rl.telemetry; print('ok')"`.
 - Expected: the grep prints nothing; the import prints `ok`.
 - Pass rule: both as expected; `clients/python/pyproject.toml` base `dependencies` lists only
   `grpcio` and `protobuf`; the extras `tracing` and `metrics` exist.
@@ -137,7 +137,7 @@ Conventions:
 
 - Command: `pytest clients/python/tests/test_observability.py -k registry` and
   `pytest clients/python/tests/test_telemetry_metrics.py`.
-- Expected: importing `ate_env` and `ate_env.observability` adds nothing to
+- Expected: importing `ate_env_rl` and `ate_env_rl.observability` adds nothing to
   `prometheus_client.REGISTRY` and does not import `prometheus_client`; constructing an `Observer`
   with metrics on registers the `ate_env_fleet_*` families once; a second `Observer` and a new
   registry do not raise or lose samples; each family's label names are exactly those in

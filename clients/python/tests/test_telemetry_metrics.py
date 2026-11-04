@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The lazy ``ate_env_client_*`` histograms in ate_env.telemetry.metrics."""
+"""The lazy ``ate_env_client_*`` histograms in ate_env_rl.telemetry.metrics."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ import textwrap
 
 import pytest
 
-from ate_env.telemetry import metrics
+from ate_env_rl.telemetry import metrics
 
 FAMILIES = {
     "acquire": "ate_env_client_acquire_seconds",
@@ -53,11 +53,11 @@ def test_missing_extra_logs_one_warning(monkeypatch, caplog):
     monkeypatch.setattr(metrics, "_PROM", False)
     monkeypatch.setattr(metrics, "_MISSING_LOGGED", False)
     monkeypatch.setattr(metrics, "_ENABLED", False)
-    caplog.set_level(logging.WARNING, logger="ate_env.telemetry.metrics")
+    caplog.set_level(logging.WARNING, logger="ate_env_rl.telemetry.metrics")
     assert metrics.enable_client_metrics() is False
     assert metrics.enable_client_metrics() is False
     assert len(caplog.records) == 1
-    assert "ate-env-client[metrics]" in caplog.records[0].getMessage()
+    assert "ate-env-rl[metrics]" in caplog.records[0].getMessage()
     metrics.observe("exec", 1.0)  # still a no-op
 
 
@@ -66,7 +66,7 @@ def test_histograms_register_on_first_use_only():
     code = textwrap.dedent(
         """
         import prometheus_client
-        from ate_env.telemetry import metrics
+        from ate_env_rl.telemetry import metrics
 
         def names():
             return {n for n in prometheus_client.REGISTRY._names_to_collectors
@@ -111,9 +111,9 @@ def test_metric_helper_is_idempotent():
 
 async def test_substrate_driver_records_client_timings(fake_stack):
     prom = pytest.importorskip("prometheus_client")
-    from ate_env.backend.substrate import SubstrateBackendDriver
-    from ate_env.config import ObservabilityConfig
-    from ate_env.observability import Observer
+    from ate_env_rl.backend.substrate import SubstrateBackendDriver
+    from ate_env_rl.config import ObservabilityConfig
+    from ate_env_rl.observability import Observer
 
     client, _fakes = fake_stack
     Observer(ObservabilityConfig(enable_metrics=True))  # enables client metrics

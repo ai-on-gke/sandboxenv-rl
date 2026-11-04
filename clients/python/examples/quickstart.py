@@ -21,7 +21,7 @@ Port-forward the service first:
 
 import asyncio
 
-from ate_env import Client, Signal
+from ate_env_rl import Client, Signal
 
 
 async def main():

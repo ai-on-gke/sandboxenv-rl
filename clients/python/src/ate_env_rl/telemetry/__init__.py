@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Optional telemetry for the ate_env client.
+"""Optional telemetry for the ate_env_rl client.
 
 Tracing needs the ``tracing`` extra and client metrics the ``metrics`` extra.
 Nothing here imports OpenTelemetry or prometheus_client at import time;

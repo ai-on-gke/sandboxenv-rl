@@ -270,3 +270,10 @@ Append-only. Each entry: date, who, what, why.
   every reap deletes `WARM_POOL_RUN_ID`, the run's own included). `_release_internal` re-tags when a
   reap ran since the pop, not only when a recycle saw the teardown; a failed release with no reap
   keeps its run id, which a test pins. The model's gap lemmas stay as the code before the fix.
+  Review of #238 found three more paths and one race, fixed in the same pull request: a recycle
+  cancelled in `suspend()` after a reap; a `warm_pool` call cancelled after a teardown before its
+  deletes started (its actors were owned under the reaped run id until a delete failed); and a
+  release that checked `_may_pool` and updated `_owned_actors` in two lock holds, so a reap on
+  another thread could start between them. `_return_popped` now does both in one hold for every
+  release path, and torn-down or drained `warm_pool` actors are owned under `WARM_POOL_RUN_ID` from
+  the start. `missed_by_reap` is gone: a reap that the recycle saw also fails `_may_pool`.

@@ -5,7 +5,7 @@ property tests here are proposed and not in the repository: `pgregory.net/rapid`
 and the Hypothesis tests named "Proposed test" do not exist. Two parts exist:
 
 - `clients/python/tests/test_warm_pool_accounting.py` (#221): the P-9 to P-11 stateful test
-  `test_warm_pool_accounting` and 18 plain interleaving tests. `hypothesis` is in the `dev` extra
+  `test_warm_pool_accounting` and 24 plain interleaving tests. `hypothesis` is in the `dev` extra
   since #221.
 - [verify/](./verify/README.md): hand-written Dafny models of P-1 to P-11 and of the two bugs review
   found in #221's first version. CI checks their results (AC-20).
@@ -622,13 +622,18 @@ and a scratch test against `main` (`c0c41ac`) reproduced both:
   `_delete_unpooled` catches `Exception`, so a cancellation skips the re-tag.
 - `ReleaseDeleteFailSafe`: `release("sb-1")` pops the actor and awaits `delete()`; `reap("run-1")`
   runs and cannot see it; the delete fails. `_release_internal` puts the actor back under `run-1`
-  (`missed_by_reap` is set only by a recycle whose `suspend()` returned after a teardown), and
+  (`missed_by_reap` was set only by a recycle whose `suspend()` returned after a teardown), and
   `reap("run-2")` leaves it alive.
 
-#238 re-tags a cancelled `_delete_unpooled` too, and makes `_release_internal` re-tag whenever a
-reap ran since it popped the actor (`not _may_pool(teardowns)`); a release whose delete fails with
-no reap keeps its run id, so the run's own reap retries it. `DeleteCancelledFixedSafe` and
-`ReleaseDeleteFailFixedSafe` verify both; the scratch reproductions are now tests.
+#238 re-tags a cancelled `_delete_unpooled` too, and owns the actors a torn-down or drained
+`warm_pool` call made under `WARM_POOL_RUN_ID` from the start, so a cancel before any delete starts
+leaves nothing under the reaped run id. A release that pops an actor and does not delete it (its
+delete fails or is cancelled, or a recycle is cancelled in `suspend()`) owns it again through
+`_return_popped`: under `WARM_POOL_RUN_ID` if a reap ran since the pop (`not _may_pool(teardowns)`),
+else under its run id, so the run's own reap retries it. The check and the update share one lock
+hold, so a reap on another thread cannot start in between. `DeleteCancelledFixedSafe`,
+`WarmCommitDrainedSafe` and `ReturnPoppedSafe` verify these; the scratch reproductions are now
+tests.
 
 **How the concurrency model works.** Each piece of code between two `await`s is one atomic action on
 shared state (`Acquire`, `RecycleStart`, `RecycleFinish`, `WarmPlan`, `WarmCommit`, `Reap`). The

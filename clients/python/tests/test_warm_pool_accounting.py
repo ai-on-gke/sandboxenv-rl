@@ -41,7 +41,7 @@ from hypothesis.stateful import (
 )
 
 from ate_env_rl.backend.substrate import SubstrateBackendDriver
-from ate_env_rl.config import ObservabilityConfig
+from ate_env_rl.config import WARM_POOL_RUN_ID, ObservabilityConfig
 from ate_env_rl.errors import NotFoundError, SandboxStartError
 from ate_env_rl.observability import Observer
 
@@ -407,6 +407,56 @@ async def test_release_delete_lost_during_reap_leaves_the_actor_for_any_later_re
 
     client.delete_gate = None
     client.delete_error = None
+    await driver.reap_async("run-2")
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+async def test_recycle_cancelled_in_suspend_after_a_reap_leaves_the_actor_for_any_later_reap() -> None:
+    client = GatedClient()
+    driver, obs = _driver(client)
+    client.live.add("sb-1")
+    handle = driver._make_instance("sb-1", "tmpl", run_id="run-1")
+    driver._owned_actors["sb-1"] = handle
+    client.suspend_gates["sb-1"] = asyncio.Event()
+
+    recycle = asyncio.create_task(driver.release_async("sb-1", recycle=True))
+    await _spin()  # paused in suspend(); the actor is not owned now
+    await driver.reap_async("run-1")  # cannot see it
+    obs.warm_reset()
+    recycle.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await recycle
+    assert driver._owned_actors["sb-1"].run_id == WARM_POOL_RUN_ID
+    assert handle.run_id == "run-1"  # the caller's handle is not changed
+
+    await driver.reap_async("run-2")
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+async def test_warm_pool_cancelled_before_its_deletes_start_leaves_actors_for_any_later_reap() -> None:
+    client = GatedClient()
+    driver, obs = _driver(client)
+    client.create_gate = asyncio.Event()
+
+    async def never_runs(actor_id: str, why: str) -> None:
+        # Stands for a cancel that lands before any _delete_unpooled starts.
+        await asyncio.Event().wait()
+
+    driver._delete_unpooled = never_runs  # type: ignore[method-assign]
+    warm = asyncio.create_task(driver.warm_pool_async("tmpl", R, run_id="run-1"))
+    await _spin()  # paused in create()
+    await driver.reap_async("run-1")
+    obs.warm_reset()
+    client.create_gate.set()
+    await _spin()  # owned the actors, awaiting the deletes
+    warm.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await warm
+    assert len(client.live) == R
+    assert {i.run_id for i in driver._owned_actors.values()} == {WARM_POOL_RUN_ID}
+
     await driver.reap_async("run-2")
     assert client.live == set()
     assert driver._owned_actors == {}

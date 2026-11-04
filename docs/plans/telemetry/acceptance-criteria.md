@@ -16,7 +16,7 @@ Conventions:
 - "Properties (proposed)" names the properties in [properties.md](./properties.md) that would
   validate a criterion over generated inputs. Those tests are not in the repository.
 
-| ID    | Title                                                                               | PR         | Status at `c0c41ac`                                                                                           |
+| ID    | Title                                                                               | PR         | Status at `d0e4802` with #238                                                                                 |
 | ----- | ----------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------- |
 | AC-1  | Base install carries no telemetry dependency and imports clean                      | 1, 2       | pass: `pyproject.toml`, `test_registry_import_does_not_load_prometheus`                                       |
 | AC-2  | Telemetry enabled without the extras is a logged no-op                              | 1, 2       | pass: `test_missing_extra_logs_one_error`, `test_observer_without_layers_is_report_only`                      |
@@ -246,7 +246,7 @@ Conventions:
   `dafny verify docs/plans/telemetry/verify/warm_pool.dfy`,
   `dafny verify docs/plans/telemetry/verify/warm_pool_generations.dfy` and
   `dafny verify docs/plans/telemetry/verify/warm_pool_drain.dfy`.
-- Expected: the pytest run passes (22 plain tests and the stateful `test_warm_pool_accounting`).
+- Expected: the pytest run passes (24 plain tests and the stateful `test_warm_pool_accounting`).
   15.4: `test_unwarm_cancels_a_warm_pool_in_flight`,
   `test_shrinking_resize_cancels_a_warm_pool_in_flight`,
   `test_warm_pool_after_unwarm_ignores_the_cancelled_call` and the machine's `unwarm` rule. 15.5:
@@ -256,14 +256,16 @@ Conventions:
   `test_direct_reap_moves_the_gauge_with_the_pool`. 15.9:
   `test_cancelled_delete_after_reap_leaves_warm_actors_for_any_later_reap`,
   `test_release_delete_lost_during_reap_leaves_the_actor_for_any_later_reap` (failed and cancelled),
-  and `test_release_delete_failure_without_a_reap_keeps_the_run_id` for the path that must not
-  change. `warm_pool.dfy`: 16 verified, 3 errors, all in `WarmPoolBefore` (the code before #221).
+  `test_recycle_cancelled_in_suspend_after_a_reap_leaves_the_actor_for_any_later_reap`,
+  `test_warm_pool_cancelled_before_its_deletes_start_leaves_actors_for_any_later_reap`, and
+  `test_release_delete_failure_without_a_reap_keeps_the_run_id` for the path that must not change.
+  `warm_pool.dfy`: 16 verified, 3 errors, all in `WarmPoolBefore` (the code before #221).
   `warm_pool_generations.dfy`: 24 verified, 3 errors, in `PlanFirstCovers` and
   `ClaimFailPutBackSafe` (#221's first version) and `ClaimOkReturnsLive` (the open claim/reap gap).
-  `warm_pool_drain.dfy`: 51 verified, 5 errors, in `CommitStaleBeforeSafe`, `ResizeBeforeSafe` and
-  `DeleteFailBeforeSafe` (the code before 15.4 and 15.5) and `DeleteCancelledSafe` and
-  `ReleaseDeleteFailSafe` (the code before 15.9's fix). [verify/README.md](./verify/README.md)
-  explains each.
+  `warm_pool_drain.dfy`: 54 verified, 7 errors, in `CommitStaleBeforeSafe`, `ResizeBeforeSafe` and
+  `DeleteFailBeforeSafe` (the code before 15.4 and 15.5) and `WarmCommitDrainedBeforeSafe`,
+  `RecycleSuspendCancelledBeforeSafe`, `DeleteCancelledSafe` and `ReleaseDeleteFailSafe` (the code
+  before 15.9's fix). [verify/README.md](./verify/README.md) explains each.
 - Pass rule: pytest green; Dafny output matches. CI runs both (the Dafny check is AC-20).
 - Status: 15.1 to 15.6 and 15.9 pass; 15.7 and 15.8 are open, with no test on `main`. The 15.9 tests
   fail on the code before #238.
@@ -328,7 +330,7 @@ Conventions:
   [verify/README.md](./verify/README.md) lists.
 - Command: `make ci-dafny` (the `.#dafny` devShell runs `hack/verify/dafny.py`).
 - Expected: `telemetry.dfy` 14 verified, 0 errors; `warm_pool.dfy` 16 verified, 3 errors;
-  `warm_pool_generations.dfy` 24 verified, 3 errors; `warm_pool_drain.dfy` 51 verified, 5 errors;
+  `warm_pool_generations.dfy` 24 verified, 3 errors; `warm_pool_drain.dfy` 54 verified, 7 errors;
   the failing lemmas are the ones the README's table lists; the script prints
   `All 4 Dafny models match docs/plans/telemetry/verify/README.md.`
 - Status: pass. CI's `Dafny models` job runs the check with the pinned nixpkgs' Dafny 4.11.0.

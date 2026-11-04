@@ -15,16 +15,26 @@
 package routertls_test
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/agent-substrate/env/internal/internaltest/testcerts"
 	"github.com/agent-substrate/env/internal/routertls"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 const routerName = "atenet-router.ate-system.svc"
@@ -176,5 +186,115 @@ func TestConfigFailsFastOnBadFiles(t *testing.T) {
 	}
 	if got := routertls.SPIFFEID("ate-env", "ate-env-api"); got != "spiffe://cluster.local/ns/ate-env/sa/ate-env-api" {
 		t.Errorf("SPIFFEID = %q", got)
+	}
+}
+
+type waitPeerCloseCreds struct {
+	credentials.TransportCredentials
+	peerClosed <-chan struct{}
+}
+
+func (w waitPeerCloseCreds) ClientHandshake(ctx context.Context, authority string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	conn, info, err := w.TransportCredentials.ClientHandshake(ctx, authority, rawConn)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, ok := conn.(syscall.Conn); !ok {
+		conn.Close()
+		return nil, nil, errors.New("wrapped connection dropped syscall.Conn")
+	}
+	select {
+	case <-w.peerClosed:
+	case <-ctx.Done():
+		conn.Close()
+		return nil, nil, ctx.Err()
+	}
+	return conn, info, nil
+}
+
+func (w waitPeerCloseCreds) Clone() credentials.TransportCredentials {
+	return waitPeerCloseCreds{
+		TransportCredentials: w.TransportCredentials.Clone(),
+		peerClosed:           w.peerClosed,
+	}
+}
+
+// In TLS 1.3 the client finishes Handshake before the router verifies the
+// client certificate. When the router sends a TLS alert and closes the TCP
+// connection before grpc-go writes its HTTP/2 client preface and initial
+// SETTINGS frame, TransportCredentials still reports the TLS alert so
+// RejectedCertificate matches it.
+func TestTransportCredentialsReadsPostHandshakeAlert(t *testing.T) {
+	ca := testcerts.NewAuthority(t, "test podcert")
+	peerClosed := make(chan struct{})
+	var closeOnce sync.Once
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(echoID))
+	srv.EnableHTTP2 = true
+	srv.TLS = &tls.Config{
+		Certificates:          []tls.Certificate{ca.Server(t, routerName)},
+		ClientAuth:            tls.RequireAndVerifyClientCert,
+		ClientCAs:             ca.Pool(),
+		VerifyPeerCertificate: testcerts.Allow(routertls.SPIFFEID("ate-env", "someone-else")),
+	}
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateClosed {
+			closeOnce.Do(func() { close(peerClosed) })
+		}
+	}
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	dir := t.TempDir()
+	cfg, err := routertls.Options{
+		CredentialBundleFile: testcerts.WriteFile(t, dir, "credential-bundle.pem", ca.ClientBundle(t, routertls.SPIFFEID("ate-env", "ate-env-api"))),
+		TrustBundleFile:      testcerts.WriteFile(t, dir, "trust-bundle.pem", ca.PEM),
+		ServerName:           routerName,
+	}.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	creds := waitPeerCloseCreds{
+		TransportCredentials: routertls.TransportCredentials(cfg),
+		peerClosed:           peerClosed,
+	}
+	conn, err := grpc.NewClient(strings.TrimPrefix(srv.URL, "https://"), grpc.WithTransportCredentials(creds))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = conn.Invoke(ctx, "/ateenv.test.Nothing/Ping", &emptypb.Empty{}, &emptypb.Empty{})
+	_ = conn.Close()
+	if !routertls.RejectedCertificate(err) {
+		t.Fatalf("Invoke() = %v, want a remote TLS alert recognized by RejectedCertificate", err)
+	}
+
+	// An allow-listed client certificate completes RPCs normally through
+	// TransportCredentials.
+	lis, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates:          []tls.Certificate{ca.Server(t, routerName)},
+		ClientAuth:            tls.RequireAndVerifyClientCert,
+		ClientCAs:             ca.Pool(),
+		NextProtos:            []string{"h2"},
+		VerifyPeerCertificate: testcerts.Allow(routertls.SPIFFEID("ate-env", "ate-env-api")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gsrv := grpc.NewServer()
+	t.Cleanup(gsrv.Stop)
+	go gsrv.Serve(lis)
+
+	okConn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(routertls.TransportCredentials(cfg).Clone()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = okConn.Close() })
+	if err := okConn.Invoke(ctx, "/ateenv.test.Nothing/Ping", &emptypb.Empty{}, &emptypb.Empty{}); status.Code(err) != codes.Unimplemented {
+		t.Fatalf("Invoke() with allow-listed certificate = %v, want Unimplemented", err)
 	}
 }

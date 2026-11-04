@@ -548,6 +548,21 @@ class SlowCreatesClient(GatedClient):
         await super().delete(actor_id, **kw)
 
 
+class SlowSuspendsClient(SlowCreatesClient):
+    """Every create() lands; the first ``fast`` suspend() calls return, the rest wait."""
+
+    def __init__(self, fast: int) -> None:
+        super().__init__(fast=1_000)
+        self.fast_suspends = fast
+        self.suspends = 0
+        self.suspend_gate = asyncio.Event()
+
+    async def suspend(self, actor_id: str, **kw: object) -> None:
+        n, self.suspends = self.suspends, self.suspends + 1
+        if n >= self.fast_suspends:
+            await self.suspend_gate.wait()
+
+
 # AC-15.8: a warm_pool call cancelled during its create() calls leaves no live
 # actor untracked; any run's reap deletes what it made.
 async def test_cancelled_warm_pool_leaves_its_actors_for_any_reap() -> None:
@@ -568,6 +583,42 @@ async def test_cancelled_warm_pool_leaves_its_actors_for_any_reap() -> None:
     assert driver._warm_inflight == {}
     # The third id's create never landed: NotFound for the reap, not counted.
     assert await driver.reap_async("run-2") == 2
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+async def test_warm_pool_cancelled_in_suspend_leaves_its_actors_for_any_reap() -> None:
+    client = SlowSuspendsClient(fast=2)
+    driver, obs = _driver(client)
+
+    warm = asyncio.create_task(driver.warm_pool_async("tmpl", R, run_id="run-1"))  # wait=True
+    await _spin()  # three actors created, the third suspend() paused
+    assert len(client.live) == R
+    warm.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await warm
+
+    assert client.live <= set(driver._owned_actors)
+    assert _pool(driver) == []
+    assert await driver.reap_async("run-2") == R
+    assert client.live == set()
+
+
+async def test_warm_pool_cancelled_just_before_the_runs_reap_deletes_its_actors() -> None:
+    # The reap snapshots what it deletes before the cancel handler runs, and
+    # the run is not reaped again: the handler deletes the actors itself.
+    client = SlowCreatesClient(fast=2)
+    driver, obs = _driver(client)
+    client.create_gate = asyncio.Event()
+
+    warm = asyncio.create_task(driver.warm_pool_async("tmpl", R, run_id="run-1"))
+    await _spin()  # two actors created, the third create() paused
+    warm.cancel()
+    await driver.reap_async("run-1")  # no await in between: the handler has not run
+    with pytest.raises(asyncio.CancelledError):
+        await warm
+    await asyncio.gather(*list(driver._background_tasks))
+
     assert client.live == set()
     assert driver._owned_actors == {}
 

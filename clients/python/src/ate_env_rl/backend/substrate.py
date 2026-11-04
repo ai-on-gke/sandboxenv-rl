@@ -714,6 +714,7 @@ class SubstrateBackendDriver(BackendDriver):
             # never created is NotFound there, which counts as gone).
             with self._lock:
                 _release_reservation()
+                reaped_since = not self._may_pool(teardowns)
                 for aid in started:
                     self._owned_actors.setdefault(
                         aid,
@@ -721,6 +722,18 @@ class SubstrateBackendDriver(BackendDriver):
                             aid, template_id, run_id=WARM_POOL_RUN_ID, rootfs_image=rootfs_image
                         ),
                     )
+            if reaped_since:
+                # A reap ran or is running and may have taken its snapshot
+                # before this handler, and a fleet reaps its run once: delete
+                # them now, in background tasks so the cancel is not delayed,
+                # as the wait=False suspends do. A delete that fails or never
+                # runs leaves them for any later reap (AC-15.8).
+                for aid in started:
+                    task = asyncio.create_task(
+                        self._delete_unpooled(aid, "after a cancelled warm_pool")
+                    )
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
             raise
 
         created = [r for r in results if isinstance(r, str)]

@@ -106,9 +106,12 @@ To see a finding come back, revert its amendment in `telemetry.dfy` and run `daf
   after the teardown) or bug B (its `Acquire` is one step with no await or put-back).
   `warm_pool_generations.dfy` was written after review found both.
 - `Reap` is one atomic step in every warm-pool model. So none covers work that runs while `reap`
-  waits on its deletes (`_reaping`, from the second review of #221), nor a `warm_pool` cancelled
-  during its `create()` calls, which can leak the actors already created. `warm_pool_drain.dfy`
-  models one kind of cancellation: a delete in flight that ends without deleting.
+  waits on its deletes (`_reaping`, from the second review of #221), and a `warm_pool` cancelled
+  during its `create()` calls is one step (`WarmCancelledFixed`) taken after all its creates ended;
+  the leak `WarmCancelledBefore` models is the code before #240. Nor does any model order a reap's
+  snapshot against that step: the case where the run's reap snapshots before the cancel handler
+  runs, which the handler covers by deleting the actors itself, is checked by a test only.
+  `warm_pool_drain.dfy` also models a delete in flight that ends without deleting.
 - `WarmPoolDrain` folds `_teardowns` and the pool generation into one counter and has no reap or
   claim; those are in `warm_pool_generations.dfy`. `WarmPoolRunIds` has no pool, and a reap's own
   failed deletes are outside it (the code drops those actors and raises `InfrastructureError` with

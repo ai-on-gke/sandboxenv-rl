@@ -24,7 +24,8 @@
 //      WarmPoolRunIds, which also has AC-15.9 (a cancelled delete, and a
 //      release whose delete fails or is cancelled after a reap ran, re-tag
 //      too) and AC-15.8 (a warm_pool cancelled during its creates owns what
-//      it made under WARM_POOL_RUN_ID).
+//      it made under WARM_POOL_RUN_ID, and an actor whose suspend() fails is
+//      owned the same way and deleted).
 //
 // As in the other models, each action is the code between two awaits of
 // clients/python/src/ate_env_rl/backend/substrate.py, for one pool key and one
@@ -269,9 +270,10 @@ module WarmPoolRunIds {
   )
 
   ghost predicate Inv(s: State) {
-    // No `owned.Keys <= live`: a cancelled warm_pool owns ids whose create()
-    // may never have landed; a reap or release finds those NotFound, which
-    // counts as gone.
+    // No `owned.Keys <= live` and no `releasing.Keys <= live`: a cancelled
+    // warm_pool owns ids whose create() may never have landed, and
+    // ReleaseStart can move such an id to releasing; a reap or release finds
+    // those NotFound, which counts as gone.
     && s.live <= s.owned.Keys + s.releasing.Keys                      // TRACKED
     && s.deleting <= s.owned.Keys
     && s.owned.Keys !! s.releasing.Keys

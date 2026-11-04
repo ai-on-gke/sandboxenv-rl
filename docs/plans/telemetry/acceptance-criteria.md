@@ -239,8 +239,9 @@ Conventions:
   (`ClaimOkReturnsLive`).
 - 15.8: a `warm_pool` call cancelled during its `create()` calls, or one of whose actors fails to
   suspend, leaves no live actor untracked. Met by #240: a cancelled call owns the actors it sent a
-  `create()` for under `WARM_POOL_RUN_ID`, so any run's reap deletes them, and an actor whose
-  `suspend()` fails is owned the same way and deleted at once; before it, those actors leaked.
+  `create()` for under `WARM_POOL_RUN_ID`, so any run's reap deletes them, and deletes them itself
+  if a reap ran since it planned (that reap may have missed them), and an actor whose `suspend()`
+  fails is owned the same way and deleted at once; before it, those actors leaked.
 - 15.9: a delete that is cancelled after the run's reap, or a `release` whose delete fails or is
   cancelled while a reap runs, also leaves the actor for the next `reap` of any run. Met by #238;
   before it both kept the reaped run id, so no later reap deleted the actor (`DeleteCancelledSafe`,
@@ -254,7 +255,7 @@ Conventions:
   `dafny verify docs/plans/telemetry/verify/warm_pool.dfy`,
   `dafny verify docs/plans/telemetry/verify/warm_pool_generations.dfy` and
   `dafny verify docs/plans/telemetry/verify/warm_pool_drain.dfy`.
-- Expected: the pytest run passes (31 plain tests and the stateful `test_warm_pool_accounting`).
+- Expected: the pytest run passes (33 plain tests and the stateful `test_warm_pool_accounting`).
   15.4: `test_unwarm_cancels_a_warm_pool_in_flight`,
   `test_shrinking_resize_cancels_a_warm_pool_in_flight`,
   `test_warm_pool_after_unwarm_ignores_the_cancelled_call` and the machine's `unwarm` rule. 15.5:
@@ -267,9 +268,10 @@ Conventions:
   the gate pauses the reap's delete of the popped actor for `run-0`, and the claim's own delete of
   it for `run-1`, where the reap deletes nothing). 15.8:
   `test_cancelled_warm_pool_leaves_its_actors_for_any_reap` (which also checks the reap counts only
-  the 2 actors that exist), `test_warm_actor_whose_suspend_fails_is_deleted_or_left_for_any_reap`
-  (delete succeeds, and fails). 15.9:
-  `test_cancelled_delete_after_reap_leaves_warm_actors_for_any_later_reap`,
+  the 2 actors that exist), `test_warm_pool_cancelled_in_suspend_leaves_its_actors_for_any_reap`,
+  `test_warm_pool_cancelled_just_before_the_runs_reap_deletes_its_actors`,
+  `test_warm_actor_whose_suspend_fails_is_deleted_or_left_for_any_reap` (delete succeeds, and
+  fails). 15.9: `test_cancelled_delete_after_reap_leaves_warm_actors_for_any_later_reap`,
   `test_release_delete_lost_during_reap_leaves_the_actor_for_any_later_reap` (failed and cancelled),
   `test_recycle_cancelled_in_suspend_after_a_reap_leaves_the_actor_for_any_later_reap`,
   `test_warm_pool_cancelled_before_its_deletes_start_leaves_actors_for_any_later_reap`, and

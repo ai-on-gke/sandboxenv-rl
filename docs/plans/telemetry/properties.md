@@ -5,7 +5,7 @@ property tests here are proposed and not in the repository: `pgregory.net/rapid`
 and the Hypothesis tests named "Proposed test" do not exist. Two parts exist:
 
 - `clients/python/tests/test_warm_pool_accounting.py` (#221): the P-9 to P-11 stateful test
-  `test_warm_pool_accounting` and 31 plain interleaving tests. `hypothesis` is in the `dev` extra
+  `test_warm_pool_accounting` and 33 plain interleaving tests. `hypothesis` is in the `dev` extra
   since #221.
 - [verify/](./verify/README.md): hand-written Dafny models of P-1 to P-11 and of the two bugs review
   found in #221's first version. CI checks their results (AC-20).
@@ -393,7 +393,10 @@ from the run is alive on Substrate or tracked by the driver.
 - AC-15.8, fixed by #240: a `warm_pool` call cancelled while `asyncio.gather` waits on its
   `create()` calls dropped the ids of the actors already created, so they were neither pooled nor
   owned and no reap found them. It now owns every id it sent a `create()` for under
-  `WARM_POOL_RUN_ID` (a reap finds one never created NotFound, which counts as gone). Test:
+  `WARM_POOL_RUN_ID` (a reap finds one never created NotFound, which counts as gone), and if a reap
+  ran since it planned, it also deletes them in background tasks: that reap may have taken its
+  snapshot before the handler ran
+  (`test_warm_pool_cancelled_just_before_the_runs_reap_deletes_its_actors`). Test:
   `test_cancelled_warm_pool_leaves_its_actors_for_any_reap`; Dafny: TRACKED in
   `verify/warm_pool_drain.dfy` (`WarmCancelledFixedSafe`; `WarmCancelledBeforeSafe` models the code
   before and fails). Review of #240 found the same leak without a cancel: with `wait=True`, an actor

@@ -95,8 +95,8 @@ Status: draft, 2026-10-30. Each criterion has a command and an expected result. 
 
 ## AC-10: Schema and secrets
 
-- Command: `go test ./internal/fleet/...` and a grep over a day of snapshots and events for `token`,
-  `password`, `authorization`, `ya29.`, `AIza`.
+- Command: `go test ./internal/inventory/...` and a grep over a day of snapshots and events for
+  `token`, `password`, `authorization`, `ya29.`, `AIza`.
 - Expected: the golden file matches; zero hits.
 - Pass rule: holds.
 

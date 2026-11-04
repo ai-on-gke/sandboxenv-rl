@@ -38,7 +38,7 @@ Phases 2, 3 and 4 run in parallel after phase 1.
 
 | #   | Scope                                                                                                                                                              | Size   |
 | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------ |
-| 1   | `internal/inventory`: snapshot and index schemas, JSON tags, a golden file                                                                                         | small  |
+| 1   | `internal/inventory`: the snapshot schema, JSON tags, a golden file                                                                                                | small  |
 | 2   | `cmd/ate-env-reporter` and `ate-env manifest reporter`: poll loop, diffing on `uid` and `update_time`, atomic writes, health endpoint, tests against `fakecontrol` | medium |
 | 3   | `manifests/telemetry/`: collector deployment and `PodMonitoring`; `ate-env manifest --pod-monitoring`                                                              | small  |
 | 4   | `cmd/ate-env-fleet-site`: HTTP server, IAP verification, GCS and BigQuery readers, Fleet and Cluster pages, JSON API                                               | large  |

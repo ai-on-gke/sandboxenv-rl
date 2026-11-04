@@ -7,7 +7,7 @@ confirms them and records changes in [decisions.md](./decisions.md).
 
 ```
 gs://<bucket>/v1/inventory/<project>/<cluster>/latest.json          overwritten every interval
-gs://<bucket>/v1/inventory/<project>/<cluster>/snapshots/<ts>.json  hourly, lifecycle 30 days
+gs://<bucket>/v1/snapshots/<project>/<cluster>/<ts>.json            hourly, lifecycle 30 days (its own prefix, so no rule can touch latest.json)
 gs://<bucket>/v1/events/<dt=YYYY-MM-DD>/...                          Cloud Storage subscription output, lifecycle 400 days
 gs://<bucket>/v1/traces/<year>/<month>/<day>/...                     google_cloud_storage exporter output, gzip
 gs://<bucket>/v1/runs/<run_id>/                                      RunReport .txt and .json, report.html, spans.jsonl
@@ -20,25 +20,50 @@ object, so no two writers touch one object.
 
 ```json
 {
-  "schema_version": 1,
-  "generated_at": "2026-10-30T12:00:05Z",
-  "project": "<gcp project>",
-  "cluster": "<gke cluster>",
-  "location": "<region>",
-  "reporter": { "version": "v0.x.y", "commit": "abc1234", "interval_s": 5 },
-  "atespaces": [{ "name": "ate-env", "create_time": "..." }],
+  "schema_version": "v1",
+  "generated_at": "2026-11-03T12:00:05Z",
+  "project": "example-project",
+  "cluster": "bench-1",
+  "location": "us-central1",
+  "reporter": {
+    "version": "v0.1.0",
+    "commit": "abc1234",
+    "interval_s": 5
+  },
+  "atespaces": [
+    {
+      "name": "ate-env",
+      "create_time": "2026-11-03T12:00:00Z"
+    }
+  ],
   "templates": [
     {
       "atespace": "ate-env",
       "name": "default-template",
-      "base": "",
-      "guest_image": "...",
-      "rootfs_image": "",
+      "guest_image": "example.com/ate-env-guest@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "workerpool": "default-template-workerpool",
-      "create_time": "..."
+      "golden_state": "none",
+      "create_time": "2026-11-03T12:00:00Z"
+    },
+    {
+      "atespace": "ate-env",
+      "name": "default-template-1a2b3c4d5e6f",
+      "base": "default-template",
+      "rootfs_image": "example.com/python@sha256:1a2b3c4d5e6f0000000000000000000000000000000000000000000000000000",
+      "guest_image": "example.com/ate-env-guest@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "workerpool": "default-template-workerpool",
+      "golden_state": "ready",
+      "create_time": "2026-11-03T12:00:01Z"
     }
   ],
-  "tags": [{ "atespace": "ate-env", "name": "...", "template": "...", "create_time": "..." }],
+  "tags": [
+    {
+      "atespace": "ate-env",
+      "name": "golden-default-template-1a2b3c4d5e6f",
+      "source_actor": "golden-7f3e",
+      "create_time": "2026-11-03T12:00:02Z"
+    }
+  ],
   "workerpools": [
     {
       "namespace": "ate-env",
@@ -47,51 +72,76 @@ object, so no two writers touch one object.
       "ready_replicas": 4,
       "sandbox_class": "gvisor",
       "sandbox_config": "gvisor-default",
-      "worker_image": "..."
+      "worker_image": "example.com/ateworker-gvisor@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     }
   ],
   "workers": [
     {
-      "name": "<opaque>",
+      "name": "w-0a1b2c",
       "namespace": "ate-env",
       "pool": "default-template-workerpool",
-      "pod": "...",
-      "node": "...",
-      "state": "idle",
-      "capacity": { "cpu_m": 8000, "memory_bytes": 0 },
-      "allocated": { "cpu_m": 2000, "memory_bytes": 0 }
+      "pod": "default-template-workerpool-7c9d8-x2k4q",
+      "node": "gke-bench-1-pool-1-abcd",
+      "state": "active",
+      "capacity": {
+        "cpu_m": 8000,
+        "memory_bytes": 34359738368
+      },
+      "allocated": {
+        "cpu_m": 2000,
+        "memory_bytes": 4294967296
+      }
     }
   ],
   "actors": [
     {
-      "uid": "8f2a...",
+      "uid": "8f2a0001",
       "atespace": "ate-env",
-      "name": "env-...",
+      "name": "env-001",
       "template": "default-template-1a2b3c4d5e6f",
-      "source_tag": "",
       "state": "running",
-      "assigned_node": "gke-...",
-      "worker": "<opaque>",
-      "create_time": "...",
-      "update_time": "...",
-      "crash": null,
-      "labels": { "ate-env/run-id": "..." }
+      "assigned_node": "gke-bench-1-pool-1-abcd",
+      "worker": "w-0a1b2c",
+      "create_time": "2026-11-03T12:00:03Z",
+      "update_time": "2026-11-03T12:00:04Z",
+      "labels": {
+        "example.com/run-id": "r-1"
+      }
+    },
+    {
+      "uid": "8f2a0002",
+      "atespace": "ate-env",
+      "name": "env-002",
+      "template": "default-template-1a2b3c4d5e6f",
+      "source_tag": "golden-default-template-1a2b3c4d5e6f",
+      "state": "crashed",
+      "create_time": "2026-11-03T12:00:03Z",
+      "update_time": "2026-11-03T12:00:05Z",
+      "crash": {
+        "message": "atelet: restore failed: snapshot download timed out",
+        "crash_time": "2026-11-03T12:00:05Z"
+      }
     }
   ],
   "deployments": [
     {
       "namespace": "ate-env",
       "name": "ate-env-api",
-      "image": "...",
-      "version": "v0.x.y",
+      "image": "example.com/ate-env-api@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "version": "v0.1.0",
       "ready": 1,
       "tracing": true,
       "metrics_port": 9090
     }
   ],
   "counts": {
-    "actors_by_state": { "running": 12, "suspended": 40 },
-    "actors_by_atespace": { "ate-env": 52 }
+    "actors_by_state": {
+      "crashed": 1,
+      "running": 1
+    },
+    "actors_by_atespace": {
+      "ate-env": 2
+    }
   }
 }
 ```
@@ -201,7 +251,7 @@ PromQL results cached 10 s; event queries bounded to 24 h by default.
 | `requests_rate`       | `sum by (cluster, namespace, method) (rate(ate_env_api_requests_total[1m]))`                                                                                                                      |
 | `create_to_ready_p50` | `histogram_quantile(0.5, sum by (cluster, namespace, le) (rate(ate_env_api_create_to_ready_seconds_bucket[5m])))`                                                                                 |
 | `wake_wait_p95`       | `histogram_quantile(0.95, sum by (cluster, namespace, le) (rate(ate_env_api_wake_wait_seconds_bucket[5m])))`                                                                                      |
-| `environments`        | `sum by (cluster, namespace, atespace, state) (ate_env_api_environments)`                                                                                                                         |
+| `environments`        | `max by (cluster, namespace, atespace, state) (ate_env_api_environments)` (each replica reports the whole count)                                                                                  |
 | `workers`             | `sum by (cluster, ate_workerpool_namespace, ate_workerpool_name) (max by (cluster, ate_workerpool_namespace, ate_workerpool_name, ate_worker_state, ate_sandbox_class) (ate_workerpool_workers))` |
 | `crashes_rate`        | `sum by (cluster, ate_template_name) (rate(ate_actor_crashes_total[5m]))`                                                                                                                         |
 

@@ -13,6 +13,7 @@ export BUCKET=...               # one bucket, uniform access
 export IAP_GROUP=group:...      # who may open the site
 export CLUSTER_PROJECT=...      # repeat the per-cluster section for each cluster project
 export CLUSTER=...              # GKE cluster name, also the reporter's cluster label
+export CLUSTER_LOCATION=...     # the cluster's region or zone
 ```
 
 ## 1. Central project, once
@@ -22,7 +23,9 @@ Enable the services:
 ```bash
 gcloud services enable run.googleapis.com iap.googleapis.com pubsub.googleapis.com \
   bigquery.googleapis.com storage.googleapis.com monitoring.googleapis.com \
-  logging.googleapis.com --project "$CENTRAL_PROJECT"
+  logging.googleapis.com artifactregistry.googleapis.com --project "$CENTRAL_PROJECT"
+gcloud artifacts repositories create ate-env --repository-format docker \
+  --location "$REGION" --project "$CENTRAL_PROJECT"
 ```
 
 Bucket, with the lifecycle rules from [interfaces.md](./interfaces.md):
@@ -32,23 +35,31 @@ gcloud storage buckets create "gs://$BUCKET" --project "$CENTRAL_PROJECT" \
   --location "$REGION" --uniform-bucket-level-access --public-access-prevention
 cat > /tmp/lifecycle.json <<'EOF'
 {"rule": [
-  {"action": {"type": "Delete"}, "condition": {"age": 30,  "matchesPrefix": ["v1/inventory/"], "matchesSuffix": [".json"]}},
+  {"action": {"type": "Delete"}, "condition": {"age": 30,  "matchesPrefix": ["v1/snapshots/"]}},
   {"action": {"type": "Delete"}, "condition": {"age": 400, "matchesPrefix": ["v1/events/"]}}
 ]}
 EOF
 gcloud storage buckets update "gs://$BUCKET" --lifecycle-file /tmp/lifecycle.json
 ```
 
-The 30-day rule must not match `latest.json`; the reporter rewrites it every interval, so its age
-never reaches 30 days. Confirm after the first day with `gcloud storage ls -l`.
+`latest.json` lives under `v1/inventory/`, which no rule matches, so a reporter that stops for a
+month still leaves its last snapshot in place; the site shows it as stale. Timestamped snapshots
+have their own prefix, `v1/snapshots/`, for the 30-day rule.
 
-Topic, dataset and the two subscriptions. The BigQuery subscription needs the table first:
+Topic, dataset and the two subscriptions. Pub/Sub checks the permissions of its service agent when
+it creates an export subscription, so the agent and its grants come before the subscriptions:
 
 ```bash
 gcloud pubsub topics create ate-actor-events --project "$CENTRAL_PROJECT"
 bq --project_id "$CENTRAL_PROJECT" mk --dataset --location "$REGION" fleet
 bq --project_id "$CENTRAL_PROJECT" mk --table fleet.actor_events \
   subscription_name:STRING,message_id:STRING,publish_time:TIMESTAMP,data:STRING,attributes:STRING
+gcloud services identity create --service pubsub.googleapis.com --project "$CENTRAL_PROJECT"
+NUMBER=$(gcloud projects describe "$CENTRAL_PROJECT" --format 'value(projectNumber)')
+PUBSUB_SA="serviceAccount:service-$NUMBER@gcp-sa-pubsub.iam.gserviceaccount.com"
+bq add-iam-policy-binding --member "$PUBSUB_SA" --role roles/bigquery.dataEditor "$CENTRAL_PROJECT:fleet"
+gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "$PUBSUB_SA" --role roles/storage.objectCreator
+gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "$PUBSUB_SA" --role roles/storage.legacyBucketReader
 gcloud pubsub subscriptions create ate-actor-events-bq --topic ate-actor-events \
   --project "$CENTRAL_PROJECT" --bigquery-table "$CENTRAL_PROJECT:fleet.actor_events" \
   --write-metadata --expiration-period never
@@ -58,11 +69,8 @@ gcloud pubsub subscriptions create ate-actor-events-gcs --topic ate-actor-events
   --cloud-storage-max-duration 1m --expiration-period never
 ```
 
-The Pub/Sub service agent of the central project
-(`service-<number>@gcp-sa-pubsub.iam.gserviceaccount.com`) needs `roles/bigquery.dataEditor` on the
-dataset and `roles/storage.objectCreator` on the bucket. Phase 1 writes the raw log entry into
-`data`; the site parses the `ate.*` keys from it. The typed columns in
-[interfaces.md](./interfaces.md) arrive with the phase 2 topic schema.
+Phase 1 writes the raw log entry into `data`; the site parses the `ate.*` keys from it. The typed
+columns in [interfaces.md](./interfaces.md) arrive with the phase 2 topic schema.
 
 Service accounts and their only roles:
 
@@ -115,7 +123,7 @@ gcloud projects add-iam-policy-binding "$CLUSTER_PROJECT" --member "serviceAccou
 Managed Prometheus, on a Standard cluster (Autopilot has it on):
 
 ```bash
-gcloud container clusters update "$CLUSTER" --project "$CLUSTER_PROJECT" --region "$REGION" --enable-managed-prometheus
+gcloud container clusters update "$CLUSTER" --project "$CLUSTER_PROJECT" --location "$CLUSTER_LOCATION" --enable-managed-prometheus
 ```
 
 In the cluster, after the components exist:
@@ -137,7 +145,7 @@ Build and deploy with IAP on the service itself, which covers the `run.app` URL 
 balancer:
 
 ```bash
-KO_DOCKER_REPO="$REGION-docker.pkg.dev/$CENTRAL_PROJECT/ate-env" ko build ./cmd/ate-env-fleet-site --bare
+KO_DOCKER_REPO="$REGION-docker.pkg.dev/$CENTRAL_PROJECT/ate-env" ko build -B ./cmd/ate-env-fleet-site
 gcloud services identity create --service iap.googleapis.com --project "$CENTRAL_PROJECT"
 gcloud run deploy ate-fleet-site --project "$CENTRAL_PROJECT" --region "$REGION" \
   --image "$REGION-docker.pkg.dev/$CENTRAL_PROJECT/ate-env/ate-env-fleet-site:latest" \
@@ -160,7 +168,7 @@ proposal for PR 4 and may change with it.
   without credentials redirects to sign-in; a group member gets the Fleet page (AC-7).
 - The Fleet page lists each cluster with a `generated_at` under one interval old (AC-1), and marks a
   cluster stale three intervals after its reporter stops (AC-9).
-- `bq query 'SELECT COUNT(*) FROM fleet.actor_events WHERE publish_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 10 MINUTE)'`
+- `bq --project_id "$CENTRAL_PROJECT" query --use_legacy_sql=false 'SELECT COUNT(*) FROM fleet.actor_events WHERE publish_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 10 MINUTE)'`
   grows while a fleet runs (AC-2).
 - The IAM policy of `ate-fleet-site@` shows viewer roles only (AC-3).
 

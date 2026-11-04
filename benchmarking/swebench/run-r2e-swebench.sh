@@ -14,44 +14,289 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Simulated mixed R2E-Gym + SWE-bench benchmark recipe at max_concurrency=200
-# over small image slices (default 20 R2E-Gym images + 20 SWE-bench images,
-# 5 concurrent sandboxes per image = 100 + 100 = 200 active actors).
+# Simulated mixed R2E-Gym + SWE-bench benchmark runner with configurable
+# concurrency, image count, and replica rollouts per image.
+#
+# Usage:
+#   run-r2e-swebench.sh [dry-run|prewarm|run] [flags] [-- extra-loader-flags]
 #
 # Subcommands:
 #   dry-run  Validate manifests, trajectories, and <63-char actor names offline.
 #   prewarm  Bake golden snapshots and warm node caches (1 actor per image).
 #   run      Drive both shards concurrently and emit unified report.json/report.md.
 #
-# Example:
-#   R2E_DATASET=/tmp/manifests/r2e-20.jsonl \
-#   SWE_DATASET=/tmp/manifests/swebench-20.jsonl \
-#   KO_DOCKER_REPO=us-central1-docker.pkg.dev/PROJECT/repo \
-#   ARTIFACT_DIR=/tmp/r2eswe20-out \
-#   benchmarking/swebench/run-r2e-swebench-200.sh prewarm
+# Flags (override corresponding environment variables):
+#   -c, --concurrency N          Total active sandboxes across both shards (env: MAX_CONCURRENCY; default: 200)
+#       --r2e-width N            Active sandbox cap for the R2E-Gym shard (env: R2E_WIDTH)
+#       --swe-width N            Active sandbox cap for the SWE-bench shard (env: SWE_WIDTH)
+#   -i, --images N               Distinct images selected per dataset (env: IMAGES; default: 20 -> 40 total)
+#       --r2e-images N           Distinct images selected from R2E-Gym (env: R2E_IMAGES)
+#       --swe-images N           Distinct images selected from SWE-bench (env: SWE_IMAGES)
+#   -r, --rollouts-per-image N   Replica rollouts (or eval tasks) per image (env: ROLLOUTS_PER_IMAGE)
+#       --rollouts N             Alias for --rollouts-per-image
+#       --r2e-rollouts N         Replica rollouts per R2E-Gym image (env: R2E_FANOUT)
+#       --swe-rollouts N         Replica rollouts per SWE-bench image (env: SWE_FANOUT)
+#       --r2e-dataset PATH       R2E-Gym JSONL manifest path (env: R2E_DATASET; required)
+#       --swe-dataset PATH       SWE-bench JSONL manifest path (env: SWE_DATASET; required)
+#       --artifact-dir DIR       Output artifact directory outside repo (env: ARTIFACT_DIR; default: /tmp/<RUN_ID>)
+#       --run-id ID              DNS-label run prefix <= 14 chars (env: RUN_ID; default: r2eswe)
+#       --workload graded|io     Trajectory profile: graded or io (env: WORKLOAD; default: graded)
+#       --mode MODE              Loader mode: steps, eval, or open-loop (env: MODE; default: steps)
+#       --steps N                Training steps in steps mode (env: STEPS; default: 4)
+#       --park POLICY            Park policy in steps mode (env: PARK; default: suspend)
+#       --step-pause DUR         Optional pause between steps, e.g. 5s (env: STEP_PAUSE; default: 0s)
+#       --execution MODE         in-cluster or local (env: EXECUTION; auto-selects in-cluster with KO_DOCKER_REPO)
+#   -h, --help                   Show this help text and exit.
 #
-#   R2E_DATASET=/tmp/manifests/r2e-20.jsonl \
-#   SWE_DATASET=/tmp/manifests/swebench-20.jsonl \
-#   KO_DOCKER_REPO=us-central1-docker.pkg.dev/PROJECT/repo \
-#   ARTIFACT_DIR=/tmp/r2eswe20-out \
-#   benchmarking/swebench/run-r2e-swebench-200.sh run
+# Examples:
+#   # 200 concurrent sandboxes across 20 R2E + 20 SWE-bench images (5 rollouts/image):
+#   KO_DOCKER_REPO=us-central1-docker.pkg.dev/PROJECT/bench \
+#   benchmarking/swebench/run-r2e-swebench.sh prewarm \
+#     --r2e-dataset /tmp/manifests/r2e-20.jsonl \
+#     --swe-dataset /tmp/manifests/swebench-30.jsonl \
+#     --concurrency 200 --images 20 --rollouts-per-image 5 \
+#     --artifact-dir /tmp/r2eswe-out
+#
+#   KO_DOCKER_REPO=us-central1-docker.pkg.dev/PROJECT/bench \
+#   SAMPLE_CACHE=1 HARVEST_RESTORES=1 \
+#   benchmarking/swebench/run-r2e-swebench.sh run \
+#     --r2e-dataset /tmp/manifests/r2e-20.jsonl \
+#     --swe-dataset /tmp/manifests/swebench-30.jsonl \
+#     --concurrency 200 --images 20 --rollouts-per-image 5 \
+#     --artifact-dir /tmp/r2eswe-out
 
 set -o errexit -o nounset -o pipefail
 
-ACTION="run"
-if (( $# > 0 )); then
+usage() {
+  sed -n '17,66p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+require_arg() {
+  if (( $# < 2 )) || [[ -z "${2:-}" ]]; then
+    echo "missing value for $1" >&2
+    exit 2
+  fi
+}
+
+require_pos_int() {
+  local name="$1"
+  local val="$2"
+  if [[ ! "${val}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${name} must be a positive integer (got ${val})" >&2
+    exit 2
+  fi
+}
+
+ACTION=""
+CLI_CONCURRENCY=""
+CLI_R2E_WIDTH=""
+CLI_SWE_WIDTH=""
+CLI_IMAGES=""
+CLI_R2E_IMAGES=""
+CLI_SWE_IMAGES=""
+CLI_ROLLOUTS=""
+CLI_R2E_ROLLOUTS=""
+CLI_SWE_ROLLOUTS=""
+EXTRA_ARGS=()
+
+while (( $# > 0 )); do
   case "$1" in
     dry-run|prewarm|run)
+      if [[ -n "${ACTION}" ]]; then
+        echo "subcommand already set to '${ACTION}' (got extra '$1')" >&2
+        exit 2
+      fi
       ACTION="$1"
       shift
       ;;
     -h|--help|help)
-      sed -n '17,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      usage
       exit 0
       ;;
+    -c|--concurrency)
+      require_arg "$1" "${2:-}"
+      CLI_CONCURRENCY="$2"
+      shift 2
+      ;;
+    --concurrency=*)
+      CLI_CONCURRENCY="${1#*=}"
+      shift
+      ;;
+    --r2e-width)
+      require_arg "$1" "${2:-}"
+      CLI_R2E_WIDTH="$2"
+      shift 2
+      ;;
+    --r2e-width=*)
+      CLI_R2E_WIDTH="${1#*=}"
+      shift
+      ;;
+    --swe-width)
+      require_arg "$1" "${2:-}"
+      CLI_SWE_WIDTH="$2"
+      shift 2
+      ;;
+    --swe-width=*)
+      CLI_SWE_WIDTH="${1#*=}"
+      shift
+      ;;
+    -i|--images)
+      require_arg "$1" "${2:-}"
+      CLI_IMAGES="$2"
+      shift 2
+      ;;
+    --images=*)
+      CLI_IMAGES="${1#*=}"
+      shift
+      ;;
+    --r2e-images)
+      require_arg "$1" "${2:-}"
+      CLI_R2E_IMAGES="$2"
+      shift 2
+      ;;
+    --r2e-images=*)
+      CLI_R2E_IMAGES="${1#*=}"
+      shift
+      ;;
+    --swe-images)
+      require_arg "$1" "${2:-}"
+      CLI_SWE_IMAGES="$2"
+      shift 2
+      ;;
+    --swe-images=*)
+      CLI_SWE_IMAGES="${1#*=}"
+      shift
+      ;;
+    -r|--rollouts-per-image|--rollouts)
+      require_arg "$1" "${2:-}"
+      CLI_ROLLOUTS="$2"
+      shift 2
+      ;;
+    --rollouts-per-image=*|--rollouts=*)
+      CLI_ROLLOUTS="${1#*=}"
+      shift
+      ;;
+    --r2e-rollouts)
+      require_arg "$1" "${2:-}"
+      CLI_R2E_ROLLOUTS="$2"
+      shift 2
+      ;;
+    --r2e-rollouts=*)
+      CLI_R2E_ROLLOUTS="${1#*=}"
+      shift
+      ;;
+    --swe-rollouts)
+      require_arg "$1" "${2:-}"
+      CLI_SWE_ROLLOUTS="$2"
+      shift 2
+      ;;
+    --swe-rollouts=*)
+      CLI_SWE_ROLLOUTS="${1#*=}"
+      shift
+      ;;
+    --r2e-dataset)
+      require_arg "$1" "${2:-}"
+      R2E_DATASET="$2"
+      shift 2
+      ;;
+    --r2e-dataset=*)
+      R2E_DATASET="${1#*=}"
+      shift
+      ;;
+    --swe-dataset)
+      require_arg "$1" "${2:-}"
+      SWE_DATASET="$2"
+      shift 2
+      ;;
+    --swe-dataset=*)
+      SWE_DATASET="${1#*=}"
+      shift
+      ;;
+    --artifact-dir)
+      require_arg "$1" "${2:-}"
+      ARTIFACT_DIR="$2"
+      shift 2
+      ;;
+    --artifact-dir=*)
+      ARTIFACT_DIR="${1#*=}"
+      shift
+      ;;
+    --run-id)
+      require_arg "$1" "${2:-}"
+      RUN_ID="$2"
+      shift 2
+      ;;
+    --run-id=*)
+      RUN_ID="${1#*=}"
+      shift
+      ;;
+    --workload)
+      require_arg "$1" "${2:-}"
+      WORKLOAD="$2"
+      shift 2
+      ;;
+    --workload=*)
+      WORKLOAD="${1#*=}"
+      shift
+      ;;
+    --mode)
+      require_arg "$1" "${2:-}"
+      MODE="$2"
+      shift 2
+      ;;
+    --mode=*)
+      MODE="${1#*=}"
+      shift
+      ;;
+    --steps)
+      require_arg "$1" "${2:-}"
+      STEPS="$2"
+      shift 2
+      ;;
+    --steps=*)
+      STEPS="${1#*=}"
+      shift
+      ;;
+    --park)
+      require_arg "$1" "${2:-}"
+      PARK="$2"
+      shift 2
+      ;;
+    --park=*)
+      PARK="${1#*=}"
+      shift
+      ;;
+    --step-pause)
+      require_arg "$1" "${2:-}"
+      STEP_PAUSE="$2"
+      shift 2
+      ;;
+    --step-pause=*)
+      STEP_PAUSE="${1#*=}"
+      shift
+      ;;
+    --execution)
+      require_arg "$1" "${2:-}"
+      EXECUTION="$2"
+      shift 2
+      ;;
+    --execution=*)
+      EXECUTION="${1#*=}"
+      shift
+      ;;
+    --)
+      shift
+      EXTRA_ARGS=("$@")
+      break
+      ;;
+    *)
+      echo "unknown argument: $1 (pass extra swebench-loader flags after --)" >&2
+      exit 2
+      ;;
   esac
-fi
-EXTRA_ARGS=("$@")
+done
+
+ACTION="${ACTION:-run}"
 
 INVOKED_DIR="$(pwd)"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -65,8 +310,8 @@ abs_path() {
   fi
 }
 
-: "${R2E_DATASET:?set R2E_DATASET to the R2E-Gym JSONL manifest path}"
-: "${SWE_DATASET:?set SWE_DATASET to the SWE-bench JSONL manifest path}"
+: "${R2E_DATASET:?set --r2e-dataset or R2E_DATASET to the R2E-Gym JSONL manifest path}"
+: "${SWE_DATASET:?set --swe-dataset or SWE_DATASET to the SWE-bench JSONL manifest path}"
 R2E_DATASET="$(abs_path "${R2E_DATASET}")"
 SWE_DATASET="$(abs_path "${SWE_DATASET}")"
 [[ -f "${R2E_DATASET}" ]] || { echo "R2E_DATASET not found: ${R2E_DATASET}" >&2; exit 2; }
@@ -88,7 +333,7 @@ if [[ -n "${R2E_EXCLUDE_FILE}" ]]; then
   [[ -f "${R2E_EXCLUDE_FILE}" ]] || { echo "R2E_EXCLUDE_FILE not found: ${R2E_EXCLUDE_FILE}" >&2; exit 2; }
 fi
 
-RUN_ID="${RUN_ID:-r2eswe20}"
+RUN_ID="${RUN_ID:-r2eswe}"
 if [[ ! "${RUN_ID}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ || ${#RUN_ID} -gt 14 ]]; then
   echo "RUN_ID must be a DNS label of at most 14 characters (got ${RUN_ID})" >&2
   exit 2
@@ -98,22 +343,92 @@ R2E_RUN_ID="${RUN_ID}-r2e"
 
 ARTIFACT_DIR="$(abs_path "${ARTIFACT_DIR:-/tmp/${RUN_ID}}")"
 
-MAX_CONCURRENCY="${MAX_CONCURRENCY:-200}"
-R2E_IMAGES="${R2E_IMAGES:-20}"
-SWE_IMAGES="${SWE_IMAGES:-20}"
-R2E_WIDTH="${R2E_WIDTH:-$(( MAX_CONCURRENCY / 2 ))}"
-SWE_WIDTH="${SWE_WIDTH:-$(( MAX_CONCURRENCY - R2E_WIDTH ))}"
+DEFAULT_IMAGES="${CLI_IMAGES:-${IMAGES:-20}}"
+R2E_IMAGES="${CLI_R2E_IMAGES:-${CLI_IMAGES:-${R2E_IMAGES:-${DEFAULT_IMAGES}}}}"
+SWE_IMAGES="${CLI_SWE_IMAGES:-${CLI_IMAGES:-${SWE_IMAGES:-${DEFAULT_IMAGES}}}}"
+require_pos_int "R2E_IMAGES" "${R2E_IMAGES}"
+require_pos_int "SWE_IMAGES" "${SWE_IMAGES}"
 
-for num_var in MAX_CONCURRENCY R2E_IMAGES SWE_IMAGES R2E_WIDTH SWE_WIDTH; do
-  val="${!num_var}"
-  if [[ ! "${val}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "${num_var} must be a positive integer (got ${val})" >&2
-    exit 2
+HAS_CONCURRENCY=0
+if [[ -n "${CLI_CONCURRENCY}" || -n "${MAX_CONCURRENCY:-}" || -n "${CLI_R2E_WIDTH}" || -n "${R2E_WIDTH:-}" || -n "${CLI_SWE_WIDTH}" || -n "${SWE_WIDTH:-}" ]]; then
+  HAS_CONCURRENCY=1
+fi
+
+HAS_ROLLOUTS=0
+if [[ -n "${CLI_ROLLOUTS}" || -n "${ROLLOUTS_PER_IMAGE:-}" || -n "${CLI_R2E_ROLLOUTS}" || -n "${R2E_FANOUT:-}" || -n "${CLI_SWE_ROLLOUTS}" || -n "${SWE_FANOUT:-}" ]]; then
+  HAS_ROLLOUTS=1
+fi
+
+EFF_CONCURRENCY="${CLI_CONCURRENCY:-${MAX_CONCURRENCY:-}}"
+EFF_R2E_WIDTH="${CLI_R2E_WIDTH:-${R2E_WIDTH:-}}"
+EFF_SWE_WIDTH="${CLI_SWE_WIDTH:-${SWE_WIDTH:-}}"
+EFF_R2E_FANOUT="${CLI_R2E_ROLLOUTS:-${CLI_ROLLOUTS:-${R2E_FANOUT:-${ROLLOUTS_PER_IMAGE:-}}}}"
+EFF_SWE_FANOUT="${CLI_SWE_ROLLOUTS:-${CLI_ROLLOUTS:-${SWE_FANOUT:-${ROLLOUTS_PER_IMAGE:-}}}}"
+
+[[ -z "${EFF_CONCURRENCY}" ]] || require_pos_int "MAX_CONCURRENCY" "${EFF_CONCURRENCY}"
+[[ -z "${EFF_R2E_WIDTH}" ]] || require_pos_int "R2E_WIDTH" "${EFF_R2E_WIDTH}"
+[[ -z "${EFF_SWE_WIDTH}" ]] || require_pos_int "SWE_WIDTH" "${EFF_SWE_WIDTH}"
+[[ -z "${EFF_R2E_FANOUT}" ]] || require_pos_int "R2E_FANOUT" "${EFF_R2E_FANOUT}"
+[[ -z "${EFF_SWE_FANOUT}" ]] || require_pos_int "SWE_FANOUT" "${EFF_SWE_FANOUT}"
+
+if (( HAS_CONCURRENCY == 0 && HAS_ROLLOUTS == 1 )); then
+  R2E_FANOUT="${EFF_R2E_FANOUT:-${EFF_SWE_FANOUT}}"
+  SWE_FANOUT="${EFF_SWE_FANOUT:-${EFF_R2E_FANOUT}}"
+  R2E_WIDTH=$(( R2E_IMAGES * R2E_FANOUT ))
+  SWE_WIDTH=$(( SWE_IMAGES * SWE_FANOUT ))
+  MAX_CONCURRENCY=$(( R2E_WIDTH + SWE_WIDTH ))
+else
+  if [[ -n "${EFF_R2E_WIDTH}" && -n "${EFF_SWE_WIDTH}" ]]; then
+    R2E_WIDTH="${EFF_R2E_WIDTH}"
+    SWE_WIDTH="${EFF_SWE_WIDTH}"
+    if [[ -n "${EFF_CONCURRENCY}" ]] && (( R2E_WIDTH + SWE_WIDTH != EFF_CONCURRENCY )); then
+      echo "R2E_WIDTH (${R2E_WIDTH}) + SWE_WIDTH (${SWE_WIDTH}) must equal MAX_CONCURRENCY (${EFF_CONCURRENCY})" >&2
+      exit 2
+    fi
+    MAX_CONCURRENCY=$(( R2E_WIDTH + SWE_WIDTH ))
+  elif [[ -n "${EFF_R2E_WIDTH}" ]]; then
+    R2E_WIDTH="${EFF_R2E_WIDTH}"
+    if [[ -n "${EFF_CONCURRENCY}" ]]; then
+      if (( EFF_CONCURRENCY <= R2E_WIDTH )); then
+        echo "MAX_CONCURRENCY (${EFF_CONCURRENCY}) must exceed R2E_WIDTH (${R2E_WIDTH})" >&2
+        exit 2
+      fi
+      SWE_WIDTH=$(( EFF_CONCURRENCY - R2E_WIDTH ))
+    else
+      SWE_WIDTH="${R2E_WIDTH}"
+    fi
+    MAX_CONCURRENCY=$(( R2E_WIDTH + SWE_WIDTH ))
+  elif [[ -n "${EFF_SWE_WIDTH}" ]]; then
+    SWE_WIDTH="${EFF_SWE_WIDTH}"
+    if [[ -n "${EFF_CONCURRENCY}" ]]; then
+      if (( EFF_CONCURRENCY <= SWE_WIDTH )); then
+        echo "MAX_CONCURRENCY (${EFF_CONCURRENCY}) must exceed SWE_WIDTH (${SWE_WIDTH})" >&2
+        exit 2
+      fi
+      R2E_WIDTH=$(( EFF_CONCURRENCY - SWE_WIDTH ))
+    else
+      R2E_WIDTH="${SWE_WIDTH}"
+    fi
+    MAX_CONCURRENCY=$(( R2E_WIDTH + SWE_WIDTH ))
+  else
+    MAX_CONCURRENCY="${EFF_CONCURRENCY:-200}"
+    if (( MAX_CONCURRENCY < 2 )); then
+      echo "MAX_CONCURRENCY must be >= 2 when driving both R2E and SWE-bench shards (got ${MAX_CONCURRENCY})" >&2
+      exit 2
+    fi
+    W_R2E=$(( R2E_IMAGES * ${EFF_R2E_FANOUT:-1} ))
+    W_SWE=$(( SWE_IMAGES * ${EFF_SWE_FANOUT:-1} ))
+    R2E_WIDTH=$(( (MAX_CONCURRENCY * W_R2E) / (W_R2E + W_SWE) ))
+    if (( R2E_WIDTH < 1 )); then
+      R2E_WIDTH=1
+    elif (( R2E_WIDTH >= MAX_CONCURRENCY )); then
+      R2E_WIDTH=$(( MAX_CONCURRENCY - 1 ))
+    fi
+    SWE_WIDTH=$(( MAX_CONCURRENCY - R2E_WIDTH ))
   fi
-done
-
-R2E_FANOUT="${R2E_FANOUT:-$(( (R2E_WIDTH + R2E_IMAGES - 1) / R2E_IMAGES ))}"
-SWE_FANOUT="${SWE_FANOUT:-$(( (SWE_WIDTH + SWE_IMAGES - 1) / SWE_IMAGES ))}"
+  R2E_FANOUT="${EFF_R2E_FANOUT:-$(( (R2E_WIDTH + R2E_IMAGES - 1) / R2E_IMAGES ))}"
+  SWE_FANOUT="${EFF_SWE_FANOUT:-$(( (SWE_WIDTH + SWE_IMAGES - 1) / SWE_IMAGES ))}"
+fi
 
 WORKLOAD="${WORKLOAD:-graded}"
 IO_TRAJECTORY="${IO_TRAJECTORY:-workload-file-read}"
@@ -134,10 +449,12 @@ esac
 
 MODE="${MODE:-steps}"
 STEPS="${STEPS:-4}"
+require_pos_int "STEPS" "${STEPS}"
 PARK="${PARK:-suspend}"
-STEP_PAUSE="${STEP_PAUSE:-5s}"
+STEP_PAUSE="${STEP_PAUSE:-0s}"
 ARRIVAL_RATE="${ARRIVAL_RATE:-2.0}"
 CONNECTIONS="${CONNECTIONS:-8}"
+require_pos_int "CONNECTIONS" "${CONNECTIONS}"
 WAKE_BUDGET="${WAKE_BUDGET:-5m}"
 CREATE_TIMEOUT="${CREATE_TIMEOUT:-5m}"
 STEP_TIMEOUT="${STEP_TIMEOUT:-15m}"
@@ -153,10 +470,7 @@ MAX_API_ERRORS="${MAX_API_ERRORS:-30}"
 SAMPLE_CACHE="${SAMPLE_CACHE:-0}"
 HARVEST_RESTORES="${HARVEST_RESTORES:-0}"
 HARVEST_INTERVAL_MIN="${HARVEST_INTERVAL_MIN:-10}"
-if [[ ! "${HARVEST_INTERVAL_MIN}" =~ ^[1-9][0-9]*$ ]]; then
-  echo "HARVEST_INTERVAL_MIN must be a positive integer (got ${HARVEST_INTERVAL_MIN})" >&2
-  exit 2
-fi
+require_pos_int "HARVEST_INTERVAL_MIN" "${HARVEST_INTERVAL_MIN}"
 
 if [[ -z "${EXECUTION:-}" ]]; then
   if [[ -n "${KO_DOCKER_REPO:-}" ]]; then
@@ -180,10 +494,31 @@ kc() { kubectl ${CONTEXT:+--context "${CONTEXT}"} "$@"; }
 mode_args_for() {
   local shard_mode="$1"
   local fanout="$2"
+  local shard_images="$3"
+  local shard_width="$4"
+  local fleet=$(( shard_images * fanout ))
+  local has_pause=0
+  if [[ -n "${STEP_PAUSE}" && "${STEP_PAUSE}" != "0" && "${STEP_PAUSE}" != "0s" ]]; then
+    has_pause=1
+  fi
+
   MODE_ARGS=("-mode=${shard_mode}")
   case "${shard_mode}" in
     steps)
-      MODE_ARGS+=("-rollouts=${fanout}" "-steps=${STEPS}" "-park=${PARK}" "-step-pause=${STEP_PAUSE}")
+      MODE_ARGS+=("-rollouts=${fanout}" "-steps=${STEPS}" "-park=${PARK}")
+      if (( fleet > shard_width )); then
+        if (( has_pause == 1 )); then
+          echo "STEP_PAUSE (${STEP_PAUSE}) holds all ${fleet} shard environments awake until the step barrier, exceeding shard width ${shard_width}; omit --step-pause or raise --concurrency" >&2
+          exit 2
+        fi
+        if [[ "${PARK}" != "suspend" && "${PARK}" != "delete" ]]; then
+          echo "PARK=${PARK} holds all ${fleet} shard environments awake until the step barrier, exceeding shard width ${shard_width}; use --park suspend or --park delete, or raise --concurrency" >&2
+          exit 2
+        fi
+        MODE_ARGS+=("-park-each")
+      elif (( has_pause == 1 )); then
+        MODE_ARGS+=("-step-pause=${STEP_PAUSE}")
+      fi
       ;;
     eval)
       MODE_ARGS+=("-tasks-per-image=${fanout}")
@@ -198,11 +533,13 @@ mode_args_for() {
   esac
 }
 
+echo "resolved plan: action=${ACTION} mode=${MODE} workload=${WORKLOAD} concurrency=${MAX_CONCURRENCY} images=$(( R2E_IMAGES + SWE_IMAGES )) (r2e=${R2E_IMAGES}x${R2E_FANOUT}@width=${R2E_WIDTH}, swe=${SWE_IMAGES}x${SWE_FANOUT}@width=${SWE_WIDTH})" >&2
+
 cd "${ROOT}"
 
 if [[ "${ACTION}" == "dry-run" ]]; then
   mkdir -p "${ARTIFACT_DIR}/events"
-  mode_args_for "${MODE}" "${SWE_FANOUT}"
+  mode_args_for "${MODE}" "${SWE_FANOUT}" "${SWE_IMAGES}" "${SWE_WIDTH}"
   SWE_DRY_ARGS=(
     run -dry-run
     "-dataset=${SWE_DATASET}"
@@ -228,7 +565,7 @@ if [[ "${ACTION}" == "dry-run" ]]; then
     SWE_DRY_ARGS+=("${EXTRA_ARGS[@]}")
   fi
 
-  mode_args_for "${MODE}" "${R2E_FANOUT}"
+  mode_args_for "${MODE}" "${R2E_FANOUT}" "${R2E_IMAGES}" "${R2E_WIDTH}"
   R2E_DRY_ARGS=(
     run -dry-run
     "-dataset=${R2E_DATASET}"
@@ -277,8 +614,14 @@ ACTIVE_SWE_RUN_ID="${SWE_RUN_ID}"
 ACTIVE_R2E_RUN_ID="${R2E_RUN_ID}"
 if [[ "${ACTION}" == "prewarm" ]]; then
   ACTIVE_MODE="eval"
-  ACTIVE_SWE_WIDTH="${SWE_IMAGES}"
-  ACTIVE_R2E_WIDTH="${R2E_IMAGES}"
+  ACTIVE_SWE_WIDTH="${SWE_WIDTH}"
+  if (( SWE_IMAGES < ACTIVE_SWE_WIDTH )); then
+    ACTIVE_SWE_WIDTH="${SWE_IMAGES}"
+  fi
+  ACTIVE_R2E_WIDTH="${R2E_WIDTH}"
+  if (( R2E_IMAGES < ACTIVE_R2E_WIDTH )); then
+    ACTIVE_R2E_WIDTH="${R2E_IMAGES}"
+  fi
   ACTIVE_SWE_FANOUT=1
   ACTIVE_R2E_FANOUT=1
   ACTIVE_SWE_TRAJ="workload-file-read-one"
@@ -291,7 +634,7 @@ run_local_shards() {
   local swe_out="$1"
   local r2e_out="$2"
 
-  mode_args_for "${ACTIVE_MODE}" "${ACTIVE_SWE_FANOUT}"
+  mode_args_for "${ACTIVE_MODE}" "${ACTIVE_SWE_FANOUT}" "${SWE_IMAGES}" "${ACTIVE_SWE_WIDTH}"
   local -a swe_cmd=(
     go run ./cmd/benchmarking/swebench-loader run
     "-endpoint=${ENDPOINT}"
@@ -318,7 +661,7 @@ run_local_shards() {
     swe_cmd+=("${EXTRA_ARGS[@]}")
   fi
 
-  mode_args_for "${ACTIVE_MODE}" "${ACTIVE_R2E_FANOUT}"
+  mode_args_for "${ACTIVE_MODE}" "${ACTIVE_R2E_FANOUT}" "${R2E_IMAGES}" "${ACTIVE_R2E_WIDTH}"
   local -a r2e_cmd=(
     go run ./cmd/benchmarking/swebench-loader run
     "-endpoint=${ENDPOINT}"
@@ -583,7 +926,7 @@ run_in_cluster_shards() {
   rm -rf "${KODATA}"
   echo "loader image ${image}"
 
-  mode_args_for "${ACTIVE_MODE}" "${ACTIVE_SWE_FANOUT}"
+  mode_args_for "${ACTIVE_MODE}" "${ACTIVE_SWE_FANOUT}" "${SWE_IMAGES}" "${ACTIVE_SWE_WIDTH}"
   local -a swe_args=(
     run
     "-endpoint=ate-env-api.${NAMESPACE}.svc:7777"
@@ -610,7 +953,7 @@ run_in_cluster_shards() {
     swe_args+=("${EXTRA_ARGS[@]}")
   fi
 
-  mode_args_for "${ACTIVE_MODE}" "${ACTIVE_R2E_FANOUT}"
+  mode_args_for "${ACTIVE_MODE}" "${ACTIVE_R2E_FANOUT}" "${R2E_IMAGES}" "${ACTIVE_R2E_WIDTH}"
   local -a r2e_args=(
     run
     "-endpoint=ate-env-api.${NAMESPACE}.svc:7777"
@@ -714,7 +1057,7 @@ if [[ "${ACTION}" == "prewarm" ]]; then
 fi
 
 if [[ "${SAMPLE_CACHE}" == "1" ]]; then
-  NAMESPACE=ate-system CONTEXT="${CONTEXT}" "${ROOT}/benchmarking/swebench/sample-node-cache.sh" "${ARTIFACT_DIR}/cache_before.prom"
+  NAMESPACE=ate-system CONTEXT="${CONTEXT}" "${ROOT}/benchmarking/swebench/sample-node-cache.sh" "${ARTIFACT_DIR}/cache_before.prom" || true
 fi
 
 if [[ "${EXECUTION}" == "in-cluster" ]]; then
@@ -724,12 +1067,15 @@ else
 fi
 
 if [[ "${SAMPLE_CACHE}" == "1" ]]; then
-  NAMESPACE=ate-system CONTEXT="${CONTEXT}" "${ROOT}/benchmarking/swebench/sample-node-cache.sh" "${ARTIFACT_DIR}/cache_after.prom"
+  NAMESPACE=ate-system CONTEXT="${CONTEXT}" "${ROOT}/benchmarking/swebench/sample-node-cache.sh" "${ARTIFACT_DIR}/cache_after.prom" || true
 fi
 
 REPORT_EXTRA=()
 if [[ -f "${ARTIFACT_DIR}/restore_timings.jsonl" ]]; then
   REPORT_EXTRA+=("-restore-log" "${ARTIFACT_DIR}/restore_timings.jsonl")
+fi
+if [[ -s "${ARTIFACT_DIR}/cache_before.prom" && -s "${ARTIFACT_DIR}/cache_after.prom" ]]; then
+  REPORT_EXTRA+=("-cache-before" "${ARTIFACT_DIR}/cache_before.prom" "-cache-after" "${ARTIFACT_DIR}/cache_after.prom")
 fi
 
 if [[ -s "${ARTIFACT_DIR}/events/swe.jsonl" ]]; then

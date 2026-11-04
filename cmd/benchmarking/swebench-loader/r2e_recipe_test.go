@@ -31,24 +31,60 @@ import (
 )
 
 type recipeFakeBackend struct {
-	mu      sync.Mutex
-	creates int
+	mu         sync.Mutex
+	creates    int
+	awake      int
+	maxAwake   int
+	parkedByID map[string]bool
 }
 
 type recipeFakeSandbox struct {
-	id string
+	backend *recipeFakeBackend
+	id      string
 }
 
 func (b *recipeFakeBackend) Create(_ context.Context, id, _ string) (swebench.Sandbox, error) {
 	b.mu.Lock()
+	if b.parkedByID == nil {
+		b.parkedByID = make(map[string]bool)
+	}
 	b.creates++
+	b.awake++
+	if b.awake > b.maxAwake {
+		b.maxAwake = b.awake
+	}
 	b.mu.Unlock()
-	return &recipeFakeSandbox{id: id}, nil
+	return &recipeFakeSandbox{backend: b, id: id}, nil
 }
 
-func (b *recipeFakeBackend) Delete(context.Context, string) error { return nil }
+func (b *recipeFakeBackend) Delete(_ context.Context, id string) error {
+	b.onDelete(id)
+	return nil
+}
+
+func (b *recipeFakeBackend) onDelete(id string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.parkedByID[id] {
+		delete(b.parkedByID, id)
+		return
+	}
+	if b.awake > 0 {
+		b.awake--
+	}
+}
 
 func (s *recipeFakeSandbox) Run(_ context.Context, command string, _ time.Duration) (swebench.Result, error) {
+	s.backend.mu.Lock()
+	if s.backend.parkedByID[s.id] {
+		delete(s.backend.parkedByID, s.id)
+		s.backend.awake++
+		if s.backend.awake > s.backend.maxAwake {
+			s.backend.maxAwake = s.backend.awake
+		}
+	}
+	s.backend.mu.Unlock()
+
 	switch {
 	case strings.Contains(command, "/tmp/grade.py"):
 		return swebench.Result{
@@ -69,8 +105,22 @@ func (s *recipeFakeSandbox) WriteFile(context.Context, string, []byte, fs.FileMo
 	return nil
 }
 
-func (s *recipeFakeSandbox) Suspend(context.Context) error { return nil }
-func (s *recipeFakeSandbox) Delete(context.Context) error  { return nil }
+func (s *recipeFakeSandbox) Suspend(context.Context) error {
+	s.backend.mu.Lock()
+	defer s.backend.mu.Unlock()
+	if !s.backend.parkedByID[s.id] {
+		s.backend.parkedByID[s.id] = true
+		if s.backend.awake > 0 {
+			s.backend.awake--
+		}
+	}
+	return nil
+}
+
+func (s *recipeFakeSandbox) Delete(context.Context) error {
+	s.backend.onDelete(s.id)
+	return nil
+}
 
 func TestMixedR2ESWEBench200ConcurrencyShards(t *testing.T) {
 	r2eTrajPath := filepath.Join("..", "..", "..", "benchmarking", "swebench", "r2e-gold.yaml")
@@ -237,5 +287,44 @@ func TestMixedR2ESWEBench200ConcurrencyShards(t *testing.T) {
 	}
 	if rep.Interference == nil || rep.Interference.ActiveJobs != 2 {
 		t.Fatalf("expected interference across 2 active jobs, got %+v", rep.Interference)
+	}
+
+	// Verify oversubscribed replica rollouts (10 images * 4 rollouts = 40 per shard = 80 total envs)
+	// capped at concurrency 30 (width 15 per shard) via -park-each never exceed 30 awake sandboxes.
+	fakeOver := &recipeFakeBackend{}
+	testBackendOverride = fakeOver
+	overDir := filepath.Join(dir, "artifacts-over")
+	var overWG sync.WaitGroup
+	var sweOverCode, r2eOverCode int
+	overWG.Add(2)
+	go func() {
+		defer overWG.Done()
+		var out, errBuf bytes.Buffer
+		sweOverCode = runMain([]string{
+			"run", "-dataset", sweManifest, "-run-id", "r2eswe-ov-swe",
+			"-images", "10", "-rollouts", "4", "-width", "15",
+			"-mode", "steps", "-steps", "2", "-park", "suspend", "-park-each",
+			"-trajectory", fastSWETraj, "-events-dir", overDir, "-worker", "swe", "-job", "swe",
+		}, &out, &errBuf)
+	}()
+	go func() {
+		defer overWG.Done()
+		var out, errBuf bytes.Buffer
+		r2eOverCode = runMain([]string{
+			"run", "-dataset", r2eManifest, "-run-id", "r2eswe-ov-r2e",
+			"-images", "10", "-rollouts", "4", "-width", "15",
+			"-mode", "steps", "-steps", "2", "-park", "suspend", "-park-each",
+			"-trajectory", fastR2ETraj, "-events-dir", overDir, "-worker", "r2e", "-job", "r2e",
+		}, &out, &errBuf)
+	}()
+	overWG.Wait()
+	if sweOverCode != 0 || r2eOverCode != 0 {
+		t.Fatalf("oversubscribed shards failed: swe=%d r2e=%d", sweOverCode, r2eOverCode)
+	}
+	if fakeOver.creates != 80 {
+		t.Fatalf("expected 80 created replica sandboxes, got %d", fakeOver.creates)
+	}
+	if fakeOver.maxAwake > 30 {
+		t.Fatalf("expected max awake sandboxes <= 30 with -park-each, got %d", fakeOver.maxAwake)
 	}
 }

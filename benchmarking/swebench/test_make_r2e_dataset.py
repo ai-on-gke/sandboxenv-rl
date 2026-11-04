@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Offline unit and dry-run tests for make-r2e-dataset.py, r2e-gold.yaml, and run-r2e-swebench-200.sh."""
+"""Offline unit and dry-run tests for make-r2e-dataset.py, r2e-gold.yaml, and run-r2e-swebench.sh."""
 
 from __future__ import annotations
 
@@ -414,7 +414,7 @@ def test_load_r2e_rows_hf_sources_and_missing_hub(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(shutil.which("go") is None, reason="go toolchain required for dry-run")
-def test_run_r2e_swebench_200_dry_run_graded_and_io(tmp_path):
+def test_run_r2e_swebench_dry_run_flags_and_validation(tmp_path):
     r2e_src = tmp_path / "r2e-src.jsonl"
     r2e_src.write_text(
         "\n".join(
@@ -447,43 +447,194 @@ def test_run_r2e_swebench_200_dry_run_graded_and_io(tmp_path):
     ]
     swe_manifest.write_text("\n".join(swe_rows) + "\n", encoding="utf-8")
 
-    script = _DIR / "run-r2e-swebench-200.sh"
+    script = _DIR / "run-r2e-swebench.sh"
+
+    help_proc = subprocess.run([str(script), "--help"], capture_output=True, text=True, check=True)
+    assert "--concurrency" in help_proc.stdout
+    assert "--images" in help_proc.stdout
+    assert "--rollouts-per-image" in help_proc.stdout
 
     # 1. Default 20 + 20 images at max_concurrency=200 (graded, steps mode -> 5 rollouts/image = 100 + 100).
-    env_20 = {
-        **os.environ,
-        "R2E_DATASET": str(r2e_manifest),
-        "SWE_DATASET": str(swe_manifest),
-        "ARTIFACT_DIR": str(tmp_path / "art-20"),
-    }
-    proc_20 = subprocess.run(
-        [str(script), "dry-run"], env=env_20, capture_output=True, text=True, check=True
+    proc_default = subprocess.run(
+        [
+            str(script),
+            "dry-run",
+            "--r2e-dataset",
+            str(r2e_manifest),
+            "--swe-dataset",
+            str(swe_manifest),
+            "--artifact-dir",
+            str(tmp_path / "art-default"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
     )
-    assert '"run":"r2eswe20-swe"' in proc_20.stderr
-    assert '"run":"r2eswe20-r2e"' in proc_20.stderr
-    assert proc_20.stderr.count('"environments":100,"width":100') == 2
+    assert '"run":"r2eswe-swe"' in proc_default.stderr
+    assert '"run":"r2eswe-r2e"' in proc_default.stderr
+    assert proc_default.stderr.count('"environments":100,"width":100') == 2
 
-    # 2. 10 + 10 images at max_concurrency=200 (auto fan-out = 10 rollouts/image -> 100 + 100 = 200).
-    env_10 = {
-        **env_20,
-        "R2E_IMAGES": "10",
-        "SWE_IMAGES": "10",
-        "ARTIFACT_DIR": str(tmp_path / "art-10"),
-    }
-    proc_10 = subprocess.run(
-        [str(script), "dry-run"], env=env_10, capture_output=True, text=True, check=True
+    # 2. CLI --concurrency and --images (auto fan-out = ceil(60 / 10) = 6 rollouts/image).
+    proc_ci = subprocess.run(
+        [
+            str(script),
+            "dry-run",
+            "--r2e-dataset",
+            str(r2e_manifest),
+            "--swe-dataset",
+            str(swe_manifest),
+            "--concurrency",
+            "120",
+            "--images",
+            "10",
+            "--artifact-dir",
+            str(tmp_path / "art-ci"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
     )
-    assert proc_10.stderr.count('"images":10') == 2
-    assert proc_10.stderr.count('"environments":100,"width":100') == 2
+    assert "concurrency=120 images=20 (r2e=10x6@width=60, swe=10x6@width=60)" in proc_ci.stderr
+    assert proc_ci.stderr.count('"images":10') == 2
+    assert proc_ci.stderr.count('"environments":60,"width":60') == 2
 
-    # 3. I/O image-delivery mode (eval mode, workload-file-read).
-    env_io = {
-        **env_20,
-        "WORKLOAD": "io",
-        "MODE": "eval",
-        "ARTIFACT_DIR": str(tmp_path / "art-io"),
-    }
-    proc_io = subprocess.run(
-        [str(script), "dry-run"], env=env_io, capture_output=True, text=True, check=True
+    # 3. CLI --images and --rollouts-per-image without --concurrency -> derives concurrency = 2 * 8 * 3 = 48.
+    proc_ir = subprocess.run(
+        [
+            str(script),
+            "dry-run",
+            "--r2e-dataset",
+            str(r2e_manifest),
+            "--swe-dataset",
+            str(swe_manifest),
+            "--images",
+            "8",
+            "--rollouts-per-image",
+            "3",
+            "--artifact-dir",
+            str(tmp_path / "art-ir"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
     )
-    assert proc_io.stderr.count('"trajectory":"workload-file-read"') == 2
+    assert "concurrency=48 images=16 (r2e=8x3@width=24, swe=8x3@width=24)" in proc_ir.stderr
+    assert proc_ir.stderr.count('"environments":24,"width":24') == 2
+
+    # 4. Oversubscribed fleet (--concurrency 80 --images 20 --rollouts-per-image 6 -> 120 envs @ width 40 with -park-each)
+    # and asymmetric slice (--concurrency 200 --r2e-images 15 --swe-images 5 --rollouts-per-image 10 -> 150 + 50).
+    proc_over = subprocess.run(
+        [
+            str(script),
+            "dry-run",
+            "--r2e-dataset",
+            str(r2e_manifest),
+            "--swe-dataset",
+            str(swe_manifest),
+            "--concurrency",
+            "80",
+            "--images",
+            "20",
+            "--rollouts-per-image",
+            "6",
+            "--artifact-dir",
+            str(tmp_path / "art-over"),
+            "--",
+            "-label=arm=oversub",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "concurrency=80 images=40 (r2e=20x6@width=40, swe=20x6@width=40)" in proc_over.stderr
+    assert proc_over.stderr.count('"environments":120,"width":40') == 2
+
+    proc_asym = subprocess.run(
+        [
+            str(script),
+            "dry-run",
+            "--r2e-dataset",
+            str(r2e_manifest),
+            "--swe-dataset",
+            str(swe_manifest),
+            "--concurrency=200",
+            "--r2e-images=15",
+            "--swe-images=5",
+            "--rollouts-per-image=10",
+            "--workload=io",
+            "--mode=eval",
+            "--artifact-dir",
+            str(tmp_path / "art-asym"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "concurrency=200 images=20 (r2e=15x10@width=150, swe=5x10@width=50)" in proc_asym.stderr
+    assert proc_asym.stderr.count('"trajectory":"workload-file-read"') == 2
+
+    # 4b. Environment variable configuration fallback (MAX_CONCURRENCY, IMAGES, ROLLOUTS_PER_IMAGE).
+    proc_env = subprocess.run(
+        [str(script), "dry-run"],
+        env={
+            **os.environ,
+            "R2E_DATASET": str(r2e_manifest),
+            "SWE_DATASET": str(swe_manifest),
+            "MAX_CONCURRENCY": "60",
+            "IMAGES": "10",
+            "ROLLOUTS_PER_IMAGE": "3",
+            "ARTIFACT_DIR": str(tmp_path / "art-env"),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "concurrency=60 images=20 (r2e=10x3@width=30, swe=10x3@width=30)" in proc_env.stderr
+    assert proc_env.stderr.count('"environments":30,"width":30') == 2
+
+    # 5. Fail-loud validation checks on invalid flags and incompatible oversubscribed step-pause.
+    bad_unknown = subprocess.run(
+        [str(script), "dry-run", "--bogus"], capture_output=True, text=True
+    )
+    assert bad_unknown.returncode == 2
+    assert "unknown argument: --bogus" in bad_unknown.stderr
+
+    bad_conc = subprocess.run(
+        [
+            str(script),
+            "dry-run",
+            "--r2e-dataset",
+            str(r2e_manifest),
+            "--swe-dataset",
+            str(swe_manifest),
+            "--concurrency",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert bad_conc.returncode == 2
+    assert "must be >= 2" in bad_conc.stderr
+
+    bad_pause = subprocess.run(
+        [
+            str(script),
+            "dry-run",
+            "--r2e-dataset",
+            str(r2e_manifest),
+            "--swe-dataset",
+            str(swe_manifest),
+            "--concurrency",
+            "80",
+            "--images",
+            "20",
+            "--rollouts-per-image",
+            "6",
+            "--step-pause",
+            "5s",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert bad_pause.returncode == 2
+    assert "STEP_PAUSE" in bad_pause.stderr

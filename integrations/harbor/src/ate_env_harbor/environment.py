@@ -83,6 +83,9 @@ TOKEN_ENV = "SUBSTRATE_ENV_AUTH_TOKEN"
 REGISTRY_ENV = "SUBSTRATE_ENV_HARBOR_REGISTRY"
 # The probe that learns which user the image runs as; the test fakes answer it.
 WHOAMI_COMMAND = "id -un"
+# Login shells source /etc/profile, which overwrites PATH on Debian, Ubuntu and
+# Alpine images, then the files in /etc/profile.d; this one restores the tool paths.
+DEFAULT_TOOL_PATHS_PROFILE = "/etc/profile.d/zz-harbor-tools.sh"
 _COMPOSE_FILE = "docker-compose.yaml"
 _PREFLIGHT_TIMEOUT = 15.0
 # gRPC statuses a guest call answers with while the actor is still coming up.
@@ -130,6 +133,15 @@ class AteEnvEnvironment(BaseEnvironment):
     - ``scratch_dir``: where tar archives are staged inside the environment;
       default ``/tmp``.
     - ``docker_bin``, ``gcloud_bin``: the executables used for images.
+    - ``tool_paths``: directories that a runtime layer mounts into the
+      environment (``ate-env manifest template --layer``), put first on
+      ``PATH`` for every command; a list, or one string with ``:`` between
+      the paths. ``start`` fails when one is missing, which means the base
+      template lacks the layer. See ``examples/harbor-tools-layer``.
+    - ``tool_paths_profile``: the ``/etc/profile.d`` drop-in written at
+      ``start`` so login shells (terminus-2's ``bash --login`` tmux session)
+      see the tool paths too; default ``/etc/profile.d/zz-harbor-tools.sh``,
+      empty to skip. A write the image user is not allowed is a warning.
     """
 
     def __init__(
@@ -155,6 +167,8 @@ class AteEnvEnvironment(BaseEnvironment):
         scratch_dir: str = "/tmp",
         docker_bin: str = "docker",
         gcloud_bin: str = "gcloud",
+        tool_paths: str | list[str] | tuple[str, ...] | None = None,
+        tool_paths_profile: str | None = DEFAULT_TOOL_PATHS_PROFILE,
         **kwargs: Any,
     ) -> None:
         self._api_url = api_url or os.environ.get(API_ENV) or DEFAULT_API_URL
@@ -171,6 +185,8 @@ class AteEnvEnvironment(BaseEnvironment):
         self._exec_timeout = float(exec_timeout_sec)
         self._workdir_kwarg = workdir or None
         self._scratch_dir = str(scratch_dir).rstrip("/") or "/tmp"
+        self._tool_paths = _parse_tool_paths(tool_paths)
+        self._tool_paths_profile = str(tool_paths_profile) if tool_paths_profile else None
         self._resolver = ImageResolver(
             registry=registry or os.environ.get(REGISTRY_ENV),
             build=self._build,
@@ -213,6 +229,19 @@ class AteEnvEnvironment(BaseEnvironment):
     @property
     def api_url(self) -> str:
         return self._api_url
+
+    @property
+    def tool_paths(self) -> tuple[str, ...]:
+        """Layer directories put first on PATH for every command."""
+        return self._tool_paths
+
+    def _tooled(self, command: str) -> str:
+        """``command`` with the tool paths first on PATH, when there are any."""
+        if not self._tool_paths:
+            return command
+        # ${PATH:+:$PATH}: an empty PATH must not leave a trailing colon,
+        # which POSIX sh reads as the current directory.
+        return f"PATH={_path_prefix(self._tool_paths)}; export PATH; {command}"
 
     @property
     def capabilities(self) -> EnvironmentCapabilities:
@@ -291,6 +320,8 @@ class AteEnvEnvironment(BaseEnvironment):
             env = await self._create(client, image)
             await self._wait_ready(env, deadline)
             await self._probe_user(env)
+            await self._check_tool_paths(env)
+            await self._write_tool_profile(env)
             self._env = env
             await self._ensure_workdir(env)
             await self.ensure_dirs(self._mount_targets(writable_only=True))
@@ -406,6 +437,36 @@ class AteEnvEnvironment(BaseEnvironment):
         if workdir:
             await self._mkdir(env, workdir)
 
+    async def _check_tool_paths(self, env: Env) -> None:
+        """Fail early when the layer the tool paths come from is not mounted."""
+        for path in self._tool_paths:
+            result = await env.shell(f"test -d {shlex.quote(path)}", timeout=30)
+            if result.exit_code != 0:
+                raise RuntimeError(
+                    f"tool path {path} is not in environment {self._env_id}: the base template "
+                    f"({self._template_used}) must mount a runtime layer there, with "
+                    f"`ate-env manifest template ... --layer tools=<image@sha256:...>={_mount_of(path)}` "
+                    "(see examples/harbor-tools-layer)"
+                )
+
+    async def _write_tool_profile(self, env: Env) -> None:
+        """Give login shells the tool paths: /etc/profile overwrites PATH, then sources profile.d."""
+        if not self._tool_paths or not self._tool_paths_profile:
+            return
+        content = (
+            "# ate-env-harbor: the runtime layer's tools first on PATH, for login shells too.\n"
+            f"PATH={_path_prefix(self._tool_paths)}; export PATH\n"
+        )
+        try:
+            await env.write_file(self._tool_paths_profile, content.encode(), mode=0o644)
+        except EnvError as e:
+            self.logger.warning(
+                "could not write %s (%s); login shells in this environment will not see "
+                "tool_paths unless the image's profile keeps PATH",
+                self._tool_paths_profile,
+                e,
+            )
+
     async def _delete_quietly(self, env: Env) -> None:
         try:
             await env.delete()
@@ -424,6 +485,8 @@ class AteEnvEnvironment(BaseEnvironment):
             "session_id": self.session_id,
             "context_id": str(self.context_id) if self.context_id else None,
             "api_url": self._api_url,
+            "tool_paths": list(self._tool_paths),
+            "tool_paths_profile": self._tool_paths_profile if self._tool_paths else None,
         }
         try:
             self.trial_paths.trial_dir.mkdir(parents=True, exist_ok=True)
@@ -482,7 +545,11 @@ class AteEnvEnvironment(BaseEnvironment):
             effective_exec_cwd(cwd, self.task_env_config.workdir, self._dockerfile_workdir)
             or self._workdir_kwarg
         )
-        command = self._as_user_command(command, resolved_user, merged, await self._switch_tool_for(resolved_user))
+        # The tool paths go inside the command, thus inside the `sh -c` a user
+        # switch wraps, where sudo's reset of the environment cannot drop them.
+        command = self._as_user_command(
+            self._tooled(command), resolved_user, merged, await self._switch_tool_for(resolved_user)
+        )
         timeout = float(timeout_sec) if timeout_sec is not None else self._exec_timeout
         result = await handle.shell(command, cwd=workdir or "", env=merged, timeout=timeout)
         return ExecResult(stdout=result.stdout, stderr=result.stderr, return_code=result.exit_code)
@@ -541,7 +608,7 @@ class AteEnvEnvironment(BaseEnvironment):
     async def _mkdir(self, handle: Env, directory: str) -> None:
         if directory in ("", "/", "."):
             return
-        result = await handle.shell(f"mkdir -p {shlex.quote(directory)}")
+        result = await handle.shell(self._tooled(f"mkdir -p {shlex.quote(directory)}"))
         if result.exit_code != 0:
             raise RuntimeError(
                 f"mkdir -p {directory} failed ({result.exit_code}): {result.stderr.strip()}"
@@ -561,13 +628,15 @@ class AteEnvEnvironment(BaseEnvironment):
         await handle.write_file(archive, payload)
         unpack = remote_unpack_command(archive, target_dir)
         try:
-            result = await handle.shell(f"{unpack}; rc=$?; rm -f {shlex.quote(archive)}; exit $rc")
+            result = await handle.shell(
+                self._tooled(f"{unpack}; rc=$?; rm -f {shlex.quote(archive)}; exit $rc")
+            )
         except BaseException:
             # The shell command removes the archive itself; when the call
             # does not come back (a transport error, a cancellation), remove
             # it from here so a failed upload leaves nothing in scratch_dir.
             with contextlib.suppress(Exception):
-                await handle.shell(f"rm -f {shlex.quote(archive)}")
+                await handle.shell(self._tooled(f"rm -f {shlex.quote(archive)}"))
             raise
         if result.exit_code != 0:
             raise RuntimeError(
@@ -585,7 +654,7 @@ class AteEnvEnvironment(BaseEnvironment):
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
         handle = self._require_started()
         archive = self._scratch_path("download")
-        result = await handle.shell(remote_pack_command(source_dir, archive))
+        result = await handle.shell(self._tooled(remote_pack_command(source_dir, archive)))
         if result.exit_code != 0:
             raise RuntimeError(
                 f"packing {source_dir} failed ({result.exit_code}): "
@@ -595,8 +664,30 @@ class AteEnvEnvironment(BaseEnvironment):
             data = await handle.read_file_bytes(archive)
         finally:
             with contextlib.suppress(EnvError):
-                await handle.shell(f"rm -f {shlex.quote(archive)}")
+                await handle.shell(self._tooled(f"rm -f {shlex.quote(archive)}"))
         extract_dir_from_bytes(data, target_dir)
+
+
+def _parse_tool_paths(value: str | list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    if value is None or value == "":
+        return ()
+    items = [value] if isinstance(value, str) else [str(p) for p in value]
+    parts = [part for item in items for part in item.split(":")]
+    paths = tuple(p.rstrip("/") or "/" for p in (q.strip() for q in parts) if p)
+    for path in paths:
+        if not path.startswith("/"):
+            raise ValueError(f"tool_paths must be absolute directories inside the environment, got {path!r}")
+    return paths
+
+
+def _path_prefix(paths: tuple[str, ...]) -> str:
+    """``<paths>${PATH:+:$PATH}``, the value that puts the tool paths first."""
+    return shlex.quote(":".join(paths)) + "${PATH:+:$PATH}"
+
+
+def _mount_of(path: str) -> str:
+    """The layer mount point a tool path sits in: its parent for ``.../bin``, else itself."""
+    return posixpath.dirname(path) if posixpath.basename(path) in ("bin", "sbin") else path
 
 
 def _warn_token_kwarg() -> None:

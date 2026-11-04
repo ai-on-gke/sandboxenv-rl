@@ -15,6 +15,10 @@ user needs to know across them.
   the reserved environment ids); the Python
   client's `image_status()` and `ImageStatus`; the Go client's `ImageStatus`
   and `EnsureImageTemplate`.
+- Python client: `FleetConfig.node_selector` is sent as every environment's
+  `worker_selector`, and `FleetConfig.placement` adds labels per task image;
+  `SubstrateBackendDriver(worker_selector=, placement=)` and
+  `worker_selector_for(image)`.
 - `swebench-loader plan-placement`: an image placement plan
   (`image-placement.json`) that assigns each task image to placement domains
   (worker pools a per-environment worker selector addresses) under each

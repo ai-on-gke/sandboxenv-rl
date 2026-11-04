@@ -21,8 +21,10 @@
 //      WarmPoolDrain.
 //   E. A delete that fails after the run's reap already ran re-tags the actor
 //      with WARM_POOL_RUN_ID, which every reap deletes.  Module
-//      WarmPoolRunIds, which also has AC-15.9: a cancelled delete, and a
-//      release whose delete fails or is cancelled after a reap ran, re-tag too.
+//      WarmPoolRunIds, which also has AC-15.9 (a cancelled delete, and a
+//      release whose delete fails or is cancelled after a reap ran, re-tag
+//      too) and AC-15.8 (a warm_pool cancelled during its creates owns what
+//      it made under WARM_POOL_RUN_ID).
 //
 // As in the other models, each action is the code between two awaits of
 // clients/python/src/ate_env_rl/backend/substrate.py, for one pool key and one
@@ -241,9 +243,11 @@ module WarmPoolDrain {
 // WARM_POOL_RUN_ID. A fleet reaps its run once, at teardown, so an actor
 // left owned under a run that was already reaped is never deleted.
 //
-//   ORPHAN  every owned actor that no delete is pending for carries a run id
-//           that some later reap still matches: WARM_POOL_RUN_ID, or a run
-//           not reaped yet
+//   ORPHAN   every owned actor that no delete is pending for carries a run id
+//            that some later reap still matches: WARM_POOL_RUN_ID, or a run
+//            not reaped yet
+//   TRACKED  every live actor is owned or being released: none is alive with
+//            no reference in the driver (AC-15.8)
 //
 // A reap's own failed deletes are out of scope: the code drops those actors
 // and raises InfrastructureError with their ids.
@@ -265,8 +269,10 @@ module WarmPoolRunIds {
   )
 
   ghost predicate Inv(s: State) {
-    && s.owned.Keys <= s.live
-    && s.releasing.Keys <= s.live
+    // No `owned.Keys <= live`: a cancelled warm_pool owns ids whose create()
+    // may never have landed; a reap or release finds those NotFound, which
+    // counts as gone.
+    && s.live <= s.owned.Keys + s.releasing.Keys                      // TRACKED
     && s.deleting <= s.owned.Keys
     && s.owned.Keys !! s.releasing.Keys
     && WARM !in s.reaped
@@ -382,6 +388,22 @@ module WarmPoolRunIds {
        releasing := map b | b in s.releasing && b != a :: s.releasing[b])
   }
 
+  // warm_pool cancelled while its creates are in flight: `made` is the ids it
+  // sent a create() for, of which `created` exist now. AC-15.8: own them all
+  // under WARM (one never created is NotFound for the reap, which counts as
+  // gone).
+  function WarmCancelledFixed(s: State, made: set<Actor>, created: set<Actor>): State
+    requires created <= made && made !! s.owned.Keys && made !! s.releasing.Keys
+  {
+    s.(live := s.live + created,
+       owned := map a | a in s.owned.Keys + made :: if a in made then WARM else s.owned[a])
+  }
+
+  // Before AC-15.8's fix: the ids were dropped.
+  function WarmCancelledBefore(s: State, made: set<Actor>, created: set<Actor>): State
+    requires created <= made
+  { s.(live := s.live + created) }
+
   // ======================================================= #221 verifies
   lemma ReapSafe(s: State, r: Run)
     requires Inv(s) && r != WARM
@@ -424,6 +446,12 @@ module WarmPoolRunIds {
     ensures a !in Reap(s, r).owned && a !in Reap(s, r).live
   {}
 
+  lemma WarmCancelledFixedSafe(s: State, made: set<Actor>, created: set<Actor>)
+    requires Inv(s) && created <= made && made !! s.live
+    requires made !! s.owned.Keys && made !! s.releasing.Keys
+    ensures Inv(WarmCancelledFixed(s, made, created))
+  {}
+
   lemma DeleteCancelledFixedSafe(s: State, a: Actor)
     requires Inv(s) && a in s.deleting
     ensures Inv(DeleteCancelledFixed(s, a))
@@ -453,6 +481,13 @@ module WarmPoolRunIds {
   lemma RecycleSuspendCancelledBeforeSafe(s: State, a: Actor)
     requires Inv(s) && a in s.releasing
     ensures Inv(RecycleSuspendCancelledBefore(s, a))                  // fails
+  {}
+
+  // Before AC-15.8's fix: a cancelled warm_pool left the actors it had
+  // created alive and untracked.
+  lemma WarmCancelledBeforeSafe(s: State, made: set<Actor>, created: set<Actor>)
+    requires Inv(s) && created <= made && made !! s.live
+    ensures Inv(WarmCancelledBefore(s, made, created))                // fails
   {}
 
   // Before AC-15.9's fix: a cancelled delete after the run's reap kept the

@@ -148,8 +148,8 @@ behind it.
   returned a deleted environment (AC-15.7, P-24).
 - Open: an `acquire` whose cold create overlaps its own run's reap returns an environment owned
   under the reaped run id; unless the caller releases it, no later reap deletes it (AC-15.10).
-- Open: a `warm_pool` cancelled during its `create()` calls can leak the actors already created
-  (AC-15.8).
+- Closed by #240: a `warm_pool` cancelled during its `create()` calls leaked the actors already
+  created (AC-15.8).
 - Closed by #238: a delete cancelled after the run's reap, or a `release` whose delete fails or is
   cancelled while a reap runs, left the actor under the reaped run id, so no later reap deleted it
   (AC-15.9).

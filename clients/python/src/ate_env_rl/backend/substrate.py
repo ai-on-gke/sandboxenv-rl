@@ -639,10 +639,14 @@ class SubstrateBackendDriver(BackendDriver):
 
         sem = asyncio.Semaphore(16)
         effective_run_id = run_id or WARM_POOL_RUN_ID
+        # Every id a create() was sent for, so a cancelled call can still
+        # account for the actors it made (AC-15.8).
+        started: list[str] = []
 
         async def _warm_one() -> str | None:
             actor_id = f"warm-{uuid.uuid4().hex[:10]}"
             async with sem:
+                started.append(actor_id)
                 try:
                     drv_tok = in_driver_span.set(True)
                     try:
@@ -686,8 +690,19 @@ class SubstrateBackendDriver(BackendDriver):
         try:
             results = await asyncio.gather(*tasks, return_exceptions=True)
         except BaseException:
+            # Cancelled: the actors created so far, and any whose create() was
+            # in flight, are neither pooled nor owned. Own them under
+            # WARM_POOL_RUN_ID, so any run's reap deletes them (one that was
+            # never created is NotFound there, which counts as gone).
             with self._lock:
                 _release_reservation()
+                for aid in started:
+                    self._owned_actors.setdefault(
+                        aid,
+                        self._make_instance(
+                            aid, template_id, run_id=WARM_POOL_RUN_ID, rootfs_image=rootfs_image
+                        ),
+                    )
             raise
 
         created = [r for r in results if isinstance(r, str)]

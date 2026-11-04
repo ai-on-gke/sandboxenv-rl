@@ -525,6 +525,44 @@ async def test_warm_claim_overlapping_a_reap_returns_a_live_environment(
     ]
 
 
+class SlowCreatesClient(GatedClient):
+    """The first ``fast`` create() calls return at once; the rest wait on create_gate."""
+
+    def __init__(self, fast: int) -> None:
+        super().__init__()
+        self.fast = fast
+
+    async def create(self, actor_id: str, **kw: object) -> None:
+        if self.creates < self.fast:
+            self.creates += 1
+            self.live.add(actor_id)
+            return
+        await super().create(actor_id, **kw)
+
+
+# AC-15.8: a warm_pool call cancelled during its create() calls leaves no live
+# actor untracked; any run's reap deletes what it made.
+async def test_cancelled_warm_pool_leaves_its_actors_for_any_reap() -> None:
+    client = SlowCreatesClient(fast=2)
+    driver, obs = _driver(client)
+    client.create_gate = asyncio.Event()
+
+    warm = asyncio.create_task(driver.warm_pool_async("tmpl", R, run_id="run-1"))
+    await _spin()  # two actors created, the third create() paused
+    assert len(client.live) == 2
+    warm.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await warm
+
+    assert client.live <= set(driver._owned_actors)  # nothing alive is untracked
+    assert _pool(driver) == []
+    assert sum(obs._warm.values()) == 0
+    assert driver._warm_inflight == {}
+    await driver.reap_async("run-2")
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
 async def test_direct_reap_moves_the_gauge_with_the_pool() -> None:
     client = GatedClient()
     driver, obs = _driver(client)

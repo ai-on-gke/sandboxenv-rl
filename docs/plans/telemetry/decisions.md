@@ -288,3 +288,9 @@ Append-only. Each entry: date, who, what, why.
   running can still end owned under the reaped run id; that is the acquire-during-teardown case, not
   a warm claim. It is tracked as open criterion AC-15.10, which a scratch test reproduced. A stale
   claim also records one `wire_claim` sample with status `error`, as a failed claim does.
+- 2026-11-04, orchestrator: #240 fixes AC-15.8. A `warm_pool` call cancelled during its creates owns
+  every id it sent a `create()` for under `WARM_POOL_RUN_ID`, instead of deleting them in the
+  cancelled task: awaiting deletes there would delay the cancellation, and background deletes could
+  outlive the loop. Any reap deletes them (one whose create never landed is NotFound, counted as
+  gone). The run-id model gained TRACKED (every live actor is owned or being released), which made
+  it drop `owned.Keys <= live`: an owned id may never have been created.

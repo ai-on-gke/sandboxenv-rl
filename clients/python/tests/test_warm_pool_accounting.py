@@ -355,6 +355,76 @@ async def test_failed_recycle_delete_after_teardown_leaves_the_actor_for_any_lat
     assert driver._owned_actors == {}
 
 
+# AC-15.9: a cancelled cleanup delete, and a release whose delete fails while a
+# reap runs, leave the actor where a later run's reap finds it.
+async def test_cancelled_delete_after_reap_leaves_warm_actors_for_any_later_reap() -> None:
+    client = GatedClient()
+    driver, obs = _driver(client)
+    client.create_gate = asyncio.Event()
+
+    warm = asyncio.create_task(driver.warm_pool_async("tmpl", R, run_id="run-1"))
+    await _spin()  # paused in create()
+    await driver.reap_async("run-1")
+    obs.warm_reset()
+    client.delete_gate = asyncio.Event()
+    client.create_gate.set()
+    await _spin()  # paused in the deletes after the teardown
+    warm.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await warm
+    assert len(client.live) == R
+
+    client.delete_gate = None
+    await driver.reap_async("run-2")
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_release_delete_lost_during_reap_leaves_the_actor_for_any_later_reap(
+    cancel: bool,
+) -> None:
+    client = GatedClient()
+    driver, _ = _driver(client)
+    client.live.add("sb-1")
+    handle = driver._make_instance("sb-1", "tmpl", run_id="run-1")
+    driver._owned_actors["sb-1"] = handle
+    client.delete_gate = asyncio.Event()
+
+    release = asyncio.create_task(driver.release_async("sb-1"))
+    await _spin()  # paused in delete(); the actor is not owned now
+    await driver.reap_async("run-1")  # cannot see it
+    if cancel:
+        release.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await release
+    else:
+        client.delete_error = RuntimeError("unavailable")
+        client.delete_gate.set()
+        await release  # release does not raise on a failed delete
+    assert client.live == {"sb-1"}
+    assert handle.run_id == "run-1"  # the caller's handle is not changed
+
+    client.delete_gate = None
+    client.delete_error = None
+    await driver.reap_async("run-2")
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+async def test_release_delete_failure_without_a_reap_keeps_the_run_id() -> None:
+    client = GatedClient()
+    driver, _ = _driver(client)
+    client.live.add("sb-1")
+    driver._owned_actors["sb-1"] = driver._make_instance("sb-1", "tmpl", run_id="run-1")
+    client.delete_failures = 1
+
+    await driver.release_async("sb-1")
+    assert driver._owned_actors["sb-1"].run_id == "run-1"  # the run's own reap retries it
+    await driver.reap_async("run-1")
+    assert client.live == set()
+
+
 async def test_direct_reap_moves_the_gauge_with_the_pool() -> None:
     client = GatedClient()
     driver, obs = _driver(client)

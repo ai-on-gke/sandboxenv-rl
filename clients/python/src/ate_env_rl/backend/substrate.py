@@ -706,9 +706,9 @@ class SubstrateBackendDriver(BackendDriver):
         reap may already have missed (``why`` goes in the log).
 
         The actor leaves _owned_actors only once the delete succeeds (or finds
-        it gone). A failed delete is counted as a release failure and re-tags
-        the actor with WARM_POOL_RUN_ID, so whichever run reaps next deletes
-        it; a cancelled one leaves it owned as it was.
+        it gone). A failed delete is counted as a release failure; a failed or
+        cancelled one re-tags the actor with WARM_POOL_RUN_ID, so whichever
+        run reaps next deletes it (AC-15.5, AC-15.9).
         """
         try:
             await self._client_for(actor_id).delete(actor_id, atespace=self.atespace)
@@ -719,6 +719,11 @@ class SubstrateBackendDriver(BackendDriver):
             logger.warning("Failed deleting actor %s %s: %s", actor_id, why, e)
             self._keep_for_any_reap(actor_id)
             return
+        except BaseException:
+            # Cancelled: the run's reap may already have run, so leave the
+            # actor where any later reap finds it, then let the cancel through.
+            self._keep_for_any_reap(actor_id)
+            raise
         with self._lock:
             self._owned_actors.pop(actor_id, None)
 
@@ -926,11 +931,14 @@ class SubstrateBackendDriver(BackendDriver):
             logger.info("Environment %s was already deleted", instance_id)
             return
         except BaseException:
-            # Keep it owned, so a reap retries the delete. The run's own reap
-            # already ran if a teardown stopped the recycle, so any run's
-            # reap must find it then.
+            # Keep it owned, so a reap retries the delete. If a reap ran since
+            # the pop above (the recycle saw it, or it ran during this delete),
+            # it could not see the actor, and the run is not reaped again:
+            # re-tag it so any run's reap finds it (AC-15.9).
             if instance is not None:
-                if missed_by_reap:
+                with self._lock:
+                    reaped_since = not self._may_pool(teardowns)
+                if missed_by_reap or reaped_since:
                     self._keep_for_any_reap(instance_id, instance)
                 else:
                     with self._lock:

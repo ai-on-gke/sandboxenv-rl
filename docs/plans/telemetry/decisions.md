@@ -265,3 +265,8 @@ Append-only. Each entry: date, who, what, why.
   (4.11.0, the version the models were checked with) in a `.#dafny` devShell and a job of its own,
   not the default devShell: it brings the .NET SDK and Z3, which no other check needs. A download of
   the GitHub release zip would have been a second, unpinned source.
+- 2026-11-04, orchestrator: #238 fixes AC-15.9 as the model proposed. `_delete_unpooled` re-tags on
+  a cancellation as well as a failure (re-tagging an actor whose run is not reaped yet is harmless:
+  every reap deletes `WARM_POOL_RUN_ID`, the run's own included). `_release_internal` re-tags when a
+  reap ran since the pop, not only when a recycle saw the teardown; a failed release with no reap
+  keeps its run id, which a test pins. The model's gap lemmas stay as the code before the fix.

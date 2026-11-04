@@ -13,25 +13,25 @@ and checks the results against this file. Nothing ties them to the Python code: 
 | `telemetry.dfy`             | `repo_family`'s reserved-name rename and `_bounded_family` (P-1 to P-3), `inject_metadata` (P-4 to P-7), `RunReport.add_phase` with the negative-duration clamp (P-8)                                                                                            | 14 verified, 0 errors |
 | `warm_pool.dfy`             | Warm-pool bookkeeping with one teardown that ends the driver. Module `WarmPool` is the design #221 ships; module `WarmPoolBefore` is the code before #221 (P-9 to P-11)                                                                                          | 16 verified, 3 errors |
 | `warm_pool_generations.dfy` | Teardowns that bump a generation (`_teardowns`) and do not end the driver, a warm claim in two steps, ghost current and stale reservations, and the generation each pooled actor entered in                                                                      | 24 verified, 3 errors |
-| `warm_pool_drain.dfy`       | #221's third review round. Module `WarmPoolDrain`: `unwarm_pool` and a shrinking `resize_pool` that start a pool generation (`_pool_gens`), P-9, P-11 and DRAIN. Module `WarmPoolRunIds`: run ids, `reap(run)`, failed and cancelled deletes, `release` (ORPHAN) | 49 verified, 5 errors |
+| `warm_pool_drain.dfy`       | #221's third review round. Module `WarmPoolDrain`: `unwarm_pool` and a shrinking `resize_pool` that start a pool generation (`_pool_gens`), P-9, P-11 and DRAIN. Module `WarmPoolRunIds`: run ids, `reap(run)`, failed and cancelled deletes, `release` (ORPHAN) | 51 verified, 5 errors |
 
 Each piece of code between two `await`s is one atomic action on a shared state. Proving that every
 action keeps the invariant proves it for every interleaving of any number of concurrent calls.
 
 ### Lemmas that fail by design
 
-| File                        | Lemma                   | Why it fails                                                                                                                                                                      |
-| --------------------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `warm_pool.dfy`             | `RecycleFinishNowSafe`  | Before #221 a recycle that awaited `suspend()` across a reap pools its actor after the teardown (P-10). One error.                                                                |
-| `warm_pool.dfy`             | `WarmPlanNowSafe`       | Before #221 `warm_pool` ignores reservations of overlapping calls (P-11). Two errors.                                                                                             |
-| `warm_pool_generations.dfy` | `PlanFirstCovers`       | Bug A in #221's first version: reap kept the reservation counter, so a `warm_pool` started after the teardown counted it and returned short.                                      |
-| `warm_pool_generations.dfy` | `ClaimFailPutBackSafe`  | Bug B in #221's first version: a failed warm claim put its actor back in the pool after a teardown.                                                                               |
-| `warm_pool_generations.dfy` | `ClaimOkReturnsLive`    | Open after #221: a warm claim whose `get()` succeeds after an overlapping reap deleted the actor hands the caller a deleted environment.                                          |
-| `warm_pool_drain.dfy`       | `CommitStaleBeforeSafe` | Before the third round, a `warm_pool` call planned before an `unwarm_pool` pooled its actors afterwards (DRAIN).                                                                  |
-| `warm_pool_drain.dfy`       | `ResizeBeforeSafe`      | Before the third round, a `resize_pool` below pooled plus in flight left the calls in flight free to fill the pool past the new size (P-11).                                      |
-| `warm_pool_drain.dfy`       | `DeleteFailBeforeSafe`  | Before the third round, a delete that failed after the run's reap kept the reaped run id (ORPHAN).                                                                                |
-| `warm_pool_drain.dfy`       | `DeleteCancelledSafe`   | Open: a cleanup delete (`_delete_unpooled`) cancelled after the run's reap leaves the actor under the reaped run id (ORPHAN).                                                     |
-| `warm_pool_drain.dfy`       | `ReleaseDeleteFailSafe` | Open: a `release` whose delete fails or is cancelled while a reap runs puts the actor back under the reaped run id, unless it was a recycle that saw the teardown first (ORPHAN). |
+| File                        | Lemma                   | Why it fails                                                                                                                                                                                       |
+| --------------------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `warm_pool.dfy`             | `RecycleFinishNowSafe`  | Before #221 a recycle that awaited `suspend()` across a reap pools its actor after the teardown (P-10). One error.                                                                                 |
+| `warm_pool.dfy`             | `WarmPlanNowSafe`       | Before #221 `warm_pool` ignores reservations of overlapping calls (P-11). Two errors.                                                                                                              |
+| `warm_pool_generations.dfy` | `PlanFirstCovers`       | Bug A in #221's first version: reap kept the reservation counter, so a `warm_pool` started after the teardown counted it and returned short.                                                       |
+| `warm_pool_generations.dfy` | `ClaimFailPutBackSafe`  | Bug B in #221's first version: a failed warm claim put its actor back in the pool after a teardown.                                                                                                |
+| `warm_pool_generations.dfy` | `ClaimOkReturnsLive`    | Open after #221: a warm claim whose `get()` succeeds after an overlapping reap deleted the actor hands the caller a deleted environment.                                                           |
+| `warm_pool_drain.dfy`       | `CommitStaleBeforeSafe` | Before the third round, a `warm_pool` call planned before an `unwarm_pool` pooled its actors afterwards (DRAIN).                                                                                   |
+| `warm_pool_drain.dfy`       | `ResizeBeforeSafe`      | Before the third round, a `resize_pool` below pooled plus in flight left the calls in flight free to fill the pool past the new size (P-11).                                                       |
+| `warm_pool_drain.dfy`       | `DeleteFailBeforeSafe`  | Before the third round, a delete that failed after the run's reap kept the reaped run id (ORPHAN).                                                                                                 |
+| `warm_pool_drain.dfy`       | `DeleteCancelledSafe`   | Before #238 (AC-15.9): a cleanup delete (`_delete_unpooled`) cancelled after the run's reap left the actor under the reaped run id (ORPHAN).                                                       |
+| `warm_pool_drain.dfy`       | `ReleaseDeleteFailSafe` | Before #238 (AC-15.9): a `release` whose delete failed or was cancelled while a reap ran put the actor back under the reaped run id, unless it was a recycle that saw the teardown first (ORPHAN). |
 
 In `warm_pool_generations.dfy`, `PlanFixedSafe` (including "after a plan, the pool plus the current
 generation's reservations covers `R`"), `CommitCurrentSafe`, `CommitStaleFixedSafe`,
@@ -42,9 +42,10 @@ In `warm_pool_drain.dfy`, `PlanDrainSafe`, `CommitCurrentDrainSafe`, `CommitStal
 `UnwarmFixedSafe` and `ResizeFixedSafe` verify the generations #221 ships; `ReapSafe`,
 `WarmCommitDrainedSafe`, `StartDeleteSafe`, `DeleteOkSafe`, `DeleteFailFixedSafe`,
 `ReleaseStartSafe`, `ReleaseDeleteOkSafe` and `AnyReapDeletesRetagged` verify the re-tag.
-`ReleaseDeleteFailProposedSafe` verifies a fix for the release gap: re-tag the actor whenever
-`_teardowns` changed since the release popped it. `UnwarmRefillWitness`, `ResizeOverfillWitness` and
-`ReleaseOrphanWitness` verify concrete traces.
+`DeleteCancelledFixedSafe` and `ReleaseDeleteFailFixedSafe` verify #238's fix for AC-15.9: a
+cancelled delete re-tags, and a release re-tags whenever `_teardowns` changed since it popped the
+actor. `UnwarmRefillWitness`, `ResizeOverfillWitness` and `ReleaseOrphanWitness` verify concrete
+traces.
 
 ## Run
 
@@ -52,7 +53,7 @@ In `warm_pool_drain.dfy`, `PlanDrainSafe`, `CommitCurrentDrainSafe`, `CommitStal
 dafny verify telemetry.dfy                # 14 verified, 0 errors
 dafny verify warm_pool.dfy                # 16 verified, 3 errors, all in WarmPoolBefore
 dafny verify warm_pool_generations.dfy    # 24 verified, 3 errors: the three lemmas above
-dafny verify warm_pool_drain.dfy          # 49 verified, 5 errors: the five lemmas above
+dafny verify warm_pool_drain.dfy          # 51 verified, 5 errors: the five lemmas above
 ```
 
 ## CI

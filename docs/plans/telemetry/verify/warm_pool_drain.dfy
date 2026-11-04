@@ -21,7 +21,8 @@
 //      WarmPoolDrain.
 //   E. A delete that fails after the run's reap already ran re-tags the actor
 //      with WARM_POOL_RUN_ID, which every reap deletes.  Module
-//      WarmPoolRunIds.
+//      WarmPoolRunIds, which also has AC-15.9: a cancelled delete, and a
+//      release whose delete fails or is cancelled after a reap ran, re-tag too.
 //
 // As in the other models, each action is the code between two awaits of
 // clients/python/src/ate_env_rl/backend/substrate.py, for one pool key and one
@@ -315,10 +316,16 @@ module WarmPoolRunIds {
     requires a in s.deleting
   { s.(deleting := s.deleting - {a}) }
 
-  // A cancelled _delete_unpooled leaves the actor owned as it was.
+  // Before AC-15.9's fix: a cancelled _delete_unpooled left the actor owned
+  // as it was.
   function DeleteCancelled(s: State, a: Actor): State
     requires a in s.deleting
   { s.(deleting := s.deleting - {a}) }
+
+  // AC-15.9: a cancelled _delete_unpooled re-tags the actor, as a failed one does.
+  function DeleteCancelledFixed(s: State, a: Actor): State
+    requires a in s.deleting
+  { s.(owned := s.owned[a := WARM], deleting := s.deleting - {a}) }
 
   // release: pop from the owned actors, remember _teardowns, await delete().
   function ReleaseStart(s: State, a: Actor): State
@@ -334,9 +341,10 @@ module WarmPoolRunIds {
     s.(live := s.live - {a}, releasing := map b | b in s.releasing && b != a :: s.releasing[b])
   }
 
-  // release's delete raised or was cancelled. `missed` is the code's
-  // missed_by_reap: a recycle whose suspend() returned after a teardown.
-  // Then the actor is re-tagged WARM; otherwise it goes back under its run id.
+  // Before AC-15.9's fix: release's delete raised or was cancelled. `missed`
+  // is the code's missed_by_reap: a recycle whose suspend() returned after a
+  // teardown. Then the actor was re-tagged WARM; otherwise it went back under
+  // its run id.
   function ReleaseDeleteFail(s: State, a: Actor, missed: bool): State
     requires a in s.releasing
   {
@@ -345,8 +353,8 @@ module WarmPoolRunIds {
        releasing := map b | b in s.releasing && b != a :: s.releasing[b])
   }
 
-  // A proposed fix: re-tag whenever a reap ran since the pop.
-  function ReleaseDeleteFailProposed(s: State, a: Actor): State
+  // AC-15.9: re-tag whenever a reap ran since the pop (`not _may_pool(teardowns)`).
+  function ReleaseDeleteFailFixed(s: State, a: Actor): State
     requires a in s.releasing
   {
     var run := if s.releasing[a].1 != s.td then WARM else s.releasing[a].0;
@@ -396,35 +404,42 @@ module WarmPoolRunIds {
     ensures a !in Reap(s, r).owned && a !in Reap(s, r).live
   {}
 
-  lemma ReleaseDeleteFailProposedSafe(s: State, a: Actor)
-    requires Inv(s) && a in s.releasing
-    ensures Inv(ReleaseDeleteFailProposed(s, a))
+  lemma DeleteCancelledFixedSafe(s: State, a: Actor)
+    requires Inv(s) && a in s.deleting
+    ensures Inv(DeleteCancelledFixed(s, a))
   {}
 
-  // ============================ before the third round and open gaps: FAIL
+  lemma ReleaseDeleteFailFixedSafe(s: State, a: Actor)
+    requires Inv(s) && a in s.releasing
+    ensures Inv(ReleaseDeleteFailFixed(s, a))
+  {}
+
+  // ==================== before the third round and before AC-15.9's fix: FAIL
   // Bug E: a failed delete after the run's reap keeps the reaped run id.
   lemma DeleteFailBeforeSafe(s: State, a: Actor)
     requires Inv(s) && a in s.deleting
     ensures Inv(DeleteFailBefore(s, a))                               // fails
   {}
 
-  // Open: a cancelled delete after the run's reap keeps the reaped run id.
+  // Before AC-15.9's fix: a cancelled delete after the run's reap kept the
+  // reaped run id.
   lemma DeleteCancelledSafe(s: State, a: Actor)
     requires Inv(s) && a in s.deleting
     ensures Inv(DeleteCancelled(s, a))                                // fails
   {}
 
-  // Open: a release whose delete fails or is cancelled after a reap that ran
-  // during that delete, other than a recycle that saw the teardown first,
-  // puts the actor back under the reaped run id.
+  // Before AC-15.9's fix: a release whose delete failed or was cancelled
+  // after a reap that ran during that delete, other than a recycle that saw
+  // the teardown first, put the actor back under the reaped run id.
   lemma ReleaseDeleteFailSafe(s: State, a: Actor, missed: bool)
     requires Inv(s) && a in s.releasing
     ensures Inv(ReleaseDeleteFail(s, a, missed))                      // fails
   {}
 
   // ============================== concrete witnesses (these verify)
-  // Run 1 releases actor 5 (delete in flight), reaps, and the delete fails:
-  // actor 5 is owned under run 1, which no later reap matches.
+  // Before AC-15.9's fix. Run 1 releases actor 5 (delete in flight), reaps,
+  // and the delete fails: actor 5 is owned under run 1, which no later reap
+  // matches. With the fix, run 2's reap deletes it.
   lemma ReleaseOrphanWitness() {
     var s0 := State({5}, map[5 := 1], {}, map[], 0, {});
     assert Inv(s0);
@@ -436,5 +451,9 @@ module WarmPoolRunIds {
     assert !Inv(s3);
     var s4 := Reap(s3, 2);
     assert 5 in s4.owned && 5 in s4.live;      // run 2's reap skips it
+    var f3 := ReleaseDeleteFailFixed(s2, 5);
+    assert f3.owned[5] == WARM && Inv(f3);
+    var f4 := Reap(f3, 2);
+    assert 5 !in f4.owned && 5 !in f4.live;    // run 2's reap deletes it
   }
 }

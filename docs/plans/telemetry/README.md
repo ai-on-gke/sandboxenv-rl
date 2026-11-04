@@ -147,9 +147,9 @@ behind it.
   deleted environment (AC-15.7, P-24, `ClaimOkReturnsLive` in [verify/](./verify/README.md)).
 - Open: a `warm_pool` cancelled during its `create()` calls can leak the actors already created
   (AC-15.8).
-- Open: a delete cancelled after the run's reap, or a `release` whose delete fails or is cancelled
-  while a reap runs, leaves the actor under the reaped run id, so no later reap deletes it (AC-15.9,
-  `DeleteCancelledSafe` and `ReleaseDeleteFailSafe` in [verify/](./verify/README.md)).
+- Closed by #238: a delete cancelled after the run's reap, or a `release` whose delete fails or is
+  cancelled while a reap runs, left the actor under the reaped run id, so no later reap deleted it
+  (AC-15.9).
 - Open: with execs started concurrently on one handle, `ate_env.first_command=true` is not always on
   the first-started exec span (AC-3.4, P-14).
 - Follow-ups with criteria but no work yet: a CI-checked span inventory (AC-16), Go and Python span

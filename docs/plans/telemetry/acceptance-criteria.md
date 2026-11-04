@@ -13,8 +13,10 @@ Conventions:
   `SimpleSpanProcessor` (the `spans` fixture in `clients/python/tests`).
 - Names in backticks are the contracts in [interfaces.md](./interfaces.md); a criterion fails if the
   implementation uses another name.
+- "Properties (proposed)" names the properties in [properties.md](./properties.md) that would
+  validate a criterion over generated inputs. Those tests are not in the repository.
 
-| ID    | Title                                                                               | PR      | Status at `3b03b03`                                                                                           |
+| ID    | Title                                                                               | PR      | Status at `c0c41ac`                                                                                           |
 | ----- | ----------------------------------------------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------- |
 | AC-1  | Base install carries no telemetry dependency and imports clean                      | 1, 2    | pass: `pyproject.toml`, `test_registry_import_does_not_load_prometheus`                                       |
 | AC-2  | Telemetry enabled without the extras is a logged no-op                              | 1, 2    | pass: `test_missing_extra_logs_one_error`, `test_observer_without_layers_is_report_only`                      |
@@ -30,6 +32,7 @@ Conventions:
 | AC-12 | Docs: `docs/observability.md`, generated `docs/metrics.md`, CI freshness check      | 5       | pass: CI step `docs/metrics.md is generated from internal/telemetry`                                          |
 | AC-13 | CI runs the suites with and without the extras; lint and boilerplate pass           | 1, 2, 5 | pass: `.github/workflows/ci.yaml`                                                                             |
 | AC-14 | Blast radius: existing tests unchanged pass; telemetry-off overhead recorded        | all     | partial: suites green; overhead not recorded                                                                  |
+| AC-15 | Warm-pool accounting under concurrent acquire, recycle, `warm_pool` and teardown    | #221    | pass: `test_warm_pool_accounting.py`; `verify/warm_pool.dfy`, `verify/warm_pool_generations.dfy`              |
 
 ## AC-1: Base install carries no telemetry dependency
 
@@ -48,6 +51,7 @@ Conventions:
 - Expected: the run completes; one ERROR for the missing `tracing` extra and one WARNING for the
   missing `metrics` extra; `fleet.report.summary()` still prints.
 - Pass rule: no exception, the report exists, each message appears once per process.
+- Properties (proposed): P-12.
 
 ## AC-3: One in-process trace, sync and async
 
@@ -58,14 +62,24 @@ Conventions:
   parent's `span_id`; the same tree under `AsyncSandboxFleet`, through `SubstrateBackendDriver`'s
   `LoopRunner` path against the threaded fake server, and under a user span that parents the run.
 - Pass rule: the assertions hold for the sync, async, runner and user-span cases.
+- First command: the first exec started on an acquired sandbox, and only that one, carries
+  `ate_env.first_command=true`.
+  `pytest clients/python/tests/test_telemetry_tracing.py -k first_command` covers sequential execs.
+  With execs started concurrently on one handle the marked span is not always the first started,
+  because `SandboxHandle.exec` sets the flag before the span starts (P-14, open on `main`).
+- Properties (proposed): P-13, P-14.
 
 ## AC-4: The W3C context is on the wire
 
-- Command: `pytest clients/python/tests/test_telemetry_tracing.py -k metadata`.
+- Command: `pytest clients/python/tests/test_telemetry_tracing.py -k 'metadata or baggage'`.
 - Expected: the recorder server sees request metadata for one unary-unary, unary-stream,
   stream-unary and stream-stream call; each carries `traceparent` matching the client's current span
   and no `baggage` key; with tracing disabled no `traceparent` is sent.
 - Pass rule: four call kinds covered, both states.
+- `inject_metadata` keeps the caller's metadata unchanged and in order, and does not add a carrier
+  key the caller already set (compared case-insensitively). The code does this; no test on `main`
+  covers a caller-set `traceparent`.
+- Properties (proposed): P-4, P-5, P-6, P-7, P-15.
 
 ## AC-5: `ate-env-api` continues the client trace and exports it
 
@@ -99,13 +113,19 @@ Conventions:
 
 ## AC-7: `RunReport` has the agent-sandbox-rl shape
 
-- Command: `pytest clients/python/tests/test_observability.py -k report`.
+- Command: `pytest clients/python/tests/test_observability.py -k report` and
+  `pytest clients/python/tests/test_release_errors.py -k report`.
 - Expected: `to_dict()` keys are exactly
-  `strategy, total_s, phases, claims, tasks_ok, tasks_err, warm_replicas_total, warm_replicas_peak, environment`;
+  `strategy, total_s, phases, claims, tasks_ok, tasks_err, release_errors, warm_replicas_total, warm_replicas_peak, environment`;
   `phases` holds `count, total_s, max_s` per phase; `summary()` prints one row per phase in
-  `RunReport.ORDER` and a `TOTAL` row; negative durations clamp to 0; `write()` produces the `.txt`
-  and `.json` pair without overwriting.
+  `RunReport.ORDER` and a `TOTAL` row; negative durations clamp to 0, so every phase keeps
+  `0 <= max_s <= total_s <= count * max_s`; each `add_release_error()` adds 1 to `release_errors`,
+  and `summary()` prints a `release_errors=N` line while it is nonzero; `write()` produces the
+  `.txt` and `.json` pair without overwriting.
 - Pass rule: assertions hold.
+  `test_release_errors.py::test_failed_delete_does_not_raise_and_is_counted` checks the
+  `release_errors=N` summary line.
+- Properties (proposed): P-8, P-16.
 
 ## AC-8: Prometheus series register lazily with the documented labels
 
@@ -118,6 +138,7 @@ Conventions:
   [interfaces.md](./interfaces.md); `ate_env_client_*` histograms register on first use only;
   `serve_metrics(port)` answers `/metrics`.
 - Pass rule: assertions hold.
+- Properties (proposed): P-17.
 
 ## AC-9: Labels stay bounded
 
@@ -126,17 +147,23 @@ Conventions:
   distinct `family` values; no label value contains an environment id, actor id, run id or image
   tag; no label named `env_id`, `instance`, `image` or `run_id` on any family; a repo named `other`
   or `unknown` does not collide with the overflow and no-family values; more than `MAX_FAMILIES`
-  families collapse into `other`.
+  families collapse into `other`. The registry holds at most `MAX_FAMILIES` (64) names, and a
+  process emits at most `MAX_FAMILIES + 2` distinct `family` values: the registered families,
+  `other` and `unknown`, neither of which counts toward the cap.
 - Pass rule: assertions hold.
+- Properties (proposed): P-1, P-2, P-3, P-18.
 
 ## AC-10: swebench loader JSONL unchanged, one span per event
 
 - Command: `go test ./internal/benchmarking/swebench/... -run 'Event|Recorder|Golden' -v`.
 - Expected: the `Recorder` output for the fixed event sequence equals `testdata/events.golden.txt`
   byte for byte with tracing off and on; with a test exporter, each event yields one span named
-  after `Event.Event` with `run`, `env`, `instance`, `step`, `task` as attributes, status from `OK`,
-  start `ts - dur_ms` and end `ts`.
+  after `Event.Event`, start `ts - dur_ms` and end `ts`, status `Ok` when `OK`, else `Error` with
+  `Err` (or `not ok`). Attributes: `run`, `step` and `task` always; `job`, `worker`, `env`,
+  `instance` and `name` when non-empty; `attempts` and `count` when above 0; `exit` and `reward`
+  when set.
 - Pass rule: golden file identical; span count equals event count.
+- Properties (proposed): P-19.
 
 ## AC-11: Go client provider injection and span names
 
@@ -146,6 +173,7 @@ Conventions:
   attributes; without a provider no span is recorded and no exporter is constructed;
   `TraceServiceName` changes the prefix; a caller-supplied `GRPCConn` still carries `traceparent`.
 - Pass rule: assertions hold.
+- Properties (proposed): P-20.
 
 ## AC-12: Docs
 
@@ -174,3 +202,32 @@ Conventions:
 - Expected: every pre-existing test passes unchanged; the three wall-clock medians are recorded.
 - Status: the suites are green in CI on every PR of the series. No overhead measurement is recorded
   in the pull requests; the procedure stays in [test-plan.md](./test-plan.md) section 7.
+
+## AC-15: Warm-pool accounting under concurrency
+
+`SubstrateBackendDriver` coroutines share one event loop and interleave at every `await`.
+
+- Status: met by #221. Added after the series from a model of the driver's warm-pool bookkeeping;
+  `main` at `9b2148a` failed it.
+- 15.1: after every step of any interleaving of acquire, recycle, `warm_pool` and teardown, the
+  `ate_env_fleet_warm_replicas{backend}` gauge equals the number of actors in the driver's warm
+  pool.
+- 15.2: a recycle, `warm_pool` call or failed warm claim paused in an `await` while teardown runs
+  deletes its actor when it resumes; after teardown no environment from the run is alive on
+  Substrate or tracked by the driver.
+- 15.3: overlapping `warm_pool(template, replicas=R)` calls create at most `R` warm actors in total
+  for one pool key.
+- Commands: in `$VENV_BASE` (the `dev` extra carries `hypothesis`):
+  `python -m pytest clients/python/tests/test_warm_pool_accounting.py`; with Dafny 4.11:
+  `dafny verify docs/plans/telemetry/verify/warm_pool.dfy` and
+  `dafny verify docs/plans/telemetry/verify/warm_pool_generations.dfy`.
+- Expected: the pytest run passes (18 plain tests and the stateful `test_warm_pool_accounting`).
+  `warm_pool.dfy`: 16 verified, 3 errors, all in `WarmPoolBefore` (the code before #221).
+  `warm_pool_generations.dfy`: 24 verified, 3 errors, in `PlanFirstCovers` and
+  `ClaimFailPutBackSafe` (#221's first version) and `ClaimOkReturnsLive` (the open claim/reap gap).
+  [verify/README.md](./verify/README.md) explains each.
+- Pass rule: pytest green; Dafny output matches. CI runs the pytest file, not Dafny.
+- Not covered: a warm claim whose `get()` succeeds after an overlapping reap deleted the actor
+  returns a deleted environment; a `warm_pool` cancelled during its `create()` calls can leak the
+  actors already created. Both are open.
+- Properties: P-9 (15.1), P-10 (15.2), P-11 (15.3).

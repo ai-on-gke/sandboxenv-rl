@@ -18,7 +18,8 @@ Skipped unless SUBSTRATE_E2E_API_URL points at a reachable ate-env-api (e.g.
 `kubectl port-forward -n ate-env svc/ate-env-api 7777:7777` then
 `SUBSTRATE_E2E_API_URL=127.0.0.1:7777 pytest tests/test_e2e.py`; an http://
 URL works too). SUBSTRATE_E2E_TEMPLATE picks the ActorTemplate (default
-`default-template`, ate-env's own default).
+`default-template`, ate-env's own default). SUBSTRATE_E2E_ATESPACE optionally
+picks the target atespace.
 
 test_full_lifecycle exercises the provider on a real Substrate actor:
 create -> exec (incl. nonzero exit, env/cwd) -> file round-trip -> status ->
@@ -47,6 +48,7 @@ from nemo_gym_substrate.provider import SubstrateSandboxProvider
 
 API_URL = os.environ.get("SUBSTRATE_E2E_API_URL")
 TEMPLATE = os.environ.get("SUBSTRATE_E2E_TEMPLATE", "default-template")
+ATESPACE = os.environ.get("SUBSTRATE_E2E_ATESPACE")
 
 pytestmark = pytest.mark.skipif(
     not API_URL, reason="SUBSTRATE_E2E_API_URL not set; e2e needs a live ate-env-api"
@@ -55,7 +57,12 @@ pytestmark = pytest.mark.skipif(
 
 def test_full_lifecycle(tmp_path: Path) -> None:
     async def scenario() -> None:
-        provider = SubstrateSandboxProvider({"connection": {"api_url": API_URL}})
+        provider = SubstrateSandboxProvider(
+            {
+                "connection": {"api_url": API_URL},
+                **({"create": {"atespace": ATESPACE}} if ATESPACE else {}),
+            }
+        )
         handle = None
         try:
             handle = await provider.create(

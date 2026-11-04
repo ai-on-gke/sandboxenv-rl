@@ -54,10 +54,14 @@ from ate_env import (
     EnvError,
     EnvironmentStatus,
     FailedPreconditionError,
+    FleetConfig,
     InvalidArgumentError,
+    LookaheadWarmer,
     NotFoundError,
     ProcessState,
+    SandboxFleet,
     Signal,
+    Task,
 )
 
 TARGET = os.environ.get("ATE_ENV_API_TARGET")
@@ -531,3 +535,46 @@ async def test_create_from_image(client):
 
     for e in envs:
         await _wait_until_deleted(e)
+
+
+def test_fleet_lookahead_warm_pool_lifecycle():
+    atespace = os.environ.get("NAMESPACE", "ate-env")
+    warm_img = "e2e-warm-base:latest"
+    base_tmpl = TEMPLATE or "default-template"
+    cfg = FleetConfig(
+        backend="substrate",
+        endpoint=TARGET,
+        tenancy=atespace,
+        template=base_tmpl,
+        image_templates={warm_img: base_tmpl},
+        max_warmpool_replicas=2,
+        auth_token=AUTH_TOKEN,
+    )
+    with SandboxFleet(cfg) as fleet:
+        warmer = LookaheadWarmer(fleet, keep_finished=1, fail_fast=True)
+        try:
+            rep = warmer.add(0, {warm_img: 1}, wait=True)
+            assert rep.ok
+            assert rep.changes == {warm_img: (0, 1)}
+            assert warmer.remaining() == {0: {warm_img: 1}}
+            assert fleet.pool_size(warm_img) == 1
+
+            handle = fleet.acquire(
+                Task(id=f"warm-task-{uuid.uuid4().hex[:6]}", image=warm_img)
+            )
+            assert handle.claim_source == "warm_pool"
+            assert fleet.pool_size(warm_img) == 0
+            assert fleet.acquired_count(warm_img) == 1
+
+            res = handle.exec("echo warm-wake-ok")
+            assert res.exit_code == 0
+            assert res.stdout == "warm-wake-ok\n"
+
+            fleet.release(handle)
+            fin = warmer.finish(0)
+            assert fin.ok
+            assert warmer.requested == {}
+            assert warmer.remaining() == {0: {}}
+        finally:
+            warmer.close()
+        assert fleet.pool_size(warm_img) == 0

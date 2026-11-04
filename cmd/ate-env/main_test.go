@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -441,6 +442,50 @@ func TestCreateRejectsSubcommandID(t *testing.T) {
 		err := root.Execute()
 		if err == nil || !strings.Contains(err.Error(), "reserved") {
 			t.Errorf("create %s: err = %v, want a reserved-id error", id, err)
+		}
+	}
+}
+
+func TestCreateWorkerSelectorFlag(t *testing.T) {
+	args := []string{"create", "dev1", "--worker-selector", "ate-env/domain=d0,tier=hot", "--worker-selector", "zone=us-central1-a"}
+	root := newRootCommand(args)
+	cmd, _, err := root.Find(args[:2])
+	if err != nil {
+		t.Fatalf("root.Find failed: %v", err)
+	}
+	if cmd.Flags().Lookup("worker-selector") == nil {
+		t.Fatal("create has no --worker-selector flag")
+	}
+	if err := cmd.ParseFlags(args[2:]); err != nil {
+		t.Fatalf("parsing --worker-selector: %v", err)
+	}
+	items, _ := cmd.Flags().GetStringSlice("worker-selector")
+	got, err := parseWorkerSelector(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"ate-env/domain": "d0", "tier": "hot", "zone": "us-central1-a"}
+	if !maps.Equal(got, want) {
+		t.Errorf("parseWorkerSelector(%q) = %v, want %v", items, got, want)
+	}
+}
+
+func TestParseWorkerSelector(t *testing.T) {
+	if got, err := parseWorkerSelector(nil); err != nil || got != nil {
+		t.Errorf("parseWorkerSelector(nil) = %v, %v; want nil, nil", got, err)
+	}
+	if got, err := parseWorkerSelector([]string{"k="}); err != nil || got["k"] != "" {
+		t.Errorf("an empty value is a value: got %v, %v", got, err)
+	}
+	if _, err := parseWorkerSelector([]string{"zone=a", "zone=b"}); err == nil || !strings.Contains(err.Error(), "given twice") {
+		t.Errorf("a repeated key must be an error, got %v", err)
+	}
+	if _, err := parseWorkerSelector([]string{"zone=a", "zone=a"}); err == nil {
+		t.Error("a repeated key with the same value must be an error too")
+	}
+	for _, bad := range []string{"novalue", "=v", ""} {
+		if _, err := parseWorkerSelector([]string{bad}); err == nil {
+			t.Errorf("parseWorkerSelector(%q) accepted, want an error", bad)
 		}
 	}
 }

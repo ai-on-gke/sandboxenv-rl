@@ -1,0 +1,61 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Categories for GitHub's automatically generated release notes
+# (repos/{owner}/{repo}/releases/generate-notes). See docs/release.md.
+#
+# GitHub places each PR in the FIRST category it matches, and labels within a
+# category are OR'd:
+#   - Bug Fixes before feature areas, so a bug fix with an area label is listed
+#     as a bug fix.
+#   - Area sections exclude documentation and dependency updates so those fall
+#     through to their own sections.
+changelog:
+  exclude:
+    labels:
+      - duplicate
+      - invalid
+      - wontfix
+  categories:
+    - title: "Bug Fixes"
+      labels:
+        - bug
+    - title: "Core Runtime, CLI & Substrate"
+      labels:
+        - go
+        - substrate
+        - api
+        - guest
+      exclude:
+        labels: [documentation, dependencies]
+    - title: "Python SDK & Fleet"
+      labels:
+        - python-sdk
+        - python
+      exclude:
+        labels: [documentation, dependencies]
+    - title: "Enhancements"
+      labels:
+        - enhancement
+      exclude:
+        labels: [documentation, dependencies]
+    - title: "Dependencies"
+      labels:
+        - dependencies
+    - title: "Documentation"
+      labels:
+        - documentation
+    - title: "Other Changes"
+      labels:
+        - "*"

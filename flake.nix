@@ -63,6 +63,7 @@
                 ci-go
                 ci-python
                 ci-coverage
+                ci-release
                 ci-e2e
                 smoke
                 check-substrate-head
@@ -74,12 +75,13 @@
             };
           in
           {
-            # The scripts, plus the Python envs ci-python builds on first use
+            # The scripts, plus the Python envs ci-python and ci-e2e build on first use
             # (they are not part of the default devShell).
             packages = scripts // {
               coverage = ci.coverage;
               python-env-base = ci.pythonEnvBase;
               python-env-uni-agent = ci.uniAgentEnv;
+              python-env-harbor = ci.harborEnv;
             };
 
             devShells = {

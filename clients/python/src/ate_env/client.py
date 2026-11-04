@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import collections
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
@@ -246,6 +246,7 @@ class Client:
         template_name: str | None = None,
         template_atespace: str | None = None,
         rootfs_image: str | None = None,
+        worker_selector: Mapping[str, str] | None = None,
     ) -> Env:
         """Register and start a new environment; returns a handle to it.
 
@@ -258,10 +259,18 @@ class Client:
         image as the container and the ate-env-guest mounted into it as an
         image volume. The derived template is created on first use and reused
         for later environments on the same image; info() reports its name.
+
+        worker_selector names labels the worker pool must carry (exact
+        equality). Substrate ANDs it with the template's own selector, so it
+        narrows the pools the environment can run on and never widens them;
+        it also applies to the environment's later wakes. get() reports it,
+        with the node the environment runs on.
         """
         req = env_pb2.CreateEnvironmentRequest(
             id=id, atespace=atespace, rootfs_image=rootfs_image or ""
         )
+        if worker_selector:
+            req.worker_selector.update(worker_selector)
         if template_name or template_atespace:
             req.template.name = template_name or ""
             req.template.atespace = template_atespace or ""

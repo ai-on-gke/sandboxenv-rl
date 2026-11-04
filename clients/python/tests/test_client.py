@@ -370,3 +370,34 @@ async def test_auth_token_sent_once_across_unary_and_streaming_env_rpcs(external
     for method, vals in seen_auth:
         assert vals == ["Bearer s3cr3t"], f"unexpected authorization headers on {method}: {vals}"
 
+
+async def test_create_passes_worker_selector(fake_stack):
+    client, fakes = fake_stack
+    await client.create("dev1", worker_selector={"ate-env/domain": "d0", "tier": "hot"})
+    sent = fakes.environments.last_create_request.worker_selector
+    assert dict(sent) == {"ate-env/domain": "d0", "tier": "hot"}
+    info = await client.get("dev1")
+    assert info.worker_selector == {"ate-env/domain": "d0", "tier": "hot"}
+
+
+async def test_create_omits_worker_selector_when_not_given(fake_stack):
+    client, fakes = fake_stack
+    await client.create("dev1")
+    assert len(fakes.environments.last_create_request.worker_selector) == 0
+    assert (await client.get("dev1")).worker_selector == {}
+
+
+async def test_environment_info_stays_hashable(fake_stack):
+    client, _ = fake_stack
+    await client.create("dev1", worker_selector={"ate-env/domain": "d0"})
+    info = await client.get("dev1")
+    assert hash(info) == hash(await client.get("dev1"))
+    assert len({info, await client.get("dev1")}) == 1
+
+
+async def test_get_reports_node(fake_stack):
+    client, fakes = fake_stack
+    await client.create("dev1")
+    assert (await client.get("dev1")).node == ""
+    fakes.environments.environments[("ate-env", "dev1")].node = "gke-pool-a-7"
+    assert (await client.get("dev1")).node == "gke-pool-a-7"

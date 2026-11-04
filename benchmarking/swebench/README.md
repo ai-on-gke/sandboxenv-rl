@@ -204,6 +204,39 @@ staying the source of truth so a run does not depend on a collector.
    image, the API derives one template from it on first use and bakes the
    golden snapshot then; the first create of each image pays that.
 
+4. Optional: plan where the images go. Placement is image-blind, so the
+   first boot of an image on a node pays its pull and unpack wherever the
+   scheduler puts it. A placement plan assigns each image to **domains**,
+   WorkerPools (or sets of pools sharing a label) that a per-environment
+   worker selector addresses, under each node's image-cache budget, so that
+   every node of a domain holds every image assigned to it. Describe the
+   domains once per cluster shape, then plan:
+
+   ```bash
+   cat > domains.json <<'EOF'
+   {"domains": [
+     {"name": "d0", "selector": {"ate-env/domain": "d0"}, "nodes": 4, "node_cache_bytes": 400000000000},
+     {"name": "d1", "selector": {"ate-env/domain": "d1"}, "nodes": 4, "node_cache_bytes": 400000000000}
+   ]}
+   EOF
+   swebench-loader plan-placement -dataset swebench-verified.jsonl -schedule schedule.json \
+     -domains domains.json -replication 1 -hot-demand 8 -hot-replication 2 -out image-placement.json
+   ```
+
+   `node_cache_bytes` is the unpacked bytes one node may hold for the plan:
+   the image-cache volume times atelet's low watermark (`--image-cache-low-percent`),
+   minus headroom. Sizes come from the manifest's `image_bytes_compressed`
+   (make-dataset.py records it) times `-unpack-factor` (default 2.5); an image
+   without a size gets `-default-image-size` and is marked `size_assumed`. The
+   planner takes the largest image first and gives each image its
+   `-replication` domains with the most free budget; with `-schedule`, an
+   image whose demand (the most environments one step asks for) reaches
+   `-hot-demand` gets `-hot-replication` domains instead. Images no domain
+   can take are listed under `unplaced` and pay cold first boots. The plan is
+   `image-placement.json` (`schema_version: v1`, `internal/benchmarking/schema`);
+   the pre-flight fills the node caches from it and the run steers each
+   create into its image's domain.
+
 ## Run
 
 From a machine with a port-forward (fine for the smoke test and the step

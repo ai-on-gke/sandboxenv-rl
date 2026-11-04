@@ -378,12 +378,12 @@ def run_tests(
         lib.step("Running live Python SDK integration tests...")
         lib.run(*py, str(root / "clients/python/tests/e2e/test_full_stack.py"), "-v", env=test_env, capture=False)
 
-        lib.step("Running NeMo Gym provider live E2E test...")
+        lib.step("Running NeMo Gym provider live E2E tests...")
         lib.run(
             *py,
             str(root / "integrations/nemo-gym/tests/test_e2e.py"),
             "-k",
-            "test_full_lifecycle",
+            "test_full_lifecycle or test_pause_policy_parks_and_the_next_command_wakes",
             "-v",
             env={
                 **test_env,

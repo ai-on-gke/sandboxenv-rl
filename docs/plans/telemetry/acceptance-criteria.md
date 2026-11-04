@@ -233,8 +233,9 @@ Conventions:
   the deletes that start after the teardown (`warm_pool`, a failed warm claim, a recycle that saw
   the teardown, a drain); 15.9 covers the rest.
 - 15.6: a direct `reap` (outside a fleet, with no `warm_reset`) leaves the gauge equal to the pool.
-- 15.7: a warm claim returns a live environment. Met by #239: a claim whose `get()` succeeds after
-  an overlapping reap claims or creates another actor; before it, the claim returned the deleted one
+- 15.7: a warm claim returns a live environment, and leaves no actor it popped alive and unpooled.
+  Met by #239: a claim whose `get()` succeeds after an overlapping reap deletes the popped actor if
+  it is still owned and claims or creates another; before it, the claim returned the deleted one
   (`ClaimOkReturnsLive`).
 - 15.8 (open): a `warm_pool` call cancelled during its `create()` calls leaves no live actor
   untracked; today the actors already created are leaked.
@@ -247,7 +248,7 @@ Conventions:
   `dafny verify docs/plans/telemetry/verify/warm_pool.dfy`,
   `dafny verify docs/plans/telemetry/verify/warm_pool_generations.dfy` and
   `dafny verify docs/plans/telemetry/verify/warm_pool_drain.dfy`.
-- Expected: the pytest run passes (26 plain tests and the stateful `test_warm_pool_accounting`).
+- Expected: the pytest run passes (28 plain tests and the stateful `test_warm_pool_accounting`).
   15.4: `test_unwarm_cancels_a_warm_pool_in_flight`,
   `test_shrinking_resize_cancels_a_warm_pool_in_flight`,
   `test_warm_pool_after_unwarm_ignores_the_cancelled_call` and the machine's `unwarm` rule. 15.5:
@@ -255,14 +256,15 @@ Conventions:
   `test_failed_recycle_delete_after_teardown_leaves_the_actor_for_any_later_reap`,
   `test_failed_delete_of_drained_actors_keeps_them_for_the_next_reap`. 15.6:
   `test_direct_reap_moves_the_gauge_with_the_pool`. 15.7:
-  `test_warm_claim_overlapping_a_reap_returns_a_live_environment` (reap finished, and still
-  running). 15.9: `test_cancelled_delete_after_reap_leaves_warm_actors_for_any_later_reap`,
+  `test_warm_claim_overlapping_a_reap_returns_a_live_environment` (reap finished or still running;
+  popped actor matched or skipped by the reap). 15.9:
+  `test_cancelled_delete_after_reap_leaves_warm_actors_for_any_later_reap`,
   `test_release_delete_lost_during_reap_leaves_the_actor_for_any_later_reap` (failed and cancelled),
   `test_recycle_cancelled_in_suspend_after_a_reap_leaves_the_actor_for_any_later_reap`,
   `test_warm_pool_cancelled_before_its_deletes_start_leaves_actors_for_any_later_reap`, and
   `test_release_delete_failure_without_a_reap_keeps_the_run_id` for the path that must not change.
   `warm_pool.dfy`: 16 verified, 3 errors, all in `WarmPoolBefore` (the code before #221).
-  `warm_pool_generations.dfy`: 29 verified, 3 errors, in `PlanFirstCovers` and
+  `warm_pool_generations.dfy`: 32 verified, 3 errors, in `PlanFirstCovers` and
   `ClaimFailPutBackSafe` (#221's first version) and `ClaimOkReturnsLive` (the code before 15.7's
   fix). `warm_pool_drain.dfy`: 54 verified, 7 errors, in `CommitStaleBeforeSafe`, `ResizeBeforeSafe`
   and `DeleteFailBeforeSafe` (the code before 15.4 and 15.5) and `WarmCommitDrainedBeforeSafe`,
@@ -332,7 +334,7 @@ Conventions:
   [verify/README.md](./verify/README.md) lists.
 - Command: `make ci-dafny` (the `.#dafny` devShell runs `hack/verify/dafny.py`).
 - Expected: `telemetry.dfy` 14 verified, 0 errors; `warm_pool.dfy` 16 verified, 3 errors;
-  `warm_pool_generations.dfy` 29 verified, 3 errors; `warm_pool_drain.dfy` 54 verified, 7 errors;
+  `warm_pool_generations.dfy` 32 verified, 3 errors; `warm_pool_drain.dfy` 54 verified, 7 errors;
   the failing lemmas are the ones the README's table lists; the script prints
   `All 4 Dafny models match docs/plans/telemetry/verify/README.md.`
 - Status: pass. CI's `Dafny models` job runs the check with the pinned nixpkgs' Dafny 4.11.0.

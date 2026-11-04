@@ -279,7 +279,11 @@ Append-only. Each entry: date, who, what, why.
   the start. `missed_by_reap` is gone: a reap that the recycle saw also fails `_may_pool`.
 - 2026-11-04, orchestrator: #239 fixes AC-15.7. A warm claim whose `get()` succeeds after a reap ran
   since the pop moves on (another pooled actor, else a cold create) instead of raising: `reap(run)`
-  clears the whole pool for every run, so a claim for another run must not fail because of it. The
-  popped actor is left to the reap, which took it while it was still owned. Not changed: an
-  `acquire` that cold-creates while its own run's reap is running can still end owned under the
-  reaped run id; that is the acquire-during-teardown case, not a warm claim.
+  clears the whole pool for every run, so a claim for another run must not fail because of it.
+  Review of #239: the popped actor is not always the reap's. A reap of another run skips an actor
+  recycled under this run, and a cancelled reap may never delete it, so the claim deletes the actor
+  if it is still owned; it also checks `_may_pool` and takes ownership in one lock hold, so a reap
+  on another thread cannot run in between. In the model `ClaimOk` deletes a stale claim's actor, as
+  `ClaimFailFixed` does. Not changed: an `acquire` that cold-creates while its own run's reap is
+  running can still end owned under the reaped run id; that is the acquire-during-teardown case, not
+  a warm claim.

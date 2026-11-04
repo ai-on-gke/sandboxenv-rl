@@ -163,12 +163,16 @@ module WarmPoolGenerations {
       s.(claiming := s.claiming - {a}, owned := s.owned - {a}, live := s.live - {a})
   }
 
-  // get() succeeded. AC-15.7: the claim ends either way; the actor is handed
-  // out only if no reap ran since the pop, otherwise acquire claims or creates
-  // another, and the reap deletes this one.
+  // get() succeeded. AC-15.7: the actor is handed out (it stays owned) only
+  // if no reap ran since the pop. Otherwise acquire deletes it if it is still
+  // owned (a reap of another run, `keep`, left it alive and unpooled), as
+  // ClaimFailFixed does, and claims or creates another.
   function ClaimOk(s: State, a: Actor): State
     requires a in s.claiming
-  { s.(claiming := s.claiming - {a}) }
+  {
+    if s.claiming[a] == s.gen then s.(claiming := s.claiming - {a})
+    else s.(claiming := s.claiming - {a}, owned := s.owned - {a}, live := s.live - {a})
+  }
 
   ghost predicate HandsOut(s: State, a: Actor)
     requires a in s.claiming
@@ -215,6 +219,18 @@ module WarmPoolGenerations {
   lemma ClaimOkSafe(s: State, a: Actor)
     requires Inv(s) && a in s.claiming
     ensures Inv(ClaimOk(s, a))
+    ensures !HandsOut(s, a) ==> a !in ClaimOk(s, a).live           // nothing left behind
+  {}
+
+  // The review's trace: actor 7 of another run sits in the pool; a claim pops
+  // it, a reap runs and keeps it (other run), get() succeeds. The claim does
+  // not hand 7 out, and 7 is not left live, unpooled and unclaimed.
+  lemma ClaimOkOtherRunWitness()
+    ensures var s0 := State({7}, {7}, {7}, 1, 0, 0, 0, 0, map[], map[7 := 0], {}, 3);
+            var s1 := ClaimStart(s0, 7);
+            var s2 := ReapFixed(s1, {7});
+            var s3 := ClaimOk(s2, 7);
+            Inv(s2) && !HandsOut(s2, 7) && 7 !in s3.live && 7 !in s3.owned && Inv(s3)
   {}
 
   // ======== the first version of #221 and the code before AC-15.7's fix: FAIL

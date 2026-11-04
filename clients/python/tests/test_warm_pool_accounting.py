@@ -478,11 +478,14 @@ async def test_release_delete_failure_without_a_reap_keeps_the_run_id() -> None:
 # AC-15.7: a warm claim whose get() returns after an overlapping reap deleted
 # the actor does not hand that actor out.
 @pytest.mark.parametrize("reap_done", [True, False])
-async def test_warm_claim_overlapping_a_reap_returns_a_live_environment(reap_done: bool) -> None:
+@pytest.mark.parametrize("owner", ["run-0", "run-1"])  # run-1: the reap skips it
+async def test_warm_claim_overlapping_a_reap_returns_a_live_environment(
+    reap_done: bool, owner: str
+) -> None:
     client = GatedClient()
     driver, obs = _driver(client)
     client.live.add("sb-x")
-    driver._owned_actors["sb-x"] = driver._make_instance("sb-x", "tmpl", run_id="run-0")
+    driver._owned_actors["sb-x"] = driver._make_instance("sb-x", "tmpl", run_id=owner)
     driver._warm_paused_pool.setdefault(("tmpl", None), []).append("sb-x")
     obs.warm_add("substrate", 1)
     client.get_gate = asyncio.Event()
@@ -492,12 +495,13 @@ async def test_warm_claim_overlapping_a_reap_returns_a_live_environment(reap_don
     if not reap_done:
         client.delete_gate = asyncio.Event()
     reap = asyncio.create_task(driver.reap_async("run-0"))
-    await _spin()  # the reap took sb-x (still owned) and deletes it
+    await _spin()  # run-0: the reap took sb-x (still owned); run-1: it skips sb-x
     client.get_gate.set()  # get() still succeeds
-    instance = await claim
+    await _spin()
     if not reap_done:
         assert client.delete_gate is not None
         client.delete_gate.set()
+    instance = await claim
     await reap
 
     assert instance.instance_id != "sb-x"

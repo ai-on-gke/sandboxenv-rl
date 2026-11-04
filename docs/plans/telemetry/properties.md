@@ -5,7 +5,7 @@ property tests here are proposed and not in the repository: `pgregory.net/rapid`
 and the Hypothesis tests named "Proposed test" do not exist. Two parts exist:
 
 - `clients/python/tests/test_warm_pool_accounting.py` (#221): the P-9 to P-11 stateful test
-  `test_warm_pool_accounting` and 26 plain interleaving tests. `hypothesis` is in the `dev` extra
+  `test_warm_pool_accounting` and 28 plain interleaving tests. `hypothesis` is in the `dev` extra
   since #221.
 - [verify/](./verify/README.md): hand-written Dafny models of P-1 to P-11 and of the two bugs review
   found in #221's first version. CI checks their results (AC-20).
@@ -438,9 +438,11 @@ environment `acquire` returns is alive on Substrate when `acquire` returns.
 **Validates: AC-15.7**
 
 - Met by #239. Test: `test_warm_claim_overlapping_a_reap_returns_a_live_environment` pauses `get()`,
-  reaps (to the end, or with the reap's delete still in flight), lets `get()` succeed, and checks
-  that `acquire` returns a live, newly created environment. Dafny: `ClaimOkFixedReturnsLive` in
-  `verify/warm_pool_generations.dfy`; `ClaimOkReturnsLive` models the code before the fix and fails.
+  reaps another run (to the end, or with the reap's delete still in flight), lets `get()` succeed,
+  and checks that `acquire` returns a live, newly created environment and that the popped actor is
+  gone, both when the reap matches it (`run-0`) and when it skips it (`run-1`). Dafny:
+  `ClaimOkFixedReturnsLive` in `verify/warm_pool_generations.dfy`; `ClaimOkReturnsLive` models the
+  code before the fix and fails.
 - The stateful machine still never runs a reap during a claim; a rule for it is proposed.
 
 ## Requirement index
@@ -610,9 +612,13 @@ concrete traces. #221 fixed both and added a plain test for each.
 the delete lands, `_acquire_internal` hands the caller a deleted environment. #221 re-checked
 `_teardowns` only on the failure path. P-10 holds (nothing survives the teardown); what breaks is
 that `acquire` returns a live environment, which P-24 now states. #239 re-checks on the success path
-too: if a reap ran since the pop, the claim moves on to another pooled actor or a cold create, and
-the reap deletes the popped one. In the model, a claim from the current generation is live (an
-invariant), and the actor is handed out only then.
+too: if a reap ran since the pop, the claim moves on to another pooled actor or a cold create. The
+reap deleted the popped actor if it matched it (its run or `WARM_POOL_RUN_ID`); one of another run,
+or a reap cancelled before its delete, leaves it alive and unpooled, so the claim deletes it if it
+is still owned. The check and taking ownership share one lock hold. In the model, a claim from the
+current generation is live (an invariant), the actor is handed out only then, and otherwise
+`ClaimOk` deletes what is still owned, as `ClaimFailFixed` does (`ClaimOkOtherRunWitness` is the
+other-run trace).
 
 Run-id gaps (AC-15.9), fixed by #238. `warm_pool_drain.dfy` states ORPHAN: every owned actor with no
 delete pending carries a run id some later reap still matches (`WARM_POOL_RUN_ID`, or a run not

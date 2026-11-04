@@ -77,6 +77,10 @@ DEFAULT_API_URL = "127.0.0.1:7777"
 DEFAULT_ATESPACE = "ate-env"
 DEFAULT_TEMPLATE = "default-template"
 RECORD_FILE = "ate_env.json"
+# Harbor's separate verifier mode starts a second environment for the same
+# trial (session_id "<trial>__verifier__<step>"); its record gets its own file
+# so the agent environment's record is not overwritten.
+VERIFIER_RECORD_FILE = "ate_env.verifier.json"
 # The same variables the ate-env CLI reads, plus one for the image registry.
 API_ENV = "SUBSTRATE_ENV_API"
 TOKEN_ENV = "SUBSTRATE_ENV_AUTH_TOKEN"
@@ -475,6 +479,11 @@ class AteEnvEnvironment(BaseEnvironment):
         except Exception as e:  # noqa: BLE001 - cleanup after another failure
             self.logger.warning("could not delete %s after a failed start: %s", self._env_id, e)
 
+    @property
+    def record_file(self) -> str:
+        """The file under the trial directory that records this environment."""
+        return VERIFIER_RECORD_FILE if "__verifier__" in self.session_id else RECORD_FILE
+
     def _write_record(self) -> None:
         record = {
             "id": self._env_id,
@@ -490,11 +499,11 @@ class AteEnvEnvironment(BaseEnvironment):
         }
         try:
             self.trial_paths.trial_dir.mkdir(parents=True, exist_ok=True)
-            (self.trial_paths.trial_dir / RECORD_FILE).write_text(
+            (self.trial_paths.trial_dir / self.record_file).write_text(
                 json.dumps(record, indent=2) + "\n"
             )
         except OSError as e:
-            self.logger.debug("could not write %s: %s", RECORD_FILE, e)
+            self.logger.debug("could not write %s: %s", self.record_file, e)
 
     async def stop(self, delete: bool) -> None:
         env, self._env = self._env, None

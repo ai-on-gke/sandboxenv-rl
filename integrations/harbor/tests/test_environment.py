@@ -75,6 +75,29 @@ async def test_start_creates_from_the_digest_and_the_class_template(fake, make_e
     assert fake.state.envs == {}
 
 
+async def test_separate_verifier_environment_keeps_its_own_record(fake, make_env, tmp_path):
+    # Harbor's separate verifier mode starts a second environment for the same
+    # trial directory; found live: its record overwrote the agent's.
+    from harbor.models.trial.paths import TrialPaths
+
+    paths = TrialPaths(trial_dir=tmp_path / "one-trial")
+    paths.mkdir()
+    agent = make_env(session_id="echo__AbCdEf__env")
+    verifier = make_env(session_id="echo__AbCdEf__verifier__trial")
+    agent.trial_paths = verifier.trial_paths = paths
+    await agent.start(force_build=False)
+    await verifier.start(force_build=False)
+    try:
+        assert agent.record_file == "ate_env.json" and verifier.record_file == "ate_env.verifier.json"
+        a = json.loads((paths.trial_dir / "ate_env.json").read_text())
+        v = json.loads((paths.trial_dir / "ate_env.verifier.json").read_text())
+        assert (a["id"], a["session_id"]) == (agent.env_id, "echo__AbCdEf__env")
+        assert (v["id"], v["session_id"]) == (verifier.env_id, "echo__AbCdEf__verifier__trial")
+    finally:
+        await agent.stop(delete=True)
+        await verifier.stop(delete=True)
+
+
 async def test_environment_dir_is_uploaded_to_the_workdir(fake, make_env):
     env = make_env()
     await env.start(force_build=False)

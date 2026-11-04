@@ -18,9 +18,9 @@ from datetime import datetime, timezone
 
 import pytest
 
-from ate_env import EnvironmentStatus, ProcessOutput, ProcessState, Signal
-from ate_env._gen.ateenv.v1alpha import env_pb2, guest_pb2
-from ate_env.types import (
+from ate_env_rl import EnvironmentStatus, ProcessOutput, ProcessState, Signal
+from ate_env_rl._gen.ateenv.v1alpha import env_pb2, guest_pb2
+from ate_env_rl.types import (
     _environment_info_from_pb,
     _process_info_from_pb,
     _process_output_from_pb,

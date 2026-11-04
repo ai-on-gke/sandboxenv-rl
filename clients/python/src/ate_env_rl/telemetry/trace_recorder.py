@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger("ate_env.telemetry.trace_recorder")
+logger = logging.getLogger("ate_env_rl.telemetry.trace_recorder")
 
 SCHEMA_VERSION = "v1"
 

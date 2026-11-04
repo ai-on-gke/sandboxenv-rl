@@ -16,7 +16,7 @@
 
 Each sandbox is a Substrate actor fronted by the ``ate-env`` API
 (https://github.com/agent-substrate/env), reached through this repo's Python
-client, ``ate_env`` (``clients/python``). Environment lifecycle (create, get, delete) goes to
+client, ``ate_env_rl`` (``clients/python``). Environment lifecycle (create, get, delete) goes to
 ``ateenv.v1alpha.EnvironmentService`` on ``ate-env-api``; command execution and
 file transfer go to the ``ProcessService`` / ``FileSystemService`` served by
 the ``ate-env-guest`` daemon inside every actor, which ``ate-env-api`` proxies
@@ -42,7 +42,7 @@ from urllib.parse import urlparse
 
 import grpc
 import grpc.aio
-from ate_env import (
+from ate_env_rl import (
     Client,
     Env,
     EnvError,
@@ -179,7 +179,7 @@ def _require_keys(options: Mapping[str, Any], allowed: frozenset[str], where: st
 
 
 def _describe(exc: BaseException) -> str:
-    """``CODE: details`` for ate_env errors, so messages name the gRPC status."""
+    """``CODE: details`` for ate_env_rl errors, so messages name the gRPC status."""
     code = getattr(exc, "code", None)
     if isinstance(code, grpc.StatusCode):
         return f"{code.name}: {exc}"
@@ -385,7 +385,7 @@ class SubstrateSandboxProvider:
         **kwargs: Any,
     ) -> None:
         """``config`` is the ``sandbox.substrate`` block. Pass ``client`` to reuse a
-        caller-owned ``ate_env.Client`` (the provider then never closes it)."""
+        caller-owned ``ate_env_rl.Client`` (the provider then never closes it)."""
         config = dict(config or {})
         config.update(kwargs)
         _require_keys(config, frozenset({"connection", "create"}), "sandbox.substrate")
@@ -778,7 +778,7 @@ class SubstrateSandboxProvider:
     def _open_client(self, api_url: str) -> Client:
         url = urlparse(api_url if "://" in api_url else f"//{api_url}")
         if url.scheme == "https":
-            # ate_env.Client only dials h2c itself; hand it a TLS channel.
+            # ate_env_rl.Client only dials h2c itself; hand it a TLS channel.
             target = f"{url.hostname}:{url.port or 443}"
             self._channel = grpc.aio.secure_channel(target, grpc.ssl_channel_credentials())
             return Client(channel=self._channel, auth_token=self._auth_token)

@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Builds sdist and wheel distributions for clients/python (ate-env-client),
+# Builds sdist and wheel distributions for clients/python (ate-env-rl),
 # checks metadata with twine, and optionally verifies the built version matches
 # a release Git tag's PEP 440 version.
 #
@@ -68,11 +68,11 @@ if built_version != expected:
         f"error: wheel {wheels[0].name} has Version={built_version!r}, expected {expected!r} for tag {tag!r}"
     )
 
-expected_sdist = f"ate_env_client-{expected}.tar.gz"
+expected_sdist = f"ate_env_rl-{expected}.tar.gz"
 if sdists[0].name != expected_sdist:
     sys.exit(f"error: sdist name {sdists[0].name!r} does not match expected {expected_sdist!r}")
 
-print(f"Verified ate-env-client {built_version} matches tag {tag}")
+print(f"Verified ate-env-rl {built_version} matches tag {tag}")
 PY
 fi
 

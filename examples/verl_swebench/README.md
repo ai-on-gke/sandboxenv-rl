@@ -1,8 +1,8 @@
-# Async GRPO Rollouts: Ray + SWE-bench on `ate_env`
+# Async GRPO Rollouts: Ray + SWE-bench on `ate_env_rl`
 
 This example runs a **GRPO-style RL rollout loop** (VeRL-shaped) on **Ray**, grading
 **SWE-bench** candidate patches inside **Agent Substrate** sandboxes via the
-`ate_env` Python client (`clients/python`).
+`ate_env_rl` Python client (`clients/python`).
 
 > [!NOTE]
 > The **policy side is simulated**: the sampler returns fixed candidates instead of
@@ -27,7 +27,7 @@ This example runs a **GRPO-style RL rollout loop** (VeRL-shaped) on **Ray**, gra
 │   - grades G candidates concurrently with SweBenchAdapter                       │
 │   - retries InfrastructureError on a fresh sandbox, else masks the rollout      │
 └─────────────────────────────────────────┬───────────────────────────────────────┘
-                                          │ ate_env (gRPC)
+                                          │ ate_env_rl (gRPC)
             ┌─────────────────────────────┴─────────────────────────────┐
             ▼ --backend substrate                                       ▼ --backend mock
   Agent Substrate (ate-system)                                 In-memory mock backend
@@ -59,7 +59,7 @@ wrong** variant of it that still applies (fails tests), and a **malformed patch*
 
 ## Requirements
 
-- `ray` and `torch` (plus the `ate_env` client: `pip install -e clients/python`,
+- `ray` and `torch` (plus the `ate_env_rl` client: `pip install -e clients/python`,
   or run from a checkout and the script adds `clients/python/src` to `sys.path`).
 - For `--backend substrate`: a reachable `ate-env-api`
   (`SUBSTRATE_API_ENDPOINT`, default

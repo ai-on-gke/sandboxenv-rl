@@ -17,7 +17,7 @@ from __future__ import annotations
 import grpc.aio
 import pytest
 
-from ate_env import (
+from ate_env_rl import (
     Client,
     EnvironmentStatus,
     InvalidArgumentError,
@@ -26,8 +26,8 @@ from ate_env import (
     ServerInfo,
     SuspendMode,
 )
-from ate_env._gen.ateenv.v1alpha import env_pb2, env_pb2_grpc, guest_pb2_grpc
-from ate_env.client import _auth_interceptors, _normalize_target
+from ate_env_rl._gen.ateenv.v1alpha import env_pb2, env_pb2_grpc, guest_pb2_grpc
+from ate_env_rl.client import _auth_interceptors, _normalize_target
 
 from .fakes import (
     FakeEnvironmentService,

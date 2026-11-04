@@ -23,7 +23,7 @@ import pickle
 import grpc
 import pytest
 
-from ate_env.errors import (
+from ate_env_rl.errors import (
     START_FAILURE_CRASHED,
     START_FAILURE_KEY,
     START_FAILURE_NO_CAPACITY,
@@ -32,7 +32,7 @@ from ate_env.errors import (
     SandboxStartError,
     map_rpc_error,
 )
-from ate_env.runtime.substrate_env_client import SubstrateEnvClientRuntime
+from ate_env_rl.runtime.substrate_env_client import SubstrateEnvClientRuntime
 
 
 class _FakeRpcError(grpc.RpcError):

@@ -9,10 +9,10 @@ for control-plane terms.
 - **Environment**: The protobuf wire representation of one sandboxed execution environment
   (`proto/ateenv/v1alpha/env.proto`), corresponding 1:1 to a Substrate actor. Distinct from client
   handles `Env` and `SandboxHandle`.
-- **Env**: The low-level client handle (`clients/go.Env` and `ate_env.Env`) for managing a single
+- **Env**: The low-level client handle (`clients/go.Env` and `ate_env_rl.Env`) for managing a single
   environment (`start_process`, `shell`, `read_file`, `write_file`, `suspend`, `delete`). Neither
   SDK defines a class named `Environment`.
-- **Sandbox** / **SandboxHandle**: The fleet handle (`ate_env.SandboxHandle`) returned by
+- **Sandbox** / **SandboxHandle**: The fleet handle (`ate_env_rl.SandboxHandle`) returned by
   `SandboxFleet.acquire` and `AsyncSandboxFleet.acquire` that wraps an environment with fleet
   recycling and both sync and async execution methods.
 - **Process**: A command execution running inside an environment, tracked by `guest/process.Tracker`
@@ -60,11 +60,11 @@ for control-plane terms.
 - **`ate-env`**: The CLI tool (`cmd/ate-env`) for managing environments, executing commands,
   transferring files, and generating deployment manifests.
 - **`SandboxFleet`** / **`AsyncSandboxFleet`**: The Python SDK synchronous and asyncio fleet
-  managers (`clients/python/src/ate_env/fleet.py`, `async_fleet.py`) for batched RL rollouts and
+  managers (`clients/python/src/ate_env_rl/fleet.py`, `async_fleet.py`) for batched RL rollouts and
   evaluations.
 - **`LoopRunner`**: A dedicated background thread running a permanent `asyncio` event loop
-  (`clients/python/src/ate_env/loop_runner.py`), enabling synchronous Python facades to share gRPC
-  channels safely.
+  (`clients/python/src/ate_env_rl/loop_runner.py`), enabling synchronous Python facades to share
+  gRPC channels safely.
 - **Suspend**: Checkpointing a running actor and releasing its worker slot: durably with
   `SuspendOptions{Mode: DURABILITY_MODE_SYNCHRONOUS}` (`Suspend`), or locally with
   `DURABILITY_MODE_ASYNCHRONOUS` (`SuspendLocal`), after which the environment reports

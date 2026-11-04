@@ -1,6 +1,6 @@
 # sandboxenv-rl
 
-<!-- Last full audit: 2026-11-03 (commit 3a67f2b) -->
+<!-- Last full audit: 2026-11-03 (commit 39e8ad4) -->
 
 Sandboxed execution environments for reinforcement learning and evaluation on Agent Substrate. Each
 environment runs as an isolated Substrate actor inside gVisor, supporting on-demand rootfs image
@@ -71,7 +71,7 @@ high-throughput Python fleet scheduling. See [README.md](./README.md) for usage 
   `wait4(-1, WNOHANG)` loop reaps orphaned grandchildren, and non-PTY process groups
   (`Setpgid: true`, PTY `Setsid: true`) must be signaled via negative PID (`-pid`) to prevent leaked
   child trees (enforced by `runIfPID1`, `supervise`, and `guest/process.Tracker`).
-- `clients/python/src/ate_env`'s `LoopRunner` owns sync-to-async bridging; synchronous callers
+- `clients/python/src/ate_env_rl`'s `LoopRunner` owns sync-to-async bridging; synchronous callers
   (`SubstrateBackendDriver`, `SubstrateEnvClientRuntime`, `SandboxFleet`, `SandboxHandle`) dispatch
   coroutines through `LoopRunner.run()` and must not call `asyncio.run()`; because `asyncio.run()`
   destroys the thread event loop and corrupts cached HTTP/2 gRPC channels (not enforced).
@@ -91,9 +91,9 @@ rules, and directory layout. Agent skills in `.agents/skills/`:
 - [maintain-docs](./.agents/skills/maintain-docs/SKILL.md): Author, update, and validate repository
   documentation against code.
 
-Python naming conventions: repository directory `clients/python`, distribution package
-`ate-env-client`, import module `ate_env`. The direct environment handle is `ate_env.Env`; the fleet
-handle is `ate_env.SandboxHandle`.
+Python naming conventions: repository directory `clients/python`, distribution package `ate-env-rl`,
+import module `ate_env_rl`. The direct environment handle is `ate_env_rl.Env`; the fleet handle is
+`ate_env_rl.SandboxHandle`.
 
 ## Build, test, verify
 

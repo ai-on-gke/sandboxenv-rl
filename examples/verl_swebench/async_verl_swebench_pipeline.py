@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """
-Asynchronous GRPO rollout loop (VeRL-style) with Ray + SWE-bench on ate_env.
+Asynchronous GRPO rollout loop (VeRL-style) with Ray + SWE-bench on ate_env_rl.
 
 Demonstrates:
 1. Overlapping LLM token generation (sampler) with sandbox acquisition: the G
@@ -64,13 +64,18 @@ PYTHON_SRC = os.path.abspath(os.path.join(SCRIPT_DIR, "../../clients/python/src"
 if os.path.isdir(PYTHON_SRC) and PYTHON_SRC not in sys.path:
     sys.path.insert(0, PYTHON_SRC)
 
-from ate_env import AsyncSandboxFleet, FleetConfig, ObservabilityConfig, SandboxHandle  # noqa: E402
-from ate_env.adapters import SweBenchAdapter  # noqa: E402
-from ate_env.errors import InfrastructureError  # noqa: E402
-from ate_env.observability import repo_family  # noqa: E402
-from ate_env.runtime.mock import MockRuntimeHook  # noqa: E402
-from ate_env.telemetry.metrics import status_of  # noqa: E402
-from ate_env.types import ExecResult, Task  # noqa: E402
+from ate_env_rl import (  # noqa: E402
+    AsyncSandboxFleet,
+    FleetConfig,
+    ObservabilityConfig,
+    SandboxHandle,
+)
+from ate_env_rl.adapters import SweBenchAdapter  # noqa: E402
+from ate_env_rl.errors import InfrastructureError  # noqa: E402
+from ate_env_rl.observability import repo_family  # noqa: E402
+from ate_env_rl.runtime.mock import MockRuntimeHook  # noqa: E402
+from ate_env_rl.telemetry.metrics import status_of  # noqa: E402
+from ate_env_rl.types import ExecResult, Task  # noqa: E402
 
 DEFAULT_INSTANCE_FILE = os.path.join(SCRIPT_DIR, "pytest-dev__pytest-5221.json")
 # Official SWE-bench eval images install the repo's env as conda env "testbed".
@@ -115,7 +120,7 @@ def _otel() -> Any:
 def setup_tracing(service_name: str) -> None:
     """Install this process's OpenTelemetry SDK provider (OTLP/gRPC exporter).
 
-    The ate_env client never installs the global provider: it sends its spans
+    The ate_env_rl client never installs the global provider: it sends its spans
     to the application's provider once one is installed. The pipeline is the
     application here, so each process (the driver and the evaluator actor)
     installs one. The driver's spans are then real, their context reaches the
@@ -615,7 +620,7 @@ def build_fleet_config(args: argparse.Namespace, task_dict: dict[str, Any]) -> F
 
 async def main_async(args: argparse.Namespace) -> None:
     print("=" * 75)
-    print("  Async GRPO rollouts: Ray + SWE-bench on ate_env")
+    print("  Async GRPO rollouts: Ray + SWE-bench on ate_env_rl")
     print(f"  Backend: {args.backend} | Task: {args.task_type} | Group Size: {args.group_size}")
     print("=" * 75)
 
@@ -739,7 +744,7 @@ def emit_run_outputs(result: dict[str, Any]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Async GRPO rollouts with Ray + SWE-bench on ate_env")
+    parser = argparse.ArgumentParser(description="Async GRPO rollouts with Ray + SWE-bench on ate_env_rl")
     parser.add_argument("--backend", choices=["mock", "substrate"], default="substrate")
     parser.add_argument("--data-plane", choices=["ate_env"], default="ate_env")
     parser.add_argument("--task-type", choices=["smoke", "swebench"], default="smoke")

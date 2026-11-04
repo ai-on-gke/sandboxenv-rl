@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 import grpc
-from ate_env import (
+from ate_env_rl import (
     Client,
     Env,
     EnvError,

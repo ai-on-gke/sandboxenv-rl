@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from ate_env import NotFoundError, PermissionDeniedError
+from ate_env_rl import NotFoundError, PermissionDeniedError
 
 from .fakes import CHUNK_SIZE
 

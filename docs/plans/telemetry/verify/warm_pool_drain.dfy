@@ -24,7 +24,7 @@
 //      WarmPoolRunIds.
 //
 // As in the other models, each action is the code between two awaits of
-// clients/python/src/ate_env/backend/substrate.py, for one pool key and one
+// clients/python/src/ate_env_rl/backend/substrate.py, for one pool key and one
 // event loop. Ghost fields record facts the code does not store.
 
 // ============================================================== G: drains

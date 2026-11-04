@@ -153,7 +153,7 @@ on exit), not on its command line; the template registration still passes the ke
 
 ## A fleet rollout
 
-`fleet_rollout.py` is the agent-sandbox-rl shape: `ate_env.SandboxFleet` acquires a sandbox per
+`fleet_rollout.py` is the agent-sandbox-rl shape: `ate_env_rl.SandboxFleet` acquires a sandbox per
 task, each rollout binds a workspace to its handle with `make_handle_workspace`, and the fleet
 releases. Point it at a base template with the agent-server layer (`demo.sh` registers one):
 

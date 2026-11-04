@@ -20,7 +20,7 @@ acquires and releases sandboxes (pools, placement, accounting) and the
 workspace merely binds one. The workspace never creates or deletes an
 environment here.
 
-    from ate_env import SandboxFleet, FleetConfig
+    from ate_env_rl import SandboxFleet, FleetConfig
     from ate_env_openhands.fleet import make_handle_workspace
 
     fleet = SandboxFleet(FleetConfig(backend="substrate", endpoint=API, template=BASE))

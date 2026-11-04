@@ -10,7 +10,7 @@ RL training and evaluation workloads. Components do not share code; they
 communicate strictly through versioned JSON/JSONL/YAML file artifacts in a
 standard run directory (`$ARTIFACT_DIR` or `--dest`, on local disk or object
 storage) so that simulated load generators, real RL trainers, and different
-sandbox backends (accessed via the Python sandbox SDK [`ate_env`], via the
+sandbox backends (accessed via the Python sandbox SDK [`ate_env_rl`], via the
 `ate-env-api` gRPC service, or directly against the backend control plane) are
 drop-in replaceable—and so that individual pieces can plug and play cleanly
 inside other benchmarking, CI, or ML orchestration frameworks.
@@ -133,7 +133,7 @@ accepts the previous version.
 ## 4. Concepts
 
 - **SUT (System Under Test)**: a deployed sandbox backend accessed through one
-  of three paths: (a) the Python sandbox SDK (`ate_env` `SandboxFleet`), (b)
+  of three paths: (a) the Python sandbox SDK (`ate_env_rl` `SandboxFleet`), (b)
    the `ate-env-api` gRPC service (`ateenv.v1alpha`), or (c) directly against the
   underlying backend control plane (`ateapi` on Substrate or Kubernetes CRDs on
   Agent Sandbox, to isolate and price each abstraction layer).
@@ -192,7 +192,7 @@ harnesses can consume them directly), `Provision(cluster, config, overlays...)
 `Reap(runID, overlays...) -> ReapStats` (including any overlay `pre_reap` hooks
 and extra `reap_resources` kinds/selectors), `Teardown(overlays...)` (executing
 `post_teardown` hooks). One implementation per backend and access mode (via
-Python `ate_env` SDK, `ate-env-api`, or direct backend API), each wrapping a
+Python `ate_env_rl` SDK, `ate-env-api`, or direct backend API), each wrapping a
 Helm chart or manifest set. Writes the system description: cluster, backend and
 SDK versions/commits, active feature overlay names/hashes and `sut_overrides`,
 workload provenance (`grader_version`, `dataset_revision`,
@@ -239,7 +239,7 @@ snapshot on-node with background upload, vs. `SYNCHRONOUS` waiting for durable
 object storage). Today `cmd/ate-env-api` (`internal/ate/client.go`) hardcodes
 `SuspendEnvironment` to `DURABILITY_MODE_SYNCHRONOUS` (using `ASYNCHRONOUS` only
 internally inside `DeleteEnvironment`) and does not yet expose a durability mode
-or `ForkEnvironment` in `ateenv.v1alpha`, while the Python SDK (`ate_env`)
+or `ForkEnvironment` in `ateenv.v1alpha`, while the Python SDK (`ate_env_rl`)
 exposes `release()` (`delete`) and `recycle()` (`suspend-sync` into a client-side
 paused list). Supporting `suspend-async` and `fork` on the `ate-env-api` / SDK
 paths therefore includes plumbing `DurabilityMode` on

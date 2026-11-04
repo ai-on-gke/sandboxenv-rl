@@ -18,7 +18,7 @@ imported, no exporter is created and no collector is registered.
 
 | Component | Traces | Metrics |
 |---|---|---|
-| Python client and fleet | `FleetConfig(observability=ObservabilityConfig(enable_tracing=True))`, or `FleetConfig(tracing=TracerConfig(enable_tracing=True))`, or `Client(..., tracer_config=TracerConfig(enable_tracing=True))`; needs the `tracing` extra | `ObservabilityConfig(enable_metrics=None)` (the default: on when the `metrics` extra is installed, else one INFO message; `True` warns when the extra is missing) and `ate_env.observability.serve_metrics(port, addr=...)` |
+| Python client and fleet | `FleetConfig(observability=ObservabilityConfig(enable_tracing=True))`, or `FleetConfig(tracing=TracerConfig(enable_tracing=True))`, or `Client(..., tracer_config=TracerConfig(enable_tracing=True))`; needs the `tracing` extra | `ObservabilityConfig(enable_metrics=None)` (the default: on when the `metrics` extra is installed, else one INFO message; `True` warns when the extra is missing) and `ate_env_rl.observability.serve_metrics(port, addr=...)` |
 | ate-env-api | `--enable-tracing` | `--metrics-listen-addr`, for example `:9090` (default empty: metrics off) |
 | `ate-env manifest` | `--enable-tracing`, `--otlp-endpoint`, `--otlp-insecure` | `--metrics-port` (adds a `metrics` container and Service port and `prometheus.io` scrape annotations) |
 | ate-env-guest | `--enable-tracing` in the ActorTemplate's guest arguments | `--enable-metrics` (serves `/metrics` on the guest listener, without authentication; reachable only inside the environment and through the atenet router, see [metrics.md](metrics.md)) |
@@ -142,7 +142,7 @@ Labels carry a bounded vocabulary only:
 |---|---|
 | `phase` | the phase names in the glossary below |
 | `backend` | `substrate`, `mock` |
-| `family` | the task's repo family (`ate_env.observability.repo_family`), never the image tag; at most `MAX_FAMILIES` (64) values per process, then `other` |
+| `family` | the task's repo family (`ate_env_rl.observability.repo_family`), never the image tag; at most `MAX_FAMILIES` (64) values per process, then `other` |
 | `strategy`, `status` | the fleet strategy; `ok`, `error`, or `cancelled` (a cancelled or interrupted block) |
 | `method`, `code` | registered gRPC full method names and status codes |
 | `atespace`, `state`, `outcome`, `exit_class` | as documented in [metrics.md](metrics.md) |

@@ -17,10 +17,10 @@
 Real RL loop on CPU: GRPO (TRL) + Substrate actors as the reward executor.
 
 Port of agent-sandbox's examples/stress/snapshot_ray/harness/grpo_sandbox_train.py
-(vicentefb/agent-sandbox#7) to the Substrate env client (ate_env). Same loop,
+(vicentefb/agent-sandbox#7) to the Substrate env client (ate_env_rl). Same loop,
 same knobs; only the sandbox calls changed:
 
-  agent-sandbox SDK                      ate_env
+  agent-sandbox SDK                      ate_env_rl
   ---------------------------------      ----------------------------------------
   client.create_sandbox(warmpool=...)    client.create(id, template_name=...)
   sb.files.write(name, program)          env.write_file(name, program)
@@ -53,9 +53,9 @@ Telemetry (docs/observability.md):
   REPORT_DIR (unset)  write the run report there at exit, <strategy>_<n>tasks_<YYYYMMDD-HHMMSS>.txt
                       and .json (strategy "grpo"); the summary is printed either way
   ENABLE_TRACING (0|1)  ate_env_fleet.* phase spans with the client's spans under them, over OTLP
-                        (OTEL_EXPORTER_OTLP_ENDPOINT); needs ate-env-client[tracing]
+                        (OTEL_EXPORTER_OTLP_ENDPOINT); needs ate-env-rl[tracing]
   METRICS_PORT (0)  serve the ate_env_fleet_* and ate_env_client_* Prometheus series on this port;
-                    needs ate-env-client[metrics]
+                    needs ate-env-rl[metrics]
 """
 
 import asyncio
@@ -97,15 +97,15 @@ ENABLE_TRACING = os.environ.get("ENABLE_TRACING", "0") == "1"
 METRICS_PORT = int(os.environ.get("METRICS_PORT", "0"))
 
 # ---------------- Substrate adapter ----------------------------------------
-# ate_env is asyncio; TRL's reward function is sync and already fans out on a
+# ate_env_rl is asyncio; TRL's reward function is sync and already fans out on a
 # ThreadPoolExecutor. One background event loop owns the grpc.aio channel and
 # every coroutine is submitted to it (grpc.aio objects must be created and
 # used on the same loop).
-from ate_env import Client
-from ate_env.config import ObservabilityConfig, TracerConfig
-from ate_env.errors import EnvError
-from ate_env.loop_runner import LoopRunner
-from ate_env.observability import Observer, serve_metrics
+from ate_env_rl import Client
+from ate_env_rl.config import ObservabilityConfig, TracerConfig
+from ate_env_rl.errors import EnvError
+from ate_env_rl.loop_runner import LoopRunner
+from ate_env_rl.observability import Observer, serve_metrics
 
 _out_lock = threading.Lock()
 

@@ -57,13 +57,13 @@ See [docs/architecture.md](./docs/architecture.md) for the full system design an
 | [`cmd/ate-env-guest`](./cmd/ate-env-guest), [`guest/`](./guest) | The daemon inside each environment (a PID 1 init with sidecar supervision) and its services: `guest/process` and `guest/filesystem`. |
 | [`cmd/benchmarking`](./cmd/benchmarking) | The benchmark binaries: `swebench-loader` and the `bench` harness. |
 | [`clients/`](./clients/README.md) | The Go client (package `env`) and the Python client `ate_env` with the fleet SDK. |
-| [`integrations/`](./integrations/README.md) | Framework integrations: NeMo Gym, OpenHands, uni-agent. |
+| [`integrations/`](./integrations/README.md) | Framework integrations: Harbor, NeMo Gym, OpenHands, uni-agent. |
 | [`examples/`](./examples/README.md) | Runnable examples, from a Go MCP client to multi-node agentic GRPO recipes. Not supported. |
 | [`benchmarking/`](./benchmarking/README.md) | The SWE-bench loader scripts, the `bench` scenarios, the telemetry report tool and the benchmarking skills. |
 | [`internal/`](./internal) | The packages the binaries are built from: `apiservice` (the gRPC server), `ate` (the Substrate client), `mcp`, `portproxy`, `routertls`, `hostcheck`, `telemetry`, `tool`, `unknownfields`, `benchmarking/*`, the test doubles in `internaltest` (`fakecontrol`, `fakerouter`, `testcerts`) and a lifecycle walkthrough in `examples/env`. |
 | [`proto/ateenv/v1alpha`](./proto/ateenv/v1alpha) | The `ateenv.v1alpha` API: `env.proto` (`EnvironmentService`) and `guest.proto` (`ProcessService`, `FileSystemService`), with the generated Go stubs. |
 | [`docs/`](./docs) | [Architecture](./docs/architecture.md), [glossary](./docs/glossary.md), [observability](./docs/observability.md), the [metrics reference](./docs/metrics.md), [rootfs images and runtime layers](./docs/rootfs-images/README.md), the [threat model](./docs/security/threat-model.md), [support](./docs/support.md), [releases](./docs/release.md), and the developer guides in [`docs/dev`](./docs/dev). |
-| [`hack/`](./hack) | Repository checks and generators: license boilerplate, `metrics-docs` (renders `docs/metrics.md`). |
+| [`hack/`](./hack) | Repository scripts, checks and generators: CI runners, release automation, license boilerplate, `metrics-docs` (renders `docs/metrics.md`). |
 | [`tests/telemetry`](./tests/telemetry) | The OpenTelemetry collector configuration of the telemetry acceptance run. |
 | [`.github/`](./.github) | CI and release workflows, Dependabot, code owners, the pull request template. |
 | [`AGENTS.md`](./AGENTS.md), [`.agents/skills`](./.agents/skills) | Instructions for coding agents and the repository skills. [`CHANGELOG.md`](./CHANGELOG.md) collects user-visible changes. |

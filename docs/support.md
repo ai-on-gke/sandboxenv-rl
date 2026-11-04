@@ -11,7 +11,7 @@ What this repository supports, and what that means.
 | [`cmd/ate-env-guest`](../cmd/ate-env-guest), [`guest/`](../guest) | The daemon inside each environment and its services. |
 | [`clients/go`](../clients/go) | The Go client. |
 | [`clients/python`](../clients/python/README.md) | The Python client (`ate_env`), including the fleet SDK (`SandboxFleet`, `AsyncSandboxFleet`). |
-| [`integrations/`](../integrations/README.md) | Framework integrations: [`nemo-gym`](../integrations/nemo-gym/README.md), [`openhands`](../integrations/openhands/README.md) and [`uni-agent`](../integrations/uni-agent/README.md). |
+| [`integrations/`](../integrations/README.md) | Framework integrations: [`harbor`](../integrations/harbor/README.md), [`nemo-gym`](../integrations/nemo-gym/README.md), [`openhands`](../integrations/openhands/README.md) and [`uni-agent`](../integrations/uni-agent/README.md). |
 | [`proto/ateenv/v1alpha`](../proto/ateenv/v1alpha) | The `ateenv.v1alpha` API. |
 
 The packages under [`internal/`](../internal) that these binaries are built from are part of them:

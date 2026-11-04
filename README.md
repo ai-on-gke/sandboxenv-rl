@@ -88,7 +88,7 @@ it.
 | [`examples/Qwen3.5-35B-A3B-verl`](./examples/Qwen3.5-35B-A3B-verl/README.md) | Agentic GRPO on real SWE tasks: verl `separate_async` with a Megatron trainer and vLLM rollouts on separate nodes, a uni-agent ReAct agent whose tools and hidden-test grading run in environments. Two 8-GPU nodes. |
 | [`examples/openhands`](./examples/openhands/README.md) | OpenHands agents and tools on the agent-server that a runtime layer mounts into any task image, through `integrations/openhands`. |
 | [`examples/Qwen3-1.7B-verl`](./examples/Qwen3-1.7B-verl/README.md) | Agentic GRPO on MATH with verl `fully_async_policy`: the model writes Python that runs in an environment through a verl tool. Trainer and rollouts on separate GPU nodes. |
-| [`examples/verl_swebench`](./examples/verl_swebench/README.md) | A GRPO-style asynchronous rollout loop on Ray that grades SWE-bench candidate patches in environments with the `ate_env` client and its SWE-bench adapter. |
+| [`examples/verl_swebench`](./examples/verl_swebench/README.md) | A GRPO-style asynchronous rollout loop on Ray that grades SWE-bench candidate patches in environments with the `ate_env_rl` client and its SWE-bench adapter. |
 
 ## Integrations
 

@@ -2,7 +2,7 @@
 
 Adapters that let an agent or RL framework run its sandboxes as Agent Substrate
 environments through `ate-env-api`. Each is a Python distribution of its own that
-depends on the Python client, [`ate-env-client`](../clients/python/README.md),
+depends on the Python client, [`ate-env-rl`](../clients/python/README.md),
 and registers with the framework the way the framework expects, with no change
 to the framework. They are supported ([docs/support.md](../docs/support.md)).
 

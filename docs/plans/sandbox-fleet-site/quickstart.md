@@ -1,0 +1,177 @@
+# Quickstart: deploy the fleet site
+
+Status: plan-stage runbook, 2026-11-04. The Terraform in pull request 6 of the
+[execution plan](./execution-plan.md) replaces the `gcloud` commands below with one `apply` per
+project; `docs/fleet-site.md` then becomes the user-facing guide. Until then this is the order of
+operations and the exact resources, with the open parameters as variables. Steps marked "after PR n"
+need a component that pull request n adds.
+
+```bash
+export CENTRAL_PROJECT=...      # hosts the bucket, the topic, BigQuery and Cloud Run
+export REGION=us-central1
+export BUCKET=...               # one bucket, uniform access
+export IAP_GROUP=group:...      # who may open the site
+export CLUSTER_PROJECT=...      # repeat the per-cluster section for each cluster project
+export CLUSTER=...              # GKE cluster name, also the reporter's cluster label
+```
+
+## 1. Central project, once
+
+Enable the services:
+
+```bash
+gcloud services enable run.googleapis.com iap.googleapis.com pubsub.googleapis.com \
+  bigquery.googleapis.com storage.googleapis.com monitoring.googleapis.com \
+  logging.googleapis.com --project "$CENTRAL_PROJECT"
+```
+
+Bucket, with the lifecycle rules from [interfaces.md](./interfaces.md):
+
+```bash
+gcloud storage buckets create "gs://$BUCKET" --project "$CENTRAL_PROJECT" \
+  --location "$REGION" --uniform-bucket-level-access --public-access-prevention
+cat > /tmp/lifecycle.json <<'EOF'
+{"rule": [
+  {"action": {"type": "Delete"}, "condition": {"age": 30,  "matchesPrefix": ["v1/inventory/"], "matchesSuffix": [".json"]}},
+  {"action": {"type": "Delete"}, "condition": {"age": 400, "matchesPrefix": ["v1/events/"]}}
+]}
+EOF
+gcloud storage buckets update "gs://$BUCKET" --lifecycle-file /tmp/lifecycle.json
+```
+
+The 30-day rule must not match `latest.json`; the reporter rewrites it every interval, so its age
+never reaches 30 days. Confirm after the first day with `gcloud storage ls -l`.
+
+Topic, dataset and the two subscriptions. The BigQuery subscription needs the table first:
+
+```bash
+gcloud pubsub topics create ate-actor-events --project "$CENTRAL_PROJECT"
+bq --project_id "$CENTRAL_PROJECT" mk --dataset --location "$REGION" fleet
+bq --project_id "$CENTRAL_PROJECT" mk --table fleet.actor_events \
+  subscription_name:STRING,message_id:STRING,publish_time:TIMESTAMP,data:STRING,attributes:STRING
+gcloud pubsub subscriptions create ate-actor-events-bq --topic ate-actor-events \
+  --project "$CENTRAL_PROJECT" --bigquery-table "$CENTRAL_PROJECT:fleet.actor_events" \
+  --write-metadata --expiration-period never
+gcloud pubsub subscriptions create ate-actor-events-gcs --topic ate-actor-events \
+  --project "$CENTRAL_PROJECT" --cloud-storage-bucket "$BUCKET" \
+  --cloud-storage-file-prefix v1/events/ --cloud-storage-file-suffix .jsonl \
+  --cloud-storage-max-duration 1m --expiration-period never
+```
+
+The Pub/Sub service agent of the central project
+(`service-<number>@gcp-sa-pubsub.iam.gserviceaccount.com`) needs `roles/bigquery.dataEditor` on the
+dataset and `roles/storage.objectCreator` on the bucket. Phase 1 writes the raw log entry into
+`data`; the site parses the `ate.*` keys from it. The typed columns in
+[interfaces.md](./interfaces.md) arrive with the phase 2 topic schema.
+
+Service accounts and their only roles:
+
+```bash
+for sa in ate-fleet-site ate-env-reporter ate-env-collector; do
+  gcloud iam service-accounts create "$sa" --project "$CENTRAL_PROJECT"
+done
+P="$CENTRAL_PROJECT.iam.gserviceaccount.com"
+gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "serviceAccount:ate-fleet-site@$P"    --role roles/storage.objectViewer
+gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "serviceAccount:ate-env-reporter@$P"  --role roles/storage.objectCreator
+gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "serviceAccount:ate-env-collector@$P" --role roles/storage.objectCreator
+gcloud projects add-iam-policy-binding "$CENTRAL_PROJECT" --member "serviceAccount:ate-fleet-site@$P" --role roles/monitoring.viewer
+gcloud projects add-iam-policy-binding "$CENTRAL_PROJECT" --member "serviceAccount:ate-fleet-site@$P" --role roles/bigquery.jobUser
+bq add-iam-policy-binding --member "serviceAccount:ate-fleet-site@$P" --role roles/bigquery.dataViewer "$CENTRAL_PROJECT:fleet"
+gcloud pubsub topics add-iam-policy-binding ate-actor-events --project "$CENTRAL_PROJECT" \
+  --member "serviceAccount:ate-env-collector@$P" --role roles/pubsub.publisher
+```
+
+The site account has no write role anywhere; that is the read-only guarantee of
+[acceptance criterion AC-3](./acceptance-criteria.md). Multi-project metrics need a metrics scope on
+`CENTRAL_PROJECT` that includes each cluster project; add them in Cloud Monitoring settings.
+
+## 2. Each cluster project
+
+Events, phase 1: a log sink from `ateapi`'s stdout to the central topic.
+
+```bash
+gcloud logging sinks create ate-actor-events \
+  "pubsub.googleapis.com/projects/$CENTRAL_PROJECT/topics/ate-actor-events" \
+  --project "$CLUSTER_PROJECT" --log-filter \
+  'resource.type="k8s_container" AND resource.labels.namespace_name="ate-system" AND resource.labels.container_name="ate-api-server" AND (jsonPayload.msg="Actor state changed" OR jsonPayload.msg="Actor crashed")'
+WRITER=$(gcloud logging sinks describe ate-actor-events --project "$CLUSTER_PROJECT" --format 'value(writerIdentity)')
+gcloud pubsub topics add-iam-policy-binding ate-actor-events --project "$CENTRAL_PROJECT" \
+  --member "$WRITER" --role roles/pubsub.publisher
+```
+
+Workload Identity for the two in-cluster components (after PR 2 and PR 3, which add the Deployments;
+the namespaces and Kubernetes service accounts are `ate-env-reporter/ate-env-reporter` and
+`ate-env-telemetry/otel-collector`):
+
+```bash
+for pair in "ate-env-reporter:ate-env-reporter:ate-env-reporter" "ate-env-collector:ate-env-telemetry:otel-collector"; do
+  IFS=: read -r sa ns ksa <<<"$pair"
+  gcloud iam service-accounts add-iam-policy-binding "$sa@$P" --project "$CENTRAL_PROJECT" \
+    --role roles/iam.workloadIdentityUser --member "serviceAccount:$CLUSTER_PROJECT.svc.id.goog[$ns/$ksa]"
+done
+gcloud projects add-iam-policy-binding "$CLUSTER_PROJECT" --member "serviceAccount:ate-env-collector@$P" --role roles/cloudtrace.agent
+```
+
+Managed Prometheus, on a Standard cluster (Autopilot has it on):
+
+```bash
+gcloud container clusters update "$CLUSTER" --project "$CLUSTER_PROJECT" --region "$REGION" --enable-managed-prometheus
+```
+
+In the cluster, after the components exist:
+
+- PR 3: `kubectl apply -f manifests/telemetry/collector.yaml` and the `PodMonitoring` that
+  `ate-env manifest --metrics-port 9090 --pod-monitoring` renders for each `ate-env` namespace.
+- PR 2:
+  `ate-env manifest reporter --bucket "$BUCKET" --project "$CLUSTER_PROJECT" --cluster "$CLUSTER" | kubectl apply -f -`,
+  then the Substrate `viewer` AccessPolicy for
+  `user:system:serviceaccount:ate-env-reporter:ate-env-reporter`, global so `ListActors` across
+  atespaces is allowed. Verify the role on one atespace first (phase 0 of the execution plan).
+- Check:
+  `gcloud storage cat "gs://$BUCKET/v1/inventory/$CLUSTER_PROJECT/$CLUSTER/latest.json" | head`
+  shows `generated_at` within one interval of now.
+
+## 3. The site, once (after PR 4)
+
+Build and deploy with IAP on the service itself, which covers the `run.app` URL as well as any load
+balancer:
+
+```bash
+KO_DOCKER_REPO="$REGION-docker.pkg.dev/$CENTRAL_PROJECT/ate-env" ko build ./cmd/ate-env-fleet-site --bare
+gcloud services identity create --service iap.googleapis.com --project "$CENTRAL_PROJECT"
+gcloud run deploy ate-fleet-site --project "$CENTRAL_PROJECT" --region "$REGION" \
+  --image "$REGION-docker.pkg.dev/$CENTRAL_PROJECT/ate-env/ate-env-fleet-site:latest" \
+  --service-account "ate-fleet-site@$P" --no-allow-unauthenticated --iap --min-instances 1 \
+  --set-env-vars "FLEET_BUCKET=$BUCKET,FLEET_EVENTS_TABLE=$CENTRAL_PROJECT.fleet.actor_events,FLEET_METRICS_PROJECT=$CENTRAL_PROJECT"
+NUMBER=$(gcloud projects describe "$CENTRAL_PROJECT" --format 'value(projectNumber)')
+gcloud run services add-iam-policy-binding ate-fleet-site --project "$CENTRAL_PROJECT" --region "$REGION" \
+  --member "serviceAccount:service-$NUMBER@gcp-sa-iap.iam.gserviceaccount.com" --role roles/run.invoker
+gcloud iap web add-iam-policy-binding --project "$CENTRAL_PROJECT" --region "$REGION" \
+  --resource-type cloud-run --service ate-fleet-site --member "$IAP_GROUP" --role roles/iap.httpsResourceAccessor
+```
+
+IAP on Cloud Run authenticates users of the organization with a Google-managed OAuth client; a
+project without an organization needs the console once. The environment variable names are the
+proposal for PR 4 and may change with it.
+
+## 4. Verify
+
+- `curl -i "$(gcloud run services describe ate-fleet-site --region "$REGION" --format 'value(status.url)')"`
+  without credentials redirects to sign-in; a group member gets the Fleet page (AC-7).
+- The Fleet page lists each cluster with a `generated_at` under one interval old (AC-1), and marks a
+  cluster stale three intervals after its reporter stops (AC-9).
+- `bq query 'SELECT COUNT(*) FROM fleet.actor_events WHERE publish_time > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 10 MINUTE)'`
+  grows while a fleet runs (AC-2).
+- The IAM policy of `ate-fleet-site@` shows viewer roles only (AC-3).
+
+## 5. Remove
+
+Delete the Cloud Run service, the sinks in each cluster project, the subscriptions, the topic, the
+dataset and the bucket, in that order; the reporters and collectors go with `kubectl delete -f` of
+the same manifests. Nothing else was created.
+
+References:
+[IAP for Cloud Run](https://docs.cloud.google.com/run/docs/securing/identity-aware-proxy-cloud-run),
+[Pub/Sub subscriptions create](https://docs.cloud.google.com/sdk/gcloud/reference/pubsub/subscriptions/create),
+[Cloud Storage subscriptions](https://docs.cloud.google.com/pubsub/docs/create-cloudstorage-subscription),
+[BigQuery subscriptions](https://docs.cloud.google.com/pubsub/docs/create-bigquery-subscription).

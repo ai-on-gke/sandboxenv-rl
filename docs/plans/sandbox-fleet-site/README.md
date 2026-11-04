@@ -4,7 +4,8 @@ Status: proposal, 2026-10-30. The decisions taken so far are in [decisions.md](.
 evidence for every data path below is in [research.md](./research.md), checked against
 `ai-on-gke/sandboxenv-rl` at `3b03b03` and `agent-substrate/substrate` at `28520c0d`. Companions:
 [prd.md](./prd.md), [execution-plan.md](./execution-plan.md), [interfaces.md](./interfaces.md),
-[acceptance-criteria.md](./acceptance-criteria.md).
+[acceptance-criteria.md](./acceptance-criteria.md) and, for the order of operations with `gcloud`,
+[quickstart.md](./quickstart.md).
 
 ## Goal
 

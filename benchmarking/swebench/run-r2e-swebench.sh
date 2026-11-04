@@ -49,6 +49,8 @@
 #       --ateapi-token-file P    Bearer token file for ateapi in --client go-direct (env: ATEAPI_TOKEN_FILE)
 #       --ateapi-ca-file P       CA PEM bundle verifying ateapi TLS in --client go-direct (env: ATEAPI_CA_FILE)
 #       --auth-token-file P      Bearer token file for ate-env-api in local mode (env: AUTH_TOKEN_FILE)
+#       --api-service NAME       In-cluster ate-env-api Service name (env: API_SERVICE; default: ate-env-api)
+#       --python-bin PATH        Python interpreter for local --client python runs (env: PYTHON_BIN; default: python3)
 #       --python-image IMAGE     Prebuilt image for in-cluster --client python Jobs (env: PYTHON_LOADER_IMAGE)
 #       --r2e-dataset PATH       R2E-Gym JSONL manifest path (env: R2E_DATASET; required)
 #       --swe-dataset PATH       SWE-bench JSONL manifest path (env: SWE_DATASET; required)
@@ -75,7 +77,7 @@
 set -o errexit -o nounset -o pipefail
 
 usage() {
-  sed -n '17,74p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '17,76p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 require_arg() {
@@ -130,6 +132,8 @@ CLI_ATENET_SERVER_NAME=""
 CLI_ATEAPI_TOKEN_FILE=""
 CLI_ATEAPI_CA_FILE=""
 CLI_AUTH_TOKEN_FILE=""
+CLI_API_SERVICE=""
+CLI_PYTHON_BIN=""
 CLI_PYTHON_IMAGE=""
 EXTRA_ARGS=()
 
@@ -325,6 +329,24 @@ while (( $# > 0 )); do
       ;;
     --auth-token-file=*)
       CLI_AUTH_TOKEN_FILE="${1#*=}"
+      shift
+      ;;
+    --api-service)
+      require_arg "$1" "${2:-}"
+      CLI_API_SERVICE="$2"
+      shift 2
+      ;;
+    --api-service=*)
+      CLI_API_SERVICE="${1#*=}"
+      shift
+      ;;
+    --python-bin)
+      require_arg "$1" "${2:-}"
+      CLI_PYTHON_BIN="$2"
+      shift 2
+      ;;
+    --python-bin=*)
+      CLI_PYTHON_BIN="${1#*=}"
       shift
       ;;
     --python-image)
@@ -607,7 +629,17 @@ ATENET_SERVER_NAME="${CLI_ATENET_SERVER_NAME:-${ATENET_SERVER_NAME:-}}"
 ATEAPI_TOKEN_FILE="${CLI_ATEAPI_TOKEN_FILE:-${ATEAPI_TOKEN_FILE:-}}"
 ATEAPI_CA_FILE="${CLI_ATEAPI_CA_FILE:-${ATEAPI_CA_FILE:-}}"
 AUTH_TOKEN_FILE="${CLI_AUTH_TOKEN_FILE:-${AUTH_TOKEN_FILE:-}}"
+API_SERVICE="${CLI_API_SERVICE:-${API_SERVICE:-ate-env-api}}"
+PYTHON_BIN="${CLI_PYTHON_BIN:-${PYTHON_BIN:-python3}}"
 PYTHON_LOADER_IMAGE="${CLI_PYTHON_IMAGE:-${PYTHON_LOADER_IMAGE:-}}"
+
+if [[ "${PYTHON_BIN}" == */* ]]; then
+  PYTHON_BIN="$(abs_path "${PYTHON_BIN}")"
+fi
+if [[ ! "${API_SERVICE}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ || ${#API_SERVICE} -gt 63 ]]; then
+  echo "API_SERVICE must be a valid Kubernetes Service DNS label (got ${API_SERVICE})" >&2
+  exit 2
+fi
 
 if [[ -n "${ATENET_CLIENT_CERT}" ]]; then
   ATENET_CLIENT_CERT="$(abs_path "${ATENET_CLIENT_CERT}")"
@@ -1142,7 +1174,7 @@ if [[ "${ACTION}" == "dry-run" ]]; then
       r2e_py_mode=("${PY_MODE_ARGS[@]}")
       arm_label_args_python "${arm_client}" "${arm_name}"
 
-      python3 "${ROOT}/benchmarking/swebench/run_fleet_bench.py" --dry-run \
+      "${PYTHON_BIN}" "${ROOT}/benchmarking/swebench/run_fleet_bench.py" --dry-run \
         "--rendered-plan=${arm_dir}/plans/swe-plan.json" \
         "--run-id=${swe_run}" \
         "--width=${SWE_WIDTH}" \
@@ -1160,7 +1192,7 @@ if [[ "${ACTION}" == "dry-run" ]]; then
         ${PY_EXTRA_SET_ARGS[@]+"${PY_EXTRA_SET_ARGS[@]}"} \
         ${PY_EXTRA_LABEL_ARGS[@]+"${PY_EXTRA_LABEL_ARGS[@]}"}
 
-      python3 "${ROOT}/benchmarking/swebench/run_fleet_bench.py" --dry-run \
+      "${PYTHON_BIN}" "${ROOT}/benchmarking/swebench/run_fleet_bench.py" --dry-run \
         "--rendered-plan=${arm_dir}/plans/r2e-plan.json" \
         "--run-id=${r2e_run}" \
         "--width=${R2E_WIDTH}" \
@@ -1247,6 +1279,24 @@ fi
 if [[ "${EXECUTION}" == "in-cluster" && ( "${ARTIFACT_DIR}" == "${ROOT}" || "${ARTIFACT_DIR}" == "${ROOT}"/* ) ]]; then
   echo "ARTIFACT_DIR (${ARTIFACT_DIR}) must be outside the repository (${ROOT}) when EXECUTION=in-cluster" >&2
   exit 2
+fi
+
+if [[ "${EXECUTION}" == "local" ]] && (( HAS_PYTHON == 1 )); then
+  if [[ "${ACTION}" != "prewarm" || "${CLIENTS[0]}" == "python" ]]; then
+    if ! "${PYTHON_BIN}" - "${ROOT}/benchmarking/swebench/run_fleet_bench.py" <<'PY'; then
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("run_fleet_bench", sys.argv[1])
+assert spec is not None and spec.loader is not None
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mod.load_sdk()
+PY
+      echo "local Python SDK pre-flight failed with PYTHON_BIN='${PYTHON_BIN}'; pass --python-bin /path/to/venv/bin/python3 with grpcio>=1.84 and protobuf>=7.35 (e.g., pip install -e ./clients/python)" >&2
+      exit 2
+    fi
+  fi
 fi
 
 mkdir -p "${ARTIFACT_DIR}/events" "${ARTIFACT_DIR}/prewarm"
@@ -1378,7 +1428,7 @@ ensure_python_loader_image() {
   cp "${ROOT}/benchmarking/swebench/run_fleet_bench.py" "${PY_BUILD_DIR}/run_fleet_bench.py"
   cat > "${PY_BUILD_DIR}/Dockerfile" <<'EOF_PY_DOCKER'
 FROM python:3.12-slim
-RUN pip install --no-cache-dir "grpcio>=1.68" "protobuf>=5.28" "pydantic>=2.0"
+RUN pip install --no-cache-dir "grpcio>=1.84" "protobuf>=7.35"
 WORKDIR /app
 COPY clients/python/src /app/clients/python/src
 COPY run_fleet_bench.py /app/run_fleet_bench.py
@@ -1598,7 +1648,7 @@ run_local_arm_shards() {
     arm_label_args_python "${arm_client}" "${arm_name}"
 
     local -a swe_cmd=(
-      python3 "${ROOT}/benchmarking/swebench/run_fleet_bench.py"
+      "${PYTHON_BIN}" "${ROOT}/benchmarking/swebench/run_fleet_bench.py"
       "--endpoint=${ENDPOINT}"
       "--rendered-plan=${arm_dir}/plans/swe-plan.json"
       "--run-id=${swe_run}"
@@ -1624,7 +1674,7 @@ run_local_arm_shards() {
     fi
 
     local -a r2e_cmd=(
-      python3 "${ROOT}/benchmarking/swebench/run_fleet_bench.py"
+      "${PYTHON_BIN}" "${ROOT}/benchmarking/swebench/run_fleet_bench.py"
       "--endpoint=${ENDPOINT}"
       "--rendered-plan=${arm_dir}/plans/r2e-plan.json"
       "--run-id=${r2e_run}"
@@ -1772,7 +1822,7 @@ run_in_cluster_arm_shards() {
     arm_label_args_python "${arm_client}" "${arm_name}"
 
     local -a swe_args=(
-      "--endpoint=ate-env-api.${NAMESPACE}.svc:7777"
+      "--endpoint=${API_SERVICE}.${NAMESPACE}.svc:7777"
       "--rendered-plan=/work/plan.json"
       "--run-id=${swe_run}"
       "--width=${swe_width}"
@@ -1793,7 +1843,7 @@ run_in_cluster_arm_shards() {
     fi
 
     local -a r2e_args=(
-      "--endpoint=ate-env-api.${NAMESPACE}.svc:7777"
+      "--endpoint=${API_SERVICE}.${NAMESPACE}.svc:7777"
       "--rendered-plan=/work/plan.json"
       "--run-id=${r2e_run}"
       "--width=${r2e_width}"
@@ -1855,7 +1905,7 @@ run_in_cluster_arm_shards() {
         creds_secret="${DIRECT_CREDS_SECRET}"
       fi
     else
-      cluster_backend_args+=("-access=ate-env-api" "-endpoint=ate-env-api.${NAMESPACE}.svc:7777")
+      cluster_backend_args+=("-access=ate-env-api" "-endpoint=${API_SERVICE}.${NAMESPACE}.svc:7777")
     fi
 
     mode_args_for_go "${cur_mode}" "${swe_fanout}" "${SWE_IMAGES}" "${swe_width}" "${arm_strategy}"

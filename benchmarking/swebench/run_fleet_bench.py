@@ -612,6 +612,12 @@ class _InstrumentedDriver:
     def _has_real_warm_pool(self) -> bool:
         return hasattr(self._inner, "_warm_paused_pool")
 
+    @staticmethod
+    def _warm_entry_id(item: Any) -> str:
+        if isinstance(item, (tuple, list)):
+            return str(item[0]) if item else ""
+        return str(item)
+
     def _snapshot_real_warm_ids(
         self, template_id: str, rootfs_image: str | None
     ) -> list[str]:
@@ -622,7 +628,7 @@ class _InstrumentedDriver:
         ctx = inner_lock if inner_lock is not None else contextlib.nullcontext()
         with ctx:
             entries = list(pool_map.get((template_id, rootfs_image), []))
-        return [str(aid) for aid, *_ in entries]
+        return [aid for item in entries if (aid := self._warm_entry_id(item))]
 
     def _snapshot_all_real_warm_ids(self) -> set[str]:
         pool_map = getattr(self._inner, "_warm_paused_pool", None)
@@ -634,7 +640,9 @@ class _InstrumentedDriver:
         with ctx:
             for entries in pool_map.values():
                 for item in entries:
-                    out.add(str(item[0]))
+                    aid = self._warm_entry_id(item)
+                    if aid:
+                        out.add(aid)
         return out
 
     def _emit_warm_create_suspend(self, env_id: str, img_label: str, dur_ms: float) -> None:

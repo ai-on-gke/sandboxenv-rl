@@ -211,7 +211,10 @@ Common parameter variations:
   pass `--concurrency 200 --images 10 --rollouts-per-image 10`.
 - **Rootfs I/O probe without `pytest`**: pass `--workload io --mode eval`.
 - **Local port-forward execution**: omit `KO_DOCKER_REPO` (or pass `--execution local`) with
-  `ENDPOINT=localhost:7777` (and `--auth-token-file` when `ate-env-api` requires bearer auth).
+  `ENDPOINT=localhost:7777` (pass `--auth-token-file` when `ate-env-api` requires bearer auth, and
+  `--python-bin /path/to/venv/bin/python3` when the host `python3` lacks `grpcio>=1.84` and
+  `protobuf>=7.35`). Override `BASE_TEMPLATE` and `--api-service` when the cluster uses non-default
+  template or `ate-env-api` Service names.
 
 ## 5. Verify outputs in `$ARTIFACT_DIR`
 

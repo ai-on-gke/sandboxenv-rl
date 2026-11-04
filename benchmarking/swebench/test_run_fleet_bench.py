@@ -449,3 +449,85 @@ def test_cross_language_render_plan_and_go_report_compatibility(tmp_path):
         assert col in comp_proc.stdout
     comp_data = json.loads(comp_json.read_text(encoding="utf-8"))
     assert len(comp_data) == 4
+
+
+class _RealWarmPoolStubDriver(_GradedMockDriver):
+    """Stub driver mimicking SubstrateBackendDriver._warm_paused_pool[key] -> list[str]."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = threading.Lock()
+        self._warm_paused_pool: dict[tuple[str, str | None], list[str]] = {}
+        self._warm_counter = 0
+
+    def warm_pool(
+        self,
+        template_id: str,
+        replicas: int,
+        wait: bool = True,
+        run_id: str | None = None,
+        rootfs_image: str | None = None,
+    ) -> None:
+        super().warm_pool(template_id, replicas, wait=wait, run_id=run_id, rootfs_image=rootfs_image)
+        key = (template_id, rootfs_image)
+        with self._lock:
+            cur = self._warm_paused_pool.setdefault(key, [])
+            while len(cur) < replicas:
+                self._warm_counter += 1
+                cur.append(f"warm-{self._warm_counter:010x}")
+
+    def acquire(
+        self,
+        template_id: str,
+        run_id: str,
+        timeout_s: float = 180.0,
+        rootfs_image: str | None = None,
+    ) -> Any:
+        raw = super().acquire(template_id, run_id, timeout_s=timeout_s, rootfs_image=rootfs_image)
+        if raw.metadata.get("claim_source") == "warm_pool":
+            key = (template_id, rootfs_image)
+            with self._lock:
+                cur = self._warm_paused_pool.get(key, [])
+                if cur:
+                    raw.instance_id = cur.pop(0)
+        return raw
+
+    def unwarm_pool(self, template_id: str, rootfs_image: str | None = None) -> None:
+        super().unwarm_pool(template_id, rootfs_image=rootfs_image)
+        with self._lock:
+            self._warm_paused_pool.pop((template_id, rootfs_image), None)
+
+    def reap(self, run_id: str) -> int:
+        with self._lock:
+            self._warm_paused_pool.clear()
+        return super().reap(run_id)
+
+
+def test_real_warm_paused_pool_string_actor_ids(tmp_path: pathlib.Path) -> None:
+    """Ensure _warm_paused_pool string actor IDs are never unpacked into single characters."""
+    manifest = _write_r2e_manifest(tmp_path / "r2e.jsonl", count=2)
+    out_jsonl = tmp_path / "events.jsonl"
+    argv = [
+        "--backend=mock",
+        f"--dataset={manifest}",
+        "--trajectory=command-default",
+        "--mode=steps",
+        "--strategy=naive",
+        "--rollouts=1",
+        "--steps=1",
+        "--width=2",
+        "--run-id=realwarm-t1",
+        f"--out={out_jsonl}",
+    ]
+    assert rfb.run_benchmark(argv, custom_driver=_RealWarmPoolStubDriver()) == 0
+    events = [json.loads(ln) for ln in out_jsonl.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    creates = [e for e in events if e["event"] == "create"]
+    suspends = [e for e in events if e["event"] == "suspend"]
+    prewarms = [e for e in events if e["event"] == "prewarm"]
+    deletes = [e for e in events if e["event"] == "delete"]
+    assert len(creates) == 2
+    assert len(suspends) == 2
+    assert len(prewarms) == 2
+    assert len(deletes) == 2
+    assert all(e["env"].startswith("warm-") and len(e["env"]) > 5 for e in creates)
+    assert all(e["env"].startswith("warm-") and len(e["env"]) > 5 for e in deletes)

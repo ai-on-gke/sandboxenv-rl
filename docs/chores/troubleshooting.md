@@ -133,8 +133,8 @@ This document is the canonical reference for common failure modes, diagnostic st
 - **Cause:** [`nix/python.nix`](../../nix/python.nix) builds the envs from `uv.lock` with uv2nix, from wheels. A package without a wheel for the platform (sdist only, or a git source) is built from source, and `uv.lock` doesn't say which build system it needs ([astral-sh/uv#5190](https://github.com/astral-sh/uv/issues/5190)). A wheel that links a system library outside the manylinux set needs that library.
 - **Fix:** in `buildSystemOverrides` in `nix/python.nix`, add the build system (`withBuildSystem "<name>" { setuptools = [ ]; }`), or add the library to the package's `buildInputs` with an `overrideAttrs`. See uv2nix's [overriding guide](https://pyproject-nix.github.io/uv2nix/overriding/index.html).
 
-### `ModuleNotFoundError: No module named 'ate_env'` from a Nix env
-- **Symptom:** a Python env's interpreter can't import one of this repository's packages (`ate_env`, `nemo_gym_substrate`, ...).
+### `ModuleNotFoundError: No module named 'ate_env_rl'` from a Nix env
+- **Symptom:** a Python env's interpreter can't import one of this repository's packages (`ate_env_rl`, `nemo_gym_substrate`, ...).
 - **Cause:** the envs install them editable, relative to `$REPO_ROOT`, which the devShell and the `ci-*` scripts set to the repository root. Running an env's `bin/python` some other way (for example from `nix build`'s `result`) leaves it unset.
 - **Fix:** `export REPO_ROOT="$(git rev-parse --show-toplevel)"`, or run the command through `nix develop -c`.
 

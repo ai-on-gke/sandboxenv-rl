@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""agent-sandbox-rl's ``SandboxFleet`` and ``SandboxHandle`` on top of ``ate_env``.
+"""agent-sandbox-rl's ``SandboxFleet`` and ``SandboxHandle`` on top of ``ate_env_rl``.
 
 ``SandboxFleet`` takes agent-sandbox-rl's ``FleetConfig`` and runs the
-``ate_env`` fleet with ``FleetConfig.to_ate_env()``. Its ``run()`` has
+``ate_env_rl`` fleet with ``FleetConfig.to_ate_env()``. Its ``run()`` has
 agent-sandbox-rl's signature (``strategy`` is the second positional
 argument, default ``"naive"``) and behavior: an unknown strategy raises, the
 sliding and pipelined window comes from ``recommended_window()``, and the
@@ -34,10 +34,10 @@ import logging
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from ate_env import SandboxFleet as AteSandboxFleet
-from ate_env import SandboxHandle as AteSandboxHandle
-from ate_env import Task
-from ate_env.strategies import STRATEGIES
+from ate_env_rl import SandboxFleet as AteSandboxFleet
+from ate_env_rl import SandboxHandle as AteSandboxHandle
+from ate_env_rl import Task
+from ate_env_rl.strategies import STRATEGIES
 
 from .config import FleetConfig
 
@@ -71,14 +71,14 @@ def _window(counts: dict[str, int], max_concurrent: int, max_pool: int) -> int:
 
 @dataclasses.dataclass
 class SandboxHandle(AteSandboxHandle):
-    """An ``ate_env.SandboxHandle`` with agent-sandbox-rl's ``cluster_name``:
+    """An ``ate_env_rl.SandboxHandle`` with agent-sandbox-rl's ``cluster_name``:
     the name of the ``ClusterConfig`` the fleet runs on."""
 
     cluster_name: str = "default"
 
     @classmethod
     def wrap(cls, handle: AteSandboxHandle, cluster_name: str) -> SandboxHandle:
-        """Copy an ``ate_env`` handle into one that carries ``cluster_name``."""
+        """Copy an ``ate_env_rl`` handle into one that carries ``cluster_name``."""
         if isinstance(handle, cls):
             return handle
         fields = dataclasses.fields(handle)
@@ -91,7 +91,7 @@ class SandboxHandle(AteSandboxHandle):
 
 
 class SandboxFleet(AteSandboxFleet):
-    """agent-sandbox-rl's fleet API, run by the ``ate_env`` fleet."""
+    """agent-sandbox-rl's fleet API, run by the ``ate_env_rl`` fleet."""
 
     def __init__(self, config: FleetConfig | None = None, driver: Any = None):
         self.agent_sandbox_config = config or FleetConfig()
@@ -148,7 +148,7 @@ class SandboxFleet(AteSandboxFleet):
         window = self.config.window_size
         if strategy in ("sliding", "pipelined"):
             window = self.recommended_window(pipelined=strategy == "pipelined")
-        # The ate_env strategies and the RunReport read the strategy and the
+        # The ate_env_rl strategies and the RunReport read the strategy and the
         # window from the fleet's configuration; set both for this run only.
         configured = self.config
         self.config = dataclasses.replace(configured, strategy=strategy, window_size=window)

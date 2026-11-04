@@ -19,7 +19,7 @@ from datetime import timedelta
 
 import pytest
 
-from ate_env import (
+from ate_env_rl import (
     FailedPreconditionError,
     InvalidArgumentError,
     NotFoundError,
@@ -29,7 +29,7 @@ from ate_env import (
     ShellResult,
     Signal,
 )
-from ate_env._gen.ateenv.v1alpha import guest_pb2
+from ate_env_rl._gen.ateenv.v1alpha import guest_pb2
 
 from .fakes import FakeProc
 
@@ -49,7 +49,7 @@ async def test_missing_metadata_rejected(fake_stack):
         try:
             await client._processes.StartProcess(guest_pb2.StartProcessRequest(command=["true"]))
         except Exception as e:
-            from ate_env import map_rpc_error
+            from ate_env_rl import map_rpc_error
 
             raise map_rpc_error(e) from e
 

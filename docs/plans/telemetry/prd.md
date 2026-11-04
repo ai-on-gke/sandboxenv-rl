@@ -28,7 +28,7 @@ path.
 
 ## Scope, as delivered
 
-1. Python tracing (#93, #164): `ate_env.telemetry.tracing`; `ate_env_client.*` spans on every
+1. Python tracing (#93, #164): `ate_env_rl.telemetry.tracing`; `ate_env_client.*` spans on every
    client, runtime, handle and driver operation; the W3C context in gRPC metadata; context carried
    across `LoopRunner` and `process_parallel`; otelgrpc's `rpc.*` keys on `Client` spans.
 2. Python observability (#109, #113, #115): `RunReport`, `Observer`, Prometheus `ate_env_fleet_*`
@@ -67,17 +67,16 @@ swebench loader and the GRPO example are unchanged.
 - Any new transport, auth or API change in `ateenv.v1alpha`. The one wire addition is the optional
   `x-ate-env-requested-at` metadata header.
 
-The JSONL trace recorder (`ate_env.telemetry.trace_recorder`, `ENV_BENCH_MODE`) came from the
+The JSONL trace recorder (`ate_env_rl.telemetry.trace_recorder`, `ENV_BENCH_MODE`) came from the
 benchmarking series (#173). It consumes the client spans this work added and is specified in
 `internal/benchmarking/PLAN.md`.
 
 ## Success metrics
 
-A trainer that installs `ate-env-client[tracing,metrics]` and sets `OTEL_EXPORTER_OTLP_ENDPOINT`
-sees one trace from `ate_env_fleet.run` down to `ate-env-api` (and to `ateapi` when Substrate
-exports), a `/metrics` endpoint on its process and on `ate-env-api`, and a run report in the same
-shape as agent-sandbox-rl's. A trainer that installs the base package sees nothing new and pays
-nothing.
+A trainer that installs `ate-env-rl[tracing,metrics]` and sets `OTEL_EXPORTER_OTLP_ENDPOINT` sees
+one trace from `ate_env_fleet.run` down to `ate-env-api` (and to `ateapi` when Substrate exports), a
+`/metrics` endpoint on its process and on `ate-env-api`, and a run report in the same shape as
+agent-sandbox-rl's. A trainer that installs the base package sees nothing new and pays nothing.
 
 Evidence: the unit and integration suites in CI (`clients/python/tests/test_telemetry_tracing.py`,
 `test_observability.py`, `test_telemetry_metrics.py`, `internal/telemetry`,

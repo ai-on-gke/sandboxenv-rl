@@ -41,9 +41,16 @@ func (e *Env) withEnv(ctx context.Context) context.Context {
 	return e.client.withAuth(metadata.AppendToOutgoingContext(ctx, "x-env-id", e.id, "x-env-atespace", e.atespace))
 }
 
-// Suspend checkpoints and stops the environment using gRPC.
+// Suspend checkpoints and stops the environment using gRPC; it returns once
+// the snapshot is in object storage.
 func (e *Env) Suspend(ctx context.Context) error {
 	return e.client.Suspend(ctx, e.atespace, e.id)
+}
+
+// SuspendLocal checkpoints and stops the environment and returns once the
+// snapshot is on the node; see Client.SuspendLocal.
+func (e *Env) SuspendLocal(ctx context.Context) error {
+	return e.client.SuspendLocal(ctx, e.atespace, e.id)
 }
 
 // Delete removes the environment permanently using gRPC.

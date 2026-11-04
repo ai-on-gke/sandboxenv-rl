@@ -23,12 +23,12 @@ Usage:
   kubectl port-forward -n ate-env svc/ate-env-api 7777:7777 &
   python benchmarks/rollout_bench.py --rollouts 5 --turns 3 --think-s 2
 
-Phases go to an ate_env Observer, created here in the benchmark process and
+Phases go to an ate_env_rl Observer, created here in the benchmark process and
 never by the provider: acquire (create), process (one turn's exec) and
 release (close), one task per rollout. REPORT_DIR (or --report-dir) receives
 the run report, rollouts_<n>tasks_<YYYYMMDD-HHMMSS>.txt and .json;
---enable-tracing adds ate_env_fleet.* spans over OTLP (ate-env-client[tracing]) and
---metrics-port serves the ate_env_fleet_* series (ate-env-client[metrics]). See
+--enable-tracing adds ate_env_fleet.* spans over OTLP (ate-env-rl[tracing]) and
+--metrics-port serves the ate_env_fleet_* series (ate-env-rl[metrics]). See
 docs/observability.md.
 """
 
@@ -40,8 +40,8 @@ import os
 import statistics
 import time
 
-from ate_env.config import ObservabilityConfig
-from ate_env.observability import Observer, serve_metrics
+from ate_env_rl.config import ObservabilityConfig
+from ate_env_rl.observability import Observer, serve_metrics
 
 from nemo_gym_substrate._compat import SandboxSpec
 from nemo_gym_substrate.provider import SubstrateSandboxProvider

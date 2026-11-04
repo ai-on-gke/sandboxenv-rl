@@ -231,10 +231,10 @@ def _generate_real_run(out: str) -> None:
 
     import grpc.aio
     import prometheus_client
-    from ate_env import FleetConfig, SandboxFleet, Task
-    from ate_env._gen.ateenv.v1alpha import env_pb2_grpc, guest_pb2_grpc
-    from ate_env.config import ObservabilityConfig
-    from ate_env.loop_runner import LoopRunner
+    from ate_env_rl import FleetConfig, SandboxFleet, Task
+    from ate_env_rl._gen.ateenv.v1alpha import env_pb2_grpc, guest_pb2_grpc
+    from ate_env_rl.config import ObservabilityConfig
+    from ate_env_rl.loop_runner import LoopRunner
     from google.protobuf.json_format import MessageToDict
     from opentelemetry import trace
     from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
@@ -298,7 +298,7 @@ def test_real_fleet_outputs(tmp_path):
     a traced fleet (proto JSON and collector OTLP/JSON ids) and a scrape."""
     import subprocess
 
-    for mod in ("ate_env", "opentelemetry.sdk", "opentelemetry.exporter.otlp.proto.common",
+    for mod in ("ate_env_rl", "opentelemetry.sdk", "opentelemetry.exporter.otlp.proto.common",
                 "prometheus_client"):
         pytest.importorskip(mod)
     here = os.path.dirname(os.path.abspath(__file__))

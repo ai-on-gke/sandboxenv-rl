@@ -30,7 +30,7 @@ namespace is left at its default). See ``config`` for what maps and what is
 ignored.
 """
 
-from ate_env import Task
+from ate_env_rl import Task
 
 from .config import (
     ClusterConfig,

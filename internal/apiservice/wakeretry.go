@@ -26,6 +26,7 @@ import (
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -60,6 +61,41 @@ const (
 	wakeRetryMaxBackoff     = 2 * time.Second
 )
 
+// StartFailureKey is the trailing metadata key on a guest call that failed
+// because the environment cannot start, so clients can tell that failure
+// from any other without parsing the message: retry the work on a fresh
+// environment rather than score it. Its value is StartFailureCrashed or
+// StartFailureNoCapacity.
+const StartFailureKey = "ate-env-start-failure"
+
+const (
+	// StartFailureCrashed: the control plane moved the environment to
+	// CRASHED while it was waking (FailedPrecondition; the message carries
+	// the control plane's crash reason).
+	StartFailureCrashed = "crashed"
+	// StartFailureNoCapacity: no worker had room to run the environment for
+	// the whole WakeNoCapacityGrace (ResourceExhausted).
+	StartFailureNoCapacity = "no-capacity"
+)
+
+// routerNoCapacityText is how the atenet router describes a resume that the
+// scheduler could not place: it keeps the ResourceExhausted description,
+// "no worker has room for the actor", in the 503 body that reaches a gRPC
+// caller as an Unavailable message.
+const routerNoCapacityText = "no worker has room for the actor"
+
+// routerNoCapacity reports whether err is the router saying that no worker
+// has room for the actor.
+func routerNoCapacity(err error) bool {
+	return err != nil && strings.Contains(err.Error(), routerNoCapacityText)
+}
+
+// setStartFailure marks the call's trailers with why the environment cannot
+// start. Outside a gRPC handler (no server transport in ctx) it does nothing.
+func setStartFailure(ctx context.Context, reason string) {
+	_ = grpc.SetTrailer(ctx, metadata.Pairs(StartFailureKey, reason))
+}
+
 // ensureAwake sends a trivial request to the environment's guest over conn
 // and repeats it while the router answers Unavailable, which is what an
 // expired parking budget and a guest that is not yet listening both look
@@ -73,6 +109,13 @@ const (
 // state is read once per attempt, and the backoff caps attempts at roughly
 // one per two seconds, so a full four-minute wait costs about 120
 // control-plane reads.
+//
+// Two failures end the wait early, because waiting cannot fix them, and mark
+// the call's trailers with StartFailureKey: an actor the control plane moved
+// to CRASHED (FailedPrecondition, with the control plane's crash reason), and,
+// when WakeNoCapacityGrace is set, a router that has said for that long that
+// no worker has room for the actor (ResourceExhausted). Without the grace a
+// fleet that is full waits the whole WakeBudget, as capacity can come back.
 //
 // With Metrics set, a wait (a first probe that found the guest unreachable)
 // is observed in ate_env_api_wake_wait_seconds with its outcome, and the
@@ -101,10 +144,16 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 		runningBudget = DefaultWakeRunningBudget
 	}
 	var runningSince time.Time // first attempt that saw the actor RUNNING
+	// When the first probe of the current run of no-room answers started:
+	// the router parks a probe for its parking budget before it answers
+	// no-room, so that wait counts toward the grace.
+	var noCapacitySince time.Time
 	probe := ateenvv1alpha.NewProcessServiceClient(conn)
 	backoff := wakeRetryInitialBackoff
 	for attempt := 1; ; attempt++ {
+		probeStart := time.Now()
 		_, err := probe.GetProcess(ctx, &ateenvv1alpha.GetProcessRequest{ProcessId: "ate-env-wake-probe"})
+		probeDone := time.Now()
 		if status.Code(err) != codes.Unavailable {
 			// Anything else, NotFound for the probe id included, came from
 			// the guest itself.
@@ -117,12 +166,17 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 				identityNote(s.RouterIdentity), err, routertls.RejectionAdvice)
 		}
 		waited = true
-		state, serr := s.actorState(ctx, atespace, id)
+		st, serr := s.actorStatus(ctx, atespace, id)
 		if serr != nil {
 			return serr
 		}
+		state := st.GetState()
 		if state == ateapipb.ActorState_ACTOR_STATE_CRASHED {
 			s.finishCreate(atespace, id, telemetry.ReadyStatusCrashed)
+			setStartFailure(ctx, StartFailureCrashed)
+			if reason := st.GetCrash().GetMessage(); reason != "" {
+				return status.Errorf(codes.FailedPrecondition, "environment %s/%s crashed while waking: %s", atespace, id, reason)
+			}
 			return status.Errorf(codes.FailedPrecondition, "environment %s/%s crashed while waking: %v", atespace, id, err)
 		}
 		if state == ateapipb.ActorState_ACTOR_STATE_DELETING {
@@ -137,6 +191,20 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 			allowed, since, which = runningBudget, runningSince, "running budget"
 		} else {
 			runningSince = time.Time{}
+		}
+		if routerNoCapacity(err) && state != ateapipb.ActorState_ACTOR_STATE_RUNNING {
+			if noCapacitySince.IsZero() {
+				noCapacitySince = probeStart
+			}
+		} else {
+			noCapacitySince = time.Time{}
+		}
+		// Measured to the probe's answer, so the state read above does not
+		// count toward the grace.
+		if grace := s.WakeNoCapacityGrace; grace > 0 && !noCapacitySince.IsZero() && probeDone.Sub(noCapacitySince) >= grace {
+			setStartFailure(ctx, StartFailureNoCapacity)
+			return status.Errorf(codes.ResourceExhausted, "environment %s/%s cannot start: no worker has had room for it for the no-capacity grace of %s (%d attempts): %v",
+				atespace, id, grace, attempt, err)
 		}
 		remaining := allowed - time.Since(since)
 		if overall := budget - time.Since(start); overall < remaining {
@@ -153,7 +221,7 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 		select {
 		case <-ctx.Done():
 			return status.FromContextError(ctx.Err()).Err()
-		case <-time.After(min(backoff, remaining)):
+		case <-time.After(min(backoff, remaining, s.noCapacityLeft(noCapacitySince))):
 		}
 		backoff = min(backoff*2, wakeRetryMaxBackoff)
 	}
@@ -176,11 +244,28 @@ func (s *Server) ActorState(ctx context.Context, atespace, id string) (ateapipb.
 // environment surfaces here as NotFound (through toGRPCError), which is the
 // right answer to a caller still holding its handle.
 func (s *Server) actorState(ctx context.Context, atespace, id string) (ateapipb.ActorState, error) {
+	st, err := s.actorStatus(ctx, atespace, id)
+	return st.GetState(), err
+}
+
+// actorStatus is actorState with the rest of the status, such as the crash
+// reason.
+func (s *Server) actorStatus(ctx context.Context, atespace, id string) (*ateapipb.ActorStatus, error) {
 	actor, err := s.client.Get(ctx, atespace, id)
 	if err != nil {
-		return ateapipb.ActorState_ACTOR_STATE_UNSPECIFIED, toGRPCError(err)
+		return nil, toGRPCError(err)
 	}
-	return actor.GetStatus().GetState(), nil
+	return actor.GetStatus(), nil
+}
+
+// noCapacityLeft is how long the current run of no-room answers may go on
+// before ensureAwake fails it, so the backoff does not sleep past the grace.
+// It is unbounded when there is no grace or no such run.
+func (s *Server) noCapacityLeft(since time.Time) time.Duration {
+	if s.WakeNoCapacityGrace <= 0 || since.IsZero() {
+		return wakeRetryMaxBackoff
+	}
+	return max(s.WakeNoCapacityGrace-time.Since(since), time.Millisecond)
 }
 
 func shortState(st ateapipb.ActorState) string {

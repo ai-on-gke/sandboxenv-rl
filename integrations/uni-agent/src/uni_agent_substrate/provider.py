@@ -14,7 +14,7 @@
 """uni-agent sandbox provider ``ate_env``: one Agent Substrate environment per episode.
 
 The provider implements :class:`uni_agent.sandbox.base.Sandbox` on top of the
-``ate_env`` Python client (the Substrate environment API served by ate-env-api).
+``ate_env_rl`` Python client (the Substrate environment API served by ate-env-api).
 Each ``start()`` creates an environment from a digest-pinned rootfs image on a base
 ActorTemplate; tools run commands with ``Env.start_process`` and read/write files
 with the native file RPCs; ``stop()`` deletes the environment.
@@ -51,9 +51,9 @@ import weakref
 from pathlib import Path
 from typing import Any
 
-from ate_env import Client, Env
-from ate_env.errors import EnvError, NotFoundError, RpcError
-from ate_env.types import EnvironmentStatus, Signal
+from ate_env_rl import Client, Env
+from ate_env_rl.errors import EnvError, NotFoundError, RpcError
+from ate_env_rl.types import EnvironmentStatus, Signal
 from uni_agent.sandbox.base import ExecResult, Sandbox, SandboxConfig
 from uni_agent.sandbox.registry import register_sandbox
 

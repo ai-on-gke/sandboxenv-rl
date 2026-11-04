@@ -2,16 +2,17 @@
 
 Runs [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) rollout sandboxes as **Substrate actors**,
 fronted by the `ate-env` API of this repo and reached through its Python client,
-[`ate_env`](../../clients/python).
+[`ate_env_rl`](../../clients/python).
 Registers as provider `substrate` next to the built-ins (Docker, Daytona, ECS Fargate, Enroot,
 OpenShell, OpenSandbox, Apptainer) via the `nemo_gym.sandbox_providers` entry point — **no changes
 to NeMo Gym required**, and no changes to your resource servers beyond the `sandbox:` config block.
 
 Why run rollouts on Substrate:
 
-- **Idle sandboxes hold no worker.** A sandbox that is waiting on model inference is suspended by
-  Substrate; the atenet router resumes it transparently on the next command. A rollout fleet is
-  mostly waiting, so effective density is bounded by the *active* set, not the fleet size.
+- **Idle sandboxes hold no worker.** With `create.suspend_policy` set, the provider parks a sandbox
+  once it has been idle for a second after a command, and ate-env-api wakes it on the next one
+  (see [Parking](#parking-an-idle-sandbox-holds-no-worker)). A rollout fleet is mostly waiting on
+  the policy model, so effective density is bounded by the *active* set, not the fleet size.
 - **Repeat sandboxes start from golden snapshots.** The first sandbox on an image pays the boot;
   later ones restore a memory snapshot instead of booting.
 - **Prepared states fork.** A sandbox that finished expensive task setup can be snapshotted and
@@ -26,7 +27,7 @@ Verified against **nemo-gym 0.5.0**: the registry resolves this provider through
 One gRPC endpoint, `ate-env-api`, carries everything (see the
 [client README](../../clients/python/README.md#how-it-works)):
 
-| Provider call | `ate_env` call | Where it lands |
+| Provider call | `ate_env_rl` call | Where it lands |
 |---|---|---|
 | `create(spec)` | `Client.create(id, template_name=…, template_atespace=…, rootfs_image=…)`, then `Env.shell("true")` until it answers, then `Env.write_file` for `spec.files` | `EnvironmentService` → Substrate control plane; the probe and the files go to the guest |
 | `exec(handle, cmd, cwd=, env=, timeout_s=)` | `Env.start_process(["sh","-c",cmd], cwd, env, timeout=)` + `Process.output(follow=True)` | `ProcessService` in `ate-env-guest`, proxied through the atenet router |
@@ -88,7 +89,7 @@ On the cluster:
 
 Locally:
 
-5. **Python ≥ 3.10** and the `ate-env-client` package from this repo's `clients/python` (not on
+5. **Python ≥ 3.10** and the `ate-env-rl` package from this repo's `clients/python` (not on
    PyPI yet). `nemo-gym` itself is only needed on the machine running the Gym resource servers —
    this package's tests run without it (see Testing).
 
@@ -124,7 +125,7 @@ enforces the deadline itself.
 
 ```bash
 # from a checkout of this repo:
-pip install ./clients/python                       # ate-env-client (import name ate_env)
+pip install ./clients/python                       # ate-env-rl (import name ate_env_rl)
 pip install ./integrations/nemo-gym                # nemo-gym-substrate
 # with NeMo Gym in the same environment:
 pip install './integrations/nemo-gym[gym]'
@@ -162,6 +163,8 @@ sandbox:
       atespace: ate-env                    # atespace the templates live in and envs are created in
       ready_timeout_s: 120
       ready_poll_interval_s: 1.0
+      suspend_policy: pause_after_exec     # never (default) | pause_after_exec | suspend_after_exec; see Parking
+      idle_before_suspend_s: 1.0           # idle time after a call before the park
       image_templates:                     # optional: pin an image to a registered template; others are derived
         python:3.12-slim: gym-py312
 ```
@@ -202,7 +205,7 @@ async def main():
 asyncio.run(main())
 ```
 
-To share one `ate_env.Client` between the provider and other code, pass it in:
+To share one `ate_env_rl.Client` between the provider and other code, pass it in:
 `SubstrateSandboxProvider(config, client=client)`. The provider then never closes it.
 
 ### Per-sandbox `provider_options` (on `SandboxSpec`)
@@ -213,6 +216,56 @@ To share one `ate_env.Client` between the provider and other code, pass it in:
 | `atespace` | Atespace of that template, and of the environment (`namespace` accepted as alias) |
 
 Unknown keys are rejected at `create()` time, as are unknown keys anywhere in the config block.
+
+### Parking: an idle sandbox holds no worker
+
+A rollout spends most of its wall-clock waiting for the policy model, and a running sandbox holds
+its worker slot the whole time. With `create.suspend_policy` set, the provider parks a sandbox once
+it has been idle for `idle_before_suspend_s` after `create()` and after each `exec()`, upload and
+download; a parked sandbox holds no worker, so a pool carries more sandboxes than it has slots.
+Nothing resumes it explicitly: the next guest call goes through ate-env-api, which wakes the
+sandbox (its `--wake-budget`, two minutes by default) and then runs the command. `create()` returns a
+parked sandbox, so a new one holds no worker through the policy's first think time and its first
+command is a wake like any later one.
+
+| `suspend_policy` | Park | Snapshot | Resumes |
+|---|---|---|---|
+| `never` (default) | none | | |
+| `pause_after_exec` | `SuspendMode.LOCAL` | on the node; uploads in the background | on that node until the upload lands; the cheapest park-and-resume cycle |
+| `suspend_after_exec` | `SuspendMode.DURABLE` | in object storage before the park counts as done | on any node; survives the loss of the node |
+
+Rules the provider keeps:
+
+- A sandbox is never parked while a request to it is in flight.
+- A park that has not reached the API yet is dropped by a new request, so back-to-back commands
+  (an eval's test runs) pay no checkpoint and no restore between them. One that has reached the
+  API is left to finish, and the new request waits for it, because a sandbox that is still
+  `SUSPENDING` cannot be woken.
+- A park runs in its own task; a cancelled caller never cancels the suspend. `aclose()` waits for
+  every park in flight before it closes the client.
+- A failed park costs density, not correctness: the sandbox stays running and the next command
+  works. A park still mid-transition after 30 s is left to the control plane with a warning, and
+  the next idle period retries.
+- `pause_after_exec` needs an ate-env-api that serves `suspend_mode` (`ate-env server-info`). An
+  older one refuses the local mode; the provider then logs a warning once and parks durably for
+  the rest of its life.
+- A sandbox that declares `SandboxSpec.ports` is skipped by automatic idle parking, because HTTP
+  requests sent through `endpoint()` go straight through the port proxy without the provider's
+  in-flight tracking and would race with an idle suspend. Call `pause()` and `resume()` explicitly
+  between turns when using `endpoint()`.
+
+`status()` reports a parked sandbox as `PAUSED` (nemo-gym 0.7 and later; `RUNNING` before that),
+without waking it. The provider also implements nemo-gym's `SupportsSandboxPauseResume`:
+`pause(handle)` waits for requests in flight to finish, parks the sandbox with the policy's mode
+(`LOCAL` under `never`) and returns once the control plane reports it parked; `resume(handle)`
+sends one guest probe, which ate-env-api answers once the sandbox runs again. A training loop can
+park a sandbox between turns that way without waiting for the idle timer.
+
+When parking pays: the saving is the think time between commands, the cost is one checkpoint and
+one restore per idle period. With as many slots as sandboxes, `never` wins; with more sandboxes
+than slots and think times of seconds or more, parking lets the pool drain. A paused sandbox is
+pinned to its node until its upload lands, so a drain or a pool rollout before then loses it; use
+`suspend_after_exec`, or suspend the fleet durably, before either.
 
 ### Services inside the sandbox: the NeMo runtime layer
 
@@ -362,7 +415,7 @@ python3 -m venv .venv
 .venv/bin/pip install ../../clients/python -e '.[test]'
 
 # Unit/contract tests — hermetic: an in-process fake ate-env-api (tests/fakes.py)
-# behind the real ate_env client; no cluster, no nemo-gym needed (base types fall
+# behind the real ate_env_rl client; no cluster, no nemo-gym needed (base types fall
 # back to structural mirrors in _compat.py; with nemo-gym installed the same
 # tests run against the real types):
 .venv/bin/python -m pytest tests/test_provider.py -q      # or: make nemo-gym-test (repo root)
@@ -422,7 +475,7 @@ exactly what golden-snapshot starts and fork-from-golden creates are for.
   and `substrate provider: exec timed out after …` follows it on stderr), or the guest did not
   answer within `timeout_s` plus a few seconds and the client killed the process.
   `error_type="sandbox"`: the environment is gone (`NOT_FOUND`) or the call could not reach the
-  guest (`ate_env.EnvError`, named on stderr). `upload_file()` and `download_file()` still raise.
+  guest (`ate_env_rl.EnvError`, named on stderr). `upload_file()` and `download_file()` still raise.
 - `status()` reads the environment's lifecycle state from `ate-env-api` without touching the
   guest, so polling it never wakes a parked sandbox. A **suspended or paused actor reports
   `PAUSED`**: it is alive and one call away, since the router resumes it on the next command (a

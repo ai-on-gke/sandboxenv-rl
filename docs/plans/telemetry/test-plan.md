@@ -1,9 +1,9 @@
 # Test plan: telemetry for sandboxenv-rl
 
 Status: describes `main` at `3b03b03` (2026-10-29). Written for the tester role on the series'
-branches; now the regression pass for a change that touches `ate_env.telemetry`,
-`ate_env.observability`, `internal/telemetry`, the otelgrpc wiring, `clients/go/tracing.go` or the
-swebench `Recorder`. Run the sections that match the change and put the results in the pull
+branches; now the regression pass for a change that touches `ate_env_rl.telemetry`,
+`ate_env_rl.observability`, `internal/telemetry`, the otelgrpc wiring, `clients/go/tracing.go` or
+the swebench `Recorder`. Run the sections that match the change and put the results in the pull
 request's Tests section; the repository keeps no result files.
 
 ## 0. Prerequisites
@@ -46,7 +46,7 @@ Scripts (write them under `/tmp/ate-telemetry-tests/`; do not commit them):
 
 ```bash
 /tmp/ate-base/bin/pip list | grep -iE 'opentelemetry|prometheus'          # expect nothing
-/tmp/ate-base/bin/python -c "import ate_env, ate_env.observability, ate_env.telemetry; print('ok')"
+/tmp/ate-base/bin/python -c "import ate_env_rl, ate_env_rl.observability, ate_env_rl.telemetry; print('ok')"
 /tmp/ate-base/bin/python /tmp/ate-telemetry-tests/quickstart_mock.py 2>&1 | tee /tmp/ac2.log
 grep -ciE 'tracing extra|metrics extra|opentelemetry|prometheus' /tmp/ac2.log   # expect one line per layer
 ```
@@ -101,7 +101,7 @@ Timings to record from the same run: `ate_env_fleet.acquire` p50 and max, `ate_e
 /tmp/ate-full/bin/python - <<'PY'
 import prometheus_client
 before = set(prometheus_client.REGISTRY._names_to_collectors)
-import ate_env, ate_env.observability
+import ate_env_rl, ate_env_rl.observability
 after = set(prometheus_client.REGISTRY._names_to_collectors)
 print("registered at import:", sorted(after - before))        # expect []
 PY
@@ -140,6 +140,48 @@ kubectl get ns -o name | sort | diff /tmp/before-namespaces.txt -           # on
 kubectl -n ate-system get deploy -o name | sort | diff /tmp/before-ate-system.txt -
 ```
 
+## 8. Property-based tests and proofs
+
+[properties.md](./properties.md) specifies P-1 to P-20. What exists:
+
+```bash
+# AC-15 (P-9, P-10, P-11), #221: 18 plain tests and the stateful test_warm_pool_accounting.
+# hypothesis comes with the dev extra, so either venv works.
+/tmp/ate-base/bin/python -m pytest clients/python/tests/test_warm_pool_accounting.py -q
+
+# Dafny 4.11, from the pinned nixpkgs. CI's `Dafny models` job runs `make ci-dafny`, which checks
+# these results against verify/README.md (hack/verify/dafny.py).
+make ci-dafny
+
+# Or by hand:
+cd docs/plans/telemetry/verify
+dafny verify telemetry.dfy                # 14 verified, 0 errors
+dafny verify warm_pool.dfy                # 16 verified, 3 errors, all in WarmPoolBefore
+dafny verify warm_pool_generations.dfy    # 24 verified, 3 errors: PlanFirstCovers, ClaimFailPutBackSafe, ClaimOkReturnsLive
+dafny verify warm_pool_drain.dfy          # 49 verified, 5 errors: CommitStaleBeforeSafe, ResizeBeforeSafe, DeleteFailBeforeSafe, DeleteCancelledSafe, ReleaseDeleteFailSafe
+```
+
+The Dafny errors are by design: each failing lemma models code before #221 or one of its review
+rounds, or an open gap ([verify/README.md](./verify/README.md)). CI fails if a result changes and
+the README does not; when a change touches the modelled code, also say in the PR whether the models
+still match it.
+
+Still proposed, not in the repository:
+
+- The other Hypothesis properties (P-1 to P-8, P-12, P-13, P-15 to P-18). Run them with Hypothesis'
+  default profile (100 examples) in CI and a larger `max_examples` locally or nightly. Each shrunk
+  counter-example goes into the PR's Tests section and becomes an `@example` regression.
+- P-14 (`test_first_command_exactly_once`) with concurrent execs on one handle. It is expected to
+  fail on `main` until `SandboxHandle.exec` claims the first-command flag inside the span.
+- The Go properties (P-19, P-20), with
+  `go test ./internal/benchmarking/swebench/... ./clients/go/... -run 'TracingIsTransparent|SpansFollowProvider'`
+  after adding `pgregory.net/rapid` to `go.mod`.
+- A test for the claim/reap gap: a warm claim whose `get()` succeeds after an overlapping reap
+  deleted the actor. No test covers it; the gap is in the code on `main` with #221.
+- Tests for the run-id gaps: a `warm_pool` cancelled while deleting its actors after the run's reap,
+  and a `release` whose delete fails while a reap runs; after each, `reap` of another run must leave
+  nothing alive. Both fail on `main`; they belong with the fix.
+
 ## What to write in the pull request
 
 Date, branch and head, venv contents (`pip freeze | grep -iE 'opentelemetry|prometheus|grpcio'`),
@@ -153,7 +195,7 @@ excerpt, the time it took. A timing table for sections 3 and 7.
 - `traceparent` on unary calls only: a stream interceptor kind is missing; `grpc.aio` dispatches one
   interceptor class per call kind.
 - `Duplicated timeseries` on a second `Observer`: registration is not idempotent per registry;
-  compare with `_metric` in `ate_env.telemetry.metrics`.
+  compare with `_metric` in `ate_env_rl.telemetry.metrics`.
 - `ate-env-api` spans without a parent: the server is not reading incoming metadata
   (`otelgrpc.NewServerHandler` missing) or the client interceptor runs before the span is current.
 - Collector shows client spans only: check `OTEL_EXPORTER_OTLP_INSECURE=true` on the server and the

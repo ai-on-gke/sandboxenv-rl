@@ -60,8 +60,9 @@ Acquire `OutputChanged()` before reading from disk to avoid missed write notific
 
 Append `ate-target-actor` via interceptors and do not forward incoming caller metadata.
 
-- **Location**: `internal/apiservice/server.go` (`guestConn`), `internal/ate/client.go`
-  (`DialGuest`), `internal/routertls/routertls.go`.
+- **Location**: `internal/apiservice/server.go` (`guestConn`, `routerCredentials`),
+  `internal/ate/client.go` (`DialGuest`), `internal/routertls/routertls.go`
+  (`TransportCredentials`).
 - **Why**: When dialing an actor through `atenet`, the router requires the destination actor
   identifier in wire metadata (`ate-target-actor: <atespace>/<id>`). Forwarding incoming client gRPC
   metadata caused duplicate header entries, which `atenet-router` rejects with an invalid actor
@@ -70,7 +71,11 @@ Append `ate-target-actor` via interceptors and do not forward incoming caller me
   `ate-target-actor` to outgoing context metadata without forwarding caller metadata headers.
 - **mTLS**: `internal/routertls` loads the kubelet-projected pod identity certificate bundle
   (`-atenet-client-cert`) and servicedns trust bundle (`-atenet-ca-file`), reloading certificates on
-  the fly during TLS handshakes when disk files change.
+  the fly during TLS handshakes when disk files change. `guestConn` and `DialGuest` dial with
+  `routertls.TransportCredentials`, which reads a pending post-handshake TLS 1.3 alert when an
+  initial HTTP/2 preface write hits `EPIPE` on a rejected client certificate. `guestConn` then
+  matches `routertls.RejectedCertificate` and fails fast without entering `ensureAwake` retries, and
+  `DialGuest` callers receive the TLS alert error.
 
 ### 5. Actor wake budgets and direct actor deletion
 
@@ -80,7 +85,7 @@ Always verify actor readiness within wake budgets, and evict pooled guest connec
   (`Delete`, `evictGuest`).
 - **Wake budgets**: Sending traffic to a suspended actor causes `atenet` to trigger restoration.
   `ensureAwake` polls `GetProcess("ate-env-wake-probe")` across two budgets:
-  - `DefaultWakeBudget` (2 minutes): bounds the entire wait from the start of the probe sequence.
+  - `DefaultWakeBudget` (5 minutes): bounds the entire wait from the start of the probe sequence.
   - `DefaultWakeRunningBudget` (20 seconds): bounds wait time starting from the first poll attempt
     that observes the actor in `RUNNING` state (giving the guest daemon time to initialize).
 - **Delete sequence**: Substrate `DeleteActor` takes an actor in any state (including `CRASHED` or
@@ -116,7 +121,7 @@ Serialize derived template creation and recovery with `imageTemplateLocks`, and 
 
 Dispatch synchronous Python calls to a persistent `LoopRunner` background thread.
 
-- **Location**: `clients/python/src/ate_env/loop_runner.py`, `cmd/ate-env-api/main.go`.
+- **Location**: `clients/python/src/ate_env_rl/loop_runner.py`, `cmd/ate-env-api/main.go`.
 - **Why**: Calling async gRPC methods from synchronous Python code (such as PyTorch training loops)
   by invoking `asyncio.run()` creates a temporary event loop that destroys open gRPC channels upon
   exit, corrupting HTTP/2 channel state.
@@ -130,9 +135,37 @@ Dispatch synchronous Python calls to a persistent `LoopRunner` background thread
 
 Record release errors in `RunReport` and retry unreleased actors during `fleet.teardown()`.
 
-- **Location**: `clients/python/src/ate_env/backend/substrate.py`.
+- **Location**: `clients/python/src/ate_env_rl/backend/substrate.py`.
 - **Why**: When releasing a sandbox in RL loops, network interruptions during `delete` must not
   crash training workers, but must not leak orphan actors in Substrate.
 - **Mechanism**: `SubstrateBackendDriver` records failed deletions in `RunReport.release_errors` and
   retains the actor in `_owned_actors`. When `fleet.teardown()` runs, it retries deletion for all
   unreleased actors and raises `InfrastructureError` if any environment cannot be reclaimed.
+
+### 9. Python warm-pool bookkeeping across awaits
+
+Re-check for a teardown after each await that ends in pooling an actor, and reserve warm-pool slots
+before creating actors.
+
+- **Location**: `clients/python/src/ate_env_rl/backend/substrate.py` (`_release_internal`,
+  `_warm_pool_internal`, the warm-claim put-back in `_acquire_internal`, `_reap_internal`).
+- **Why**: A recycle pops the actor from `_owned_actors` and awaits `suspend()`; `reap` cannot see
+  it during that await. Pooling it afterwards leaves a live environment that outlives the teardown,
+  with the warm-replica gauge already reset. Two overlapping `warm_pool` calls that each read the
+  pool before creating provision the shortfall twice.
+- **Mechanism**: `reap` increments `_teardowns` when it starts and when it ends, and `_reaping`
+  counts the reaps in progress. A recycle, `warm_pool` or failed warm claim reads `_teardowns`
+  before its await, and pools its actor only if the value is unchanged and no reap is running
+  (`_may_pool`); otherwise it deletes the actor. The actor stays in `_owned_actors` until that
+  delete succeeds, so a failed or cancelled delete leaves it for the next `reap`; a failed one also
+  re-tags it with `WARM_POOL_RUN_ID`, because the run's own `reap` has already run and a later run's
+  `reap` matches only its own `run_id`, the pool and `WARM_POOL_RUN_ID`. `unwarm_pool` and
+  `resize_pool` delete the actors they drain the same way. `_warm_inflight` counts the actors
+  `warm_pool` calls are still creating, per pool key, `_teardowns` value and pool generation
+  (`_pool_gens`), so a `reap` drops them. `unwarm_pool`, and a `resize_pool` below the pooled plus
+  in-flight count, bump the pool's generation: a `warm_pool` call that started before deletes what
+  it created instead of pooling it, and later calls do not count it. `warm_pool` subtracts the
+  in-flight actors from the shortfall, so an overlapping call can return before the pool is full.
+  `reap` moves the warm-replica gauge with the pool it clears, so a direct `reap` (outside a fleet)
+  keeps the two equal. `tests/test_warm_pool_accounting.py` checks these interleavings, including
+  work that runs while a `reap` waits on its deletes, with a Hypothesis state machine.

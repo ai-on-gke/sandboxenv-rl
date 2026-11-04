@@ -9,7 +9,7 @@ Used by `examples/Qwen3.5-35B-A3B-verl`.
 ## Install
 
 ```bash
-pip install ./clients/python             # ate_env client
+pip install ./clients/python             # ate_env_rl client
 # uni-agent is not on PyPI: install the pinned commit without its dependency list (it declares none that
 # matter here beyond the five below), then this package
 git clone --filter=blob:none https://github.com/verl-project/uni-agent.git && git -C uni-agent checkout 174b040

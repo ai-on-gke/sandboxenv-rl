@@ -20,11 +20,11 @@ from __future__ import annotations
 
 import pytest
 
-from ate_env import AsyncSandboxFleet, FleetConfig, SandboxFleet
-from ate_env._gen.ateenv.v1alpha import env_pb2
-from ate_env.backend.mock import MockBackendDriver
-from ate_env.backend.substrate import SubstrateBackendDriver
-from ate_env.observability import Observer
+from ate_env_rl import AsyncSandboxFleet, FleetConfig, SandboxFleet
+from ate_env_rl._gen.ateenv.v1alpha import env_pb2
+from ate_env_rl.backend.mock import MockBackendDriver
+from ate_env_rl.backend.substrate import SubstrateBackendDriver
+from ate_env_rl.observability import Observer
 
 IMG = "example.com/task@sha256:" + "b" * 64
 

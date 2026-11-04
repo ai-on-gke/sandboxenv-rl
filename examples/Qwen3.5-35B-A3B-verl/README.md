@@ -6,15 +6,16 @@ decide the reward. GRPO, full-weight Megatron training, verl v1 `separate_async`
 trainer on one 8-GPU node, vLLM rollout engines on a second 8-GPU node, both the
 agent's tool calls and the post-hoc grading in Substrate through `ate-env-api`.
 
-Pins: uni-agent `174b040` (its verl submodule `3efe38c7`), image
-`verlai/verl:vllm024.dev2`, client `ai-on-gke/sandboxenv-rl@2eccd896`, `swebench==4.1.0`, model
-revision `59d61f3c`. Validated against Agent Substrate `ddb46651` with the plaintext router. This repo's
-main now pins Substrate `v0.6.0` with router mTLS; moving the recipe to that pair is a separate change.
-Provider, task, dataset and image tooling: [`integrations/uni-agent`](../../integrations/uni-agent).
+Pins: uni-agent `174b040` (its verl submodule `3efe38c7`), image `verlai/verl:vllm024.dev2`, client
+`clients/python` (`ate-env-rl`, bundled from this checkout by `deploy.sh`), `swebench==4.1.0`, model
+revision `59d61f3c`. Validated against Agent Substrate `ddb46651` (plaintext router) and
+`ate-env-api` at `2eccd896`. This repo's main now pins Substrate `v0.6.0` with router mTLS; moving
+the recipe to that pair is a separate change. Provider, task, dataset and image tooling:
+[`integrations/uni-agent`](../../integrations/uni-agent).
 
 ## Prerequisites
 
-- Agent Substrate `ddb46651` and `ate-env-api` built from client commit `2eccd896`, installed in
+- Agent Substrate `ddb46651` and `ate-env-api` built from commit `2eccd896`, installed in
   namespace `ate-env` (Quickstart); `kubectl-ate` and `ate-env` binaries from the same commits. If
   `ate-env-api` requires a caller token, export `SUBSTRATE_ENV_AUTH_TOKEN` before `deploy.sh up`.
 - Two GKE GPU nodes with 8 GPUs each (validated on a3-ultragpu-8g / H200, no RDMA).
@@ -120,8 +121,10 @@ after the last step whatever the length.
   the slice is the first `TRAIN_INSTANCES` by instance id. SWE-bench Verified is
   validation only, minus the 55 instances that need network access.
 - Environments have no egress: agents cannot `pip install`, and the shell handle
-  persists `cd`/exports without tmux. Thinking stays on (model default); unfinished
-  episodes (step or token limits) are masked.
+  persists `cd`/exports without tmux. Thinking stays on (model default). Unfinished
+  episodes (step or token limits) keep their tokens (`mask_unfinished_episode=False`): most
+  episodes in the early steps are unfinished (105 of 126 in step 1 of validation), and a
+  step with every episode masked leaves verl no trainable token and crashes it.
 - Only the WorkerPool is configured (node selector, capacity, replicas); the pool's
   `ate.dev/sandboxClass` taint is the one Substrate handles itself. Re-apply the patch
   after a Substrate reinstall.

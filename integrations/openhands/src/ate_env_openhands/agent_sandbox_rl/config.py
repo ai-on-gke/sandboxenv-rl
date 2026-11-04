@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""agent-sandbox-rl's configuration models, mapped onto ``ate_env.FleetConfig``.
+"""agent-sandbox-rl's configuration models, mapped onto ``ate_env_rl.FleetConfig``.
 
 The field names, defaults and validators are agent-sandbox-rl's
 (kubernetes-sigs/agent-sandbox ``examples/agent-sandbox-rl``,
 ``agent_sandbox_rl/config.py`` at 7d956bce), so code written against it
 constructs the same objects unchanged, and a configuration it refuses is
-refused here too. ``FleetConfig.to_ate_env()`` gives the ``ate_env``
+refused here too. ``FleetConfig.to_ate_env()`` gives the ``ate_env_rl``
 configuration the fleet actually runs with.
 
 What maps, and what does not:
@@ -62,10 +62,10 @@ import re
 from collections.abc import Callable
 from typing import Any
 
-from ate_env import DEFAULT_ATESPACE
-from ate_env import FleetConfig as AteFleetConfig
-from ate_env import ObservabilityConfig as AteObservabilityConfig
-from ate_env.config import SecretStr as AteSecretStr
+from ate_env_rl import DEFAULT_ATESPACE
+from ate_env_rl import FleetConfig as AteFleetConfig
+from ate_env_rl import ObservabilityConfig as AteObservabilityConfig
+from ate_env_rl.config import SecretStr as AteSecretStr
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -369,7 +369,7 @@ class FleetConfig(BaseModel):
         return out
 
     def to_ate_env(self) -> AteFleetConfig:
-        """The ``ate_env.FleetConfig`` this configuration means on ate-env."""
+        """The ``ate_env_rl.FleetConfig`` this configuration means on ate-env."""
         cluster = self.cluster()
         token = cluster.ate_auth_token()
         observability: dict[str, Any] = {

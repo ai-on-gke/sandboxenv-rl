@@ -20,12 +20,20 @@ template helper scripts, unit fakes, and live `tests/test_e2e.py` targets. See
 
 ## Tests in CI
 
-The `Python client and integration tests` job runs the `nemo-gym` and `uni-agent` tests
-(`uni-agent` is installed at a pinned commit without its `verl` submodule). The
-`OpenHands integration` and `Harbor integration` jobs run in dedicated `devShell`
-environments because `openhands-sdk` and `harbor` pull large dependency sets (and Harbor's
-trial test starts containers through Docker). See
-[`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml).
+Three jobs of [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) run the integration
+tests, each in a Nix `devShell` whose Python environment [`nix/python.nix`](../nix/python.nix)
+builds from `uv.lock`:
+
+- `Python client and integration tests` runs `ci-python` ([`nix/ci.nix`](../nix/ci.nix)): `ruff`
+  and `pytest` for `nemo-gym`, and for `uni-agent` on Python 3.12 in the `python-env-uni-agent`
+  environment, with `uni-agent` itself from git at the commit
+  [`uni-agent/pyproject.toml`](./uni-agent/pyproject.toml) pins.
+- `OpenHands integration` runs `pytest` and `ruff` for `openhands` in the `.#openhands` shell.
+- `Harbor integration` runs `pytest` and `ruff` for `harbor` in the `.#harbor` shell; its trial
+  test starts containers through Docker.
+
+`openhands-sdk` and `harbor` pull large dependency sets, which is why the last two are jobs of
+their own.
 
 ## Used by
 

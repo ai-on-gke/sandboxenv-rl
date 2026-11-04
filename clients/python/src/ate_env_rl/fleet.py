@@ -48,7 +48,7 @@ from .types import (
     Task,
 )
 
-logger = logging.getLogger("ate_env.fleet")
+logger = logging.getLogger("ate_env_rl.fleet")
 
 
 def _dict_task_id(item: dict[str, Any], index: int) -> str:
@@ -333,7 +333,7 @@ class SandboxFleet:
     def _size_pools(
         self, counts: dict[str, int], images: Sequence[str] | None = None
     ) -> dict[str, int]:
-        """Warm replicas per image: its share of max_concurrent (see ate_env.sizing).
+        """Warm replicas per image: its share of max_concurrent (see ate_env_rl.sizing).
 
         ``images`` limits the share to those images (a strategy's window). An
         image with no loaded task has nothing to size by and gets

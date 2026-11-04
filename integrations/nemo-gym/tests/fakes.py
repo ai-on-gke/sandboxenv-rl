@@ -27,8 +27,8 @@ from dataclasses import dataclass, field
 
 import grpc
 import grpc.aio
-from ate_env import EnvironmentStatus, ProcessState
-from ate_env._gen.ateenv.v1alpha import env_pb2, env_pb2_grpc, guest_pb2, guest_pb2_grpc
+from ate_env_rl import EnvironmentStatus, ProcessState
+from ate_env_rl._gen.ateenv.v1alpha import env_pb2, env_pb2_grpc, guest_pb2, guest_pb2_grpc
 
 DEFAULT_ATESPACE = "ate-env"
 DEFAULT_TEMPLATE = "default-template"

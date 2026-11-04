@@ -51,7 +51,7 @@ from ..telemetry.tracing import (
 from ..types import DataPlaneEndpoint, EnvironmentSpec, RawSandboxInstance
 from .base import BackendDriver
 
-logger = logging.getLogger("ate_env.backend.substrate")
+logger = logging.getLogger("ate_env_rl.backend.substrate")
 
 
 class _WarmPoolDict(dict):
@@ -88,7 +88,7 @@ class SubstrateBackendDriver(BackendDriver):
     """Agent Substrate Backend Driver.
 
     Manages environment lifecycle directly against the ate-env-api gRPC service
-    via ate_env.Client: creating environments, suspending for pre-warmed pools,
+    via ate_env_rl.Client: creating environments, suspending for pre-warmed pools,
     and deleting on release.
 
     tracer_config enables ``ate_env_client.ensure_template`` / ``.warm_pool`` /

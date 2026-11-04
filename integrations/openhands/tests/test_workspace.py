@@ -26,7 +26,7 @@ from types import SimpleNamespace
 import grpc
 import httpx
 import pytest
-from ate_env import EnvError, EnvironmentStatus, NotFoundError
+from ate_env_rl import EnvError, EnvironmentStatus, NotFoundError
 from openhands.sdk.workspace import RemoteWorkspace
 
 from ate_env_openhands import AteEnvWorkspace, port_capability, port_url

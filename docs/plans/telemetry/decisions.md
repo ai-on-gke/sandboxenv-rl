@@ -245,3 +245,8 @@ Append-only. Each entry: date, who, what, why.
   them delete what they create. The plain tests grew to 18 and the stateful machine gained
   `start_teardown` / `finish_teardown` and `unwarm`. The Dafny models cover none of E, F or G
   ([verify/README.md](./verify/README.md)).
+- 2026-11-03, orchestrator: `clients/python` renamed its distribution package from `ate-env-client`
+  to `ate-env-rl` and its import module from `ate_env` to `ate_env_rl`. Span prefixes
+  (`ate_env_client.*`, `ate_env_fleet.*`), attribute keys (`ate_env.*`), default OTel resource
+  `service.name` (`ate-env-client`), and Prometheus metric families (`ate_env_*`) stay unchanged so
+  dashboards, collectors, and cross-language Go/Python queries do not break.

@@ -49,7 +49,7 @@ import uuid
 
 import pytest
 
-from ate_env import (
+from ate_env_rl import (
     Client,
     EnvError,
     EnvironmentStatus,

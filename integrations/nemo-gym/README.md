@@ -2,7 +2,7 @@
 
 Runs [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) rollout sandboxes as **Substrate actors**,
 fronted by the `ate-env` API of this repo and reached through its Python client,
-[`ate_env`](../../clients/python).
+[`ate_env_rl`](../../clients/python).
 Registers as provider `substrate` next to the built-ins (Docker, Daytona, ECS Fargate, Enroot,
 OpenShell, OpenSandbox, Apptainer) via the `nemo_gym.sandbox_providers` entry point — **no changes
 to NeMo Gym required**, and no changes to your resource servers beyond the `sandbox:` config block.
@@ -26,7 +26,7 @@ Verified against **nemo-gym 0.5.0**: the registry resolves this provider through
 One gRPC endpoint, `ate-env-api`, carries everything (see the
 [client README](../../clients/python/README.md#how-it-works)):
 
-| Provider call | `ate_env` call | Where it lands |
+| Provider call | `ate_env_rl` call | Where it lands |
 |---|---|---|
 | `create(spec)` | `Client.create(id, template_name=…, template_atespace=…, rootfs_image=…)`, then `Env.shell("true")` until it answers, then `Env.write_file` for `spec.files` | `EnvironmentService` → Substrate control plane; the probe and the files go to the guest |
 | `exec(handle, cmd, cwd=, env=, timeout_s=)` | `Env.start_process(["sh","-c",cmd], cwd, env, timeout=)` + `Process.output(follow=True)` | `ProcessService` in `ate-env-guest`, proxied through the atenet router |
@@ -88,7 +88,7 @@ On the cluster:
 
 Locally:
 
-5. **Python ≥ 3.10** and the `ate-env-client` package from this repo's `clients/python` (not on
+5. **Python ≥ 3.10** and the `ate-env-rl` package from this repo's `clients/python` (not on
    PyPI yet). `nemo-gym` itself is only needed on the machine running the Gym resource servers —
    this package's tests run without it (see Testing).
 
@@ -124,7 +124,7 @@ enforces the deadline itself.
 
 ```bash
 # from a checkout of this repo:
-pip install ./clients/python                       # ate-env-client (import name ate_env)
+pip install ./clients/python                       # ate-env-rl (import name ate_env_rl)
 pip install ./integrations/nemo-gym                # nemo-gym-substrate
 # with NeMo Gym in the same environment:
 pip install './integrations/nemo-gym[gym]'
@@ -202,7 +202,7 @@ async def main():
 asyncio.run(main())
 ```
 
-To share one `ate_env.Client` between the provider and other code, pass it in:
+To share one `ate_env_rl.Client` between the provider and other code, pass it in:
 `SubstrateSandboxProvider(config, client=client)`. The provider then never closes it.
 
 ### Per-sandbox `provider_options` (on `SandboxSpec`)
@@ -362,7 +362,7 @@ python3 -m venv .venv
 .venv/bin/pip install ../../clients/python -e '.[test]'
 
 # Unit/contract tests — hermetic: an in-process fake ate-env-api (tests/fakes.py)
-# behind the real ate_env client; no cluster, no nemo-gym needed (base types fall
+# behind the real ate_env_rl client; no cluster, no nemo-gym needed (base types fall
 # back to structural mirrors in _compat.py; with nemo-gym installed the same
 # tests run against the real types):
 .venv/bin/python -m pytest tests/test_provider.py -q      # or: make nemo-gym-test (repo root)
@@ -422,7 +422,7 @@ exactly what golden-snapshot starts and fork-from-golden creates are for.
   and `substrate provider: exec timed out after …` follows it on stderr), or the guest did not
   answer within `timeout_s` plus a few seconds and the client killed the process.
   `error_type="sandbox"`: the environment is gone (`NOT_FOUND`) or the call could not reach the
-  guest (`ate_env.EnvError`, named on stderr). `upload_file()` and `download_file()` still raise.
+  guest (`ate_env_rl.EnvError`, named on stderr). `upload_file()` and `download_file()` still raise.
 - `status()` reads the environment's lifecycle state from `ate-env-api` without touching the
   guest, so polling it never wakes a parked sandbox. A **suspended or paused actor reports
   `PAUSED`**: it is alive and one call away, since the router resumes it on the next command (a

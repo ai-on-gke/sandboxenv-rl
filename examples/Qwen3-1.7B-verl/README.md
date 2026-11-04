@@ -5,9 +5,9 @@ Agent Substrate environment through `ate-env-api`, and the final answer is
 rewarded. GRPO, full-weight FSDP, verl `fully_async_policy`: trainer on one
 8-GPU node, vLLM rollout engines on a second 8-GPU node.
 
-Pins: verl `60546ef2`, image `verlai/verl:vllm020.dev2`, client
-`ai-on-gke/sandboxenv-rl@eedeb63` (`clients/python`, this repository's main), model and dataset
-revisions in `run_fully_async.sh`, `TransferQueue==0.1.11`, `cupy-cuda12x==13.6.0` (the image's `datasets` 4.8.5 is used as is).
+Pins: verl `60546ef2`, image `verlai/verl:vllm020.dev2`, client `clients/python` (`ate-env-rl`,
+bundled from this checkout by `deploy.sh`; validated at `eedeb63`), model and dataset revisions in
+`run_fully_async.sh`, `TransferQueue==0.1.11`, `cupy-cuda12x==13.6.0` (the image's `datasets` 4.8.5 is used as is).
 
 ## Prerequisites
 
@@ -80,7 +80,7 @@ instances and GRPO needs mixed outcomes per group. The sandbox is therefore
 used only during the rollout; the reward is verl's rule-based MATH scorer, not
 hidden tests run in a fresh environment. For both halves, switch to MBPP+ or
 difficulty-filtered KodCode and add a verl `custom_reward_function` that runs
-hidden tests through the `ate_env` client; nothing else changes.
+hidden tests through the `ate_env_rl` client; nothing else changes.
 
 ## Notes
 

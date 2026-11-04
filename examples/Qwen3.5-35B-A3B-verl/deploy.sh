@@ -67,10 +67,12 @@ check_substrate() {
 up_job() {  # ConfigMap: run script, task config, image map, and the code the pods install
   local tmp; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
   tar -C "$REPO/integrations" -czf "$tmp/uni-agent-substrate.tgz" uni-agent
+  tar --exclude='__pycache__' --exclude='*.pyc' -C "$REPO/clients/python" -czf "$tmp/ate-env-rl.tgz" pyproject.toml README.md src
   $K -n default create configmap "$JOB" \
       --from-file=run_fully_async.sh="$HERE/run_fully_async.sh" --from-file=task_config.yaml="$HERE/task_config.yaml" \
       --from-file=images.json="$IMAGES_JSON" \
       --from-file=uni-agent-substrate.tgz="$tmp/uni-agent-substrate.tgz" \
+      --from-file=ate-env-rl.tgz="$tmp/ate-env-rl.tgz" \
       --from-file=offline-exclusions.txt="$REPO/benchmarking/swebench/offline-exclusions.txt" \
       --dry-run=client -o yaml | $K -n default apply -f -
   # secrets fed through stdin (not visible in ps), named after the Job so `down` can remove them

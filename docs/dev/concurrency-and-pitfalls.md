@@ -116,7 +116,7 @@ Serialize derived template creation and recovery with `imageTemplateLocks`, and 
 
 Dispatch synchronous Python calls to a persistent `LoopRunner` background thread.
 
-- **Location**: `clients/python/src/ate_env/loop_runner.py`, `cmd/ate-env-api/main.go`.
+- **Location**: `clients/python/src/ate_env_rl/loop_runner.py`, `cmd/ate-env-api/main.go`.
 - **Why**: Calling async gRPC methods from synchronous Python code (such as PyTorch training loops)
   by invoking `asyncio.run()` creates a temporary event loop that destroys open gRPC channels upon
   exit, corrupting HTTP/2 channel state.
@@ -130,7 +130,7 @@ Dispatch synchronous Python calls to a persistent `LoopRunner` background thread
 
 Record release errors in `RunReport` and retry unreleased actors during `fleet.teardown()`.
 
-- **Location**: `clients/python/src/ate_env/backend/substrate.py`.
+- **Location**: `clients/python/src/ate_env_rl/backend/substrate.py`.
 - **Why**: When releasing a sandbox in RL loops, network interruptions during `delete` must not
   crash training workers, but must not leak orphan actors in Substrate.
 - **Mechanism**: `SubstrateBackendDriver` records failed deletions in `RunReport.release_errors` and
@@ -142,7 +142,7 @@ Record release errors in `RunReport` and retry unreleased actors during `fleet.t
 Re-check for a teardown after each await that ends in pooling an actor, and reserve warm-pool slots
 before creating actors.
 
-- **Location**: `clients/python/src/ate_env/backend/substrate.py` (`_release_internal`,
+- **Location**: `clients/python/src/ate_env_rl/backend/substrate.py` (`_release_internal`,
   `_warm_pool_internal`, the warm-claim put-back in `_acquire_internal`, `_reap_internal`).
 - **Why**: A recycle pops the actor from `_owned_actors` and awaits `suspend()`; `reap` cannot see
   it during that await. Pooling it afterwards leaves a live environment that outlives the teardown,

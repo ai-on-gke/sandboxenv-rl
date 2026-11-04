@@ -16,7 +16,7 @@ harbor run -p /path/to/task -a oracle -e ate_env_harbor:AteEnvEnvironment
 ```
 
 Harbor loads the class from the import path, so no change to Harbor is needed.
-Python 3.12 or newer (Harbor's floor); `ate-env-client` from this checkout.
+Python 3.12 or newer (Harbor's floor); `ate-env-rl` from this checkout.
 
 ## Settings
 

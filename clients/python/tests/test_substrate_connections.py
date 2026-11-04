@@ -20,10 +20,10 @@ import grpc
 import grpc.aio
 import pytest
 
-from ate_env import AsyncSandboxFleet, FleetConfig, Task
-from ate_env._gen.ateenv.v1alpha import env_pb2_grpc
-from ate_env.backend.substrate import SubstrateBackendDriver
-from ate_env.config import ValidationError
+from ate_env_rl import AsyncSandboxFleet, FleetConfig, Task
+from ate_env_rl._gen.ateenv.v1alpha import env_pb2_grpc
+from ate_env_rl.backend.substrate import SubstrateBackendDriver
+from ate_env_rl.config import ValidationError
 
 from .fakes import FakeEnvironmentService
 
@@ -227,7 +227,7 @@ async def test_close_async_closes_every_client_when_one_fails():
 
 
 def test_close_closes_pooled_clients_concurrently():
-    from ate_env.loop_runner import LoopRunner
+    from ate_env_rl.loop_runner import LoopRunner
 
     driver, clients, tracker = _driver_with_clients(4)
     driver._loop_runner = LoopRunner(name="test-close")

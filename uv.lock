@@ -18,9 +18,9 @@ resolution-markers = [
 
 [manifest]
 members = [
-    "ate-env-client",
     "ate-env-harbor",
     "ate-env-openhands",
+    "ate-env-rl",
     "nemo-gym-substrate",
     "uni-agent-substrate",
 ]
@@ -326,7 +326,65 @@ wheels = [
 ]
 
 [[package]]
-name = "ate-env-client"
+name = "ate-env-harbor"
+version = "0.1.0"
+source = { editable = "integrations/harbor" }
+dependencies = [
+    { name = "ate-env-rl" },
+    { name = "dockerfile-parse" },
+    { name = "harbor" },
+]
+
+[package.optional-dependencies]
+test = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "ate-env-rl", editable = "clients/python" },
+    { name = "dockerfile-parse", specifier = ">=2.0.1" },
+    { name = "harbor", specifier = ">=0.25,<0.26" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },
+    { name = "pytest-asyncio", marker = "extra == 'test'", specifier = ">=1.0" },
+]
+provides-extras = ["test"]
+
+[[package]]
+name = "ate-env-openhands"
+version = "0.1.0"
+source = { editable = "integrations/openhands" }
+dependencies = [
+    { name = "ate-env-rl" },
+    { name = "httpx" },
+    { name = "openhands-sdk" },
+]
+
+[package.optional-dependencies]
+examples = [
+    { name = "openhands-tools" },
+]
+test = [
+    { name = "openhands-agent-server" },
+    { name = "openhands-tools" },
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "ate-env-rl", editable = "clients/python" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "openhands-agent-server", marker = "extra == 'test'", specifier = "==1.55.0" },
+    { name = "openhands-sdk", specifier = "==1.55.0" },
+    { name = "openhands-tools", marker = "extra == 'examples'", specifier = "==1.55.0" },
+    { name = "openhands-tools", marker = "extra == 'test'", specifier = "==1.55.0" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },
+]
+provides-extras = ["examples", "test"]
+
+[[package]]
+name = "ate-env-rl"
 source = { editable = "clients/python" }
 dependencies = [
     { name = "grpcio" },
@@ -367,64 +425,6 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = "~=0.17.2" },
 ]
 provides-extras = ["dev", "tracing", "metrics"]
-
-[[package]]
-name = "ate-env-harbor"
-version = "0.1.0"
-source = { editable = "integrations/harbor" }
-dependencies = [
-    { name = "ate-env-client" },
-    { name = "dockerfile-parse" },
-    { name = "harbor" },
-]
-
-[package.optional-dependencies]
-test = [
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "ate-env-client", editable = "clients/python" },
-    { name = "dockerfile-parse", specifier = ">=2.0.1" },
-    { name = "harbor", specifier = ">=0.25,<0.26" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },
-    { name = "pytest-asyncio", marker = "extra == 'test'", specifier = ">=1.0" },
-]
-provides-extras = ["test"]
-
-[[package]]
-name = "ate-env-openhands"
-version = "0.1.0"
-source = { editable = "integrations/openhands" }
-dependencies = [
-    { name = "ate-env-client" },
-    { name = "httpx" },
-    { name = "openhands-sdk" },
-]
-
-[package.optional-dependencies]
-examples = [
-    { name = "openhands-tools" },
-]
-test = [
-    { name = "openhands-agent-server" },
-    { name = "openhands-tools" },
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "ate-env-client", editable = "clients/python" },
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "openhands-agent-server", marker = "extra == 'test'", specifier = "==1.55.0" },
-    { name = "openhands-sdk", specifier = "==1.55.0" },
-    { name = "openhands-tools", marker = "extra == 'examples'", specifier = "==1.55.0" },
-    { name = "openhands-tools", marker = "extra == 'test'", specifier = "==1.55.0" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },
-]
-provides-extras = ["examples", "test"]
 
 [[package]]
 name = "attrs"
@@ -3974,7 +3974,7 @@ name = "nemo-gym-substrate"
 version = "0.2.0"
 source = { editable = "integrations/nemo-gym" }
 dependencies = [
-    { name = "ate-env-client" },
+    { name = "ate-env-rl" },
     { name = "grpcio" },
 ]
 
@@ -3988,7 +3988,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ate-env-client", editable = "clients/python" },
+    { name = "ate-env-rl", editable = "clients/python" },
     { name = "grpcio", specifier = ">=1.84" },
     { name = "nemo-gym", marker = "python_full_version >= '3.13.14' and extra == 'gym'" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },
@@ -9410,7 +9410,7 @@ name = "uni-agent-substrate"
 version = "0.1.0"
 source = { editable = "integrations/uni-agent" }
 dependencies = [
-    { name = "ate-env-client" },
+    { name = "ate-env-rl" },
     { name = "pydantic" },
 ]
 
@@ -9438,7 +9438,7 @@ uni-agent = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ate-env-client", editable = "clients/python" },
+    { name = "ate-env-rl", editable = "clients/python" },
     { name = "datasets", marker = "extra == 'datasets'" },
     { name = "grpcio", marker = "extra == 'test'", specifier = ">=1.84" },
     { name = "huggingface-hub", marker = "extra == 'datasets'" },

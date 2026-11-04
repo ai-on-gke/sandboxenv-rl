@@ -1,9 +1,9 @@
 # Test plan: telemetry for sandboxenv-rl
 
 Status: describes `main` at `3b03b03` (2026-10-29). Written for the tester role on the series'
-branches; now the regression pass for a change that touches `ate_env.telemetry`,
-`ate_env.observability`, `internal/telemetry`, the otelgrpc wiring, `clients/go/tracing.go` or the
-swebench `Recorder`. Run the sections that match the change and put the results in the pull
+branches; now the regression pass for a change that touches `ate_env_rl.telemetry`,
+`ate_env_rl.observability`, `internal/telemetry`, the otelgrpc wiring, `clients/go/tracing.go` or
+the swebench `Recorder`. Run the sections that match the change and put the results in the pull
 request's Tests section; the repository keeps no result files.
 
 ## 0. Prerequisites
@@ -46,7 +46,7 @@ Scripts (write them under `/tmp/ate-telemetry-tests/`; do not commit them):
 
 ```bash
 /tmp/ate-base/bin/pip list | grep -iE 'opentelemetry|prometheus'          # expect nothing
-/tmp/ate-base/bin/python -c "import ate_env, ate_env.observability, ate_env.telemetry; print('ok')"
+/tmp/ate-base/bin/python -c "import ate_env_rl, ate_env_rl.observability, ate_env_rl.telemetry; print('ok')"
 /tmp/ate-base/bin/python /tmp/ate-telemetry-tests/quickstart_mock.py 2>&1 | tee /tmp/ac2.log
 grep -ciE 'tracing extra|metrics extra|opentelemetry|prometheus' /tmp/ac2.log   # expect one line per layer
 ```
@@ -101,7 +101,7 @@ Timings to record from the same run: `ate_env_fleet.acquire` p50 and max, `ate_e
 /tmp/ate-full/bin/python - <<'PY'
 import prometheus_client
 before = set(prometheus_client.REGISTRY._names_to_collectors)
-import ate_env, ate_env.observability
+import ate_env_rl, ate_env_rl.observability
 after = set(prometheus_client.REGISTRY._names_to_collectors)
 print("registered at import:", sorted(after - before))        # expect []
 PY
@@ -186,7 +186,7 @@ excerpt, the time it took. A timing table for sections 3 and 7.
 - `traceparent` on unary calls only: a stream interceptor kind is missing; `grpc.aio` dispatches one
   interceptor class per call kind.
 - `Duplicated timeseries` on a second `Observer`: registration is not idempotent per registry;
-  compare with `_metric` in `ate_env.telemetry.metrics`.
+  compare with `_metric` in `ate_env_rl.telemetry.metrics`.
 - `ate-env-api` spans without a parent: the server is not reading incoming metadata
   (`otelgrpc.NewServerHandler` missing) or the client interceptor runs before the span is current.
 - Collector shows client spans only: check `OTEL_EXPORTER_OTLP_INSECURE=true` on the server and the

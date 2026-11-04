@@ -84,7 +84,7 @@ def _init_fields(obj: Any, kwargs: dict[str, Any]) -> None:
 
 @dataclass(frozen=True)
 class TracerConfig:
-    """OpenTelemetry tracing for the ate_env client (needs the ``tracing`` extra).
+    """OpenTelemetry tracing for the ate_env_rl client (needs the ``tracing`` extra).
 
     trace_service_name is the OTel resource ``service.name`` of the process's
     TracerProvider; client spans are always named ``ate_env_client.<op>``.
@@ -185,7 +185,7 @@ class FleetConfig:
     max_warmpool_replicas: int = 4
     window_size: int | None = None
     # Warm-pool depth. False sizes each image's pool to its share of
-    # max_concurrent (see ate_env.sizing); True gives every task its own warm
+    # max_concurrent (see ate_env_rl.sizing); True gives every task its own warm
     # replica, up to max_warmpool_replicas, so the G rollouts of a problem
     # claim at once.
     warm_per_task: bool = False

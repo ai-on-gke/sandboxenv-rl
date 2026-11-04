@@ -42,13 +42,13 @@ from ..loop_runner import LoopRunner
 from ..types import ExecResult, ShellResult
 from .base import RuntimeGuestHook
 
-logger = logging.getLogger("ate_env.runtime.substrate_env_client")
+logger = logging.getLogger("ate_env_rl.runtime.substrate_env_client")
 
 
 class SubstrateEnvClientRuntime(RuntimeGuestHook):
-    """Substrate guest hook backed directly by the official ate_env.Env handle.
+    """Substrate guest hook backed directly by the official ate_env_rl.Env handle.
 
-    Leverages ate_env.Client and ate_env.Env for process execution, streaming,
+    Leverages ate_env_rl.Client and ate_env_rl.Env for process execution, streaming,
     and chunked file I/O over gRPC.
     """
 
@@ -182,7 +182,7 @@ class SubstrateEnvClientRuntime(RuntimeGuestHook):
                             elif out.exit is not None:
                                 exit_info = out.exit
                         if exit_info is None:
-                            raise RuntimeError("ate_env: output stream ended before process exited")
+                            raise RuntimeError("ate_env_rl: output stream ended before process exited")
                         return ShellResult(
                             stdout=stdout.decode("utf-8", errors="replace"),
                             stderr=stderr.decode("utf-8", errors="replace"),

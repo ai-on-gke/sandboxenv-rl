@@ -25,7 +25,7 @@ readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
 dependencies = [
-  "ate-env-client",   # clients/python of this repository (pip install ./clients/python)
+  "ate-env-rl",   # clients/python of this repository (pip install ./clients/python)
   "pydantic>=2",
   # uni-agent itself is not on PyPI: install git+https://github.com/verl-project/uni-agent@174b040
   # with --no-deps first (see README); it is deliberately not declared here.
@@ -66,5 +66,5 @@ uni-agent = [
 ]
 
 [tool.uv.sources]
-ate-env-client = { workspace = true }
+ate-env-rl = { workspace = true }
 uni-agent = { git = "https://github.com/verl-project/uni-agent", rev = "174b040e541f70234a22930a3f2ff8d1e2be5399" }

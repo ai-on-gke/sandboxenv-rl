@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 import pytest
-from ate_env import FailedPreconditionError, RpcError
+from ate_env_rl import FailedPreconditionError, RpcError
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.config import ResourceMode
 

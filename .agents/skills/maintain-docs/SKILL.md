@@ -24,7 +24,7 @@ Every fact lives in **one** canonical file; other documents link to it using rel
 | `docs/glossary.md`                     | 1–2 sentences / entry | Precise definitions for API resources, Substrate primitives, components, runtime states, and telemetry terms. Structured with nested lists and explicit disambiguations (what a term is _not_).                                                                                      | Defining a term or resolving ambiguity between related concepts (`Env` vs. `SandboxHandle`, `TTFI` vs. `TTFE`). |
 | `docs/dev/code-layout.md`              |     60–120 lines      | Annotated directory tree, answer-first package placement decision rules, test double locations, and the new RPC checklist.                                                                                                                                                           | Deciding where new code belongs or finding existing test doubles.                                               |
 | `docs/dev/concurrency-and-pitfalls.md` |    ~120–150 lines     | Operational invariants and pitfalls ("what breaks if you change it"): PID 1 subreaper zombie reaping, negative-PID signal delivery, spool cursor ordering, router mTLS and header deduplication, wake/delete ordering, HTTP/2 stream concurrency, and Python `LoopRunner` isolation. | Explaining race conditions, signal traps, or lifecycle ordering constraints.                                    |
-| Generated code `README.md`             |      3–15 lines       | Placed beside generated code directories (`proto/ateenv/v1alpha/README.md`, `clients/python/src/ate_env/_gen/README.md`) with a strict "never hand-edit" rule and regeneration instructions.                                                                                         | Reminding contributors and agents how to regenerate stubs.                                                      |
+| Generated code `README.md`             |      3–15 lines       | Placed beside generated code directories (`proto/ateenv/v1alpha/README.md`, `clients/python/src/ate_env_rl/_gen/README.md`) with a strict "never hand-edit" rule and regeneration instructions.                                                                                      | Reminding contributors and agents how to regenerate stubs.                                                      |
 
 ### Recommended authoring and update order
 
@@ -93,11 +93,11 @@ authoritative code entry points:
   (`runIfPID1`, `supervise`), `cmd/ate-env-guest/sidecar.go` (readiness URL probing on `/readyz`),
   `guest/process/tracker.go` (process groups, PTY allocation, spooling, signal delivery), and
   `guest/filesystem/service.go` (path confinement and read chunk buffers).
-- **Python SDK and concurrency**: Inspect `clients/python/src/ate_env/loop_runner.py`, `handle.py`,
-  `client.py`, `fleet.py`, and `backend/substrate.py`. Check how coroutines are dispatched from
-  synchronous methods and how gRPC channels are managed.
+- **Python SDK and concurrency**: Inspect `clients/python/src/ate_env_rl/loop_runner.py`,
+  `handle.py`, `client.py`, `fleet.py`, and `backend/substrate.py`. Check how coroutines are
+  dispatched from synchronous methods and how gRPC channels are managed.
 - **Test doubles**: Inspect `internal/internaltest/` (`fakecontrol`, `fakerouter`, `testcerts`),
-  `clients/python/src/ate_env/backend/mock.py`, and `clients/python/tests/fakes.py` before
+  `clients/python/src/ate_env_rl/backend/mock.py`, and `clients/python/tests/fakes.py` before
   documenting testing recommendations.
 - **Import boundaries**: Run `go list -f '{{.Imports}}' ./...` to verify package import graphs
   before asserting an architectural boundary.
@@ -139,7 +139,7 @@ repositories that inspired this structure:
 - **`AGENTS.md` (_Repository layout_ table)**:
   - Model for explicit table formatting that marks each path as **generated** or hand-written.
   - Model for highlighting package naming triads (directory name vs. PyPI distribution name vs.
-    import module name, e.g. `clients/python` vs. `ate-env-client` vs. `ate_env`).
+    import module name, e.g. `clients/python` vs. `ate-env-rl` vs. `ate_env_rl`).
 - **`AGENTS.md` (_Agent Skills_ section)**:
   - Model for indexing specialized instructions in `.agents/skills/` and importing from `CLAUDE.md`.
 - **`AGENTS.md` (_Coding conventions_ & _Writing_ section)**:

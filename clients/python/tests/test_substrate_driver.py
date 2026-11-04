@@ -18,11 +18,11 @@ import asyncio
 
 import pytest
 
-from ate_env import FleetConfig, SandboxFleet, Task
-from ate_env._gen.ateenv.v1alpha import env_pb2
-from ate_env.backend.substrate import SubstrateBackendDriver
-from ate_env.errors import PreflightError
-from ate_env.types import EnvironmentSpec, PlacementSpec
+from ate_env_rl import FleetConfig, SandboxFleet, Task
+from ate_env_rl._gen.ateenv.v1alpha import env_pb2
+from ate_env_rl.backend.substrate import SubstrateBackendDriver
+from ate_env_rl.errors import PreflightError
+from ate_env_rl.types import EnvironmentSpec, PlacementSpec
 
 
 async def test_substrate_driver_lifecycle_with_client(fake_stack):
@@ -160,7 +160,7 @@ def test_substrate_default_template_resolution():
 
 
 async def test_substrate_rootfs_image_sent_to_server(fake_stack):
-    from ate_env.async_fleet import AsyncSandboxFleet
+    from ate_env_rl.async_fleet import AsyncSandboxFleet
 
     client, fakes = fake_stack
     image = "docker.io/library/python@sha256:" + "d" * 64
@@ -231,8 +231,8 @@ async def test_substrate_rootfs_image_sent_to_server(fake_stack):
 
 
 def _warm_observer():
-    from ate_env.config import ObservabilityConfig
-    from ate_env.observability import Observer
+    from ate_env_rl.config import ObservabilityConfig
+    from ate_env_rl.observability import Observer
 
     return Observer(ObservabilityConfig(enable_metrics=False))
 
@@ -255,7 +255,7 @@ async def test_recycle_counts_the_actor_back_into_the_warm_pool(fake_stack):
 
 
 async def test_failed_warm_check_counts_the_put_back(fake_stack, monkeypatch):
-    from ate_env.errors import SandboxStartError
+    from ate_env_rl.errors import SandboxStartError
 
     client, _fakes = fake_stack
     driver = SubstrateBackendDriver(client=client)
@@ -277,8 +277,8 @@ async def test_failed_warm_check_counts_the_put_back(fake_stack, monkeypatch):
 async def test_cancelled_claim_has_status_cancelled(fake_stack, monkeypatch):
     """A cancelled acquire counts a claim with status cancelled, not error."""
     prom = pytest.importorskip("prometheus_client")
-    from ate_env.config import ObservabilityConfig
-    from ate_env.observability import Observer
+    from ate_env_rl.config import ObservabilityConfig
+    from ate_env_rl.observability import Observer
 
     client, _fakes = fake_stack
     reg = prom.CollectorRegistry()

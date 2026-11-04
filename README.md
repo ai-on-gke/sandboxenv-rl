@@ -20,7 +20,7 @@ This repo started in October 2026 as a copy of [agent-substrate/env](https://git
 with its history, its pull requests (recreated here with an `[env#N]` title prefix) and its open
 issues. agent-substrate/env is being repurposed, and the RL work continues here. The components keep
 their ate-env names: the `ate-env`, `ate-env-api` and `ate-env-guest` binaries and images, the
-`ate_env` Python package and the `ateenv.v1alpha` API. The Go module path is still
+`ate_env_rl` Python package and the `ateenv.v1alpha` API. The Go module path is still
 `github.com/agent-substrate/env`.
 
 The focus moves from a general environment service to RL training and evaluation:
@@ -55,7 +55,7 @@ See [docs/architecture.md](./docs/architecture.md) for the full system design an
 | [`cmd/ate-env`](./cmd/ate-env) | CLI: create, suspend and delete environments, run commands, move files, and print the Kubernetes and Substrate manifests. |
 | [`cmd/ate-env-api`](./cmd/ate-env-api) | The API service: environment lifecycle, guest calls, MCP and the port proxy. |
 | [`cmd/ate-env-guest`](./cmd/ate-env-guest) | The daemon inside each environment: processes and files. |
-| [`clients/python`](./clients/python/README.md) | Python client, import name `ate_env`: `Client` and `Env` for single environments, and the fleet SDK. |
+| [`clients/python`](./clients/python/README.md) | Python client, import name `ate_env_rl`: `Client` and `Env` for single environments, and the fleet SDK. |
 | [`clients/go`](./clients/go) | Go client. |
 | [`integrations/`](#integrations) | Framework integrations. |
 | [`examples/`](#examples) | Runnable examples. |
@@ -138,7 +138,7 @@ Drive environments from Python with the fleet SDK (`pip install ./clients/python
 ```python
 import os
 
-from ate_env import FleetConfig, SandboxFleet, Task
+from ate_env_rl import FleetConfig, SandboxFleet, Task
 
 config = FleetConfig(endpoint="127.0.0.1:7777", auth_token=os.environ["SUBSTRATE_ENV_AUTH_TOKEN"])
 with SandboxFleet(config) as fleet:
@@ -843,7 +843,7 @@ CI_RUNNER=docker make ci
 - **`auto` (default):** Runs via Nix (`nix develop -c <cmd>`) if `nix` is installed, else via Docker if `docker` is available.
 - **`nix`:** Runs impurely using `nix develop -c` without whitelisting or clearing the environment. Every Python env is built by Nix from `uv.lock` ([`nix/python.nix`](nix/python.nix), with uv2nix), with this repository's projects installed editable; besides the default devShell, `nix develop .#openhands` (Python 3.13) and `nix develop .#uni-agent` (Python 3.12) carry the integrations' envs, and `ci-python` builds the base and uni-agent envs it needs (`nix build .#python-env-base .#python-env-uni-agent`) on first use, so other commands don't pay for them. After editing a `pyproject.toml`, run `uv lock` in the devShell and commit `uv.lock` (see [check-pins.md](docs/chores/check-pins.md)).
 - **`docker`:** Automatically builds `sandboxenv-rl-ci:local` from a copy of the tree and runs the command in a container. The Nix store and the Go and other caches live in named volumes (`sandboxenv-rl-nix`, `sandboxenv-rl-cache`), so like on a Nix host, the first run builds the devShell and later runs add only what changed. `docker volume rm sandboxenv-rl-nix` reclaims the space. Commands that write files (`make protos`, `make update-pins`) return a `git diff` that is applied on the host as you, so file ownership stays yours. Note that passing `--docker-socket` (used only by `make ci-e2e` in the Docker runner) mounts `/var/run/docker.sock`, which grants the container root-equivalent access to the host; `make smoke` uses `--host-network` instead. Both share the host network and mount the host kubeconfig read-only (a single file; a colon-separated `KUBECONFIG` isn't mounted), so `REUSE_CLUSTER` works under Docker too.
-- **`host`:** Executes the command directly on the host, with whatever is on `PATH`. Targets that only need Go and Python work without Nix or Docker: `make protos` needs Go (`GOTOOLCHAIN` fetches the version `go.mod` asks for) and `grpcio-tools` (`uv sync --package ate-env-client --extra dev`, or `pip install -e 'clients/python[dev]'`); buf and the protoc plugins come from `go.mod` through `go tool`. The `ci-*`, `smoke`, `check-pins`, `update-pins`, `check-substrate-head` and `lint-actions-locally` commands are scripts the devShell provides, so with `host` they only work inside `nix develop`.
+- **`host`:** Executes the command directly on the host, with whatever is on `PATH`. Targets that only need Go and Python work without Nix or Docker: `make protos` needs Go (`GOTOOLCHAIN` fetches the version `go.mod` asks for) and `grpcio-tools` (`uv sync --package ate-env-rl --extra dev`, or `pip install -e 'clients/python[dev]'`); buf and the protoc plugins come from `go.mod` through `go tool`. The `ci-*`, `smoke`, `check-pins`, `update-pins`, `check-substrate-head` and `lint-actions-locally` commands are scripts the devShell provides, so with `host` they only work inside `nix develop`.
 
 > [!NOTE]
 > Online GitHub Actions security audits (such as ref-version-mismatch and impostor-commit) are covered by the organization's required GitHub Actions scan on pull requests. `make lint-actions-locally` runs zizmor in `--offline` mode alongside actionlint.

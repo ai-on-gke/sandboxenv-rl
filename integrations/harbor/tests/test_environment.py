@@ -328,6 +328,29 @@ async def test_shared_client_cache_evicts_closed_loops(fake):
     assert not any(bound.is_closed() for _, bound in _client._clients.values())
 
 
+def test_uploaded_archives_are_owned_by_root(tmp_path):
+    # GNU tar extracting as root restores the archived owner; inside an actor
+    # a chown to the host's uid fails. Pack with root ownership instead.
+    import io
+    import tarfile
+
+    from ate_env_harbor.environment import pack_dir_as_root
+
+    src = tmp_path / "src"
+    (src / "sub").mkdir(parents=True)
+    (src / "empty").mkdir()
+    (src / "a.sh").write_text("#!/bin/sh\n")
+    (src / "a.sh").chmod(0o750)
+    (src / "link").symlink_to("a.sh")
+    with tarfile.open(fileobj=io.BytesIO(pack_dir_as_root(src)), mode="r:gz") as tar:
+        members = {m.name: m for m in tar.getmembers()}
+    assert set(members) == {".", "./sub", "./empty", "./a.sh", "./link"}
+    assert all(m.uid == 0 and m.gid == 0 and m.uname == "root" and m.gname == "root" for m in members.values())
+    assert members["./a.sh"].mode & 0o777 == 0o750
+    assert members["./link"].issym() and members["./link"].linkname == "a.sh"
+    assert members["./empty"].isdir()
+
+
 async def test_download_dir_of_a_missing_directory_fails_clearly(fake, make_env, tmp_path):
     env = make_env()
     await env.start(force_build=False)

@@ -9,7 +9,7 @@ Companion documents in this directory: [prd.md](./prd.md), [execution-plan.md](.
 [interfaces.md](./interfaces.md) (the shipped contracts),
 [acceptance-criteria.md](./acceptance-criteria.md), [test-plan.md](./test-plan.md),
 [properties.md](./properties.md) (property-based tests, mostly proposed),
-[verify/](./verify/README.md) (Dafny models, not run by CI) and [decisions.md](./decisions.md). The
+[verify/](./verify/README.md) (Dafny models, checked in CI) and [decisions.md](./decisions.md). The
 user-facing result is [docs/observability.md](../../observability.md) and
 [docs/metrics.md](../../metrics.md).
 
@@ -132,7 +132,7 @@ families, so a W3C `traceparent` in gRPC metadata continues a trace into the con
 [acceptance-criteria.md](./acceptance-criteria.md) maps each criterion to the test or evidence
 behind it.
 
-## 6. Open questions, as of 2026-11-02
+## 6. Open questions, as of 2026-11-03
 
 - Closed on 2026-10-30: Substrate's resume and suspend workflows already join the client trace
   through the router and `ateapi` (section 4, item 1). What remains is deployment: Substrate's
@@ -142,10 +142,17 @@ behind it.
   [docs/observability.md](../../observability.md#phase-glossary).
 - No overhead measurement for telemetry off against on is recorded in the series' pull requests;
   [test-plan.md](./test-plan.md) section 7 keeps the procedure.
-- Closed by #221: AC-15, warm-pool accounting under concurrency (P-9 to P-11).
+- Closed by #221: AC-15.1 to AC-15.6, warm-pool accounting under concurrency (P-9 to P-11).
 - Open: a warm claim whose `get()` succeeds after an overlapping reap deleted the actor returns a
-  deleted environment ([properties.md](./properties.md), `ClaimOkReturnsLive` in
-  [verify/](./verify/README.md)).
-- Open: a `warm_pool` cancelled during its `create()` calls can leak the actors already created.
+  deleted environment (AC-15.7, P-24, `ClaimOkReturnsLive` in [verify/](./verify/README.md)).
+- Open: a `warm_pool` cancelled during its `create()` calls can leak the actors already created
+  (AC-15.8).
+- Open: a delete cancelled after the run's reap, or a `release` whose delete fails or is cancelled
+  while a reap runs, leaves the actor under the reaped run id, so no later reap deletes it (AC-15.9,
+  `DeleteCancelledSafe` and `ReleaseDeleteFailSafe` in [verify/](./verify/README.md)).
 - Open: with execs started concurrently on one handle, `ate_env.first_command=true` is not always on
-  the first-started exec span (P-14).
+  the first-started exec span (AC-3.4, P-14).
+- Follow-ups with criteria but no work yet: a CI-checked span inventory (AC-16), Go and Python span
+  parity from one shared fixture (AC-17), a property test that no attribute value holds a secret or
+  content (AC-18). AC-14 now has a pass threshold.
+- Closed: the Dafny models verify in CI (AC-20).

@@ -7,6 +7,11 @@ user needs to know across them.
 ## Unreleased
 
 ### Added
+- `swebench-loader plan-placement`: an image placement plan
+  (`image-placement.json`) that assigns each task image to placement domains
+  (worker pools a per-environment worker selector addresses) under each
+  node's image-cache budget, largest image first, with replication and a hot
+  rule from the schedule's demand; `domains.json` describes the domains.
 - ate-env-api: `worker_selector` on `CreateEnvironment`, labels the worker pool
   must carry, ANDed with the template's own selector (`Actor.worker_selector`,
   so it holds for wakes too); `node` and `worker_selector` on `Environment`.

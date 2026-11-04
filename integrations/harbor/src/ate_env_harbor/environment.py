@@ -677,9 +677,13 @@ def pack_dir_as_root(source_dir: Path | str) -> bytes:
     ("Cannot change ownership to uid ..."), thus the upload of ``environment/``
     and ``tests/`` failed on glibc images. Owned by root, the members are
     extracted as the image's user without a chown. Modes, symlinks and empty
-    directories are kept, as in Harbor's helper.
+    directories are kept, as in Harbor's helper. The top-level path is
+    resolved first: a ``source_dir`` that is itself a symlink to a directory
+    would otherwise be archived as one ``SYMLINK`` member named ``.``, which
+    GNU tar refuses to extract into an existing directory. Symlinks inside
+    the tree stay symlinks.
     """
-    source = Path(source_dir)
+    source = Path(source_dir).resolve()
     if not source.is_dir():
         raise FileNotFoundError(f"Source directory {source_dir} does not exist")
 

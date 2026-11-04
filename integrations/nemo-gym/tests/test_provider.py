@@ -928,6 +928,117 @@ def test_close_drops_a_pending_park_and_aclose_waits_for_one_under_way():
     run(t())
 
 
+def test_ports_skip_automatic_idle_parking_while_explicit_pause_works(tmp_path: Path):
+    async def t():
+        async with stack(PAUSE) as (provider, fake):
+            handle = await provider.create(SandboxSpec(ports=(6000,)))
+            assert fake.suspends == []
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.RUNNING
+            assert (await provider.exec(handle, "echo hi")).return_code == 0
+            src = tmp_path / "up.bin"
+            src.write_bytes(b"ok")
+            await provider.upload_file(handle, src, "/task/up.bin")
+            await provider.download_file(handle, "/task/up.bin", tmp_path / "down.bin")
+            assert fake.suspends == []
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.RUNNING
+            # Explicit pause() and resume() still work between endpoint() turns.
+            await provider.pause(handle)
+            assert _parks(fake, handle.sandbox_id) == [LOCAL]
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+            await provider.resume(handle)
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.RUNNING
+
+    run(t())
+
+
+def test_failed_file_calls_still_schedule_idle_park(tmp_path: Path):
+    async def t():
+        async with stack(PAUSE) as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            assert len(_parks(fake, handle.sandbox_id)) == 1
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+            with pytest.raises(NotFoundError):
+                await provider.download_file(handle, "/no-such-remote", tmp_path / "out.bin")
+            assert len(_parks(fake, handle.sandbox_id)) == 2
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+            with pytest.raises(FileNotFoundError):
+                await provider.upload_file(handle, tmp_path / "no-such-local", "/task/dst")
+            assert len(_parks(fake, handle.sandbox_id)) == 3
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+
+    run(t())
+
+
+def test_pause_wraps_rpc_errors_and_timeouts_as_runtime_error(monkeypatch):
+    monkeypatch.setattr(provider_mod, "_PARK_SETTLE_S", 0.05)
+    monkeypatch.setattr(provider_mod, "_PARK_POLL_S", 0.01)
+
+    async def t():
+        async with stack(connection={"request_timeout_s": 0.05}) as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            fake.suspend_code = grpc.StatusCode.PERMISSION_DENIED
+            with pytest.raises(RuntimeError, match="PermissionDeniedError"):
+                await provider.pause(handle)
+            fake.suspend_code = None
+            fake.suspend_settle_polls = 10
+            fake.get_delay_s = 0.2
+            with pytest.raises(RuntimeError, match="no answer from"):
+                await provider.pause(handle)
+
+    run(t())
+
+
+def test_park_settle_loop_retries_transient_get_errors(monkeypatch):
+    monkeypatch.setattr(provider_mod, "_PARK_POLL_S", 0.02)
+
+    async def t():
+        async with stack() as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            fake.suspend_settle_polls = 2
+            fake.fail_gets = 2
+            await provider.pause(handle)
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+            assert fake.fail_gets == 0
+
+    run(t())
+
+
+def test_pause_under_never_remembers_local_refusal(caplog):
+    async def t():
+        async with stack() as (provider, fake):
+            fake.reject_local = True
+            h1 = await provider.create(SandboxSpec())
+            h2 = await provider.create(SandboxSpec())
+            with caplog.at_level(logging.WARNING, logger="nemo_gym_substrate.provider"):
+                await provider.pause(h1)
+                await provider.pause(h2)
+            assert _parks(fake, h1.sandbox_id) == [LOCAL, DURABLE]
+            assert _parks(fake, h2.sandbox_id) == [DURABLE]
+            assert provider._park_mode is None
+            assert sum("does not serve suspend_mode" in r.message for r in caplog.records) == 1
+
+    run(t())
+
+
+def test_aclose_waits_for_suspend_rpc_spawned_during_drain(monkeypatch):
+    monkeypatch.setattr(provider_mod, "_PARK_SETTLE_S", 0.02)
+    monkeypatch.setattr(provider_mod, "_PARK_POLL_S", 0.01)
+
+    async def t():
+        config = {"suspend_policy": "pause_after_exec", "idle_before_suspend_s": 0.03}
+        async with stack(config, connection={"request_timeout_s": 0.05}) as (provider, fake):
+            handle = await provider.create(SandboxSpec())
+            fake.suspend_delay_s = 0.2
+            assert (await provider.exec(handle, "echo hi")).return_code == 0
+            # _park_after wakes during aclose(), spawns the slow suspend RPC,
+            # and finishes after its 0.05 s wait while the RPC is still running.
+            await provider.aclose()
+            assert provider._park_tasks == set()
+            assert _env_status(fake, handle.sandbox_id) == EnvironmentStatus.PAUSED
+
+    run(t())
+
+
 def test_parking_config_is_validated():
     with pytest.raises(ValueError, match="suspend_policy must be one of"):
         SubstrateSandboxProvider({"create": {"suspend_policy": "sometimes"}})

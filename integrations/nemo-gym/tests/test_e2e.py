@@ -113,7 +113,11 @@ def test_pause_policy_parks_and_the_next_command_wakes() -> None:
         provider = SubstrateSandboxProvider(
             {
                 "connection": {"api_url": API_URL},
-                "create": {"suspend_policy": "pause_after_exec", "idle_before_suspend_s": 0},
+                "create": {
+                    "suspend_policy": "pause_after_exec",
+                    "idle_before_suspend_s": 0,
+                    **({"atespace": ATESPACE} if ATESPACE else {}),
+                },
             }
         )
         handle = None
@@ -174,7 +178,13 @@ def test_runtime_layer_endpoint() -> None:
         # task image is derived from it; a provider_options template would
         # select the base itself and skip the image.
         provider = SubstrateSandboxProvider(
-            {"connection": {"api_url": API_URL}, "create": {"template": RUNTIME_TEMPLATE}}
+            {
+                "connection": {"api_url": API_URL},
+                "create": {
+                    "template": RUNTIME_TEMPLATE,
+                    **({"atespace": ATESPACE} if ATESPACE else {}),
+                },
+            }
         )
         handle = None
         try:

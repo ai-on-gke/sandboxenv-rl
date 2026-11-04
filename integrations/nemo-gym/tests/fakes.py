@@ -73,6 +73,8 @@ class FakeAteEnv:
     procs: dict[str, FakeProc] = field(default_factory=dict)
     create_code: grpc.StatusCode | None = None
     get_code: grpc.StatusCode | None = None
+    fail_gets: int = 0  # fail this many GetEnvironment calls with UNAVAILABLE first
+    get_delay_s: float = 0.0
     delete_code: grpc.StatusCode | None = None
     ready_after_probes: int = 0  # fail this many `true` probes with UNAVAILABLE first
     hang: set[str] = field(default_factory=set)  # shell commands whose process never exits
@@ -92,6 +94,7 @@ class FakeAteEnv:
     # is still SUSPENDING, as the router does.
     suspends: list[tuple[str, int]] = field(default_factory=list)
     suspend_code: grpc.StatusCode | None = None
+    suspend_delay_s: float = 0.0
     reject_local: bool = False
     suspend_settle_polls: int = 0
     _settling: dict[str, tuple[int, int]] = field(default_factory=dict)
@@ -155,6 +158,11 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
 
     async def GetEnvironment(self, request, context):
         s = self.state
+        if s.get_delay_s > 0:
+            await asyncio.sleep(s.get_delay_s)
+        if s.fail_gets > 0:
+            s.fail_gets -= 1
+            await context.abort(grpc.StatusCode.UNAVAILABLE, "transient get failure")
         if s.get_code is not None:
             await context.abort(s.get_code, "get refused")
         if request.id not in s.envs:
@@ -174,6 +182,8 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
         if request.id not in s.envs:
             await context.abort(grpc.StatusCode.NOT_FOUND, "no such env")
         s.suspends.append((request.id, int(request.mode)))  # every request seen, refused ones too
+        if s.suspend_delay_s > 0:
+            await asyncio.sleep(s.suspend_delay_s)
         if s.suspend_code is not None:
             await context.abort(s.suspend_code, "suspend refused")
         if s.reject_local and request.mode == env_pb2.SUSPEND_MODE_LOCAL:

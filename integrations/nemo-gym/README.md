@@ -249,6 +249,10 @@ Rules the provider keeps:
 - `pause_after_exec` needs an ate-env-api that serves `suspend_mode` (`ate-env server-info`). An
   older one refuses the local mode; the provider then logs a warning once and parks durably for
   the rest of its life.
+- A sandbox that declares `SandboxSpec.ports` is skipped by automatic idle parking, because HTTP
+  requests sent through `endpoint()` go straight through the port proxy without the provider's
+  in-flight tracking and would race with an idle suspend. Call `pause()` and `resume()` explicitly
+  between turns when using `endpoint()`.
 
 `status()` reports a parked sandbox as `PAUSED` (nemo-gym 0.7 and later; `RUNNING` before that),
 without waking it. The provider also implements nemo-gym's `SupportsSandboxPauseResume`:

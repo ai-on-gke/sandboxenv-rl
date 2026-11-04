@@ -66,6 +66,10 @@ user needs to know across them.
   per-event JSONL for one more release.
 - `benchmarking/telemetry_report`: builds a self-contained HTML report from run
   reports, OTLP/JSON spans and Prometheus or collector metrics.
+- Release publishing for `ate-env-client`: `clients/python` derives its version
+  from the Git tag (`setuptools-scm`) and is published to PyPI via OIDC Trusted
+  Publishing when a GitHub Release is published; `hack/release/create-release.py`
+  drafts release notes and cuts draft releases (see [docs/release.md](docs/release.md)).
 
 ### Changed
 

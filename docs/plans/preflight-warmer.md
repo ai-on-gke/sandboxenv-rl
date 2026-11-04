@@ -302,6 +302,49 @@ phases. Go: `clients/go` gets `ListPlacementDomains`, `WarmImage` and a `Preflig
 its client. The planner (#212) stays client-side: bin-packing needs the job's image sizes and
 per-step demand, which only the job has.
 
+### With the fleet strategies
+
+`SandboxFleet.run` picks one of four strategies (`clients/python/src/ate_env/strategies.py`): `none`
+(no pools, every acquire is a create), `naive` (every pool warmed in `setup()` before the first
+task), `sliding` (one window of image pools at a time, dropped after its tasks) and `pipelined` (the
+next window's pools fill on a background thread while the current window runs). All four end in
+`process_parallel`: acquire, `process_fn`, release per task. A warm pool is a count of suspended
+environments per image that `acquire` claims; filling it does not touch the node caches, so each
+pool member's first boot on its node still pulls the image and fetches the golden.
+
+The pre-flight and the pools cache different layers and compose without double work:
+
+|               | Pre-flight (`WarmImage`)                                                                             | Warm pools (`naive`, `sliding`, `pipelined`)                     |
+| ------------- | ---------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Caches        | image layers in the node's image cache and the golden in its file cache, on every node of the domain | suspended environments per image, one pool per window            |
+| Speeds up     | the first create of an image on a node: a restore instead of pull, unpack and boot                   | each acquire: a wake of a pooled environment instead of a create |
+| Leaves behind | nothing; the probes are deleted                                                                      | at most two windows of pooled environments                       |
+| Runs          | before the run, once per (image, domain)                                                             | window N+1 fills while window N runs                             |
+
+With both on, `pipelined`'s `warm_images` for window N+1 creates pool members on nodes that already
+hold the layers and the golden, so each create is a restore of seconds and the prefetch finishes
+inside window N's rollout time: the stall at the window boundary goes away. A cold create when a
+pool runs dry hits a warm node too, and the placement selector (#211) keeps both kinds of create
+inside the domain the pre-flight warmed. `none` gains the most, because the pre-flight is its only
+warm-up.
+
+Three rules keep the two straight:
+
+- The golden must be `READY` before a pool fills, or its members boot cold; the pre-flight waits on
+  it, the pools never check it, so the pre-flight runs first.
+- Capacity is shared only when they overlap. Run up front, the probes are gone before any pool
+  exists. A per-window pre-flight one window ahead (`preflight="window"`, a follow-up) competes with
+  running tasks for slots, which is what `probes_per_node` and `node_slots` bound.
+- Pool wakes restore the pooled environment's own snapshot, not the golden. With the local suspend
+  mode (#147) that snapshot stays on the node and the wake is local; with the durable default it is
+  uploaded as well, and Substrate still prefers the node that holds it when there is room.
+
+Coverage today: the four strategies pass their unit tests on the mock backend
+(`test_fleet_strategies`, `test_add_tasks_during_run_does_not_break_the_run`); no test runs a
+strategy against ate-env-api, and the Kind E2E checks warm-pool accounting only. The flag PR adds
+one Kind E2E case: `sliding` over two images with the pre-flight on, the path every integration
+takes.
+
 ## What this replaces or changes
 
 Nothing is removed. One thing is subsumed, two change behaviour, the rest is additive.

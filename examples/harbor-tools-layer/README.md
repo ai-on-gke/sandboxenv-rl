@@ -60,7 +60,7 @@ needs carries it. The flag is `--layer <name>=<image@sha256:...>=<mount path>`:
 integrations/harbor/hack/register-templates.sh ./tb2/terminal-bench -- \
   --guest-image <registry>/ate-env-guest@sha256:<digest> \
   --snapshots-bucket <object-storage-url> \
-  --layer "tools=$LAYER_REF=/opt/harbor-tools" | sh
+  --layer "tools=$LAYER_REF=/opt/harbor-tools" | bash -euo pipefail
 ```
 
 ## 3. Run with the layer on PATH

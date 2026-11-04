@@ -21,6 +21,9 @@
 #
 #   demo.sh <tasks-dir> [harbor run flags...]
 #
+# Without flags after <tasks-dir>: `-a oracle -n 10`, as examples/harbor/run-tb2.sh
+# does; a model run is `-a terminus-2 -m <model> -n 10`.
+#
 # Environment:
 #   LAYER_REPO                   where the layer goes, e.g. us-central1-docker.pkg.dev/<project>/harbor/tools-layer
 #   GUEST_IMAGE                  digest-pinned ate-env-guest image, for the templates
@@ -66,6 +69,6 @@ fi
 
 echo "== running Harbor with ${MOUNT}/bin first on PATH"
 if [[ $# -eq 0 ]]; then
-  set -- -a terminus-2 -n 10
+  set -- -a oracle -n 10
 fi
 exec "${ROOT}/examples/harbor/run-tb2.sh" -p "${TASKS}" --ek "tool_paths=${MOUNT}/bin" "$@"

@@ -222,6 +222,18 @@ let
       ];
       shellHook = pureEnvSetup;
     };
+  # Dafny for the hand-written models in docs/plans/telemetry/verify/
+  # (hack/verify/dafny.py). A shell of its own: Dafny brings the .NET SDK and
+  # Z3, which no other check needs.
+  dafnyShell = pkgs.mkShell {
+    packages = [
+      pkgs.dafny
+      pkgs.python3
+      pkgs.git
+      pkgs.coreutils
+    ];
+    shellHook = pureEnvSetup;
+  };
   openhandsShell = mkPythonShell openhandsEnv;
   uniAgentShell = mkPythonShell uniAgentEnv;
   harborShell = mkPythonShell harborEnv;
@@ -542,6 +554,7 @@ in
     check-pins
     update-pins
     lint-actions-locally
+    dafnyShell
     openhandsShell
     uniAgentShell
     harborShell

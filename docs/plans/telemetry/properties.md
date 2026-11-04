@@ -5,7 +5,7 @@ property tests here are proposed and not in the repository: `pgregory.net/rapid`
 and the Hypothesis tests named "Proposed test" do not exist. Two parts exist:
 
 - `clients/python/tests/test_warm_pool_accounting.py` (#221): the P-9 to P-11 stateful test
-  `test_warm_pool_accounting` and 29 plain interleaving tests. `hypothesis` is in the `dev` extra
+  `test_warm_pool_accounting` and 31 plain interleaving tests. `hypothesis` is in the `dev` extra
   since #221.
 - [verify/](./verify/README.md): hand-written Dafny models of P-1 to P-11 and of the two bugs review
   found in #221's first version. CI checks their results (AC-20).
@@ -396,7 +396,12 @@ from the run is alive on Substrate or tracked by the driver.
   `WARM_POOL_RUN_ID` (a reap finds one never created NotFound, which counts as gone). Test:
   `test_cancelled_warm_pool_leaves_its_actors_for_any_reap`; Dafny: TRACKED in
   `verify/warm_pool_drain.dfy` (`WarmCancelledFixedSafe`; `WarmCancelledBeforeSafe` models the code
-  before and fails). The stateful machine cancels nothing, so it does not reach this case.
+  before and fails). Review of #240 found the same leak without a cancel: with `wait=True`, an actor
+  whose `create()` succeeded and `suspend()` raised was neither pooled, returned nor owned. It is
+  now owned under `WARM_POOL_RUN_ID` and deleted at once
+  (`test_warm_actor_whose_suspend_fails_is_deleted_or_left_for_any_reap`; `WarmSuspendFailedSafe`,
+  with `WarmSuspendFailedBeforeSafe` failing). The stateful machine cancels nothing and never fails
+  a suspend, so it reaches neither case.
 - AC-15.9, fixed by #238: a cancelled cleanup delete, and a `release` whose delete fails or is
   cancelled while a reap runs, re-tag the actor too. See "Run-id gaps" in the findings.
 - Fixed by #221. Before it, the stateful test shrank it to two minimal counter-examples (recorded

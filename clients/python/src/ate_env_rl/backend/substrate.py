@@ -659,25 +659,6 @@ class SubstrateBackendDriver(BackendDriver):
                         )
                     finally:
                         in_driver_span.reset(drv_tok)
-                    if wait:
-                        await self._client_for(actor_id).suspend(actor_id, atespace=self.atespace)
-                    else:
-                        task = asyncio.create_task(
-                            self._client_for(actor_id).suspend(actor_id, atespace=self.atespace)
-                        )
-                        self._background_tasks.add(task)
-
-                        def _done(t: asyncio.Task[Any]) -> None:
-                            self._background_tasks.discard(t)
-                            if not t.cancelled() and t.exception():
-                                logger.warning(
-                                    "Background suspend for warm actor %s failed: %s",
-                                    actor_id,
-                                    t.exception(),
-                                )
-
-                        task.add_done_callback(_done)
-                    return actor_id
                 except (NotFoundError, FailedPreconditionError) as e:
                     raise SandboxStartError(
                         f"ActorTemplate '{template_id}' invalid or does not exist on Substrate server: {e}"
@@ -685,6 +666,43 @@ class SubstrateBackendDriver(BackendDriver):
                 except Exception as e:
                     logger.warning("Failed to provision warm actor %s: %s", actor_id, e)
                     return None
+                if wait:
+                    try:
+                        await self._client_for(actor_id).suspend(actor_id, atespace=self.atespace)
+                    except Exception as e:
+                        # Created but not paused: neither pooled nor returned.
+                        # Own it under WARM_POOL_RUN_ID and delete it, so a
+                        # failed delete leaves it for any reap (AC-15.8).
+                        logger.warning("Failed to suspend warm actor %s: %s", actor_id, e)
+                        with self._lock:
+                            self._owned_actors.setdefault(
+                                actor_id,
+                                self._make_instance(
+                                    actor_id,
+                                    template_id,
+                                    run_id=WARM_POOL_RUN_ID,
+                                    rootfs_image=rootfs_image,
+                                ),
+                            )
+                        await self._delete_unpooled(actor_id, "after failed warm suspend")
+                        return None
+                else:
+                    task = asyncio.create_task(
+                        self._client_for(actor_id).suspend(actor_id, atespace=self.atespace)
+                    )
+                    self._background_tasks.add(task)
+
+                    def _done(t: asyncio.Task[Any]) -> None:
+                        self._background_tasks.discard(t)
+                        if not t.cancelled() and t.exception():
+                            logger.warning(
+                                "Background suspend for warm actor %s failed: %s",
+                                actor_id,
+                                t.exception(),
+                            )
+
+                    task.add_done_callback(_done)
+                return actor_id
 
         tasks = [_warm_one() for _ in range(needed)]
         try:

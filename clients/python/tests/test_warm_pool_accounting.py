@@ -63,6 +63,7 @@ class GatedClient:
         self.delete_failures = 0  # fail this many delete() calls, then succeed
         self.get_gate: asyncio.Event | None = None
         self.get_error: Exception | None = None
+        self.suspend_error: Exception | None = None
 
     async def create(self, actor_id: str, **kw: object) -> None:
         n, self.creates = self.creates, self.creates + 1
@@ -76,6 +77,8 @@ class GatedClient:
         gate = self.suspend_gates.get(actor_id)
         if gate is not None:
             await gate.wait()
+        if self.suspend_error is not None:
+            raise self.suspend_error
 
     async def delete(self, actor_id: str, **kw: object) -> None:
         if self.delete_gate is not None:
@@ -539,6 +542,11 @@ class SlowCreatesClient(GatedClient):
             return
         await super().create(actor_id, **kw)
 
+    async def delete(self, actor_id: str, **kw: object) -> None:
+        if actor_id not in self.live:
+            raise NotFoundError(actor_id)
+        await super().delete(actor_id, **kw)
+
 
 # AC-15.8: a warm_pool call cancelled during its create() calls leaves no live
 # actor untracked; any run's reap deletes what it made.
@@ -558,7 +566,31 @@ async def test_cancelled_warm_pool_leaves_its_actors_for_any_reap() -> None:
     assert _pool(driver) == []
     assert sum(obs._warm.values()) == 0
     assert driver._warm_inflight == {}
-    await driver.reap_async("run-2")
+    # The third id's create never landed: NotFound for the reap, not counted.
+    assert await driver.reap_async("run-2") == 2
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+@pytest.mark.parametrize("delete_fails", [False, True])
+async def test_warm_actor_whose_suspend_fails_is_deleted_or_left_for_any_reap(
+    delete_fails: bool,
+) -> None:
+    client = GatedClient()
+    driver, obs = _driver(client)
+    client.suspend_error = RuntimeError("suspend failed")
+    if delete_fails:
+        client.delete_failures = R
+
+    await driver.warm_pool_async("tmpl", R, run_id="run-1")  # wait=True
+
+    assert _pool(driver) == []
+    assert sum(obs._warm.values()) == 0
+    assert client.live <= set(driver._owned_actors)  # nothing alive is untracked
+    if delete_fails:
+        assert len(client.live) == R
+        assert {i.run_id for i in driver._owned_actors.values()} == {WARM_POOL_RUN_ID}
+        await driver.reap_async("run-2")
     assert client.live == set()
     assert driver._owned_actors == {}
 

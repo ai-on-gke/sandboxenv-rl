@@ -293,4 +293,6 @@ Append-only. Each entry: date, who, what, why.
   cancelled task: awaiting deletes there would delay the cancellation, and background deletes could
   outlive the loop. Any reap deletes them (one whose create never landed is NotFound, counted as
   gone). The run-id model gained TRACKED (every live actor is owned or being released), which made
-  it drop `owned.Keys <= live`: an owned id may never have been created.
+  it drop `owned.Keys <= live`: an owned id may never have been created. Review of #240: a suspend
+  that fails after a successful create leaked the actor the same way; `_warm_one` now separates the
+  two calls and owns and deletes such an actor at once.

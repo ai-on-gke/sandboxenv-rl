@@ -233,5 +233,7 @@ records one `wire_claim` sample with status `error`, as a failed claim does; the
 that follows records its own.
 
 A `warm_pool` call cancelled during its `create()` calls releases its reservation and owns every
-actor it sent a `create()` for under `WARM_POOL_RUN_ID`, so any run's reap deletes them (AC-15.8).
-[properties.md](./properties.md) and [verify/README.md](./verify/README.md) have the details.
+actor it sent a `create()` for under `WARM_POOL_RUN_ID`, so any run's reap deletes them. With
+`wait=True`, an actor whose `create()` succeeds and `suspend()` raises is owned the same way and
+deleted through `_delete_unpooled` (AC-15.8). [properties.md](./properties.md) and
+[verify/README.md](./verify/README.md) have the details.

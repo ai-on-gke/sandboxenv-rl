@@ -404,6 +404,18 @@ module WarmPoolRunIds {
     requires created <= made
   { s.(live := s.live + created) }
 
+  // warm_pool(wait=True): create() returned but suspend() raised. AC-15.8:
+  // own the actor under WARM and start its delete (a failed delete re-tags,
+  // and it is WARM already).
+  function WarmSuspendFailed(s: State, a: Actor): State
+    requires a !in s.live && a !in s.owned && a !in s.releasing
+  { s.(live := s.live + {a}, owned := s.owned[a := WARM], deleting := s.deleting + {a}) }
+
+  // Before AC-15.8's fix: the actor was neither pooled, returned nor owned.
+  function WarmSuspendFailedBefore(s: State, a: Actor): State
+    requires a !in s.live
+  { s.(live := s.live + {a}) }
+
   // ======================================================= #221 verifies
   lemma ReapSafe(s: State, r: Run)
     requires Inv(s) && r != WARM
@@ -452,6 +464,11 @@ module WarmPoolRunIds {
     ensures Inv(WarmCancelledFixed(s, made, created))
   {}
 
+  lemma WarmSuspendFailedSafe(s: State, a: Actor)
+    requires Inv(s) && a !in s.live && a !in s.owned && a !in s.releasing
+    ensures Inv(WarmSuspendFailed(s, a))
+  {}
+
   lemma DeleteCancelledFixedSafe(s: State, a: Actor)
     requires Inv(s) && a in s.deleting
     ensures Inv(DeleteCancelledFixed(s, a))
@@ -481,6 +498,13 @@ module WarmPoolRunIds {
   lemma RecycleSuspendCancelledBeforeSafe(s: State, a: Actor)
     requires Inv(s) && a in s.releasing
     ensures Inv(RecycleSuspendCancelledBefore(s, a))                  // fails
+  {}
+
+  // Before AC-15.8's fix: a warm actor whose suspend() failed stayed alive
+  // and untracked.
+  lemma WarmSuspendFailedBeforeSafe(s: State, a: Actor)
+    requires Inv(s) && a !in s.live
+    ensures Inv(WarmSuspendFailedBefore(s, a))                        // fails
   {}
 
   // Before AC-15.8's fix: a cancelled warm_pool left the actors it had

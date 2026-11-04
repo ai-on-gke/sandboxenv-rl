@@ -4,7 +4,8 @@ description: >-
   Configures and runs a simulated mixed R2E-Gym and SWE-bench Verified benchmark on Agent Substrate
   and ate-env across configurable concurrency, image counts, replica rollouts per image, warm-pool
   orchestration strategies (none, naive, sliding, pipelined, all), and API/SDK client chains (go,
-  go-direct, python, all), then verifies per-arm and side-by-side comparison artifacts.
+  go-direct, python, all), verifies per-arm and side-by-side comparison artifacts, and populates
+  BENCHMARK_REPORT.md from REPORT_TEMPLATE.md.
 ---
 
 # Mixed R2E-Gym and SWE-bench Simulated Benchmark
@@ -13,7 +14,8 @@ Use this skill when asked to run a simulated RL load mixing R2E-Gym and SWE-benc
 images on Agent Substrate without GPUs or model servers.
 [`../run-r2e-swebench.sh`](../run-r2e-swebench.sh) drives two concurrent shards (`job=r2e` and
 `job=swe`) for each selected `(client, strategy)` arm into `$ARTIFACT_DIR`, builds `bench report`
-bundles, and emits cross-arm comparison tables when sweeping multiple arms.
+bundles, emits cross-arm comparison tables when sweeping multiple arms, and feeds the narrative
+report template in [`./REPORT_TEMPLATE.md`](./REPORT_TEMPLATE.md).
 
 For the 8 cluster checks that affect every `swebench-loader` measurement, read
 [`../SKILL.md`](../SKILL.md). For real RL trainer hooks and `bench` overlays, read
@@ -29,15 +31,15 @@ memory headroom when `--workload graded` runs concurrent `pytest` suites.
 Pick the sizing, strategy, and client-chain knobs with CLI flags or environment variables (CLI flags
 override environment variables):
 
-| Parameter             | CLI flags                                                                                                                      | Environment variables                                                                                  | Default and resolution rule                                                                               |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
-| Concurrency           | `-c N`, `--concurrency N`, `--r2e-width N`, `--swe-width N`                                                                    | `MAX_CONCURRENCY`, `R2E_WIDTH`, `SWE_WIDTH`                                                            | `200` total active sandboxes split proportionally across `r2e` and `swe` shards (`>= 2` when split).      |
-| Images                | `-i N`, `--images N`, `--r2e-images N`, `--swe-images N`                                                                       | `IMAGES`, `R2E_IMAGES`, `SWE_IMAGES`                                                                   | `20` per dataset (`40` total images). Pass `--images 10` for `20` total (`10` R2E + `10` SWE-bench).      |
-| Rollouts per image    | `-r N`, `--rollouts-per-image N`, `--r2e-rollouts N`, `--swe-rollouts N`                                                       | `ROLLOUTS_PER_IMAGE`, `R2E_FANOUT`, `SWE_FANOUT`                                                       | Auto-computed as `ceil(shard_width / shard_images)` when omitted (`5` for `width=100, images=20`).        |
-| Strategy              | `--strategy none\|naive\|sliding\|pipelined\|all\|CSV`, `--window-size N`                                                      | `STRATEGY`, `WINDOW_SIZE`                                                                              | Unset runs legacy standing-pool `MODE`; `all` sweeps `none,naive,sliding,pipelined`.                      |
-| Client / API chain    | `--client go\|go-direct\|python\|all\|CSV` (alias `--chain`)                                                                   | `CLIENT`                                                                                               | `go` (`swebench-loader` -> Go SDK -> `ate-env-api`). `all` sweeps `go` and `python` (plus `go-direct` when `--control-addr` is set). |
-| Direct Substrate auth | `--control-addr ADDR`, `--router-addr ADDR`, `--atenet-client-cert P`, `--atenet-ca-file P`, `--atenet-server-name S`, `--ateapi-token-file P`, `--ateapi-ca-file P` | `CONTROL_ADDR`, `ROUTER_ADDR`, `ATENET_CLIENT_CERT`, `ATENET_CA_FILE`, `ATENET_SERVER_NAME`, `ATEAPI_TOKEN_FILE`, `ATEAPI_CA_FILE` | Required for `--client go-direct` (`--control-addr` points at `ateapi` gRPC `host:port`; `--ateapi-ca-file` verifies `ateapi` TLS). |
-| Workload and schedule | `--workload graded\|io`, `--mode steps\|eval\|open-loop`, `--steps N`, `--park POLICY`, `--step-pause DUR`                     | `WORKLOAD`, `MODE`, `STEPS`, `PARK`, `STEP_PAUSE`                                                      | `WORKLOAD=graded`, `MODE=steps`, `STEPS=4` (`1` single-pass when `--strategy` or `--client python` is set), `PARK=suspend`, `STEP_PAUSE=0s`. |
+| Parameter             | CLI flags                                                                                                                                                            | Environment variables                                                                                                              | Default and resolution rule                                                                                                                  |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Concurrency           | `-c N`, `--concurrency N`, `--r2e-width N`, `--swe-width N`                                                                                                          | `MAX_CONCURRENCY`, `R2E_WIDTH`, `SWE_WIDTH`                                                                                        | `200` total active sandboxes split proportionally across `r2e` and `swe` shards (`>= 2` when split).                                         |
+| Images                | `-i N`, `--images N`, `--r2e-images N`, `--swe-images N`                                                                                                             | `IMAGES`, `R2E_IMAGES`, `SWE_IMAGES`                                                                                               | `20` per dataset (`40` total images). Pass `--images 10` for `20` total (`10` R2E + `10` SWE-bench).                                         |
+| Rollouts per image    | `-r N`, `--rollouts-per-image N`, `--r2e-rollouts N`, `--swe-rollouts N`                                                                                             | `ROLLOUTS_PER_IMAGE`, `R2E_FANOUT`, `SWE_FANOUT`                                                                                   | Auto-computed as `ceil(shard_width / shard_images)` when omitted (`5` for `width=100, images=20`).                                           |
+| Strategy              | `--strategy none\|naive\|sliding\|pipelined\|all\|CSV`, `--window-size N`                                                                                            | `STRATEGY`, `WINDOW_SIZE`                                                                                                          | Unset runs legacy standing-pool `MODE`; `all` sweeps `none,naive,sliding,pipelined`.                                                         |
+| Client / API chain    | `--client go\|go-direct\|python\|all\|CSV` (alias `--chain`)                                                                                                         | `CLIENT`                                                                                                                           | `go` (`swebench-loader` -> Go SDK -> `ate-env-api`). `all` sweeps `go` and `python` (plus `go-direct` when `--control-addr` is set).         |
+| Direct Substrate auth | `--control-addr ADDR`, `--router-addr ADDR`, `--atenet-client-cert P`, `--atenet-ca-file P`, `--atenet-server-name S`, `--ateapi-token-file P`, `--ateapi-ca-file P` | `CONTROL_ADDR`, `ROUTER_ADDR`, `ATENET_CLIENT_CERT`, `ATENET_CA_FILE`, `ATENET_SERVER_NAME`, `ATEAPI_TOKEN_FILE`, `ATEAPI_CA_FILE` | Required for `--client go-direct` (`--control-addr` points at `ateapi` gRPC `host:port`; `--ateapi-ca-file` verifies `ateapi` TLS).          |
+| Workload and schedule | `--workload graded\|io`, `--mode steps\|eval\|open-loop`, `--steps N`, `--park POLICY`, `--step-pause DUR`                                                           | `WORKLOAD`, `MODE`, `STEPS`, `PARK`, `STEP_PAUSE`                                                                                  | `WORKLOAD=graded`, `MODE=steps`, `STEPS=4` (`1` single-pass when `--strategy` or `--client python` is set), `PARK=suspend`, `STEP_PAUSE=0s`. |
 
 [`../run-r2e-swebench.sh`](../run-r2e-swebench.sh) resolves sizing combinations with three rules:
 
@@ -59,9 +61,10 @@ Select the warm-pool orchestration strategy with `--strategy`:
   warm hit rate).
 - `naive`: prewarms `1` suspended sandbox per rollout across every selected image upfront before
   claiming (`100%` warm hit rate, `images * rollouts` peak parked footprint).
-- `sliding`: warms `window_size` distinct images (`DefaultWindowSize` = `clamp(ceil(images/2), 1, 8)`
-  when `--window-size 0`), runs all rollouts in that window, deletes those sandboxes, and advances to
-  the next window (`window_size * rollouts` bounded parked footprint).
+- `sliding`: warms `window_size` distinct images (`DefaultWindowSize` =
+  `clamp(ceil(images/2), 1, 8)` when `--window-size 0`), runs all rollouts in that window, deletes
+  those sandboxes, and advances to the next window (`window_size * rollouts` bounded parked
+  footprint).
 - `pipelined`: double-buffers two windows, prefetching window `N+1` in the background while window
   `N` executes (`<= 2 * window_size * rollouts` parked footprint, sharing the shard `Width` active
   concurrency cap across prefetch and replay).
@@ -235,3 +238,40 @@ top-level comparison artifacts land at `$ARTIFACT_DIR/`:
   across all `(client, strategy)` arms.
 - `cache_before.prom`, `cache_after.prom`, and `restore_timings.jsonl`: node cache metrics and
   `atelet` restore phases captured when `SAMPLE_CACHE=1` and `HARVEST_RESTORES=1` are set.
+
+## 6. Write the benchmark report
+
+Copy [`./REPORT_TEMPLATE.md`](./REPORT_TEMPLATE.md) to `$ARTIFACT_DIR/BENCHMARK_REPORT.md` so the
+machine-validated `report.md` and `comparison.md` files stay intact, then populate every section:
+
+1. **Collect system and orphan records when missing**: If the run did not invoke `bench measure` or
+   `bench reap`, capture cluster topology and verify zero leaked actors before finalizing the
+   report:
+   ```bash
+   go -C "${ENV_REPO}" run ./cmd/benchmarking/bench measure -k8s \
+     -atespace "${ATESPACE:-ate-env}" \
+     -run-id "${RUN_PREFIX:-r2eswe}" \
+     -dest "${ARTIFACT_DIR}"
+   go -C "${ENV_REPO}" run ./cmd/benchmarking/bench reap \
+     -ate-endpoint "${ATE_ENDPOINT}" \
+     -atespace "${ATESPACE:-ate-env}" \
+     -prefix "${RUN_PREFIX:-r2eswe}" \
+     -dest "${ARTIFACT_DIR}"
+   ```
+2. **State the start footing and per-node concurrency**: Classify the run in `## Summary` and
+   section `1.2` as `cold boot` (no golden snapshot), `cold restore` (golden snapshot present,
+   `misses_per_first_cmd` near `1.0`), `warm restore` (golden snapshot and node image cached,
+   `misses_per_first_cmd` near `0.0`), or `wake` (resumed from local suspend snapshot). Record
+   `MAX_CONCURRENCY / sandbox_nodes` alongside node boot disk type, CPU family, worker pod density,
+   and `atelet` GC flags from [`../SKILL.md`](../SKILL.md) sections 1 and 4.
+3. **Fill latency, rollout, and cost tables from bundle JSON**: Populate section `4.1` from
+   `comparison.json` (or `report.json` on single-arm runs), section `4.2` from `report.json`
+   (`stats[]`, `headline_baseline`, `acquisition_sources`) and `measurements.json`, section `4.3`
+   from `restore_timings.jsonl` and `cache_{before,after}.prom`, section `4.4` from `steps[]`,
+   `rollout_breakdown[]`, `rl_step_breakdown`, `jobs`, and `interference`, and section `4.5` from
+   `measurements.json` and `system_description.json`.
+4. **Preserve zero-vs-missing semantics**: Write `not collected` when a telemetry scope or OTel
+   collector was disabled and `not applicable (simulated RL)` for GPU trainer fields. Never write
+   `0` for an uncollected metric.
+5. **Check all 7 validity gates**: Complete the checklist in section `6.2`
+   (`bench validate -dest "${ARTIFACT_DIR}"`) and list any comparison caveats in section `6.3`.

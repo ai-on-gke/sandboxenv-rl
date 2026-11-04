@@ -7,6 +7,14 @@ user needs to know across them.
 ## Unreleased
 
 ### Added
+- ate-env-api: `GetImageStatus` and `EnsureImageTemplate`, the ActorTemplate
+  derived for a `rootfs_image` and the state of its golden snapshot (`NONE`,
+  `PENDING`, `READY` with the tag, `FAILED` with the reason); ensure creates
+  the template, which starts the bake, with no environment. Feature
+  `image_status`; `ate-env image-status <image> [--ensure]` (`image-status` joins
+  the reserved environment ids); the Python
+  client's `image_status()` and `ImageStatus`; the Go client's `ImageStatus`
+  and `EnsureImageTemplate`.
 - Python client: `FleetConfig.node_selector` is sent as every environment's
   `worker_selector`, and `FleetConfig.placement` adds labels per task image;
   `SubstrateBackendDriver(worker_selector=, placement=)` and

@@ -29,8 +29,8 @@ func TestGetServerInfoFeaturesFollowConfig(t *testing.T) {
 		info ServerInfo
 		want []string
 	}{
-		{"defaults", ServerInfo{}, []string{FeatureRootfsImage, FeaturePTY, FeatureSuspendMode}},
-		{"port proxy", ServerInfo{PortProxy: true}, []string{FeatureRootfsImage, FeaturePTY, FeatureSuspendMode, FeaturePortProxy}},
+		{"defaults", ServerInfo{}, []string{FeatureRootfsImage, FeaturePTY, FeatureSuspendMode, FeatureImageStatus}},
+		{"port proxy", ServerInfo{PortProxy: true}, []string{FeatureRootfsImage, FeaturePTY, FeatureSuspendMode, FeatureImageStatus, FeaturePortProxy}},
 	}
 	for _, tc := range cases {
 		s := New(nil, "", "")

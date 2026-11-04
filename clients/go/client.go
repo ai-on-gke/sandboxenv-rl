@@ -266,6 +266,46 @@ func (c *Client) ServerInfo(ctx context.Context) (_ *ateenvv1alpha.GetServerInfo
 	return resp, nil
 }
 
+// ImageStatus reports the template derived for a rootfs image and the state
+// of its golden snapshot, without creating anything.
+func (c *Client) ImageStatus(ctx context.Context, req *ateenvv1alpha.GetImageStatusRequest) (_ *ateenvv1alpha.ImageStatus, err error) {
+	ctx, span := c.tracer.startRPC(ctx, opGetImageStatus, "GetImageStatus",
+		AttrRootfsImage.String(imageRefAttr(req.GetRootfsImage())),
+		AttrTemplateName.String(req.GetTemplate().GetName()),
+		AttrTemplateAtespace.String(req.GetTemplate().GetAtespace()),
+		AttrAtespace.String(req.GetAtespace()))
+	defer func() { endSpan(span, err) }()
+	resp, err := c.grpc.GetImageStatus(c.withAuth(ctx), req)
+	if err != nil {
+		return nil, fromGRPCError(err)
+	}
+	// The server resolves the derived template; record what it chose.
+	setAttributes(span,
+		AttrTemplateName.String(resp.GetTemplate().GetName()),
+		AttrTemplateAtespace.String(resp.GetTemplate().GetAtespace()))
+	return resp, nil
+}
+
+// EnsureImageTemplate creates the template derived for a rootfs image when
+// it is missing, which starts its golden snapshot bake, and reports it as
+// ImageStatus does. No environment is created.
+func (c *Client) EnsureImageTemplate(ctx context.Context, req *ateenvv1alpha.EnsureImageTemplateRequest) (_ *ateenvv1alpha.ImageStatus, err error) {
+	ctx, span := c.tracer.startRPC(ctx, opEnsureImageTemplate, "EnsureImageTemplate",
+		AttrRootfsImage.String(imageRefAttr(req.GetRootfsImage())),
+		AttrTemplateName.String(req.GetTemplate().GetName()),
+		AttrTemplateAtespace.String(req.GetTemplate().GetAtespace()),
+		AttrAtespace.String(req.GetAtespace()))
+	defer func() { endSpan(span, err) }()
+	resp, err := c.grpc.EnsureImageTemplate(c.withAuth(ctx), req)
+	if err != nil {
+		return nil, fromGRPCError(err)
+	}
+	setAttributes(span,
+		AttrTemplateName.String(resp.GetTemplate().GetName()),
+		AttrTemplateAtespace.String(resp.GetTemplate().GetAtespace()))
+	return resp, nil
+}
+
 // Env returns a handle to an environment without checking that it exists.
 func (c *Client) Env(atespace, id string) *Env {
 	if atespace == "" {

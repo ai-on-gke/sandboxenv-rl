@@ -80,6 +80,16 @@ class EnvironmentServiceStub:
                 request_serializer=ateenv_dot_v1alpha_dot_env__pb2.GetServerInfoRequest.SerializeToString,
                 response_deserializer=ateenv_dot_v1alpha_dot_env__pb2.GetServerInfoResponse.FromString,
                 _registered_method=True)
+        self.GetImageStatus = channel.unary_unary(
+                '/ateenv.v1alpha.EnvironmentService/GetImageStatus',
+                request_serializer=ateenv_dot_v1alpha_dot_env__pb2.GetImageStatusRequest.SerializeToString,
+                response_deserializer=ateenv_dot_v1alpha_dot_env__pb2.ImageStatus.FromString,
+                _registered_method=True)
+        self.EnsureImageTemplate = channel.unary_unary(
+                '/ateenv.v1alpha.EnvironmentService/EnsureImageTemplate',
+                request_serializer=ateenv_dot_v1alpha_dot_env__pb2.EnsureImageTemplateRequest.SerializeToString,
+                response_deserializer=ateenv_dot_v1alpha_dot_env__pb2.ImageStatus.FromString,
+                _registered_method=True)
 
 
 class EnvironmentServiceServicer:
@@ -131,6 +141,25 @@ class EnvironmentServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetImageStatus(self, request, context):
+        """Report the ActorTemplate derived for a rootfs image: whether it exists
+        and whether its golden snapshot is ready, still baking, or failed. Reads
+        only; a missing template is reported, not created.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def EnsureImageTemplate(self, request, context):
+        """Create the ActorTemplate derived for a rootfs image when it is missing,
+        which starts its golden snapshot bake, and report it as GetImageStatus
+        does. No environment is created. A template whose golden bake failed is
+        recreated the way CreateEnvironment would.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_EnvironmentServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -158,6 +187,16 @@ def add_EnvironmentServiceServicer_to_server(servicer, server):
                     servicer.GetServerInfo,
                     request_deserializer=ateenv_dot_v1alpha_dot_env__pb2.GetServerInfoRequest.FromString,
                     response_serializer=ateenv_dot_v1alpha_dot_env__pb2.GetServerInfoResponse.SerializeToString,
+            ),
+            'GetImageStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetImageStatus,
+                    request_deserializer=ateenv_dot_v1alpha_dot_env__pb2.GetImageStatusRequest.FromString,
+                    response_serializer=ateenv_dot_v1alpha_dot_env__pb2.ImageStatus.SerializeToString,
+            ),
+            'EnsureImageTemplate': grpc.unary_unary_rpc_method_handler(
+                    servicer.EnsureImageTemplate,
+                    request_deserializer=ateenv_dot_v1alpha_dot_env__pb2.EnsureImageTemplateRequest.FromString,
+                    response_serializer=ateenv_dot_v1alpha_dot_env__pb2.ImageStatus.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -302,6 +341,60 @@ class EnvironmentService:
             '/ateenv.v1alpha.EnvironmentService/GetServerInfo',
             ateenv_dot_v1alpha_dot_env__pb2.GetServerInfoRequest.SerializeToString,
             ateenv_dot_v1alpha_dot_env__pb2.GetServerInfoResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetImageStatus(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ateenv.v1alpha.EnvironmentService/GetImageStatus',
+            ateenv_dot_v1alpha_dot_env__pb2.GetImageStatusRequest.SerializeToString,
+            ateenv_dot_v1alpha_dot_env__pb2.ImageStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def EnsureImageTemplate(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/ateenv.v1alpha.EnvironmentService/EnsureImageTemplate',
+            ateenv_dot_v1alpha_dot_env__pb2.EnsureImageTemplateRequest.SerializeToString,
+            ateenv_dot_v1alpha_dot_env__pb2.ImageStatus.FromString,
             options,
             channel_credentials,
             insecure,

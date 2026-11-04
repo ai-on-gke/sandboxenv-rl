@@ -1135,3 +1135,81 @@ func TestCreatePassesWorkerSelectorAndGetReportsNode(t *testing.T) {
 		}
 	})
 }
+
+func TestImageStatusFollowsTheDerivedTemplate(t *testing.T) {
+	client, control := newTestEnv(t)
+	ctx := context.Background()
+	seedGuestTemplate(control, "ate-env", "default-template")
+
+	if _, err := client.GetImageStatus(ctx, &ateenvv1alpha.GetImageStatusRequest{RootfsImage: "docker.io/library/python:3.11"}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("unpinned image: code %v, want InvalidArgument", status.Code(err))
+	}
+
+	// No template yet: reported, not created.
+	st, err := client.GetImageStatus(ctx, &ateenvv1alpha.GetImageStatusRequest{RootfsImage: testRootfsImage})
+	if err != nil {
+		t.Fatalf("GetImageStatus: %v", err)
+	}
+	if st.GetTemplateExists() || st.GetGolden() != ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_NONE {
+		t.Errorf("before ensure: exists=%v golden=%v, want false NONE", st.GetTemplateExists(), st.GetGolden())
+	}
+	if st.GetTemplate().GetName() != testDerivedTemplate || st.GetTemplate().GetAtespace() != "ate-env" {
+		t.Errorf("template = %s/%s, want ate-env/%s", st.GetTemplate().GetAtespace(), st.GetTemplate().GetName(), testDerivedTemplate)
+	}
+	if n := control.TemplateCount(); n != 1 {
+		t.Errorf("GetImageStatus created a template: count %d, want 1", n)
+	}
+
+	// Ensure derives it once; the bake is pending until Substrate tags it.
+	for i := 0; i < 2; i++ {
+		st, err = client.EnsureImageTemplate(ctx, &ateenvv1alpha.EnsureImageTemplateRequest{RootfsImage: testRootfsImage})
+		if err != nil {
+			t.Fatalf("EnsureImageTemplate: %v", err)
+		}
+		if !st.GetTemplateExists() || st.GetGolden() != ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_PENDING {
+			t.Errorf("after ensure: exists=%v golden=%v, want true PENDING", st.GetTemplateExists(), st.GetGolden())
+		}
+	}
+	if n := control.TemplateCount(); n != 2 {
+		t.Errorf("template count = %d, want 2 (base + one derived)", n)
+	}
+	if tmpl := control.Template("ate-env", testDerivedTemplate); tmpl == nil || tmpl.GetContainers()[0].GetImage() != testRootfsImage {
+		t.Errorf("derived template missing or runs another image: %v", tmpl)
+	}
+}
+
+func TestImageStatusReportsReadyAndFailedGoldens(t *testing.T) {
+	ctx := context.Background()
+
+	client, control := newTestEnv(t)
+	seedDerivedTemplate(t, control, &ateapipb.GoldenSnapshotStatus{GoldenTag: &ateapipb.ObjectRef{Atespace: "ate-env", Name: "golden-7"}}, 0)
+	st, err := client.GetImageStatus(ctx, &ateenvv1alpha.GetImageStatusRequest{RootfsImage: testRootfsImage})
+	if err != nil {
+		t.Fatalf("GetImageStatus: %v", err)
+	}
+	if st.GetGolden() != ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_READY || st.GetGoldenTag() != "golden-7" {
+		t.Errorf("ready golden: golden=%v tag=%q, want READY golden-7", st.GetGolden(), st.GetGoldenTag())
+	}
+
+	// A failed bake is reported with its reason; ensure recreates the template
+	// once the failure is old enough and nothing uses it, and the new one bakes.
+	client, control = newTestEnv(t)
+	seedDerivedTemplate(t, control, failedGolden(), time.Hour)
+	st, err = client.GetImageStatus(ctx, &ateenvv1alpha.GetImageStatusRequest{RootfsImage: testRootfsImage})
+	if err != nil {
+		t.Fatalf("GetImageStatus: %v", err)
+	}
+	if st.GetGolden() != ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_FAILED || st.GetGoldenError() != testGoldenError {
+		t.Errorf("failed golden: golden=%v error=%q, want FAILED %q", st.GetGolden(), st.GetGoldenError(), testGoldenError)
+	}
+	st, err = client.EnsureImageTemplate(ctx, &ateenvv1alpha.EnsureImageTemplateRequest{RootfsImage: testRootfsImage})
+	if err != nil {
+		t.Fatalf("EnsureImageTemplate: %v", err)
+	}
+	if st.GetGolden() != ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_PENDING {
+		t.Errorf("after recreate: golden=%v, want PENDING", st.GetGolden())
+	}
+	if tmpl := control.Template("ate-env", testDerivedTemplate); tmpl == nil || tmpl.GetMetadata().GetUid() == "seeded" {
+		t.Errorf("failed template was not recreated: %v", tmpl)
+	}
+}

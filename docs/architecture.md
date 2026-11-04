@@ -117,8 +117,9 @@ child processes, and serves `ProcessService` and `FileSystemService`.
 ### CLI, SDKs, and integrations
 
 - **`cmd/ate-env`**: CLI for environment lifecycle (`create`, `suspend`, `delete`), server
-  inspection (`server-info`, `newServerInfoCommand`), interactive shell (`shell`), file transfer
-  (`read`, `write`), and manifest generation (`ate-env manifest`).
+  inspection (`server-info`, `newServerInfoCommand`; `image-status`, `newImageStatusCommand`),
+  interactive shell (`shell`), file transfer (`read`, `write`), and manifest generation
+  (`ate-env manifest`).
 - **`clients/go`**: Public Go SDK client (`Client`, `Env`, `Process`).
 - **`clients/python`**: Published as `ate-env-client` (import name `ate_env`). Low-level modules
   expose async `Client` and `Env`. High-level modules expose synchronous `SandboxFleet` (backed by a

@@ -20,14 +20,14 @@
 #  2. Go CLI: ate-env static binaries cross-compiled for Linux and macOS (amd64 / arm64), built
 #     into dist/ with baked-in image defaults, single SHA256SUMS_${TAG}.txt, and Cosign signatures,
 #     attached to the GitHub Release.
-#  3. Python client SDK: ate-env-client (clients/python) published to PyPI via OIDC
+#  3. Python client SDK: ate-env-rl (clients/python) published to PyPI via OIDC
 #     Trusted Publishing when the release is published and vars.PYPI_PUBLISH_ENABLED == 'true'
 #     (optional; cleanly skipped when PyPI credentials/Trusted Publishing are not yet configured).
 #  4. gRPC protos: Wire-compatible protocol buffers contracts tagged at vX.Y.Z.
 #
 # Triggers:
 #  - push tags (v*): Builds images, signs them, builds CLI, creates/updates draft GitHub Release.
-#  - release (published): Builds ate-env-client and publishes to PyPI when vars.PYPI_PUBLISH_ENABLED == 'true'.
+#  - release (published): Builds ate-env-rl and publishes to PyPI when vars.PYPI_PUBLISH_ENABLED == 'true'.
 #  - workflow_dispatch: Manual dispatch from a specific tag (republishes images/CLI by default, or
 #    backfills PyPI for an already-published release when publish_pypi=true and
 #    vars.PYPI_PUBLISH_ENABLED == 'true').

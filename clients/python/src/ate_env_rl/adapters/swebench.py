@@ -148,7 +148,7 @@ class SweBenchAdapter:
         image_prefix: str | None = None,
         template: str | None = None,
     ) -> Task:
-        """Convert a SWE-bench dataset record into an ``ate_env.Task``.
+        """Convert a SWE-bench dataset record into an ``ate_env_rl.Task``.
 
         Accepts raw Hugging Face rows (``instance_id``, ``base_commit``,
         ``test_patch``, ``FAIL_TO_PASS``, ...). The image is taken from

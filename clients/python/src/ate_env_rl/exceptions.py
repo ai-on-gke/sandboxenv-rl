@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Deprecated: Use ate_env.errors instead.
+"""Deprecated: Use ate_env_rl.errors instead.
 
-This module re-exports error classes from ate_env.errors for backwards compatibility.
+This module re-exports error classes from ate_env_rl.errors for backwards compatibility.
 """
 
 from __future__ import annotations

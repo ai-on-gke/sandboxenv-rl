@@ -21,7 +21,7 @@ fleet releases), ``handle.exec`` for commands and ``handle.write_file`` plus
 ``tar`` for file copies. Everything else in the runtime (setup, patches, reward
 grading) runs unchanged against the environment.
 
-    from ate_env import SandboxFleet, FleetConfig
+    from ate_env_rl import SandboxFleet, FleetConfig
     from ate_env_openhands.r2egym import make_fleet_repo_env, r2egym_command_files
 
     def rollout(task, handle):                 # task.metadata["ds"] is the dataset row

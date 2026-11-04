@@ -27,7 +27,7 @@ class BackendDriver(ABC):
     Governs fleet provisioning, template creation, warm-pool sizing,
     instance claims, snapshotting, and run isolation / reaping.
 
-    ``observer`` (an ``ate_env.observability.Observer``, set by the fleet)
+    ``observer`` (an ``ate_env_rl.observability.Observer``, set by the fleet)
     receives claim and warm-replica counts under the ``backend_name`` label.
     A driver belongs to one fleet; a second fleet on the same driver takes
     over its events (and logs a warning).

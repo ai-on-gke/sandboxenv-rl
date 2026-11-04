@@ -6,15 +6,16 @@ decide the reward. GRPO, full-weight Megatron training, verl v1 `separate_async`
 trainer on one 8-GPU node, vLLM rollout engines on a second 8-GPU node, both the
 agent's tool calls and the post-hoc grading in Substrate through `ate-env-api`.
 
-Pins: uni-agent `174b040` (its verl submodule `3efe38c7`), image
-`verlai/verl:vllm024.dev2`, client `ai-on-gke/sandboxenv-rl@2eccd896`, `swebench==4.1.0`, model
-revision `59d61f3c`. Validated against Agent Substrate `ddb46651` with the plaintext router. This repo's
-main now pins Substrate `v0.6.0` with router mTLS; moving the recipe to that pair is a separate change.
-Provider, task, dataset and image tooling: [`integrations/uni-agent`](../../integrations/uni-agent).
+Pins: uni-agent `174b040` (its verl submodule `3efe38c7`), image `verlai/verl:vllm024.dev2`, client
+`clients/python` (`ate-env-rl`, bundled from this checkout by `deploy.sh`), `swebench==4.1.0`, model
+revision `59d61f3c`. Validated against Agent Substrate `ddb46651` (plaintext router) and
+`ate-env-api` at `2eccd896`. This repo's main now pins Substrate `v0.6.0` with router mTLS; moving
+the recipe to that pair is a separate change. Provider, task, dataset and image tooling:
+[`integrations/uni-agent`](../../integrations/uni-agent).
 
 ## Prerequisites
 
-- Agent Substrate `ddb46651` and `ate-env-api` built from client commit `2eccd896`, installed in
+- Agent Substrate `ddb46651` and `ate-env-api` built from commit `2eccd896`, installed in
   namespace `ate-env` (Quickstart); `kubectl-ate` and `ate-env` binaries from the same commits. If
   `ate-env-api` requires a caller token, export `SUBSTRATE_ENV_AUTH_TOKEN` before `deploy.sh up`.
 - Two GKE GPU nodes with 8 GPUs each (validated on a3-ultragpu-8g / H200, no RDMA).

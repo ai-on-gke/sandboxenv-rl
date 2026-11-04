@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""One ``ate_env.Client`` per (endpoint, token) per event loop.
+"""One ``ate_env_rl.Client`` per (endpoint, token) per event loop.
 
 Harbor runs every trial of a job as an asyncio task on one loop, thus a job
 at ``-n 50`` shares one gRPC channel instead of opening fifty. The channel
@@ -26,7 +26,7 @@ import asyncio
 import atexit
 import contextlib
 
-from ate_env import Client
+from ate_env_rl import Client
 
 _clients: dict[tuple[str, str | None, int], tuple[Client, asyncio.AbstractEventLoop]] = {}
 

@@ -30,11 +30,11 @@ import grpc
 import grpc.aio
 import pytest
 
-from ate_env import AsyncSandboxFleet, Client, FleetConfig, SandboxFleet, Task
-from ate_env._gen.ateenv.v1alpha import env_pb2_grpc, guest_pb2_grpc
-from ate_env.config import TracerConfig, ValidationError
-from ate_env.loop_runner import LoopRunner
-from ate_env.telemetry import tracing
+from ate_env_rl import AsyncSandboxFleet, Client, FleetConfig, SandboxFleet, Task
+from ate_env_rl._gen.ateenv.v1alpha import env_pb2_grpc, guest_pb2_grpc
+from ate_env_rl.config import TracerConfig, ValidationError
+from ate_env_rl.loop_runner import LoopRunner
+from ate_env_rl.telemetry import tracing
 
 from .fakes import FakeEnvironmentService, FakeFileSystemService, FakeProcessService
 
@@ -49,7 +49,7 @@ def test_import_does_not_load_opentelemetry():
     code = textwrap.dedent(
         """
         import sys
-        import ate_env, ate_env.telemetry, ate_env.telemetry.tracing
+        import ate_env_rl, ate_env_rl.telemetry, ate_env_rl.telemetry.tracing
         loaded = sorted(m for m in sys.modules if m.split(".")[0] == "opentelemetry")
         assert not loaded, loaded
         print("ok")
@@ -85,9 +85,9 @@ async def test_disabled_tracing_is_a_noop():
 
 
 def test_tracer_config_is_exported_and_to_dict_is_json_serializable():
-    import ate_env
+    import ate_env_rl
 
-    assert ate_env.TracerConfig is TracerConfig
+    assert ate_env_rl.TracerConfig is TracerConfig
     cfg = FleetConfig(backend="mock", tracing=TracerConfig(enable_tracing=True))
     data = json.loads(json.dumps(cfg.to_dict()))
     assert data["tracing"] == {"enable_tracing": True, "trace_service_name": "ate-env-client"}
@@ -109,7 +109,7 @@ async def test_missing_extra_logs_one_error(monkeypatch, caplog):
     errors = [r for r in caplog.records if "tracing" in r.getMessage().lower()]
     assert len(errors) == 1, [r.getMessage() for r in errors]
     assert errors[0].levelno == logging.ERROR
-    assert "ate-env-client[tracing]" in errors[0].getMessage()
+    assert "ate-env-rl[tracing]" in errors[0].getMessage()
     assert tracing.OPENTELEMETRY_AVAILABLE is False
 
 
@@ -220,7 +220,7 @@ _APP_PROVIDER_AFTER_CLIENT = """
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-    from ate_env import Client, TracerConfig
+    from ate_env_rl import Client, TracerConfig
 
     async def main():
         # Tracing starts before the application installs its provider.
@@ -266,8 +266,8 @@ def test_client_exports_through_its_own_provider_when_endpoint_is_set():
     import logging
     logging.basicConfig(level=logging.WARNING)
     from opentelemetry import trace
-    from ate_env.config import TracerConfig
-    from ate_env.telemetry import tracing
+    from ate_env_rl.config import TracerConfig
+    from ate_env_rl.telemetry import tracing
 
     tracer = tracing.tracer_from_config(TracerConfig(enable_tracing=True))
     with tracing.start_span(tracer, "ate_env_client.op"):
@@ -307,8 +307,8 @@ def test_app_provider_after_client_wins_even_with_otlp_endpoint():
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-    from ate_env.config import TracerConfig
-    from ate_env.telemetry import tracing
+    from ate_env_rl.config import TracerConfig
+    from ate_env_rl.telemetry import tracing
 
     tracer = tracing.tracer_from_config(TracerConfig(enable_tracing=True))
     with tracing.start_span(tracer, "ate_env_client.before"):
@@ -336,8 +336,8 @@ def test_client_keeps_an_application_provider_even_with_otlp_endpoint():
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import SimpleSpanProcessor
         from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-        from ate_env.config import TracerConfig
-        from ate_env.telemetry import tracing
+        from ate_env_rl.config import TracerConfig
+        from ate_env_rl.telemetry import tracing
 
         exporter = InMemorySpanExporter()
         app = TracerProvider()
@@ -358,8 +358,8 @@ def test_client_keeps_an_application_provider_even_with_otlp_endpoint():
 
 def test_no_otlp_endpoint_builds_no_provider():
     code = """
-        from ate_env.config import TracerConfig
-        from ate_env.telemetry import tracing
+        from ate_env_rl.config import TracerConfig
+        from ate_env_rl.telemetry import tracing
 
         tracer = tracing.tracer_from_config(TracerConfig(enable_tracing=True))
         with tracing.start_span(tracer, "ate_env_client.op"):
@@ -441,7 +441,7 @@ def test_executable_attr_skips_env_assignments(command, want):
 def test_check_failure_marks_exec_span_as_error(spans):
     from opentelemetry.trace import StatusCode
 
-    from ate_env import CommandExecutionError, ExecResult
+    from ate_env_rl import CommandExecutionError, ExecResult
 
     cfg = FleetConfig(backend="mock", strategy="naive", tracing=TracerConfig(enable_tracing=True))
     fleet = SandboxFleet(cfg)
@@ -754,7 +754,7 @@ def test_nests_mock_fleet_phases(spans):
 
 def test_nests_observability_switch_enables_client_spans(spans, threaded_fake_server):
     """ObservabilityConfig.enable_tracing alone traces the client too, under one service."""
-    from ate_env.config import ObservabilityConfig
+    from ate_env_rl.config import ObservabilityConfig
 
     cfg = FleetConfig(
         backend="substrate",
@@ -889,7 +889,7 @@ def test_rpc_attrs_follow_the_semconv_mode(monkeypatch, mode, want):
 
 def test_rpc_semconv_mode_is_read_from_the_environment_at_import():
     code = (
-        "from ate_env.telemetry import tracing; "
+        "from ate_env_rl.telemetry import tracing; "
         "print(sorted(tracing.rpc_attrs('s.S', 'M', None)))"
     )
     env = {k: v for k, v in os.environ.items() if k != "OTEL_SEMCONV_STABILITY_OPT_IN"}
@@ -915,7 +915,7 @@ async def test_cancelled_exec_async_marks_span_as_error(spans):
 
     from opentelemetry.trace import StatusCode
 
-    from ate_env.handle import SandboxHandle
+    from ate_env_rl.handle import SandboxHandle
 
     class HangingRuntime:
         async def exec_async(self, *args, **kwargs):
@@ -1024,7 +1024,7 @@ def test_first_command_marks_only_the_first_exec_per_sandbox(spans, threaded_fak
 
 
 async def test_client_builds_no_attributes_with_tracing_off(monkeypatch):
-    import ate_env.client as client_mod
+    import ate_env_rl.client as client_mod
 
     def fail(*args, **kwargs):
         raise AssertionError("attribute work on the tracing-off path")

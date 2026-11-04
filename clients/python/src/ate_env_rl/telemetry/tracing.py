@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OpenTelemetry tracing for the ate_env client, behind the ``tracing`` extra.
+"""OpenTelemetry tracing for the ate_env_rl client, behind the ``tracing`` extra.
 
 Derived from agent-sandbox's ``k8s_agent_sandbox/trace_manager.py``:
 ``ate_env_client.<op>`` span names, a per-client ``TracerManager`` and W3C
@@ -28,7 +28,7 @@ that provider is never made global, so OpenTelemetry never refuses the
 application's provider.
 
 OpenTelemetry is imported lazily, the first time tracing is enabled, so
-``import ate_env`` never imports it even when it is installed. Without the
+``import ate_env_rl`` never imports it even when it is installed. Without the
 extra every entry point is a no-op and enabling tracing logs one error naming
 the missing extra.
 """
@@ -63,16 +63,16 @@ from .trace_recorder import (
 if TYPE_CHECKING:
     from ..config import TracerConfig
 
-logger = logging.getLogger("ate_env.telemetry.tracing")
+logger = logging.getLogger("ate_env_rl.telemetry.tracing")
 
-# Span name prefix of every span the ate_env client library emits. The
+# Span name prefix of every span the ate_env_rl client library emits. The
 # TracerConfig service name is the OTel resource ``service.name``; it does not
 # rename spans, so fleet and client spans keep one vocabulary.
 CLIENT_SPAN_PREFIX = "ate_env_client"
 
 _MISSING_EXTRA_MSG = (
     "OpenTelemetry not installed; tracing disabled. "
-    "Install the tracing extra: pip install 'ate-env-client[tracing]'"
+    "Install the tracing extra: pip install 'ate-env-rl[tracing]'"
 )
 
 # W3C trace-context carrier keys. Baggage is deliberately never propagated.

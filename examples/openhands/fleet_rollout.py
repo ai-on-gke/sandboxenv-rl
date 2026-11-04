@@ -17,7 +17,7 @@ each rollout binds an OpenHands workspace to its handle, the fleet releases.
 
 The agent-sandbox-rl rollout shape, with the imports changed:
 
-    fleet = ate_env.SandboxFleet(FleetConfig(backend="substrate", ...))
+    fleet = ate_env_rl.SandboxFleet(FleetConfig(backend="substrate", ...))
     def rollout(task, handle):
         workspace = ate_env_openhands.make_handle_workspace(handle, api_key=KEY)
         ...
@@ -39,9 +39,9 @@ import os
 import sys
 import time
 
-from ate_env import FleetConfig, SandboxFleet, Task
-from ate_env.config import SecretStr
 from ate_env_openhands import make_handle_workspace
+from ate_env_rl import FleetConfig, SandboxFleet, Task
+from ate_env_rl.config import SecretStr
 
 
 def main() -> int:

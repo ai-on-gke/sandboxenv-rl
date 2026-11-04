@@ -23,7 +23,7 @@ State on `main` with #221:
 | Item            | Requirement  | State                                                                                                                                                                                                     |
 | --------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | P-9, P-10, P-11 | AC-15        | Fixed by #221. Before it, a recycle or `warm_pool` that awaited across a reap pooled its actor after the teardown, and overlapping `warm_pool` calls each provisioned the full shortfall.                 |
-| P-14            | AC-3.4       | Open. `SandboxHandle.exec` and `exec_async` (`clients/python/src/ate_env/handle.py`) call `_note_first_command()` before `_exec_span` starts the span, so another thread's exec span can start first.     |
+| P-14            | AC-3.4       | Open. `SandboxHandle.exec` and `exec_async` (`clients/python/src/ate_env_rl/handle.py`) call `_note_first_command()` before `_exec_span` starts the span, so another thread's exec span can start first.  |
 | P-24            | AC-15.7      | Open. A warm claim pops an actor and awaits `get()`; if a reap deletes the actor meanwhile and `get()` still succeeds, `acquire` returns a deleted environment. See the findings.                         |
 | P-10            | AC-15.8      | Open. A `warm_pool` call cancelled during its `create()` calls leaks the actors already created: they are neither pooled nor tracked.                                                                     |
 | P-10            | AC-15.9      | Open. A delete cancelled after the run's reap, or a `release` whose delete fails or is cancelled while a reap runs, leaves the actor under the reaped run id; no later reap deletes it. See the findings. |
@@ -89,7 +89,7 @@ environment id, actor id, run id or image tag, and no family defines a label nam
 
 ## W3C context propagation (AC-4)
 
-P-4 to P-7 are properties of `inject_metadata` (`ate_env.telemetry.tracing`).
+P-4 to P-7 are properties of `inject_metadata` (`ate_env_rl.telemetry.tracing`).
 
 ### P-4: Caller metadata is preserved
 
@@ -184,7 +184,7 @@ execs started concurrently from several threads, exactly one `ate_env_client.exe
 - Fails on `main` (open, not addressed by #221). A run of this property against the series' code,
   with execs started concurrently on one handle, marked a span that was not the first started in 9
   of 12 runs. No run marked more than one span, so "exactly one" held and "the first started" did
-  not. The cause is in `clients/python/src/ate_env/handle.py`: `exec` and `exec_async` call
+  not. The cause is in `clients/python/src/ate_env_rl/handle.py`: `exec` and `exec_async` call
   `_note_first_command()` before `_exec_span` starts the span. `_note_first_command` is also a
   check-and-set without a lock. The fix belongs in the code; the property stays as written.
 
@@ -227,7 +227,7 @@ then other phases in first-seen order, then `TOTAL`. `json.loads(json.dumps(to_d
 
 ### P-17: Lazy, single registration with documented labels
 
-_For any_ sequence of operations from {import, reload `ate_env.observability`, create
+_For any_ sequence of operations from {import, reload `ate_env_rl.observability`, create
 `Observer(enable_metrics=b)`, record a client timing}, nothing is registered before the first
 metrics-enabled `Observer` or client timing. After it, each documented family (including
 `ate_env_fleet_release_failures_total{backend}`) is registered exactly once with exactly its
@@ -450,7 +450,7 @@ The requirement numbers the properties validate. Each refines the criterion of t
 | ID      | Requirement                                                                                                                        |
 | ------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | AC-1.1  | The base install depends only on `grpcio` and `protobuf` and offers the extras `tracing` and `metrics`.                            |
-| AC-1.2  | Importing `ate_env`, `ate_env.observability` or `ate_env.telemetry` in the base install loads neither extra.                       |
+| AC-1.2  | Importing `ate_env_rl`, `ate_env_rl.observability` or `ate_env_rl.telemetry` in the base install loads neither extra.              |
 | AC-2.1  | With a layer enabled and its extra missing, the run completes and `fleet.report` exists.                                           |
 | AC-2.2  | Each enabled layer missing its extra logs exactly one `ERROR` or `WARNING` naming the extra.                                       |
 | AC-2.3  | Telemetry code raises no exception.                                                                                                |
@@ -474,7 +474,7 @@ The requirement numbers the properties validate. Each refines the criterion of t
 | AC-7.5  | `summary()` rows follow `ORDER`, then other phases first-seen, then `TOTAL`; `to_dict()` survives a JSON round trip.               |
 | AC-7.6  | A mock run records the documented phase set.                                                                                       |
 | AC-7.7  | `add_release_error()` adds 1 to `release_errors`; `summary()` prints `release_errors=N` while it is nonzero.                       |
-| AC-8.1  | Importing `ate_env` or `ate_env.observability` registers nothing.                                                                  |
+| AC-8.1  | Importing `ate_env_rl` or `ate_env_rl.observability` registers nothing.                                                            |
 | AC-8.2  | The first metrics-enabled `Observer` or client timing registers each documented family once, with exactly its labels.              |
 | AC-8.3  | A second `Observer` or a module reload neither raises nor registers a family twice.                                                |
 | AC-8.4  | `serve_metrics(port)` answers `/metrics`.                                                                                          |

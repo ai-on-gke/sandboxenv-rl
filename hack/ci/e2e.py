@@ -23,7 +23,7 @@ What it does:
   5. Compiles container images (ateworker-gvisor, ate-env-api, ate-env-guest) using ko to target registry.
   6. Applies Kubernetes manifests (atespace, access policy, caller auth Secret, WorkerPool, and ate-env-api with metrics).
   7. Registers ActorTemplate with target snapshot bucket, environment marker, and waits for golden snapshot.
-  8. Forwards a free local port and runs portable smoke test and Python SDK full-stack tests.
+  8. Forwards a free local port and runs portable smoke test, Python SDK full-stack tests, NeMo Gym provider live test, swebench-loader Go SDK smoke test, and Harbor provider live trial test.
 
 When it runs:
   - CI: .github/workflows/ci.yaml in job `e2e-kind` on PR and push to main.
@@ -43,6 +43,7 @@ How to run:
 Prerequisites:
   - Docker daemon running and accessible (socket mounted if inside container).
   - Tools on PATH: go, ko, kind, kubectl, pytest (all provided in nix develop or Dockerfile.ci).
+  - Harbor runner: nix (for .#python-env-harbor), HARBOR_PYTEST_BIN, or harbor on PATH.
 
 Environment variables:
   REUSE_CLUSTER                   (unset)             Existing cluster name to run against; never created or deleted
@@ -50,9 +51,10 @@ Environment variables:
   NAMESPACE                       ate-env             Kubernetes namespace for ate-env deployment
   LOCAL_PORT                      (free port)         Local port on host for ate-env-api port-forward (free port by default)
   TEMPLATE_NAME                   default-template    Name of ActorTemplate to register and test
-  ATE_ENV_ROOTFS_IMAGE            (target default)    Rootfs image for test_create_from_image; empty disables
+  ATE_ENV_ROOTFS_IMAGE            (target default)    Rootfs image for test_create_from_image and swebench-loader; empty skips both
   ATE_INGRESS_ALLOWED_SPIFFE_IDS  (auto)              Allowed SPIFFE IDs for router TLS ingress
   PYTEST_BIN                      (auto)              Path to pytest binary or python test runner
+  HARBOR_PYTEST_BIN               (auto)              Path to pytest binary with harbor installed (defaults to .#python-env-harbor or host PATH)
 
 Outputs / exit codes:
   - Provisions test cluster and Docker containers; publishes images to target registry.
@@ -67,19 +69,22 @@ Troubleshooting:
 
 See also:
   hack/ci/targets.py, hack/ci/test_smoke.py, hack/ci/ensure-substrate.sh,
-  clients/python/tests/e2e/test_full_stack.py, Makefile, nix/ci.nix.
+  clients/python/tests/e2e/test_full_stack.py, integrations/nemo-gym/tests/test_e2e.py,
+  integrations/harbor/tests/test_e2e.py, cmd/benchmarking/swebench-loader, Makefile, nix/ci.nix.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import json
 import os
 import re
 import shutil
 import socket
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -293,6 +298,46 @@ def pick_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _candidate_bin_dirs(binary: Path) -> list[Path]:
+    return list(dict.fromkeys((binary.absolute().parent, binary.resolve().parent)))
+
+
+def resolve_harbor_runner(root: Path) -> tuple[list[str], str]:
+    if hb_pytest := os.environ.get("HARBOR_PYTEST_BIN"):
+        cand = Path(hb_pytest).expanduser()
+        resolved = cand if cand.is_file() else Path(shutil.which(hb_pytest) or "")
+        if not resolved.is_file():
+            raise RuntimeError(f"HARBOR_PYTEST_BIN={hb_pytest} was not found")
+        candidate_dirs = _candidate_bin_dirs(resolved)
+        for parent_dir in candidate_dirs:
+            if (parent_dir / "harbor").is_file():
+                return [str(resolved.absolute())], str(parent_dir)
+        searched = ", ".join(str(d) for d in candidate_dirs)
+        raise RuntimeError(f"harbor binary not found alongside HARBOR_PYTEST_BIN in {searched}")
+    if shutil.which("nix"):
+        out_paths = (
+            lib.run(
+                "nix", "build", "--no-link", "--print-out-paths", ".#python-env-harbor",
+                cwd=str(root),
+            ).stdout.strip().splitlines()
+        )
+        harbor_env = Path(out_paths[-1])
+        return [str(harbor_env / "bin/pytest")], str(harbor_env / "bin")
+    if harbor_bin := shutil.which("harbor"):
+        candidate_dirs = _candidate_bin_dirs(Path(harbor_bin))
+        for harbor_dir in candidate_dirs:
+            if (harbor_dir / "pytest").is_file():
+                return [str(harbor_dir / "pytest")], str(harbor_dir)
+        for harbor_dir in candidate_dirs:
+            if (harbor_dir / "python").is_file():
+                return [str(harbor_dir / "python"), "-m", "pytest"], str(harbor_dir)
+        searched = ", ".join(str(d) for d in candidate_dirs)
+        raise RuntimeError(f"Neither pytest nor python found alongside harbor in {searched}")
+    raise RuntimeError(
+        "Harbor live E2E requires Nix (.#python-env-harbor), HARBOR_PYTEST_BIN, or harbor on PATH"
+    )
+
+
 def run_tests(
     root: Path,
     target: KindTarget,
@@ -301,6 +346,8 @@ def run_tests(
     tmpl: str,
     port: int,
     auth_token: str,
+    harbor_py: list[str],
+    harbor_bin_dir: str,
 ) -> None:
     lib.step(f"Running test suites under port-forward on 127.0.0.1:{port}...")
     with lib.port_forward(target.context, ns, "svc/ate-env-api", port):
@@ -318,6 +365,9 @@ def run_tests(
             ATE_ENV_EXPECT_METRICS="1",
             ATE_ENV_EXPECTED_MARKER=TEMPLATE_MARKER,
             ATE_ENV_EXPECT_PORT_PROXY_ALLOWLIST="1",
+            # Editable .pth files in nix/python.nix:65 resolve workspace packages from
+            # $REPO_ROOT at run time, and only pureEnvSetup exports it.
+            REPO_ROOT=str(root),
         )
         py = [
             os.environ.get("PYTEST_BIN") or shutil.which("pytest") or sys.executable,
@@ -327,6 +377,106 @@ def run_tests(
         lib.run(*py, str(root / "hack/ci/test_smoke.py"), "-v", env=test_env, capture=False)
         lib.step("Running live Python SDK integration tests...")
         lib.run(*py, str(root / "clients/python/tests/e2e/test_full_stack.py"), "-v", env=test_env, capture=False)
+
+        lib.step("Running NeMo Gym provider live E2E test...")
+        lib.run(
+            *py,
+            str(root / "integrations/nemo-gym/tests/test_e2e.py"),
+            "-k",
+            "test_full_lifecycle",
+            "-v",
+            env={
+                **test_env,
+                "SUBSTRATE_E2E_API_URL": f"127.0.0.1:{port}",
+                "SUBSTRATE_E2E_TEMPLATE": tmpl,
+                "SUBSTRATE_E2E_ATESPACE": ns,
+            },
+            capture=False,
+        )
+
+        if target.rootfs_image:
+            lib.step("Running swebench-loader Go SDK live smoke test...")
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_path = Path(tmp_dir)
+                manifest = tmp_path / "manifest.jsonl"
+                manifest.write_text(
+                    json.dumps(
+                        {
+                            "instance_id": "smoke-cmd-1",
+                            "kind": "command",
+                            "command": "echo swebench-live-ok",
+                            "expected_stdout": "swebench-live-ok",
+                            "image": target.rootfs_image,
+                        }
+                    )
+                    + "\n"
+                )
+                events_jsonl = tmp_path / "events.jsonl"
+                summary_json = tmp_path / "summary.json"
+                loader_bin = tmp_path / "swebench-loader"
+                lib.run(
+                    "go", "-C", str(root), "build", "-o", str(loader_bin),
+                    "./cmd/benchmarking/swebench-loader",
+                    capture=False,
+                )
+                lib.run(
+                    str(loader_bin),
+                    "run",
+                    "-dataset",
+                    str(manifest),
+                    "-endpoint",
+                    f"127.0.0.1:{port}",
+                    "-atespace",
+                    ns,
+                    "-base-template",
+                    tmpl,
+                    "-mode",
+                    "eval",
+                    "-images",
+                    "1",
+                    "-tasks-per-image",
+                    "1",
+                    "-width",
+                    "1",
+                    "-connections",
+                    "1",
+                    "-out",
+                    str(events_jsonl),
+                    env=test_env,
+                    capture=False,
+                )
+                lib.run(
+                    str(loader_bin),
+                    "report",
+                    str(events_jsonl),
+                    "-json",
+                    str(summary_json),
+                    env=test_env,
+                    capture=False,
+                )
+                summary = json.loads(summary_json.read_text())
+                if (
+                    summary.get("tasks") != 1
+                    or summary.get("failed") != 0
+                    or summary.get("rewarded") != 1
+                ):
+                    raise RuntimeError(f"swebench-loader run failed: {summary}")
+
+        lib.step("Running Harbor provider live trial E2E test...")
+        harbor_path = f"{harbor_bin_dir}:{test_env.get('PATH', '')}"
+        lib.run(
+            *harbor_py,
+            str(root / "integrations/harbor/tests/test_e2e.py"),
+            "-v",
+            env={
+                **test_env,
+                "SUBSTRATE_E2E_API_URL": f"127.0.0.1:{port}",
+                "HB_E2E_TEMPLATE": tmpl,
+                "HB_E2E_ATESPACE": ns,
+                "PATH": harbor_path,
+            },
+            capture=False,
+        )
 
 
 def main() -> None:
@@ -343,6 +493,17 @@ def main() -> None:
     port = pick_port()
     tmpl = os.environ.get("TEMPLATE_NAME", "default-template")
 
+    harbor_future: concurrent.futures.Future[tuple[list[str], str]] | None = None
+    executor: concurrent.futures.ThreadPoolExecutor | None = None
+    harbor_py: list[str] = []
+    harbor_bin_dir = ""
+
+    if not os.environ.get("HARBOR_PYTEST_BIN") and shutil.which("nix"):
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        harbor_future = executor.submit(resolve_harbor_runner, root)
+    else:
+        harbor_py, harbor_bin_dir = resolve_harbor_runner(root)
+
     target = KindTarget(sub_dir=sub_dir, namespace=ns)
 
     try:
@@ -350,10 +511,16 @@ def main() -> None:
         ate_ctl, ate_env = build_cli_tools(root, sub_dir)
         imgs = build_images(root, sub_dir, target)
         auth_token = deploy_manifests(target, ate_ctl, ate_env, ns, tmpl, imgs)
-        run_tests(root, target, ate_env, ns, tmpl, port, auth_token)
+        if harbor_future is not None:
+            harbor_py, harbor_bin_dir = harbor_future.result()
+        run_tests(root, target, ate_env, ns, tmpl, port, auth_token, harbor_py, harbor_bin_dir)
         lib.step("PASS: E2E Kind pipeline succeeded!")
     finally:
-        target.teardown()
+        try:
+            if executor is not None:
+                executor.shutdown(wait=True)
+        finally:
+            target.teardown()
 
 
 if __name__ == "__main__":

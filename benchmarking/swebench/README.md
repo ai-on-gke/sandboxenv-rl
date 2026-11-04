@@ -215,8 +215,8 @@ staying the source of truth so a run does not depend on a collector.
    ```bash
    cat > domains.json <<'EOF'
    {"domains": [
-     {"name": "d0", "selector": {"ate-env/domain": "d0"}, "nodes": 4, "node_cache_bytes": 400000000000},
-     {"name": "d1", "selector": {"ate-env/domain": "d1"}, "nodes": 4, "node_cache_bytes": 400000000000}
+     {"name": "d0", "selector": {"ate-env/domain": "d0"}, "nodes": 4, "node_cache_bytes": 400000000000, "node_slots": 16},
+     {"name": "d1", "selector": {"ate-env/domain": "d1"}, "nodes": 4, "node_cache_bytes": 400000000000, "node_slots": 16}
    ]}
    EOF
    swebench-loader plan-placement -dataset swebench-verified.jsonl -schedule schedule.json \
@@ -225,7 +225,9 @@ staying the source of truth so a run does not depend on a collector.
 
    `node_cache_bytes` is the unpacked bytes one node may hold for the plan:
    the image-cache volume times atelet's low watermark (`--image-cache-low-percent`),
-   minus headroom. Sizes come from the manifest's `image_bytes_compressed`
+   minus headroom; `node_slots`, optional, is how many environments one node
+   runs at once, which caps the pre-flight's concurrency. Sizes come from the
+   manifest's `image_bytes_compressed`
    (make-dataset.py records it) times `-unpack-factor` (default 2.5); an image
    without a size gets `-default-image-size` and is marked `size_assumed`. The
    planner takes the largest image first and gives each image its
@@ -238,31 +240,35 @@ staying the source of truth so a run does not depend on a collector.
    create into its image's domain.
 
 5. Optional: warm the nodes from the plan. The PreflightWarmer ensures each
-   image's derived template and waits for its golden snapshot (the bake
-   throughput is 5 per ateapi replica, about two minutes each: scale
-   `ate-api-server` for a large image set, or run a first pass with
-   `-skip-golden-wait` to pull the layers while the bakes run and a second
-   without it), then per (image, domain) creates probe environments with the
-   domain's worker selector, round after round, until every node of the
-   domain has run the image once; each probe's first command returns when
-   the layers and the golden snapshot are on its node, and the node is read
-   back from `ate-env-api`:
+   image's derived template, which starts its golden bake (5 at a time per
+   ateapi replica, about two minutes each: scale `ate-api-server` for a
+   large image set), then warms every domain in parallel: as soon as an
+   image's golden is ready it creates probe environments with the domain's
+   worker selector, round after round, until every node of the domain has
+   run the image once. A domain warms `-image-concurrency` images at once
+   (default 4; `node_slots` in `domains.json` caps it at
+   `node_slots / -probes-per-node`), so the bakes and the node warming
+   overlap and the slots stay busy; the probes of concurrent images share
+   the nodes, so an image can need a second round. Each probe's first
+   command returns when
+   the layers and the golden snapshot are on its node; the node is read back
+   from `ate-env-api` and the probe is deleted:
 
    ```bash
    swebench-loader preflight -plan image-placement.json -events-dir runs/pf-$(date +%s) \
      -endpoint 127.0.0.1:7777 -auth-token-file token -probes-per-node 2 -max-rounds 3
    ```
 
-   It writes `events/preflight.jsonl` (a `prewarm` event per image, which
-   Validity Rule 1 and the report count, a `preflight_golden` per image and a
-   `preflight_probe` per probe with its node) and `preflight-coverage.json`
-   (`schema_version: v1`): per domain the nodes seen and per image the nodes
-   covered, probes, rounds and failures. It exits non-zero when a golden is
-   not ready or a pair is short of its nodes, and says which. `-pin` leaves
-   the probes suspended instead of deleting them: their local snapshots pin
-   them to their nodes and keep the layers referenced, so nothing changes
-   before the run; delete them after it (`ate-env delete`, they are named
-   `<run-id>-<domain>-<image>-<round>-<slot>`).
+   It writes `preflight-events.jsonl` (a `preflight_template` and a
+   `preflight_golden` per image, a `preflight_probe` per probe with its
+   node; next to the run's `events/` directory, not in it, so the run report
+   does not count them) and `preflight-coverage.json` (`schema_version: v1`):
+   per domain the nodes seen and per image the nodes covered, probes, rounds
+   and failures. It exits non-zero when a golden is not ready or a pair is
+   short of its nodes, and says which. `-golden-timeout` (default 30 min)
+   gives up on the goldens still baking once none became ready for that
+   long. The probes are deleted: the planner keeps each node's assigned
+   images under atelet's GC low watermark, so the layers stay until the run.
 
 ## Run
 

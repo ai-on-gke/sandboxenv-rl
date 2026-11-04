@@ -108,6 +108,9 @@ HTTP and `CONNECT` router), and `testcerts` (dynamic SPIFFE client certificates)
 
 ### Agent workflows in `.agents/skills/`
 
+- Cutting releases: follow
+  [.agents/skills/create-release/SKILL.md](../../.agents/skills/create-release/SKILL.md) for
+  generating release notes, pushing tags, attaching signed assets, and publishing to PyPI and GHCR.
 - Adding a new RPC: follow
   [.agents/skills/extend-env-surface/SKILL.md](../../.agents/skills/extend-env-surface/SKILL.md) for
   proto definition, stubs, guest execution, `s.guestConn` with `ensureAwake`, and SDK methods.

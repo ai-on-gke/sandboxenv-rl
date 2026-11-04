@@ -84,7 +84,14 @@ type fakeAPI struct {
 	statusCalls      map[string]int
 	goldenReadyAfter int
 	goldenFail       map[string]string
-	ensured          []string
+	goldenDisabled   bool
+	// goldenPendingForever names images whose golden never gets ready.
+	goldenPendingForever map[string]bool
+	ensured              []string
+	// images is the rootfs image per environment.
+	images map[string]string
+	// inflight and maxInflight count the environments alive per domain.
+	inflight, maxInflight map[string]int
 }
 
 func (f *fakeAPI) CreateEnvironment(_ context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (*ateenvv1alpha.CreateEnvironmentResponse, error) {
@@ -92,6 +99,7 @@ func (f *fakeAPI) CreateEnvironment(_ context.Context, req *ateenvv1alpha.Create
 	defer f.mu.Unlock()
 	f.created = append(f.created, req.GetId())
 	f.selectors[req.GetId()] = req.GetWorkerSelector()
+	f.images[req.GetId()] = req.GetRootfsImage()
 	domain := req.GetWorkerSelector()["ate-env/domain"]
 	node := "node-any"
 	if list := f.domainNodes[domain]; len(list) > 0 {
@@ -103,6 +111,8 @@ func (f *fakeAPI) CreateEnvironment(_ context.Context, req *ateenvv1alpha.Create
 		node = list[idx]
 	}
 	f.nodes[req.GetId()] = node
+	f.inflight[domain]++
+	f.maxInflight[domain] = max(f.maxInflight[domain], f.inflight[domain])
 	return &ateenvv1alpha.CreateEnvironmentResponse{Environment: &ateenvv1alpha.Environment{Id: req.GetId(), Atespace: req.GetAtespace(), WorkerSelector: req.GetWorkerSelector()}}, nil
 }
 
@@ -132,6 +142,9 @@ func (f *fakeAPI) imageStatusLocked(image string) *ateenvv1alpha.ImageStatus {
 	st.TemplateExists = true
 	f.statusCalls[image]++
 	switch {
+	case f.goldenDisabled:
+	case f.goldenPendingForever[image]:
+		st.Golden = ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_PENDING
 	case f.goldenFail[image] != "":
 		st.Golden = ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_FAILED
 		st.GoldenError = f.goldenFail[image]
@@ -175,6 +188,7 @@ func (f *fakeAPI) DeleteEnvironment(_ context.Context, req *ateenvv1alpha.Delete
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleted = append(f.deleted, req.GetId())
+	f.inflight[f.selectors[req.GetId()]["ate-env/domain"]]--
 	return &ateenvv1alpha.DeleteEnvironmentResponse{}, nil
 }
 
@@ -242,6 +256,9 @@ func newFakeBackend(t *testing.T, api *fakeAPI) *EnvBackend {
 	api.domainCounter = map[string]int{}
 	api.nodes = map[string]string{}
 	api.selectors = map[string]map[string]string{}
+	api.inflight = map[string]int{}
+	api.maxInflight = map[string]int{}
+	api.images = map[string]string{}
 	api.templates = map[string]bool{}
 	api.statusCalls = map[string]int{}
 	if api.goldenFail == nil {

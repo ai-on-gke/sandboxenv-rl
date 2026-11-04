@@ -378,16 +378,15 @@ func preflightCmd(args []string, stderr io.Writer) (retErr error) {
 		connections   = fs.Int("connections", 1, "gRPC connections to ate-env-api.")
 		authTokenFile = fs.String("auth-token-file", "", "File with the ate-env-api bearer token; SUBSTRATE_ENV_AUTH_TOKEN otherwise.")
 		runID         = fs.String("run-id", "pf", "Prefix of the probe environment names (at most 20 characters).")
-		eventsDir     = fs.String("events-dir", "", "Directory for events/preflight.jsonl and preflight-coverage.json; required unless -out is given.")
+		eventsDir     = fs.String("events-dir", "", "Directory for preflight-events.jsonl and preflight-coverage.json; required unless -out is given.")
 		out           = fs.String("out", "", "Events file to write instead of -events-dir.")
 		coverageOut   = fs.String("coverage-out", "", "Where to write preflight-coverage.json; default <events-dir>/preflight-coverage.json.")
 		probesPerNode = fs.Int("probes-per-node", 2, "Probes a round starts per node of a domain; the round holds them until all are placed.")
+		imageConc     = fs.Int("image-concurrency", 4, "Images a domain warms at once; node_slots in the plan caps it at node_slots / probes-per-node.")
 		maxRounds     = fs.Int("max-rounds", 3, "Rounds per (image, domain) before the pair is reported short.")
-		goldenTimeout = fs.Duration("golden-timeout", 30*time.Minute, "How long to wait for one image's golden snapshot.")
+		goldenTimeout = fs.Duration("golden-timeout", 30*time.Minute, "Give up on the goldens still baking once none became ready for this long.")
 		goldenPoll    = fs.Duration("golden-poll", 10*time.Second, "How often to poll a baking golden.")
-		skipGolden    = fs.Bool("skip-golden-wait", false, "Ensure the templates and move on without waiting for the goldens: a layer-only wave while the bakes run.")
 		probeTimeout  = fs.Duration("probe-timeout", 10*time.Minute, "Bound on one probe's create and first command.")
-		pin           = fs.Bool("pin", false, "Suspend the probes instead of deleting them, so they pin their nodes and hold the layers against GC until the run deletes them.")
 		images        = fs.String("images", "", "Comma-separated images to restrict the pass to; default every image of the plan.")
 		domains       = fs.String("domains", "", "Comma-separated domains to restrict the pass to; default every domain of the plan.")
 	)
@@ -429,46 +428,46 @@ func preflightCmd(args []string, stderr io.Writer) (retErr error) {
 		backend = b
 	}
 
-	var rec *swebench.Recorder
-	var f *os.File
+	// The events go next to the run's events/ directory, not into it: the
+	// run report aggregates events/*.jsonl and must not count the probes.
+	eventsPath := *out
 	if *eventsDir != "" {
-		if rec, err = swebench.NewShardRecorder(*eventsDir, *runID, "preflight"); err != nil {
+		if err := os.MkdirAll(*eventsDir, 0o755); err != nil {
 			return err
 		}
-	} else {
-		if f, err = os.Create(*out); err != nil {
-			return err
-		}
-		rec = swebench.NewRecorder(f)
+		eventsPath = filepath.Join(*eventsDir, "preflight-events.jsonl")
 	}
+	f, err := os.Create(eventsPath)
+	if err != nil {
+		return err
+	}
+	rec := swebench.NewRecorder(f)
+	rec.SetWorker("preflight")
 	defer func() {
 		if rerr := rec.Close(); rerr != nil && retErr == nil {
 			retErr = fmt.Errorf("writing events: %w", rerr)
 		}
-		if f != nil {
-			if cerr := f.Close(); cerr != nil && retErr == nil {
-				retErr = fmt.Errorf("closing %s: %w", *out, cerr)
-			}
+		if cerr := f.Close(); cerr != nil && retErr == nil {
+			retErr = fmt.Errorf("closing %s: %w", eventsPath, cerr)
 		}
 	}()
 
 	log := slog.New(slog.NewJSONHandler(stderr, nil))
 	warmer, err := swebench.NewPreflightWarmer(swebench.PreflightOptions{
-		Plan:           placement,
-		PlanPath:       *plan,
-		Backend:        backend,
-		Recorder:       rec,
-		Logger:         log,
-		RunID:          *runID,
-		ProbesPerNode:  *probesPerNode,
-		MaxRounds:      *maxRounds,
-		GoldenTimeout:  *goldenTimeout,
-		GoldenPoll:     *goldenPoll,
-		SkipGoldenWait: *skipGolden,
-		ProbeTimeout:   *probeTimeout,
-		Pin:            *pin,
-		Images:         splitList(*images),
-		Domains:        splitList(*domains),
+		Plan:             placement,
+		PlanPath:         *plan,
+		Backend:          backend,
+		Recorder:         rec,
+		Logger:           log,
+		RunID:            *runID,
+		ProbesPerNode:    *probesPerNode,
+		ImageConcurrency: *imageConc,
+		MaxRounds:        *maxRounds,
+		GoldenTimeout:    *goldenTimeout,
+		GoldenPoll:       *goldenPoll,
+		ProbeTimeout:     *probeTimeout,
+		Images:           splitList(*images),
+		Domains:          splitList(*domains),
 	})
 	if err != nil {
 		return err
@@ -499,15 +498,18 @@ func splitList(s string) []string {
 }
 
 func printPreflightSummary(w io.Writer, r *schema.PreflightCoverage, path string) {
-	ready := 0
+	ready, none := 0, 0
 	for _, g := range r.Goldens {
-		if g.State == "ready" || g.State == "skipped" {
+		switch {
+		case g.State == "ready":
 			ready++
+		case swebench.GoldenSettled(g):
+			none++
 		}
 	}
 	fmt.Fprintf(w, "pre-flight %s: goldens %d/%d ready", map[bool]string{true: "complete", false: "INCOMPLETE"}[r.Complete], ready, len(r.Goldens))
-	if r.Pinned {
-		fmt.Fprint(w, ", probes left suspended")
+	if none > 0 {
+		fmt.Fprintf(w, ", %d without a golden (disabled on the template)", none)
 	}
 	fmt.Fprintf(w, "; wrote %s\n", path)
 	for _, d := range r.Domains {
@@ -525,7 +527,7 @@ func printPreflightSummary(w io.Writer, r *schema.PreflightCoverage, path string
 		}
 	}
 	for _, g := range r.Goldens {
-		if g.State != "ready" && g.State != "skipped" {
+		if !swebench.GoldenSettled(g) {
 			fmt.Fprintf(w, "  golden %s: %s %s\n", g.Image, g.State, g.Error)
 		}
 	}

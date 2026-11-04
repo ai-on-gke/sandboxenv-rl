@@ -31,9 +31,6 @@ type PreflightCoverage struct {
 	FinishedAt    time.Time `json:"finished_at"`
 	// Plan is the image-placement.json the pre-flight ran; "" when unknown.
 	Plan string `json:"plan,omitempty"`
-	// Pinned is true when the probes were suspended, not deleted, so their
-	// local snapshots pin them to their nodes and hold the layers against GC.
-	Pinned bool `json:"pinned"`
 	// Goldens is the golden state the pre-flight left each image in.
 	Goldens []GoldenRecord   `json:"goldens"`
 	Domains []DomainCoverage `json:"domains"`
@@ -47,8 +44,8 @@ type PreflightCoverage struct {
 type GoldenRecord struct {
 	Image    string `json:"image"`
 	Template string `json:"template,omitempty"`
-	// State is none, pending, ready, failed, or skipped when the pre-flight
-	// did not wait.
+	// State is ready, none (goldens are disabled on the base template),
+	// failed, or pending when the pre-flight gave up waiting.
 	State string `json:"state"`
 	Tag   string `json:"tag,omitempty"`
 	Error string `json:"error,omitempty"`
@@ -79,8 +76,6 @@ type ImageCoverage struct {
 	Failed   int  `json:"failed"`
 	Rounds   int  `json:"rounds"`
 	Complete bool `json:"complete"`
-	// Pinned lists the environments left suspended on the nodes, by node.
-	Pinned map[string]string `json:"pinned,omitempty"`
 	// Error is the last probe error when the image could not be covered.
 	Error string `json:"error,omitempty"`
 }

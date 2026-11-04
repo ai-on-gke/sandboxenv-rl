@@ -84,6 +84,8 @@ See [docs/architecture.md](./docs/architecture.md), [docs/glossary.md](./docs/gl
 See [docs/dev/code-layout.md](./docs/dev/code-layout.md) for package responsibilities, decision
 rules, and directory layout. Agent skills in `.agents/skills/`:
 
+- [create-release](./.agents/skills/create-release/SKILL.md): Draft and cut releases, push tags,
+  create draft GitHub releases, and publish to PyPI and GHCR.
 - [extend-env-surface](./.agents/skills/extend-env-surface/SKILL.md): Add or extend an RPC, guest
   capability, MCP tool, or SDK method.
 - [maintain-docs](./.agents/skills/maintain-docs/SKILL.md): Author, update, and validate repository

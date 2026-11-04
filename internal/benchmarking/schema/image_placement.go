@@ -53,6 +53,10 @@ type PlacementDomain struct {
 	// this plan: the image-cache volume times atelet's low watermark, minus
 	// headroom. 0 means no budget check.
 	NodeCacheBytes int64 `json:"node_cache_bytes"`
+	// NodeSlots is how many environments one node of the domain runs at
+	// once, when known; the pre-flight caps its concurrency by it. 0 means
+	// unknown.
+	NodeSlots int `json:"node_slots,omitempty"`
 	// AssignedBytes is the unpacked size of the images assigned to the
 	// domain, which each of its nodes holds; filled by the planner.
 	AssignedBytes int64 `json:"assigned_bytes"`
@@ -157,8 +161,8 @@ func (d PlacementDomain) Validate() error {
 	if d.Nodes < 1 {
 		return fmt.Errorf("domain %q: nodes must be >= 1", d.Name)
 	}
-	if d.NodeCacheBytes < 0 || d.AssignedBytes < 0 || d.ImageCount < 0 {
-		return fmt.Errorf("domain %q: node_cache_bytes, assigned_bytes and image_count must be >= 0", d.Name)
+	if d.NodeCacheBytes < 0 || d.AssignedBytes < 0 || d.ImageCount < 0 || d.NodeSlots < 0 {
+		return fmt.Errorf("domain %q: node_cache_bytes, node_slots, assigned_bytes and image_count must be >= 0", d.Name)
 	}
 	return nil
 }

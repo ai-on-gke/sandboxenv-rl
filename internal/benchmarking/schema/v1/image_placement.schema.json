@@ -37,6 +37,7 @@
         },
         "nodes": { "type": "integer", "minimum": 1 },
         "node_cache_bytes": { "type": "integer", "minimum": 0 },
+        "node_slots": { "type": "integer", "minimum": 0 },
         "assigned_bytes": { "type": "integer", "minimum": 0 },
         "image_count": { "type": "integer", "minimum": 0 }
       }

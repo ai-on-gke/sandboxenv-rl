@@ -4,7 +4,6 @@
   "started_at": "2026-11-02T20:00:00Z",
   "finished_at": "2026-11-02T20:41:12Z",
   "plan": "image-placement.json",
-  "pinned": false,
   "goldens": [
     {"image": "registry.example/swebench/django@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "template": "default-template-0123456789ab", "state": "ready", "tag": "golden-7", "wait_ms": 118342.5},
     {"image": "registry.example/swebench/sympy@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210", "template": "default-template-fedcba987654", "state": "failed", "error": "GoldenActorCrashed: golden actor crashed before its snapshot was taken", "wait_ms": 2000}

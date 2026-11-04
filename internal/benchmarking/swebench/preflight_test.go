@@ -30,6 +30,7 @@ import (
 const (
 	pfImgA = "registry.example/swebench/a@sha256:" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	pfImgB = "registry.example/swebench/b@sha256:" + "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	pfImgC = "registry.example/swebench/c@sha256:" + "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 )
 
 // twoDomainPlan places a in d0 and b in both domains, two nodes each.
@@ -113,19 +114,25 @@ func countEvents(events []Event, kind string) int {
 
 func TestPreflightCoversEveryNodeOfEveryDomain(t *testing.T) {
 	api := newPreflightFake()
-	report, err, events := runPreflight(t, api, nil)
+	// One image at a time per domain: the fake spreads a domain's creates
+	// round-robin over its nodes, so a round of two probes covers both nodes
+	// only when no other image's probes interleave.
+	report, err, events := runPreflight(t, api, func(o *PreflightOptions) { o.ImageConcurrency = 1 })
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if !report.Complete || report.Pinned {
-		t.Errorf("report complete=%v pinned=%v, want true false", report.Complete, report.Pinned)
+	if !report.Complete {
+		t.Errorf("report incomplete: %+v", report)
 	}
 	// Goldens: ensured once per image (in parallel, so in any order), polled
-	// until ready, tag recorded.
+	// until ready, tag recorded, in plan order.
 	ensured := append([]string(nil), api.ensured...)
 	sort.Strings(ensured)
 	if !reflect.DeepEqual(ensured, []string{pfImgA, pfImgB}) {
 		t.Errorf("ensured = %v", api.ensured)
+	}
+	if len(report.Goldens) != 2 || report.Goldens[0].Image != pfImgA || report.Goldens[1].Image != pfImgB {
+		t.Errorf("goldens = %+v, want a then b", report.Goldens)
 	}
 	for _, g := range report.Goldens {
 		if g.State != "ready" || !strings.HasPrefix(g.Tag, "golden-") || g.Template == "" {
@@ -141,29 +148,34 @@ func TestPreflightCoversEveryNodeOfEveryDomain(t *testing.T) {
 		if !d.Complete {
 			t.Errorf("domain %s incomplete: %+v", d.Name, d)
 		}
+		if len(d.Images) != len(want[d.Name]) {
+			t.Errorf("domain %s covers %d images, want %d", d.Name, len(d.Images), len(want[d.Name]))
+		}
 		for _, ic := range d.Images {
 			if got := want[d.Name][ic.Image]; !reflect.DeepEqual(ic.Nodes, got) || !ic.Complete || ic.Rounds != 1 || ic.Probes != 2 || ic.Failed != 0 {
 				t.Errorf("%s/%s = %+v, want nodes %v in one round of two probes", d.Name, ic.Image, ic, got)
 			}
 		}
 	}
-	// Every probe carried its domain's selector and was deleted, not suspended.
+	// Every probe carried its domain's selector and was deleted.
 	for id, sel := range api.selectors {
-		domain := sel["ate-env/domain"]
-		if domain == "" {
+		if sel["ate-env/domain"] == "" {
 			t.Errorf("probe %s has no domain selector: %v", id, sel)
 		}
 	}
 	if len(api.deleted) != len(api.created) || len(api.suspended) != 0 {
 		t.Errorf("created %d, deleted %d, suspended %d; want all deleted", len(api.created), len(api.deleted), len(api.suspended))
 	}
-	// Events: a prewarm per image (Validity Rule 1 sees a real pre-flight), a
-	// golden wait per image, a probe per environment with its node.
-	if n := countEvents(events, EventPrewarm); n != 2 {
-		t.Errorf("prewarm events = %d, want 2", n)
+	// Events: a template and a golden per image, a probe per environment
+	// with its node; no run event (prewarm) the report would count.
+	if n := countEvents(events, EventPreflightTemplate); n != 2 {
+		t.Errorf("template events = %d, want 2", n)
 	}
 	if n := countEvents(events, EventPreflightGolden); n != 2 {
 		t.Errorf("golden events = %d, want 2", n)
+	}
+	if n := countEvents(events, EventPrewarm); n != 0 {
+		t.Errorf("prewarm events = %d, want none", n)
 	}
 	probes := 0
 	for _, e := range events {
@@ -180,25 +192,84 @@ func TestPreflightCoversEveryNodeOfEveryDomain(t *testing.T) {
 	}
 }
 
-func TestPreflightPinLeavesProbesSuspended(t *testing.T) {
+// With a concurrency above one a domain warms several images at once, so
+// more than nodes x ProbesPerNode probes are alive in it; with one, never.
+func TestPreflightImageConcurrency(t *testing.T) {
 	api := newPreflightFake()
-	report, err, _ := runPreflight(t, api, func(o *PreflightOptions) { o.Pin = true })
-	if err != nil {
+	api.goldenReadyAfter = 0
+	// Slow probes: each first command takes a few polls, so the two images
+	// of d0 overlap when the warmer lets them.
+	api.pollsUntilExit = 3
+	if _, err, _ := runPreflight(t, api, func(o *PreflightOptions) { o.ImageConcurrency = 2 }); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if !report.Pinned || len(api.suspended) != len(api.created) || len(api.deleted) != 0 {
-		t.Errorf("pinned=%v created %d suspended %d deleted %d; want all suspended", report.Pinned, len(api.created), len(api.suspended), len(api.deleted))
+	if api.maxInflight["d0"] <= 2 {
+		t.Errorf("d0 max in flight = %d with concurrency 2, want above nodes x probes (2)", api.maxInflight["d0"])
+	}
+
+	api = newPreflightFake()
+	api.goldenReadyAfter = 0
+	api.pollsUntilExit = 3
+	if _, err, _ := runPreflight(t, api, func(o *PreflightOptions) { o.ImageConcurrency = 1 }); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if api.maxInflight["d0"] > 2 {
+		t.Errorf("d0 max in flight = %d with concurrency 1, want at most 2", api.maxInflight["d0"])
+	}
+
+	// node_slots caps the concurrency and refuses too many probes per node.
+	api = newPreflightFake()
+	api.goldenReadyAfter = 0
+	api.pollsUntilExit = 3
+	if _, err, _ := runPreflight(t, api, func(o *PreflightOptions) {
+		o.ImageConcurrency = 4
+		o.Plan.Domains[0].NodeSlots = 1
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if api.maxInflight["d0"] > 2 {
+		t.Errorf("d0 max in flight = %d with one slot per node, want at most 2", api.maxInflight["d0"])
+	}
+	plan := twoDomainPlan()
+	plan.Domains[0].NodeSlots = 1
+	if _, err := NewPreflightWarmer(PreflightOptions{Plan: plan, Backend: newFakeBackend(t, newPreflightFake()), ProbesPerNode: 2}); err == nil || !strings.Contains(err.Error(), "node slots") {
+		t.Errorf("2 probes per node on 1 slot: err = %v, want a node slots error", err)
+	}
+}
+
+// A domain does not wait for a slow golden before warming the images behind
+// it: a, first in plan order, never gets its golden; b, behind it in d0, is
+// covered while a's golden is still pending, with one image at a time.
+func TestPreflightStreamsReadyGoldensIntoCoverage(t *testing.T) {
+	api := newPreflightFake()
+	api.goldenReadyAfter = 0
+	api.goldenPendingForever = map[string]bool{pfImgA: true}
+	report, err, events := runPreflight(t, api, func(o *PreflightOptions) {
+		o.ImageConcurrency = 1
+		o.GoldenTimeout = 200 * time.Millisecond
+	})
+	if err == nil || !strings.Contains(err.Error(), "1 goldens not ready") {
+		t.Fatalf("Run error = %v, want a's golden not ready", err)
+	}
+	// The recorder keeps the order: every probe of b in d0 is recorded
+	// before a's golden gives up, and a's probes after it.
+	aGolden, bProbesBefore, aProbesAfter := -1, 0, 0
+	for i, e := range events {
+		switch {
+		case e.Event == EventPreflightGolden && e.Image == pfImgA:
+			aGolden = i
+		case e.Event == EventPreflightProbe && e.Image == pfImgB && e.Labels["domain"] == "d0" && aGolden < 0:
+			bProbesBefore++
+		case e.Event == EventPreflightProbe && e.Image == pfImgA && aGolden >= 0:
+			aProbesAfter++
+		}
+	}
+	if aGolden < 0 || bProbesBefore != 2 || aProbesAfter != 2 {
+		t.Errorf("b probes in d0 before a's golden settled = %d, a probes after = %d; want 2 and 2", bProbesBefore, aProbesAfter)
 	}
 	for _, d := range report.Domains {
-		for _, ic := range d.Images {
-			if len(ic.Pinned) != d.Nodes {
-				t.Errorf("%s/%s pinned = %v, want one per node", d.Name, ic.Image, ic.Pinned)
-			}
-			for node, id := range ic.Pinned {
-				if api.nodes[id] != node {
-					t.Errorf("pinned %s recorded on %s, the fake put it on %s", id, node, api.nodes[id])
-				}
-			}
+		if !d.Complete {
+			t.Errorf("domain %s incomplete: a pending golden still boots and fills the layers: %+v", d.Name, d)
 		}
 	}
 }
@@ -228,7 +299,7 @@ func TestPreflightReportsShortCoverageAfterItsRounds(t *testing.T) {
 	}
 }
 
-func TestPreflightGoldenFailureAndSkip(t *testing.T) {
+func TestPreflightGoldenFailure(t *testing.T) {
 	api := newPreflightFake()
 	api.goldenFail = map[string]string{pfImgB: "GoldenActorCrashed: boom"}
 	report, err, events := runPreflight(t, api, nil)
@@ -260,21 +331,24 @@ func TestPreflightGoldenFailureAndSkip(t *testing.T) {
 	if failedGoldenEvents != 1 {
 		t.Errorf("failed golden events = %d, want 1", failedGoldenEvents)
 	}
+}
 
-	// Skipping the wait records the state and completes on coverage alone.
-	api = newPreflightFake()
-	api.goldenReadyAfter = 1 << 20
-	report, err, _ = runPreflight(t, api, func(o *PreflightOptions) { o.SkipGoldenWait = true })
+// Goldens disabled on the base template: the templates exist with no
+// golden, the pass does not wait, and completes on coverage alone.
+func TestPreflightGoldensDisabled(t *testing.T) {
+	api := newPreflightFake()
+	api.goldenDisabled = true
+	report, err, _ := runPreflight(t, api, nil)
 	if err != nil || !report.Complete {
-		t.Fatalf("skip golden wait: err=%v complete=%v", err, report.Complete)
+		t.Fatalf("goldens disabled: err=%v complete=%v", err, report.Complete)
 	}
 	for _, g := range report.Goldens {
-		if g.State != "skipped" || g.WaitMS != 0 {
-			t.Errorf("golden = %+v, want skipped", g)
+		if g.State != "none" || g.Error != "" || g.Template == "" {
+			t.Errorf("golden = %+v, want none with the template", g)
 		}
 	}
 	if n := api.statusCalls[pfImgA]; n != 1 {
-		t.Errorf("status calls with the wait skipped = %d, want the one from ensure", n)
+		t.Errorf("status calls = %d, want the one from ensure", n)
 	}
 }
 
@@ -301,9 +375,17 @@ func TestPreflightSubsetsAndValidation(t *testing.T) {
 	if len(report.Goldens) != 1 || len(report.Domains) != 1 || len(report.Domains[0].Images) != 1 {
 		t.Errorf("subset report = %+v", report)
 	}
+	// A domain subset drops the images no selected domain holds, so the
+	// pass does not wait for goldens it does not use.
+	api = newPreflightFake()
+	report, err, _ = runPreflight(t, api, func(o *PreflightOptions) { o.Domains = []string{"d1"} })
+	if err != nil || !report.Complete || len(report.Goldens) != 1 || report.Goldens[0].Image != pfImgB {
+		t.Errorf("d1 only: err=%v goldens=%+v, want b alone", err, report.Goldens)
+	}
 	for _, bad := range []func(*PreflightOptions){
-		func(o *PreflightOptions) { o.Images = []string{"registry.example/x@sha256:" + strings.Repeat("c", 64)} },
+		func(o *PreflightOptions) { o.Images = []string{pfImgC} },
 		func(o *PreflightOptions) { o.Domains = []string{"d9"} },
+		func(o *PreflightOptions) { o.Images = []string{pfImgA}; o.Domains = []string{"d1"} },
 		func(o *PreflightOptions) { o.RunID = "Not Valid" },
 		func(o *PreflightOptions) { o.Plan = nil },
 		func(o *PreflightOptions) { o.Backend = nil },

@@ -98,20 +98,29 @@ type ImageState struct {
 	Error    string
 }
 
+// CreateOptions are the per-environment choices of a create beyond its id
+// and image. Create passes none; CreateWith takes them.
+type CreateOptions struct {
+	// WorkerSelector is the labels the environment's worker pool must carry;
+	// Substrate ANDs it with the template's own selector.
+	WorkerSelector map[string]string
+}
+
 // ImageWarmer is the optional interface the pre-flight needs from a
-// backend: the golden state of an image's derived template, creates placed
-// with a worker selector, and the node an environment landed on. EnvBackend
-// implements it.
+// backend: the golden state of an image's derived template, creates with
+// options (a worker selector), and the node an environment landed on.
+// EnvBackend implements it; Create and CreateWith share one code path.
 type ImageWarmer interface {
 	// EnsureImageTemplate creates the derived template when it is missing,
 	// which starts its golden bake, and reports it; no environment is created.
 	EnsureImageTemplate(ctx context.Context, image string) (ImageState, error)
 	// ImageStatus reports the derived template without creating anything.
 	ImageStatus(ctx context.Context, image string) (ImageState, error)
-	// CreatePlaced is Create with a per-environment worker selector, which
-	// Substrate ANDs with the template's.
-	CreatePlaced(ctx context.Context, id, image string, selector map[string]string) (Sandbox, error)
-	// Node is the node the environment is on, or "" before its placement.
+	// CreateWith is Create with options.
+	CreateWith(ctx context.Context, id, image string, opts CreateOptions) (Sandbox, error)
+	// Node is the node the environment is on, or "" before its placement. It
+	// is a call of its own because the create returns before the scheduler
+	// has placed the environment.
 	Node(ctx context.Context, id string) (string, error)
 }
 
@@ -221,17 +230,17 @@ func (b *EnvBackend) Prewarm(ctx context.Context, images []string) error {
 // Create implements Backend. The environment keeps the connection it was
 // created on for the rest of its life.
 func (b *EnvBackend) Create(ctx context.Context, id, image string) (Sandbox, error) {
-	return b.CreatePlaced(ctx, id, image, nil)
+	return b.CreateWith(ctx, id, image, CreateOptions{})
 }
 
-// CreatePlaced implements ImageWarmer: Create with a worker selector.
-func (b *EnvBackend) CreatePlaced(ctx context.Context, id, image string, selector map[string]string) (Sandbox, error) {
+// CreateWith implements ImageWarmer: Create with options.
+func (b *EnvBackend) CreateWith(ctx context.Context, id, image string, opts CreateOptions) (Sandbox, error) {
 	e, err := b.pick().Create(ctx, &ateenvv1alpha.CreateEnvironmentRequest{
 		Id:             id,
 		Atespace:       b.atespace,
 		Template:       &ateenvv1alpha.Template{Name: b.baseTemplate, Atespace: b.atespace},
 		RootfsImage:    image,
-		WorkerSelector: selector,
+		WorkerSelector: opts.WorkerSelector,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create %s: %w", id, err)

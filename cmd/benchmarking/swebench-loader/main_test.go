@@ -706,10 +706,10 @@ func (f *fakeWarmer) ImageStatus(ctx context.Context, image string) (swebench.Im
 	return f.EnsureImageTemplate(ctx, image)
 }
 
-func (f *fakeWarmer) CreatePlaced(_ context.Context, id, _ string, selector map[string]string) (swebench.Sandbox, error) {
+func (f *fakeWarmer) CreateWith(_ context.Context, id, _ string, opts swebench.CreateOptions) (swebench.Sandbox, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	domain := selector["ate-env/domain"]
+	domain := opts.WorkerSelector["ate-env/domain"]
 	f.nodes[id] = fmt.Sprintf("node-%s-%d", domain, f.counter[domain]%2)
 	f.counter[domain]++
 	return &fakeWarmerSandbox{w: f, id: id}, nil
@@ -772,7 +772,7 @@ func TestPreflightCmd(t *testing.T) {
 	if len(warmer.deleted) != 2 {
 		t.Errorf("deleted = %v, want the two probes", warmer.deleted)
 	}
-	if _, err := os.Stat(filepath.Join(events, "events", "preflight.jsonl")); err != nil {
+	if _, err := os.Stat(filepath.Join(events, "preflight-events.jsonl")); err != nil {
 		t.Errorf("events file: %v", err)
 	}
 	if !strings.Contains(stderr.String(), "pre-flight complete: goldens 1/1 ready") {

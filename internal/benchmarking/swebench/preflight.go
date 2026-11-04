@@ -27,12 +27,12 @@ import (
 	"github.com/agent-substrate/env/internal/benchmarking/schema"
 )
 
-// Pre-flight event names, next to the loader's own. A prewarm event is
-// recorded per image when its template is ensured, so Validity Rule 1 and
-// the report's prewarm count see a real pre-flight.
+// Pre-flight event names. They go to the pre-flight's own events file, not
+// to the run's shards, so the run report does not count them.
 const (
-	EventPreflightGolden = "preflight_golden" // one image's golden wait
-	EventPreflightProbe  = "preflight_probe"  // one probe environment: created, ready, node read, released
+	EventPreflightTemplate = "preflight_template" // one image's derived template ensured
+	EventPreflightGolden   = "preflight_golden"   // one image's golden settled: ready, none, failed, or given up
+	EventPreflightProbe    = "preflight_probe"    // one probe environment: created, ready, node read, deleted
 )
 
 // PreflightOptions configure a PreflightWarmer.
@@ -50,34 +50,36 @@ type PreflightOptions struct {
 	// a round holds its probes alive until all are placed, so the scheduler
 	// spreads them. Default 2.
 	ProbesPerNode int
+	// ImageConcurrency is how many images a domain warms at once, each with
+	// its own rounds, so a domain keeps ImageConcurrency x nodes x
+	// ProbesPerNode slots busy. A domain whose plan entry has node_slots
+	// caps it at node_slots / ProbesPerNode. Default 4.
+	ImageConcurrency int
 	// MaxRounds caps the rounds per (image, domain); default 3.
 	MaxRounds int
-	// GoldenTimeout bounds the wait for one image's golden; default 30 min.
-	// SkipGoldenWait ensures the templates and moves on, for a layer-only
-	// wave while the bakes run.
-	GoldenTimeout  time.Duration
-	GoldenPoll     time.Duration
-	SkipGoldenWait bool
+	// GoldenTimeout gives up on the goldens still baking once none became
+	// ready or failed for that long; default 30 min. GoldenPoll is how often
+	// the baking goldens are polled; default 10 s.
+	GoldenTimeout time.Duration
+	GoldenPoll    time.Duration
 	// ProbeTimeout bounds one probe's create and first command; default 10 min.
 	ProbeTimeout time.Duration
-	// Pin suspends the probes instead of deleting them: their local
-	// snapshots pin them to their nodes and keep the layers referenced.
-	Pin bool
 	// Images and Domains, when set, restrict the pass to those.
 	Images  []string
 	Domains []string
-	// EnsureWidth is how many templates are ensured and polled at once;
-	// default 8.
+	// EnsureWidth is how many templates are ensured, and later polled, at
+	// once; default 8.
 	EnsureWidth int
 
 	now func() time.Time
 }
 
-// PreflightWarmer fills the node caches an image placement plan describes:
-// it ensures each image's derived template and waits for its golden, then
-// per (image, domain) creates probe environments with the domain's worker
-// selector until every node of the domain has run the image once, reading
-// the node each probe landed on, and releases them.
+// PreflightWarmer fills the node caches an image placement plan describes.
+// It ensures each image's derived template, which starts the golden bake,
+// then per domain warms images as their goldens become ready: for each
+// (image, domain) it creates probe environments with the domain's worker
+// selector, round after round, until every node of the domain has run the
+// image once, reading the node each probe landed on, and deletes them.
 type PreflightWarmer struct {
 	opts PreflightOptions
 }
@@ -104,6 +106,9 @@ func NewPreflightWarmer(opts PreflightOptions) (*PreflightWarmer, error) {
 	}
 	if opts.ProbesPerNode <= 0 {
 		opts.ProbesPerNode = 2
+	}
+	if opts.ImageConcurrency <= 0 {
+		opts.ImageConcurrency = 4
 	}
 	if opts.MaxRounds <= 0 {
 		opts.MaxRounds = 3
@@ -133,7 +138,16 @@ func NewPreflightWarmer(opts PreflightOptions) (*PreflightWarmer, error) {
 			return nil, fmt.Errorf("preflight: the plan does not place %q", img)
 		}
 	}
-	return &PreflightWarmer{opts: opts}, nil
+	for _, d := range opts.Plan.Domains {
+		if d.NodeSlots > 0 && opts.ProbesPerNode > d.NodeSlots {
+			return nil, fmt.Errorf("preflight: %d probes per node exceed the %d node slots of domain %s", opts.ProbesPerNode, d.NodeSlots, d.Name)
+		}
+	}
+	w := &PreflightWarmer{opts: opts}
+	if len(w.images()) == 0 {
+		return nil, errors.New("preflight: no image of the pass is placed in its domains")
+	}
+	return w, nil
 }
 
 // Run executes the pre-flight and returns the coverage report. The error is
@@ -151,16 +165,21 @@ func (w *PreflightWarmer) Run(ctx context.Context) (*schema.PreflightCoverage, e
 		RunID:         o.RunID,
 		StartedAt:     started,
 		Plan:          o.PlanPath,
-		Pinned:        o.Pin,
 	}
 
-	goldens, goldensOK := w.ensureGoldens(ctx, images)
-	report.Goldens = goldens
+	goldens := newGoldenTracker(images, started)
+	w.ensureTemplates(ctx, images, goldens)
+	polled := make(chan struct{})
+	go func() {
+		defer close(polled)
+		w.pollGoldens(ctx, goldens)
+	}()
+	coverage, coverageOK := w.cover(ctx, domains, goldens)
+	<-polled
 
-	coverage, coverageOK := w.cover(ctx, images, domains)
-	report.Domains = coverage
+	report.Goldens, report.Domains = goldens.records(images), coverage
 	report.FinishedAt = o.now()
-	report.Complete = goldensOK && coverageOK && ctx.Err() == nil
+	report.Complete = goldens.allOK() && coverageOK && ctx.Err() == nil
 
 	if o.Recorder != nil {
 		_ = o.Recorder.Flush()
@@ -174,15 +193,28 @@ func (w *PreflightWarmer) Run(ctx context.Context) (*schema.PreflightCoverage, e
 	return report, nil
 }
 
+// images is the pass's images in plan order: those of Images, or all, that
+// at least one domain of the pass holds.
 func (w *PreflightWarmer) images() []string {
-	if len(w.opts.Images) > 0 {
-		out := append([]string(nil), w.opts.Images...)
-		sort.Strings(out)
-		return out
+	wanted := map[string]bool{}
+	for _, img := range w.opts.Images {
+		wanted[img] = true
 	}
-	out := make([]string, 0, len(w.opts.Plan.Images))
+	domains := map[string]bool{}
+	for _, d := range w.domains() {
+		domains[d.Name] = true
+	}
+	var out []string
 	for _, e := range w.opts.Plan.Images {
-		out = append(out, e.Image)
+		if len(wanted) > 0 && !wanted[e.Image] {
+			continue
+		}
+		for _, d := range e.Domains {
+			if domains[d] {
+				out = append(out, e.Image)
+				break
+			}
+		}
 	}
 	return out
 }
@@ -204,115 +236,275 @@ func (w *PreflightWarmer) domains() []schema.PlacementDomain {
 	return out
 }
 
-// ensureGoldens derives every image's template and, unless skipped, waits
-// for its golden. It reports whether every golden it waited for is ready.
-func (w *PreflightWarmer) ensureGoldens(ctx context.Context, images []string) ([]schema.GoldenRecord, bool) {
-	o := w.opts
-	records := make([]schema.GoldenRecord, len(images))
-	var mu sync.Mutex
-	allOK := true
-	forEach(ctx, len(images), o.EnsureWidth, func(i int) {
-		img := images[i]
-		rec := schema.GoldenRecord{Image: img}
-		t0 := o.now()
-		st, err := o.Backend.EnsureImageTemplate(ctx, img)
-		w.record(Event{Event: EventPrewarm, Task: i, Image: img, Env: st.Template, DurMS: DurMS(o.now().Sub(t0)), OK: err == nil, Err: errString(err)})
-		if err != nil {
-			rec.State = "failed"
-			rec.Error = err.Error()
-			o.Logger.Warn("preflight: ensure template failed", slog.String("image", img), slog.Any("err", err))
-			mu.Lock()
-			records[i], allOK = rec, false
-			mu.Unlock()
-			return
+// imageWidth is how many images the domain warms at once.
+func (w *PreflightWarmer) imageWidth(d schema.PlacementDomain) int {
+	k := w.opts.ImageConcurrency
+	if d.NodeSlots > 0 {
+		if c := d.NodeSlots / w.opts.ProbesPerNode; c < k {
+			k = c
 		}
-		rec.Template = st.Template
-		if o.SkipGoldenWait {
-			rec.State, rec.Tag, rec.Error = "skipped", st.Tag, st.Error
-			mu.Lock()
-			records[i] = rec
-			mu.Unlock()
-			return
-		}
-		waitStart := o.now()
-		st, err = w.waitGolden(ctx, img, st)
-		rec.WaitMS = DurMS(o.now().Sub(waitStart))
-		rec.State, rec.Tag, rec.Error = string(st.Golden), st.Tag, st.Error
-		ok := err == nil && st.Golden == GoldenReady
-		if err != nil {
-			rec.Error = err.Error()
-		}
-		w.record(Event{Event: EventPreflightGolden, Task: i, Image: img, Env: st.Template, DurMS: rec.WaitMS, OK: ok, Err: rec.Error})
-		if !ok {
-			o.Logger.Warn("preflight: golden not ready", slog.String("image", img), slog.String("state", rec.State), slog.String("err", rec.Error))
-		}
-		mu.Lock()
-		records[i] = rec
-		if !ok {
-			allOK = false
-		}
-		mu.Unlock()
-	})
-	return records, allOK
+	}
+	return max(k, 1)
 }
 
-// waitGolden polls the image's status until its golden is ready or failed,
-// or the timeout passes.
-func (w *PreflightWarmer) waitGolden(ctx context.Context, img string, st ImageState) (ImageState, error) {
-	o := w.opts
-	deadline := o.now().Add(o.GoldenTimeout)
-	for {
-		switch st.Golden {
-		case GoldenReady:
-			return st, nil
-		case GoldenFailed:
-			return st, fmt.Errorf("golden bake failed: %s", st.Error)
+// goldenTracker holds each image's golden state while the pass runs. The
+// coverage work of an image waits on its done channel; changed is closed and
+// replaced whenever an image settles, so a waiter can pick the next settled
+// image instead of a fixed one.
+type goldenTracker struct {
+	mu       sync.Mutex
+	waits    map[string]*goldenWait
+	changed  chan struct{}
+	progress time.Time
+}
+
+type goldenWait struct {
+	task    int
+	done    chan struct{}
+	ensured time.Time
+	settled bool
+	ok      bool
+	rec     schema.GoldenRecord
+}
+
+func newGoldenTracker(images []string, now time.Time) *goldenTracker {
+	t := &goldenTracker{waits: make(map[string]*goldenWait, len(images)), changed: make(chan struct{}), progress: now}
+	for i, img := range images {
+		t.waits[img] = &goldenWait{task: i, done: make(chan struct{}), ensured: now, rec: schema.GoldenRecord{Image: img}}
+	}
+	return t
+}
+
+// settle records the final state of one image's golden and releases the
+// work waiting on it; it returns false when the image was settled already.
+func (t *goldenTracker) settle(img string, rec schema.GoldenRecord, ok bool, now time.Time) (*goldenWait, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	gw := t.waits[img]
+	if gw.settled {
+		return gw, false
+	}
+	gw.settled, gw.ok, gw.rec = true, ok, rec
+	gw.rec.WaitMS = DurMS(now.Sub(gw.ensured))
+	t.progress = now
+	close(gw.done)
+	close(t.changed)
+	t.changed = make(chan struct{})
+	return gw, true
+}
+
+func (t *goldenTracker) pending() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var out []string
+	for img, gw := range t.waits {
+		if !gw.settled {
+			out = append(out, img)
 		}
-		if o.now().After(deadline) {
-			return st, fmt.Errorf("golden still %s after %s", st.Golden, o.GoldenTimeout)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (t *goldenTracker) lastProgress() time.Time {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.progress
+}
+
+func (t *goldenTracker) records(images []string) []schema.GoldenRecord {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]schema.GoldenRecord, 0, len(images))
+	for _, img := range images {
+		out = append(out, t.waits[img].rec)
+	}
+	return out
+}
+
+func (t *goldenTracker) allOK() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, gw := range t.waits {
+		if !gw.ok {
+			return false
+		}
+	}
+	return true
+}
+
+// ensureTemplates derives every image's template, which starts the bakes,
+// and settles the images whose golden needs no wait: ready, failed, or none
+// when goldens are disabled on the base template (the probes then boot cold
+// and still fill the layer caches).
+func (w *PreflightWarmer) ensureTemplates(ctx context.Context, images []string, t *goldenTracker) {
+	o := w.opts
+	forEach(ctx, len(images), o.EnsureWidth, func(i int) {
+		img := images[i]
+		t0 := o.now()
+		st, err := o.Backend.EnsureImageTemplate(ctx, img)
+		w.record(Event{Event: EventPreflightTemplate, Task: i, Image: img, Env: st.Template, DurMS: DurMS(o.now().Sub(t0)), OK: err == nil, Err: errString(err)})
+		t.mu.Lock()
+		t.waits[img].ensured = o.now()
+		t.mu.Unlock()
+		if err != nil {
+			w.settleGolden(t, img, schema.GoldenRecord{Image: img, State: "failed", Error: err.Error()}, false)
+			return
+		}
+		w.settleFromState(t, img, st, true)
+	})
+}
+
+// settleFromState settles the image when st is final; a pending golden stays
+// open. When goldens are disabled the template exists with no golden, which
+// ensured tells apart from a template that is not there.
+func (w *PreflightWarmer) settleFromState(t *goldenTracker, img string, st ImageState, ensured bool) {
+	rec := schema.GoldenRecord{Image: img, Template: st.Template, State: string(st.Golden), Tag: st.Tag, Error: st.Error}
+	switch st.Golden {
+	case GoldenReady:
+		w.settleGolden(t, img, rec, true)
+	case GoldenFailed:
+		rec.Error = "golden bake failed: " + st.Error
+		w.settleGolden(t, img, rec, false)
+	case GoldenNone:
+		if st.Exists {
+			w.settleGolden(t, img, rec, true)
+		} else if ensured {
+			rec.State, rec.Error = "failed", "the template was not created"
+			w.settleGolden(t, img, rec, false)
+		}
+	}
+}
+
+// settleGolden settles the image and records its golden event once.
+func (w *PreflightWarmer) settleGolden(t *goldenTracker, img string, rec schema.GoldenRecord, ok bool) {
+	gw, first := t.settle(img, rec, ok, w.opts.now())
+	if !first {
+		return
+	}
+	w.record(Event{Event: EventPreflightGolden, Task: gw.task, Image: img, Env: gw.rec.Template, DurMS: gw.rec.WaitMS, OK: ok, Err: gw.rec.Error})
+	if !ok {
+		w.opts.Logger.Warn("preflight: golden not ready", slog.String("image", img), slog.String("state", gw.rec.State), slog.String("err", gw.rec.Error))
+	}
+}
+
+// pollGoldens polls the baking goldens until all settle, none has settled
+// for GoldenTimeout, or the context ends. A status call that fails is
+// retried at the next poll; the timeout bounds that too.
+func (w *PreflightWarmer) pollGoldens(ctx context.Context, t *goldenTracker) {
+	o := w.opts
+	t.mu.Lock()
+	t.progress = o.now()
+	t.mu.Unlock()
+	for {
+		pending := t.pending()
+		if len(pending) == 0 {
+			return
 		}
 		select {
 		case <-ctx.Done():
-			return st, ctx.Err()
+			for _, img := range pending {
+				w.settleGolden(t, img, schema.GoldenRecord{Image: img, State: "pending", Error: ctx.Err().Error()}, false)
+			}
+			return
 		case <-time.After(o.GoldenPoll):
 		}
-		next, err := o.Backend.ImageStatus(ctx, img)
-		if err != nil {
-			return st, err
+		forEach(ctx, len(pending), o.EnsureWidth, func(i int) {
+			img := pending[i]
+			st, err := o.Backend.ImageStatus(ctx, img)
+			if err != nil {
+				o.Logger.Warn("preflight: image status failed", slog.String("image", img), slog.Any("err", err))
+				return
+			}
+			w.settleFromState(t, img, st, false)
+		})
+		if stalled := o.now().Sub(t.lastProgress()); stalled > o.GoldenTimeout {
+			for _, img := range t.pending() {
+				w.settleGolden(t, img, schema.GoldenRecord{Image: img, State: "pending", Error: fmt.Sprintf("golden still pending after %s without progress", o.GoldenTimeout)}, false)
+			}
+			return
 		}
-		st = next
 	}
 }
 
-// cover runs the coverage pass, one domain at a time in parallel, the
-// images of a domain one after another so a domain never has more than
-// nodes x ProbesPerNode probes in flight.
-func (w *PreflightWarmer) cover(ctx context.Context, images []string, domains []schema.PlacementDomain) ([]schema.DomainCoverage, bool) {
-	wanted := make(map[string]bool, len(images))
-	for _, img := range images {
-		wanted[img] = true
-	}
+// cover runs the coverage pass, every domain in parallel. Inside a domain
+// up to imageWidth images run at once, each taken as soon as its golden has
+// settled (earliest in plan order first), so a slow bake does not hold up
+// the images behind it and a domain never has more than
+// imageWidth x nodes x ProbesPerNode probes in flight.
+func (w *PreflightWarmer) cover(ctx context.Context, domains []schema.PlacementDomain, t *goldenTracker) ([]schema.DomainCoverage, bool) {
 	results := make([]schema.DomainCoverage, len(domains))
 	forEach(ctx, len(domains), len(domains), func(di int) {
 		d := domains[di]
+		type item struct {
+			index int
+			image string
+		}
+		var items []item
+		for ii, e := range w.opts.Plan.Images {
+			if _, ok := t.waits[e.Image]; ok && contains(e.Domains, d.Name) {
+				items = append(items, item{ii, e.Image})
+			}
+		}
+		covs := make([]schema.ImageCoverage, len(items))
+		ran := make([]bool, len(items))
+		started := make([]bool, len(items))
+		sem := make(chan struct{}, w.imageWidth(d))
+		var wg sync.WaitGroup
+		for n := 0; n < len(items); {
+			// The first item, in plan order, whose golden has settled.
+			t.mu.Lock()
+			changed := t.changed
+			pick := -1
+			for k, it := range items {
+				if !started[k] && t.waits[it.image].settled {
+					pick = k
+					break
+				}
+			}
+			t.mu.Unlock()
+			if pick < 0 {
+				select {
+				case <-ctx.Done():
+					n = len(items)
+					continue
+				case <-changed:
+					continue
+				}
+			}
+			select {
+			case <-ctx.Done():
+				n = len(items)
+				continue
+			case sem <- struct{}{}:
+			}
+			started[pick] = true
+			n++
+			wg.Add(1)
+			go func(k int, it item) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				covs[k] = w.coverImage(ctx, di, it.index, d, it.image)
+				ran[k] = true
+			}(pick, items[pick])
+		}
+		wg.Wait()
+
 		dc := schema.DomainCoverage{Name: d.Name, Nodes: d.Nodes, NodesSeen: []string{}, Images: []schema.ImageCoverage{}, Complete: true}
 		seen := map[string]bool{}
-		for ii, e := range w.opts.Plan.Images {
-			if !wanted[e.Image] || !contains(e.Domains, d.Name) {
+		for k, it := range items {
+			if !ran[k] {
+				dc.Complete = false
+				dc.Images = append(dc.Images, schema.ImageCoverage{Image: it.image, Nodes: []string{}, Wanted: d.Nodes, Error: "not started"})
 				continue
 			}
-			if ctx.Err() != nil {
-				dc.Complete = false
-				break
+			for _, node := range covs[k].Nodes {
+				seen[node] = true
 			}
-			ic := w.coverImage(ctx, di, ii, d, e.Image)
-			for _, n := range ic.Nodes {
-				seen[n] = true
-			}
-			if !ic.Complete {
+			if !covs[k].Complete {
 				dc.Complete = false
 			}
-			dc.Images = append(dc.Images, ic)
+			dc.Images = append(dc.Images, covs[k])
 		}
 		dc.NodesSeen = sortedKeys(seen)
 		if len(dc.NodesSeen) > d.Nodes {
@@ -335,7 +527,6 @@ func (w *PreflightWarmer) coverImage(ctx context.Context, di, ii int, d schema.P
 	o := w.opts
 	ic := schema.ImageCoverage{Image: img, Nodes: []string{}, Wanted: d.Nodes}
 	nodes := map[string]bool{}
-	pinned := map[string]string{}
 	width := d.Nodes * o.ProbesPerNode
 	for round := 1; round <= o.MaxRounds && len(nodes) < d.Nodes && ctx.Err() == nil; round++ {
 		ic.Rounds = round
@@ -354,7 +545,7 @@ func (w *PreflightWarmer) coverImage(ctx context.Context, di, ii int, d schema.P
 			pctx, cancel := context.WithTimeout(ctx, o.ProbeTimeout)
 			defer cancel()
 			var node string
-			sb, err := o.Backend.CreatePlaced(pctx, id, img, d.Selector)
+			sb, err := o.Backend.CreateWith(pctx, id, img, CreateOptions{WorkerSelector: d.Selector})
 			if err == nil {
 				// The first command returns once the restore finished: the
 				// layers and the golden snapshot are on the node by then.
@@ -385,14 +576,7 @@ func (w *PreflightWarmer) coverImage(ctx context.Context, di, ii int, d schema.P
 				continue
 			}
 			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-			if o.Pin && oc.err == nil {
-				if err := oc.sb.Suspend(rctx); err != nil {
-					o.Logger.Warn("preflight: suspend failed, deleting", slog.String("env", oc.id), slog.Any("err", err))
-					_ = oc.sb.Delete(rctx)
-				} else {
-					pinned[oc.node] = oc.id
-				}
-			} else if err := oc.sb.Delete(rctx); err != nil {
+			if err := oc.sb.Delete(rctx); err != nil {
 				o.Logger.Warn("preflight: delete failed", slog.String("env", oc.id), slog.Any("err", err))
 			}
 			cancel()
@@ -406,9 +590,6 @@ func (w *PreflightWarmer) coverImage(ctx context.Context, di, ii int, d schema.P
 	}
 	ic.Nodes = sortedKeys(nodes)
 	ic.Complete = len(ic.Nodes) >= d.Nodes
-	if len(pinned) > 0 {
-		ic.Pinned = pinned
-	}
 	if o.Recorder != nil {
 		_ = o.Recorder.Flush()
 	}
@@ -427,12 +608,18 @@ func (w *PreflightWarmer) record(e Event) {
 	}
 }
 
+// GoldenSettled reports whether a golden record needs no more waiting for
+// the run: ready, or none when goldens are disabled.
+func GoldenSettled(g schema.GoldenRecord) bool {
+	return g.State == "ready" || (g.State == "none" && g.Error == "")
+}
+
 // shortfall summarises what kept the pass from completing.
 func (w *PreflightWarmer) shortfall(r *schema.PreflightCoverage) string {
 	var parts []string
 	notReady := 0
 	for _, g := range r.Goldens {
-		if g.State != "ready" && g.State != "skipped" {
+		if !GoldenSettled(g) {
 			notReady++
 		}
 	}

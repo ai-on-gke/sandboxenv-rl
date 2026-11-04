@@ -484,6 +484,14 @@ class SubstrateBackendDriver(BackendDriver):
                     logger.info(
                         "Teardown ran while claiming warm actor %s; not handing it out", actor_id
                     )
+                    # One wire_claim sample for the abandoned claim, as for a
+                    # failed one; the claim that follows records its own.
+                    metrics.observe_subphase(
+                        "wire_claim",
+                        time.monotonic() - claim_start,
+                        status="error",
+                        source="warm_pool",
+                    )
                     if stale is not None:
                         await self._delete_unpooled(actor_id, "after teardown")
                     continue

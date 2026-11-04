@@ -32,7 +32,7 @@ Conventions:
 | AC-12 | Docs: `docs/observability.md`, generated `docs/metrics.md`, CI freshness check      | 5                | pass: CI step `docs/metrics.md is generated from internal/telemetry`                                          |
 | AC-13 | CI runs the suites with and without the extras; lint and boilerplate pass           | 1, 2, 5          | pass: `.github/workflows/ci.yaml`                                                                             |
 | AC-14 | Blast radius: existing tests pass unchanged; telemetry-off overhead under 2%        | all              | partial: suites green; overhead not measured                                                                  |
-| AC-15 | Warm-pool accounting under concurrent acquire, recycle, `warm_pool` and teardown    | #221, #238, #239 | partial: 15.1 to 15.7 and 15.9 pass (`test_warm_pool_accounting.py`, `verify/*.dfy`); 15.8 open               |
+| AC-15 | Warm-pool accounting under concurrent acquire, recycle, `warm_pool` and teardown    | #221, #238, #239 | partial: 15.1 to 15.7 and 15.9 pass (`test_warm_pool_accounting.py`, `verify/*.dfy`); 15.8, 15.10 open        |
 | AC-16 | The span and attribute inventory in `interfaces.md` matches the code, checked in CI | follow-up        | not met: the table is hand-written; last checked against `c0c41ac`                                            |
 | AC-17 | The Go and Python clients emit the same span names and keys for shared operations   | follow-up        | partial: mirrored tables in `attrs_test.go`, `executable_test.go`; no shared fixture                          |
 | AC-18 | No command line, secret or file content in any span attribute value                 | follow-up        | partial: example tests in both clients; no property test                                                      |
@@ -243,6 +243,10 @@ Conventions:
   cancelled while a reap runs, also leaves the actor for the next `reap` of any run. Met by #238;
   before it both kept the reaped run id, so no later reap deleted the actor (`DeleteCancelledSafe`,
   `ReleaseDeleteFailSafe`).
+- 15.10 (open): an `acquire` that completes after its own run's reap leaves its environment where a
+  later `reap` finds it. Today a cold create that overlaps the run's reap returns an environment
+  owned under the reaped run id; if the caller never releases it, `reap` of a later run skips it. A
+  scratch test against #239 reproduced it. Found in review of #239.
 - Commands: in `$VENV_BASE` (the `dev` extra carries `hypothesis`):
   `python -m pytest clients/python/tests/test_warm_pool_accounting.py`; with Dafny 4.11:
   `dafny verify docs/plans/telemetry/verify/warm_pool.dfy`,
@@ -257,7 +261,9 @@ Conventions:
   `test_failed_delete_of_drained_actors_keeps_them_for_the_next_reap`. 15.6:
   `test_direct_reap_moves_the_gauge_with_the_pool`. 15.7:
   `test_warm_claim_overlapping_a_reap_returns_a_live_environment` (reap finished or still running;
-  popped actor matched or skipped by the reap). 15.9:
+  popped actor matched by the reap, `run-0`, or skipped by it, `run-1`; in the still-running cases
+  the gate pauses the reap's delete of the popped actor for `run-0`, and the claim's own delete of
+  it for `run-1`, where the reap deletes nothing). 15.9:
   `test_cancelled_delete_after_reap_leaves_warm_actors_for_any_later_reap`,
   `test_release_delete_lost_during_reap_leaves_the_actor_for_any_later_reap` (failed and cancelled),
   `test_recycle_cancelled_in_suspend_after_a_reap_leaves_the_actor_for_any_later_reap`,
@@ -271,9 +277,10 @@ Conventions:
   `RecycleSuspendCancelledBeforeSafe`, `DeleteCancelledSafe` and `ReleaseDeleteFailSafe` (the code
   before 15.9's fix). [verify/README.md](./verify/README.md) explains each.
 - Pass rule: pytest green; Dafny output matches. CI runs both (the Dafny check is AC-20).
-- Status: 15.1 to 15.7 and 15.9 pass; 15.8 is open, with no test on `main`. The 15.9 tests fail on
-  the code before #238, the 15.7 test on the code before #239.
-- Properties: P-9 (15.1, 15.6), P-10 (15.2, 15.5, 15.8, 15.9), P-11 (15.3, 15.4), P-24 (15.7).
+- Status: 15.1 to 15.7 and 15.9 pass; 15.8 and 15.10 are open, with no test on `main`. The 15.9
+  tests fail on the code before #238, the 15.7 test on the code before #239.
+- Properties: P-9 (15.1, 15.6), P-10 (15.2, 15.5, 15.8, 15.9, 15.10), P-11 (15.3, 15.4), P-24
+  (15.7).
 
 ## AC-16: The span inventory matches the code
 

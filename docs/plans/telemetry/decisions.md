@@ -286,4 +286,5 @@ Append-only. Each entry: date, who, what, why.
   on another thread cannot run in between. In the model `ClaimOk` deletes a stale claim's actor, as
   `ClaimFailFixed` does. Not changed: an `acquire` that cold-creates while its own run's reap is
   running can still end owned under the reaped run id; that is the acquire-during-teardown case, not
-  a warm claim.
+  a warm claim. It is tracked as open criterion AC-15.10, which a scratch test reproduced. A stale
+  claim also records one `wire_claim` sample with status `error`, as a failed claim does.

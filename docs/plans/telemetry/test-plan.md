@@ -176,6 +176,9 @@ Still proposed, not in the repository:
 - The Go properties (P-19, P-20), with
   `go test ./internal/benchmarking/swebench/... ./clients/go/... -run 'TracingIsTransparent|SpansFollowProvider'`
   after adding `pgregory.net/rapid` to `go.mod`.
+- A test for AC-15.10: a cold `acquire` paused in `create()` while its own run's `reap` runs; after
+  it returns, `reap` of a later run must leave nothing alive that the caller did not keep. It fails
+  on `main`; it belongs with the fix.
 
 ## What to write in the pull request
 

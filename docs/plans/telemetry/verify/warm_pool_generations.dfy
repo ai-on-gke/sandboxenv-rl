@@ -60,7 +60,10 @@ module WarmPoolGenerations {
     && s.gauge == |s.pool|                                          // P-9
     && s.pool <= s.owned && s.owned <= s.live
     // No `claiming.Keys <= live`: a reap can delete an actor whose claim is
-    // still awaiting get() (see ClaimOkReturnsLive below).
+    // still awaiting get() (see ClaimOkReturnsLive below). A claim from the
+    // current generation is live: no reap ran since its pop (AC-15.7).
+    && (forall a :: a in s.claiming ==> s.claiming[a] <= s.gen)
+    && (forall a :: a in s.claiming && s.claiming[a] == s.gen ==> a in s.live)
     && s.pool !! s.claiming.Keys
     && (forall a :: a in s.pool ==> a in s.epoch && s.epoch[a] == s.gen)   // P-10
     && (forall a :: a in s.claiming ==> a in s.epoch && s.claiming[a] == s.epoch[a])
@@ -160,6 +163,17 @@ module WarmPoolGenerations {
       s.(claiming := s.claiming - {a}, owned := s.owned - {a}, live := s.live - {a})
   }
 
+  // get() succeeded. AC-15.7: the claim ends either way; the actor is handed
+  // out only if no reap ran since the pop, otherwise acquire claims or creates
+  // another, and the reap deletes this one.
+  function ClaimOk(s: State, a: Actor): State
+    requires a in s.claiming
+  { s.(claiming := s.claiming - {a}) }
+
+  ghost predicate HandsOut(s: State, a: Actor)
+    requires a in s.claiming
+  { s.claiming[a] == s.gen }
+
   // ========================================================== #221 verifies
   lemma PlanFixedSafe(s: State)
     requires Inv(s) && Fixed(s)
@@ -192,7 +206,18 @@ module WarmPoolGenerations {
     ensures Inv(ClaimFailFixed(s, a))
   {}
 
-  // ================== the first version of #221 and the open gap: these FAIL
+  // AC-15.7: what a successful claim hands out is live.
+  lemma ClaimOkFixedReturnsLive(s: State, a: Actor)
+    requires Inv(s) && a in s.claiming && HandsOut(s, a)
+    ensures a in s.live
+  {}
+
+  lemma ClaimOkSafe(s: State, a: Actor)
+    requires Inv(s) && a in s.claiming
+    ensures Inv(ClaimOk(s, a))
+  {}
+
+  // ======== the first version of #221 and the code before AC-15.7's fix: FAIL
   // Bug A. A reap leaves the counter, so a warm_pool planned afterwards counts
   // stale reservations and the pool plus its own reservations falls short.
   lemma PlanFirstCovers(s: State)
@@ -200,8 +225,8 @@ module WarmPoolGenerations {
     ensures |Plan(s).pool| + Plan(s).cur >= s.R                     // fails
   {}
 
-  // Open on main, not fixed by #221: get() succeeds after a reap deleted
-  // the claimed actor, and acquire hands the caller a deleted environment.
+  // Before AC-15.7's fix: get() succeeded after a reap deleted the claimed
+  // actor, and acquire handed the caller a deleted environment.
   lemma ClaimOkReturnsLive(s: State, a: Actor)
     requires Inv(s) && a in s.claiming
     ensures a in s.live                                             // fails

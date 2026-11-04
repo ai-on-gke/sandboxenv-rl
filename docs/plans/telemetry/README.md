@@ -144,8 +144,8 @@ behind it.
 - No overhead measurement for telemetry off against on is recorded in the series' pull requests;
   [test-plan.md](./test-plan.md) section 7 keeps the procedure.
 - Closed by #221: AC-15.1 to AC-15.6, warm-pool accounting under concurrency (P-9 to P-11).
-- Open: a warm claim whose `get()` succeeds after an overlapping reap deleted the actor returns a
-  deleted environment (AC-15.7, P-24, `ClaimOkReturnsLive` in [verify/](./verify/README.md)).
+- Closed by #239: a warm claim whose `get()` succeeded after an overlapping reap deleted the actor
+  returned a deleted environment (AC-15.7, P-24).
 - Open: a `warm_pool` cancelled during its `create()` calls can leak the actors already created
   (AC-15.8).
 - Closed by #238: a delete cancelled after the run's reap, or a `release` whose delete fails or is

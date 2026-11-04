@@ -463,6 +463,16 @@ class SubstrateBackendDriver(BackendDriver):
                     raise SandboxStartError(f"Error checking warm actor {actor_id}: {e}") from e
                 finally:
                     current_warm_claim.reset(wc_token)
+                with self._lock:
+                    reaped_since = not self._may_pool(teardowns)
+                if reaped_since:
+                    # A reap ran during get(). The actor was still owned, so
+                    # that reap deletes it (or already did): do not hand out a
+                    # deleted environment; claim or create another (AC-15.7).
+                    logger.info(
+                        "Teardown ran while claiming warm actor %s; not handing it out", actor_id
+                    )
+                    continue
                 wire_dur = time.monotonic() - claim_start
                 metrics.observe("warm_claim", wire_dur)
                 metrics.observe_subphase("wire_claim", wire_dur, status="ok", source="warm_pool")

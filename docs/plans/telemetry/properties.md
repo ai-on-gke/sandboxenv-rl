@@ -5,7 +5,7 @@ property tests here are proposed and not in the repository: `pgregory.net/rapid`
 and the Hypothesis tests named "Proposed test" do not exist. Two parts exist:
 
 - `clients/python/tests/test_warm_pool_accounting.py` (#221): the P-9 to P-11 stateful test
-  `test_warm_pool_accounting` and 24 plain interleaving tests. `hypothesis` is in the `dev` extra
+  `test_warm_pool_accounting` and 26 plain interleaving tests. `hypothesis` is in the `dev` extra
   since #221.
 - [verify/](./verify/README.md): hand-written Dafny models of P-1 to P-11 and of the two bugs review
   found in #221's first version. CI checks their results (AC-20).
@@ -24,7 +24,7 @@ State on `main` with #221:
 | --------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | P-9, P-10, P-11 | AC-15        | Fixed by #221. Before it, a recycle or `warm_pool` that awaited across a reap pooled its actor after the teardown, and overlapping `warm_pool` calls each provisioned the full shortfall.                     |
 | P-14            | AC-3.4       | Open. `SandboxHandle.exec` and `exec_async` (`clients/python/src/ate_env_rl/handle.py`) call `_note_first_command()` before `_exec_span` starts the span, so another thread's exec span can start first.      |
-| P-24            | AC-15.7      | Open. A warm claim pops an actor and awaits `get()`; if a reap deletes the actor meanwhile and `get()` still succeeds, `acquire` returns a deleted environment. See the findings.                             |
+| P-24            | AC-15.7      | Fixed by #239. Before it, a warm claim whose `get()` succeeded after an overlapping reap deleted the actor returned a deleted environment.                                                                    |
 | P-10            | AC-15.8      | Open. A `warm_pool` call cancelled during its `create()` calls leaks the actors already created: they are neither pooled nor tracked.                                                                         |
 | P-10            | AC-15.9      | Fixed by #238. Before it, a delete cancelled after the run's reap, or a `release` whose delete failed or was cancelled while a reap ran, left the actor under the reaped run id, so no later reap deleted it. |
 | P-21, P-22      | AC-17, AC-18 | Partial. Example tests only; the Go tests copy the Python tables by hand.                                                                                                                                     |
@@ -437,10 +437,11 @@ environment `acquire` returns is alive on Substrate when `acquire` returns.
 
 **Validates: AC-15.7**
 
-- Open on `main`. `ClaimOkReturnsLive` in `verify/warm_pool_generations.dfy` fails on it, and the
-  stateful machine never runs a reap during a claim. See "Claim/reap gap" in the findings.
-- Proposed test: a plain test that pauses `get()`, reaps, lets `get()` succeed, and asserts the
-  claim fails or retries; then a machine rule for it.
+- Met by #239. Test: `test_warm_claim_overlapping_a_reap_returns_a_live_environment` pauses `get()`,
+  reaps (to the end, or with the reap's delete still in flight), lets `get()` succeed, and checks
+  that `acquire` returns a live, newly created environment. Dafny: `ClaimOkFixedReturnsLive` in
+  `verify/warm_pool_generations.dfy`; `ClaimOkReturnsLive` models the code before the fix and fails.
+- The stateful machine still never runs a reap during a claim; a rule for it is proposed.
 
 ## Requirement index
 
@@ -494,7 +495,7 @@ The requirement numbers the properties validate. Each refines the criterion of t
 | AC-15.4 | `unwarm_pool` and a shrinking `resize_pool` cancel the `warm_pool` calls in flight for that pool.                                  |
 | AC-15.5 | An actor whose delete fails after a teardown or a drain is deleted by the next `reap` of any run.                                  |
 | AC-15.6 | A direct `reap` leaves the gauge equal to the pool.                                                                                |
-| AC-15.7 | A warm claim returns a live environment (open).                                                                                    |
+| AC-15.7 | A warm claim returns a live environment.                                                                                           |
 | AC-15.8 | A `warm_pool` cancelled during `create()` leaves no live actor untracked (open).                                                   |
 | AC-15.9 | A delete cancelled after a reap, or a release's delete that fails during one, leaves the actor for any later reap.                 |
 | AC-16.1 | A test collects every span name and attribute key the client and driver operations emit.                                           |
@@ -603,12 +604,15 @@ two more bugs. Neither Dafny nor Hypothesis found them first.
 `ClaimFailPutBackSafe` (B) fail, the fixed actions verify, and `BugAWitness` and `BugBWitness` check
 concrete traces. #221 fixed both and added a plain test for each.
 
-**Claim/reap gap, open.** Proving "claimed actors are live" in `warm_pool_generations.dfy` failed
-(`ClaimOkReturnsLive`). A warm claim pops an actor and awaits `get()`; a reap that runs meanwhile
-deletes it, since it is still owned. If `get()` returns before the delete lands, `_acquire_internal`
-hands the caller a deleted environment. #221 re-checks `_teardowns` only on the failure path. No
-property in this file covers it: P-10 holds (nothing survives the teardown); what breaks is that
-`acquire` returns a live environment, which no property states. No test covers it.
+**Claim/reap gap (AC-15.7), fixed by #239.** Proving "claimed actors are live" in
+`warm_pool_generations.dfy` failed (`ClaimOkReturnsLive`). A warm claim pops an actor and awaits
+`get()`; a reap that runs meanwhile deletes it, since it is still owned. If `get()` returns before
+the delete lands, `_acquire_internal` hands the caller a deleted environment. #221 re-checked
+`_teardowns` only on the failure path. P-10 holds (nothing survives the teardown); what breaks is
+that `acquire` returns a live environment, which P-24 now states. #239 re-checks on the success path
+too: if a reap ran since the pop, the claim moves on to another pooled actor or a cold create, and
+the reap deletes the popped one. In the model, a claim from the current generation is live (an
+invariant), and the actor is handed out only then.
 
 Run-id gaps (AC-15.9), fixed by #238. `warm_pool_drain.dfy` states ORPHAN: every owned actor with no
 delete pending carries a run id some later reap still matches (`WARM_POOL_RUN_ID`, or a run not

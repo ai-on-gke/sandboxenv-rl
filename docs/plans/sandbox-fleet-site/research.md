@@ -94,7 +94,7 @@ environment variable in `ate-otel-config` and a rollout restart.
 
 - Python and Go client spans carry `ate.actor.name`, `ate.atespace`, `ate.template.name`,
   `ate.template.atespace`, `ate_env.rootfs_image` and `ate_env.run_id`
-  (`clients/python/src/ate_env/client.py`, `clients/go/tracing.go`).
+  (`clients/python/src/ate_env_rl/client.py`, `clients/go/tracing.go`).
 - `ate-env-api` continues the context with otelgrpc on its server and on the `ateapi`, guest and
   wake-probe connections (#114). Its own spans carry `rpc.*` only.
 - The atenet router's ingress extracts `traceparent` from the request metadata and calls

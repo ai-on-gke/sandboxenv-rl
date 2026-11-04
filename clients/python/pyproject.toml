@@ -17,9 +17,9 @@ requires = ["setuptools>=77", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ate-env-client"
+name = "ate-env-rl"
 dynamic = ["version"]
-description = "Async Python client for the Agent Substrate Environment API (ate-env-api)"
+description = "Async Python client and RL fleet SDK for the Agent Substrate Environment API (ate-env-api)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -32,7 +32,7 @@ dependencies = [
 dev = [
     "pytest>=9",
     "pytest-asyncio>=1.0",
-    # Generates the committed stubs in src/ate_env/_gen, which refuse to run on
+    # Generates the committed stubs in src/ate_env_rl/_gen, which refuse to run on
     # a grpcio older than the generator: keep it at the grpcio floor above, and
     # move both together, then `make protos`.
     "grpcio-tools==1.84.0",
@@ -41,7 +41,7 @@ dev = [
     # Stateful property tests (tests/test_warm_pool_accounting.py).
     "hypothesis>=6.100",
 ]
-# OpenTelemetry tracing (ate_env.telemetry.tracing). 1.43 is the first release
+# OpenTelemetry tracing (ate_env_rl.telemetry.tracing). 1.43 is the first release
 # whose opentelemetry-proto accepts protobuf 7. Only the OTLP/gRPC span
 # exporter is used, so the HTTP exporter is not pulled in. No upper bound: the
 # API is stable, and a cap conflicts with applications on a newer OTel.
@@ -50,7 +50,7 @@ tracing = [
     "opentelemetry-sdk>=1.43",
     "opentelemetry-exporter-otlp-proto-grpc>=1.43",
 ]
-# Prometheus series (ate_env.observability, ate_env.telemetry.metrics).
+# Prometheus series (ate_env_rl.observability, ate_env_rl.telemetry.metrics).
 metrics = [
     "prometheus-client>=0.20",
 ]
@@ -66,7 +66,7 @@ fallback_version = "0.1.0"
 where = ["src"]
 
 [tool.setuptools.package-data]
-ate_env = ["py.typed", "_gen/**/*.pyi"]
+ate_env_rl = ["py.typed", "_gen/**/*.pyi"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -74,7 +74,7 @@ asyncio_mode = "auto"
 
 [tool.ruff]
 target-version = "py310"
-extend-exclude = ["src/ate_env/_gen"]
+extend-exclude = ["src/ate_env_rl/_gen"]
 
 [tool.ruff.lint]
 # pyflakes, the pycodestyle errors that are not about layout, import order,

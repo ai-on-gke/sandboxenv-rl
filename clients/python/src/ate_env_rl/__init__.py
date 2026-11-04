@@ -17,7 +17,7 @@
 Quickstart:
 
     import asyncio
-    from ate_env import Client
+    from ate_env_rl import Client
 
     async def main():
         client = Client("localhost:7777")

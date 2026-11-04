@@ -17,21 +17,23 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
 import shutil
 import stat
+import tarfile
 import time
 from pathlib import Path
 
 import pytest
-from ate_env import FailedPreconditionError, RpcError
+from ate_env_rl import FailedPreconditionError, RpcError
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.config import ResourceMode
 
 from ate_env_harbor import AteEnvEnvironment
-from ate_env_harbor.environment import RECORD_FILE, WHOAMI_COMMAND
+from ate_env_harbor.environment import RECORD_FILE, WHOAMI_COMMAND, pack_dir_as_root
 
 from .conftest import ALPINE
 
@@ -326,6 +328,40 @@ async def test_shared_client_cache_evicts_closed_loops(fake):
     assert any(bound.is_closed() for _, bound in _client._clients.values())
     _client.shared_client(fake.addr, None)
     assert not any(bound.is_closed() for _, bound in _client._clients.values())
+
+
+def test_uploaded_archives_are_owned_by_root(tmp_path):
+    # GNU tar extracting as root restores the archived owner; inside an actor
+    # a chown to the host's uid fails. Pack with root ownership instead.
+    src = tmp_path / "src"
+    (src / "sub").mkdir(parents=True)
+    (src / "empty").mkdir()
+    (src / "a.sh").write_text("#!/bin/sh\n")
+    (src / "a.sh").chmod(0o750)
+    (src / "link").symlink_to("a.sh")
+    with tarfile.open(fileobj=io.BytesIO(pack_dir_as_root(src)), mode="r:gz") as tar:
+        members = {m.name: m for m in tar.getmembers()}
+    assert set(members) == {".", "./sub", "./empty", "./a.sh", "./link"}
+    assert all(m.uid == 0 and m.gid == 0 and m.uname == "root" and m.gname == "root" for m in members.values())
+    assert members["./a.sh"].mode & 0o777 == 0o750
+    assert members["./link"].issym() and members["./link"].linkname == "a.sh"
+    assert members["./empty"].isdir()
+
+
+def test_pack_dir_as_root_follows_a_symlinked_source_dir(tmp_path):
+    # tar.add on a symlinked source_dir archives "." as a SYMLINK member and
+    # GNU tar then fails to extract it into an existing directory. The top
+    # level is resolved; symlinks inside the tree stay symlinks.
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "a.sh").write_text("#!/bin/sh\n")
+    (real / "link").symlink_to("a.sh")
+    (tmp_path / "alias").symlink_to(real, target_is_directory=True)
+    with tarfile.open(fileobj=io.BytesIO(pack_dir_as_root(tmp_path / "alias")), mode="r:gz") as tar:
+        members = {m.name: m for m in tar.getmembers()}
+    assert set(members) == {".", "./a.sh", "./link"}
+    assert members["."].isdir()
+    assert members["./link"].issym() and members["./link"].linkname == "a.sh"
 
 
 async def test_download_dir_of_a_missing_directory_fails_clearly(fake, make_env, tmp_path):

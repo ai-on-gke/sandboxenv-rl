@@ -66,7 +66,7 @@ from .telemetry.tracing import set_attributes, start_span, tracer_from_config
 
 __all__ = ["MAX_FAMILIES", "Observer", "RunReport", "repo_family", "serve_metrics"]
 
-logger = logging.getLogger("ate_env.observability")
+logger = logging.getLogger("ate_env_rl.observability")
 
 FLEET_SPAN_PREFIX = "ate_env_fleet"
 
@@ -607,7 +607,7 @@ def _log_metrics_off_once() -> None:
         _METRICS_OFF_LOGGED = True
         logger.info(
             "prometheus_client not installed; fleet metrics off. Install the metrics "
-            "extra (pip install 'ate-env-client[metrics]') to record them."
+            "extra (pip install 'ate-env-rl[metrics]') to record them."
         )
 
 
@@ -645,7 +645,7 @@ def serve_metrics(port: int = 9095, addr: str = "0.0.0.0", *, registry: Any = No
     if prom is None:
         raise RuntimeError(
             "prometheus_client not installed; install the metrics extra: "
-            "pip install 'ate-env-client[metrics]'"
+            "pip install 'ate-env-rl[metrics]'"
         )
     if registry is None:
         return prom.start_http_server(port, addr)

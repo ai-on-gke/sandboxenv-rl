@@ -15,8 +15,12 @@
 package job
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,8 +63,17 @@ func (r *RealJobDriver) runVeRLManifest(
 			"--from-file=ate_env_tool.py=" + filepath.Join(dir, "ate_env_tool.py"),
 			"--from-file=tool_config.yaml=" + filepath.Join(dir, "tool_config.yaml"),
 			"--from-file=run_fully_async.sh=" + filepath.Join(dir, "run_fully_async.sh"),
-			"--dry-run=client", "-o", "yaml",
 		}
+		clientsPythonDir := filepath.Join(dir, "..", "..", "clients", "python")
+		if _, err := os.Stat(filepath.Join(clientsPythonDir, "pyproject.toml")); err == nil {
+			tgzPath, err := archiveClientsPython(clientsPythonDir)
+			if err != nil {
+				return nil, fmt.Errorf("archive %s: %w", clientsPythonDir, err)
+			}
+			defer os.Remove(tgzPath)
+			cmArgs = append(cmArgs, "--from-file=ate-env-rl.tgz="+tgzPath)
+		}
+		cmArgs = append(cmArgs, "--dry-run=client", "-o", "yaml")
 		cmYAML, err := execRunner.Run(ctx, "kubectl", env, cmArgs...)
 		if err != nil {
 			return nil, fmt.Errorf("prepare configmap %s: %w", VeRLConfigMapName, err)
@@ -94,4 +107,105 @@ func (r *RealJobDriver) runVeRLManifest(
 		return nil, fmt.Errorf("collect logs from %s: %w", VeRLHeadJobName, err)
 	}
 	return logs, nil
+}
+
+// archiveClientsPython packs pyproject.toml, README.md, and src/ from
+// clientsPythonDir into a temporary .tgz so run_fully_async.sh can install
+// ate-env-rl from /workspace/cfg/ate-env-rl.tgz without pinning a pre-merge
+// commit hash.
+func archiveClientsPython(clientsPythonDir string) (string, error) {
+	f, err := os.CreateTemp("", "ate-env-rl-*.tgz")
+	if err != nil {
+		return "", err
+	}
+	tgzPath := f.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.Remove(tgzPath)
+		}
+	}()
+
+	gzw := gzip.NewWriter(f)
+	tw := tar.NewWriter(gzw)
+
+	addFile := func(relPath, fullPath string, info fs.FileInfo) error {
+		hdr, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		hdr.Name = filepath.ToSlash(relPath)
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		src, err := os.Open(fullPath)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+		_, err = io.Copy(tw, src)
+		return err
+	}
+
+	for _, name := range []string{"pyproject.toml", "README.md"} {
+		full := filepath.Join(clientsPythonDir, name)
+		info, err := os.Stat(full)
+		if err != nil {
+			_ = tw.Close()
+			_ = gzw.Close()
+			_ = f.Close()
+			return "", err
+		}
+		if err := addFile(name, full, info); err != nil {
+			_ = tw.Close()
+			_ = gzw.Close()
+			_ = f.Close()
+			return "", err
+		}
+	}
+
+	srcRoot := filepath.Join(clientsPythonDir, "src")
+	if err := filepath.WalkDir(srcRoot, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			if d.Name() == "__pycache__" || strings.HasSuffix(d.Name(), ".egg-info") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ".pyc") {
+			return nil
+		}
+		rel, err := filepath.Rel(clientsPythonDir, path)
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		return addFile(rel, path, info)
+	}); err != nil {
+		_ = tw.Close()
+		_ = gzw.Close()
+		_ = f.Close()
+		return "", err
+	}
+
+	if err := tw.Close(); err != nil {
+		_ = gzw.Close()
+		_ = f.Close()
+		return "", err
+	}
+	if err := gzw.Close(); err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	ok = true
+	return tgzPath, nil
 }

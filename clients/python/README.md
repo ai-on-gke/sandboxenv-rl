@@ -1,4 +1,4 @@
-# ate-env-client — Python Client & Sandbox Fleet SDK
+# ate-env-rl — Python Client & Sandbox Fleet SDK
 
 > [!WARNING]
 > This is an alpha API and is likely to change until v1.0 is released.
@@ -20,7 +20,7 @@ The client talks to a single endpoint — the `ate-env-api` service — over
 plain gRPC (h2c). Behind that endpoint there are two distinct paths:
 
 ```
-       ate_env (this package)                                       cluster
+       ate_env_rl (this package)                                    cluster
  ╭────────────────────────────╮
  │ Client                     │ EnvironmentService ╭───────────────╮ lifecycle  ╭────────╮
  │  create() get() suspend()  │───────────────────▶│               │───────────▶│ ateapi │
@@ -101,8 +101,8 @@ From a repo checkout:
 pip install ./clients/python
 ```
 
-The distribution is named `ate-env-client`; the import package is
-`ate_env` (mirroring the Go client, which lives at `clients/go`).
+The distribution is named `ate-env-rl`; the import package is
+`ate_env_rl` (mirroring the Go client, which lives at `clients/go`).
 
 ### Connect
 
@@ -120,7 +120,7 @@ across tasks — for long-lived programs (servers, multi-agent
 orchestration), create one client, share it, and close it on shutdown:
 
 ```python
-from ate_env import Client
+from ate_env_rl import Client
 
 client = Client("localhost:7777")
 try:
@@ -173,7 +173,7 @@ A freshly created (or suspended) environment starts serving on first
 contact. Gate on readiness by retrying a trivial command:
 
 ```python
-from ate_env import EnvError, SandboxStartError
+from ate_env_rl import EnvError, SandboxStartError
 
 async def wait_until_serving(env, timeout=180):
     async with asyncio.timeout(timeout):
@@ -334,7 +334,7 @@ Deletion is permanent.
 
 ### Handle errors
 
-All failures raise subclasses of `ate_env.EnvError`:
+All failures raise subclasses of `ate_env_rl.EnvError`:
 
 | Exception | gRPC code | Typical cause |
 | --- | --- | --- |
@@ -347,7 +347,7 @@ All failures raise subclasses of `ate_env.EnvError`:
 | `RpcError` | anything else | transport failures, `ALREADY_EXISTS`, actor still waking, … (`.code` holds the status) |
 
 ```python
-from ate_env import NotFoundError
+from ate_env_rl import NotFoundError
 
 try:
     data = await env.read_file_bytes("/no/such/file")
@@ -523,7 +523,7 @@ with off-policy staleness it may still be claiming for a batch it dispatched
 exactly the batches in flight:
 
 ```python
-from ate_env import LookaheadWarmer
+from ate_env_rl import LookaheadWarmer
 
 warmer = LookaheadWarmer(fleet, keep_finished=max_staleness)  # cap = max_warmpool_replicas
 warmer.add(0, {img: n * G for img, n in batch0}, wait=True)   # start-up barrier
@@ -556,7 +556,7 @@ driver cannot tell) to trim recycled surplus, and counts claims with
 
 [USER_GUIDE.md](USER_GUIDE.md) covers what is specific to RL: overlapping
 sandbox claims with policy decoding (`AsyncSandboxFleet.acquire_batch`), and
-grading candidates with `ate_env.adapters` (`SweBenchAdapter`). The VeRL
+grading candidates with `ate_env_rl.adapters` (`SweBenchAdapter`). The VeRL
 example in [`examples/verl_swebench`](../../examples/verl_swebench) uses both.
 
 ### Observability
@@ -626,11 +626,11 @@ records `ate_env_client_{acquire,exec,suspend,warm_claim,release}_seconds`
 happens on the first guest request, so it lands in the first `exec`).
 Collectors register on the first metrics-enabled `Observer`, never at
 import. Labels are limited to `phase`, `backend` (`substrate` or `mock`),
-`family` (the task's repo family, see `ate_env.observability.repo_family`),
+`family` (the task's repo family, see `ate_env_rl.observability.repo_family`),
 `strategy` and `status` (`ok`, `error`, or `cancelled` for a cancelled or
 interrupted block); environment ids, run ids, commands, paths and image
 tags never become labels. `family` has at most
-`ate_env.observability.MAX_FAMILIES` (64) values per process: the first 64
+`ate_env_rl.observability.MAX_FAMILIES` (64) values per process: the first 64
 repo families keep their name and later ones are reported as `other`, so a
 dataset with thousands of repos does not grow the series without limit.
 A repo whose family is `other` or `unknown` is labelled `other_repo` or
@@ -649,7 +649,7 @@ warning.
 Expose the series with:
 
 ```python
-from ate_env.observability import serve_metrics
+from ate_env_rl.observability import serve_metrics
 serve_metrics(9095, addr="127.0.0.1")  # /metrics on the default registry, local only
 ```
 
@@ -668,7 +668,7 @@ Either fleet switch turns on tracing for the whole fleet, under one
 service name:
 
 ```python
-from ate_env import Client, FleetConfig, ObservabilityConfig, TracerConfig
+from ate_env_rl import Client, FleetConfig, ObservabilityConfig, TracerConfig
 
 FleetConfig(observability=ObservabilityConfig(enable_tracing=True))   # service "ate-env-fleet"
 FleetConfig(tracing=TracerConfig(enable_tracing=True))                # service "ate-env-client"
@@ -712,7 +712,7 @@ ate_env_fleet.run
 - **Propagation.** Every gRPC call on a channel the client creates carries
   the W3C `traceparent` / `tracestate` (never baggage), so `ate-env-api`
   can continue the trace. A caller-owned `Client(channel=...)` gets spans
-  but not the header: add `ate_env.telemetry.TraceContextInterceptor`
+  but not the header: add `ate_env_rl.telemetry.TraceContextInterceptor`
   subclasses to your channel yourself.
 - **Nesting.** Client spans nest under the caller's current span, including
   across the fleet's worker threads and background event loop.
@@ -799,7 +799,7 @@ starts, so there are two cases:
 If neither applies (no provider and no OTLP endpoint), spans are created but
 not exported, and nothing is sent over the network.
 
-Without the extra, `import ate_env` never loads OpenTelemetry. Enabling
+Without the extra, `import ate_env_rl` never loads OpenTelemetry. Enabling
 tracing then logs one error naming the missing extra, and the client keeps
 working without spans.
 
@@ -836,7 +836,7 @@ python3 -m venv .venv
 
 ### Regenerating gRPC stubs
 
-Generated code under `src/ate_env/_gen/` is committed. After changing
+Generated code under `src/ate_env_rl/_gen/` is committed. After changing
 `proto/ateenv/v1alpha/*.proto`, regenerate from the repo root:
 
 ```bash

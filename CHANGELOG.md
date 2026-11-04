@@ -44,7 +44,7 @@ user needs to know across them.
   (`TracerConfig`, `FleetConfig.tracing`, `ObservabilityConfig.enable_tracing`).
   `ate_env_client.*` and `ate_env_fleet.*` spans, W3C `traceparent` on every gRPC
   call, context carried across `LoopRunner` threads and `process_parallel`.
-- Python client: `ate_env.observability`. `fleet.report` is a `RunReport`
+- Python client: `ate_env_rl.observability`. `fleet.report` is a `RunReport`
   (per-phase count, total and max, claims, task outcomes, warm replicas) with
   `summary()`, `to_dict()` and `write(report_dir)`; `ate_env_fleet_*` and
   `ate_env_client_*` Prometheus series behind the `metrics` extra, served by
@@ -67,13 +67,15 @@ user needs to know across them.
   per-event JSONL for one more release.
 - `benchmarking/telemetry_report`: builds a self-contained HTML report from run
   reports, OTLP/JSON spans and Prometheus or collector metrics.
-- Release publishing for `ate-env-client`: `clients/python` derives its version
+- Release publishing for `ate-env-rl`: `clients/python` derives its version
   from the Git tag (`setuptools-scm`) and is published to PyPI via OIDC Trusted
   Publishing when a GitHub Release is published; `hack/release/create-release.py`
   drafts release notes and cuts draft releases (see [docs/release.md](docs/release.md)).
 
 ### Changed
 
+- Python client: renamed distribution package from `ate-env-client` to
+  `ate-env-rl` and import module from `ate_env` to `ate_env_rl`.
 - Python client: `warm_pool` pools the actors it created before it raises
   `SandboxStartError`. An overlapping `warm_pool(wait=True)` counts the actors
   another call is still creating and can return before the pool is full.

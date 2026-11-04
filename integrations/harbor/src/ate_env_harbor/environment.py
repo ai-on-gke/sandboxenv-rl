@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import io
 import itertools
 import json
 import logging
@@ -32,12 +33,13 @@ import os
 import posixpath
 import shlex
 import stat
+import tarfile
 import time
 from pathlib import Path
 from typing import Any
 
 import grpc
-from ate_env import (
+from ate_env_rl import (
     Client,
     Env,
     EnvError,
@@ -59,7 +61,6 @@ from harbor.environments.definition import (
 )
 from harbor.environments.tar_transfer import (
     extract_dir_from_bytes,
-    pack_dir_to_bytes,
     remote_pack_command,
     remote_unpack_command,
 )
@@ -624,7 +625,7 @@ class AteEnvEnvironment(BaseEnvironment):
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
         handle = self._require_started()
         archive = self._scratch_path("upload")
-        payload = pack_dir_to_bytes(source_dir, compress=True).getvalue()
+        payload = pack_dir_as_root(source_dir)
         await handle.write_file(archive, payload)
         unpack = remote_unpack_command(archive, target_dir)
         try:
@@ -666,6 +667,35 @@ class AteEnvEnvironment(BaseEnvironment):
             with contextlib.suppress(EnvError):
                 await handle.shell(self._tooled(f"rm -f {shlex.quote(archive)}"))
         extract_dir_from_bytes(data, target_dir)
+
+
+def pack_dir_as_root(source_dir: Path | str) -> bytes:
+    """A gzipped tar of ``source_dir`` rooted at ``.``, every member owned by root.
+
+    Harbor's ``pack_dir_to_bytes`` keeps the host's uid and gid. GNU tar
+    extracting as root restores them, and inside an actor that chown fails
+    ("Cannot change ownership to uid ..."), thus the upload of ``environment/``
+    and ``tests/`` failed on glibc images. Owned by root, the members are
+    extracted as the image's user without a chown. Modes, symlinks and empty
+    directories are kept, as in Harbor's helper. The top-level path is
+    resolved first: a ``source_dir`` that is itself a symlink to a directory
+    would otherwise be archived as one ``SYMLINK`` member named ``.``, which
+    GNU tar refuses to extract into an existing directory. Symlinks inside
+    the tree stay symlinks.
+    """
+    source = Path(source_dir).resolve()
+    if not source.is_dir():
+        raise FileNotFoundError(f"Source directory {source_dir} does not exist")
+
+    def as_root(member: tarfile.TarInfo) -> tarfile.TarInfo:
+        member.uid = member.gid = 0
+        member.uname = member.gname = "root"
+        return member
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        tar.add(source, arcname=".", filter=as_root)
+    return buffer.getvalue()
 
 
 def _parse_tool_paths(value: str | list[str] | tuple[str, ...] | None) -> tuple[str, ...]:

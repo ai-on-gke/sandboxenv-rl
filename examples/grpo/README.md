@@ -138,7 +138,7 @@ same run report as a fleet run, plus the optional layers (see
 ```bash
 REPORT_DIR=/tmp/reports SMOKE=1 python grpo_substrate_train.py   # grpo_<n>tasks_<stamp>.txt and .json
 python report.py /tmp/reports/grpo_*tasks_*.json                  # same table, from the JSON
-# spans (pip install 'ate-env-client[tracing]') and Prometheus (pip install 'ate-env-client[metrics]')
+# spans (pip install 'ate-env-rl[tracing]') and Prometheus (pip install 'ate-env-rl[metrics]')
 ENABLE_TRACING=1 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 METRICS_PORT=9095 python grpo_substrate_train.py
 ```
 

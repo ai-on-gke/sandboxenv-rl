@@ -14,7 +14,7 @@
 
 import pytest
 
-from ate_env.config import FleetConfig, ValidationError
+from ate_env_rl.config import FleetConfig, ValidationError
 
 
 def test_unknown_fields_are_rejected():

@@ -167,6 +167,21 @@ func TestValidateRejects(t *testing.T) {
 		{"crashed without record", func(s *Snapshot) { s.Actors[1].Crash = nil }, "crash is present"},
 		{"counts", func(s *Snapshot) { s.Counts.ActorsByState[ActorStateRunning]++ }, "counts do not match"},
 		{"negative capacity", func(s *Snapshot) { s.Workers[0].Capacity.CPUMillicores = -1 }, "negative"},
+		{"nil actors", func(s *Snapshot) { s.Actors = nil; s.Counts = ComputeCounts(nil) }, "not null"},
+		{"nil deployments", func(s *Snapshot) { s.Deployments = nil }, "not null"},
+		{"atespace create_time", func(s *Snapshot) { s.Atespaces[0].CreateTime = time.Time{} }, "create_time"},
+		{"template create_time", func(s *Snapshot) { s.Templates[0].CreateTime = time.Time{} }, "create_time"},
+		{"tag create_time", func(s *Snapshot) { s.Tags[0].CreateTime = time.Time{} }, "create_time"},
+		{"crash_time", func(s *Snapshot) { s.Actors[1].Crash.CrashTime = time.Time{} }, "crash_time"},
+		{"negative ready", func(s *Snapshot) { s.Deployments[0].Ready = -1 }, "ready"},
+		{"metrics_port too large", func(s *Snapshot) { s.Deployments[0].MetricsPort = 70000 }, "metrics_port"},
+		{"metrics_port negative", func(s *Snapshot) { s.Deployments[0].MetricsPort = -1 }, "metrics_port"},
+		{"duplicate atespace", func(s *Snapshot) { s.Atespaces = append(s.Atespaces, s.Atespaces[0]) }, "repeats"},
+		{"duplicate template", func(s *Snapshot) { s.Templates[1].Name = s.Templates[0].Name }, "repeats"},
+		{"duplicate tag", func(s *Snapshot) { s.Tags = append(s.Tags, s.Tags[0]) }, "repeats"},
+		{"duplicate workerpool", func(s *Snapshot) { s.WorkerPools = append(s.WorkerPools, s.WorkerPools[0]) }, "repeats"},
+		{"duplicate worker", func(s *Snapshot) { s.Workers = append(s.Workers, s.Workers[0]) }, "repeats"},
+		{"duplicate deployment", func(s *Snapshot) { s.Deployments = append(s.Deployments, s.Deployments[0]) }, "repeats"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -180,6 +195,36 @@ func TestValidateRejects(t *testing.T) {
 	}
 	if err := goldenSnapshot().Validate(); err != nil {
 		t.Fatalf("golden must validate: %v", err)
+	}
+}
+
+// TestEmptyClusterValidatesInGoAndSchema pins that a cluster with nothing in
+// it is a valid snapshot in both validators: empty lists encode as [] and
+// pass the schema, while nil lists are refused by Validate before they can
+// encode as null.
+func TestEmptyClusterValidatesInGoAndSchema(t *testing.T) {
+	s := &Snapshot{
+		SchemaVersion: SchemaVersion, GeneratedAt: time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC),
+		Project: "p", Cluster: "c", Reporter: Reporter{Version: "v0.1.0", IntervalSeconds: 5},
+		Atespaces: []Atespace{}, Templates: []Template{}, WorkerPools: []WorkerPool{}, Workers: []Worker{},
+		Actors: []Actor{}, Deployments: []Deployment{},
+	}
+	s.Counts = ComputeCounts(s.Actors)
+	if err := s.Validate(); err != nil {
+		t.Fatalf("empty cluster: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := s.Encode(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "null") {
+		t.Fatalf("empty cluster encoded a null:\n%s", buf.String())
+	}
+	if err := ValidateAgainstJSONSchema(SnapshotSchema, buf.Bytes()); err != nil {
+		t.Fatalf("empty cluster does not validate against the schema: %v", err)
+	}
+	if _, err := DecodeSnapshot(bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatalf("empty cluster does not decode: %v", err)
 	}
 }
 

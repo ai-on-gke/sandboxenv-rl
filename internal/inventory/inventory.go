@@ -307,9 +307,11 @@ func (s *Snapshot) Sort() {
 
 func key2(a, b string) string { return a + "\x00" + b }
 
-// Validate checks the invariants the JSON Schema cannot express: the version,
-// the identity of the snapshot and of each object, the state vocabularies,
-// unique actor uids, and Counts matching Actors.
+// Validate checks what the JSON Schema requires and what it cannot express:
+// the version, non-null lists, the identity and timestamps of the snapshot and
+// of each object, the state vocabularies, the numeric bounds, unique keys in
+// every list, and Counts matching Actors. A snapshot that passes Validate
+// encodes to a document that validates against snapshot.schema.json.
 func (s *Snapshot) Validate() error {
 	if s.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("inventory: unsupported schema_version %q (want %q)", s.SchemaVersion, SchemaVersion)
@@ -326,22 +328,67 @@ func (s *Snapshot) Validate() error {
 	if s.Reporter.IntervalSeconds <= 0 {
 		return fmt.Errorf("inventory: reporter.interval_s must be positive, got %d", s.Reporter.IntervalSeconds)
 	}
+	// The schema requires these lists; a nil slice would encode as null. Tags
+	// is optional and omitted when nil.
+	for _, l := range []struct {
+		name string
+		nil  bool
+	}{
+		{"atespaces", s.Atespaces == nil}, {"templates", s.Templates == nil},
+		{"workerpools", s.WorkerPools == nil}, {"workers", s.Workers == nil},
+		{"actors", s.Actors == nil}, {"deployments", s.Deployments == nil},
+	} {
+		if l.nil {
+			return fmt.Errorf("inventory: %s must be a list, not null (use an empty slice)", l.name)
+		}
+	}
+	seen := map[string]map[string]int{}
+	unique := func(list, key string, i int) error {
+		m := seen[list]
+		if m == nil {
+			m = map[string]int{}
+			seen[list] = m
+		}
+		if j, dup := m[key]; dup {
+			return fmt.Errorf("inventory: %s[%d] repeats %s[%d]", list, i, list, j)
+		}
+		m[key] = i
+		return nil
+	}
 	for i, a := range s.Atespaces {
 		if a.Name == "" {
 			return fmt.Errorf("inventory: atespaces[%d]: name is required", i)
+		}
+		if a.CreateTime.IsZero() {
+			return fmt.Errorf("inventory: atespaces[%d]: create_time is required", i)
+		}
+		if err := unique("atespaces", a.Name, i); err != nil {
+			return err
 		}
 	}
 	for i, t := range s.Templates {
 		if t.Atespace == "" || t.Name == "" {
 			return fmt.Errorf("inventory: templates[%d]: atespace and name are required", i)
 		}
+		if t.CreateTime.IsZero() {
+			return fmt.Errorf("inventory: templates[%d]: create_time is required", i)
+		}
 		if t.GoldenState != "" && !goldenStates[t.GoldenState] {
 			return fmt.Errorf("inventory: templates[%d]: unknown golden_state %q", i, t.GoldenState)
+		}
+		if err := unique("templates", key2(t.Atespace, t.Name), i); err != nil {
+			return err
 		}
 	}
 	for i, t := range s.Tags {
 		if t.Atespace == "" || t.Name == "" {
 			return fmt.Errorf("inventory: tags[%d]: atespace and name are required", i)
+		}
+		if t.CreateTime.IsZero() {
+			return fmt.Errorf("inventory: tags[%d]: create_time is required", i)
+		}
+		if err := unique("tags", key2(t.Atespace, t.Name), i); err != nil {
+			return err
 		}
 	}
 	for i, p := range s.WorkerPools {
@@ -350,6 +397,9 @@ func (s *Snapshot) Validate() error {
 		}
 		if p.Replicas < 0 || p.ReadyReplicas < 0 {
 			return fmt.Errorf("inventory: workerpools[%d]: replica counts must not be negative", i)
+		}
+		if err := unique("workerpools", key2(p.Namespace, p.Name), i); err != nil {
+			return err
 		}
 	}
 	for i, w := range s.Workers {
@@ -362,16 +412,17 @@ func (s *Snapshot) Validate() error {
 		if w.Capacity.CPUMillicores < 0 || w.Capacity.MemoryBytes < 0 || w.Allocated.CPUMillicores < 0 || w.Allocated.MemoryBytes < 0 {
 			return fmt.Errorf("inventory: workers[%d]: resources must not be negative", i)
 		}
+		if err := unique("workers", w.Name, i); err != nil {
+			return err
+		}
 	}
-	uids := make(map[string]int, len(s.Actors))
 	for i, a := range s.Actors {
 		if a.UID == "" || a.Atespace == "" || a.Name == "" {
 			return fmt.Errorf("inventory: actors[%d]: uid, atespace and name are required", i)
 		}
-		if j, dup := uids[a.UID]; dup {
-			return fmt.Errorf("inventory: actors[%d]: uid %q repeats actors[%d]", i, a.UID, j)
+		if err := unique("actors", a.UID, i); err != nil {
+			return err
 		}
-		uids[a.UID] = i
 		if !actorStates[a.State] {
 			return fmt.Errorf("inventory: actors[%d]: unknown state %q", i, a.State)
 		}
@@ -381,10 +432,22 @@ func (s *Snapshot) Validate() error {
 		if (a.State == ActorStateCrashed) != (a.Crash != nil) {
 			return fmt.Errorf("inventory: actors[%d]: crash is present exactly when state is %q", i, ActorStateCrashed)
 		}
+		if a.Crash != nil && a.Crash.CrashTime.IsZero() {
+			return fmt.Errorf("inventory: actors[%d]: crash.crash_time is required", i)
+		}
 	}
 	for i, d := range s.Deployments {
 		if d.Namespace == "" || d.Name == "" || d.Image == "" {
 			return fmt.Errorf("inventory: deployments[%d]: namespace, name and image are required", i)
+		}
+		if d.Ready < 0 {
+			return fmt.Errorf("inventory: deployments[%d]: ready must not be negative", i)
+		}
+		if d.MetricsPort < 0 || d.MetricsPort > 65535 {
+			return fmt.Errorf("inventory: deployments[%d]: metrics_port %d is not a port number", i, d.MetricsPort)
+		}
+		if err := unique("deployments", key2(d.Namespace, d.Name), i); err != nil {
+			return err
 		}
 	}
 	if want := ComputeCounts(s.Actors); !countsEqual(want, s.Counts) {

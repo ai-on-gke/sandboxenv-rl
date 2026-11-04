@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import copy
 import re
+from collections.abc import Mapping
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from typing import Any, Literal
 
@@ -198,9 +200,17 @@ class FleetConfig:
     # ceil(max_concurrent / 200).
     connections: int | None = None
 
-    # Hardware & placement (reserved for template placement and future scheduler extensions)
+    # Hardware & placement. worker_family and tolerations are reserved.
     worker_family: str | None = "c2"
+    # Labels the worker pool of every environment must carry: sent as the
+    # per-environment worker_selector on CreateEnvironment, which Substrate
+    # ANDs with the template's own selector, so it narrows the template's
+    # pools and never widens them, and holds for the environment's wakes.
     node_selector: dict[str, str] = field(default_factory=dict)
+    # Per-image labels merged over node_selector, keyed by the task image
+    # (the rootfs_image): the placement plan that keeps an image's
+    # environments on the pools whose nodes already hold it.
+    placement: dict[str, dict[str, str]] = field(default_factory=dict)
     tolerations: list[dict[str, Any]] = field(default_factory=list)
     labels: dict[str, str] = field(default_factory=dict)
 
@@ -266,6 +276,18 @@ class FleetConfig:
             raise ValidationError(f"connections must be >= 1, got {self.connections}")
 
         object.__setattr__(self, "node_selector", dict(self.node_selector))
+        placement: dict[str, dict[str, str]] = {}
+        for image, labels in dict(self.placement or {}).items():
+            if not isinstance(image, str) or not image:
+                raise ValidationError(f"placement keys must be image references, got {image!r}")
+            if not isinstance(labels, Mapping) or not all(
+                isinstance(k, str) and k and isinstance(v, str) for k, v in labels.items()
+            ):
+                raise ValidationError(
+                    f"placement[{image!r}] must map label keys to string values, got {labels!r}"
+                )
+            placement[image] = dict(labels)
+        object.__setattr__(self, "placement", placement)
         object.__setattr__(self, "tolerations", list(self.tolerations))
         object.__setattr__(self, "labels", dict(self.labels))
 
@@ -309,6 +331,9 @@ class FleetConfig:
             val = getattr(self, f.name)
             if isinstance(val, (TracerConfig, ObservabilityConfig)):
                 val = asdict(val)
+            elif isinstance(val, (dict, list)):
+                # A copy, so the caller cannot reach into a frozen config.
+                val = copy.deepcopy(val)
             res[f.name] = val
         return res
 

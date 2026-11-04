@@ -327,7 +327,6 @@ wheels = [
 
 [[package]]
 name = "ate-env-client"
-version = "0.1.0"
 source = { editable = "clients/python" }
 dependencies = [
     { name = "grpcio" },
@@ -3972,7 +3971,7 @@ wheels = [
 
 [[package]]
 name = "nemo-gym-substrate"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "integrations/nemo-gym" }
 dependencies = [
     { name = "ate-env-client" },

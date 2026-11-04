@@ -158,7 +158,13 @@ func New(opts Options) (*Client, error) {
 		creds = credentials.NewTLS(&tls.Config{InsecureSkipVerify: opts.SkipVerify})
 	}
 
-	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
+	// svc/api in ate-system is headless, so the DNS resolver sees every
+	// ate-api-server pod. The default pick_first policy would still pin
+	// this client to one of them.
+	dialOpts := []grpc.DialOption{
+		grpc.WithTransportCredentials(creds),
+		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`),
+	}
 	if opts.BearerTokenFile != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(fileTokenCreds{path: opts.BearerTokenFile}))
 	}

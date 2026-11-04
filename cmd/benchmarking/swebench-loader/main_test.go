@@ -608,3 +608,81 @@ func TestCLIConvertTraceSubcommandAndFlag(t *testing.T) {
 }
 
 func statsOutPath(p string) string { return p }
+
+func TestPlanPlacementCmd(t *testing.T) {
+	dir := t.TempDir()
+	imgA := "registry.example/swebench/a@sha256:" + strings.Repeat("a", 64)
+	imgB := "registry.example/swebench/b@sha256:" + strings.Repeat("b", 64)
+	manifest := filepath.Join(dir, "tasks.jsonl")
+	if err := os.WriteFile(manifest, []byte(
+		`{"instance_id":"a","repo":"","image":"`+imgA+`","image_bytes_compressed":3000000000,"patch":"","test_patch":"","eval_script":"","fail_to_pass":[],"pass_to_pass":[],"log_parser":"","eval_type":""}`+"\n"+
+			`{"instance_id":"b","repo":"","image":"`+imgB+`","patch":"","test_patch":"","eval_script":"","fail_to_pass":[],"pass_to_pass":[],"log_parser":"","eval_type":""}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	domains := filepath.Join(dir, "domains.json")
+	if err := os.WriteFile(domains, []byte(`{"domains":[
+		{"name":"d0","selector":{"ate-env/domain":"d0"},"nodes":4,"node_cache_bytes":400000000000},
+		{"name":"d1","selector":{"ate-env/domain":"d1"},"nodes":4,"node_cache_bytes":400000000000}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "plan", "image-placement.json")
+	var stderr bytes.Buffer
+	if err := planPlacementCmd([]string{"-dataset", manifest, "-domains", domains, "-default-image-size", "1GiB", "-out", out}, &stderr); err != nil {
+		t.Fatalf("plan-placement: %v\n%s", err, stderr.String())
+	}
+	plan, err := swebench.ReadImagePlacement(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Images) != 2 || len(plan.Unplaced) != 0 {
+		t.Fatalf("plan = %+v", plan)
+	}
+	if e := plan.Entry(imgA); e == nil || e.SizeAssumed || e.BytesUnpacked != 7500000000 || len(e.Domains) != 1 {
+		t.Errorf("a = %+v", e)
+	}
+	if e := plan.Entry(imgB); e == nil || !e.SizeAssumed || e.BytesCompressed != 1<<30 {
+		t.Errorf("b = %+v, want the assumed 1GiB", e)
+	}
+	if !strings.Contains(stderr.String(), "placed 2 images in 2 domains; 0 unplaced") || !strings.Contains(stderr.String(), "1 images had no size") {
+		t.Errorf("summary:\n%s", stderr.String())
+	}
+	if err := planPlacementCmd([]string{"-dataset", manifest, "-domains", domains, "-hot-demand", "4"}, &stderr); err == nil {
+		t.Error("-hot-demand without -schedule accepted")
+	}
+	sched := filepath.Join(dir, "schedule.json")
+	all, err := swebench.LoadDataset(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := swebench.ResolveSingleJobSchedule("sched", 1, schema.ParkSuspendAsync, 1, 0, 1, all)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := swebench.WriteSchedule(sched, resolved); err != nil {
+		t.Fatal(err)
+	}
+	// A schedule names the images; the selection flags do not apply with it,
+	// and the whole manifest supplies the sizes.
+	if err := planPlacementCmd([]string{"-dataset", manifest, "-domains", domains, "-schedule", sched, "-images", "1", "-out", filepath.Join(dir, "p3.json")}, &stderr); err == nil {
+		t.Error("-schedule with -images accepted")
+	}
+	if err := planPlacementCmd([]string{"-dataset", manifest, "-domains", domains, "-schedule", sched, "-default-image-size", "0", "-out", filepath.Join(dir, "p3.json")}, &stderr); err != nil {
+		t.Fatalf("plan with schedule: %v\n%s", err, stderr.String())
+	}
+	withSched, err := swebench.ReadImagePlacement(filepath.Join(dir, "p3.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e := withSched.Entry(imgA); e == nil || e.SizeAssumed || e.Demand != 1 {
+		t.Errorf("a with schedule = %+v, want its manifest size and demand 1", e)
+	}
+	if err := planPlacementCmd([]string{"-dataset", manifest, "-domains", domains, "stray"}, &stderr); err == nil {
+		t.Error("a positional argument was accepted")
+	}
+	if err := planPlacementCmd([]string{"-dataset", manifest}, &stderr); err == nil {
+		t.Error("missing -domains accepted")
+	}
+	if runMain([]string{"plan-placement", "-dataset", manifest, "-domains", domains, "-out", filepath.Join(dir, "p2.json")}, &stderr, &stderr) != 0 {
+		t.Errorf("runMain plan-placement failed:\n%s", stderr.String())
+	}
+}

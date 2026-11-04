@@ -60,8 +60,9 @@ Acquire `OutputChanged()` before reading from disk to avoid missed write notific
 
 Append `ate-target-actor` via interceptors and do not forward incoming caller metadata.
 
-- **Location**: `internal/apiservice/server.go` (`guestConn`), `internal/ate/client.go`
-  (`DialGuest`), `internal/routertls/routertls.go`.
+- **Location**: `internal/apiservice/server.go` (`guestConn`, `routerCredentials`),
+  `internal/ate/client.go` (`DialGuest`), `internal/routertls/routertls.go`
+  (`TransportCredentials`).
 - **Why**: When dialing an actor through `atenet`, the router requires the destination actor
   identifier in wire metadata (`ate-target-actor: <atespace>/<id>`). Forwarding incoming client gRPC
   metadata caused duplicate header entries, which `atenet-router` rejects with an invalid actor
@@ -70,7 +71,11 @@ Append `ate-target-actor` via interceptors and do not forward incoming caller me
   `ate-target-actor` to outgoing context metadata without forwarding caller metadata headers.
 - **mTLS**: `internal/routertls` loads the kubelet-projected pod identity certificate bundle
   (`-atenet-client-cert`) and servicedns trust bundle (`-atenet-ca-file`), reloading certificates on
-  the fly during TLS handshakes when disk files change.
+  the fly during TLS handshakes when disk files change. `guestConn` and `DialGuest` dial with
+  `routertls.TransportCredentials`, which reads a pending post-handshake TLS 1.3 alert when an
+  initial HTTP/2 preface write hits `EPIPE` on a rejected client certificate. `guestConn` then
+  matches `routertls.RejectedCertificate` and fails fast without entering `ensureAwake` retries, and
+  `DialGuest` callers receive the TLS alert error.
 
 ### 5. Actor wake budgets and direct actor deletion
 

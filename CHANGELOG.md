@@ -11,6 +11,11 @@ user needs to know across them.
   `worker_selector`, and `FleetConfig.placement` adds labels per task image;
   `SubstrateBackendDriver(worker_selector=, placement=)` and
   `worker_selector_for(image)`.
+- `swebench-loader plan-placement`: an image placement plan
+  (`image-placement.json`) that assigns each task image to placement domains
+  (worker pools a per-environment worker selector addresses) under each
+  node's image-cache budget, largest image first, with replication and a hot
+  rule from the schedule's demand; `domains.json` describes the domains.
 - ate-env-api: `worker_selector` on `CreateEnvironment`, labels the worker pool
   must carry, ANDed with the template's own selector (`Actor.worker_selector`,
   so it holds for wakes too); `node` and `worker_selector` on `Environment`.
@@ -47,6 +52,10 @@ user needs to know across them.
   per-event JSONL for one more release.
 - `benchmarking/telemetry_report`: builds a self-contained HTML report from run
   reports, OTLP/JSON spans and Prometheus or collector metrics.
+- Release publishing for `ate-env-client`: `clients/python` derives its version
+  from the Git tag (`setuptools-scm`) and is published to PyPI via OIDC Trusted
+  Publishing when a GitHub Release is published; `hack/release/create-release.py`
+  drafts release notes and cuts draft releases (see [docs/release.md](docs/release.md)).
 
 ### Changed
 

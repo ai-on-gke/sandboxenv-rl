@@ -198,7 +198,7 @@ snapshots), `PENDING` (baking; environments created now boot from the image),
 template when it is missing, which starts the bake, and creates no environment.
 
 ```python
-from ate_env import GoldenSnapshotState
+from ate_env_rl import GoldenSnapshotState
 
 status = await client.image_status(image, ensure=True)   # starts the bake if needed
 while status.golden is GoldenSnapshotState.PENDING:

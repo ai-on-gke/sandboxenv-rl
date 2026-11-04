@@ -157,15 +157,20 @@ before creating actors.
   counts the reaps in progress. A recycle, `warm_pool` or failed warm claim reads `_teardowns`
   before its await, and pools its actor only if the value is unchanged and no reap is running
   (`_may_pool`); otherwise it deletes the actor. The actor stays in `_owned_actors` until that
-  delete succeeds, so a failed or cancelled delete leaves it for the next `reap`; a failed one also
-  re-tags it with `WARM_POOL_RUN_ID`, because the run's own `reap` has already run and a later run's
-  `reap` matches only its own `run_id`, the pool and `WARM_POOL_RUN_ID`. `unwarm_pool` and
-  `resize_pool` delete the actors they drain the same way. `_warm_inflight` counts the actors
-  `warm_pool` calls are still creating, per pool key, `_teardowns` value and pool generation
-  (`_pool_gens`), so a `reap` drops them. `unwarm_pool`, and a `resize_pool` below the pooled plus
-  in-flight count, bump the pool's generation: a `warm_pool` call that started before deletes what
-  it created instead of pooling it, and later calls do not count it. `warm_pool` subtracts the
-  in-flight actors from the shortfall, so an overlapping call can return before the pool is full.
-  `reap` moves the warm-replica gauge with the pool it clears, so a direct `reap` (outside a fleet)
-  keeps the two equal. `tests/test_warm_pool_accounting.py` checks these interleavings, including
-  work that runs while a `reap` waits on its deletes, with a Hypothesis state machine.
+  delete succeeds. A failed delete (counted as a release failure) or a cancelled one re-tags it with
+  `WARM_POOL_RUN_ID`, because the run's own `reap` has already run and a later run's `reap` matches
+  only its own `run_id`, the pool and `WARM_POOL_RUN_ID`; every `reap` deletes it then. Actors a
+  torn-down or drained `warm_pool` call made are owned under `WARM_POOL_RUN_ID` from the start. A
+  `release` that popped an actor and did not delete it (its delete failed or was cancelled, or a
+  recycle was cancelled in `suspend()`) owns it again through `_return_popped`: under
+  `WARM_POOL_RUN_ID` if a reap ran since the pop, else under its run id, checked and updated in one
+  lock hold. `unwarm_pool` and `resize_pool` delete the actors they drain the same way.
+  `_warm_inflight` counts the actors `warm_pool` calls are still creating, per pool key,
+  `_teardowns` value and pool generation (`_pool_gens`), so a `reap` drops them. `unwarm_pool`, and
+  a `resize_pool` below the pooled plus in-flight count, bump the pool's generation: a `warm_pool`
+  call that started before deletes what it created instead of pooling it, and later calls do not
+  count it. `warm_pool` subtracts the in-flight actors from the shortfall, so an overlapping call
+  can return before the pool is full. `reap` moves the warm-replica gauge with the pool it clears,
+  so a direct `reap` (outside a fleet) keeps the two equal. `tests/test_warm_pool_accounting.py`
+  checks these interleavings, including work that runs while a `reap` waits on its deletes, with a
+  Hypothesis state machine.

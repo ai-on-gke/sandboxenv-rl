@@ -145,7 +145,7 @@ kubectl -n ate-system get deploy -o name | sort | diff /tmp/before-ate-system.tx
 [properties.md](./properties.md) specifies P-1 to P-20. What exists:
 
 ```bash
-# AC-15 (P-9, P-10, P-11), #221: 18 plain tests and the stateful test_warm_pool_accounting.
+# AC-15 (P-9, P-10, P-11), #221, #238: 24 plain tests and the stateful test_warm_pool_accounting.
 # hypothesis comes with the dev extra, so either venv works.
 /tmp/ate-base/bin/python -m pytest clients/python/tests/test_warm_pool_accounting.py -q
 
@@ -158,7 +158,7 @@ cd docs/plans/telemetry/verify
 dafny verify telemetry.dfy                # 14 verified, 0 errors
 dafny verify warm_pool.dfy                # 16 verified, 3 errors, all in WarmPoolBefore
 dafny verify warm_pool_generations.dfy    # 24 verified, 3 errors: PlanFirstCovers, ClaimFailPutBackSafe, ClaimOkReturnsLive
-dafny verify warm_pool_drain.dfy          # 49 verified, 5 errors: CommitStaleBeforeSafe, ResizeBeforeSafe, DeleteFailBeforeSafe, DeleteCancelledSafe, ReleaseDeleteFailSafe
+dafny verify warm_pool_drain.dfy          # 54 verified, 7 errors: CommitStaleBeforeSafe, ResizeBeforeSafe, DeleteFailBeforeSafe, WarmCommitDrainedBeforeSafe, RecycleSuspendCancelledBeforeSafe, DeleteCancelledSafe, ReleaseDeleteFailSafe
 ```
 
 The Dafny errors are by design: each failing lemma models code before #221 or one of its review
@@ -178,9 +178,6 @@ Still proposed, not in the repository:
   after adding `pgregory.net/rapid` to `go.mod`.
 - A test for the claim/reap gap: a warm claim whose `get()` succeeds after an overlapping reap
   deleted the actor. No test covers it; the gap is in the code on `main` with #221.
-- Tests for the run-id gaps: a `warm_pool` cancelled while deleting its actors after the run's reap,
-  and a `release` whose delete fails while a reap runs; after each, `reap` of another run must leave
-  nothing alive. Both fail on `main`; they belong with the fix.
 
 ## What to write in the pull request
 

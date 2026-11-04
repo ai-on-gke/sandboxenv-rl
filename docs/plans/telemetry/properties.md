@@ -5,7 +5,7 @@ property tests here are proposed and not in the repository: `pgregory.net/rapid`
 and the Hypothesis tests named "Proposed test" do not exist. Two parts exist:
 
 - `clients/python/tests/test_warm_pool_accounting.py` (#221): the P-9 to P-11 stateful test
-  `test_warm_pool_accounting` and 18 plain interleaving tests. `hypothesis` is in the `dev` extra
+  `test_warm_pool_accounting` and 24 plain interleaving tests. `hypothesis` is in the `dev` extra
   since #221.
 - [verify/](./verify/README.md): hand-written Dafny models of P-1 to P-11 and of the two bugs review
   found in #221's first version. CI checks their results (AC-20).
@@ -20,14 +20,14 @@ a minimal counter-example, which then becomes an `@example` regression.
 
 State on `main` with #221:
 
-| Item            | Requirement  | State                                                                                                                                                                                                     |
-| --------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P-9, P-10, P-11 | AC-15        | Fixed by #221. Before it, a recycle or `warm_pool` that awaited across a reap pooled its actor after the teardown, and overlapping `warm_pool` calls each provisioned the full shortfall.                 |
-| P-14            | AC-3.4       | Open. `SandboxHandle.exec` and `exec_async` (`clients/python/src/ate_env_rl/handle.py`) call `_note_first_command()` before `_exec_span` starts the span, so another thread's exec span can start first.  |
-| P-24            | AC-15.7      | Open. A warm claim pops an actor and awaits `get()`; if a reap deletes the actor meanwhile and `get()` still succeeds, `acquire` returns a deleted environment. See the findings.                         |
-| P-10            | AC-15.8      | Open. A `warm_pool` call cancelled during its `create()` calls leaks the actors already created: they are neither pooled nor tracked.                                                                     |
-| P-10            | AC-15.9      | Open. A delete cancelled after the run's reap, or a `release` whose delete fails or is cancelled while a reap runs, leaves the actor under the reaped run id; no later reap deletes it. See the findings. |
-| P-21, P-22      | AC-17, AC-18 | Partial. Example tests only; the Go tests copy the Python tables by hand.                                                                                                                                 |
+| Item            | Requirement  | State                                                                                                                                                                                                         |
+| --------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P-9, P-10, P-11 | AC-15        | Fixed by #221. Before it, a recycle or `warm_pool` that awaited across a reap pooled its actor after the teardown, and overlapping `warm_pool` calls each provisioned the full shortfall.                     |
+| P-14            | AC-3.4       | Open. `SandboxHandle.exec` and `exec_async` (`clients/python/src/ate_env_rl/handle.py`) call `_note_first_command()` before `_exec_span` starts the span, so another thread's exec span can start first.      |
+| P-24            | AC-15.7      | Open. A warm claim pops an actor and awaits `get()`; if a reap deletes the actor meanwhile and `get()` still succeeds, `acquire` returns a deleted environment. See the findings.                             |
+| P-10            | AC-15.8      | Open. A `warm_pool` call cancelled during its `create()` calls leaks the actors already created: they are neither pooled nor tracked.                                                                         |
+| P-10            | AC-15.9      | Fixed by #238. Before it, a delete cancelled after the run's reap, or a `release` whose delete failed or was cancelled while a reap ran, left the actor under the reaped run id, so no later reap deleted it. |
+| P-21, P-22      | AC-17, AC-18 | Partial. Example tests only; the Go tests copy the Python tables by hand.                                                                                                                                     |
 
 ## Labels and cardinality (AC-9)
 
@@ -392,8 +392,8 @@ from the run is alive on Substrate or tracked by the driver.
 - Open (AC-15.8): a `warm_pool` call cancelled while `asyncio.gather` waits on its `create()` calls
   drops the ids of the actors already created, so they are neither pooled nor owned and no reap
   finds them. The stateful machine cancels nothing, so it does not reach this case.
-- Open (AC-15.9): two paths still leave an actor under a run id that was already reaped. See "Run-id
-  gaps" in the findings.
+- AC-15.9, fixed by #238: a cancelled cleanup delete, and a `release` whose delete fails or is
+  cancelled while a reap runs, re-tag the actor too. See "Run-id gaps" in the findings.
 - Fixed by #221. Before it, the stateful test shrank it to two minimal counter-examples (recorded
   when one `fleet_teardown` rule ran the whole reap):
 
@@ -496,7 +496,7 @@ The requirement numbers the properties validate. Each refines the criterion of t
 | AC-15.6 | A direct `reap` leaves the gauge equal to the pool.                                                                                |
 | AC-15.7 | A warm claim returns a live environment (open).                                                                                    |
 | AC-15.8 | A `warm_pool` cancelled during `create()` leaves no live actor untracked (open).                                                   |
-| AC-15.9 | A delete cancelled after a reap, or a release's delete that fails during one, leaves the actor for any later reap (open).          |
+| AC-15.9 | A delete cancelled after a reap, or a release's delete that fails during one, leaves the actor for any later reap.                 |
 | AC-16.1 | A test collects every span name and attribute key the client and driver operations emit.                                           |
 | AC-16.2 | The collected set equals the documented table; CI fails on a difference.                                                           |
 | AC-17.1 | Shared operations have the same span `<op>` in both clients.                                                                       |
@@ -610,10 +610,10 @@ hands the caller a deleted environment. #221 re-checks `_teardowns` only on the 
 property in this file covers it: P-10 holds (nothing survives the teardown); what breaks is that
 `acquire` returns a live environment, which no property states. No test covers it.
 
-Run-id gaps, open (AC-15.9). `warm_pool_drain.dfy` states ORPHAN: every owned actor with no delete
-pending carries a run id some later reap still matches (`WARM_POOL_RUN_ID`, or a run not reaped
-yet). A fleet reaps its run once, so an actor left under a reaped run id outlives every later
-teardown. The re-tag #221 ships keeps ORPHAN for failed cleanup deletes; two paths still break it,
+Run-id gaps (AC-15.9), fixed by #238. `warm_pool_drain.dfy` states ORPHAN: every owned actor with no
+delete pending carries a run id some later reap still matches (`WARM_POOL_RUN_ID`, or a run not
+reaped yet). A fleet reaps its run once, so an actor left under a reaped run id outlives every later
+teardown. The re-tag #221 shipped kept ORPHAN for failed cleanup deletes; two paths still broke it,
 and a scratch test against `main` (`c0c41ac`) reproduced both:
 
 - `DeleteCancelledSafe`: a `warm_pool` call with `run_id="run-1"` paused in `create()`;
@@ -622,9 +622,18 @@ and a scratch test against `main` (`c0c41ac`) reproduced both:
   `_delete_unpooled` catches `Exception`, so a cancellation skips the re-tag.
 - `ReleaseDeleteFailSafe`: `release("sb-1")` pops the actor and awaits `delete()`; `reap("run-1")`
   runs and cannot see it; the delete fails. `_release_internal` puts the actor back under `run-1`
-  (`missed_by_reap` is set only by a recycle whose `suspend()` returned after a teardown), and
-  `reap("run-2")` leaves it alive. `ReleaseDeleteFailProposedSafe` verifies a fix: re-tag whenever
-  `_teardowns` changed since the pop.
+  (`missed_by_reap` was set only by a recycle whose `suspend()` returned after a teardown), and
+  `reap("run-2")` leaves it alive.
+
+#238 re-tags a cancelled `_delete_unpooled` too, and owns the actors a torn-down or drained
+`warm_pool` call made under `WARM_POOL_RUN_ID` from the start, so a cancel before any delete starts
+leaves nothing under the reaped run id. A release that pops an actor and does not delete it (its
+delete fails or is cancelled, or a recycle is cancelled in `suspend()`) owns it again through
+`_return_popped`: under `WARM_POOL_RUN_ID` if a reap ran since the pop (`not _may_pool(teardowns)`),
+else under its run id, so the run's own reap retries it. The check and the update share one lock
+hold, so a reap on another thread cannot start in between. `DeleteCancelledFixedSafe`,
+`WarmCommitDrainedSafe` and `ReturnPoppedSafe` verify these; the scratch reproductions are now
+tests.
 
 **How the concurrency model works.** Each piece of code between two `await`s is one atomic action on
 shared state (`Acquire`, `RecycleStart`, `RecycleFinish`, `WarmPlan`, `WarmCommit`, `Reap`). The

@@ -1,9 +1,10 @@
 # Plan: telemetry and the OpenTelemetry adapter for sandboxenv-rl
 
-Status: executed. Contracts checked against `main` at `3b03b03` (2026-10-29); the series completed
-with #186 (`9c30be1`, 2026-11-02). All six pull requests are merged. The plan was written on
-2026-10-21 against `8ff5c3e` as a proposal to replicate agent-sandbox's telemetry; this revision
-records the names, flags and families that shipped and where they differ from the proposal.
+Status: executed. Contracts checked against `main` at `3b03b03` (2026-10-29), and the warm-pool
+contract in [interfaces.md](./interfaces.md) at `d0e4802` with #238; the series completed with #186
+(`9c30be1`, 2026-11-02). All six pull requests are merged. The plan was written on 2026-10-21
+against `8ff5c3e` as a proposal to replicate agent-sandbox's telemetry; this revision records the
+names, flags and families that shipped and where they differ from the proposal.
 
 Companion documents in this directory: [prd.md](./prd.md), [execution-plan.md](./execution-plan.md),
 [interfaces.md](./interfaces.md) (the shipped contracts),
@@ -147,9 +148,9 @@ behind it.
   deleted environment (AC-15.7, P-24, `ClaimOkReturnsLive` in [verify/](./verify/README.md)).
 - Open: a `warm_pool` cancelled during its `create()` calls can leak the actors already created
   (AC-15.8).
-- Open: a delete cancelled after the run's reap, or a `release` whose delete fails or is cancelled
-  while a reap runs, leaves the actor under the reaped run id, so no later reap deletes it (AC-15.9,
-  `DeleteCancelledSafe` and `ReleaseDeleteFailSafe` in [verify/](./verify/README.md)).
+- Closed by #238: a delete cancelled after the run's reap, or a `release` whose delete fails or is
+  cancelled while a reap runs, left the actor under the reaped run id, so no later reap deleted it
+  (AC-15.9).
 - Open: with execs started concurrently on one handle, `ate_env.first_command=true` is not always on
   the first-started exec span (AC-3.4, P-14).
 - Follow-ups with criteria but no work yet: a CI-checked span inventory (AC-16), Go and Python span

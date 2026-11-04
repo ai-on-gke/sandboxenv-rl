@@ -661,22 +661,23 @@ class SubstrateBackendDriver(BackendDriver):
         created = [r for r in results if isinstance(r, str)]
         # The reservation turns into pool entries under one lock, so a
         # concurrent warm_pool always counts these actors in one of the two.
-        instances = [
-            self._make_instance(aid, template_id, run_id=effective_run_id, rootfs_image=rootfs_image)
-            for aid in created
-        ]
         with self._lock:
             _release_reservation()
             # After a reap, unwarm_pool or a shrinking resize_pool, the pool
             # these actors were made for is gone: delete them instead.
             torn_down = not self._may_pool(teardowns)
             drained = self._pool_gens.get(pool_key, 0) != gen
-            for inst in instances:
-                # Owned either way, so a cancelled delete below leaves them
-                # for the next reap.
-                self._owned_actors[inst.instance_id] = inst
+            # Owned either way. Actors to delete are owned under
+            # WARM_POOL_RUN_ID from the start: the run's reap may already
+            # have run, and a cancel can land before any delete below starts
+            # (AC-15.9).
+            owner = WARM_POOL_RUN_ID if (torn_down or drained) else effective_run_id
+            for aid in created:
+                self._owned_actors[aid] = self._make_instance(
+                    aid, template_id, run_id=owner, rootfs_image=rootfs_image
+                )
                 if not (torn_down or drained):
-                    self._warm_paused_pool.setdefault(pool_key, []).append(inst.instance_id)
+                    self._warm_paused_pool.setdefault(pool_key, []).append(aid)
         if torn_down or drained:
             if created:
                 logger.info(
@@ -706,9 +707,9 @@ class SubstrateBackendDriver(BackendDriver):
         reap may already have missed (``why`` goes in the log).
 
         The actor leaves _owned_actors only once the delete succeeds (or finds
-        it gone). A failed delete is counted as a release failure and re-tags
-        the actor with WARM_POOL_RUN_ID, so whichever run reaps next deletes
-        it; a cancelled one leaves it owned as it was.
+        it gone). A failed delete is counted as a release failure; a failed or
+        cancelled one re-tags the actor with WARM_POOL_RUN_ID, so whichever
+        run reaps next deletes it (AC-15.5, AC-15.9).
         """
         try:
             await self._client_for(actor_id).delete(actor_id, atespace=self.atespace)
@@ -719,18 +720,46 @@ class SubstrateBackendDriver(BackendDriver):
             logger.warning("Failed deleting actor %s %s: %s", actor_id, why, e)
             self._keep_for_any_reap(actor_id)
             return
+        except BaseException:
+            # Cancelled: the run's reap may already have run, so leave the
+            # actor where any later reap finds it, then let the cancel through.
+            self._keep_for_any_reap(actor_id)
+            raise
         with self._lock:
             self._owned_actors.pop(actor_id, None)
 
-    def _keep_for_any_reap(self, actor_id: str, instance: RawSandboxInstance | None = None) -> None:
-        """Keep an actor owned under WARM_POOL_RUN_ID, which every reap deletes.
+    def _return_popped(self, actor_id: str, instance: RawSandboxInstance, teardowns: int) -> None:
+        """Own again an actor that release popped and did not delete.
+
+        A reap since the pop (one read ``teardowns``) could not see the actor,
+        and a fleet reaps its run once: then own it under WARM_POOL_RUN_ID,
+        which every reap deletes; otherwise under its own run id, for the
+        run's reap. The check and the update share one lock hold, so a reap
+        that starts in between cannot miss the actor (AC-15.9). A copy, so
+        the caller's handle keeps its run_id.
+        """
+        with self._lock:
+            if self._may_pool(teardowns):
+                self._owned_actors.setdefault(actor_id, instance)
+            else:
+                self._own_for_any_reap(actor_id, instance)
+
+    def _keep_for_any_reap(self, actor_id: str) -> None:
+        """Keep an owned actor under WARM_POOL_RUN_ID, which every reap deletes.
+
+        An actor a reap already popped is not added back.
+        """
+        with self._lock:
+            inst = self._owned_actors.get(actor_id)
+            if inst is not None:
+                self._own_for_any_reap(actor_id, inst)
+
+    def _own_for_any_reap(self, actor_id: str, instance: RawSandboxInstance) -> None:
+        """Own ``instance`` under WARM_POOL_RUN_ID. Caller holds self._lock.
 
         A copy, so the caller's handle keeps its run_id.
         """
-        with self._lock:
-            inst = self._owned_actors.get(actor_id, instance)
-            if inst is not None:
-                self._owned_actors[actor_id] = dataclasses.replace(inst, run_id=WARM_POOL_RUN_ID)
+        self._owned_actors[actor_id] = dataclasses.replace(instance, run_id=WARM_POOL_RUN_ID)
 
     def warm_pool(
         self,
@@ -892,7 +921,6 @@ class SubstrateBackendDriver(BackendDriver):
             instance = self._owned_actors.pop(instance_id, None)
             teardowns = self._teardowns
 
-        missed_by_reap = False
         if recycle and instance:
             try:
                 await self._client_for(instance_id).suspend(instance_id, atespace=self.atespace)
@@ -909,15 +937,14 @@ class SubstrateBackendDriver(BackendDriver):
                 # The reap could not see this actor (it was popped above), so
                 # pooling it now would outlive the teardown: delete it below.
                 logger.info("Teardown ran while recycling actor %s; deleting it", instance_id)
-                missed_by_reap = True
             except Exception as e:
                 logger.warning(
                     "Failed to suspend actor %s for recycle, deleting: %s", instance_id, e
                 )
             except BaseException:
-                # Cancelled during suspend(): keep it owned for the run's reap.
-                with self._lock:
-                    self._owned_actors.setdefault(instance_id, instance)
+                # Cancelled during suspend(): own it again, for the run's reap
+                # or, if a reap ran since the pop, for any reap.
+                self._return_popped(instance_id, instance, teardowns)
                 raise
 
         try:
@@ -926,15 +953,11 @@ class SubstrateBackendDriver(BackendDriver):
             logger.info("Environment %s was already deleted", instance_id)
             return
         except BaseException:
-            # Keep it owned, so a reap retries the delete. The run's own reap
-            # already ran if a teardown stopped the recycle, so any run's
-            # reap must find it then.
+            # Own it again, so a reap retries the delete: the run's reap, or
+            # any reap if one ran since the pop (the recycle saw it, or it ran
+            # during this delete).
             if instance is not None:
-                if missed_by_reap:
-                    self._keep_for_any_reap(instance_id, instance)
-                else:
-                    with self._lock:
-                        self._owned_actors.setdefault(instance_id, instance)
+                self._return_popped(instance_id, instance, teardowns)
             raise
         logger.info("Deleted environment %s", instance_id)
 

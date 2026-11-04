@@ -2,40 +2,44 @@
 name: r2e-swebench-simulated-benchmark
 description: >-
   Configures and runs a simulated mixed R2E-Gym and SWE-bench Verified benchmark on Agent Substrate
-  and ate-env with user-selected concurrency, image counts, and replica rollouts per image, then
-  verifies unified multi-job report artifacts.
+  and ate-env across configurable concurrency, image counts, replica rollouts per image, warm-pool
+  orchestration strategies (none, naive, sliding, pipelined, all), and API/SDK client chains (go,
+  go-direct, python, all), then verifies per-arm and side-by-side comparison artifacts.
 ---
 
 # Mixed R2E-Gym and SWE-bench Simulated Benchmark
 
 Use this skill when asked to run a simulated RL load mixing R2E-Gym and SWE-bench Verified task
 images on Agent Substrate without GPUs or model servers.
-[`../run-r2e-swebench.sh`](../run-r2e-swebench.sh) drives two concurrent `swebench-loader` shards
-(`job=r2e` and `job=swe`) into one `$ARTIFACT_DIR` and builds a combined multi-job report with
-`bench report`.
+[`../run-r2e-swebench.sh`](../run-r2e-swebench.sh) drives two concurrent shards (`job=r2e` and
+`job=swe`) for each selected `(client, strategy)` arm into `$ARTIFACT_DIR`, builds `bench report`
+bundles, and emits cross-arm comparison tables when sweeping multiple arms.
 
 For the 8 cluster checks that affect every `swebench-loader` measurement, read
 [`../SKILL.md`](../SKILL.md). For real RL trainer hooks and `bench` overlays, read
 [`../../SKILL.md`](../../SKILL.md). For event definitions and run shapes, read
 [`../README.md`](../README.md).
 
-## 1. Choose parameters and check cluster capacity
+## 1. Choose parameters, strategies, and client chains
 
 Run the 8 cluster checks in [`../SKILL.md`](../SKILL.md) before starting. Ensure the Substrate
 `WorkerPool` satisfies `replicas * per_worker_actor_capacity >= MAX_CONCURRENCY`, with CPU and
 memory headroom when `--workload graded` runs concurrent `pytest` suites.
 
-Pick the three sizing knobs with CLI flags or environment variables (CLI flags override environment
-variables):
+Pick the sizing, strategy, and client-chain knobs with CLI flags or environment variables (CLI flags
+override environment variables):
 
-| Parameter             | CLI flags                                                                                                  | Environment variables                             | Default and resolution rule                                                                          |
-| --------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| Concurrency           | `-c N`, `--concurrency N`, `--r2e-width N`, `--swe-width N`                                                | `MAX_CONCURRENCY`, `R2E_WIDTH`, `SWE_WIDTH`       | `200` total active sandboxes split proportionally across `r2e` and `swe` shards (`>= 2` when split). |
-| Images                | `-i N`, `--images N`, `--r2e-images N`, `--swe-images N`                                                   | `IMAGES`, `R2E_IMAGES`, `SWE_IMAGES`              | `20` per dataset (`40` total images). Pass `--images 10` for `20` total (`10` R2E + `10` SWE-bench). |
-| Rollouts per image    | `-r N`, `--rollouts-per-image N`, `--r2e-rollouts N`, `--swe-rollouts N`                                   | `ROLLOUTS_PER_IMAGE`, `R2E_FANOUT`, `SWE_FANOUT`  | Auto-computed as `ceil(shard_width / shard_images)` when omitted (`5` for `width=100, images=20`).   |
-| Workload and schedule | `--workload graded\|io`, `--mode steps\|eval\|open-loop`, `--steps N`, `--park POLICY`, `--step-pause DUR` | `WORKLOAD`, `MODE`, `STEPS`, `PARK`, `STEP_PAUSE` | `WORKLOAD=graded`, `MODE=steps`, `STEPS=4`, `PARK=suspend`, `STEP_PAUSE=0s`.                         |
+| Parameter             | CLI flags                                                                                                                      | Environment variables                                                                                  | Default and resolution rule                                                                               |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| Concurrency           | `-c N`, `--concurrency N`, `--r2e-width N`, `--swe-width N`                                                                    | `MAX_CONCURRENCY`, `R2E_WIDTH`, `SWE_WIDTH`                                                            | `200` total active sandboxes split proportionally across `r2e` and `swe` shards (`>= 2` when split).      |
+| Images                | `-i N`, `--images N`, `--r2e-images N`, `--swe-images N`                                                                       | `IMAGES`, `R2E_IMAGES`, `SWE_IMAGES`                                                                   | `20` per dataset (`40` total images). Pass `--images 10` for `20` total (`10` R2E + `10` SWE-bench).      |
+| Rollouts per image    | `-r N`, `--rollouts-per-image N`, `--r2e-rollouts N`, `--swe-rollouts N`                                                       | `ROLLOUTS_PER_IMAGE`, `R2E_FANOUT`, `SWE_FANOUT`                                                       | Auto-computed as `ceil(shard_width / shard_images)` when omitted (`5` for `width=100, images=20`).        |
+| Strategy              | `--strategy none\|naive\|sliding\|pipelined\|all\|CSV`, `--window-size N`                                                      | `STRATEGY`, `WINDOW_SIZE`                                                                              | Unset runs legacy standing-pool `MODE`; `all` sweeps `none,naive,sliding,pipelined`.                      |
+| Client / API chain    | `--client go\|go-direct\|python\|all\|CSV` (alias `--chain`)                                                                   | `CLIENT`                                                                                               | `go` (`swebench-loader` -> Go SDK -> `ate-env-api`). `all` sweeps `go` and `python` (plus `go-direct` when `--control-addr` is set). |
+| Direct Substrate auth | `--control-addr ADDR`, `--router-addr ADDR`, `--atenet-client-cert P`, `--atenet-ca-file P`, `--atenet-server-name S`, `--ateapi-token-file P`, `--ateapi-ca-file P` | `CONTROL_ADDR`, `ROUTER_ADDR`, `ATENET_CLIENT_CERT`, `ATENET_CA_FILE`, `ATENET_SERVER_NAME`, `ATEAPI_TOKEN_FILE`, `ATEAPI_CA_FILE` | Required for `--client go-direct` (`--control-addr` points at `ateapi` gRPC `host:port`; `--ateapi-ca-file` verifies `ateapi` TLS). |
+| Workload and schedule | `--workload graded\|io`, `--mode steps\|eval\|open-loop`, `--steps N`, `--park POLICY`, `--step-pause DUR`                     | `WORKLOAD`, `MODE`, `STEPS`, `PARK`, `STEP_PAUSE`                                                      | `WORKLOAD=graded`, `MODE=steps`, `STEPS=4` (`1` single-pass when `--strategy` or `--client python` is set), `PARK=suspend`, `STEP_PAUSE=0s`. |
 
-[`../run-r2e-swebench.sh`](../run-r2e-swebench.sh) resolves parameter combinations with three rules:
+[`../run-r2e-swebench.sh`](../run-r2e-swebench.sh) resolves sizing combinations with three rules:
 
 1. **Concurrency set (or defaulted) without `--rollouts-per-image`**: splits `MAX_CONCURRENCY`
    across both shards and sets each shard's replica rollouts per image to
@@ -44,10 +48,36 @@ variables):
    `shard_images * shard_rollouts` and sets `MAX_CONCURRENCY` to `R2E_WIDTH + SWE_WIDTH`.
 3. **Both `--concurrency` and `--rollouts-per-image` set**: caps concurrent active sandboxes to
    `shard_width` while keeping `shard_images * shard_rollouts` replica rollouts per shard. When
-   `shard_images * shard_rollouts > shard_width` in `steps` mode,
+   `--strategy` is unset and `shard_images * shard_rollouts > shard_width` in `steps` mode,
    [`../run-r2e-swebench.sh`](../run-r2e-swebench.sh) adds `-park-each` (requiring `--park suspend`
    or `--park delete` and `--step-pause 0s`) so each sandbox parks right after its episode and awake
    sandboxes stay within `--concurrency`.
+
+Select the warm-pool orchestration strategy with `--strategy`:
+
+- `none`: creates `1` sandbox on demand per rollout, executes the trajectory, and deletes it (`0%`
+  warm hit rate).
+- `naive`: prewarms `1` suspended sandbox per rollout across every selected image upfront before
+  claiming (`100%` warm hit rate, `images * rollouts` peak parked footprint).
+- `sliding`: warms `window_size` distinct images (`DefaultWindowSize` = `clamp(ceil(images/2), 1, 8)`
+  when `--window-size 0`), runs all rollouts in that window, deletes those sandboxes, and advances to
+  the next window (`window_size * rollouts` bounded parked footprint).
+- `pipelined`: double-buffers two windows, prefetching window `N+1` in the background while window
+  `N` executes (`<= 2 * window_size * rollouts` parked footprint, sharing the shard `Width` active
+  concurrency cap across prefetch and replay).
+- `all`: runs `none`, `naive`, `sliding`, and `pipelined` sequentially and compares them side by
+  side.
+
+Select the client and API chain with `--client` (or `--chain`):
+
+- `go`: `swebench-loader` -> Go SDK (`clients/go` `*env.Client`) -> `ate-env-api` -> Substrate.
+- `go-direct`: `swebench-loader -backend=substrate -access=direct` -> `DirectSubstrateBackend`
+  (`internal/ate.Client`) -> Substrate `ateapi` and `atenet-router`, bypassing `ate-env-api`.
+- `python`: [`../run_fleet_bench.py`](../run_fleet_bench.py) (fed rendered trajectory plans from
+  `swebench-loader render-plan`) -> Python `SandboxFleet` (`SubstrateBackendDriver` +
+  `SubstrateEnvClientRuntime`) -> `ate-env-api` -> Substrate.
+- `all`: sweeps `go` and `python`, and includes `go-direct` automatically when `--control-addr` (or
+  `CONTROL_ADDR`) is set.
 
 Select the trajectory profile with `--workload`:
 
@@ -114,8 +144,8 @@ SWE_LIMIT=30
 
 ## 3. Validate the plan offline (`dry-run`)
 
-Run `dry-run` before touching the cluster to verify manifest schemas, rendered trajectories, shard
-widths, and the 63-character actor name limit:
+Run `dry-run` before touching the cluster to verify manifest schemas, rendered Go and Python
+trajectories, arm matrix expansion, shard widths, and the 63-character actor name limit:
 
 ```bash
 "${ENV_REPO}/benchmarking/swebench/run-r2e-swebench.sh" dry-run \
@@ -124,11 +154,13 @@ widths, and the 63-character actor name limit:
   --concurrency 200 \
   --images 20 \
   --rollouts-per-image 5 \
+  --client all \
+  --strategy all \
   --artifact-dir /tmp/r2eswe-dry
 ```
 
-Confirm stderr prints the expected `resolved plan:` line and two `swebench-loader` `"msg":"plan"`
-JSON lines with exit code `0`.
+Confirm stderr prints the expected `resolved plan:` line (listing every `<client>-<strategy>` arm)
+and two `"msg":"plan"` JSON lines per arm with exit code `0`.
 
 ## 4. Prewarm and run on the cluster
 
@@ -150,10 +182,10 @@ export ARTIFACT_DIR=/tmp/r2eswe-run
   --artifact-dir "${ARTIFACT_DIR}"
 ```
 
-Execute the timed run in-cluster (launches `swebench-loader-<run>-swe` and
-`swebench-loader-<run>-r2e` Kubernetes Jobs next to `ate-env-api`):
+Execute a single-arm run or a multi-arm strategy and client sweep in-cluster:
 
 ```bash
+# Sweep all 4 strategies across both Go API and ate-env-api + Python SandboxFleet:
 SAMPLE_CACHE=1 HARVEST_RESTORES=1 \
 "${ENV_REPO}/benchmarking/swebench/run-r2e-swebench.sh" run \
   --r2e-dataset "${MANIFEST_DIR}/r2e.jsonl" \
@@ -161,29 +193,42 @@ SAMPLE_CACHE=1 HARVEST_RESTORES=1 \
   --concurrency 200 \
   --images 20 \
   --rollouts-per-image 5 \
+  --client all \
+  --strategy all \
   --artifact-dir "${ARTIFACT_DIR}"
 ```
 
 Common parameter variations:
 
+- **Sweep all 4 strategies on the Go API chain only**: pass `--client go --strategy all`.
+- **Test the `ate-env-api` + Python `SandboxFleet` chain on `pipelined`**: pass
+  `--client python --strategy pipelined --window-size 6`.
+- **Include the direct Go Substrate chain (`go-direct`)**: pass
+  `--client go-direct --control-addr api.ate-system.svc.cluster.local:443 --atenet-client-cert /path/to/bundle.pem --atenet-ca-file /path/to/ca.pem --ateapi-token-file /path/to/token`
+  (or combine `--client all --control-addr ... --strategy all` to sweep all 12 `(client, strategy)`
+  arms). `in-cluster` mode mounts direct credentials via an ephemeral Kubernetes `Secret`.
 - **20 total images (`10` R2E + `10` SWE-bench) at `200` concurrency (`10` rollouts per image)**:
   pass `--concurrency 200 --images 10 --rollouts-per-image 10`.
-- **Oversubscribed fleet (`320` replica rollouts across `100` active slots)**: pass
-  `--concurrency 100 --images 20 --rollouts-per-image 8` (enables `-park-each` in `steps` mode).
 - **Rootfs I/O probe without `pytest`**: pass `--workload io --mode eval`.
-- **Extra `swebench-loader` labels**: append `-- -label arm=baseline -label commit=abc1234`.
 - **Local port-forward execution**: omit `KO_DOCKER_REPO` (or pass `--execution local`) with
-  `ENDPOINT=localhost:7777`.
+  `ENDPOINT=localhost:7777` (and `--auth-token-file` when `ate-env-api` requires bearer auth).
 
 ## 5. Verify outputs in `$ARTIFACT_DIR`
 
-Check these files and invariants after `run` exits `0`:
+For a single `(client, strategy)` run, outputs land directly under `$ARTIFACT_DIR/`. For multi-arm
+sweeps (`NUM_ARMS > 1`), per-arm outputs land under `$ARTIFACT_DIR/arms/<client>-<strategy>/` and
+top-level comparison artifacts land at `$ARTIFACT_DIR/`:
 
-- `events/r2e.jsonl` and `events/swe.jsonl`: raw operation streams stamped with `job` and `worker`.
-- `r2e-summary.json` and `swe-summary.json`: per-shard `swebench-loader report` summaries.
-- `report.json` and `report.md`: unified `bench report` bundle. On `--workload graded`, verify
-  `failed == 0` and `reward_rate == 1.0`. Check `distinct_instances`, `distinct_envs`,
-  `peak_active_sandboxes`, per-step `barrier_ms` / `park_ms` / `wake_p50_ms`, `jobs.r2e`,
-  `jobs.swe`, and `interference`.
+- `events/r2e.jsonl` and `events/swe.jsonl` (or `arms/<arm>/events/*.jsonl`): raw operation streams
+  stamped with `job`, `worker`, `client`, and `arm`.
+- `r2e-summary.json` and `swe-summary.json` (or `arms/<arm>/*-summary.json`): per-shard
+  `swebench-loader report` summaries.
+- `report.json` and `report.md` (or `arms/<arm>/report.{json,md}`): unified `bench report` bundle.
+  On `--workload graded`, verify `failed == 0` and `reward_rate == 1.0`. Check
+  `working_set_hit_rate` (`0.0` on `none`, `1.0` on `naive`/`sliding`/`pipelined`),
+  `standing_pool_size`, `peak_active_sandboxes`, `jobs.r2e`, `jobs.swe`, and `interference`.
+- `comparison.txt`, `comparison.json`, and `comparison.md` (multi-arm sweeps): side-by-side latency,
+  throughput (`tasks/min`), warm-pool hit rate, peak active sandboxes, and standing-pool footprint
+  across all `(client, strategy)` arms.
 - `cache_before.prom`, `cache_after.prom`, and `restore_timings.jsonl`: node cache metrics and
   `atelet` restore phases captured when `SAMPLE_CACHE=1` and `HARVEST_RESTORES=1` are set.

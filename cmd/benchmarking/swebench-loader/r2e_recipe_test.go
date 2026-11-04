@@ -35,7 +35,9 @@ type recipeFakeBackend struct {
 	creates    int
 	awake      int
 	maxAwake   int
+	maxParked  int
 	parkedByID map[string]bool
+	opDelay    time.Duration
 }
 
 type recipeFakeSandbox struct {
@@ -53,7 +55,11 @@ func (b *recipeFakeBackend) Create(_ context.Context, id, _ string) (swebench.Sa
 	if b.awake > b.maxAwake {
 		b.maxAwake = b.awake
 	}
+	delay := b.opDelay
 	b.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 	return &recipeFakeSandbox{backend: b, id: id}, nil
 }
 
@@ -83,7 +89,11 @@ func (s *recipeFakeSandbox) Run(_ context.Context, command string, _ time.Durati
 			s.backend.maxAwake = s.backend.awake
 		}
 	}
+	delay := s.backend.opDelay
 	s.backend.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 
 	switch {
 	case strings.Contains(command, "/tmp/grade.py"):
@@ -110,6 +120,9 @@ func (s *recipeFakeSandbox) Suspend(context.Context) error {
 	defer s.backend.mu.Unlock()
 	if !s.backend.parkedByID[s.id] {
 		s.backend.parkedByID[s.id] = true
+		if len(s.backend.parkedByID) > s.backend.maxParked {
+			s.backend.maxParked = len(s.backend.parkedByID)
+		}
 		if s.backend.awake > 0 {
 			s.backend.awake--
 		}
@@ -326,5 +339,252 @@ func TestMixedR2ESWEBench200ConcurrencyShards(t *testing.T) {
 	}
 	if fakeOver.maxAwake > 30 {
 		t.Fatalf("expected max awake sandboxes <= 30 with -park-each, got %d", fakeOver.maxAwake)
+	}
+}
+
+func TestAllStrategiesRenderPlanAndDirectDriverValidation(t *testing.T) {
+	r2eTrajPath := filepath.Join("..", "..", "..", "benchmarking", "swebench", "r2e-gold.yaml")
+	rawR2ETraj, err := os.ReadFile(r2eTrajPath)
+	if err != nil {
+		t.Fatalf("read r2e-gold.yaml: %v", err)
+	}
+	dir := t.TempDir()
+	fastR2ETraj := filepath.Join(dir, "r2e-gold-fast.yaml")
+	fastYAML := strings.NewReplacer("think: 1s", "think: 0s", "think: 2s", "think: 0s", "think: 3s", "think: 0s").Replace(string(rawR2ETraj))
+	if err := os.WriteFile(fastR2ETraj, []byte(fastYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rawSWETraj, err := os.ReadFile(filepath.Join("..", "..", "..", "internal", "benchmarking", "swebench", "trajectories", "swebench-gold.yaml"))
+	if err != nil {
+		t.Fatalf("read swebench-gold.yaml: %v", err)
+	}
+	fastSWETraj := filepath.Join(dir, "swebench-gold-fast.yaml")
+	fastSWEYAML := strings.NewReplacer("think: 1s", "think: 0s", "think: 2s", "think: 0s", "think: 3s", "think: 0s").Replace(string(rawSWETraj))
+	if err := os.WriteFile(fastSWETraj, []byte(fastSWEYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	graderPy, err := os.ReadFile(filepath.Join("..", "..", "..", "internal", "benchmarking", "swebench", "trajectories", "swebench-grade.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "swebench-grade.py"), graderPy, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var r2eBuf, sweBuf bytes.Buffer
+	for i := 0; i < 6; i++ {
+		r2eRec := map[string]any{
+			"kind":               "command",
+			"instance_id":        fmt.Sprintf("r2e-st-%02d", i),
+			"repo":               "demo/r2e",
+			"image":              fmt.Sprintf("us-docker.pkg.dev/p/r2e/img-%02d@sha256:%064x", i, 300+i),
+			"setup_command":      "test -d /testbed",
+			"reset_command":      "cd /testbed && git reset -q --hard",
+			"command":            "/bin/bash run_tests.sh",
+			"expected_exit_code": 0,
+		}
+		b, _ := json.Marshal(r2eRec)
+		r2eBuf.Write(b)
+		r2eBuf.WriteByte('\n')
+
+		sweRec := map[string]any{
+			"instance_id":  fmt.Sprintf("sympy__sympy-%d", 12000+i),
+			"repo":         "sympy/sympy",
+			"image":        fmt.Sprintf("us-docker.pkg.dev/p/swe/img-%02d@sha256:%064x", i, 400+i),
+			"patch":        "diff --git a/a.py b/a.py\n",
+			"test_patch":   "diff --git a/t.py b/t.py\n",
+			"eval_script":  "#!/bin/bash\npytest\n",
+			"fail_to_pass": []string{"test_a"},
+			"pass_to_pass": []string{"test_b"},
+			"log_parser":   "parse_log_pytest",
+			"eval_type":    "pass_and_fail",
+		}
+		sb, _ := json.Marshal(sweRec)
+		sweBuf.Write(sb)
+		sweBuf.WriteByte('\n')
+	}
+	r2eManifest := filepath.Join(dir, "r2e-6.jsonl")
+	sweManifest := filepath.Join(dir, "swe-6.jsonl")
+	if err := os.WriteFile(r2eManifest, r2eBuf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sweManifest, sweBuf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Verify render-plan subcommand for both R2E and SWE-bench trajectories.
+	r2ePlanPath := filepath.Join(dir, "r2e-plan.json")
+	swePlanPath := filepath.Join(dir, "swe-plan.json")
+	var outBuf, errBuf bytes.Buffer
+	if code := runMain([]string{
+		"render-plan",
+		"-dataset", r2eManifest,
+		"-images", "4",
+		"-trajectory", fastR2ETraj,
+		"-fanout", "2",
+		"-out", r2ePlanPath,
+	}, &outBuf, &errBuf); code != 0 {
+		t.Fatalf("render-plan r2e exited %d: %s", code, errBuf.String())
+	}
+	var renderedR2E swebench.RenderedPlan
+	rawPlan, err := os.ReadFile(r2ePlanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(rawPlan, &renderedR2E); err != nil {
+		t.Fatalf("unmarshal r2e plan: %v", err)
+	}
+	if len(renderedR2E.Instances) != 4 || renderedR2E.DatasetLabel != "r2e-6.jsonl" {
+		t.Fatalf("unexpected rendered R2E plan: %+v", renderedR2E)
+	}
+	if len(renderedR2E.Instances[0].Setup) == 0 || len(renderedR2E.Instances[0].Steps) == 0 {
+		t.Fatalf("expected rendered setup and steps on R2E instance, got %+v", renderedR2E.Instances[0])
+	}
+
+	errBuf.Reset()
+	if code := runMain([]string{
+		"render-plan",
+		"-dataset", sweManifest,
+		"-images", "4",
+		"-trajectory", fastSWETraj,
+		"-out", swePlanPath,
+	}, &outBuf, &errBuf); code != 0 {
+		t.Fatalf("render-plan swe exited %d: %s", code, errBuf.String())
+	}
+
+	// 2. Sweep all 4 strategies (none, naive, sliding, pipelined) and verify invariants + comparison report.
+	prev := testBackendOverride
+	t.Cleanup(func() { testBackendOverride = prev })
+
+	var armReportPaths []string
+	for idx, strat := range swebench.AllStrategies {
+		fake := &recipeFakeBackend{}
+		if strat == swebench.StrategyPipelined {
+			fake.opDelay = 2 * time.Millisecond
+		}
+		testBackendOverride = fake
+
+		outPath := filepath.Join(dir, fmt.Sprintf("events-%s.jsonl", strat))
+		runArgs := []string{
+			"run",
+			"-dataset", r2eManifest,
+			"-run-id", fmt.Sprintf("strat-a%d", idx+1),
+			"-images", "6",
+			"-rollouts", "2",
+			"-width", "4",
+			"-mode", "steps",
+			"-strategy", string(strat),
+			"-trajectory", fastR2ETraj,
+			"-out", outPath,
+			"-label", "client=go",
+			"-label", fmt.Sprintf("arm=go-%s", strat),
+		}
+		if strat == swebench.StrategySliding || strat == swebench.StrategyPipelined {
+			runArgs = append(runArgs, "-window-size", "2")
+		}
+		var runOut, runErr bytes.Buffer
+		if code := runMain(runArgs, &runOut, &runErr); code != 0 {
+			t.Fatalf("strategy %s exited %d: %s", strat, code, runErr.String())
+		}
+
+		rep, err := swebench.SummarizeFile(outPath)
+		if err != nil {
+			t.Fatalf("SummarizeFile(%s): %v", strat, err)
+		}
+		if rep.Tasks != 12 || rep.Rewarded != 12 || rep.RewardRate != 1.0 {
+			t.Fatalf("strategy %s: expected 12/12 rewarded tasks, got tasks=%d rewarded=%d rate=%v", strat, rep.Tasks, rep.Rewarded, rep.RewardRate)
+		}
+		if fake.maxAwake > 4 {
+			t.Fatalf("strategy %s: expected maxAwake <= width (4), got %d", strat, fake.maxAwake)
+		}
+		switch strat {
+		case swebench.StrategyNone:
+			if rep.Labels["park"] != "delete" {
+				t.Fatalf("strategy none: expected park=delete label, got %q", rep.Labels["park"])
+			}
+			if rep.WorkingSetHitRate != 0 || rep.StandingPoolSize != 0 || rep.WorkingSetHits != 0 || fake.maxParked != 0 {
+				t.Fatalf("strategy none: expected 0 warm hits and 0 parked sandboxes, got hits=%d misses=%d hitRate=%v pool=%d maxParked=%d", rep.WorkingSetHits, rep.WorkingSetMisses, rep.WorkingSetHitRate, rep.StandingPoolSize, fake.maxParked)
+			}
+		case swebench.StrategyNaive:
+			if rep.Labels["park"] != "suspend" {
+				t.Fatalf("strategy naive: expected park=suspend label, got %q", rep.Labels["park"])
+			}
+			if rep.WorkingSetHitRate != 1.0 || rep.StandingPoolSize != 12 || rep.WorkingSetHits != 12 || fake.maxParked != 12 {
+				t.Fatalf("strategy naive: expected 100%% hit rate and 12 parked sandboxes, got hits=%d misses=%d hitRate=%v pool=%d maxParked=%d", rep.WorkingSetHits, rep.WorkingSetMisses, rep.WorkingSetHitRate, rep.StandingPoolSize, fake.maxParked)
+			}
+		case swebench.StrategySliding:
+			if rep.Labels["park"] != "suspend" {
+				t.Fatalf("strategy sliding: expected park=suspend label, got %q", rep.Labels["park"])
+			}
+			if rep.WorkingSetHitRate != 1.0 || rep.StandingPoolSize != 4 || rep.WorkingSetHits != 12 || fake.maxParked > 4 {
+				t.Fatalf("strategy sliding: expected 100%% hit rate and <=4 parked sandboxes (window=2*2), got hits=%d misses=%d hitRate=%v pool=%d maxParked=%d", rep.WorkingSetHits, rep.WorkingSetMisses, rep.WorkingSetHitRate, rep.StandingPoolSize, fake.maxParked)
+			}
+		case swebench.StrategyPipelined:
+			if rep.Labels["park"] != "suspend" {
+				t.Fatalf("strategy pipelined: expected park=suspend label, got %q", rep.Labels["park"])
+			}
+			if rep.WorkingSetHitRate != 1.0 || rep.StandingPoolSize > 8 || rep.WorkingSetHits != 12 || fake.maxParked > 8 {
+				t.Fatalf("strategy pipelined: expected 100%% hit rate and <=8 double-buffered parked sandboxes, got hits=%d misses=%d hitRate=%v pool=%d maxParked=%d", rep.WorkingSetHits, rep.WorkingSetMisses, rep.WorkingSetHitRate, rep.StandingPoolSize, fake.maxParked)
+			}
+		}
+
+		rep.RunID = fmt.Sprintf("go-%s", strat)
+		armJSONPath := filepath.Join(dir, fmt.Sprintf("go-%s-report.json", strat))
+		b, err := json.Marshal(rep)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(armJSONPath, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		armReportPaths = append(armReportPaths, armJSONPath)
+	}
+
+	compJSON := filepath.Join(dir, "comparison.json")
+	var compOut, compErr bytes.Buffer
+	reportArgs := append([]string{"report"}, armReportPaths...)
+	reportArgs = append(reportArgs, "-json", compJSON)
+	if code := runMain(reportArgs, &compOut, &compErr); code != 0 {
+		t.Fatalf("report multi-arm comparison exited %d: %s", code, compErr.String())
+	}
+	for _, wantCol := range []string{"go-none", "go-naive", "go-sliding", "go-pipelined"} {
+		if !strings.Contains(compOut.String(), wantCol) {
+			t.Fatalf("comparison output missing column %q:\n%s", wantCol, compOut.String())
+		}
+	}
+
+	// 3. Verify fail-loud flag and direct-driver validation.
+	for _, badArgs := range [][]string{
+		{"run", "-dataset", r2eManifest, "-strategy", "bogus"},
+		{"run", "-dataset", r2eManifest, "-strategy", "naive", "-window-size", "2"},
+		{"run", "-dataset", r2eManifest, "-strategy", "sliding", "-mode", "open-loop"},
+		{"run", "-dataset", r2eManifest, "-strategy", "sliding", "-mode", "steps", "-steps", "2"},
+	} {
+		var bo, be bytes.Buffer
+		if code := runMain(badArgs, &bo, &be); code == 0 {
+			t.Fatalf("expected non-zero exit for invalid args %v", badArgs)
+		}
+	}
+
+	if _, _, err := swebench.NewBackendDriver(swebench.BackendDriverOptions{
+		Backend:          "substrate",
+		Access:           "direct",
+		ControlAddr:      "127.0.0.1:7443",
+		AtenetClientCert: filepath.Join(dir, "missing-cert.pem"),
+	}); err == nil {
+		t.Fatal("expected NewBackendDriver to fail on missing AtenetClientCert")
+	}
+	emptyToken := filepath.Join(dir, "empty-token.txt")
+	if err := os.WriteFile(emptyToken, []byte("   \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := swebench.NewBackendDriver(swebench.BackendDriverOptions{
+		Backend:         "substrate",
+		Access:          "direct",
+		ControlAddr:     "127.0.0.1:7443",
+		AteapiTokenFile: emptyToken,
+	}); err == nil {
+		t.Fatal("expected NewBackendDriver to fail on empty AteapiTokenFile")
 	}
 }

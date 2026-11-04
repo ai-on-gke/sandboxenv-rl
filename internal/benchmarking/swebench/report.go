@@ -477,6 +477,47 @@ type jobAccum struct {
 	ttfi     []float64
 }
 
+type wsSnapshot struct {
+	hits                 int
+	misses               int
+	standingPoolSize     int
+	created              int
+	reused               int
+	retired              int
+	prefetchLeadMarginMS float64
+	releaseOverlapMS     float64
+}
+
+func sumWSSnapshots(m map[string]wsSnapshot) (out wsSnapshot, hitRate float64) {
+	for _, s := range m {
+		out.hits += s.hits
+		out.misses += s.misses
+		out.standingPoolSize += s.standingPoolSize
+		out.created += s.created
+		out.reused += s.reused
+		out.retired += s.retired
+		out.prefetchLeadMarginMS += s.prefetchLeadMarginMS
+		out.releaseOverlapMS += s.releaseOverlapMS
+	}
+	if total := out.hits + out.misses; total > 0 {
+		hitRate = float64(out.hits) / float64(total)
+	}
+	return out, hitRate
+}
+
+func maxFloat64(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	mx := xs[0]
+	for _, v := range xs[1:] {
+		if v > mx {
+			mx = v
+		}
+	}
+	return mx
+}
+
 // Builder folds a stream of events into a Report without materializing the full
 // event slice in memory.
 type Builder struct {
@@ -500,6 +541,8 @@ type Builder struct {
 	stepThinkPool      map[int][]float64
 	customMetrics      map[string][]float64
 	jobs               map[string]*jobAccum
+	jobRunWS           map[string]wsSnapshot
+	stepJobBarrierWS   map[int]map[string]wsSnapshot
 	slotWaits          []float64
 	stepSlotWaits      map[int][]float64
 	stepCreates        map[int][]float64
@@ -551,6 +594,8 @@ func NewBuilder() *Builder {
 		stepThinkPool:      map[int][]float64{},
 		customMetrics:      map[string][]float64{},
 		jobs:               map[string]*jobAccum{},
+		jobRunWS:           map[string]wsSnapshot{},
+		stepJobBarrierWS:   map[int]map[string]wsSnapshot{},
 		stepSlotWaits:      map[int][]float64{},
 		stepCreates:        map[int][]float64{},
 		stepJobTasks:       map[int]map[string]int{},
@@ -887,6 +932,18 @@ func (b *Builder) Add(e Event) {
 		b.rep.Retired = e.Retired
 		b.rep.PrefetchLeadMarginMS = e.PrefetchLeadMarginMS
 		b.rep.ReleaseOverlapMS = e.ReleaseOverlapMS
+		if e.Job != "" {
+			b.jobRunWS[e.Job] = wsSnapshot{
+				hits:                 e.WorkingSetHits,
+				misses:               e.WorkingSetMisses,
+				standingPoolSize:     e.StandingPoolSize,
+				created:              e.Created,
+				reused:               e.Reused,
+				retired:              e.Retired,
+				prefetchLeadMarginMS: e.PrefetchLeadMarginMS,
+				releaseOverlapMS:     e.ReleaseOverlapMS,
+			}
+		}
 		for tk, tv := range e.Tags {
 			b.runTags[tk] = tv
 		}
@@ -967,6 +1024,21 @@ func (b *Builder) Add(e Event) {
 		st.Retired = e.Retired
 		st.PrefetchLeadMarginMS = e.PrefetchLeadMarginMS
 		st.ReleaseOverlapMS = e.ReleaseOverlapMS
+		if e.Job != "" {
+			if b.stepJobBarrierWS[e.Step] == nil {
+				b.stepJobBarrierWS[e.Step] = map[string]wsSnapshot{}
+			}
+			b.stepJobBarrierWS[e.Step][e.Job] = wsSnapshot{
+				hits:                 e.WorkingSetHits,
+				misses:               e.WorkingSetMisses,
+				standingPoolSize:     e.StandingPoolSize,
+				created:              e.Created,
+				reused:               e.Reused,
+				retired:              e.Retired,
+				prefetchLeadMarginMS: e.PrefetchLeadMarginMS,
+				releaseOverlapMS:     e.ReleaseOverlapMS,
+			}
+		}
 		if e.Step > 0 && len(e.Metrics) > 0 {
 			if b.trainerStepMetrics[e.Step] == nil {
 				b.trainerStepMetrics[e.Step] = make(map[string]float64, len(e.Metrics))
@@ -1068,7 +1140,23 @@ func (b *Builder) Finish() *Report {
 	if rep.Tasks > 0 {
 		rep.RewardRate = float64(rep.Rewarded) / float64(rep.Tasks)
 	}
-	rep.RunMS = median(b.runs)
+	if len(b.jobs) > 1 {
+		rep.RunMS = maxFloat64(b.runs)
+	} else {
+		rep.RunMS = median(b.runs)
+	}
+	if len(b.jobRunWS) > 1 {
+		wsSum, hitRate := sumWSSnapshots(b.jobRunWS)
+		rep.WorkingSetHits = wsSum.hits
+		rep.WorkingSetMisses = wsSum.misses
+		rep.WorkingSetHitRate = hitRate
+		rep.StandingPoolSize = wsSum.standingPoolSize
+		rep.Created = wsSum.created
+		rep.Reused = wsSum.reused
+		rep.Retired = wsSum.retired
+		rep.PrefetchLeadMarginMS = wsSum.prefetchLeadMarginMS
+		rep.ReleaseOverlapMS = wsSum.releaseOverlapMS
+	}
 	rep.Labels = b.labels.merged()
 	for _, k := range b.order {
 		d := b.durs[k]
@@ -1155,8 +1243,25 @@ func (b *Builder) Finish() *Report {
 		cp.WakeP50MS = percentile(w, 0.5)
 		cp.WakeP95MS = percentile(w, 0.95)
 		if len(b.barriers[step]) > 0 {
-			cp.BarrierMS = median(b.barriers[step])
+			if len(b.jobs) > 1 {
+				cp.BarrierMS = maxFloat64(b.barriers[step])
+			} else {
+				cp.BarrierMS = median(b.barriers[step])
+			}
 			s.BarrierMS = cp.BarrierMS
+		}
+		if jw := b.stepJobBarrierWS[step]; len(jw) > 1 {
+			wsSum, hitRate := sumWSSnapshots(jw)
+			cp.WorkingSetHits = wsSum.hits
+			cp.WorkingSetMisses = wsSum.misses
+			cp.WorkingSetHitRate = hitRate
+			cp.StandingPoolSize = wsSum.standingPoolSize
+			cp.Created = wsSum.created
+			cp.Reused = wsSum.reused
+			cp.Retired = wsSum.retired
+			cp.PrefetchLeadMarginMS = wsSum.prefetchLeadMarginMS
+			cp.ReleaseOverlapMS = wsSum.releaseOverlapMS
+			*s = cp
 		}
 		if len(b.parks[step]) > 0 {
 			cp.ParkMS = median(b.parks[step])

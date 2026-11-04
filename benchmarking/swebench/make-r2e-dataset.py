@@ -432,7 +432,7 @@ def main(argv: list[str] | None = None) -> int:
         "instances": written,
         "missing_images": missing,
         "skipped_empty_patch": skipped_empty_patch,
-        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "generated_at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
     }
     Path(args.out + ".meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     print(

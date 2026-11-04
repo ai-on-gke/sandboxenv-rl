@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,12 +26,14 @@ import (
 	"io/fs"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
 	env "github.com/agent-substrate/env/clients/go"
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/ate"
+	"github.com/agent-substrate/env/internal/routertls"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
@@ -42,16 +45,22 @@ import (
 //   - Backend: "substrate" (default) or "agent-sandbox"
 //   - Access:  "ate-env-api" (default), "direct", or "sdk"
 type BackendDriverOptions struct {
-	Backend      string
-	Access       string
-	Endpoint     string
-	ControlAddr  string
-	RouterAddr   string
-	Atespace     string
-	BaseTemplate string
-	WarmPool     string
-	Connections  int
-	AuthToken    string
+	Backend          string
+	Access           string
+	Endpoint         string
+	ControlAddr      string
+	RouterAddr       string
+	Atespace         string
+	BaseTemplate     string
+	WarmPool         string
+	Connections      int
+	AuthToken        string
+	AtenetClientCert string
+	AtenetCAFile     string
+	AtenetServerName string
+	AteapiTokenFile  string
+	AteapiCAFile     string
+	AteapiSkipVerify *bool
 }
 
 type nopCloser struct{}
@@ -105,11 +114,56 @@ func NewBackendDriver(opts BackendDriverOptions) (Backend, io.Closer, error) {
 			if ctrl == "" {
 				ctrl = opts.Endpoint
 			}
+			routerAddr := opts.RouterAddr
+			var routerTLS *tls.Config
+			if opts.AtenetClientCert != "" || opts.AtenetCAFile != "" {
+				serverName := opts.AtenetServerName
+				if serverName == "" {
+					serverName = "atenet-router.ate-system.svc"
+				}
+				tlsCfg, err := (routertls.Options{
+					CredentialBundleFile: opts.AtenetClientCert,
+					TrustBundleFile:      opts.AtenetCAFile,
+					ServerName:           serverName,
+				}).Config()
+				if err != nil {
+					return nil, nil, fmt.Errorf("router TLS: %w", err)
+				}
+				routerTLS = tlsCfg
+				if routerAddr == "" || routerAddr == ate.DefaultRouterAddr {
+					routerAddr = ate.DefaultRouterTLSAddr
+				}
+			}
+			var controlTLS *tls.Config
+			skipVerify := true
+			if opts.AteapiSkipVerify != nil {
+				skipVerify = *opts.AteapiSkipVerify
+			}
+			if opts.AteapiCAFile != "" {
+				pemBytes, err := os.ReadFile(opts.AteapiCAFile)
+				if err != nil {
+					return nil, nil, fmt.Errorf("reading ateapi CA file %s: %w", opts.AteapiCAFile, err)
+				}
+				pool := x509.NewCertPool()
+				if !pool.AppendCertsFromPEM(pemBytes) {
+					return nil, nil, fmt.Errorf("ateapi CA file %s contains no valid PEM certificates", opts.AteapiCAFile)
+				}
+				if opts.AteapiSkipVerify == nil {
+					skipVerify = false
+				}
+				controlTLS = &tls.Config{
+					RootCAs:            pool,
+					InsecureSkipVerify: skipVerify,
+				}
+			}
 			b, err := NewDirectSubstrateBackend(DirectSubstrateOptions{
 				ATEOptions: ate.Options{
-					ControlAddr: ctrl,
-					RouterAddr:  opts.RouterAddr,
-					SkipVerify:  true,
+					ControlAddr:     ctrl,
+					RouterAddr:      routerAddr,
+					TLSConfig:       controlTLS,
+					RouterTLS:       routerTLS,
+					BearerTokenFile: opts.AteapiTokenFile,
+					SkipVerify:      skipVerify,
 				},
 				Atespace:     opts.Atespace,
 				BaseTemplate: opts.BaseTemplate,
@@ -127,9 +181,27 @@ func NewBackendDriver(opts BackendDriverOptions) (Backend, io.Closer, error) {
 	}
 }
 
+type directFileTokenCreds struct {
+	path string
+}
+
+func (f directFileTokenCreds) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	raw, err := os.ReadFile(f.path)
+	if err != nil {
+		return nil, fmt.Errorf("reading ateapi token file %s: %w", f.path, err)
+	}
+	tok := strings.TrimSpace(string(raw))
+	if tok == "" {
+		return nil, fmt.Errorf("ateapi token file %s is empty", f.path)
+	}
+	return map[string]string{"authorization": "Bearer " + tok}, nil
+}
+
+func (directFileTokenCreds) RequireTransportSecurity() bool { return true }
+
 // DirectSubstrateOptions configures a DirectSubstrateBackend that talks
 // directly to the Substrate control plane and atenet router without routing
-// through ate-env-api (isolating API-proxy overhead per DESIGN.md §4/§5.4).
+// directly through ate-env-api (isolating API-proxy overhead per DESIGN.md §4/§5.4).
 type DirectSubstrateOptions struct {
 	ATEOptions   ate.Options
 	Atespace     string
@@ -152,6 +224,11 @@ type DirectSubstrateBackend struct {
 
 // NewDirectSubstrateBackend dials the Substrate control plane and router.
 func NewDirectSubstrateBackend(opts DirectSubstrateOptions) (*DirectSubstrateBackend, error) {
+	if opts.ATEOptions.BearerTokenFile != "" {
+		if _, err := (directFileTokenCreds{path: opts.ATEOptions.BearerTokenFile}).GetRequestMetadata(context.Background()); err != nil {
+			return nil, err
+		}
+	}
 	c, err := ate.New(opts.ATEOptions)
 	if err != nil {
 		return nil, err
@@ -162,7 +239,11 @@ func NewDirectSubstrateBackend(opts DirectSubstrateOptions) (*DirectSubstrateBac
 	} else {
 		creds = credentials.NewTLS(&tls.Config{InsecureSkipVerify: opts.ATEOptions.SkipVerify})
 	}
-	controlConn, err := grpc.NewClient(opts.ATEOptions.ControlAddr, grpc.WithTransportCredentials(creds))
+	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
+	if opts.ATEOptions.BearerTokenFile != "" {
+		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(directFileTokenCreds{path: opts.ATEOptions.BearerTokenFile}))
+	}
+	controlConn, err := grpc.NewClient(opts.ATEOptions.ControlAddr, dialOpts...)
 	if err != nil {
 		_ = c.Close()
 		return nil, err
@@ -204,9 +285,7 @@ func (b *DirectSubstrateBackend) Close() error {
 }
 
 // ensureImageTemplate resolves or derives the per-image ActorTemplate on the
-// Substrate control plane. If the base template has not been registered on the
-// control plane (for example in minimal fake-control tests), it falls back to
-// b.baseTemplate so actor creation still proceeds.
+// Substrate control plane, returning an error if b.baseTemplate is missing.
 func (b *DirectSubstrateBackend) ensureImageTemplate(ctx context.Context, image string) (string, error) {
 	if image == "" {
 		return b.baseTemplate, nil
@@ -222,10 +301,7 @@ func (b *DirectSubstrateBackend) ensureImageTemplate(ctx context.Context, image 
 	}
 	baseTmpl, err := b.client.GetActorTemplate(ctx, b.atespace, b.baseTemplate)
 	if err != nil {
-		if errors.Is(err, ate.ErrNotFound) {
-			return b.baseTemplate, nil
-		}
-		return "", err
+		return "", fmt.Errorf("base template %q: %w", b.baseTemplate, err)
 	}
 	derived, err := apiservice.DeriveImageTemplate(baseTmpl, name, image)
 	if err != nil {

@@ -453,6 +453,8 @@ def test_run_r2e_swebench_dry_run_flags_and_validation(tmp_path):
     assert "--concurrency" in help_proc.stdout
     assert "--images" in help_proc.stdout
     assert "--rollouts-per-image" in help_proc.stdout
+    assert "--strategy" in help_proc.stdout
+    assert "--client" in help_proc.stdout
 
     # 1. Default 20 + 20 images at max_concurrency=200 (graded, steps mode -> 5 rollouts/image = 100 + 100).
     proc_default = subprocess.run(
@@ -594,7 +596,10 @@ def test_run_r2e_swebench_dry_run_flags_and_validation(tmp_path):
 
     # 5. Fail-loud validation checks on invalid flags and incompatible oversubscribed step-pause.
     bad_unknown = subprocess.run(
-        [str(script), "dry-run", "--bogus"], capture_output=True, text=True
+        [str(script), "dry-run", "--bogus"],
+        check=False,
+        capture_output=True,
+        text=True,
     )
     assert bad_unknown.returncode == 2
     assert "unknown argument: --bogus" in bad_unknown.stderr
@@ -610,6 +615,7 @@ def test_run_r2e_swebench_dry_run_flags_and_validation(tmp_path):
             "--concurrency",
             "1",
         ],
+        check=False,
         capture_output=True,
         text=True,
     )
@@ -633,8 +639,223 @@ def test_run_r2e_swebench_dry_run_flags_and_validation(tmp_path):
             "--step-pause",
             "5s",
         ],
+        check=False,
         capture_output=True,
         text=True,
     )
     assert bad_pause.returncode == 2
     assert "STEP_PAUSE" in bad_pause.stderr
+
+    # 6. Strategy sweep (--strategy all) across Go API -> 4 arms.
+    proc_strat_all = subprocess.run(
+        [
+            str(script),
+            "dry-run",
+            "--r2e-dataset",
+            str(r2e_manifest),
+            "--swe-dataset",
+            str(swe_manifest),
+            "--concurrency",
+            "40",
+            "--images",
+            "4",
+            "--rollouts-per-image",
+            "2",
+            "--strategy",
+            "all",
+            "--artifact-dir",
+            str(tmp_path / "art-strat-all"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "steps=1" in proc_strat_all.stderr
+    assert "arms=4 (go-none go-naive go-sliding go-pipelined)" in proc_strat_all.stderr
+    for s_name in ("none", "naive", "sliding", "pipelined"):
+        assert f'"strategy":"{s_name}"' in proc_strat_all.stderr
+
+    # 7. Python client chain (--client python --strategy pipelined --window-size 4) renders plan JSONs.
+    art_py = tmp_path / "art-py"
+    proc_py = subprocess.run(
+        [
+            str(script),
+            "dry-run",
+            "--r2e-dataset",
+            str(r2e_manifest),
+            "--swe-dataset",
+            str(swe_manifest),
+            "--concurrency",
+            "40",
+            "--images",
+            "6",
+            "--rollouts-per-image",
+            "2",
+            "--client",
+            "python",
+            "--strategy",
+            "pipelined",
+            "--window-size",
+            "4",
+            "--artifact-dir",
+            str(art_py),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "arms=1 (python-pipelined)" in proc_py.stderr
+    assert proc_py.stderr.count('"client": "python"') == 2
+    assert proc_py.stderr.count('"window_size": 4') == 2
+    assert (art_py / "plans" / "swe-plan.json").is_file()
+    assert (art_py / "plans" / "r2e-plan.json").is_file()
+
+    # 8. Direct Go Substrate chain (--client go-direct) and full matrix (--client all --strategy all).
+    proc_direct = subprocess.run(
+        [
+            str(script),
+            "dry-run",
+            "--r2e-dataset",
+            str(r2e_manifest),
+            "--swe-dataset",
+            str(swe_manifest),
+            "--concurrency",
+            "20",
+            "--images",
+            "6",
+            "--rollouts-per-image",
+            "2",
+            "--client",
+            "go-direct",
+            "--control-addr",
+            "127.0.0.1:7443",
+            "--router-addr",
+            "127.0.0.1:8443",
+            "--strategy",
+            "sliding",
+            "--window-size",
+            "5",
+            "--artifact-dir",
+            str(tmp_path / "art-direct"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "arms=1 (go-direct-sliding)" in proc_direct.stderr
+    assert '"window_size":5' in proc_direct.stderr
+
+    proc_all_no_ctrl = subprocess.run(
+        [
+            str(script),
+            "dry-run",
+            "--r2e-dataset",
+            str(r2e_manifest),
+            "--swe-dataset",
+            str(swe_manifest),
+            "--concurrency",
+            "20",
+            "--images",
+            "2",
+            "--rollouts-per-image",
+            "1",
+            "--client",
+            "all",
+            "--strategy",
+            "all",
+            "--artifact-dir",
+            str(tmp_path / "art-all-8"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert (
+        "arms=8 (go-none go-naive go-sliding go-pipelined "
+        "python-none python-naive python-sliding python-pipelined)"
+    ) in proc_all_no_ctrl.stderr
+
+    proc_all_with_ctrl = subprocess.run(
+        [
+            str(script),
+            "dry-run",
+            "--r2e-dataset",
+            str(r2e_manifest),
+            "--swe-dataset",
+            str(swe_manifest),
+            "--concurrency",
+            "20",
+            "--images",
+            "2",
+            "--rollouts-per-image",
+            "1",
+            "--client",
+            "all",
+            "--control-addr",
+            "127.0.0.1:7443",
+            "--strategy",
+            "all",
+            "--artifact-dir",
+            str(tmp_path / "art-all-12"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "arms=12 (" in proc_all_with_ctrl.stderr
+    assert "go-direct-pipelined" in proc_all_with_ctrl.stderr
+
+    proc_client_all_default = subprocess.run(
+        [
+            str(script),
+            "dry-run",
+            "--r2e-dataset",
+            str(r2e_manifest),
+            "--swe-dataset",
+            str(swe_manifest),
+            "--concurrency",
+            "20",
+            "--images",
+            "2",
+            "--rollouts-per-image",
+            "1",
+            "--client",
+            "all",
+            "--artifact-dir",
+            str(tmp_path / "art-client-all"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "steps=1" in proc_client_all_default.stderr
+    assert "arms=2 (go-pipelined python-pipelined)" in proc_client_all_default.stderr
+
+    # 9. Fail-loud checks for strategy/client flags.
+    for bad_flags, want_msg in [
+        (["dry-run", "--strategy", "bogus"], "STRATEGY must be"),
+        (["dry-run", "--client", "bogus"], "CLIENT must be"),
+        (["dry-run", "--strategy", "naive", "--window-size", "4"], "--window-size"),
+        (["dry-run", "--mode", "open-loop", "--strategy", "all"], "open-loop"),
+        (["dry-run", "--mode", "open-loop", "--client", "python"], "open-loop"),
+        (["dry-run", "--steps", "2", "--strategy", "sliding"], "--steps"),
+        (["dry-run", "--steps", "2", "--client", "python"], "--steps"),
+        (["dry-run", "--execution", "in-cluster", "--auth-token-file", str(r2e_manifest)], "AUTH_TOKEN_SECRET"),
+        (["dry-run", "--ateapi-ca-file", str(tmp_path / "missing-ca.pem")], "ATEAPI_CA_FILE not found"),
+        (["run", "--client", "go-direct"], "--control-addr"),
+    ]:
+        bad_res = subprocess.run(
+            [
+                str(script),
+                *bad_flags,
+                "--r2e-dataset",
+                str(r2e_manifest),
+                "--swe-dataset",
+                str(swe_manifest),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert bad_res.returncode == 2, f"expected rc=2 for {bad_flags}, got {bad_res.returncode}"
+        assert want_msg in bad_res.stderr

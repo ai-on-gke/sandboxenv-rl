@@ -24,6 +24,16 @@ in numbers.
 | steps (training loop) | `-mode steps -images 500 -rollouts 2 -steps 8 -park suspend` | 1,000 environments created once. Each step replays the trajectory on all of them, waits for the last (the barrier), then parks the fleet. `-park` is `suspend`, `delete` or `none`. |
 | steps, parked one by one (fleet larger than the slots) | `-mode steps -images 500 -rollouts 16 -steps 8 -park suspend -width 64 -park-each` | 8,000 environments, created on their first step. Each environment is parked as soon as its own step ends instead of after the whole fleet's, so at most 64 are awake at once and the fleet can be many times the running slots: the shape of a trainer that releases a sandbox at the end of its episode, and the way to measure how many parked environments a node can hold. The barrier includes the parking and there is no `park` event. |
 | steps with a window (pools per step) | `-mode steps -images-per-step 32 -rollouts 16 -steps 6 -park delete` | Each step takes the next 32 images (wrapping around the dataset), creates 16 fresh environments per image, 512 in all, runs the step behind a barrier, and retires them. Nothing survives a step, so every task pays the cold path, and a new image is a new derived template and a golden bake on first use: the shape of a trainer that creates and retires pools every step. Run several loaders at once, one run id each, for several jobs on one cluster. |
+| strategy sweep (`none`, `naive`, `sliding`, `pipelined`) | `-mode steps -steps 1 -images 20 -rollouts 5 -width 100 -strategy pipelined -window-size 8` | Single-pass sweep of the four warm-pool orchestration strategies matching Python `SandboxFleet`: `none` (on-demand create and delete per rollout), `naive` (prewarm and suspend all `images * rollouts` sandboxes upfront), `sliding` (warm `window-size` distinct images, execute, retire, advance), or `pipelined` (double-buffer window `N+1` prefetch behind window `N` execution while sharing `-width`). |
+
+`benchmarking/swebench/run-r2e-swebench.sh` orchestrates mixed R2E-Gym and SWE-bench sweeps across
+`--strategy <none|naive|sliding|pipelined|all>` and `--client <go|go-direct|python|all>`:
+`go` drives `swebench-loader` through the Go SDK (`clients/go`) and `ate-env-api`, `go-direct`
+drives `DirectSubstrateBackend` (`-backend=substrate -access=direct`) directly against Substrate
+`ateapi` and `atenet-router`, and `python` renders trajectories with `swebench-loader render-plan`
+and drives Python `SandboxFleet` (`benchmarking/swebench/run_fleet_bench.py`) through `ate-env-api`.
+Multi-arm runs emit per-arm `bench report` bundles under `$ARTIFACT_DIR/arms/<arm>/` and top-level
+`comparison.{txt,json,md}` tables.
 
 The trajectory is YAML (`internal/benchmarking/swebench/trajectories/`,
 or `-trajectory FILE`). The built-in `swebench-gold` does what a SWE agent

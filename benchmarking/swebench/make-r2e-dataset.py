@@ -65,19 +65,11 @@ R2E_EASY_FILES = {
 R2E_SUBSET_DATASET = "R2E-Gym/R2E-Gym-Subset"
 
 _INLINE_GRADER = """\
-import base64, json, pathlib, re, sys
+import json, pathlib, re, sys
 ANSI = re.compile(r"\\x1b\\[[0-9;]*m|\\[\\d+m")
 MARKER = "short test summary info"
 log = pathlib.Path(sys.argv[1]).read_text(errors="replace")
-try:
-    is_path = pathlib.Path(sys.argv[2]).is_file()
-except OSError:
-    is_path = False
-exp_raw = json.loads(
-    pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
-    if is_path
-    else base64.b64decode(sys.argv[2]).decode("utf-8")
-)
+exp_raw = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
 norm = lambda m: {ANSI.sub("", str(k)).split(" - ", 1)[0].strip(): str(v) for k, v in (m or {}).items()}
 expected = norm(exp_raw)
 expected.pop("", None)
@@ -178,9 +170,15 @@ def build_r2e_commands(
     archive: str = "/tmp/r2e_tests.tar.gz",
     venv_bin: str = "/testbed/.venv/bin",
     local_bin: str = "/root/.local/bin",
+    system_bin: str = "/usr/local/bin",
     work_dir: str = "/tmp",
 ) -> tuple[str, str, str]:
-    """Build (setup_command, reset_command, command) for an R2E-Gym instance."""
+    """Build (setup_command, reset_command, command) for an R2E-Gym instance.
+
+    setup_command links the venv's python into system_bin (python and python3)
+    when the image has a venv; the paths are parameters so a test can run the
+    commands on a host without touching its interpreter.
+    """
     expected_obj = (
         json.loads(expected_output_json)
         if isinstance(expected_output_json, str)
@@ -204,6 +202,8 @@ def build_r2e_commands(
     q_archive = shlex.quote(archive)
     q_venv_bin = shlex.quote(venv_bin)
     q_local_bin = shlex.quote(local_bin)
+    q_system_py = shlex.quote(posixpath.join(system_bin, "python"))
+    q_system_py3 = shlex.quote(posixpath.join(system_bin, "python3"))
     q_venv_py = shlex.quote(posixpath.join(venv_bin, "python"))
     q_restored = shlex.quote(posixpath.join(testbed, hidden_name))
     q_patch_file = shlex.quote(posixpath.join(work_dir, "r2e_gold.patch"))
@@ -216,8 +216,8 @@ def build_r2e_commands(
         f"if [ -d {q_venv_bin} ]; then "
         f"mkdir -p {q_local_bin} && "
         f'for f in {q_venv_bin}/*; do if [ -f "$f" ] && [ -x "$f" ]; then ln -sfn "$f" {q_local_bin}/"$(basename "$f")"; fi; done && '
-        f"(ln -sfn {q_venv_py} /usr/local/bin/python 2>/dev/null || true) && "
-        f"(ln -sfn {q_venv_py} /usr/local/bin/python3 2>/dev/null || true); "
+        f"(ln -sfn {q_venv_py} {q_system_py} 2>/dev/null || true) && "
+        f"(ln -sfn {q_venv_py} {q_system_py3} 2>/dev/null || true); "
         f"fi && "
         f"if [ -d {q_hidden} ]; then tar -C {q_hidden_parent} -czf {q_archive} {q_hidden_name} && rm -rf {q_hidden}; fi && "
         f"test -f {q_archive} && "
@@ -225,8 +225,11 @@ def build_r2e_commands(
         f"git -c user.email=bench@localhost -c user.name=bench add -A && "
         f'git -c user.email=bench@localhost -c user.name=bench commit -q --allow-empty -m "benchmark baseline"'
     )
+    # The reset also clears what the previous command staged in work_dir, so
+    # a later rollout in the same environment starts from the baseline alone.
     reset_command = (
-        f"cd {q_testbed} && git reset -q --hard && git clean -qfd && rm -rf {q_restored}"
+        f"cd {q_testbed} && git reset -q --hard && git clean -qfd && rm -rf {q_restored} && "
+        f"rm -f {q_patch_file} {q_expected_file} {q_grader_file} {q_eval_log}"
     )
     command = "\n".join([
         "set -e",

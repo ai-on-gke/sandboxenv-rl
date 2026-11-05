@@ -184,6 +184,10 @@ def test_build_r2e_commands_executes_setup_grade_reset_and_second_step(tmp_path)
     archive = tmp_path / "work" / "r2e_tests.tar.gz"
     venv_bin = testbed / ".venv" / "bin"
     local_bin = tmp_path / "local_bin"
+    # setup_command links the venv python into system_bin; on the host that
+    # must not be /usr/local/bin (as root it would replace the interpreter).
+    system_bin = tmp_path / "system_bin"
+    system_bin.mkdir()
     work_dir = tmp_path / "work"
     work_dir.mkdir(parents=True)
     (testbed / "pkg" / "__pycache__").mkdir(parents=True)
@@ -251,22 +255,30 @@ def test_build_r2e_commands_executes_setup_grade_reset_and_second_step(tmp_path)
         archive=str(archive),
         venv_bin=str(venv_bin),
         local_bin=str(local_bin),
+        system_bin=str(system_bin),
         work_dir=str(work_dir),
     )
+    assert "/usr/local/bin" not in setup_cmd
 
     subprocess.run(["sh", "-c", setup_cmd], check=True)
     assert not hidden.exists()
     assert archive.is_file()
     assert not (testbed / "pkg" / "__pycache__").exists()
     assert (local_bin / "helper-tool").is_symlink()
+    assert (system_bin / "python").is_symlink() and (system_bin / "python3").is_symlink()
+    assert (system_bin / "python").resolve() == (venv_bin / "python").resolve()
 
     step1 = subprocess.run(["sh", "-c", grade_cmd], check=True, capture_output=True, text=True)
     verdict1 = json.loads(step1.stdout.strip())
     assert verdict1 == {"valid": True, "reward": 1, "detail": "matched 2/2 tests"}
+    staged = [work_dir / n for n in ("r2e_gold.patch", "r2e_expected.json", "r2e_grade.py", "r2e_eval.log")]
+    assert all(p.is_file() for p in staged)
 
     subprocess.run(["sh", "-c", reset_cmd], check=True)
     assert not (testbed / "r2e_tests").exists()
     assert "return a - b" in (testbed / "pkg" / "calc.py").read_text(encoding="utf-8")
+    assert not any(p.exists() for p in staged)  # the reset clears the staged payload too
+    assert archive.is_file()  # but keeps the hidden-test archive the next rollout restores
 
     # Step 2 proves archive reuse across steps mode rollouts.
     step2 = subprocess.run(["sh", "-c", grade_cmd], check=True, capture_output=True, text=True)
@@ -282,6 +294,7 @@ def test_build_r2e_commands_executes_setup_grade_reset_and_second_step(tmp_path)
         archive=str(archive),
         venv_bin=str(venv_bin),
         local_bin=str(local_bin),
+        system_bin=str(system_bin),
         work_dir=str(work_dir),
     )
     wrong = subprocess.run(
@@ -979,7 +992,6 @@ def test_run_r2e_swebench_dry_run_flags_and_validation(tmp_path):
 
 def test_build_r2e_commands_exceeding_linux_max_arg_strlen_executes_without_e2big(tmp_path):
     """Regression for E2BIG when expected_output_json + patch exceed Linux MAX_ARG_STRLEN (128 KiB)."""
-    import base64
     import errno
 
     testbed = tmp_path / "testbed"
@@ -1048,6 +1060,8 @@ def test_build_r2e_commands_exceeding_linux_max_arg_strlen_executes_without_e2bi
     subprocess.run(["git", "checkout", "--", "."], cwd=testbed, check=True)
     assert len(large_patch) > 150_000
 
+    system_bin = tmp_path / "system_bin"  # not the host's /usr/local/bin
+    system_bin.mkdir()
     setup_cmd, reset_cmd, grade_cmd = r2e.build_r2e_commands(
         large_patch,
         expected,
@@ -1056,8 +1070,10 @@ def test_build_r2e_commands_exceeding_linux_max_arg_strlen_executes_without_e2bi
         archive=str(archive),
         venv_bin=str(venv_bin),
         local_bin=str(local_bin),
+        system_bin=str(system_bin),
         work_dir=str(work_dir),
     )
+    assert "/usr/local/bin" not in setup_cmd
     assert len(grade_cmd.encode("utf-8")) > 400_000
 
     # Confirm an inline `sh -c <grade_cmd>` hits kernel E2BIG on Linux, whereas staging to
@@ -1079,28 +1095,15 @@ def test_build_r2e_commands_exceeding_linux_max_arg_strlen_executes_without_e2bi
     assert verdict == {"valid": True, "reward": 1, "detail": "matched 3500/3500 tests"}
 
     subprocess.run(["/bin/bash", "-c", reset_cmd], check=True)
+    assert not (work_dir / "r2e_expected.json").exists()
 
-    # Also verify _INLINE_GRADER base64 fallback when argv[2] exceeds NAME_MAX (255 bytes)
-    # without raising OSError(ENAMETOOLONG).
-    long_b64 = base64.b64encode(
-        json.dumps({f"test_case_{i:03d}": "PASSED" for i in range(40)}).encode("utf-8")
-    ).decode("ascii")
-    assert 300 < len(long_b64) < 65536
-    eval_log = tmp_path / "fallback.log"
-    eval_log.write_text(
-        "=== short test summary info ===\n"
-        + "\n".join(f"PASSED suite.py::test_case_{i:03d}" for i in range(40))
-        + "\n",
-        encoding="utf-8",
-    )
-    fb_res = subprocess.run(
-        [sys.executable, "-c", r2e._INLINE_GRADER, str(eval_log), long_b64],
-        check=True,
+    # The grader reads its expected map from the file path it is given and
+    # nothing else: a missing file is an error, not a base64 guess.
+    missing = subprocess.run(
+        [sys.executable, "-c", r2e._INLINE_GRADER, str(work_dir / "r2e_eval.log"), str(work_dir / "r2e_expected.json")],
+        check=False,
         capture_output=True,
         text=True,
     )
-    assert json.loads(fb_res.stdout.strip()) == {
-        "valid": True,
-        "reward": 1,
-        "detail": "matched 40/40 tests",
-    }
+    assert missing.returncode != 0
+    assert "FileNotFoundError" in missing.stderr

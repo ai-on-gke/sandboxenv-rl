@@ -49,7 +49,8 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
 resolve_one() {  # prints "<tag ref> <digest ref>"
   local ref="$1" name tag src dst digest
-  name="${ref%%:*}"; tag="${ref##*:}"; [ "$name" = "$ref" ] && tag=latest
+  # the tag colon is the one after the last slash; a registry host:port colon is not a tag
+  if [[ "${ref##*/}" == *:* ]]; then name="${ref%:*}"; tag="${ref##*:}"; else name="$ref"; tag=latest; fi
   if [ "$MODE" = "mirror" ]; then
     src="$ref"; dst="$REPO/$(echo "${name#docker.io/}" | sed "s|/|$SEP|g")"
     digest=$(crane digest "$src") || return 1
@@ -68,15 +69,16 @@ if [ "$MODE" = "hubapi" ]; then
 import collections, json, os, sys, time, urllib.parse, urllib.request
 refs = [l.strip() for l in open(sys.argv[1]) if l.strip() and not l.startswith("#")]
 repo, sep = sys.argv[2], sys.argv[3]
+def split_ref(ref):  # (name, tag); the tag colon follows the last slash, a registry host:port colon does not
+    name, _, tag = ref.rpartition(":") if ":" in ref.rsplit("/", 1)[-1] else (ref, "", "latest")
+    name = name.replace("docker.io/", "")
+    return ("library/" + name if "/" not in name else name), tag
 def dst(name):
     return f"{repo}/{name.removeprefix('library/').replace('/', sep)}"
 by_repo = collections.defaultdict(dict)
 for ref in refs:
-    name, _, tag = ref.rpartition(":")
-    name = name.replace("docker.io/", "")
-    if "/" not in name:
-        name = "library/" + name
-    by_repo[name][tag or "latest"] = ref
+    name, tag = split_ref(ref)
+    by_repo[name][tag] = ref
 def get(url, tries=8):
     for i in range(tries):
         try:
@@ -113,6 +115,10 @@ elif [ "$MODE" = "arapi" ]; then
 import json, os, sys
 refs = [l.strip() for l in open(sys.argv[1]) if l.strip() and not l.startswith("#")]
 repo, sep = sys.argv[2], sys.argv[3]
+def split_ref(ref):  # (name, tag); the tag colon follows the last slash, a registry host:port colon does not
+    name, _, tag = ref.rpartition(":") if ":" in ref.rsplit("/", 1)[-1] else (ref, "", "latest")
+    name = name.replace("docker.io/", "")
+    return ("library/" + name if "/" not in name else name), tag
 index = {}
 for img in json.load(open(sys.argv[4])):
     tags = img.get("tags") or []
@@ -122,12 +128,9 @@ for img in json.load(open(sys.argv[4])):
         index[(img["package"], t)] = img["version"]
 missing = 0
 for ref in refs:
-    name, _, tag = ref.rpartition(":")
-    name = name.replace("docker.io/", "")
-    if "/" not in name:
-        name = "library/" + name
+    name, tag = split_ref(ref)
     package = f"{repo}/{name.removeprefix('library/').replace('/', sep)}"
-    digest = index.get((package, tag or "latest"))
+    digest = index.get((package, tag))
     if digest:
         print(ref, f"{package}@{digest}")
     else:

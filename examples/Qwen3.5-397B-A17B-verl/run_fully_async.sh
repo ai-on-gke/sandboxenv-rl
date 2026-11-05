@@ -374,12 +374,13 @@ if [ "$ROLE" = "head" ] && [ "${DRY_RUN:-0}" != "1" ]; then
   # Same patience as the provider: a wake that misses the server's budget (pool busy) is retried on the same
   # environment up to SANDBOX_START_WAIT_S; anything else fails the launch before the model pull.
   python3 - "$ATE_ENV_ENDPOINT" "$ATE_TEMPLATE" "$PROBE_IMAGE" "$ACTOR_PREFIX" "$SANDBOX_START_WAIT_S" <<'PY'
-import asyncio, sys, time, uuid
+import asyncio, os, sys, time, uuid
 from ate_env import Client
 from ate_env.errors import EnvError
 endpoint, template, image, prefix, wait_s = sys.argv[1:6]
 async def probe():
-    c = Client(endpoint)
+    token = os.environ.get("SUBSTRATE_ENV_AUTH_TOKEN") or None   # the caller token ate-env-api may require (deploy.sh forwards it)
+    c = Client(endpoint, auth_token=token) if token else Client(endpoint)
     env = await c.create(f"{prefix}-probe-{uuid.uuid4().hex[:8]}", template_name=template, rootfs_image=image)
     t0 = time.monotonic(); attempt = 0
     try:
@@ -549,9 +550,11 @@ NCCL_IF=()
 # quoted: a comma-separated interface list (e.g. eth0,eth1) would otherwise be parsed by Hydra as a sweep
 [ -n "${NCCL_SOCKET_IFNAME:-}" ] && NCCL_IF+=("+ray_kwargs.ray_init.runtime_env.env_vars.NCCL_SOCKET_IFNAME='$NCCL_SOCKET_IFNAME'")
 [ -n "${GLOO_SOCKET_IFNAME:-}" ] && NCCL_IF+=("+ray_kwargs.ray_init.runtime_env.env_vars.GLOO_SOCKET_IFNAME='$GLOO_SOCKET_IFNAME'")
+AUTH_ENV=(); [ -n "${SUBSTRATE_ENV_AUTH_TOKEN:-}" ] && AUTH_ENV=("+ray_kwargs.ray_init.runtime_env.env_vars.SUBSTRATE_ENV_AUTH_TOKEN=$SUBSTRATE_ENV_AUTH_TOKEN")   # the provider reads it in every Ray worker
 cd /workspace/results   # not the uni-agent checkout: its docker/ folder would shadow the docker package for Ray workers
 OVERRIDES=(
   model_engine=megatron
+  "${AUTH_ENV[@]}"
   '+ray_kwargs.ray_init.runtime_env.env_vars.HF_HUB_OFFLINE="1"'
   "+ray_kwargs.ray_init.runtime_env.env_vars.SANDBOX_STARTUP_CONCURRENCY=\"$SANDBOX_STARTUP_CONCURRENCY\""   # quoted: Ray env vars must be strings
   "+ray_kwargs.ray_init.runtime_env.env_vars.SANDBOX_STARTUP_TIMEOUT=\"$((SANDBOX_START_WAIT_S + 600))\""     # uni-agent's per-start cap must cover the capacity wait

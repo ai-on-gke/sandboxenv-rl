@@ -58,7 +58,8 @@ spec:
         env:
         - {name: ROLE, value: "head"}
         - {name: NODE_WAIT_S, value: "3600"}
-        - {name: HF_TOKEN, valueFrom: {secretKeyRef: {name: hf-token, key: token, optional: true}}}
+        - {name: HF_TOKEN, valueFrom: {secretKeyRef: {name: __JOB__-hf-token, key: token, optional: true}}}
+        - {name: SUBSTRATE_ENV_AUTH_TOKEN, valueFrom: {secretKeyRef: {name: __JOB__-substrate-token, key: token, optional: true}}}
         - {name: ATE_ENV_ENDPOINT, value: "ate-env-api.ate-env.svc:7777"}
         - {name: ACTOR_PREFIX, value: "__ACTOR_PREFIX__"}     # environment id prefix: purge and probes stay scoped to this instance
         __GPU_EXTRA_ENV__
@@ -108,7 +109,8 @@ spec:
         env:
         - {name: ROLE, value: "worker"}
         - {name: RAY_HEAD_HOST, value: "__HEAD_SVC__.default.svc"}
-        - {name: HF_TOKEN, valueFrom: {secretKeyRef: {name: hf-token, key: token, optional: true}}}
+        - {name: HF_TOKEN, valueFrom: {secretKeyRef: {name: __JOB__-hf-token, key: token, optional: true}}}
+        - {name: SUBSTRATE_ENV_AUTH_TOKEN, valueFrom: {secretKeyRef: {name: __JOB__-substrate-token, key: token, optional: true}}}
         - {name: ATE_ENV_ENDPOINT, value: "ate-env-api.ate-env.svc:7777"}
         - {name: ACTOR_PREFIX, value: "__ACTOR_PREFIX__"}     # environment id prefix: purge and probes stay scoped to this instance
         __GPU_EXTRA_ENV__

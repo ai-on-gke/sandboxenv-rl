@@ -33,6 +33,7 @@
 #   IMAGES_JSON       tag -> digest map from integrations/uni-agent/scripts/resolve_images.sh (default ./images.json)
 #   KUBECTL_ATE       kubectl-ate binary; `up`/`down` delete leftover environments (actors ua-*)
 #   HF_TOKEN          optional, forwarded to the pods for model/dataset downloads
+#   SUBSTRATE_ENV_AUTH_TOKEN  optional bearer token for ate-env-api, forwarded to the pods (probe, provider in every Ray worker)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
@@ -109,8 +110,12 @@ up_job() {  # ConfigMaps: run script, task config, image map, the code the pods 
       --dry-run=client -o yaml | $K -n default apply --server-side --force-conflicts -f -   # server-side: no last-applied annotation (256 KiB cap) for the big payload
   profile_env > "$tmp/profile.env"
   $K -n default create configmap "$JOB-profile" --from-env-file="$tmp/profile.env" --dry-run=client -o yaml | $K -n default apply -f -
+  # secrets fed through stdin (not visible in ps), named after the Job so instances do not share them and `down` removes them
   if [ -n "${HF_TOKEN:-}" ]; then
-    $K -n default create secret generic hf-token --from-literal=token="$HF_TOKEN" --dry-run=client -o yaml | $K -n default apply -f -
+    printf '%s' "$HF_TOKEN" | $K -n default create secret generic "$JOB-hf-token" --from-file=token=/dev/stdin --dry-run=client -o yaml | $K -n default apply -f -
+  fi
+  if [ -n "${SUBSTRATE_ENV_AUTH_TOKEN:-}" ]; then
+    printf '%s' "$SUBSTRATE_ENV_AUTH_TOKEN" | $K -n default create secret generic "$JOB-substrate-token" --from-file=token=/dev/stdin --dry-run=client -o yaml | $K -n default apply -f -
   fi
   render_job | $K -n default apply -f -
 }
@@ -118,6 +123,7 @@ down() {
   $K -n default delete job "$JOB" "$JOB-worker" --ignore-not-found --wait=true
   $K -n default delete service "$HEAD_SVC" --ignore-not-found
   $K -n default delete configmap "$JOB" "$JOB-profile" --ignore-not-found
+  $K -n default delete secret "$JOB-hf-token" "$JOB-substrate-token" --ignore-not-found
   purge_envs
 }
 case "${1:-up}" in

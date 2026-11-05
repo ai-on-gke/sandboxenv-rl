@@ -167,6 +167,8 @@ func rerootCommand(command []string) ([]string, error) {
 			strings.Join(command, " "), GuestMountPath, guestBinaryName)
 	}
 	out := append([]string(nil), command...)
-	out[0] = path.Join(GuestMountPath, out[0])
+	// Clean first: path.Join would let a leading ".." cancel GuestMountPath
+	// ("/../ko-app/ate-env-guest" would become "/ko-app/ate-env-guest").
+	out[0] = path.Join(GuestMountPath, path.Clean(out[0]))
 	return out, nil
 }

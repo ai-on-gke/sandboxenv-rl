@@ -859,3 +859,132 @@ def test_run_r2e_swebench_dry_run_flags_and_validation(tmp_path):
         )
         assert bad_res.returncode == 2, f"expected rc=2 for {bad_flags}, got {bad_res.returncode}"
         assert want_msg in bad_res.stderr
+
+
+def test_build_r2e_commands_exceeding_linux_max_arg_strlen_executes_without_e2big(tmp_path):
+    """Regression for E2BIG when expected_output_json + patch exceed Linux MAX_ARG_STRLEN (128 KiB)."""
+    import base64
+    import errno
+
+    testbed = tmp_path / "testbed"
+    hidden = tmp_path / "r2e_tests"
+    archive = tmp_path / "work" / "r2e_tests.tar.gz"
+    venv_bin = testbed / ".venv" / "bin"
+    local_bin = tmp_path / "local_bin"
+    work_dir = tmp_path / "work"
+    work_dir.mkdir(parents=True)
+    venv_bin.mkdir(parents=True)
+    hidden.mkdir(parents=True)
+
+    # Create a large source file and >150 KiB unified diff patch.
+    orig_lines = ["def add(a, b):", "    return a - b"] + [
+        f"CONST_{i:04d} = {i}  # padding-line-for-large-gold-patch" for i in range(2600)
+    ]
+    (testbed / "pkg").mkdir(parents=True)
+    (testbed / "pkg" / "calc.py").write_text("\n".join(orig_lines) + "\n", encoding="utf-8")
+    (hidden / "check.py").write_text(
+        "import sys; sys.path.insert(0, '.')\nfrom pkg.calc import add\nassert add(4, 5) == 9\n",
+        encoding="utf-8",
+    )
+
+    # Build 3,500 test expectations (>220 KiB JSON -> >300 KiB base64, well over 131,072-byte MAX_ARG_STRLEN).
+    expected = {
+        f"numpy/core/tests/test_numeric_suite.py.TestLargeMatrixCase.test_variant_{i:04d}": "PASSED"
+        for i in range(3500)
+    }
+    summary_lines = "\n".join(
+        f"PASSED r2e_tests/test_suite.py::{tid.replace('.', '::', 1)}" for tid in expected
+    )
+    summary_file = tmp_path / "summary.txt"
+    summary_file.write_text(
+        f"=== short test summary info ===\n{summary_lines}\n",
+        encoding="utf-8",
+    )
+
+    run_tests = testbed / "run_tests.sh"
+    run_tests.write_text(
+        f"#!/usr/bin/env bash\nset -e\npython3 r2e_tests/check.py\ncat '{summary_file}'\n",
+        encoding="utf-8",
+    )
+    run_tests.chmod(0o755)
+
+    subprocess.run(["git", "init", "-q"], cwd=testbed, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@localhost", "-c", "user.name=t", "add", "-A"],
+        cwd=testbed,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.email=t@localhost", "-c", "user.name=t", "commit", "-q", "-m", "init"],
+        cwd=testbed,
+        check=True,
+    )
+
+    new_lines = ["def add(a, b):", "    return a + b"] + [
+        f"CONST_{i:04d} = {i + 1}  # updated-padding-line-for-large-gold-patch"
+        for i in range(2600)
+    ]
+    (testbed / "pkg" / "calc.py").write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    diff_proc = subprocess.run(
+        ["git", "diff"], cwd=testbed, check=True, capture_output=True, text=True
+    )
+    large_patch = diff_proc.stdout
+    subprocess.run(["git", "checkout", "--", "."], cwd=testbed, check=True)
+    assert len(large_patch) > 150_000
+
+    setup_cmd, reset_cmd, grade_cmd = r2e.build_r2e_commands(
+        large_patch,
+        expected,
+        testbed=str(testbed),
+        hidden_tests=str(hidden),
+        archive=str(archive),
+        venv_bin=str(venv_bin),
+        local_bin=str(local_bin),
+        work_dir=str(work_dir),
+    )
+    assert len(grade_cmd.encode("utf-8")) > 400_000
+
+    # Confirm an inline `sh -c <grade_cmd>` hits kernel E2BIG on Linux, whereas staging to
+    # /tmp/r2e-grade.sh (as r2e-gold.yaml does) runs both outer and inner processes cleanly.
+    if sys.platform == "linux":
+        with pytest.raises(OSError) as exc_info:
+            subprocess.run(["/bin/bash", "-c", grade_cmd], check=True)
+        assert exc_info.value.errno == errno.E2BIG
+
+    subprocess.run(["/bin/bash", "-c", setup_cmd], check=True)
+    staged_script = tmp_path / "r2e-grade.sh"
+    staged_script.write_text(grade_cmd, encoding="utf-8")
+    staged_script.chmod(0o755)
+
+    res = subprocess.run(
+        ["/bin/bash", str(staged_script)], check=True, capture_output=True, text=True
+    )
+    verdict = json.loads(res.stdout.strip())
+    assert verdict == {"valid": True, "reward": 1, "detail": "matched 3500/3500 tests"}
+
+    subprocess.run(["/bin/bash", "-c", reset_cmd], check=True)
+
+    # Also verify _INLINE_GRADER base64 fallback when argv[2] exceeds NAME_MAX (255 bytes)
+    # without raising OSError(ENAMETOOLONG).
+    long_b64 = base64.b64encode(
+        json.dumps({f"test_case_{i:03d}": "PASSED" for i in range(40)}).encode("utf-8")
+    ).decode("ascii")
+    assert 300 < len(long_b64) < 65536
+    eval_log = tmp_path / "fallback.log"
+    eval_log.write_text(
+        "=== short test summary info ===\n"
+        + "\n".join(f"PASSED suite.py::test_case_{i:03d}" for i in range(40))
+        + "\n",
+        encoding="utf-8",
+    )
+    fb_res = subprocess.run(
+        [sys.executable, "-c", r2e._INLINE_GRADER, str(eval_log), long_b64],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(fb_res.stdout.strip()) == {
+        "valid": True,
+        "reward": 1,
+        "detail": "matched 40/40 tests",
+    }

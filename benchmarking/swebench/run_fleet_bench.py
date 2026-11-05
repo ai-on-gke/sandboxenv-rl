@@ -32,7 +32,6 @@ import json
 import os
 import pathlib
 import re
-import shlex
 import signal
 import sys
 import threading
@@ -91,6 +90,8 @@ LOADER_LABEL_KEYS = frozenset({
 _DIGEST_RE = re.compile(r"@sha256:[0-9a-f]{64}$")
 _RUN_ID_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 _DURATION_TOKEN_RE = re.compile(r"(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)")
+# Keep inline sh -c arguments well under Linux MAX_ARG_STRLEN (131072 bytes).
+_MAX_INLINE_CMD_BYTES = 65536
 
 
 def parse_duration_s(raw: str) -> float:
@@ -379,6 +380,20 @@ def _load_standalone_plan(
                 raise ValueError(f"{iid}: command is required")
             setup_cmd = str(material.get("setup_command") or row.get("setup_command") or "true")
             reset_cmd = str(material.get("reset_command") or row.get("reset_command") or "true")
+            if len(cmd.encode("utf-8")) >= _MAX_INLINE_CMD_BYTES:
+                cmd_steps: list[dict[str, Any]] = [
+                    {
+                        "name": "write-grade",
+                        "write": {"path": "/tmp/ate-cmd-grade.sh", "content": cmd, "mode": "0755"},
+                    },
+                    {
+                        "name": "grade",
+                        "run": "/bin/bash /tmp/ate-cmd-grade.sh",
+                        "reward": True,
+                    },
+                ]
+            else:
+                cmd_steps = [{"name": "grade", "run": cmd, "reward": True}]
             rendered_instances.append({
                 "instance_id": iid,
                 "repo": str(row.get("repo") or ""),
@@ -388,7 +403,7 @@ def _load_standalone_plan(
                 "has_reward": True,
                 "setup": [{"name": "setup", "run": setup_cmd}],
                 "reset": [{"name": "reset", "run": reset_cmd}],
-                "steps": [{"name": "grade", "run": cmd, "reward": True}],
+                "steps": cmd_steps,
                 "expected_stdout": str(material.get("expected_stdout") or row.get("expected_stdout") or ""),
                 "expected_exit_code": int(material.get("expected_exit_code", row.get("expected_exit_code", 0)) or 0),
             })
@@ -444,12 +459,24 @@ def _load_standalone_plan(
                         "write": {"path": "/tmp/ate-eval.sh", "content": eval_script, "mode": "0755"},
                     },
                     {
+                        "name": "run-tests",
+                        "run": "/bin/bash /tmp/ate-eval.sh > /tmp/ate-eval.log 2>&1 || true",
+                        "timeout_s": 1200.0,
+                    },
+                    {
                         "name": "write-grader",
                         "write": {"path": "/tmp/ate-grade.py", "content": grader_script, "mode": "0755"},
                     },
                     {
+                        "name": "write-instance",
+                        "write": {"path": "/tmp/ate-instance.json", "content": spec_json, "mode": "0644"},
+                    },
+                    {
                         "name": "grade",
-                        "run": f"python3 /tmp/ate-grade.py /tmp/ate-eval.sh {shlex.quote(spec_json)}",
+                        "run": (
+                            'PY=/opt/miniconda3/bin/python; [ -x "$PY" ] || PY=python3; '
+                            '"$PY" /tmp/ate-grade.py /tmp/ate-instance.json /tmp/ate-eval.log'
+                        ),
                         "reward": True,
                     },
                 ],

@@ -100,7 +100,9 @@ applied) select the base:
    wait for the guest to answer, learn the image's user, create the working
    directory when the image lacks it, upload `environment/` for prebuilt-image
    tasks, and write `trial_dir/ate_env.json` (environment id, atespace,
-   template, image digest, session and context ids; never the token).
+   template, image digest, session and context ids; never the token). A verifier that Harbor runs in a separate environment
+   (`[verifier] environment_mode = "separate"`) records its own environment in
+   `trial_dir/ate_env.verifier.<step>.json`, so the agent's record is kept.
 2. `exec`: `sh -c <command>` through the guest, with the working directory
    from the call, the task, the Dockerfile's `WORKDIR` or the kwarg, in that
    order. At `timeout_sec` (or `exec_timeout_sec` when Harbor passes none) the
@@ -148,7 +150,8 @@ builds a static tmux and asciinema layer and runs Terminal-Bench with it.
 - No run-as-user in the guest: see `exec` above.
 - No host mounts, no SSH stream mode, no `attach` (the error names the CLI
   command instead).
-- No labels on environments: the mapping to Harbor's ids is in `ate_env.json`.
+- No labels on environments: the mapping to Harbor's ids is in `ate_env.json`
+  (and `ate_env.verifier.<step>.json` for a separate verifier environment).
 
 ## Tests
 

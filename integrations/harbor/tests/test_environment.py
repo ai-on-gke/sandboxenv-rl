@@ -88,14 +88,47 @@ async def test_separate_verifier_environment_keeps_its_own_record(fake, make_env
     await agent.start(force_build=False)
     await verifier.start(force_build=False)
     try:
-        assert agent.record_file == "ate_env.json" and verifier.record_file == "ate_env.verifier.json"
+        assert agent.record_file == "ate_env.json" and verifier.record_file == "ate_env.verifier.trial.json"
         a = json.loads((paths.trial_dir / "ate_env.json").read_text())
-        v = json.loads((paths.trial_dir / "ate_env.verifier.json").read_text())
+        v = json.loads((paths.trial_dir / "ate_env.verifier.trial.json").read_text())
         assert (a["id"], a["session_id"]) == (agent.env_id, "echo__AbCdEf__env")
         assert (v["id"], v["session_id"]) == (verifier.env_id, "echo__AbCdEf__verifier__trial")
     finally:
         await agent.stop(delete=True)
         await verifier.stop(delete=True)
+
+
+def test_record_file_survives_harbor_truncation_and_multi_step_verifiers(fake, make_env, tmp_path):
+    # Harbor 0.25 truncates a separate verifier's session id to 63 characters:
+    # safe[:53] + "__" + sha1[:8] (trial.py, _separate_verifier_session_id),
+    # which cuts "__verifier__" off for trial names of 42 characters or more.
+    import hashlib
+
+    from harbor.models.trial.paths import TrialPaths
+
+    trial_name = "swebench-verified-django-django-16379__aBcDeFg"  # 47 characters
+    assert len(trial_name) >= 42
+    paths = TrialPaths(trial_dir=tmp_path / trial_name)
+    paths.mkdir()
+
+    def verifier_session(key: str) -> str:
+        raw = f"{trial_name}__verifier__{key}"
+        safe = "".join(c if c.isalnum() or c in "-._" else "_" for c in raw)
+        return safe if len(safe) <= 63 else safe[:53] + "__" + hashlib.sha1(raw.encode()).hexdigest()[:8]
+
+    agent = make_env(session_id=f"{trial_name}__env")
+    step_a = make_env(session_id=verifier_session("grade"))
+    step_b = make_env(session_id=verifier_session("lint"))
+    for env in (agent, step_a, step_b):
+        env.trial_paths = paths
+    assert "__verifier__" not in step_a.session_id  # the marker is cut off
+    assert agent.record_file == "ate_env.json"
+    assert step_a.record_file.startswith("ate_env.verifier.") and step_a.record_file.endswith(".json")
+    assert step_a.record_file != step_b.record_file != agent.record_file
+    # A short trial name keeps the step name readable.
+    short = make_env(session_id="echo__AbCdEf__verifier__grade")
+    short.trial_paths = TrialPaths(trial_dir=tmp_path / "echo__AbCdEf")
+    assert short.record_file == "ate_env.verifier.grade.json"
 
 
 async def test_environment_dir_is_uploaded_to_the_workdir(fake, make_env):

@@ -6,7 +6,7 @@ confirms them and records changes in [decisions.md](./decisions.md).
 ## Bucket layout
 
 ```
-gs://<bucket>/v1/inventory/<project>/<cluster>/latest.json          overwritten every interval
+gs://<bucket>/v1/inventory/<project>/<cluster>/latest.json          rewritten every interval by that cluster's reporter, its only writer
 gs://<bucket>/v1/snapshots/<project>/<cluster>/<ts>.json            hourly, lifecycle 30 days (its own prefix, so no rule can touch latest.json)
 gs://<bucket>/v1/events/<dt=YYYY-MM-DD>/...                          Cloud Storage subscription output, lifecycle 400 days
 gs://<bucket>/v1/traces/<year>/<month>/<day>/...                     google_cloud_storage exporter output, gzip

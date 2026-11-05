@@ -58,11 +58,12 @@ Per cluster, applied by `ate-env manifest` or the fleet's Config Sync repository
   components keep the managed collector for traces and metrics; in phase 2 only `ate-api-server`'s
   logs go to this collector, through `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`.
 - Reporter: `cmd/ate-env-reporter`, a single-replica Deployment in its own namespace labeled
-  `ate.dev/api-access=true`, reusing `internal/ate` to dial `ateapi`. It writes `latest.json` every
-  interval and an hourly snapshot. Workload Identity to a service account with
-  `roles/storage.objectCreator` on the bucket; a global AccessPolicy with the `viewer` role; a
-  ClusterRole with `get`, `list`, `watch` on WorkerPools, SandboxConfigs, Deployments, Services and
-  Pods.
+  `ate.dev/api-access=true`, reusing `internal/ate` to dial `ateapi`. It rewrites `latest.json`
+  every interval and adds an hourly snapshot. Workload Identity to a service account with
+  `roles/storage.objectUser` on the bucket, restricted by an IAM condition to that cluster's
+  `v1/inventory/` and `v1/snapshots/` prefixes (an overwrite needs `storage.objects.delete`, which
+  `objectCreator` lacks); a global AccessPolicy with the `viewer` role; a ClusterRole with `get`,
+  `list`, `watch` on WorkerPools, SandboxConfigs, Deployments, Services and Pods.
 - PodMonitoring for `ate-env-api`'s metrics port, rendered by `ate-env manifest --metrics-port`.
 - Substrate configuration: `OTEL_LOGS_EXPORTER=otlp,console` and `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`
   on the `ate-api-server` Deployment (phase 2; not in the shared `ate-otel-config`, because the
@@ -107,8 +108,12 @@ intervals, which doubles as reporter health.
 ## Security
 
 - Read-only is enforced by IAM rather than by code: the site's service account has viewer roles
-  only, the reporter's has `objectCreator` on one bucket and `viewer` in Substrate, the collector's
-  has `pubsub.publisher`, `storage.objectCreator` and `cloudtrace.agent`.
+  only, the reporter's has `storage.objectUser` under an IAM condition on its own two prefixes of
+  one bucket and `viewer` in Substrate, the collector's has `pubsub.publisher`,
+  `storage.objectCreator` and `cloudtrace.agent`.
+- A compromised reporter can overwrite or delete only its own cluster's `latest.json` and hourly
+  snapshots. The event archive under `v1/events/` and the BigQuery table are written by Pub/Sub,
+  outside every reporter's prefixes, and keep the transition history.
 - The metrics listeners of `ate-env-api` and the guest have no authentication and stay
   cluster-internal; only the in-cluster collectors scrape them.
 - Snapshots and events carry atespace names, template names, image references and run ids, never

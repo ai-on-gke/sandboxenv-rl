@@ -94,8 +94,9 @@ SQL
 bq --project_id "$CENTRAL_PROJECT" query --use_legacy_sql=false < /tmp/actor_events_v.sql
 ```
 
-Phase 1 writes the raw log entry into `data`; the site parses the `ate.*` keys from it. The typed
-columns in [interfaces.md](./interfaces.md) arrive with the phase 2 topic schema.
+Phase 1 writes the Cloud Logging entry into `data`, and the view above projects the typed columns of
+[interfaces.md](./interfaces.md) from it. Phase 2 writes the OTLP log record into the same column
+and adds a second branch to the view for that shape.
 
 Service accounts and their only roles:
 
@@ -146,8 +147,9 @@ gcloud projects add-iam-policy-binding "$CLUSTER_PROJECT" --member "serviceAccou
 
 The reporter writes under two prefixes of its own cluster. Overwriting `latest.json` needs
 `storage.objects.delete` as well as `storage.objects.create`, so the grant is
-`roles/storage.objectUser` with an IAM condition on those prefixes (uniform bucket-level access
-allows conditions; the Terraform can tighten this to a custom role with the two permissions):
+`roles/storage.objectUser` with an IAM condition on those prefixes. The condition needs the uniform
+bucket-level access that section 1 sets; the Terraform can tighten the role to a custom one with the
+two permissions:
 
 ```bash
 gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "serviceAccount:ate-env-reporter@$P" \
@@ -172,7 +174,10 @@ In the cluster, after the components exist:
   atespaces is allowed. Verify the role on one atespace first (phase 0 of the execution plan).
 - Check:
   `gcloud storage cat "gs://$BUCKET/v1/inventory/$CLUSTER_PROJECT/$CLUSTER/latest.json" | head`
-  shows `generated_at` within one interval of now.
+  shows `generated_at` within one interval of now, and
+  `gcloud storage objects describe "gs://$BUCKET/v1/inventory/$CLUSTER_PROJECT/$CLUSTER/latest.json" --format 'value(generation)'`
+  returns a new value one interval later. A grant without `storage.objects.delete` passes the first
+  write and fails the second with HTTP 403.
 
 ## 3. The site, once (after PR 4)
 

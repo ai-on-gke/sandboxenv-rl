@@ -59,7 +59,14 @@ Append-only. Each entry: date, who, what, why.
   `roles/storage.objectUser` under an IAM condition for its own two prefixes, because an overwrite
   of `latest.json` needs `storage.objects.delete`, which `objectCreator` lacks. The reporter
   rewrites `latest.json` on every tick, so the object generation moves with `generated_at` and the
-  site's revalidation holds; the metadata-only write is gone.
+  site's revalidation holds; the metadata-only write is gone. The alternative, keeping
+  `objectCreator` and writing an immutable object per tick that the site finds by listing, was
+  rejected: at a 5 s interval that is 17,280 objects per cluster per day, a list per cluster on
+  every request and a lifecycle rule under `v1/inventory/`, where the plan keeps one `latest.json`
+  per cluster with the hourly snapshots as its history. The cost of `objectUser` is that the
+  reporter can also delete its own cluster's snapshots. The condition limits that to its two
+  prefixes, the event archive is outside them, and the Terraform can replace `objectUser` with a
+  custom role of `storage.objects.create` and `storage.objects.delete`.
 - 2026-11-05, orchestrator, same review: the BigQuery subscription uses no topic schema. `data` is a
   JSON column with the raw payload, and the typed columns are a view projected with `JSON_VALUE`,
   because a topic schema maps top-level fields only and cannot flatten a `LogEntry` or an OTLP

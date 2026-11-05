@@ -256,14 +256,15 @@ Copy [`./REPORT_TEMPLATE.md`](./REPORT_TEMPLATE.md) to `$ARTIFACT_DIR/BENCHMARK_
      -dest "${ARTIFACT_DIR}"
    ```
 2. **Populate the headline summary, concurrency, workload parameters, and command
-   (`## Headline Outcome & Time Attribution Summary` and `## 2`)**: Record the key numbers bullet
-   (`Max concurrency observed` via `steps[].active_sandboxes` vs configured `--concurrency` and
-   `standing_pool_size` / `peak_parked_sandboxes`, `TTFI start` `p50/p90` via `0 ms` warm-pool hit
-   or `custom_metrics.wire_claim_to_ready_ms`, and `Time to restore p50/p90` via
-   `restores.{first,wakes}.phases[total]`), start footing (`cold boot`, `cold restore`,
-   `warm restore`, or `wake`), headline time attribution across `Go`/`Python`/`ate` infra/LLM
-   think/guest workload, workload parameters, and exact `prewarm` and `run-r2e-swebench.sh`
-   commands.
+   (`## Headline Outcome & Time Attribution Summary` and `## 2`)**: Keep the `Key numbers` headline
+   bullet concise with single summed `p50 / p90` values (`Max concurrency observed` via
+   `steps[].active_sandboxes`, `TTFI start` `p50 / p90` via `0 ms` warm-pool hit + summed `prewarm`
+   or `custom_metrics.wire_claim_to_ready_ms`, and `Time to restore p50 / p90` via
+   `restores.{first,wakes}.phases[total]`), leaving the `create` vs `suspend`, wire-hop, and
+   per-phase/per-arm breakdown to Sections `3.1`–`3.4`; also record start footing (`cold boot`,
+   `cold restore`, `warm restore`, or `wake`), headline time attribution across `Go`/`Python`/`ate`
+   infra/LLM think/guest workload, workload parameters, and exact `prewarm` and
+   `run-r2e-swebench.sh` commands.
 3. **Populate results and findings (`## 3` and `## 4`)**: Fill the multi-arm table (`3.1`) from
    `comparison.json` / `comparison.md`, per-arm `report.json`, and `{r2e,swe}-summary.json` (with
    explicit `ms` vs `s` units and per-shard `r2e`/`swe` `TTFC`/`Wake`), decompose where time is

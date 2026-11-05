@@ -21,20 +21,13 @@ version tables from `system_description.json` (`bench measure -k8s`) and the pre
 
 > [!IMPORTANT]
 >
-> - **Key numbers (`<reference-arm>`)**:
+> - **Key numbers (`<reference-arm>`; drill-down in Sections `3.1`–`3.4`)**:
 >   - **Max concurrency observed**: `<active_sandboxes>` concurrent in-flight sandboxes
->     (`steps[].active_sandboxes`, vs `<max_concurrent>` configured: `r2e=<r2e_width>`,
->     `swe=<swe_width>`, `<per_node_concurrency>` active/node, and `standing_pool_size=<n>` /
->     `peak_parked_sandboxes=<n>`).
->   - **`TTFI` start** (claim start -> sandbox handle ready / 1st cmd issued):
->     `<ttfi_start_p50> / <ttfi_start_p90> ms` (`0 ms` in-band on `100%` warm-pool hits after
->     upfront `create` `<create_p50>/<create_p90> ms` + `suspend` `<suspend_p50>/<suspend_p90> ms`;
->     `<claim_p50> / <claim_p90> ms` `p50/p90` in-band on `none` via
->     `custom_metrics.wire_claim_to_ready_ms`).
->   - **Time to restore (`p50 / p90`)**: `<restore_total_p50> / <restore_total_p90> ms` in `atelet`
->     (`restores.{first,wakes}.phases[total]`, `worker_restore` `<wr_p50> / <wr_p90> ms`;
->     `~<infra_wake_p50> / <infra_wake_p90> ms` client-observed wake-to-ready including
->     `~<wire_p50> / <wire_p90> ms` gRPC wire hop).
+>     (`standing_pool=<n>`).
+>   - **`TTFI` start** (claim start -> sandbox handle ready / 1st cmd issued, `p50 / p90`):
+>     `<ttfi_start_p50> / <ttfi_start_p90> ms` (`<prewarm_p50> / <prewarm_p90> ms` summed upfront
+>     prewarm when `0 ms` warm-pool hit).
+>   - **Time to restore (`p50 / p90`)**: `<restore_total_p50> / <restore_total_p90> ms` in `atelet`.
 > - **Workload, cache footing, and reward**: `<tasks>` rollouts across `<distinct_images>` distinct
 >   images (`<r2e_images>` R2E-Gym + `<swe_images>` SWE-bench),
 >   `<cold boot | cold restore | warm restore | wake>` (goldens `<pre-baked | baked in-band>`,

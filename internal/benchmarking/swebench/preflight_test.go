@@ -376,11 +376,29 @@ func TestPreflightSubsetsAndValidation(t *testing.T) {
 		t.Errorf("subset report = %+v", report)
 	}
 	// A domain subset drops the images no selected domain holds, so the
-	// pass does not wait for goldens it does not use.
+	// pass does not wait for goldens it does not use. Its probe names still
+	// carry the domain's index in the plan, so parallel -domains passes
+	// sharing the default -run-id do not collide on pf-0-....
+	apiD0 := newPreflightFake()
+	if _, err, _ := runPreflight(t, apiD0, func(o *PreflightOptions) { o.RunID = ""; o.Domains = []string{"d0"} }); err != nil {
+		t.Fatalf("d0 only: %v", err)
+	}
 	api = newPreflightFake()
-	report, err, _ = runPreflight(t, api, func(o *PreflightOptions) { o.Domains = []string{"d1"} })
+	report, err, _ = runPreflight(t, api, func(o *PreflightOptions) { o.RunID = ""; o.Domains = []string{"d1"} })
 	if err != nil || !report.Complete || len(report.Goldens) != 1 || report.Goldens[0].Image != pfImgB {
 		t.Errorf("d1 only: err=%v goldens=%+v, want b alone", err, report.Goldens)
+	}
+	d0Names := map[string]bool{}
+	for _, id := range apiD0.created {
+		d0Names[id] = true
+	}
+	for _, id := range api.created {
+		if !strings.HasPrefix(id, "pf-1-") {
+			t.Errorf("d1 probe id = %q, want plan domain index 1 (pf-1-...)", id)
+		}
+		if d0Names[id] {
+			t.Errorf("d1 probe id %q collides with d0 pass", id)
+		}
 	}
 	for _, bad := range []func(*PreflightOptions){
 		func(o *PreflightOptions) { o.Images = []string{pfImgC} },
@@ -395,5 +413,36 @@ func TestPreflightSubsetsAndValidation(t *testing.T) {
 		if _, err := NewPreflightWarmer(opts); err == nil {
 			t.Error("NewPreflightWarmer accepted an invalid option")
 		}
+	}
+}
+
+func TestPreflightRetriesTransientFirstCommand(t *testing.T) {
+	api := newPreflightFake()
+	api.goldenReadyAfter = 0
+	api.unavailableStarts = 3
+	report, err, _ := runPreflight(t, api, func(o *PreflightOptions) {
+		o.Images = []string{pfImgA}
+		o.Domains = []string{"d0"}
+		o.wakeBackoff = time.Millisecond
+	})
+	if err != nil || !report.Complete {
+		t.Fatalf("transient StartProcess Unavailable: err=%v complete=%v", err, report.Complete)
+	}
+	if ic := report.Domains[0].Images[0]; ic.Rounds != 1 || ic.Failed != 0 {
+		t.Errorf("coverage after transient wake retries = %+v, want 1 round and 0 failed", ic)
+	}
+
+	// A non-zero exit from the probe command fails the probe instead of
+	// counting the node as covered.
+	api = newPreflightFake()
+	api.goldenReadyAfter = 0
+	api.exitCode = 1
+	report, err, _ = runPreflight(t, api, func(o *PreflightOptions) {
+		o.Images = []string{pfImgA}
+		o.Domains = []string{"d0"}
+		o.MaxRounds = 1
+	})
+	if err == nil || report.Complete {
+		t.Fatalf("non-zero probe exit: err=%v complete=%v, want failure", err, report.Complete)
 	}
 }

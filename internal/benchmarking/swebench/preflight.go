@@ -71,7 +71,8 @@ type PreflightOptions struct {
 	// once; default 8.
 	EnsureWidth int
 
-	now func() time.Time
+	now         func() time.Time
+	wakeBackoff time.Duration
 }
 
 // PreflightWarmer fills the node caches an image placement plan describes.
@@ -127,6 +128,9 @@ func NewPreflightWarmer(opts PreflightOptions) (*PreflightWarmer, error) {
 	}
 	if opts.now == nil {
 		opts.now = time.Now
+	}
+	if opts.wakeBackoff <= 0 {
+		opts.wakeBackoff = DefaultWakeBackoff
 	}
 	for _, name := range opts.Domains {
 		if opts.Plan.Domain(name) == nil {
@@ -234,6 +238,15 @@ func (w *PreflightWarmer) domains() []schema.PlacementDomain {
 		}
 	}
 	return out
+}
+
+func (w *PreflightWarmer) domainIndex(name string) int {
+	for i, d := range w.opts.Plan.Domains {
+		if d.Name == name {
+			return i
+		}
+	}
+	return 0
 }
 
 // imageWidth is how many images the domain warms at once.
@@ -436,6 +449,7 @@ func (w *PreflightWarmer) cover(ctx context.Context, domains []schema.PlacementD
 	results := make([]schema.DomainCoverage, len(domains))
 	forEach(ctx, len(domains), len(domains), func(di int) {
 		d := domains[di]
+		planDI := w.domainIndex(d.Name)
 		type item struct {
 			index int
 			image string
@@ -484,7 +498,7 @@ func (w *PreflightWarmer) cover(ctx context.Context, domains []schema.PlacementD
 			go func(k int, it item) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				covs[k] = w.coverImage(ctx, di, it.index, d, it.image)
+				covs[k] = w.coverImage(ctx, planDI, it.index, d, it.image)
 				ran[k] = true
 			}(pick, items[pick])
 		}
@@ -549,7 +563,7 @@ func (w *PreflightWarmer) coverImage(ctx context.Context, di, ii int, d schema.P
 			if err == nil {
 				// The first command returns once the restore finished: the
 				// layers and the golden snapshot are on the node by then.
-				if _, rerr := sb.Run(pctx, "true", o.ProbeTimeout); rerr != nil {
+				if rerr := w.runProbe(pctx, sb); rerr != nil {
 					err = fmt.Errorf("first command: %w", rerr)
 				} else if node, err = o.Backend.Node(pctx, id); err == nil && node == "" {
 					err = errors.New("the environment reports no node")
@@ -594,6 +608,35 @@ func (w *PreflightWarmer) coverImage(ctx context.Context, di, ii int, d schema.P
 		_ = o.Recorder.Flush()
 	}
 	return ic
+}
+
+// runProbe runs the probe's first command, retrying transient wake or bake
+// errors inside ctx with DefaultWakeBackoff the way doStep does: a cold pull
+// or golden restore that exceeds one router forward timeout answers
+// Unavailable or Unknown while ctx still has budget left.
+func (w *PreflightWarmer) runProbe(ctx context.Context, sb Sandbox) error {
+	wait := w.opts.wakeBackoff
+	for {
+		res, err := sb.Run(ctx, "true", w.opts.ProbeTimeout)
+		if err == nil {
+			if res.ExitCode != 0 {
+				return fmt.Errorf("exit %d", res.ExitCode)
+			}
+			return nil
+		}
+		if !isTransient(err) || ctx.Err() != nil {
+			return err
+		}
+		if dl, ok := ctx.Deadline(); ok && time.Now().Add(wait).After(dl) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(wait):
+		}
+		wait = min(wait*2, 5*w.opts.wakeBackoff)
+	}
 }
 
 // probeID names a probe environment: short, Substrate-valid, unique per

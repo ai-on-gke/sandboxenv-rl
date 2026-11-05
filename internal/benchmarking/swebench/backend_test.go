@@ -53,11 +53,13 @@ type fakeAPI struct {
 
 	mu sync.Mutex
 	// pollsUntilExit is how many GetProcess calls a process stays running;
-	// unavailablePolls is how many GetProcess calls answer Unavailable first.
-	pollsUntilExit   int
-	unavailablePolls int
-	exitCode         int32
-	stdout, stderr   string
+	// unavailableStarts and unavailablePolls are how many StartProcess or
+	// GetProcess calls answer Unavailable first.
+	pollsUntilExit    int
+	unavailableStarts int
+	unavailablePolls  int
+	exitCode          int32
+	stdout, stderr    string
 
 	nextID    int
 	polls     map[string]int
@@ -194,6 +196,10 @@ func (f *fakeAPI) DeleteEnvironment(_ context.Context, req *ateenvv1alpha.Delete
 func (f *fakeAPI) StartProcess(_ context.Context, req *ateenvv1alpha.StartProcessRequest) (*ateenvv1alpha.Process, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.unavailableStarts > 0 {
+		f.unavailableStarts--
+		return nil, status.Error(codes.Unavailable, "router: wake timed out")
+	}
 	f.nextID++
 	id := fmt.Sprintf("p%d", f.nextID)
 	f.commands = append(f.commands, strings.Join(req.GetCommand(), " "))

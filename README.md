@@ -11,10 +11,11 @@ learning (RL) trainers, evaluation harnesses, and agent frameworks on
 of sandboxes over gRPC, HTTP/MCP, or the Python and Go SDKs with no direct Kubernetes management.
 
 Each environment is an isolated gVisor actor running `ate-env-guest`, which executes commands,
-streams output, transfers files, and exposes local TCP ports. Between rollout or generation steps,
-`ate-env-api` suspends the environment to a checkpoint snapshot (releasing worker compute) and
-resumes it on the next call, while new environments on an image restore a golden snapshot from
-object storage (`gs://`) to skip a cold boot.
+streams output, and transfers files, and the port proxy on `ate-env-api` reaches any TCP port
+inside the actor through the router. Between steps a caller suspends the environment
+(`SuspendEnvironment`) to a checkpoint snapshot, which frees the worker. The next guest call
+resumes it, and new environments on a derived template restore its golden snapshot from object
+storage (`gs://`) to skip a cold boot.
 
 ## Feature tour
 
@@ -23,9 +24,9 @@ object storage (`gs://`) to skip a cold boot.
   strategies (`none`, `naive`, `sliding`, `pipelined`), and per-image worker scheduling via
   `FleetConfig.placement` and `node_selector`.
 - **Any task image** ([docs/rootfs-images](./docs/rootfs-images/README.md)): Passing a
-  digest-pinned `rootfs_image` causes `ate-env-api` to derive an `ActorTemplate` from
-  `default-template`, mount `ate-env-guest` as an image volume, and cache one golden snapshot per
-  image digest while leaving the container image unmodified.
+  digest-pinned `rootfs_image` causes `ate-env-api` to derive an `ActorTemplate` from the
+  request's template (`default-template` by default), mount `ate-env-guest` as an image volume, and
+  cache one golden snapshot per derived template while leaving the container image unmodified.
 - **Suspend modes and parking** ([docs/architecture.md](./docs/architecture.md)):
   `SuspendEnvironment` supports `SUSPEND_MODE_DURABLE` (waiting for object storage via
   `DURABILITY_MODE_SYNCHRONOUS`) and `SUSPEND_MODE_LOCAL` (`SuspendLocal` in Go, returning once
@@ -994,7 +995,8 @@ kubectl ate delete atespace ate-env
 
 ## Origin
 
-This repository started in October 2026 from [agent-substrate/env](https://github.com/agent-substrate/env)
-with its git history and open issues (recreated here with an `[env#N]` title prefix). The components
-keep the `ate-env`, `ate-env-api`, and `ate-env-guest` names, the `ate_env_rl` Python package, the
+This repository started in October 2026 from
+[agent-substrate/env](https://github.com/agent-substrate/env) with its git history, its pull
+requests (recreated here with an `[env#N]` title prefix) and its open issues. The components keep
+the `ate-env`, `ate-env-api`, and `ate-env-guest` names, the `ate_env_rl` Python package, the
 `ateenv.v1alpha` API, and the `github.com/agent-substrate/env` Go module path.

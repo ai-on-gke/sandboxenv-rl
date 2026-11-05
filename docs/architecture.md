@@ -1,6 +1,6 @@
 # sandboxenv-rl architecture
 
-Status: describes `main` at `ae29368`. Re-check the claims in §Components when `internal/ate` or
+Status: describes `main` at `b815e71`. Re-check the claims in §Components when `internal/ate` or
 `internal/apiservice` changes. Companion to [README.md](../README.md) (how to use it) and
 [docs/glossary.md](./glossary.md).
 

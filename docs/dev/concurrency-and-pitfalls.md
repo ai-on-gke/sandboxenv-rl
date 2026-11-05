@@ -78,7 +78,7 @@ Verify readiness within wake budgets, fail fast on unrecoverable errors, and evi
 ### 6. Idempotent derived `ActorTemplate` creation and failed golden-snapshot recovery
 
 Serialize derived template creation and recovery with `imageTemplateLocks`, and treat
-`codes.AlreadyExists` as success.
+`codes.AlreadyExists` as success after the same-digest check on the winner.
 
 - **Location**: `internal/apiservice/imagetemplate.go` (`DeriveImageTemplate`),
   `internal/apiservice/templaterecover.go` (`imageTemplateLocks`, `imageTemplateLock`,
@@ -91,9 +91,9 @@ Serialize derived template creation and recovery with `imageTemplateLocks`, and 
 - **Mechanism**: `ensureImageTemplate` holds a per-template read lock (`imageTemplateLocks`) through
   `CreateActor`. `getOrCreateImageTemplate` reuses an existing template when `sameImageDigest`
   matches across repository paths, returns `codes.FailedPrecondition` on mismatch, and treats
-  `codes.AlreadyExists` as success. When a golden snapshot failed at least
-  `failedTemplateRecreateAfter` (10 minutes) ago, `ensureImageTemplate` upgrades to the write lock
-  and calls `recreateFailedImageTemplate` to verify zero `templateUsers` and recreate by UID.
+  `codes.AlreadyExists` as success after the same-digest check on the winner. If a golden snapshot
+  failed `>= failedTemplateRecreateAfter` (10m) ago, `ensureImageTemplate` upgrades to a write lock
+  and calls `recreateFailedImageTemplate` (checking zero `templateUsers`) to recreate by UID.
 
 ## Client connection pooling and event loops
 

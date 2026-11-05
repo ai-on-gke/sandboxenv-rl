@@ -77,7 +77,7 @@ Select the client and API chain with `--client` (or `--chain`):
 - `go-direct`: `swebench-loader -backend=substrate -access=direct` -> `DirectSubstrateBackend`
   (`internal/ate.Client`) -> Substrate `ateapi` and `atenet-router`, bypassing `ate-env-api`.
 - `python`: [`../run_fleet_bench.py`](../run_fleet_bench.py) (fed rendered trajectory plans from
-  `swebench-loader render-plan`) -> Python `SandboxFleet` (`SubstrateBackendDriver` +
+  `swebench-loader render-plan`) -> Python `ate_env_rl` `SandboxFleet` (`SubstrateBackendDriver` +
   `SubstrateEnvClientRuntime`) -> `ate-env-api` -> Substrate.
 - `all`: sweeps `go` and `python`, and includes `go-direct` automatically when `--control-addr` (or
   `CONTROL_ADDR`) is set.
@@ -204,7 +204,7 @@ SAMPLE_CACHE=1 HARVEST_RESTORES=1 \
 Common parameter variations:
 
 - **Sweep all 4 strategies on the Go API chain only**: pass `--client go --strategy all`.
-- **Test the `ate-env-api` + Python `SandboxFleet` chain on `pipelined`**: pass
+- **Test the `ate-env-api` + Python `ate_env_rl` `SandboxFleet` chain on `pipelined`**: pass
   `--client python --strategy pipelined --window-size 6`.
 - **Include the direct Go Substrate chain (`go-direct`)**: pass
   `--client go-direct --control-addr api.ate-system.svc.cluster.local:443 --atenet-client-cert /path/to/bundle.pem --atenet-ca-file /path/to/ca.pem --ateapi-token-file /path/to/token`
@@ -244,19 +244,28 @@ top-level comparison artifacts land at `$ARTIFACT_DIR/`:
 Copy [`./REPORT_TEMPLATE.md`](./REPORT_TEMPLATE.md) to `$ARTIFACT_DIR/BENCHMARK_REPORT.md` so
 `report.md` and `comparison.md` stay intact, then fill every section:
 
-1. **Capture `system_description.json`**: Run `bench measure -k8s` once into `$ARTIFACT_DIR` to
-   record cluster name, node pools, Kubernetes and Substrate versions, `WorkerPool` capacity, and
-   `sandboxenv-rl` commit:
+1. **Capture `system_description.json` and cluster / version specs (`## 1`)**: Run
+   `bench measure -k8s` once into `$ARTIFACT_DIR` and combine it with the pre-run checks in
+   [`../SKILL.md`](../SKILL.md) to record the cluster spec (`1.1`), node pool spec (`1.2`: machine
+   type, CPU family, boot disk, labels, and taints), and `ate` (Substrate) and `ate-env`
+   (`sandboxenv-rl`) versions and settings (`1.3`):
    ```bash
    go -C "${ENV_REPO}" run ./cmd/benchmarking/bench measure -k8s \
      -atespace "${ATESPACE:-ate-env}" \
      -run-id "${RUN_PREFIX:-r2eswe}" \
      -dest "${ARTIFACT_DIR}"
    ```
-2. **Populate setup and command (`## 1` and `## 2`)**: Fill workload flags and cluster footprint
-   from `report.json` (`labels`, `distinct_images`) and `system_description.json`, and state the
-   start footing (`cold boot`, `cold restore`, `warm restore`, or `wake`) in `## Summary`.
-3. **Populate results and findings (`## 3` and `## 4`)**: Copy the arm comparison rows from
-   `comparison.md` (or `report.json` on single-arm runs), fill `stats[]` and `rollout_breakdown[]`
-   for the reference arm, include the optional cache/restore bullet only when `SAMPLE_CACHE=1` or
-   `HARVEST_RESTORES=1` ran, and summarize findings and caveats.
+2. **Populate concurrency, workload parameters, and command (`## Summary` and `## 2`)**: Record
+   configured concurrency (`--concurrency`, shard widths, active sandboxes per node), observed pool
+   footprint (`peak_active_sandboxes`, `standing_pool_size`, `peak_parked_sandboxes`), start footing
+   (`cold boot`, `cold restore`, `warm restore`, or `wake`), workload parameters, and exact
+   `prewarm` and `run-r2e-swebench.sh` commands.
+3. **Populate results and findings (`## 3` and `## 4`)**: Fill the multi-arm table (`3.1`) from
+   `comparison.json` / `comparison.md` (or `report.json` on single-arm runs), fill all sandbox
+   lifecycle and command latencies across `p50`, `p90`, `p95`, `p99`, and `max` (`3.2`:
+   `sdk_slot_wait`, `actor_create`, `sandbox_create`, `prewarm`, `ttfi` [cmd start via
+   `wire_claim_to_ready_ms`], `first_cmd_exec` [`ready_to_first_cmd_ms`], `ttfc` [cmd finished via
+   `stats[event="ttfi"]`], `suspend`, `wake`, `step/*`, `task/*`, `delete`, `step_barrier`), fill
+   step barrier and shard split (`3.3`, plus node cache and `atelet` restore phases when
+   `SAMPLE_CACHE=1` or `HARVEST_RESTORES=1` ran), and summarize failures, findings, and caveats
+   (`## 4`).

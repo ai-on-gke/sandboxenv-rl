@@ -2115,14 +2115,17 @@ def stat_cell(rep: dict, event: str) -> str:
     for s in rep.get("stats") or []:
         if s.get("event") == event and not s.get("name"):
             if s.get("count") == s.get("failed"):
-                return f"-/- (n={s.get('count', 0)}, f={s.get('failed', 0)})"
-            return f"{s.get('p50_ms', 0.0):.0f}/{s.get('p95_ms', 0.0):.0f} ms (n={s.get('count', 0)})"
+                return f"-/-/- (n={s.get('count', 0)}, f={s.get('failed', 0)})"
+            p50 = s.get("p50_ms", 0.0)
+            p95 = s.get("p95_ms", 0.0)
+            p99 = s.get("p99_ms", p95)
+            return f"{p50:.0f}/{p95:.0f}/{p99:.0f} ms (n={s.get('count', 0)})"
     return "-"
 
 lines = [
     "# Multi-Arm Strategy & Client Chain Comparison",
     "",
-    "| Arm | Client | Strategy | Tasks | Failed | Reward Rate | Wall Clock (s) | Throughput (tasks/min) | Warm Hit Rate | Peak Active | Standing Pool | TTFI p50/p95 | Wake p50/p95 |",
+    "| Arm | Client | Strategy | Tasks | Failed | Reward Rate | Wall Clock (s) | Throughput (tasks/min) | Warm Hit Rate | Peak Active | Standing Pool | TTFI p50/p95/p99 | Wake p50/p95/p99 |",
     "| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- |",
 ]
 for r in reps:

@@ -741,6 +741,27 @@ def test_run_r2e_swebench_dry_run_flags_and_validation(tmp_path):
     assert bad_pause.returncode == 2
     assert "STEP_PAUSE" in bad_pause.stderr
 
+    # A strategy parks by itself and runs one pass: --step-pause is refused with it.
+    bad_strategy_pause = subprocess.run(
+        [
+            str(script),
+            "dry-run",
+            "--r2e-dataset",
+            str(r2e_manifest),
+            "--swe-dataset",
+            str(swe_manifest),
+            "--strategy",
+            "naive",
+            "--step-pause",
+            "5s",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert bad_strategy_pause.returncode == 2
+    assert "belongs to the step loop" in bad_strategy_pause.stderr
+
     # 6. Strategy sweep (--strategy all) across Go API -> 4 arms.
     proc_strat_all = subprocess.run(
         [

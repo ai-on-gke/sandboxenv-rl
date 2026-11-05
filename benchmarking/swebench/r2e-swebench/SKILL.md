@@ -107,10 +107,10 @@ mkdir -p "${MANIFEST_DIR}"
 Set `R2E_LIMIT` to at least your chosen `--r2e-images` count. Build the digest-pinned R2E-Gym
 `CommandAdapter` manifest with [`../make-r2e-dataset.py`](../make-r2e-dataset.py) and
 [`../../../integrations/uni-agent/scripts/resolve_images.sh`](../../../integrations/uni-agent/scripts/resolve_images.sh).
-The first pass lists every candidate image, not the first `R2E_LIMIT`: the manifest pass skips a
-tag whose digest an earlier tag already has, so it reads past the first `R2E_LIMIT` candidates,
-and every tag it reads must be in `r2e-images.json`. Set `MODE=hubapi` on `resolve_images.sh` to
-resolve thousands of tags in minutes; the mapping serves any later `R2E_LIMIT`.
+The first pass lists every candidate image, not the first `R2E_LIMIT`: the manifest pass skips a tag
+whose digest an earlier tag already has, so it reads past the first `R2E_LIMIT` candidates, and
+every tag it reads must be in `r2e-images.json`. Set `MODE=hubapi` on `resolve_images.sh` to resolve
+thousands of tags in minutes; the mapping serves any later `R2E_LIMIT`.
 
 ```bash
 R2E_LIMIT=20
@@ -239,24 +239,31 @@ top-level comparison artifacts land at `$ARTIFACT_DIR/`:
 - `comparison.txt`, `comparison.json`, and `comparison.md` (multi-arm sweeps): side-by-side latency,
   throughput (`tasks/min`), warm-pool hit rate, peak active sandboxes, and standing-pool footprint
   across all `(client, strategy)` arms.
-- `cache_before.prom`, `cache_after.prom`, and `restore_timings.jsonl`: node cache metrics and
-  `atelet` restore phases captured when `SAMPLE_CACHE=1` and `HARVEST_RESTORES=1` are set.
+- `system_description.json` and `measurements.json` (or `arms/<arm>/...`): `bench measure -k8s`
+  output, taken after each arm and folded into `report.json` by `bench report`.
+- `cache_before.prom`, `cache_after.prom`, and `atelet_restores.jsonl`: node cache metrics and the
+  raw `atelet` restore records captured when `SAMPLE_CACHE=1` and `HARVEST_RESTORES=1` are set (`go`
+  and `go-direct` arms; `swebench-loader report -restore-log` joins them into the `*-summary.json`
+  files, which is why they are not named `restore_timings.jsonl`, the `schema.RestoreSample` file
+  `bench measure` and `bench validate` read).
 
 ## 6. Write the benchmark report
 
 Copy [`./REPORT_TEMPLATE.md`](./REPORT_TEMPLATE.md) to `$ARTIFACT_DIR/BENCHMARK_REPORT.md` so
 `report.md` and `comparison.md` stay intact, then fill every section:
 
-1. **Capture `system_description.json` and cluster / version specs (`## 1`)**: Run
-   `bench measure -k8s` once into `$ARTIFACT_DIR` and combine it with the pre-run checks in
+1. **Capture `system_description.json` and cluster / version specs (`## 1`)**: the runner runs
+   `bench measure -k8s` into each arm directory before `bench report`, so `system_description.json`
+   and `measurements.json` sit next to `report.json`. Combine them with the pre-run checks in
    [`../SKILL.md`](../SKILL.md) to record the cluster spec (`1.1`), node pool spec (`1.2`: machine
    type, CPU family, boot disk, labels, and taints), and `ate` (Substrate) and `ate-env`
-   (`sandboxenv-rl`) versions and settings (`1.3`):
+   (`sandboxenv-rl`) versions and settings (`1.3`). To measure again by hand, into one arm's
+   directory (`$ARTIFACT_DIR` for a single arm):
    ```bash
    go -C "${ENV_REPO}" run ./cmd/benchmarking/bench measure -k8s \
      -atespace "${ATESPACE:-ate-env}" \
-     -run-id "${RUN_PREFIX:-r2eswe}" \
-     -dest "${ARTIFACT_DIR}"
+     -run-id "${RUN_ID:-r2eswe}" \
+     -dest "${ARTIFACT_DIR}/arms/<client>-<strategy>"
    ```
 2. **Populate the headline summary, concurrency, workload parameters, and command
    (`## Headline Outcome & Time Attribution Summary` and `## 2`)**: Keep the `Key numbers` headline

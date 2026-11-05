@@ -59,8 +59,8 @@
 #       --workload graded|io     Trajectory profile: graded or io (env: WORKLOAD; default: graded)
 #       --mode MODE              Loader mode: steps, eval, or open-loop (env: MODE; default: steps)
 #       --steps N                Passes / training steps in steps mode (env: STEPS; default: 4, or 1 when --strategy is set)
-#       --park POLICY            Park policy in steps mode (env: PARK; default: suspend)
-#       --step-pause DUR         Optional pause between steps, e.g. 5s (env: STEP_PAUSE; default: 0s)
+#       --park POLICY            Park policy in steps mode without --strategy, which parks by itself (env: PARK; default: suspend)
+#       --step-pause DUR         Optional pause between steps without --strategy, e.g. 5s (env: STEP_PAUSE; default: 0s)
 #       --execution MODE         in-cluster or local (env: EXECUTION; auto-selects in-cluster with KO_DOCKER_REPO)
 #   -h, --help                   Show this help text and exit.
 #
@@ -974,10 +974,13 @@ mode_args_for_go() {
     fi
     case "${shard_mode}" in
       steps)
-        MODE_ARGS+=("-rollouts=${fanout}" "-steps=${STEPS}" "-park=${PARK}")
+        # The loader parks by the strategy (suspend; delete for none) and
+        # runs one pass; it refuses -park and -step-pause with -strategy.
         if (( has_pause == 1 )); then
-          MODE_ARGS+=("-step-pause=${STEP_PAUSE}")
+          echo "STEP_PAUSE (${STEP_PAUSE}) belongs to the step loop; it cannot be combined with --strategy ${arm_strategy}" >&2
+          exit 2
         fi
+        MODE_ARGS+=("-rollouts=${fanout}" "-steps=${STEPS}")
         ;;
       eval)
         MODE_ARGS+=("-tasks-per-image=${fanout}")
@@ -1307,6 +1310,7 @@ R2E_JOB=""
 DIRECT_CREDS_SECRET=""
 HARVEST_DIR=""
 HARVEST_PID=""
+HARVEST_ACTIVE=0
 LOCAL_PIDS=()
 LOG_PIDS=()
 KUBECTL_ERR=""
@@ -1446,19 +1450,27 @@ EOF_PY_DOCKER
   echo "python loader image ${BUILT_PYTHON_IMAGE}"
 }
 
+# wait_for_pod prints the name of the Job's pod once its loader container has
+# started (running, or already terminated) and its keep sidecar is running:
+# the plan copy and the event copy go through keep, and a keep that is still
+# ContainerCreating fails them.
 wait_for_pod() {
   local job_name="$1"
   local pod=""
+  local states=""
   local deadline=$((SECONDS + START_TIMEOUT))
   while (( SECONDS < deadline )); do
     pod="$(kc -n "${NAMESPACE}" get pod -l "job-name=${job_name}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-    if [[ -n "${pod}" ]] && kc -n "${NAMESPACE}" get pod "${pod}" -o jsonpath='{.status.containerStatuses[?(@.name=="loader")].state}' 2>/dev/null | grep -q 'running\|terminated'; then
-      printf '%s\n' "${pod}"
-      return 0
+    if [[ -n "${pod}" ]]; then
+      states="$(kc -n "${NAMESPACE}" get pod "${pod}" -o jsonpath='{range .status.containerStatuses[*]}{.name}={.state}{"\n"}{end}' 2>/dev/null || true)"
+      if grep -q '^loader=.*\(running\|terminated\)' <<<"${states}" && grep -q '^keep=.*running' <<<"${states}"; then
+        printf '%s\n' "${pod}"
+        return 0
+      fi
     fi
     sleep 5
   done
-  echo "loader pod for ${job_name} did not start within ${START_TIMEOUT}s" >&2
+  echo "loader and keep containers of ${job_name} did not start within ${START_TIMEOUT}s" >&2
   if [[ -n "${pod}" ]]; then
     kc -n "${NAMESPACE}" describe pod "${pod}" | tail -15 >&2 || true
   else
@@ -1616,6 +1628,78 @@ harvest_both_parts() {
   fi
 }
 
+# start_restore_harvest begins the periodic harvest of atelet's restore
+# records for a timed go or go-direct arm when HARVEST_RESTORES=1, in local
+# and in-cluster execution alike: the harvester reads kubectl logs from the
+# host. Python arms are skipped, because SandboxFleet names its actors warm-*
+# and sb-*, not <run_id>-*, and the harvester selects by run id.
+start_restore_harvest() {
+  local arm_client="$1"
+  local arm_name="$2"
+  local is_timed_run="$3"
+  local swe_run="$4"
+  local r2e_run="$5"
+  HARVEST_ACTIVE=0
+  if [[ "${is_timed_run}" != "1" || "${HARVEST_RESTORES}" != "1" ]]; then
+    return 0
+  fi
+  if [[ "${arm_client}" == "python" ]]; then
+    echo "note: skipping HARVEST_RESTORES for python arm ${arm_name} (Python SandboxFleet actors use warm-*/sb-* IDs rather than <run_id>-*)" >&2
+    return 0
+  fi
+  HARVEST_DIR="$(mktemp -d)"
+  (
+    n=0
+    while :; do
+      sleep "$(( HARVEST_INTERVAL_MIN * 60 ))" || true
+      n=$(( n + 1 ))
+      harvest_both_parts "${swe_run}" "${r2e_run}" "${n}"
+    done
+  ) &
+  HARVEST_PID=$!
+  HARVEST_ACTIVE=1
+}
+
+# finish_restore_harvest stops the harvester, takes a last sample and writes
+# the raw atelet records to ARM_DIR/atelet_restores.jsonl. They are not
+# schema.RestoreSample records, which is what bench measure, bench report
+# -dest and bench validate read from restore_timings.jsonl, so they do not go
+# under that name; swebench-loader report -restore-log joins the raw records
+# with the events itself (generate_arm_reports).
+finish_restore_harvest() {
+  local arm_dir="$1"
+  local swe_run="$2"
+  local r2e_run="$3"
+  if (( HARVEST_ACTIVE != 1 )); then
+    return 0
+  fi
+  kill "${HARVEST_PID}" 2>/dev/null || true
+  wait "${HARVEST_PID}" 2>/dev/null || true
+  HARVEST_PID=""
+  harvest_both_parts "${swe_run}" "${r2e_run}" final
+  local -a parts=()
+  shopt -s nullglob
+  parts=("${HARVEST_DIR}"/part-*.jsonl)
+  shopt -u nullglob
+  if (( ${#parts[@]} > 0 )); then
+    sort -u "${parts[@]}" > "${arm_dir}/atelet_restores.jsonl"
+  else
+    : > "${arm_dir}/atelet_restores.jsonl"
+  fi
+  rm -rf "${HARVEST_DIR}"
+  HARVEST_DIR=""
+  HARVEST_ACTIVE=0
+}
+
+# stage_python_plan copies a rendered plan into the pod through the keep
+# sidecar and releases the loader, which waits for /work/plan.ready.
+stage_python_plan() {
+  local pod="$1"
+  local plan="$2"
+  kc -n "${NAMESPACE}" cp -c keep "${plan}" "${pod}:/work/plan.json"
+  kc -n "${NAMESPACE}" exec -c keep "${pod}" -- touch /work/plan.ready
+}
+
 SHARD_EXIT=0
 
 run_local_arm_shards() {
@@ -1635,6 +1719,7 @@ run_local_arm_shards() {
   local r2e_out="${14}"
   local arm_dir="${15}"
   local pass_extra="${16}"
+  local is_timed_run="${17}"
 
   mkdir -p "$(dirname "${swe_out}")" "$(dirname "${r2e_out}")"
   local swe_pid r2e_pid swe_rc=0 r2e_rc=0
@@ -1770,9 +1855,11 @@ run_local_arm_shards() {
   fi
 
   LOCAL_PIDS=("${swe_pid}" "${r2e_pid}")
+  start_restore_harvest "${arm_client}" "${arm_name}" "${is_timed_run}" "${swe_run}" "${r2e_run}"
   wait "${swe_pid}" || swe_rc=$?
   wait "${r2e_pid}" || r2e_rc=$?
   LOCAL_PIDS=()
+  finish_restore_harvest "${arm_dir}" "${swe_run}" "${r2e_run}"
   SHARD_EXIT=$(( swe_rc != 0 ? swe_rc : r2e_rc ))
 }
 
@@ -1801,7 +1888,6 @@ run_in_cluster_arm_shards() {
 
   SWE_JOB="swebench-loader-${swe_run}"
   R2E_JOB="swebench-loader-${r2e_run}"
-  HARVEST_DIR="$(mktemp -d)"
   KUBECTL_ERR="$(mktemp)"
 
   local image=""
@@ -1863,8 +1949,11 @@ run_in_cluster_arm_shards() {
       r2e_args+=(${PY_EXTRA_SET_ARGS[@]+"${PY_EXTRA_SET_ARGS[@]}"} ${PY_EXTRA_LABEL_ARGS[@]+"${PY_EXTRA_LABEL_ARGS[@]}"})
     fi
 
+    # The loader waits for the plan that stage_python_plan copies in after
+    # wait_for_pod, up to START_TIMEOUT (the same bound as wait_for_pod, which
+    # the other shard's pod may use up first).
     # shellcheck disable=SC2016 # $n and $@ expand inside the container shell
-    command_json="$(json_encode_args sh -c 'n=0; while [ ! -f /work/plan.ready ]; do n=$((n+1)); if [ "$n" -ge 240 ]; then echo "timed out waiting for /work/plan.ready" >&2; exit 2; fi; sleep 0.5; done; exec python3 /app/run_fleet_bench.py "$@"' --)"
+    command_json="$(json_encode_args sh -c 'n=0; while [ ! -f /work/plan.ready ]; do n=$((n+1)); if [ "$n" -ge '"$(( START_TIMEOUT * 2 ))"' ]; then echo "timed out waiting for /work/plan.ready" >&2; exit 2; fi; sleep 0.5; done; exec python3 /app/run_fleet_bench.py "$@"' --)"
     swe_json="$(json_encode_args "${swe_args[@]}")"
     r2e_json="$(json_encode_args "${r2e_args[@]}")"
   else
@@ -1971,38 +2060,20 @@ run_in_cluster_arm_shards() {
   apply_loader_job "${SWE_JOB}" "${image}" "${swe_json}" "${command_json}" "${creds_secret}"
   apply_loader_job "${R2E_JOB}" "${image}" "${r2e_json}" "${command_json}" "${creds_secret}"
 
+  # Each plan goes in as soon as its own pod is up: the loader's wait for it
+  # must not also cover the other pod's start.
   local swe_pod r2e_pod
   swe_pod="$(wait_for_pod "${SWE_JOB}")"
+  if [[ "${arm_client}" == "python" ]]; then
+    stage_python_plan "${swe_pod}" "${arm_dir}/plans/swe-plan.json"
+  fi
   r2e_pod="$(wait_for_pod "${R2E_JOB}")"
+  if [[ "${arm_client}" == "python" ]]; then
+    stage_python_plan "${r2e_pod}" "${arm_dir}/plans/r2e-plan.json"
+  fi
   echo "started pods: swe=${swe_pod} r2e=${r2e_pod}"
 
-  if [[ "${arm_client}" == "python" ]]; then
-    kc -n "${NAMESPACE}" cp -c keep "${arm_dir}/plans/swe-plan.json" "${swe_pod}:/work/plan.json"
-    kc -n "${NAMESPACE}" exec -c keep "${swe_pod}" -- touch /work/plan.ready
-    kc -n "${NAMESPACE}" cp -c keep "${arm_dir}/plans/r2e-plan.json" "${r2e_pod}:/work/plan.json"
-    kc -n "${NAMESPACE}" exec -c keep "${r2e_pod}" -- touch /work/plan.ready
-  fi
-
-  local do_harvest=0
-  if [[ "${is_timed_run}" == "1" && "${HARVEST_RESTORES}" == "1" ]]; then
-    if [[ "${arm_client}" == "python" ]]; then
-      echo "note: skipping HARVEST_RESTORES for python arm ${arm_name} (Python SandboxFleet actors use warm-*/sb-* IDs rather than <run_id>-*)" >&2
-    else
-      do_harvest=1
-    fi
-  fi
-
-  if (( do_harvest == 1 )); then
-    (
-      n=0
-      while :; do
-        sleep "$(( HARVEST_INTERVAL_MIN * 60 ))" || true
-        n=$(( n + 1 ))
-        harvest_both_parts "${swe_run}" "${r2e_run}" "${n}"
-      done
-    ) &
-    HARVEST_PID=$!
-  fi
+  start_restore_harvest "${arm_client}" "${arm_name}" "${is_timed_run}" "${swe_run}" "${r2e_run}"
 
   kc -n "${NAMESPACE}" logs -f "${swe_pod}" -c loader > "${arm_dir}/swe-loader.log" 2>&1 &
   local log_swe_pid=$!
@@ -2027,21 +2098,7 @@ run_in_cluster_arm_shards() {
     r2e_rc=$(( r2e_rc == 0 ? 1 : r2e_rc ))
   fi
 
-  if (( do_harvest == 1 )); then
-    kill "${HARVEST_PID}" 2>/dev/null || true
-    wait "${HARVEST_PID}" 2>/dev/null || true
-    HARVEST_PID=""
-    harvest_both_parts "${swe_run}" "${r2e_run}" final
-    local -a parts=()
-    shopt -s nullglob
-    parts=("${HARVEST_DIR}"/part-*.jsonl)
-    shopt -u nullglob
-    if (( ${#parts[@]} > 0 )); then
-      sort -u "${parts[@]}" > "${arm_dir}/restore_timings.jsonl"
-    else
-      : > "${arm_dir}/restore_timings.jsonl"
-    fi
-  fi
+  finish_restore_harvest "${arm_dir}" "${swe_run}" "${r2e_run}"
 
   cleanup_cluster
   SWE_JOB=""
@@ -2051,9 +2108,12 @@ run_in_cluster_arm_shards() {
 
 generate_arm_reports() {
   local arm_dir="$1"
+  local run_prefix="$2"
   local -a shard_extra=()
-  if [[ -f "${arm_dir}/restore_timings.jsonl" ]]; then
-    shard_extra+=("-restore-log" "${arm_dir}/restore_timings.jsonl")
+  # Only this run's harvest: an earlier run's file in a reused artifact
+  # directory must not be joined with these events.
+  if [[ "${HARVEST_RESTORES}" == "1" && -s "${arm_dir}/atelet_restores.jsonl" ]]; then
+    shard_extra+=("-restore-log" "${arm_dir}/atelet_restores.jsonl")
   fi
 
   if [[ -s "${arm_dir}/events/swe.jsonl" ]]; then
@@ -2065,6 +2125,13 @@ generate_arm_reports() {
       -json "${arm_dir}/r2e-summary.json" ${shard_extra[@]+"${shard_extra[@]}"}
   fi
   if [[ -s "${arm_dir}/events/swe.jsonl" || -s "${arm_dir}/events/r2e.jsonl" ]]; then
+    # system_description.json and measurements.json, which bench report
+    # folds into report.json; a cluster the host cannot read leaves the
+    # report without them rather than without a report.
+    if ! go run ./cmd/benchmarking/bench measure -k8s -atespace "${ATESPACE}" \
+      -base-template "${BASE_TEMPLATE}" -run-id "${run_prefix}" -dest "${arm_dir}"; then
+      echo "warning: bench measure -k8s failed for ${arm_dir}; report.json has no system_description or measurements" >&2
+    fi
     go run ./cmd/benchmarking/bench report -dest "${arm_dir}"
   fi
 }
@@ -2098,68 +2165,11 @@ PY
     return 0
   fi
 
+  # -md renders the arm table (swebench.WriteComparisonMarkdown) over the
+  # text comparison.
   go run ./cmd/benchmarking/swebench-loader report "${report_files[@]}" \
-    -json "${out_dir}/comparison.json" > "${out_dir}/comparison.txt"
+    -json "${out_dir}/comparison.json" -md "${out_dir}/comparison.md" > "${out_dir}/comparison.txt"
   cat "${out_dir}/comparison.txt"
-
-  python3 - "${out_dir}/comparison.json" "${out_dir}/comparison.txt" "${out_dir}/comparison.md" <<'PY'
-import json
-import pathlib
-import sys
-
-comp_json, comp_txt, comp_md = (pathlib.Path(p) for p in sys.argv[1:4])
-raw = json.loads(comp_json.read_text(encoding="utf-8"))
-reps = raw if isinstance(raw, list) else [raw]
-
-def stat_cell(rep: dict, event: str) -> str:
-    for s in rep.get("stats") or []:
-        if s.get("event") == event and not s.get("name"):
-            if s.get("count") == s.get("failed"):
-                return f"-/-/- (n={s.get('count', 0)}, f={s.get('failed', 0)})"
-            p50 = s.get("p50_ms", 0.0)
-            p95 = s.get("p95_ms", 0.0)
-            p99 = s.get("p99_ms", p95)
-            return f"{p50:.0f}/{p95:.0f}/{p99:.0f} ms (n={s.get('count', 0)})"
-    return "-"
-
-lines = [
-    "# Multi-Arm Strategy & Client Chain Comparison",
-    "",
-    "| Arm | Client | Strategy | Tasks | Failed | Reward Rate | Wall Clock (s) | Throughput (tasks/min) | Warm Hit Rate | Peak Active | Standing Pool | TTFI p50/p95/p99 | Wake p50/p95/p99 |",
-    "| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- |",
-]
-for r in reps:
-    labels = r.get("labels") or {}
-    arm = r.get("run") or labels.get("arm") or "-"
-    client = labels.get("client") or "-"
-    strategy = labels.get("strategy") or r.get("mode") or "-"
-    hits = int(r.get("working_set_hits") or 0)
-    misses = int(r.get("working_set_misses") or 0)
-    has_ws = (hits + misses) > 0 or ("working_set_hit_rate" in r)
-    hit_rate = f"{float(r.get('working_set_hit_rate') or 0.0) * 100.0:.1f}%" if has_ws else "-"
-    pool_sz = str(int(r.get("standing_pool_size") or 0)) if has_ws else "-"
-    hl = r.get("headline_baseline") or {}
-    run_ms = float(r.get("run_ms") or 0.0)
-    tasks_n = int(r.get("tasks") or 0)
-    tpm = float(hl.get("tasks_per_min") or ((tasks_n * 60000.0 / run_ms) if run_ms > 0 else 0.0))
-    lines.append(
-        f"| `{arm}` | `{client}` | `{strategy}` | {tasks_n} | {r.get('failed', 0)} | "
-        f"{r.get('reward_rate', 0.0):.3f} | {run_ms / 1000.0:.1f} | "
-        f"{tpm:.1f} | {hit_rate} | {r.get('peak_active_sandboxes', 0)} | "
-        f"{pool_sz} | {stat_cell(r, 'ttfi')} | {stat_cell(r, 'wake')} |"
-    )
-
-lines.extend([
-    "",
-    "## Detailed Event Breakdown (`swebench-loader report`)",
-    "",
-    "```text",
-    comp_txt.read_text(encoding="utf-8").rstrip(),
-    "```",
-    "",
-])
-comp_md.write_text("\n".join(lines), encoding="utf-8")
-PY
 }
 
 if [[ "${ACTION}" == "prewarm" ]]; then
@@ -2193,7 +2203,7 @@ if [[ "${ACTION}" == "prewarm" ]]; then
       "${pw_swe_run}" "${pw_r2e_run}" "${pw_swe_width}" "${pw_r2e_width}" \
       1 1 "workload-file-read-one" "workload-file-read-one" \
       "${ARTIFACT_DIR}/prewarm/swe.jsonl" "${ARTIFACT_DIR}/prewarm/r2e.jsonl" \
-      "${ARTIFACT_DIR}/prewarm" "0"
+      "${ARTIFACT_DIR}/prewarm" "0" "0"
   fi
   echo "prewarm finished (client=${pw_client}, swe=${SWE_IMAGES} images, r2e=${R2E_IMAGES} images) -> ${ARTIFACT_DIR}/prewarm/"
   exit "${SHARD_EXIT}"
@@ -2235,7 +2245,7 @@ for (( idx = 0; idx < NUM_ARMS; idx++ )); do
       "${swe_run}" "${r2e_run}" "${SWE_WIDTH}" "${R2E_WIDTH}" \
       "${SWE_FANOUT}" "${R2E_FANOUT}" "${SWE_TRAJECTORY}" "${R2E_TRAJECTORY}" \
       "${arm_dir}/events/swe.jsonl" "${arm_dir}/events/r2e.jsonl" \
-      "${arm_dir}" "1"
+      "${arm_dir}" "1" "1"
   fi
   if (( SHARD_EXIT != 0 && OVERALL_EXIT == 0 )); then
     OVERALL_EXIT="${SHARD_EXIT}"
@@ -2245,7 +2255,7 @@ for (( idx = 0; idx < NUM_ARMS; idx++ )); do
     NAMESPACE=ate-system CONTEXT="${CONTEXT}" "${ROOT}/benchmarking/swebench/sample-node-cache.sh" "${arm_dir}/cache_after.prom"
   fi
 
-  generate_arm_reports "${arm_dir}"
+  generate_arm_reports "${arm_dir}" "${arm_prefix}"
 done
 
 if (( NUM_ARMS > 1 )); then

@@ -27,5 +27,6 @@
 // without its prefix, the same values Substrate writes as ate.actor.state on
 // its lifecycle records, so a snapshot joins that event stream without a
 // mapping. Identity (uid, name, atespace, template) is data in a snapshot;
-// it never becomes a metric label. No field carries a credential.
+// it never becomes a metric label. No field carries a credential, and both
+// validators refuse an actor label key that names one.
 package inventory

@@ -23,10 +23,12 @@ import (
 	"io"
 	"net/url"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
@@ -94,6 +96,36 @@ var (
 		GoldenNone: true, GoldenPending: true, GoldenReady: true, GoldenFailed: true,
 	}
 )
+
+// credentialWords are the words an actor label key must not contain, in any
+// letter case. A snapshot is published to a shared bucket, and a label key
+// that names a credential is the usual sign that its value is one.
+// TestSchemaHasNoCredentialFields holds the schema's own property names to the
+// same list.
+var credentialWords = []string{"token", "password", "authorization", "secret", "credential"}
+
+// labelKeyPattern matches a label key that names a credential. It is spelled
+// with character classes instead of (?i) so the same text is a valid pattern
+// in Go's RE2 and in the ECMA-262 dialect JSON Schema uses; the propertyNames
+// rule on Actor.labels in snapshot.schema.json carries the identical pattern,
+// and TestLabelKeyPatternMatchesSchema keeps the two equal.
+var labelKeyPattern = regexp.MustCompile(caseInsensitivePattern(credentialWords))
+
+func caseInsensitivePattern(words []string) string {
+	var b strings.Builder
+	for i, w := range words {
+		if i > 0 {
+			b.WriteByte('|')
+		}
+		for _, r := range w {
+			b.WriteByte('[')
+			b.WriteRune(unicode.ToUpper(r))
+			b.WriteRune(r)
+			b.WriteByte(']')
+		}
+	}
+	return b.String()
+}
 
 // Snapshot is one cluster's inventory at GeneratedAt.
 type Snapshot struct {
@@ -184,6 +216,8 @@ type Worker struct {
 }
 
 // Actor is one Substrate actor, the entity behind an ate-env environment.
+// Labels are the actor's labels as data; Validate refuses a key that names a
+// credential (see credentialWords).
 type Actor struct {
 	UID          string            `json:"uid"`
 	Atespace     string            `json:"atespace"`
@@ -199,7 +233,11 @@ type Actor struct {
 	Labels       map[string]string `json:"labels,omitempty"`
 }
 
-// Crash is the control plane's crash record for an actor in state crashed.
+// Crash is the control plane's crash record, ActorStatus.crash. Substrate sets
+// it when an actor enters crashed, keeps it while a crashed actor is deleting
+// or reverting, and clears it only when a revert returns the actor to
+// suspended; so Crash can accompany any state, and a crashed actor can lack
+// one (fakecontrol.SetState writes crashed without a record).
 type Crash struct {
 	Message   string    `json:"message"`
 	CrashTime time.Time `json:"crash_time"`
@@ -308,10 +346,12 @@ func (s *Snapshot) Sort() {
 func key2(a, b string) string { return a + "\x00" + b }
 
 // Validate checks what the JSON Schema requires and what it cannot express:
-// the version, non-null lists, the identity and timestamps of the snapshot and
-// of each object, the state vocabularies, the numeric bounds, unique keys in
-// every list, and Counts matching Actors. A snapshot that passes Validate
-// encodes to a document that validates against snapshot.schema.json.
+// the version, non-null lists and counts maps, the identity and timestamps of
+// the snapshot and of each object, the state vocabularies, the numeric bounds,
+// unique keys in every list, label keys that name no credential, and Counts
+// matching Actors. It does not tie Crash to a state; see Crash. A snapshot
+// that passes Validate encodes to a document that validates against
+// snapshot.schema.json.
 func (s *Snapshot) Validate() error {
 	if s.SchemaVersion != SchemaVersion {
 		return fmt.Errorf("inventory: unsupported schema_version %q (want %q)", s.SchemaVersion, SchemaVersion)
@@ -429,11 +469,13 @@ func (s *Snapshot) Validate() error {
 		if a.CreateTime.IsZero() || a.UpdateTime.IsZero() {
 			return fmt.Errorf("inventory: actors[%d]: create_time and update_time are required", i)
 		}
-		if (a.State == ActorStateCrashed) != (a.Crash != nil) {
-			return fmt.Errorf("inventory: actors[%d]: crash is present exactly when state is %q", i, ActorStateCrashed)
-		}
 		if a.Crash != nil && a.Crash.CrashTime.IsZero() {
 			return fmt.Errorf("inventory: actors[%d]: crash.crash_time is required", i)
+		}
+		for k := range a.Labels {
+			if labelKeyPattern.MatchString(k) {
+				return fmt.Errorf("inventory: actors[%d]: label key %q names a credential (%s); a snapshot carries none", i, k, strings.Join(credentialWords, ", "))
+			}
 		}
 	}
 	for i, d := range s.Deployments {
@@ -449,6 +491,11 @@ func (s *Snapshot) Validate() error {
 		if err := unique("deployments", key2(d.Namespace, d.Name), i); err != nil {
 			return err
 		}
+	}
+	// The schema requires both maps as objects; a nil map would encode as null
+	// and still compare equal to the empty counts of an empty actor list.
+	if s.Counts.ActorsByState == nil || s.Counts.ActorsByAtespace == nil {
+		return errors.New("inventory: counts.actors_by_state and counts.actors_by_atespace must be objects, not null (use ComputeCounts)")
 	}
 	if want := ComputeCounts(s.Actors); !countsEqual(want, s.Counts) {
 		return errors.New("inventory: counts do not match actors")
@@ -481,9 +528,18 @@ func (s *Snapshot) Encode(w io.Writer) error {
 }
 
 // DecodeSnapshot reads one snapshot from r. It rejects unknown fields, a
-// second JSON value after the first, and any snapshot Validate refuses.
+// second JSON value after the first, any document snapshot.schema.json
+// refuses, and any snapshot Validate refuses. The schema pass is not
+// redundant: the Go types accept null for an optional list, map or object and
+// a zero value for an optional enum or port, forms omitempty never writes and
+// the schema does not allow, so without it a reader would accept documents a
+// writer cannot produce.
 func DecodeSnapshot(r io.Reader) (*Snapshot, error) {
-	dec := json.NewDecoder(r)
+	raw, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("inventory: decode snapshot: %w", err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	var s Snapshot
 	if err := dec.Decode(&s); err != nil {
@@ -491,6 +547,9 @@ func DecodeSnapshot(r io.Reader) (*Snapshot, error) {
 	}
 	if err := ensureEOF(dec); err != nil {
 		return nil, fmt.Errorf("inventory: decode snapshot: %w", err)
+	}
+	if err := ValidateAgainstJSONSchema(SnapshotSchema, raw); err != nil {
+		return nil, err
 	}
 	if err := s.Validate(); err != nil {
 		return nil, err

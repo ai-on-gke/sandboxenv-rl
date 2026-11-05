@@ -163,9 +163,11 @@ func TestValidateRejects(t *testing.T) {
 		{"worker state", func(s *Snapshot) { s.Workers[0].State = "idle" }, "unknown state"},
 		{"golden state", func(s *Snapshot) { s.Templates[1].GoldenState = "baking" }, "golden_state"},
 		{"duplicate uid", func(s *Snapshot) { s.Actors[1].UID = s.Actors[0].UID; s.Counts = ComputeCounts(s.Actors) }, "repeats"},
-		{"crash without state", func(s *Snapshot) { s.Actors[0].Crash = &Crash{Message: "x", CrashTime: s.GeneratedAt} }, "crash is present"},
-		{"crashed without record", func(s *Snapshot) { s.Actors[1].Crash = nil }, "crash is present"},
 		{"counts", func(s *Snapshot) { s.Counts.ActorsByState[ActorStateRunning]++ }, "counts do not match"},
+		{"nil counts", func(s *Snapshot) { s.Counts = Counts{} }, "not null"},
+		{"nil counts by atespace", func(s *Snapshot) { s.Counts.ActorsByAtespace = nil }, "not null"},
+		{"credential label key", func(s *Snapshot) { s.Actors[0].Labels = map[string]string{"example.com/api-token": "x"} }, "names a credential"},
+		{"credential label key, upper case", func(s *Snapshot) { s.Actors[0].Labels = map[string]string{"EXAMPLE.COM/CLIENT_SECRET": "x"} }, "names a credential"},
 		{"negative capacity", func(s *Snapshot) { s.Workers[0].Capacity.CPUMillicores = -1 }, "negative"},
 		{"nil actors", func(s *Snapshot) { s.Actors = nil; s.Counts = ComputeCounts(nil) }, "not null"},
 		{"nil deployments", func(s *Snapshot) { s.Deployments = nil }, "not null"},
@@ -198,11 +200,9 @@ func TestValidateRejects(t *testing.T) {
 	}
 }
 
-// TestEmptyClusterValidatesInGoAndSchema pins that a cluster with nothing in
-// it is a valid snapshot in both validators: empty lists encode as [] and
-// pass the schema, while nil lists are refused by Validate before they can
-// encode as null.
-func TestEmptyClusterValidatesInGoAndSchema(t *testing.T) {
+// emptySnapshot is a cluster with nothing in it: every required list empty
+// and Counts computed from the empty actor list.
+func emptySnapshot() *Snapshot {
 	s := &Snapshot{
 		SchemaVersion: SchemaVersion, GeneratedAt: time.Date(2026, 11, 4, 0, 0, 0, 0, time.UTC),
 		Project: "p", Cluster: "c", Reporter: Reporter{Version: "v0.1.0", IntervalSeconds: 5},
@@ -210,6 +210,15 @@ func TestEmptyClusterValidatesInGoAndSchema(t *testing.T) {
 		Actors: []Actor{}, Deployments: []Deployment{},
 	}
 	s.Counts = ComputeCounts(s.Actors)
+	return s
+}
+
+// TestEmptyClusterValidatesInGoAndSchema pins that a cluster with nothing in
+// it is a valid snapshot in both validators: empty lists encode as [] and
+// pass the schema, while nil lists are refused by Validate before they can
+// encode as null.
+func TestEmptyClusterValidatesInGoAndSchema(t *testing.T) {
+	s := emptySnapshot()
 	if err := s.Validate(); err != nil {
 		t.Fatalf("empty cluster: %v", err)
 	}
@@ -228,6 +237,124 @@ func TestEmptyClusterValidatesInGoAndSchema(t *testing.T) {
 	}
 }
 
+// TestNilCountsAreRejectedBeforeTheyEncodeAsNull pins the gap a zero Counts
+// opened: with no actors, nil maps compare equal to the computed empty maps,
+// yet they encode as null, which the schema refuses. Validate now refuses
+// them first, so the two validators agree.
+func TestNilCountsAreRejectedBeforeTheyEncodeAsNull(t *testing.T) {
+	s := emptySnapshot()
+	s.Counts = Counts{}
+	if err := s.Validate(); err == nil || !strings.Contains(err.Error(), "not null") {
+		t.Fatalf("Validate() = %v, want a not-null error for counts", err)
+	}
+	var buf bytes.Buffer
+	if err := s.Encode(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), `"actors_by_state": null`) {
+		t.Fatalf("expected nil counts to encode as null:\n%s", buf.String())
+	}
+	if err := ValidateAgainstJSONSchema(SnapshotSchema, buf.Bytes()); err == nil {
+		t.Fatal("schema accepted null counts; Validate and the schema disagree")
+	}
+}
+
+// TestCrashRecordIsIndependentOfState pins what Substrate does with
+// ActorStatus.crash. The control plane sets it when an actor enters crashed
+// and leaves it on the record while a crashed actor is deleting or reverting
+// (controlapi ensureMarkedDeleting and ensureMarkedReverting change only the
+// state); only the step that returns a reverted actor to suspended clears it.
+// A crashed actor without a record is legal too: fakecontrol.SetState writes
+// the state alone. Validate, the schema and DecodeSnapshot accept each
+// combination.
+func TestCrashRecordIsIndependentOfState(t *testing.T) {
+	rec := &Crash{Message: "resume failed: snapshot download timed out", CrashTime: time.Date(2026, 11, 3, 12, 0, 5, 0, time.UTC)}
+	cases := []struct {
+		name  string
+		state string
+		crash *Crash
+	}{
+		{"crashed without record", ActorStateCrashed, nil},
+		{"deleting keeps the record", ActorStateDeleting, rec},
+		{"reverting keeps the record", ActorStateReverting, rec},
+		{"running with a record", ActorStateRunning, rec},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := goldenSnapshot()
+			s.Actors[1].State = tc.state
+			s.Actors[1].Crash = tc.crash
+			s.Counts = ComputeCounts(s.Actors)
+			if err := s.Validate(); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			var buf bytes.Buffer
+			if err := s.Encode(&buf); err != nil {
+				t.Fatal(err)
+			}
+			if err := ValidateAgainstJSONSchema(SnapshotSchema, buf.Bytes()); err != nil {
+				t.Fatalf("schema: %v", err)
+			}
+			got, err := DecodeSnapshot(bytes.NewReader(buf.Bytes()))
+			if err != nil {
+				t.Fatalf("DecodeSnapshot: %v", err)
+			}
+			if !reflect.DeepEqual(got.Actors[1].Crash, tc.crash) || got.Actors[1].State != tc.state {
+				t.Fatalf("round trip changed the actor: got state %q crash %+v", got.Actors[1].State, got.Actors[1].Crash)
+			}
+		})
+	}
+}
+
+// TestDecodeRejectsWhatTheSchemaRejects pins that DecodeSnapshot is no looser
+// than snapshot.schema.json. Each payload decodes into the Go types without
+// error, because a nil slice, map or pointer and a zero int or string are
+// legal Go values; the schema refuses each, and so DecodeSnapshot must too.
+func TestDecodeRejectsWhatTheSchemaRejects(t *testing.T) {
+	raw, err := os.ReadFile(goldenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := func(doc map[string]any, list string, i int) map[string]any {
+		return doc[list].([]any)[i].(map[string]any)
+	}
+	cases := []struct {
+		name string
+		edit func(doc map[string]any)
+	}{
+		{"tags null", func(d map[string]any) { d["tags"] = nil }},
+		{"labels null", func(d map[string]any) { item(d, "actors", 0)["labels"] = nil }},
+		{"crash null", func(d map[string]any) { item(d, "actors", 1)["crash"] = nil }},
+		{"metrics_port 0", func(d map[string]any) { item(d, "deployments", 0)["metrics_port"] = 0 }},
+		{"golden_state empty", func(d map[string]any) { item(d, "templates", 0)["golden_state"] = "" }},
+		{"counts null", func(d map[string]any) { d["counts"].(map[string]any)["actors_by_state"] = nil }},
+		{"credential label key", func(d map[string]any) {
+			item(d, "actors", 0)["labels"] = map[string]any{"example.com/Access-Token": "x"}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var doc map[string]any
+			if err := json.Unmarshal(raw, &doc); err != nil {
+				t.Fatal(err)
+			}
+			tc.edit(doc)
+			payload, err := json.Marshal(doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var plain Snapshot
+			if err := json.Unmarshal(payload, &plain); err != nil {
+				t.Fatalf("the Go types alone refused the payload, so this case does not test the schema pass: %v", err)
+			}
+			_, err = DecodeSnapshot(bytes.NewReader(payload))
+			if err == nil || !strings.Contains(err.Error(), SnapshotSchema) {
+				t.Fatalf("DecodeSnapshot = %v, want a %s validation error", err, SnapshotSchema)
+			}
+		})
+	}
+}
+
 func TestJSONSchemaRejectsMissingRequiredAndUnknownField(t *testing.T) {
 	var buf bytes.Buffer
 	if err := goldenSnapshot().Encode(&buf); err != nil {
@@ -240,6 +367,8 @@ func TestJSONSchemaRejectsMissingRequiredAndUnknownField(t *testing.T) {
 		{"unknown actor field", strings.Replace(valid, `"uid": "8f2a0001",`, `"uid": "8f2a0001", "authorization": "x",`, 1)},
 		{"bad actor state", strings.Replace(valid, `"state": "running"`, `"state": "paused"`, 1)},
 		{"bad metrics port", strings.Replace(valid, `"metrics_port": 9090`, `"metrics_port": 0`, 1)},
+		{"credential label key", strings.Replace(valid, `"example.com/run-id": "r-1"`, `"example.com/api-token": "r-1"`, 1)},
+		{"upper-case credential label key", strings.Replace(valid, `"example.com/run-id": "r-1"`, `"EXAMPLE.COM/PASSWORD": "r-1"`, 1)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -338,10 +467,53 @@ func TestSchemaHasNoCredentialFields(t *testing.T) {
 		t.Fatal("walked no property names")
 	}
 	for _, n := range names {
-		for _, bad := range []string{"token", "password", "authorization", "secret", "credential"} {
-			if strings.Contains(strings.ToLower(n), bad) {
-				t.Errorf("schema property %q looks like a credential field", n)
+		if labelKeyPattern.MatchString(n) {
+			t.Errorf("schema property %q looks like a credential field", n)
+		}
+	}
+}
+
+// TestLabelKeyPatternMatchesSchema keeps the Go label-key rule and the
+// schema's propertyNames rule on Actor.labels the same text, so a reader in
+// another language refuses exactly the keys Validate refuses. It also pins
+// the pattern's reach: every credential word in any letter case, and none of
+// the ordinary keys.
+func TestLabelKeyPatternMatchesSchema(t *testing.T) {
+	raw, err := SchemaFS.ReadFile("v1/" + SnapshotSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Defs struct {
+			Actor struct {
+				Properties struct {
+					Labels struct {
+						PropertyNames struct {
+							Not struct {
+								Pattern string `json:"pattern"`
+							} `json:"not"`
+						} `json:"propertyNames"`
+					} `json:"labels"`
+				} `json:"properties"`
+			} `json:"Actor"`
+		} `json:"$defs"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := doc.Defs.Actor.Properties.Labels.PropertyNames.Not.Pattern, labelKeyPattern.String(); got != want {
+		t.Fatalf("schema propertyNames pattern\n got %q\nwant %q", got, want)
+	}
+	for _, w := range credentialWords {
+		for _, k := range []string{w, strings.ToUpper(w), "example.com/" + w, "x-" + strings.ToUpper(w[:1]) + w[1:] + "-id"} {
+			if !labelKeyPattern.MatchString(k) {
+				t.Errorf("pattern does not match %q", k)
 			}
+		}
+	}
+	for _, k := range []string{"example.com/run-id", "app.kubernetes.io/name", "topology.kubernetes.io/zone", "ate.actor.state"} {
+		if labelKeyPattern.MatchString(k) {
+			t.Errorf("pattern matches ordinary key %q", k)
 		}
 	}
 }

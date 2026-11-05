@@ -147,10 +147,20 @@
         "create_time": { "type": "string", "format": "date-time" },
         "update_time": { "type": "string", "format": "date-time" },
         "crash": { "$ref": "#/$defs/Crash" },
-        "labels": { "type": "object", "additionalProperties": { "type": "string" } }
+        "labels": {
+          "description": "The actor's labels as data. A key must not name a credential: it must not contain token, password, authorization, secret or credential in any letter case.",
+          "type": "object",
+          "propertyNames": {
+            "not": {
+              "pattern": "[Tt][Oo][Kk][Ee][Nn]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]"
+            }
+          },
+          "additionalProperties": { "type": "string" }
+        }
       }
     },
     "Crash": {
+      "description": "The control plane's crash record. Set when the actor entered crashed; it stays while a crashed actor is deleting or reverting and is cleared when a revert returns the actor to suspended, so it can accompany any state.",
       "type": "object",
       "additionalProperties": false,
       "required": ["message", "crash_time"],

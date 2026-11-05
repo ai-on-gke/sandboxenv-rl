@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import pathlib
+import time
 
 import pytest
 
@@ -100,15 +100,14 @@ async def test_covers_every_node_of_every_domain(fake_stack, tmp_path):
     data = json.loads(out.read_text())
     assert data["schema_version"] == "v1" and data["run_id"] == "pf-test"
     assert data["plan"] == "image-placement.json" and data["complete"] is True
-    fixture = pathlib.Path(__file__).resolve().parents[3] / (
-        "internal/benchmarking/schema/testdata/preflight_coverage.json"
-    )
-    if fixture.exists():
-        go = json.loads(fixture.read_text())
-        assert set(data) <= set(go)
-        assert set(data["goldens"][0]) <= set(go["goldens"][0])
-        assert set(data["domains"][0]) == set(go["domains"][0])
-        assert set(data["domains"][0]["images"][0]) <= set(go["domains"][1]["images"][0])
+    # The keys of the Go loader's preflight-coverage.json (schema v1), fixed
+    # here so the check does not depend on the Go fixture being on the branch.
+    assert set(data) == {"schema_version", "run_id", "started_at", "finished_at", "plan",
+                         "goldens", "domains", "complete"}
+    assert set(data["goldens"][0]) == {"image", "template", "state", "tag", "wait_ms"}
+    assert set(data["domains"][0]) == {"name", "nodes", "nodes_seen", "images", "complete"}
+    assert set(data["domains"][0]["images"][0]) == {"image", "nodes", "wanted", "probes",
+                                                   "failed", "rounds", "complete"}
 
 
 async def test_streams_ready_goldens_and_gives_up_on_a_stalled_one(fake_stack):
@@ -215,3 +214,46 @@ async def test_subsets_concurrency_cap_and_validation(fake_stack):
         ImagePlacement.from_dict({"schema_version": "v0"})
     with pytest.raises(ValueError, match="pinned by digest"):
         ImagePlacement.from_dict({**PLAN, "images": [{"image": "reg/x:latest", "domains": ["d0"]}]})
+
+
+async def test_cancel_mid_round_deletes_the_probes_and_returns_at_once(fake_stack):
+    client, fakes = fake_stack
+    fakes.environments.domain_nodes = dict(NODES)
+    _set_golden(fakes, IMG_A, env_pb2.GOLDEN_SNAPSHOT_STATE_READY)
+    # b's golden never comes, so a cancel also has to stop the golden poller
+    # instead of waiting for golden_timeout.
+    created = asyncio.Event()
+    hold = asyncio.Event()
+    original_get = client.get
+
+    async def get(env_id, **kw):
+        created.set()
+        await hold.wait()
+        return await original_get(env_id, **kw)
+
+    client.get = get  # type: ignore[method-assign]
+    run = asyncio.create_task(_warmer(client, golden_timeout=30.0, probe_timeout=30.0).run())
+    await asyncio.wait_for(created.wait(), 5)
+    assert fakes.environments.environments, "the probes of a's first round exist"
+    started = time.monotonic()
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+    assert time.monotonic() - started < 5, "the cancel did not wait for golden_timeout"
+    assert fakes.environments.environments == {}, "every probe was deleted"
+    assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()
+                and "preflight" in repr(t.get_coro())], "no warmer task is left pending"
+
+
+async def test_cancel_during_the_golden_wait_returns_at_once(fake_stack):
+    client, fakes = fake_stack
+    fakes.environments.domain_nodes = dict(NODES)
+    # Neither golden comes: the run sits in the golden wait until cancelled.
+    run = asyncio.create_task(_warmer(client, golden_timeout=30.0).run())
+    await asyncio.sleep(0.05)
+    started = time.monotonic()
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run
+    assert time.monotonic() - started < 5
+    assert fakes.environments.environments == {}

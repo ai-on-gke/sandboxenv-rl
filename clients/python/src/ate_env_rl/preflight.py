@@ -439,14 +439,32 @@ class PreflightWarmer:
         try:
             await self._ensure_templates()
             poller = asyncio.create_task(self._poll_goldens())
+            domain_tasks = [asyncio.create_task(self._cover_domain(d)) for d in self._domains]
             try:
-                domains = await asyncio.gather(*(self._cover_domain(d) for d in self._domains))
+                # return_exceptions keeps a cancelled or failed domain from
+                # ending this await while the others still delete their
+                # probes; the first error is raised below, once all are done.
+                results = await asyncio.gather(*domain_tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                await _await_all(domain_tasks)
+                raise
             finally:
-                await poller
+                # A run that ends early (cancelled, or a domain failed) must
+                # not wait for the goldens still baking: stop the poller, which
+                # settles them as cancelled, and let a cancel of this task
+                # through once it has.
+                if not poller.done():
+                    poller.cancel()
+                await asyncio.gather(poller, return_exceptions=True)
         finally:
             coverage.goldens = [self._goldens[img].record for img in self._images]
             coverage.finished_at = datetime.now(timezone.utc)
-        coverage.domains = list(domains)
+        domains: list[DomainCoverage] = []
+        for r in results:
+            if isinstance(r, BaseException):
+                raise r
+            domains.append(r)
+        coverage.domains = domains
         coverage.complete = all(g.ok for g in self._goldens.values()) and all(
             d.complete for d in domains
         )
@@ -602,11 +620,17 @@ class PreflightWarmer:
                 started.add(pick)
                 ii, image = items[pick]
                 tasks.append(asyncio.create_task(cover(pick, ii, image)))
-            await asyncio.gather(*tasks)
+            for r in await asyncio.gather(*tasks, return_exceptions=True):
+                if isinstance(r, BaseException):
+                    raise r
         except asyncio.CancelledError:
+            # The images still running finish their probes' deletes before
+            # this re-raises; a task that was already cancelled through the
+            # gather above is not cancelled again.
             for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+                if not t.done():
+                    t.cancel()
+            await _await_all(tasks)
             raise
 
         dc = DomainCoverage(name=d.name, nodes=d.nodes)
@@ -648,9 +672,15 @@ class PreflightWarmer:
                 *(
                     self._probe(f"{self.run_id}-{di}-{ii}-{rnd}-{k}", image, d)
                     for k in range(width)
-                )
+                ),
+                return_exceptions=True,
             )
-            for node, err in outcomes:
+            for outcome in outcomes:
+                if isinstance(outcome, BaseException):
+                    # _probe reports its own errors; this is a cancel or a
+                    # bug, and the round cannot be scored.
+                    raise outcome
+                node, err = outcome
                 ic.probes += 1
                 if err:
                     ic.failed += 1
@@ -699,12 +729,28 @@ class PreflightWarmer:
                 if not node:
                     raise RuntimeError("the environment reports no node")
         except asyncio.CancelledError:
-            await self._delete(env_id, env)
+            await self._delete_through_cancel(env_id, env)
             raise
         except Exception as e:
             error = str(e)
-        await self._delete(env_id, env)
+        await self._delete_through_cancel(env_id, env)
         return node, error
+
+    async def _delete_through_cancel(self, env_id: str, env: Any) -> None:
+        """Delete the probe and wait for it even if this task is cancelled
+        again meanwhile, so a cancel mid-round strands nothing; the delete's
+        own 60 s timeout bounds the wait."""
+        delete = asyncio.ensure_future(self._delete(env_id, env))
+        while True:
+            try:
+                await asyncio.shield(delete)
+                return
+            except asyncio.CancelledError:
+                if delete.done():
+                    raise
+                # Keep waiting for the delete; the cancel is re-raised by the
+                # caller once the probe is gone.
+                continue
 
     async def _delete(self, env_id: str, env: Any) -> None:
         try:
@@ -723,6 +769,19 @@ class PreflightWarmer:
         if self.observer is None:
             return _NoPhase()
         return self.observer.phase(name)
+
+
+async def _await_all(tasks: list[asyncio.Task[Any]]) -> None:
+    """Wait for every task to finish, through cancels of the waiter: a task
+    cancelled during its cleanup would otherwise strand what it was deleting."""
+    while True:
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            return
+        except asyncio.CancelledError:
+            if all(t.done() for t in tasks):
+                raise
+            continue
 
 
 class _NoPhase:

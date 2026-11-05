@@ -206,7 +206,9 @@ def make_env(fake, tmp_path, task_dir):
         return AteEnvEnvironment(
             environment_dir=environment_dir or task_dir / "environment",
             environment_name="echo",
-            session_id=session_id or f"{SESSION}{n}",
+            # Unique per environment, and ending in "__env" like Harbor's agent
+            # environment session ids (the record file is told by that suffix).
+            session_id=session_id or f"echo__AbCdEf{n}__env",
             trial_paths=paths,
             task_env_config=cfg,
             **options,

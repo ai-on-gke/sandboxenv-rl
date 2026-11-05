@@ -393,11 +393,17 @@ func preflightCmd(args []string, stderr io.Writer) (retErr error) {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("preflight takes no positional arguments, got %q", fs.Args())
+	}
 	if *plan == "" {
 		return fmt.Errorf("-plan is required")
 	}
 	if *eventsDir == "" && *out == "" {
 		return fmt.Errorf("-events-dir or -out is required")
+	}
+	if *eventsDir != "" && *out != "" {
+		return fmt.Errorf("-events-dir and -out exclude each other")
 	}
 	placement, err := swebench.ReadImagePlacement(*plan)
 	if err != nil {

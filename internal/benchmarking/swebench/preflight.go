@@ -142,12 +142,13 @@ func NewPreflightWarmer(opts PreflightOptions) (*PreflightWarmer, error) {
 			return nil, fmt.Errorf("preflight: the plan does not place %q", img)
 		}
 	}
-	for _, d := range opts.Plan.Domains {
+	w := &PreflightWarmer{opts: opts}
+	// Only the domains of the pass: an unselected pool's slots do not bound it.
+	for _, d := range w.domains() {
 		if d.NodeSlots > 0 && opts.ProbesPerNode > d.NodeSlots {
 			return nil, fmt.Errorf("preflight: %d probes per node exceed the %d node slots of domain %s", opts.ProbesPerNode, d.NodeSlots, d.Name)
 		}
 	}
-	w := &PreflightWarmer{opts: opts}
 	if len(w.images()) == 0 {
 		return nil, errors.New("preflight: no image of the pass is placed in its domains")
 	}
@@ -275,9 +276,12 @@ type goldenWait struct {
 	task    int
 	done    chan struct{}
 	ensured time.Time
-	settled bool
-	ok      bool
-	rec     schema.GoldenRecord
+	// template is the derived template's name once ensured, so a record
+	// settled by a timeout or a cancel still names it.
+	template string
+	settled  bool
+	ok       bool
+	rec      schema.GoldenRecord
 }
 
 func newGoldenTracker(images []string, now time.Time) *goldenTracker {
@@ -304,6 +308,13 @@ func (t *goldenTracker) settle(img string, rec schema.GoldenRecord, ok bool, now
 	close(t.changed)
 	t.changed = make(chan struct{})
 	return gw, true
+}
+
+// template is the derived template name of an ensured image, or "".
+func (t *goldenTracker) template(img string) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.waits[img].template
 }
 
 func (t *goldenTracker) pending() []string {
@@ -359,6 +370,7 @@ func (w *PreflightWarmer) ensureTemplates(ctx context.Context, images []string, 
 		w.record(Event{Event: EventPreflightTemplate, Task: i, Image: img, Env: st.Template, DurMS: DurMS(o.now().Sub(t0)), OK: err == nil, Err: errString(err)})
 		t.mu.Lock()
 		t.waits[img].ensured = o.now()
+		t.waits[img].template = st.Template
 		t.mu.Unlock()
 		if err != nil {
 			w.settleGolden(t, img, schema.GoldenRecord{Image: img, State: "failed", Error: err.Error()}, false)
@@ -417,7 +429,7 @@ func (w *PreflightWarmer) pollGoldens(ctx context.Context, t *goldenTracker) {
 		select {
 		case <-ctx.Done():
 			for _, img := range pending {
-				w.settleGolden(t, img, schema.GoldenRecord{Image: img, State: "pending", Error: ctx.Err().Error()}, false)
+				w.settleGolden(t, img, schema.GoldenRecord{Image: img, Template: t.template(img), State: "pending", Error: ctx.Err().Error()}, false)
 			}
 			return
 		case <-time.After(o.GoldenPoll):
@@ -433,7 +445,7 @@ func (w *PreflightWarmer) pollGoldens(ctx context.Context, t *goldenTracker) {
 		})
 		if stalled := o.now().Sub(t.lastProgress()); stalled > o.GoldenTimeout {
 			for _, img := range t.pending() {
-				w.settleGolden(t, img, schema.GoldenRecord{Image: img, State: "pending", Error: fmt.Sprintf("golden still pending after %s without progress", o.GoldenTimeout)}, false)
+				w.settleGolden(t, img, schema.GoldenRecord{Image: img, Template: t.template(img), State: "pending", Error: fmt.Sprintf("golden still pending after %s without progress", o.GoldenTimeout)}, false)
 			}
 			return
 		}
@@ -581,31 +593,43 @@ func (w *PreflightWarmer) coverImage(ctx context.Context, di, ii int, d schema.P
 			w.record(Event{Event: EventPreflightProbe, Image: img, Env: id, Node: node, Attempts: round, DurMS: DurMS(o.now().Sub(t0)), OK: err == nil, Err: errString(err), Labels: map[string]string{"domain": d.Name}})
 			outcomes[k] = outcome{id: id, sb: sb, node: node, err: err}
 		})
+		started, roundFailed := 0, 0
 		for _, oc := range outcomes {
 			if oc.id == "" {
-				continue
+				continue // a slot forEach never started: the context ended
 			}
+			started++
 			ic.Probes++
 			if oc.err != nil {
 				ic.Failed++
+				roundFailed++
 				ic.Error = oc.err.Error()
 			} else {
 				nodes[oc.node] = true
 			}
+		}
+		// Delete the round's probes together, each within the cleanup budget,
+		// whatever happened to ctx: a wide domain would otherwise wait on one
+		// delete after another.
+		forEach(context.Background(), width, width, func(k int) {
+			oc := outcomes[k]
+			if oc.id == "" {
+				return
+			}
+			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+			defer cancel()
 			if oc.sb == nil {
 				// A create that failed client-side may exist server-side.
 				if del, ok := o.Backend.(Backend); ok {
-					_ = del.Delete(context.WithoutCancel(ctx), oc.id)
+					_ = del.Delete(rctx, oc.id)
 				}
-				continue
+				return
 			}
-			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
 			if err := oc.sb.Delete(rctx); err != nil {
 				o.Logger.Warn("preflight: delete failed", slog.String("env", oc.id), slog.Any("err", err))
 			}
-			cancel()
-		}
-		if ic.Probes > 0 && ic.Failed == ic.Probes {
+		})
+		if started > 0 && roundFailed == started {
 			// Nothing of this round came up: the image, the domain or the
 			// cluster is the problem, and more rounds would not change it.
 			o.Logger.Warn("preflight: every probe of the round failed", slog.String("image", img), slog.String("domain", d.Name), slog.String("err", ic.Error))
@@ -665,11 +689,9 @@ func (w *PreflightWarmer) record(e Event) {
 	w.opts.Recorder.Record(e)
 }
 
-// GoldenSettled reports whether a golden record needs no more waiting for
-// the run: ready, or none when goldens are disabled.
-func GoldenSettled(g schema.GoldenRecord) bool {
-	return g.State == "ready" || (g.State == "none" && g.Error == "")
-}
+// GoldenSettled is schema.GoldenSettled: ready, or none when goldens are
+// disabled on the base template.
+func GoldenSettled(g schema.GoldenRecord) bool { return schema.GoldenSettled(g) }
 
 // shortfall summarises what kept the pass from completing.
 func (w *PreflightWarmer) shortfall(r *schema.PreflightCoverage) string {
@@ -727,6 +749,7 @@ func sortedKeys(m map[string]bool) []string {
 
 // WritePreflightCoverage validates c and writes it as indented JSON.
 func WritePreflightCoverage(path string, c *schema.PreflightCoverage) error {
+	c.Normalize()
 	if err := c.Validate(); err != nil {
 		return err
 	}

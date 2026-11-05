@@ -86,6 +86,9 @@ type fakeAPI struct {
 	goldenReadyAfter int
 	goldenFail       map[string]string
 	goldenDisabled   bool
+	// createFailAfter makes every CreateEnvironment after that many fail
+	// with ResourceExhausted, as a full pool does.
+	createFailAfter int
 	// goldenPendingForever names images whose golden never gets ready.
 	goldenPendingForever map[string]bool
 	ensured              []string
@@ -99,6 +102,9 @@ type fakeAPI struct {
 func (f *fakeAPI) CreateEnvironment(_ context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (*ateenvv1alpha.CreateEnvironmentResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.createFailAfter > 0 && len(f.created) >= f.createFailAfter {
+		return nil, status.Error(codes.ResourceExhausted, "no worker has room for the actor")
+	}
 	f.created = append(f.created, req.GetId())
 	f.selectors[req.GetId()] = req.GetWorkerSelector()
 	f.images[req.GetId()] = req.GetRootfsImage()

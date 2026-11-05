@@ -781,6 +781,12 @@ func TestPreflightCmd(t *testing.T) {
 	if err := preflightCmd([]string{"-events-dir", events}, &stderr); err == nil {
 		t.Error("missing -plan accepted")
 	}
+	if err := preflightCmd([]string{"-plan", plan, "-events-dir", events, "stray"}, &stderr); err == nil || !strings.Contains(err.Error(), "positional") {
+		t.Errorf("a positional argument: err = %v, want a refusal", err)
+	}
+	if err := preflightCmd([]string{"-plan", plan, "-events-dir", events, "-out", filepath.Join(dir, "x.jsonl")}, &stderr); err == nil || !strings.Contains(err.Error(), "exclude") {
+		t.Errorf("-events-dir with -out: err = %v, want a refusal", err)
+	}
 	if err := preflightCmd([]string{"-plan", plan}, &stderr); err == nil {
 		t.Error("missing -events-dir and -out accepted")
 	}

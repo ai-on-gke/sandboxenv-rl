@@ -297,7 +297,9 @@ staying the source of truth so a run does not depend on a collector.
    image's derived template, which starts its golden bake (5 at a time per
    ateapi replica, about two minutes each: scale `ate-api-server` for a
    large image set), then warms every domain in parallel: as soon as an
-   image's golden is ready it creates probe environments with the domain's
+   image's golden has settled (ready; `none` when the base template disables
+   goldens; failed or given up on, which still fills the layers by cold
+   boots) it creates probe environments with the domain's
    worker selector, round after round, until every node of the domain has
    run the image once. A domain warms `-image-concurrency` images at once
    (default 4; `node_slots` in `domains.json` caps it at

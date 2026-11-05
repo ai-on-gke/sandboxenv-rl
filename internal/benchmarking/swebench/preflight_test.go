@@ -18,9 +18,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,6 +92,9 @@ func runPreflight(t *testing.T, api *fakeAPI, mutate func(*PreflightOptions)) (*
 		if line == "" {
 			continue
 		}
+		if err := schema.ValidateAgainstJSONSchema("event.schema.json", []byte(line)); err != nil {
+			t.Fatalf("event schema %q: %v", line, err)
+		}
 		var e Event
 		if err := json.Unmarshal([]byte(line), &e); err != nil {
 			t.Fatalf("event %q: %v", line, err)
@@ -98,6 +103,13 @@ func runPreflight(t *testing.T, api *fakeAPI, mutate func(*PreflightOptions)) (*
 	}
 	if err := report.Validate(); err != nil {
 		t.Fatalf("report does not validate: %v", err)
+	}
+	rawReport, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := schema.ValidateAgainstJSONSchema("preflight_coverage.schema.json", rawReport); err != nil {
+		t.Fatalf("report JSON schema: %v", err)
 	}
 	return report, runErr, events
 }
@@ -444,5 +456,93 @@ func TestPreflightRetriesTransientFirstCommand(t *testing.T) {
 	})
 	if err == nil || report.Complete {
 		t.Fatalf("non-zero probe exit: err=%v complete=%v, want failure", err, report.Complete)
+	}
+}
+
+type cancelAfterFirstErrCtx struct {
+	context.Context
+	cancel func()
+	checks atomic.Int32
+}
+
+func (c *cancelAfterFirstErrCtx) Err() error {
+	if c.checks.Add(1) == 1 {
+		c.cancel()
+		return nil
+	}
+	return c.Context.Err()
+}
+
+func TestPreflightCancellationSkipsUnstartedProbes(t *testing.T) {
+	api := newPreflightFake()
+	api.goldenReadyAfter = 0
+	api.domainNodes["d0"] = []string{"n0", "n1", "n2", "n3"}
+
+	plan := twoDomainPlan()
+	plan.Domains[0].Nodes = 4
+	w, err := NewPreflightWarmer(PreflightOptions{
+		Plan:          plan,
+		Backend:       newFakeBackend(t, api),
+		RunID:         "pf-cancel",
+		ProbesPerNode: 4,
+		Images:        []string{pfImgA},
+		Domains:       []string{"d0"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Deterministically cancel right after coverImage's round condition check
+	// so forEach stops with unstarted outcome slots (oc.id == "").
+	inner, innerCancel := context.WithCancel(context.Background())
+	ic := w.coverImage(&cancelAfterFirstErrCtx{Context: inner, cancel: innerCancel}, 0, 0, plan.Domains[0], pfImgA)
+	for _, n := range ic.Nodes {
+		if n == "" {
+			t.Fatalf("empty node recorded from unstarted slot: %+v", ic)
+		}
+	}
+	if ic.Probes >= 16 {
+		t.Fatalf("unstarted probe slots counted: probes=%d, want < 16", ic.Probes)
+	}
+
+	// Cancel mid-round during Run via CreateEnvironment callback.
+	ctx, cancel := context.WithCancel(context.Background())
+	api.onCreate = func(string) { cancel() }
+	report, runErr := w.Run(ctx)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("Run err = %v, want context.Canceled", runErr)
+	}
+	if report.Complete {
+		t.Fatalf("cancelled report marked complete: %+v", report)
+	}
+	if err := report.Validate(); err != nil {
+		t.Fatalf("cancelled report.Validate: %v", err)
+	}
+	raw, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := schema.ValidateAgainstJSONSchema("preflight_coverage.schema.json", raw); err != nil {
+		t.Fatalf("cancelled report schema: %v\n%s", err, string(raw))
+	}
+
+	// Pre-cancelled context before Run starts: domain coverage still
+	// validates and can be written by WritePreflightCoverage.
+	api.onCreate = nil
+	preCtx, preCancel := context.WithCancel(context.Background())
+	preCancel()
+	report2, runErr2 := w.Run(preCtx)
+	if !errors.Is(runErr2, context.Canceled) {
+		t.Fatalf("pre-cancelled Run err = %v, want context.Canceled", runErr2)
+	}
+	if err := report2.Validate(); err != nil {
+		t.Fatalf("pre-cancelled report.Validate: %v", err)
+	}
+	raw2, err := json.Marshal(report2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := schema.ValidateAgainstJSONSchema("preflight_coverage.schema.json", raw2); err != nil {
+		t.Fatalf("pre-cancelled report schema: %v\n%s", err, string(raw2))
 	}
 }

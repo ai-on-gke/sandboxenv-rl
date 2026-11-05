@@ -93,6 +93,7 @@ type fakeAPI struct {
 	images map[string]string
 	// inflight and maxInflight count the environments alive per domain.
 	inflight, maxInflight map[string]int
+	onCreate              func(id string)
 }
 
 func (f *fakeAPI) CreateEnvironment(_ context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (*ateenvv1alpha.CreateEnvironmentResponse, error) {
@@ -114,6 +115,10 @@ func (f *fakeAPI) CreateEnvironment(_ context.Context, req *ateenvv1alpha.Create
 	f.nodes[req.GetId()] = node
 	f.inflight[domain]++
 	f.maxInflight[domain] = max(f.maxInflight[domain], f.inflight[domain])
+	cb := f.onCreate
+	if cb != nil {
+		cb(req.GetId())
+	}
 	return &ateenvv1alpha.CreateEnvironmentResponse{Environment: &ateenvv1alpha.Environment{Id: req.GetId(), Atespace: req.GetAtespace(), WorkerSelector: req.GetWorkerSelector()}}, nil
 }
 

@@ -447,6 +447,15 @@ func (w *PreflightWarmer) pollGoldens(ctx context.Context, t *goldenTracker) {
 // imageWidth x nodes x ProbesPerNode probes in flight.
 func (w *PreflightWarmer) cover(ctx context.Context, domains []schema.PlacementDomain, t *goldenTracker) ([]schema.DomainCoverage, bool) {
 	results := make([]schema.DomainCoverage, len(domains))
+	for di, d := range domains {
+		imgs := []schema.ImageCoverage{}
+		for _, e := range w.opts.Plan.Images {
+			if _, ok := t.waits[e.Image]; ok && contains(e.Domains, d.Name) {
+				imgs = append(imgs, schema.ImageCoverage{Image: e.Image, Nodes: []string{}, Wanted: d.Nodes, Error: "not started"})
+			}
+		}
+		results[di] = schema.DomainCoverage{Name: d.Name, Nodes: d.Nodes, NodesSeen: []string{}, Images: imgs, Complete: len(imgs) == 0}
+	}
 	forEach(ctx, len(domains), len(domains), func(di int) {
 		d := domains[di]
 		planDI := w.domainIndex(d.Name)
@@ -573,6 +582,9 @@ func (w *PreflightWarmer) coverImage(ctx context.Context, di, ii int, d schema.P
 			outcomes[k] = outcome{id: id, sb: sb, node: node, err: err}
 		})
 		for _, oc := range outcomes {
+			if oc.id == "" {
+				continue
+			}
 			ic.Probes++
 			if oc.err != nil {
 				ic.Failed++
@@ -581,11 +593,9 @@ func (w *PreflightWarmer) coverImage(ctx context.Context, di, ii int, d schema.P
 				nodes[oc.node] = true
 			}
 			if oc.sb == nil {
-				if oc.id != "" {
-					// A create that failed client-side may exist server-side.
-					if del, ok := o.Backend.(Backend); ok {
-						_ = del.Delete(context.WithoutCancel(ctx), oc.id)
-					}
+				// A create that failed client-side may exist server-side.
+				if del, ok := o.Backend.(Backend); ok {
+					_ = del.Delete(context.WithoutCancel(ctx), oc.id)
 				}
 				continue
 			}
@@ -595,7 +605,7 @@ func (w *PreflightWarmer) coverImage(ctx context.Context, di, ii int, d schema.P
 			}
 			cancel()
 		}
-		if ic.Failed == ic.Probes {
+		if ic.Probes > 0 && ic.Failed == ic.Probes {
 			// Nothing of this round came up: the image, the domain or the
 			// cluster is the problem, and more rounds would not change it.
 			o.Logger.Warn("preflight: every probe of the round failed", slog.String("image", img), slog.String("domain", d.Name), slog.String("err", ic.Error))
@@ -646,9 +656,13 @@ func probeID(runID string, domain, image, round, slot int) string {
 }
 
 func (w *PreflightWarmer) record(e Event) {
-	if w.opts.Recorder != nil {
-		w.opts.Recorder.Record(e)
+	if w.opts.Recorder == nil {
+		return
 	}
+	if e.RunID == "" {
+		e.RunID = w.opts.RunID
+	}
+	w.opts.Recorder.Record(e)
 }
 
 // GoldenSettled reports whether a golden record needs no more waiting for

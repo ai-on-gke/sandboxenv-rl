@@ -231,7 +231,7 @@ func (s *Server) GetImageStatus(ctx context.Context, req *ateenvv1alpha.GetImage
 	}
 	// The same conflict a create reports: a template under the derived name
 	// that runs another image is not this image's template.
-	if got := firstContainerImage(tmpl); tmpl != nil && got != req.GetRootfsImage() {
+	if got := firstContainerImage(tmpl); tmpl != nil && !sameImageDigest(got, req.GetRootfsImage()) {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"actor template %q exists but runs %q, not %q; delete it or use another base template", name, got, req.GetRootfsImage())
 	}

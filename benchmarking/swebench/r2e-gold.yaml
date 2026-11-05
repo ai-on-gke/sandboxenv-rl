@@ -43,7 +43,6 @@ steps:
     write:
       path: /tmp/r2e-grade.sh
       content: "{{.Command}}"
-      mode: "0755"
   - name: grade
     run: /bin/bash /tmp/r2e-grade.sh
     think: 3s

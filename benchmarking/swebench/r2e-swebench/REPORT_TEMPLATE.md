@@ -110,7 +110,7 @@ Populate from `$ARTIFACT_DIR/comparison.json` / `comparison.md`, per-arm `report
   `Create` + `Suspend` prewarm; container has not booted yet).
 - **`TTFI` start (`p50/p90/p95 ms`)**: Sandbox requested -> container restored and 1st command
   starts running inside the guest (join `events/*.jsonl` `ttfi`/`wake` start `ts - dur_ms` to
-  `restore_timings.jsonl` `time`, or sum `handle_claim` + demand-wake routing + `atelet` `total`
+  `atelet_restores.jsonl` `time`, or sum `handle_claim` + demand-wake routing + `atelet` `total`
   restore).
 - **`TTFC / Wake` 1st cmd (`ms`)**: Client `stats[event="ttfi"]` (`none`) or `stats[event="wake"]`
   (warm-pool strategies), which **includes execution of `step=baseline`** inside the sandbox.
@@ -167,7 +167,7 @@ operation does not occur in the selected strategy (for example `ttfc` on `100%` 
 | `sandbox_create`         | `CreateEnvironment` / SDK sandbox claim                   | `stats[event="create"]`                                            | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
 | `prewarm`                | Warm-pool sandbox create + suspend                        | `stats[event="prewarm"]` or summed `create + suspend`              | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
 | `handle_claim`           | Sandbox requested -> `SUSPENDED` handle returned          | `custom_metrics.wire_claim_to_ready_ms` (`0` on warm-pool hit)     | `<n>` |    `-` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
-| `ttfi` (cmd start)       | Sandbox requested -> container restored & 1st cmd running | `events/*.jsonl` (`ts - dur_ms`) -> `restore_timings.jsonl` `time` | `<n>` |    `-` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
+| `ttfi` (cmd start)       | Sandbox requested -> container restored & 1st cmd running | `events/*.jsonl` (`ts - dur_ms`) -> `atelet_restores.jsonl` `time` | `<n>` |    `-` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
 | `first_cmd_exec`         | First command issued -> first command finished            | `custom_metrics.ready_to_first_cmd_ms` / `stats[step/baseline]`    | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
 | `ttfc` (cmd finished)    | Sandbox requested -> first command finished               | `stats[event="ttfi"]`                                              | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
 | `suspend`                | `SuspendEnvironment` checkpoint                           | `stats[event="suspend"]`                                           | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |

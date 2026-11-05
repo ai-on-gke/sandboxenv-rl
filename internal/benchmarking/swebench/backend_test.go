@@ -107,9 +107,10 @@ func (f *fakeAPI) CreateEnvironment(_ context.Context, req *ateenvv1alpha.Create
 	if list := f.domainNodes[domain]; len(list) > 0 {
 		idx := 0
 		if !f.sameNode {
-			idx = f.domainCounter[domain] % len(list)
+			key := domain + "\x00" + req.GetRootfsImage()
+			idx = f.domainCounter[key] % len(list)
+			f.domainCounter[key]++
 		}
-		f.domainCounter[domain]++
 		node = list[idx]
 	}
 	f.nodes[req.GetId()] = node

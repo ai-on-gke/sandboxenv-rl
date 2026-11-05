@@ -52,7 +52,7 @@ See [docs/architecture.md](./docs/architecture.md) for the full system design an
 
 | Path | What it is |
 |---|---|
-| [`cmd/ate-env`](./cmd/ate-env) | CLI: create, suspend and delete environments, run commands, move files, and print the Kubernetes and Substrate manifests. |
+| [`cmd/ate-env`](./cmd/ate-env) | CLI: create, get, suspend and delete environments, run commands, move files, and print the Kubernetes and Substrate manifests. |
 | [`cmd/ate-env-api`](./cmd/ate-env-api) | The API service: environment lifecycle, guest calls, MCP and the port proxy. |
 | [`cmd/ate-env-guest`](./cmd/ate-env-guest), [`guest/`](./guest) | The daemon inside each environment (a PID 1 init with sidecar supervision) and its services: `guest/process` and `guest/filesystem`. |
 | [`cmd/benchmarking`](./cmd/benchmarking) | The benchmark binaries: `swebench-loader` and the `bench` harness. |
@@ -128,8 +128,9 @@ supported means for each path.
 
 You need a cluster with Agent Substrate at or after
 [`48f5744c`](https://github.com/agent-substrate/substrate/commit/48f5744c), a snapshots bucket,
-`kubectl` with `kubectl-ate`, Go, [ko](https://ko.build), and Python 3.10 or later for the SDK. This
-repo publishes no release binaries or images yet, thus build them:
+`kubectl` with `kubectl-ate`, Go, [ko](https://ko.build), and Python 3.10 or later for the SDK. No
+release has been published yet; see [docs/release.md](./docs/release.md) for the release process.
+Build the CLI and images from source:
 
 ```bash
 git clone https://github.com/ai-on-gke/sandboxenv-rl && cd sandboxenv-rl
@@ -437,7 +438,7 @@ ate-env create dev1
 
 # Or run any digest-pinned image unmodified. ate-env-api derives a template
 # from default-template on first use (guest mounted in as an image volume)
-# and reuses it for later environments on the same image.
+# and reuses it for later environments on the same image or digest.
 ate-env create py1 --rootfs-image docker.io/library/python@sha256:<digest>
 
 # Or from the layered template above: the second runtime answers inside the
@@ -510,6 +511,7 @@ Available Commands:
   completion  Generate the autocompletion script for the specified shell
   create      Create and start an environment
   delete      Delete an environment
+  get         Show an environment: template, status, node and worker selector
   help        Help about any command
   manifest    Generate Kubernetes manifests to deploy the system
   server-info Show the ate-env-api server's version and features
@@ -827,6 +829,8 @@ make ci
 make ci-go
 make ci-python
 make ci-openhands
+make ci-harbor
+make ci-dafny
 make ci-e2e
 
 # Run Go and Python test suites with coverage and generate reports (see docs/chores/coverage.md)

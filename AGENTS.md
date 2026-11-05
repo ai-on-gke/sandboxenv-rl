@@ -1,12 +1,11 @@
 # sandboxenv-rl
 
-<!-- Last full audit: 2026-11-03 (commit 39e8ad4) -->
+<!-- Last full audit: 2026-11-04 (commit ae29368) -->
 
-Sandboxed execution environments for reinforcement learning and evaluation on Agent Substrate. Each
-environment runs as an isolated Substrate actor inside gVisor, supporting on-demand rootfs image
-derivation, interactive terminals, streaming file transfers, Model Context Protocol tools, and
-high-throughput Python fleet scheduling. See [README.md](./README.md) for usage and
-[docs/architecture.md](./docs/architecture.md) for design.
+Isolated execution environments for reinforcement learning and evaluation on Agent Substrate. Each
+environment runs as a gVisor actor supporting on-demand rootfs derivation, PTYs, file streaming, MCP
+tools, and Python fleet scheduling. See [README.md](./README.md) and
+[docs/architecture.md](./docs/architecture.md).
 
 ## Rules for contributors
 
@@ -40,60 +39,52 @@ high-throughput Python fleet scheduling. See [README.md](./README.md) for usage 
 
 - `internal/apiservice` owns host adapter translation and proxy routing; `guest/process` and
   `guest/filesystem` own in-environment execution; callers forward through `s.guestConn` with
-  `ensureAwake` and must not buffer full files or track process state inside `ate-env-api`; because
+  `ensureAwake` and must not buffer full files or track process state in `ate-env-api`; because
   `ate-env-api` is an unbuffered horizontal adapter (not enforced).
 - `apiservice.(*Server).guestConn` owns per-call guest gRPC dialing with wake verification; new
   proxy handlers call it and must not dial `atenet` directly; because `ensureAwake` handles actor
   restoration from storage (not enforced). `internal/ate.Client.DialGuest` dials `atenet` for
   `internal/mcp` without `ensureAwake` (known gap; not enforced). `internal/portproxy` owns raw
   `CONNECT` dialing and manages its own wake loop (not enforced).
-- `proto/ateenv/v1alpha` owns the interface contract between `ate-env-api` and `ate-env-guest`;
-  `internal/` and `clients/` call generated stubs and must not import `guest/` outside tests
-  (`guest/` and `cmd/ate-env-guest` must not import `internal/ate` or `go.ate.dev/substrate`);
-  because `ate-env-guest` runs inside task images without control-plane dependencies (not enforced).
+- `proto/ateenv/v1alpha` owns the contract between `ate-env-api` and `ate-env-guest`; `internal/`
+  and `clients/` call generated stubs and must not import `guest/` in production (`guest/` and
+  `cmd/ate-env-guest` must not import `internal/ate` or `go.ate.dev/substrate`); because
+  `ate-env-guest` runs inside task images without control-plane dependencies (not enforced).
 - `internal/apiservice` owns on-demand `ActorTemplate` derivation; `apiservice.Server` calls
-  `DeriveImageTemplate` and `ImageTemplateName` and callers must not construct derived templates
-  outside them (base templates come from `ate-env manifest template`, `buildActorTemplate` in
+  `DeriveImageTemplate` and `ImageTemplateName` and callers must not build derived templates outside
+  them (base templates via `ate-env manifest template`, `buildActorTemplate` in
   `cmd/ate-env/manifest.go`); because derived names (`<base>-<digest:12>`) must be deterministic and
-  idempotent across racing calls (not enforced).
-- `internal/mcp` and `internal/portproxy` own external protocol translation; `internal/mcp`
-  translates tool calls to guest RPCs via `ate.Client.DialGuest` (bypassing `apiservice`), while
-  `internal/portproxy` tunnels ports within allowed atespaces; callers must not bypass these
-  adapters; because external clients need translation and origin filtering (not enforced).
-- `internal/hostcheck` owns Host header validation for HTTP endpoints, and
-  `internal/apiservice.BearerAuth` owns token authentication; HTTP handlers wrap with
-  `hostcheck.(*Checker).Wrap` (and `BearerAuth` when `-auth-token-file` is configured) and must not
-  implement bespoke checks; because browsers can mount DNS-rebinding attacks against local daemons
-  (not enforced; `GET /healthz` is exempt from bearer auth).
-- `cmd/ate-env-guest` (`init_linux.go` and `sidecar.go`) owns PID 1 orphan reaping and sidecar
-  supervision, and `guest/process.Tracker` owns command subprocess lifecycle; callers invoke
-  `Tracker` methods and must not manage child processes directly; because PID 1's
-  `wait4(-1, WNOHANG)` loop reaps orphaned grandchildren, and non-PTY process groups
-  (`Setpgid: true`, PTY `Setsid: true`) must be signaled via negative PID (`-pid`) to prevent leaked
-  child trees (enforced by `runIfPID1`, `supervise`, and `guest/process.Tracker`).
+  idempotent across races (not enforced).
+- `internal/mcp` and `internal/portproxy` own external protocol translation; `internal/mcp` dials
+  `ate.Client.DialGuest` (bypassing `apiservice`), and `internal/portproxy` tunnels allowed
+  atespaces; callers must not bypass them; because external clients need translation and origin
+  filtering (not enforced).
+- `internal/hostcheck` owns Host header validation, and `internal/apiservice.BearerAuth` owns token
+  auth; HTTP handlers wrap with `hostcheck.(*Checker).Wrap` (and `BearerAuth` when
+  `-auth-token-file` is set) and must not re-implement checks; because browsers can DNS-rebind local
+  daemons (not enforced; `GET /healthz` is exempt from auth).
+- `cmd/ate-env-guest` (`init_linux.go`, `sidecar.go`) owns PID 1 reaping and sidecars, and
+  `guest/process.Tracker` owns subprocess lifecycle; callers invoke `Tracker` methods and must not
+  manage children directly; because PID 1's `wait4(-1, WNOHANG)` loop reaps orphans, and non-PTY
+  process groups (`Setpgid: true`, PTY `Setsid: true`) need `-pid` signals (enforced by `runIfPID1`,
+  `supervise`, and `guest/process.Tracker`).
 - `clients/python/src/ate_env_rl`'s `LoopRunner` owns sync-to-async bridging; synchronous callers
   (`SubstrateBackendDriver`, `SubstrateEnvClientRuntime`, `SandboxFleet`, `SandboxHandle`) dispatch
-  coroutines through `LoopRunner.run()` and must not call `asyncio.run()`; because `asyncio.run()`
-  destroys the thread event loop and corrupts cached HTTP/2 gRPC channels (not enforced).
+  through `LoopRunner.run()` and must not call `asyncio.run()`; because `asyncio.run()` destroys the
+  loop and corrupts cached HTTP/2 gRPC channels (not enforced).
 
-See [docs/architecture.md](./docs/architecture.md), [docs/glossary.md](./docs/glossary.md), and
-[docs/dev/concurrency-and-pitfalls.md](./docs/dev/concurrency-and-pitfalls.md).
+Docs: [docs/architecture.md](./docs/architecture.md), [docs/glossary.md](./docs/glossary.md),
+[docs/dev/concurrency-and-pitfalls.md](./docs/dev/concurrency-and-pitfalls.md),
+[docs/dev/code-layout.md](./docs/dev/code-layout.md).
 
 ## Repository layout
 
-See [docs/dev/code-layout.md](./docs/dev/code-layout.md) for package responsibilities, decision
-rules, and directory layout. Agent skills in `.agents/skills/`:
+Skills in `.agents/skills/`: [create-release](./.agents/skills/create-release/SKILL.md) (cut
+releases, PyPI/GHCR), [extend-env-surface](./.agents/skills/extend-env-surface/SKILL.md) (add
+RPC/tool), [maintain-docs](./.agents/skills/maintain-docs/SKILL.md) (sync/validate docs).
 
-- [create-release](./.agents/skills/create-release/SKILL.md): Draft and cut releases, push tags,
-  create draft GitHub releases, and publish to PyPI and GHCR.
-- [extend-env-surface](./.agents/skills/extend-env-surface/SKILL.md): Add or extend an RPC, guest
-  capability, MCP tool, or SDK method.
-- [maintain-docs](./.agents/skills/maintain-docs/SKILL.md): Author, update, and validate repository
-  documentation against code.
-
-Python naming conventions: repository directory `clients/python`, distribution package `ate-env-rl`,
-import module `ate_env_rl`. The direct environment handle is `ate_env_rl.Env`; the fleet handle is
-`ate_env_rl.SandboxHandle`.
+Python SDK: dir `clients/python`, package `ate-env-rl`, module `ate_env_rl`, handles
+`ate_env_rl.Env` and `ate_env_rl.SandboxHandle`.
 
 ## Build, test, verify
 
@@ -103,29 +94,27 @@ Run before opening a pull request:
 make verify-boilerplate
 make verify-gofmt
 make verify-docs
+make verify-protos
 make vet
 make test
 make python-test
 make nemo-gym-test
 make harbor-test
-python -m pytest integrations/openhands/tests benchmarking/swebench benchmarking/telemetry_report internal/benchmarking/swebench/trajectories examples/Qwen3-1.7B-verl/tests
-ruff check clients/python examples/verl_swebench benchmarking/telemetry_report
+make ci-dafny   # when touching docs/plans/telemetry/verify or modelled code
+python -m pytest integrations/openhands/tests benchmarking/swebench benchmarking/telemetry_report internal/benchmarking/swebench/trajectories examples/Qwen3-1.7B-verl/tests hack/release/test_create_release.py
+ruff check clients/python examples/verl_swebench benchmarking/telemetry_report hack/release
 ruff check --config clients/python/pyproject.toml examples/Qwen3-1.7B-verl
 ```
 
-Build targets: `make build` (Go packages), `make build-cli` (`bin/ate-env`), `make images` (via
-`ko`), `make format-docs` (Markdown docs), `make clean` (`bin/`).
-
-Regenerate protobuf stubs with `buf generate` (Go) and `make python-protos` (Python); never
-hand-edit generated files.
-
-Test doubles: use `internal/internaltest` (`fakecontrol`, `fakerouter`, `testcerts`) instead of
-custom mocks; see [docs/dev/code-layout.md](./docs/dev/code-layout.md).
+Targets: `make build` (Go), `make build-cli` (`bin/ate-env`), `make images` (`ko`),
+`make format-docs` (Markdown), `make clean` (`bin/`). Regenerate protos via `buf generate` (Go) and
+`make python-protos` (Python); never hand-edit generated files. Use `internal/internaltest`
+(`fakecontrol`, `fakerouter`, `testcerts`) for test doubles instead of custom mocks.
 
 ## Pull requests and commits
 
-- Fill out `.github/pull_request_template.md`, including the `Security impact` checklist. If any
-  security box is checked, update `docs/security/threat-model.md`.
+- Fill out `.github/pull_request_template.md`, including the `Security impact` checklist. Update
+  `docs/security/threat-model.md` if any security box is checked.
 - Start the pull request description with why the change is needed. Write `Fixes #N` only if the
   pull request fully resolves the issue.
 - Pull requests merge as a single squashed commit whose subject ends in `(#N)` and whose body lists

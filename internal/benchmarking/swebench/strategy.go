@@ -100,11 +100,13 @@ func (c *Config) strategyFanout() int {
 	return c.TasksPerImage
 }
 
-func (c *Config) strategyPasses() int {
-	if c.Mode == ModeSteps && c.Steps > 1 {
-		return c.Steps
+// strategyPark is the park policy a strategy run reports: none deletes each
+// environment after its replay, the others suspend into the warm pool.
+func (c *Config) strategyPark() Park {
+	if c.Strategy == StrategyNone {
+		return ParkDelete
 	}
-	return 1
+	return ParkSuspend
 }
 
 type strategyBatch struct {
@@ -112,7 +114,11 @@ type strategyBatch struct {
 	envs   []*environment
 }
 
-func (r *runner) planStrategyPass(pass int, tp *trajectoryPicker) ([]*environment, []strategyBatch, error) {
+// planStrategy builds the run's environments, one per instance and rollout,
+// and groups them by image into windows of effectiveWindowSize images. A
+// strategy runs one pass (validate refuses more), so each environment keeps
+// its EnvID name.
+func (r *runner) planStrategy(tp *trajectoryPicker) ([]*environment, []strategyBatch, error) {
 	fanout := r.cfg.strategyFanout()
 	envs := make([]*environment, 0, len(r.cfg.Instances)*fanout)
 	byImage := make(map[string][]*environment, len(r.cfg.Instances))
@@ -131,14 +137,10 @@ func (r *runner) planStrategyPass(pass int, tp *trajectoryPicker) ([]*environmen
 			if err != nil {
 				return nil, nil, err
 			}
-			base := EnvID(r.cfg.RunID, in.InstanceID, k)
-			id := base
-			if pass > 1 {
-				id = fmt.Sprintf("%s-s%d", base, pass)
-			}
+			id := EnvID(r.cfg.RunID, in.InstanceID, k)
 			e := &environment{
 				id:            id,
-				base:          base,
+				base:          id,
 				inst:          in,
 				task:          k,
 				traj:          traj,
@@ -170,25 +172,113 @@ func (r *runner) planStrategyPass(pass int, tp *trajectoryPicker) ([]*environmen
 	return envs, batches, nil
 }
 
+// warmPoolStats is the working-set bookkeeping of a strategy run. An
+// environment is in the warm pool from its suspend in warmBatch until the
+// claim that replays it or the delete that retires it, whichever comes
+// first; environment.inWarmPool records which, so a delete after a claim
+// (or after a failed suspend) does not count the environment out a second
+// time and lower the standing pool a concurrent prefetch is building.
+type warmPoolStats struct {
+	mu               sync.Mutex
+	hits             int
+	misses           int
+	created          int
+	reused           int
+	retired          int
+	cur              int
+	peak             int
+	prefetchMarginMS float64
+}
+
+// warmed counts a suspended environment into the pool.
+func (s *warmPoolStats) warmed(e *environment) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.created++
+	e.inWarmPool = true
+	s.cur++
+	if s.cur > s.peak {
+		s.peak = s.cur
+	}
+}
+
+// claimed counts a warm hit: e leaves the pool for its replay.
+func (s *warmPoolStats) claimed(e *environment) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.hits++
+	s.reused++
+	s.leaveLocked(e)
+}
+
+// missed counts a cold claim, and coldCreated its create.
+func (s *warmPoolStats) missed() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.misses++
+}
+
+func (s *warmPoolStats) coldCreated() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.created++
+}
+
+// retire counts a delete; an environment still in the pool leaves it.
+func (s *warmPoolStats) retire(e *environment) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.retired++
+	s.leaveLocked(e)
+}
+
+func (s *warmPoolStats) leaveLocked(e *environment) {
+	if e.inWarmPool {
+		e.inWarmPool = false
+		s.cur--
+	}
+}
+
+func (s *warmPoolStats) addPrefetchMargin(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.prefetchMarginMS += ms(d)
+}
+
+func (s *warmPoolStats) snapshot() WorkingSetStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var hitRate float64
+	if total := s.hits + s.misses; total > 0 {
+		hitRate = float64(s.hits) / float64(total)
+	}
+	return WorkingSetStats{
+		Hits:                 s.hits,
+		Misses:               s.misses,
+		HitRate:              hitRate,
+		StandingPoolSize:     s.peak,
+		Created:              s.created,
+		Reused:               s.reused,
+		Retired:              s.retired,
+		PrefetchLeadMarginMS: s.prefetchMarginMS,
+	}
+}
+
 // runStrategy executes Config.Strategy ("none", "naive", "sliding", or
 // "pipelined") with 1:1 lifecycle and working-set telemetry parity with
 // Python SandboxFleet.
 func (r *runner) runStrategy(ctx context.Context) error {
 	tp := r.newTrajectoryPicker()
-	passes := r.cfg.strategyPasses()
+	stepNum := 0
+	if r.cfg.Mode == ModeSteps {
+		stepNum = 1
+	}
+	envs, batches, err := r.planStrategy(tp)
+	if err != nil {
+		return err
+	}
 
-	var (
-		statsMu          sync.Mutex
-		hits             int
-		misses           int
-		created          int
-		reused           int
-		retired          int
-		curWarm          int
-		peakWarm         int
-		prefetchMarginMS float64
-	)
-
+	var ws warmPoolStats
 	sem := make(chan struct{}, max(1, r.cfg.Width))
 	acquireSlot := func(sctx context.Context) bool {
 		select {
@@ -200,15 +290,14 @@ func (r *runner) runStrategy(ctx context.Context) error {
 	}
 	releaseSlot := func() { <-sem }
 
-	warmBatch := func(wctx context.Context, batch []*environment, stepNum int) {
+	warmBatch := func(wctx context.Context, batch []*environment) {
 		forEach(wctx, len(batch), r.cfg.Width, func(i int) {
 			if !acquireSlot(wctx) {
 				return
 			}
 			defer releaseSlot()
 			e := batch[i]
-			// Pass 0 so r.create preserves e.id (which already carries -s<pass> when pass > 1).
-			if !r.createWithStepEvent(wctx, e, stepNum) {
+			if !r.create(wctx, e, stepNum) {
 				return
 			}
 			sStart := time.Now()
@@ -226,17 +315,11 @@ func (r *runner) runStrategy(ctx context.Context) error {
 			}
 			e.wsFresh = true
 			e.wsWake = true
-			statsMu.Lock()
-			created++
-			curWarm++
-			if curWarm > peakWarm {
-				peakWarm = curWarm
-			}
-			statsMu.Unlock()
+			ws.warmed(e)
 		})
 	}
 
-	execWarmBatch := func(ectx context.Context, batch []*environment, stepNum int) int {
+	execWarmBatch := func(ectx context.Context, batch []*environment) int {
 		var live int
 		var liveMu sync.Mutex
 		forEach(ectx, len(batch), r.cfg.Width, func(i int) {
@@ -248,13 +331,7 @@ func (r *runner) runStrategy(ctx context.Context) error {
 				return
 			}
 			defer releaseSlot()
-			statsMu.Lock()
-			hits++
-			reused++
-			if curWarm > 0 {
-				curWarm--
-			}
-			statsMu.Unlock()
+			ws.claimed(e)
 
 			r.replay(ectx, e, stepNum)
 			if !e.failed {
@@ -267,16 +344,17 @@ func (r *runner) runStrategy(ctx context.Context) error {
 				r.remove(cleanup, e, stepNum)
 				cancel()
 				if e.sb == nil {
-					statsMu.Lock()
-					retired++
-					statsMu.Unlock()
+					ws.retire(e)
 				}
 			}
 		})
 		return live
 	}
 
-	cleanupRemaining := func(envs []*environment, stepNum int) {
+	// cleanupRemaining deletes what a window left behind: environments the
+	// run never claimed (a cancelled window, a failed suspend) and ones
+	// whose delete after the replay failed.
+	cleanupRemaining := func(envs []*environment) {
 		if r.cfg.Keep {
 			return
 		}
@@ -287,197 +365,126 @@ func (r *runner) runStrategy(ctx context.Context) error {
 			if e.sb != nil {
 				r.remove(cleanup, e, stepNum)
 				if e.sb == nil {
-					statsMu.Lock()
-					retired++
-					if curWarm > 0 {
-						curWarm--
-					}
-					statsMu.Unlock()
+					ws.retire(e)
 				}
 			}
 		})
 	}
 
-	for pass := 1; pass <= passes; pass++ {
-		if ctx.Err() != nil {
-			break
-		}
-		stepNum := 0
-		if r.cfg.Mode == ModeSteps {
-			stepNum = pass
-		}
-		envs, batches, err := r.planStrategyPass(pass, tp)
-		if err != nil {
-			return err
-		}
+	start := time.Now()
+	var live int
 
-		passStart := time.Now()
-		var passLive int
-
-		switch r.cfg.Strategy {
-		case StrategyNone:
-			var liveMu sync.Mutex
-			forEach(ctx, len(envs), r.cfg.Width, func(i int) {
-				e := envs[i]
-				e.wsFresh = true
-				e.wsWake = false
-				statsMu.Lock()
-				misses++
-				statsMu.Unlock()
-				if r.createWithStepEvent(ctx, e, stepNum) {
-					statsMu.Lock()
-					created++
-					statsMu.Unlock()
-					r.replay(ctx, e, stepNum)
-					if !e.failed {
-						liveMu.Lock()
-						passLive++
-						liveMu.Unlock()
-					}
+	switch r.cfg.Strategy {
+	case StrategyNone:
+		var liveMu sync.Mutex
+		forEach(ctx, len(envs), r.cfg.Width, func(i int) {
+			e := envs[i]
+			e.wsFresh = true
+			e.wsWake = false
+			ws.missed()
+			if r.create(ctx, e, stepNum) {
+				ws.coldCreated()
+				r.replay(ctx, e, stepNum)
+				if !e.failed {
+					liveMu.Lock()
+					live++
+					liveMu.Unlock()
 				}
-				if !r.cfg.Keep && e.sb != nil {
-					cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-					r.remove(cleanup, e, stepNum)
-					cancel()
-					if e.sb == nil {
-						statsMu.Lock()
-						retired++
-						statsMu.Unlock()
-					}
+			}
+			if !r.cfg.Keep && e.sb != nil {
+				cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+				r.remove(cleanup, e, stepNum)
+				cancel()
+				if e.sb == nil {
+					ws.retire(e)
 				}
-			})
+			}
+		})
 
-		case StrategyNaive:
-			warmBatch(ctx, envs, stepNum)
+	case StrategyNaive:
+		warmBatch(ctx, envs)
+		if ctx.Err() == nil {
+			live = execWarmBatch(ctx, envs)
+		}
+		cleanupRemaining(envs)
+
+	case StrategySliding:
+		for bIdx, b := range batches {
+			if ctx.Err() != nil {
+				break
+			}
+			r.log.Info("sliding window",
+				slog.Int("window", bIdx+1),
+				slog.Int("windows", len(batches)),
+				slog.Int("images", len(b.images)),
+				slog.Int("tasks", len(b.envs)))
+			warmBatch(ctx, b.envs)
 			if ctx.Err() == nil {
-				passLive = execWarmBatch(ctx, envs, stepNum)
+				live += execWarmBatch(ctx, b.envs)
 			}
-			cleanupRemaining(envs, stepNum)
-
-		case StrategySliding:
-			for bIdx, b := range batches {
-				if ctx.Err() != nil {
-					break
-				}
-				r.log.Info("sliding window",
-					slog.Int("window", bIdx+1),
-					slog.Int("windows", len(batches)),
-					slog.Int("images", len(b.images)),
-					slog.Int("tasks", len(b.envs)))
-				warmBatch(ctx, b.envs, stepNum)
-				if ctx.Err() == nil {
-					passLive += execWarmBatch(ctx, b.envs, stepNum)
-				}
-				cleanupRemaining(b.envs, stepNum)
-			}
-
-		case StrategyPipelined:
-			if len(batches) > 0 {
-				warmBatch(ctx, batches[0].envs, stepNum)
-			}
-			for bIdx, b := range batches {
-				if ctx.Err() != nil {
-					break
-				}
-				var (
-					prefetchWG     sync.WaitGroup
-					prefetchDoneAt time.Time
-					hasPrefetch    bool
-				)
-				if bIdx+1 < len(batches) {
-					hasPrefetch = true
-					nextEnvs := batches[bIdx+1].envs
-					prefetchWG.Add(1)
-					go func() {
-						defer prefetchWG.Done()
-						warmBatch(ctx, nextEnvs, stepNum)
-						prefetchDoneAt = time.Now()
-					}()
-				}
-				r.log.Info("pipelined window",
-					slog.Int("window", bIdx+1),
-					slog.Int("windows", len(batches)),
-					slog.Int("images", len(b.images)),
-					slog.Int("tasks", len(b.envs)))
-				passLive += execWarmBatch(ctx, b.envs, stepNum)
-				batchDoneAt := time.Now()
-				cleanupRemaining(b.envs, stepNum)
-
-				if hasPrefetch {
-					prefetchWG.Wait()
-					if !prefetchDoneAt.IsZero() && batchDoneAt.After(prefetchDoneAt) {
-						statsMu.Lock()
-						prefetchMarginMS += ms(batchDoneAt.Sub(prefetchDoneAt))
-						statsMu.Unlock()
-					}
-				}
-			}
-			cleanupRemaining(envs, stepNum)
+			cleanupRemaining(b.envs)
 		}
 
-		if r.cfg.Mode == ModeSteps {
-			var hitRate float64
-			if total := hits + misses; total > 0 {
-				hitRate = float64(hits) / float64(total)
-			}
-			r.rec.Record(Event{
-				RunID:                r.cfg.RunID,
-				Event:                EventBarrier,
-				Step:                 stepNum,
-				DurMS:                ms(time.Since(passStart)),
-				OK:                   ctx.Err() == nil,
-				Count:                passLive,
-				WorkingSetHits:       hits,
-				WorkingSetMisses:     misses,
-				WorkingSetHitRate:    hitRate,
-				StandingPoolSize:     peakWarm,
-				Created:              created,
-				Reused:               reused,
-				Retired:              retired,
-				PrefetchLeadMarginMS: prefetchMarginMS,
-			})
+	case StrategyPipelined:
+		if len(batches) > 0 {
+			warmBatch(ctx, batches[0].envs)
 		}
+		for bIdx, b := range batches {
+			if ctx.Err() != nil {
+				break
+			}
+			var (
+				prefetchWG     sync.WaitGroup
+				prefetchDoneAt time.Time
+				hasPrefetch    bool
+			)
+			if bIdx+1 < len(batches) {
+				hasPrefetch = true
+				nextEnvs := batches[bIdx+1].envs
+				prefetchWG.Add(1)
+				go func() {
+					defer prefetchWG.Done()
+					warmBatch(ctx, nextEnvs)
+					prefetchDoneAt = time.Now()
+				}()
+			}
+			r.log.Info("pipelined window",
+				slog.Int("window", bIdx+1),
+				slog.Int("windows", len(batches)),
+				slog.Int("images", len(b.images)),
+				slog.Int("tasks", len(b.envs)))
+			live += execWarmBatch(ctx, b.envs)
+			batchDoneAt := time.Now()
+			cleanupRemaining(b.envs)
+
+			if hasPrefetch {
+				prefetchWG.Wait()
+				if !prefetchDoneAt.IsZero() && batchDoneAt.After(prefetchDoneAt) {
+					ws.addPrefetchMargin(batchDoneAt.Sub(prefetchDoneAt))
+				}
+			}
+		}
+		cleanupRemaining(envs)
 	}
 
-	var hitRate float64
-	if total := hits + misses; total > 0 {
-		hitRate = float64(hits) / float64(total)
-	}
-	r.wsStats = WorkingSetStats{
-		Hits:                 hits,
-		Misses:               misses,
-		HitRate:              hitRate,
-		StandingPoolSize:     peakWarm,
-		Created:              created,
-		Reused:               reused,
-		Retired:              retired,
-		PrefetchLeadMarginMS: prefetchMarginMS,
+	r.wsStats = ws.snapshot()
+	if r.cfg.Mode == ModeSteps {
+		r.rec.Record(Event{
+			RunID:                r.cfg.RunID,
+			Event:                EventBarrier,
+			Step:                 stepNum,
+			DurMS:                ms(time.Since(start)),
+			OK:                   ctx.Err() == nil,
+			Count:                live,
+			WorkingSetHits:       r.wsStats.Hits,
+			WorkingSetMisses:     r.wsStats.Misses,
+			WorkingSetHitRate:    r.wsStats.HitRate,
+			StandingPoolSize:     r.wsStats.StandingPoolSize,
+			Created:              r.wsStats.Created,
+			Reused:               r.wsStats.Reused,
+			Retired:              r.wsStats.Retired,
+			PrefetchLeadMarginMS: r.wsStats.PrefetchLeadMarginMS,
+		})
 	}
 	return nil
-}
-
-// createWithStepEvent creates e.id on the backend and records EventCreate at
-// stepNum without mutating e.id (which planStrategyPass already suffixed).
-func (r *runner) createWithStepEvent(ctx context.Context, e *environment, stepNum int) bool {
-	cctx, cancel := context.WithTimeout(ctx, r.cfg.CreateTimeout)
-	defer cancel()
-	e.createStart = time.Now()
-	sb, err := r.cfg.Backend.Create(cctx, e.id, e.inst.Image)
-	ev := r.event(EventCreate, e, stepNum, time.Since(e.createStart), err)
-	r.rec.Record(ev)
-	if err != nil {
-		e.failed = true
-		task := r.event(EventTask, e, stepNum, 0, err)
-		r.rec.Record(task)
-		r.countTask(e, stepNum, false, nil)
-		r.log.Warn("create failed", slog.String("env", e.id), slog.String("err", err.Error()))
-		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-		defer cancel()
-		if derr := r.cfg.Backend.Delete(cleanup, e.id); derr != nil && !isNotFound(derr) {
-			r.log.Warn("delete after failed create", slog.String("env", e.id), slog.String("err", derr.Error()))
-		}
-		return false
-	}
-	e.sb = sb
-	return true
 }

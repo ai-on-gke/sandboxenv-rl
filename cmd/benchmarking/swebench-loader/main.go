@@ -24,6 +24,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -672,19 +673,22 @@ func runCmd(args []string) (retErr error) {
 		if visited["rollouts"] && !visited["tasks-per-image"] && swebench.Mode(*mode) == swebench.ModeEval {
 			*tasksPerImage = *rollouts
 		}
+		// A strategy owns the lifecycle: it parks by suspend (delete for
+		// none) and runs one pass. The step loop's flags would be recorded
+		// as labels of a run that never acted on them, so they are refused.
+		for _, name := range []string{"park", "step-pause", "park-each", "images-per-step", "prefetch", "schedule"} {
+			if visited[name] {
+				return fmt.Errorf("-%s belongs to the step loop; -strategy %s parks by %s and runs one pass (omit -%s)",
+					name, *strategy, strategyPark(swebench.Strategy(*strategy)), name)
+			}
+		}
 		if swebench.Mode(*mode) == swebench.ModeSteps {
 			if !visited["steps"] {
 				*steps = 1
 			} else if *steps > 1 {
 				return fmt.Errorf("-strategy is single-pass (requires -steps 1 in steps mode; omit -strategy for multi-step reset loops)")
 			}
-			if !visited["park"] {
-				if swebench.Strategy(*strategy) == swebench.StrategyNone {
-					*park = string(swebench.ParkDelete)
-				} else {
-					*park = string(swebench.ParkSuspend)
-				}
-			}
+			*park = string(strategyPark(swebench.Strategy(*strategy)))
 		}
 	}
 	if *convertTrace != "" {
@@ -829,6 +833,44 @@ func runCmd(args []string) (retErr error) {
 		slog.Int("images_per_step", *imagesPerStep),
 		slog.Int("environments", environments), slog.Int("width", *width), slog.Int("steps", *steps),
 		slog.String("park", *park), slog.String("trajectory", *trajectory), slog.String("out", *out))
+	cfg := swebench.Config{
+		RunID:         *runID,
+		Dataset:       *dataset,
+		Instances:     selected,
+		Trajectory:    traj,
+		Trajectories:  trajs,
+		Seed:          *seed,
+		Logger:        log,
+		Mode:          swebench.Mode(*mode),
+		Strategy:      swebench.Strategy(*strategy),
+		WindowSize:    *windowSize,
+		Width:         *width,
+		ArrivalRate:   *arrivalRate,
+		TasksPerImage: *tasksPerImage,
+		Rollouts:      *rollouts,
+		Steps:         *steps,
+		Park:          swebench.Park(*park),
+		ImagesPerStep: *imagesPerStep,
+		ParkEach:      *parkEach,
+		Schedule:      sched,
+		TasksPerStep:  *tasksPerStep,
+		GroupSize:     *groupSize,
+		StepPause:     *stepPause,
+		Prefetch:      *prefetch,
+		CreateTimeout: *createTimeout,
+		StepTimeout:   *stepTimeout,
+		WakeBudget:    *wakeBudget,
+		WakeBackoff:   *wakeBackoff,
+		Keep:          *keep,
+		Labels:        labels,
+		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids, effective),
+	}
+	// The checks Run makes before it touches the API, here so -dry-run makes
+	// them too: the run id, the longest actor name against Substrate's 63
+	// characters, the -label keys, and the mode, strategy and park flags.
+	if err := swebench.ValidateConfig(cfg); err != nil {
+		return err
+	}
 	if *dryRun {
 		return nil
 	}
@@ -920,40 +962,9 @@ func runCmd(args []string) (retErr error) {
 	defer stop()
 
 	startTS := time.Now().UTC()
-	sum, err := swebench.Run(ctx, swebench.Config{
-		RunID:         *runID,
-		Dataset:       *dataset,
-		Backend:       backend,
-		Instances:     selected,
-		Trajectory:    traj,
-		Trajectories:  trajs,
-		Seed:          *seed,
-		Recorder:      rec,
-		Logger:        log,
-		Mode:          swebench.Mode(*mode),
-		Strategy:      swebench.Strategy(*strategy),
-		WindowSize:    *windowSize,
-		Width:         *width,
-		ArrivalRate:   *arrivalRate,
-		TasksPerImage: *tasksPerImage,
-		Rollouts:      *rollouts,
-		Steps:         *steps,
-		Park:          swebench.Park(*park),
-		ImagesPerStep: *imagesPerStep,
-		ParkEach:      *parkEach,
-		Schedule:      sched,
-		TasksPerStep:  *tasksPerStep,
-		GroupSize:     *groupSize,
-		StepPause:     *stepPause,
-		Prefetch:      *prefetch,
-		CreateTimeout: *createTimeout,
-		StepTimeout:   *stepTimeout,
-		WakeBudget:    *wakeBudget,
-		WakeBackoff:   *wakeBackoff,
-		Keep:          *keep,
-		Labels:        labels,
-		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids, effective),
-	})
+	cfg.Backend = backend
+	cfg.Recorder = rec
+	sum, err := swebench.Run(ctx, cfg)
 	endTS := time.Now().UTC()
 	_ = rec.Flush()
 
@@ -1009,6 +1020,15 @@ func runCmd(args []string) (retErr error) {
 	return nil
 }
 
+// strategyPark is the park policy a strategy run reports: none deletes each
+// environment after its replay, the others suspend into the warm pool.
+func strategyPark(s swebench.Strategy) swebench.Park {
+	if s == swebench.StrategyNone {
+		return swebench.ParkDelete
+	}
+	return swebench.ParkSuspend
+}
+
 func reportCmd(args []string, ws ...io.Writer) error {
 	var stdout io.Writer = os.Stdout
 	if len(ws) > 0 && ws[0] != nil {
@@ -1029,7 +1049,7 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 		eventsGlob     = fs.String("events-glob", "", "Glob pattern for multi-worker event shards (e.g. 'events/*.jsonl').")
 		jsonOut        = fs.String("json", "", "Also write the summary as JSON to this path (an array when several files are given).")
 		out            = fs.String("out", "", "Alias for -json: write the summary as JSON to this path.")
-		mdOut          = fs.String("md", "", "Optional path to write Markdown report (including ## Validity).")
+		mdOut          = fs.String("md", "", "Optional path to write a Markdown report: one run's report (including ## Validity); for several runs the arm table over the text comparison, or with -thresholds the regression verdict.")
 		unresolved     = fs.String("unresolved", "", "Write the unresolved instances to this path in -exclude-file format; one file only.")
 		unresNote      = fs.String("unresolved-note", "Instances graded unresolved", "First comment line of the -unresolved file.")
 		cacheBefore    = fs.String("cache-before", "", "Node cache sample taken before the run (benchmarking/swebench/sample-node-cache.sh); with -cache-after, the report adds the run's cache misses. One file only.")
@@ -1162,6 +1182,13 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log and -top take one events file")
 		}
 		swebench.WriteComparison(stdout, reps, labels)
+		if *mdOut != "" && *thresholds == "" {
+			var md bytes.Buffer
+			swebench.WriteComparisonMarkdown(&md, reps, labels)
+			if err := os.WriteFile(*mdOut, md.Bytes(), 0o644); err != nil {
+				return err
+			}
+		}
 		if *thresholds != "" {
 			th, err := swebench.LoadThresholds(*thresholds)
 			if err != nil {

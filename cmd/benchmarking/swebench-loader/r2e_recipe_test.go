@@ -595,9 +595,10 @@ func TestAllStrategiesRenderPlanAndDirectDriverValidation(t *testing.T) {
 	}
 
 	compJSON := filepath.Join(dir, "comparison.json")
+	compMD := filepath.Join(dir, "comparison.md")
 	var compOut, compErr bytes.Buffer
 	reportArgs := append([]string{"report"}, armReportPaths...)
-	reportArgs = append(reportArgs, "-json", compJSON)
+	reportArgs = append(reportArgs, "-json", compJSON, "-md", compMD)
 	if code := runMain(reportArgs, &compOut, &compErr); code != 0 {
 		t.Fatalf("report multi-arm comparison exited %d: %s", code, compErr.String())
 	}
@@ -606,18 +607,68 @@ func TestAllStrategiesRenderPlanAndDirectDriverValidation(t *testing.T) {
 			t.Fatalf("comparison output missing column %q:\n%s", wantCol, compOut.String())
 		}
 	}
+	// The Markdown arm table run-r2e-swebench.sh writes to comparison.md:
+	// one row per arm from its labels and working-set figures, then the text
+	// comparison in a code block.
+	mdBytes, err := os.ReadFile(compMD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	md := string(mdBytes)
+	for _, want := range []string{
+		"| Arm | Client | Strategy | Tasks | Failed | Reward Rate | Wall Clock (s) | Throughput (tasks/min) | Warm Hit Rate | Peak Active | Standing Pool | TTFI p50/p95/p99 | Wake p50/p95/p99 |",
+		"| `go-none` | `go` | `none` | 12 | 0 | 1.000 | ",
+		"| `go-naive` | `go` | `naive` | 12 | 0 | 1.000 | ",
+		"| `go-sliding` | `go` | `sliding` | 12 | 0 | 1.000 | ",
+		"| `go-pipelined` | `go` | `pipelined` | 12 | 0 | 1.000 | ",
+		" | 100.0% | ", // the warm arms' hit rate
+		" | 12 | ",     // naive's standing pool
+		"## Detailed Event Breakdown (`swebench-loader report`)",
+		"```text\n" + strings.SplitN(compOut.String(), "\n", 2)[0],
+	} {
+		if !strings.Contains(md, want) {
+			t.Fatalf("comparison.md lacks %q:\n%s", want, md)
+		}
+	}
 
-	// 3. Verify fail-loud flag and direct-driver validation.
+	// 3. Verify fail-loud flag and direct-driver validation. The step loop's
+	// flags are refused with -strategy; -dry-run makes Run's checks too.
+	longManifest := filepath.Join(dir, "r2e-long-id.jsonl")
+	longRec, _ := json.Marshal(map[string]any{
+		"kind":               "command",
+		"instance_id":        strings.Repeat("a", 40),
+		"repo":               "demo/long",
+		"image":              fmt.Sprintf("us-docker.pkg.dev/p/r2e/long@sha256:%064x", 999),
+		"setup_command":      "test -d /testbed",
+		"reset_command":      "cd /testbed && git reset -q --hard",
+		"command":            "/bin/bash run_tests.sh",
+		"expected_exit_code": 0,
+	})
+	if err := os.WriteFile(longManifest, append(longRec, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	for _, badArgs := range [][]string{
 		{"run", "-dataset", r2eManifest, "-strategy", "bogus"},
 		{"run", "-dataset", r2eManifest, "-strategy", "naive", "-window-size", "2"},
 		{"run", "-dataset", r2eManifest, "-strategy", "sliding", "-mode", "open-loop"},
 		{"run", "-dataset", r2eManifest, "-strategy", "sliding", "-mode", "steps", "-steps", "2"},
+		{"run", "-dataset", r2eManifest, "-strategy", "naive", "-mode", "steps", "-park", "delete"},
+		{"run", "-dataset", r2eManifest, "-strategy", "naive", "-mode", "steps", "-park", "suspend"},
+		{"run", "-dataset", r2eManifest, "-strategy", "naive", "-mode", "steps", "-step-pause", "5s"},
+		{"run", "-dataset", r2eManifest, "-strategy", "none", "-mode", "steps", "-park-each"},
+		{"run", "-dataset", r2eManifest, "-strategy", "none", "-mode", "steps", "-prefetch"},
+		// -dry-run: a 64-character actor name (20 + 1 + 36 + 1 + 6) and a loader label key.
+		{"run", "-dataset", longManifest, "-trajectory", fastR2ETraj, "-run-id", strings.Repeat("r", 20), "-mode", "eval", "-tasks-per-image", "100001", "-dry-run"},
+		{"run", "-dataset", r2eManifest, "-trajectory", fastR2ETraj, "-label", "width=10", "-dry-run"},
 	} {
 		var bo, be bytes.Buffer
 		if code := runMain(badArgs, &bo, &be); code == 0 {
 			t.Fatalf("expected non-zero exit for invalid args %v", badArgs)
 		}
+	}
+	var dryOut, dryErr bytes.Buffer
+	if code := runMain([]string{"run", "-dataset", longManifest, "-trajectory", fastR2ETraj, "-run-id", strings.Repeat("r", 20), "-mode", "eval", "-tasks-per-image", "10", "-dry-run"}, &dryOut, &dryErr); code != 0 {
+		t.Fatalf("dry-run with a 58-character name exited %d: %s", code, dryErr.String())
 	}
 
 	if _, _, err := swebench.NewBackendDriver(swebench.BackendDriverOptions{

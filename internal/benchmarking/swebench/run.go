@@ -267,6 +267,31 @@ func (c *Config) validate() error {
 	if c.Strategy != "" && c.Mode == ModeSteps && c.Steps > 1 {
 		return errors.New("strategy is single-pass (requires -steps 1 in steps mode; omit -strategy for multi-step reset loops)")
 	}
+	if c.Strategy != "" {
+		// A strategy owns the lifecycle: it parks by suspend (delete for
+		// none) and runs one pass, so the step loop's settings have nothing
+		// to act on. Refuse them rather than record a park or a pause that
+		// did not happen.
+		if c.Mode == ModeSteps {
+			if c.Park == "" {
+				c.Park = c.strategyPark()
+			} else if c.Park != c.strategyPark() {
+				return fmt.Errorf("strategy %s parks by %s; park mode %s cannot apply (omit -park with -strategy)", c.Strategy, c.strategyPark(), c.Park)
+			}
+		}
+		switch {
+		case c.StepPause > 0:
+			return errors.New("step pause belongs to the step loop; it cannot be combined with a strategy")
+		case c.ParkEach:
+			return errors.New("park each belongs to the step loop; it cannot be combined with a strategy")
+		case c.ImagesPerStep > 0:
+			return errors.New("images per step belongs to the step loop; it cannot be combined with a strategy")
+		case c.Prefetch:
+			return errors.New("prefetch belongs to the schedule's step loop; a strategy prefetches by its window (pipelined)")
+		case c.Schedule != nil:
+			return errors.New("a schedule drives the step loop; it cannot be combined with a strategy")
+		}
+	}
 	if c.Schedule != nil && c.Mode == ModeSteps && len(c.Schedule.Jobs) > 0 {
 		if c.Rollouts < 1 {
 			c.Rollouts = 1
@@ -368,10 +393,7 @@ func (c *Config) validate() error {
 func (c *Config) longestName() string {
 	k, suffix := c.TasksPerImage-1, ""
 	if c.Strategy != "" {
-		k = c.strategyFanout() - 1
-		if passes := c.strategyPasses(); passes > 1 {
-			suffix = fmt.Sprintf("-s%d", passes)
-		}
+		k = c.strategyFanout() - 1 // one pass: no step suffix
 	} else if c.Mode == ModeSteps {
 		k = c.Rollouts - 1
 		if (c.Park == ParkDelete || c.Park == ParkFork || c.ImagesPerStep > 0) && c.Steps > 1 {
@@ -457,6 +479,9 @@ type environment struct {
 	wsFresh       bool
 	wsWake        bool
 	slotWaitMS    float64
+	// inWarmPool is set by a strategy run while the environment sits
+	// suspended in its warm pool; see warmPoolStats.
+	inWarmPool bool
 }
 
 type runner struct {
@@ -469,6 +494,29 @@ type runner struct {
 	failed   int
 	rewarded int
 	wsStats  WorkingSetStats
+}
+
+// ValidateConfig checks cfg as Run does before it touches the backend: the
+// run id, the longest environment name against Substrate's 63 characters,
+// the label keys, and the mode, strategy and park settings against each
+// other. It is the check behind swebench-loader run -dry-run, which has no
+// backend; a nil Backend passes.
+func ValidateConfig(cfg Config) error {
+	if cfg.Backend == nil {
+		cfg.Backend = noBackend{}
+	}
+	return cfg.validate()
+}
+
+// noBackend stands in for the backend during ValidateConfig; nothing calls it.
+type noBackend struct{}
+
+func (noBackend) Create(context.Context, string, string) (Sandbox, error) {
+	return nil, errors.New("no backend: validate only")
+}
+
+func (noBackend) Delete(context.Context, string) error {
+	return errors.New("no backend: validate only")
 }
 
 // Run executes the configured workload and returns its summary. A non-nil

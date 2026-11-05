@@ -3834,6 +3834,71 @@ func WriteComparison(w io.Writer, reps []*Report, names []string) {
 	tw.Flush()
 }
 
+// WriteComparisonMarkdown writes the arm table of a strategy or client sweep,
+// one row per run: its client and strategy labels, tasks, failures, reward
+// rate, wall clock, throughput, warm-pool hit rate, peak active sandboxes,
+// standing pool and the ttfi and wake percentiles; then WriteComparison's
+// text table in a code block. run-r2e-swebench.sh writes it to comparison.md.
+func WriteComparisonMarkdown(w io.Writer, reps []*Report, names []string) {
+	labels := columnLabels(reps, names)
+	fmt.Fprintln(w, "# Multi-Arm Strategy & Client Chain Comparison")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "| Arm | Client | Strategy | Tasks | Failed | Reward Rate | Wall Clock (s) | Throughput (tasks/min) | Warm Hit Rate | Peak Active | Standing Pool | TTFI p50/p95/p99 | Wake p50/p95/p99 |")
+	fmt.Fprintln(w, "| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- |")
+	for i, r := range reps {
+		client := r.Labels["client"]
+		if client == "" {
+			client = "-"
+		}
+		strategy := r.Labels["strategy"]
+		if strategy == "" {
+			strategy = r.Mode
+		}
+		if strategy == "" {
+			strategy = "-"
+		}
+		hitRate, pool := "-", "-"
+		if r.WorkingSetHits+r.WorkingSetMisses > 0 || r.StandingPoolSize > 0 {
+			hitRate = fmt.Sprintf("%.1f%%", r.WorkingSetHitRate*100)
+			pool = strconv.Itoa(r.StandingPoolSize)
+		}
+		tpm := r.ThroughputTasksPerMin()
+		if r.Headline != nil && r.Headline.TasksPerMin > 0 {
+			tpm = r.Headline.TasksPerMin
+		}
+		fmt.Fprintf(w, "| `%s` | `%s` | `%s` | %d | %d | %.3f | %.1f | %.1f | %s | %d | %s | %s | %s |\n",
+			labels[i], client, strategy, r.Tasks, r.Failed, r.RewardRate, r.RunMS/1000, tpm,
+			hitRate, r.PeakActiveSandboxes, pool, percentileCell(r, "ttfi"), percentileCell(r, "wake"))
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "## Detailed Event Breakdown (`swebench-loader report`)")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "```text")
+	var text bytes.Buffer
+	WriteComparison(&text, reps, names)
+	fmt.Fprintln(w, strings.TrimRight(text.String(), "\n"))
+	fmt.Fprintln(w, "```")
+}
+
+// percentileCell is the p50/p95/p99 cell of the unnamed stat of event in the
+// arm table; "-" when the run has none, and no latency when no call succeeded.
+func percentileCell(r *Report, event string) string {
+	for _, s := range r.Stats {
+		if s.Event != event || s.Name != "" {
+			continue
+		}
+		if s.Count == s.Failed {
+			return fmt.Sprintf("-/-/- (n=%d, f=%d)", s.Count, s.Failed)
+		}
+		p99 := s.P99MS
+		if p99 == 0 {
+			p99 = s.P95MS
+		}
+		return fmt.Sprintf("%.0f/%.0f/%.0f ms (n=%d)", s.P50MS, s.P95MS, p99, s.Count)
+	}
+	return "-"
+}
+
 // columnLabels heads each column with its run id, or with the file name when
 // the run id is empty or the same as another column's; when the file names
 // also repeat, with the full path.

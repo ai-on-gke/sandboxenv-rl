@@ -498,9 +498,26 @@ func TestStepsParkEachBoundsAwakeEnvironments(t *testing.T) {
 					t.Fatalf("created %d wakes %d ttfis %d, want 9 created once, 18 wakes, 9 ttfis", len(f.created), wakes, ttfis)
 				}
 				for id, n := range f.created {
-					if n != 1 || f.suspended[id] != 3 || f.deleted[id] != 1 {
-						t.Fatalf("env %s created %d suspended %d deleted %d, want 1, 3 (the last step parks too) and 1", id, n, f.suspended[id], f.deleted[id])
+					if n != 1 || f.suspended[id] != 2 || f.deleted[id] != 1 {
+						t.Fatalf("env %s created %d suspended %d deleted %d, want 1, 2 (the last step deletes instead) and 1", id, n, f.suspended[id], f.deleted[id])
 					}
+				}
+				// The last step's deletes happen inside the step: every delete
+				// event precedes the step's barrier event.
+				events := parseEvents(t, out.String())
+				lastBarrier, deletesBefore := -1, 0
+				for i, ev := range events {
+					if ev.Event == EventBarrier && ev.Step == 3 {
+						lastBarrier = i
+					}
+				}
+				for _, ev := range events[:lastBarrier+1] {
+					if ev.Event == EventDelete && ev.Step == 3 {
+						deletesBefore++
+					}
+				}
+				if lastBarrier < 0 || deletesBefore != 9 {
+					t.Fatalf("%d of 9 last-step deletes recorded before the step 3 barrier (at %d); the rest ran in the cleanup", deletesBefore, lastBarrier)
 				}
 			case ParkDelete:
 				if len(f.created) != 27 || wakes != 0 || ttfis != 27 {
@@ -513,6 +530,31 @@ func TestStepsParkEachBoundsAwakeEnvironments(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// With Keep the last step parks like the others, so the fleet stays behind
+// suspended rather than deleted.
+func TestStepsParkEachKeepParksTheLastStep(t *testing.T) {
+	f := newFake()
+	var out bytes.Buffer
+	cfg := baseConfig(t, f, &out)
+	cfg.Mode = ModeSteps
+	cfg.Rollouts = 2
+	cfg.Steps = 2
+	cfg.Park = ParkSuspend
+	cfg.ParkEach = true
+	cfg.Keep = true
+	if _, err := Run(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.created) != 6 || len(f.deleted) != 0 {
+		t.Fatalf("created %d deleted %v, want 6 created and none deleted", len(f.created), f.deleted)
+	}
+	for id, n := range f.suspended {
+		if n != 2 {
+			t.Fatalf("env %s suspended %d times, want 2 (every step parks under -keep)", id, n)
+		}
 	}
 }
 

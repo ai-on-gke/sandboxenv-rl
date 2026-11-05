@@ -508,6 +508,7 @@ func runCmd(args []string) (retErr error) {
 		stepTimeout   = fs.Duration("step-timeout", 10*time.Minute, "Default deadline for a run step without its own timeout.")
 		wakeBudget    = fs.Duration("wake-budget", 3*time.Minute, "How long a task's first command is retried while the environment is still waking or its image is still being baked.")
 		wakeBackoff   = fs.Duration("wake-backoff", swebench.DefaultWakeBackoff, "Initial pause between wake retries; doubles up to five times this.")
+		deleteRate    = fs.Float64("delete-rate", swebench.DefaultDeleteRate, "Most environment deletes per second across the run, through ate-env-api; the bucket rate-limits snapshot deletes, and a delete it refuses is retried with backoff for up to two minutes. 0 removes the cap.")
 		runID         = fs.String("run-id", "", "Run id, prefix of every environment name: lowercase letters, digits and '-', at most 20 characters; default swe-<unix time>.")
 		out           = fs.String("out", "", "JSONL events file; default <run-id>.jsonl in the working directory.")
 		eventsDir     = fs.String("events-dir", "", "Optional base directory for per-worker event shards (events/<worker>.jsonl).")
@@ -691,6 +692,7 @@ func runCmd(args []string) (retErr error) {
 			WarmPool:     *warmPool,
 			Connections:  *connections,
 			AuthToken:    authToken,
+			DeleteRate:   *deleteRate,
 		})
 		if err != nil {
 			return err

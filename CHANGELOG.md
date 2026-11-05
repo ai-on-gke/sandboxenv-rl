@@ -7,6 +7,11 @@ user needs to know across them.
 ## Unreleased
 
 ### Added
+
+- swebench-loader: `run -delete-rate` caps the environment deletes per second
+  through ate-env-api (default 200; 0 removes the cap), and a delete the
+  bucket rate-limits (429, `ResourceExhausted`) is retried with backoff for
+  up to two minutes instead of failing.
 - `examples/Qwen3.5-397B-A17B-verl`: the agentic GRPO recipe from 2 to 16 GPU
   nodes with profiles for Qwen3.5-35B-A3B and Qwen3.5-397B-A17B, steps of
   thousands of trajectories, and guarded verl patches for 64K responses.
@@ -80,6 +85,11 @@ user needs to know across them.
 
 ### Fixed
 
+- swebench-loader `-park-each`: the last step deletes each environment right
+  after its replay instead of suspending it (unless `-keep`). A 37,000
+  environment run suspended them all, one more snapshot upload each. The
+  cleanup then deleted them in one burst at about 1,850 per second; 15,031
+  deletes failed on GCS 429 and leaked.
 - ate-env-api port proxy: the path form
   (`/v1alpha/envs/<id>/ports/<port>/...`) forwards the rest of the path
   exactly as sent; it re-escaped `! ' ( ) *` (`/report(1).txt` reached the

@@ -59,6 +59,11 @@ type fakeAPI struct {
 	exitCode         int32
 	stdout, stderr   string
 
+	// deleteRateLimited is how many DeleteEnvironment calls answer a 429
+	// first; deleteCalls counts every call.
+	deleteRateLimited int
+	deleteCalls       int
+
 	nextID    int
 	polls     map[string]int
 	exited    map[string]bool
@@ -86,6 +91,11 @@ func (f *fakeAPI) SuspendEnvironment(_ context.Context, req *ateenvv1alpha.Suspe
 func (f *fakeAPI) DeleteEnvironment(_ context.Context, req *ateenvv1alpha.DeleteEnvironmentRequest) (*ateenvv1alpha.DeleteEnvironmentResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.deleteCalls++
+	if f.deleteRateLimited > 0 {
+		f.deleteRateLimited--
+		return nil, status.Error(codes.ResourceExhausted, "deleting snapshot: googleapi: Error 429: rateLimitExceeded")
+	}
 	f.deleted = append(f.deleted, req.GetId())
 	return &ateenvv1alpha.DeleteEnvironmentResponse{}, nil
 }
@@ -168,7 +178,7 @@ func newFakeBackend(t *testing.T, api *fakeAPI) *EnvBackend {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = c.Close(); _ = conn.Close(); srv.Stop() })
-	b := &EnvBackend{clients: []*env.Client{c}, atespace: "ate-env", baseTemplate: "default-template"}
+	b := &EnvBackend{clients: []*env.Client{c}, atespace: "ate-env", baseTemplate: "default-template", deletes: defaultDeleteLimits()}
 	WithPollBounds(time.Millisecond, 5*time.Millisecond)(b)
 	return b
 }
@@ -242,6 +252,89 @@ func TestEnvBackendDeleteByName(t *testing.T) {
 	}
 	if len(api.deleted) != 1 || api.deleted[0] != "gone" {
 		t.Fatalf("deleted %v", api.deleted)
+	}
+}
+
+// A delete the bucket rate-limits is retried until it lands, on the backend
+// and on a sandbox alike.
+func TestEnvBackendDeleteRetriesRateLimit(t *testing.T) {
+	api := &fakeAPI{deleteRateLimited: 2}
+	b := newFakeBackend(t, api)
+	b.deletes.minWait, b.deletes.maxWait = time.Millisecond, 2*time.Millisecond
+	if err := b.Delete(context.Background(), "busy"); err != nil {
+		t.Fatalf("Delete after two 429s: %v", err)
+	}
+	if api.deleteCalls != 3 || len(api.deleted) != 1 || api.deleted[0] != "busy" {
+		t.Fatalf("calls %d deleted %v, want 3 calls and one delete", api.deleteCalls, api.deleted)
+	}
+	api.deleteRateLimited, api.deleteCalls = 1, 0
+	sb, err := b.Create(context.Background(), "env1", "reg/img@sha256:"+strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sb.Delete(context.Background()); err != nil {
+		t.Fatalf("sandbox Delete after a 429: %v", err)
+	}
+	if api.deleteCalls != 2 {
+		t.Fatalf("sandbox delete made %d calls, want 2", api.deleteCalls)
+	}
+}
+
+// Retries stop at the budget and surface the last error; other errors are
+// not retried at all.
+func TestEnvBackendDeleteGivesUpWithinBudget(t *testing.T) {
+	api := &fakeAPI{deleteRateLimited: 1000}
+	b := newFakeBackend(t, api)
+	b.deletes.budget, b.deletes.minWait, b.deletes.maxWait = 100*time.Millisecond, 5*time.Millisecond, 10*time.Millisecond
+	err := b.Delete(context.Background(), "busy")
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("Delete past the budget: %v, want the 429 as ResourceExhausted", err)
+	}
+	if api.deleteCalls < 2 || api.deleteCalls > 12 {
+		t.Fatalf("%d calls within a 100 ms budget at 5 to 10 ms backoff, want a few", api.deleteCalls)
+	}
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{status.Error(codes.InvalidArgument, "id is required"), false},
+		{status.Error(codes.FailedPrecondition, "deleting snapshot: googleapi: Error 429: rateLimitExceeded"), true},
+		{status.Error(codes.FailedPrecondition, `actor: deleting "swe-1794290000-x": not running`), false},
+		{status.Error(codes.ResourceExhausted, "too many requests"), true},
+	} {
+		if got := isRetryableDelete(tc.err); got != tc.want {
+			t.Errorf("isRetryableDelete(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+	if zero := (deleteLimits{}); zero.do(context.Background(), func(context.Context) error {
+		return status.Error(codes.ResourceExhausted, "busy")
+	}) == nil {
+		t.Fatal("the zero deleteLimits must not retry")
+	}
+}
+
+// The cap paces deletes; one that cannot run before the context's deadline
+// fails at once instead of waiting.
+func TestEnvBackendDeleteRateCap(t *testing.T) {
+	api := &fakeAPI{}
+	b := newFakeBackend(t, api)
+	WithDeleteRate(2)(b)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	for i := range 2 {
+		if err := b.Delete(ctx, fmt.Sprintf("e%d", i)); err != nil {
+			t.Fatalf("delete %d within the burst: %v", i, err)
+		}
+	}
+	if err := b.Delete(ctx, "e2"); err == nil || !strings.Contains(err.Error(), "delete rate cap") {
+		t.Fatalf("third delete at 2/s with 400 ms left: %v, want the cap to refuse it", err)
+	}
+	if len(api.deleted) != 2 {
+		t.Fatalf("deleted %v, want the two the burst allowed", api.deleted)
+	}
+	WithDeleteRate(0)(b)
+	if b.deletes.limiter != nil {
+		t.Fatal("WithDeleteRate(0) must remove the cap")
 	}
 }
 

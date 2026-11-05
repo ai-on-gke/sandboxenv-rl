@@ -52,6 +52,9 @@ type BackendDriverOptions struct {
 	WarmPool     string
 	Connections  int
 	AuthToken    string
+	// DeleteRate caps the environment deletes per second through the
+	// ate-env-api backend (WithDeleteRate); 0 removes the cap.
+	DeleteRate float64
 }
 
 type nopCloser struct{}
@@ -119,7 +122,7 @@ func NewBackendDriver(opts BackendDriverOptions) (Backend, io.Closer, error) {
 			}
 			return b, b, nil
 		}
-		b, err := NewEnvBackend(opts.Endpoint, opts.Atespace, opts.BaseTemplate, opts.Connections, opts.AuthToken)
+		b, err := NewEnvBackend(opts.Endpoint, opts.Atespace, opts.BaseTemplate, opts.Connections, opts.AuthToken, WithDeleteRate(opts.DeleteRate))
 		if err != nil {
 			return nil, nil, err
 		}

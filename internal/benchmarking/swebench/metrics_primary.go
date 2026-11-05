@@ -166,11 +166,11 @@ func PromHistogramStat(meas *schema.Measurements, baseName string, labelFilter m
 				p95 = summary.P90
 			}
 			return Stat{
-				Count:  summary.Count,
-				P50MS:  round2(summary.P50),
-				P90MS:  round2(summary.P90),
-				P95MS:  round2(p95),
-				MaxMS:  round2(summary.Max),
+				Count: summary.Count,
+				P50MS: round2(summary.P50),
+				P90MS: round2(summary.P90),
+				P95MS: round2(p95),
+				MaxMS: round2(summary.Max),
 			}, true
 		}
 		if summary, ok := m[baseName]; ok && summary.Count > 0 {
@@ -179,11 +179,11 @@ func PromHistogramStat(meas *schema.Measurements, baseName string, labelFilter m
 				p95 = summary.P90
 			}
 			return Stat{
-				Count:  summary.Count,
-				P50MS:  round2(summary.P50 * 1000.0),
-				P90MS:  round2(summary.P90 * 1000.0),
-				P95MS:  round2(p95 * 1000.0),
-				MaxMS:  round2(summary.Max * 1000.0),
+				Count: summary.Count,
+				P50MS: round2(summary.P50 * 1000.0),
+				P90MS: round2(summary.P90 * 1000.0),
+				P95MS: round2(p95 * 1000.0),
+				MaxMS: round2(summary.Max * 1000.0),
 			}, true
 		}
 	}

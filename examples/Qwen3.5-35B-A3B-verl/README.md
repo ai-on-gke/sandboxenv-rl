@@ -12,6 +12,10 @@ revision `59d61f3c`. Validated against Agent Substrate `ddb46651` (plaintext rou
 `ate-env-api` at `2eccd896`. This repo's main now pins Substrate `v0.6.0` with router mTLS; moving
 the recipe to that pair is a separate change. Provider, task, dataset and image tooling:
 [`integrations/uni-agent`](../../integrations/uni-agent).
+This recipe runs one loop on its own. [`examples/Qwen3.5-397B-A17B-verl`](../Qwen3.5-397B-A17B-verl/README.md)
+carries 35B profiles of the same shape meant to run eight at a time, many RL loops that put one 397B run's
+load on the same hardware; the two share most of their code, and extracting it while keeping both purposes is
+a follow-up.
 
 ## Prerequisites
 

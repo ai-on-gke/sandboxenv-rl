@@ -54,49 +54,74 @@ See [docs/architecture.md](./docs/architecture.md) for the full system design an
 |---|---|
 | [`cmd/ate-env`](./cmd/ate-env) | CLI: create, suspend and delete environments, run commands, move files, and print the Kubernetes and Substrate manifests. |
 | [`cmd/ate-env-api`](./cmd/ate-env-api) | The API service: environment lifecycle, guest calls, MCP and the port proxy. |
-| [`cmd/ate-env-guest`](./cmd/ate-env-guest) | The daemon inside each environment: processes and files. |
-| [`clients/python`](./clients/python/README.md) | Python client, import name `ate_env_rl`: `Client` and `Env` for single environments, and the fleet SDK. |
-| [`clients/go`](./clients/go) | Go client. |
-| [`integrations/`](#integrations) | Framework integrations. |
-| [`examples/`](#examples) | Runnable examples. |
-| [`benchmarking/`](./benchmarking/swebench/README.md), [`cmd/benchmarking`](./cmd/benchmarking), [`internal/benchmarking`](./internal/benchmarking/DESIGN.md) | The SWE-bench loader, its scripts and the benchmark design. |
-| [`docs/`](./docs) | Architecture, glossary, rootfs images, runtime layers, the [metrics reference](./docs/metrics.md), the [threat model](./docs/security/threat-model.md), developer guides, and how releases are cut. |
+| [`cmd/ate-env-guest`](./cmd/ate-env-guest), [`guest/`](./guest) | The daemon inside each environment (a PID 1 init with sidecar supervision) and its services: `guest/process` and `guest/filesystem`. |
+| [`cmd/benchmarking`](./cmd/benchmarking) | The benchmark binaries: `swebench-loader` and the `bench` harness. |
+| [`clients/`](./clients/README.md) | The Go client (package `env`) and the Python client `ate_env_rl` with the fleet SDK. |
+| [`integrations/`](./integrations/README.md) | Framework integrations: Harbor, NeMo Gym, OpenHands, uni-agent. |
+| [`examples/`](./examples/README.md) | Runnable examples, from a Go MCP client to multi-node agentic GRPO recipes. Not supported. |
+| [`benchmarking/`](./benchmarking/README.md) | The SWE-bench loader scripts, the `bench` scenarios, the telemetry report tool and the benchmarking skills. |
+| [`internal/`](./internal) | The packages the binaries are built from: `apiservice` (the gRPC server), `ate` (the Substrate client), `mcp`, `portproxy`, `routertls`, `hostcheck`, `telemetry`, `tool`, `unknownfields`, `benchmarking/*`, the test doubles in `internaltest` (`fakecontrol`, `fakerouter`, `testcerts`) and a lifecycle walkthrough in `examples/env`. |
+| [`proto/ateenv/v1alpha`](./proto/ateenv/v1alpha) | The `ateenv.v1alpha` API: `env.proto` (`EnvironmentService`) and `guest.proto` (`ProcessService`, `FileSystemService`), with the generated Go stubs. |
+| [`docs/`](./docs) | [Architecture](./docs/architecture.md), [glossary](./docs/glossary.md), [observability](./docs/observability.md), the [metrics reference](./docs/metrics.md), [rootfs images and runtime layers](./docs/rootfs-images/README.md), the [threat model](./docs/security/threat-model.md), [support](./docs/support.md), [releases](./docs/release.md), the developer guides in [`docs/dev`](./docs/dev), the maintenance chores in [`docs/chores`](./docs/chores), and the plans in [`docs/plans`](./docs/plans). |
+| [`hack/`](./hack) | Repository scripts, checks and generators: the CI runners in [`hack/ci`](./hack/ci) (the Kind e2e run, the smoke test, pin and Substrate head checks), release automation in [`hack/release`](./hack/release), license boilerplate, [`hack/verify`](./hack/verify) and `metrics-docs` (renders `docs/metrics.md`). |
+| [`nix/`](./nix), [`flake.nix`](./flake.nix), [`uv.lock`](./uv.lock) | The Nix flake: the `devShell`s, the Python environments built from `uv.lock` (`python.nix`), and the CI scripts `ci-go`, `ci-python`, `ci-e2e` and `ci-release` (`ci.nix`). |
+| [`tests/telemetry`](./tests/telemetry) | The OpenTelemetry collector configuration of the telemetry acceptance run. |
+| [`.github/`](./.github) | CI and release workflows, Dependabot, code owners, the pull request template. |
+| [`AGENTS.md`](./AGENTS.md), [`.agents/skills`](./.agents/skills) | Instructions for coding agents and the repository skills. [`CHANGELOG.md`](./CHANGELOG.md) collects user-visible changes. |
+
+Each of `clients/`, `integrations/`, `examples/` and `benchmarking/` has a README that
+lists what is inside.
 
 ## Examples
 
+[`examples/README.md`](./examples/README.md) lists each example with what it needs and how to run
+it.
+
 | Example | What it shows |
 |---|---|
-| [`examples/grpo`](examples/grpo/README.md) | A real RL loop: TRL's GRPOTrainer trains Qwen2.5-0.5B on MBPP, and each completion runs in an environment that computes the reward. Covers the park/wake pattern, with the fleet suspended after each step. CPU only. |
-| [`examples/runtime-layers`](examples/runtime-layers/README.md) | An unmodified rootfs image with a second runtime injected as a layer and supervised as a sidecar. |
-| [`examples/harbor`](examples/harbor/README.md) | Terminal-Bench 2.0 on ate-env through the Harbor provider: prebuilt images, resource class templates, `run-tb2.sh` around `harbor run`, and the comparison with Docker. |
-| [`examples/harbor-tools-layer`](examples/harbor-tools-layer/README.md) | Harbor with tools as a second layer: a static tmux and asciinema layer mounted into every task image, the class templates registered with `--layer`, and `harbor run` with the layer first on `PATH`, thus terminus-2 installs nothing. |
-| [`examples/mcp`](examples/mcp/main.go) | Go: connect to an environment's MCP endpoint, list the tools and call them. |
-| [`examples/guest-daemon`](examples/guest-daemon/README.md) | Go: run the guest gRPC services standalone, without a cluster. |
-| [`examples/Qwen3.5-35B-A3B-verl`](examples/Qwen3.5-35B-A3B-verl/README.md) | Agentic GRPO on real SWE tasks: verl `separate_async` with a Megatron trainer and vLLM rollouts on separate nodes, a uni-agent ReAct agent whose tools and hidden-test grading run in environments. Two 8-GPU nodes. |
-| [`examples/openhands`](examples/openhands/README.md) | OpenHands agents and tools on the agent-server that a runtime layer mounts into any task image, through `integrations/openhands`. |
+| [`examples/grpo`](./examples/grpo/README.md) | A real RL loop: TRL's GRPOTrainer trains Qwen2.5-0.5B on MBPP, and each completion runs in an environment that computes the reward. Covers the park/wake pattern, with the fleet suspended after each step. CPU only. |
+| [`examples/runtime-layers`](./examples/runtime-layers/README.md) | An unmodified rootfs image with a second runtime injected as a layer and supervised as a sidecar. |
+| [`examples/harbor`](./examples/harbor/README.md) | Terminal-Bench 2.0 on ate-env through the Harbor provider: prebuilt images, resource class templates, `run-tb2.sh` around `harbor run`, and the comparison with Docker. |
+| [`examples/harbor-tools-layer`](./examples/harbor-tools-layer/README.md) | Harbor with tools as a second layer: a static tmux and asciinema layer mounted into every task image, the class templates registered with `--layer`, and `harbor run` with the layer first on `PATH`, thus terminus-2 installs nothing. |
+| [`examples/mcp`](./examples/mcp/main.go) | Go: connect to an environment's MCP endpoint, list the tools and call them. |
+| [`examples/guest-daemon`](./examples/guest-daemon/README.md) | Go: run the guest gRPC services standalone, without a cluster. |
+| [`examples/Qwen3.5-397B-A17B-verl`](./examples/Qwen3.5-397B-A17B-verl/README.md) | The same agentic GRPO loop from 2 to 16 GPU nodes: profiles for Qwen3.5-35B-A3B and Qwen3.5-397B-A17B (Megatron trainer with CPU-offloaded params and optimizer, FP8 vLLM replicas), steps of thousands of trajectories, sandbox sizing and guarded verl patches for 64K responses; the 35B profiles run eight at a time to put one 397B run's load on the same hardware. |
+| [`examples/Qwen3.5-35B-A3B-verl`](./examples/Qwen3.5-35B-A3B-verl/README.md) | Agentic GRPO on real SWE tasks: verl `separate_async` with a Megatron trainer and vLLM rollouts on separate nodes, a uni-agent ReAct agent whose tools and hidden-test grading run in environments. Two 8-GPU nodes, one loop on its own. |
+| [`examples/openhands`](./examples/openhands/README.md) | OpenHands agents and tools on the agent-server that a runtime layer mounts into any task image, through `integrations/openhands`. |
+| [`examples/Qwen3-1.7B-verl`](./examples/Qwen3-1.7B-verl/README.md) | Agentic GRPO on MATH with verl `fully_async_policy`: the model writes Python that runs in an environment through a verl tool. Trainer and rollouts on separate GPU nodes. |
+| [`examples/verl_swebench`](./examples/verl_swebench/README.md) | A GRPO-style asynchronous rollout loop on Ray that grades SWE-bench candidate patches in environments with the `ate_env_rl` client and its SWE-bench adapter. |
 
 ## Integrations
 
+[`integrations/README.md`](./integrations/README.md) lists what each package contains and how it is
+installed and tested.
+
 | Integration | Framework | What it does |
 |---|---|---|
-| [`integrations/nemo-gym`](integrations/nemo-gym/README.md) | [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) | Sandbox provider `substrate`, registered through the `nemo_gym.sandbox_providers` entry point, with no change to NeMo Gym. `endpoint()` reaches a daemon inside the sandbox through the port proxy, and [`layer/`](integrations/nemo-gym/layer) is that daemon for NeMo: NeMo Skills' sandbox server and NeMo Gym's exec server injected into any task image. |
-| [`integrations/uni-agent`](integrations/uni-agent/README.md) | [uni-agent](https://github.com/verl-project/uni-agent) | Sandbox provider `ate_env` plus an `r2e_gym` task that hides the tests, lets the agent work, then grades in the same environment; dataset and image tooling for R2E-Gym, SWE-reBench and SWE-bench rows. Used by `examples/Qwen3.5-35B-A3B-verl`. |
-| [`integrations/openhands`](integrations/openhands/README.md) | [OpenHands](https://github.com/OpenHands/software-agent-sdk) | `AteEnvWorkspace`, an OpenHands `RemoteWorkspace` that mirrors OpenHands' `AgentSandboxWorkspace` and runs the agent-server in any unmodified task image (glibc 2.31 or newer). |
-| [`integrations/harbor`](integrations/harbor/README.md) | [Harbor](https://github.com/harbor-framework/harbor) | `AteEnvEnvironment`, a Harbor environment provider: `harbor run ... -e ate_env_harbor:AteEnvEnvironment` runs each trial in an ate-env environment from a digest-pinned task image, with no change to Harbor. |
+| [`integrations/nemo-gym`](./integrations/nemo-gym/README.md) | [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) | Sandbox provider `substrate`, registered through the `nemo_gym.sandbox_providers` entry point, with no change to NeMo Gym. `endpoint()` reaches a daemon inside the sandbox through the port proxy, and [`layer/`](./integrations/nemo-gym/layer) is that daemon for NeMo: NeMo Skills' sandbox server and NeMo Gym's exec server injected into any task image. |
+| [`integrations/uni-agent`](./integrations/uni-agent/README.md) | [uni-agent](https://github.com/verl-project/uni-agent) | Sandbox provider `ate_env` plus an `r2e_gym` task that hides the tests, lets the agent work, then grades in the same environment; dataset and image tooling for R2E-Gym, SWE-reBench and SWE-bench rows. Used by `examples/Qwen3.5-397B-A17B-verl` and `examples/Qwen3.5-35B-A3B-verl`. |
+| [`integrations/openhands`](./integrations/openhands/README.md) | [OpenHands](https://github.com/OpenHands/software-agent-sdk) | `AteEnvWorkspace`, an OpenHands `RemoteWorkspace` that mirrors OpenHands' `AgentSandboxWorkspace` and runs the agent-server in any unmodified task image (glibc 2.31 or newer). |
+| [`integrations/harbor`](./integrations/harbor/README.md) | [Harbor](https://github.com/harbor-framework/harbor) | `AteEnvEnvironment`, a Harbor environment provider: `harbor run ... -e ate_env_harbor:AteEnvEnvironment` runs each trial in an ate-env environment from a digest-pinned task image, with no change to Harbor. |
 
 ## Benchmarks
 
-[`swebench-loader`](benchmarking/swebench/README.md) drives SWE-bench Verified task images through
+[`swebench-loader`](./benchmarking/swebench/README.md) drives SWE-bench Verified task images through
 the API the way a simulated RL job does: `eval` mode creates, replays, grades and deletes each task,
 and `steps` mode creates a fleet once and parks it between training steps. Image-delivery workloads
 compare image pull, image streaming and other loaders on the same images. The report breaks down
 what each phase cost.
-[`internal/benchmarking/DESIGN.md`](internal/benchmarking/DESIGN.md) specifies the benchmark system.
+The [`bench`](./cmd/benchmarking/bench) harness runs the scenarios in
+[`benchmarking/scenarios`](./benchmarking/scenarios) (`resolve`, `render`, `prewarm`, `spinup`,
+`spindown`, `measure`, `reap`, `report`, `validate`, `upload`, `compare` and `run`), and
+[`benchmarking/telemetry_report`](./benchmarking/telemetry_report) renders one run's
+report, spans and scrapes as one HTML page.
+[`internal/benchmarking/DESIGN.md`](./internal/benchmarking/DESIGN.md) specifies the benchmark
+system; [`benchmarking/README.md`](./benchmarking/README.md) lists the scripts and tools.
 
 ## Support
 
 The components, the clients, the integrations and the `ateenv.v1alpha` API are supported;
-`examples/` and `internal/examples/` are not. [docs/support.md](docs/support.md) says what
+`examples/` and `internal/examples/` are not. [docs/support.md](./docs/support.md) says what
 supported means for each path.
 
 ## Get started

@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import posixpath
+import re
 import shlex
 import stat
 import tarfile
@@ -78,6 +79,12 @@ DEFAULT_API_URL = "127.0.0.1:7777"
 DEFAULT_ATESPACE = "ate-env"
 DEFAULT_TEMPLATE = "default-template"
 RECORD_FILE = "ate_env.json"
+# Harbor's separate verifier mode starts more environments for the same trial
+# (session ids "<trial>__verifier__<step>", truncated to 63 characters with a
+# hash when the trial name is long); each records itself in its own file so
+# the agent environment's record (session id "<trial>__env", never truncated)
+# is not overwritten.
+VERIFIER_RECORD_FORMAT = "ate_env.verifier.{step}.json"
 # The same variables the ate-env CLI reads, plus one for the image registry.
 API_ENV = "SUBSTRATE_ENV_API"
 TOKEN_ENV = "SUBSTRATE_ENV_AUTH_TOKEN"
@@ -476,6 +483,28 @@ class AteEnvEnvironment(BaseEnvironment):
         except Exception as e:  # noqa: BLE001 - cleanup after another failure
             self.logger.warning("could not delete %s after a failed start: %s", self._env_id, e)
 
+    @property
+    def record_file(self) -> str:
+        """The file under the trial directory that records this environment.
+
+        The agent environment's session id is ``<trial>__env`` and Harbor never
+        truncates it; every other environment of the trial is a verifier's,
+        named after what remains of its session id once the trial name and
+        the ``verifier`` marker are removed (the step name, or Harbor's hash
+        suffix when the id was truncated).
+        """
+        if self.session_id.endswith("__env"):
+            return RECORD_FILE
+        trial = self.trial_paths.trial_dir.name
+        tail = self.session_id
+        if trial and tail.startswith(trial):
+            tail = tail[len(trial):]
+        tail = tail.strip("_")
+        if tail.startswith("verifier"):
+            tail = tail[len("verifier"):].strip("_")
+        tail = re.sub(r"[^A-Za-z0-9.-]+", "_", tail).strip("_") or "verifier"
+        return VERIFIER_RECORD_FORMAT.format(step=tail)
+
     def _write_record(self) -> None:
         record = {
             "id": self._env_id,
@@ -491,11 +520,11 @@ class AteEnvEnvironment(BaseEnvironment):
         }
         try:
             self.trial_paths.trial_dir.mkdir(parents=True, exist_ok=True)
-            (self.trial_paths.trial_dir / RECORD_FILE).write_text(
+            (self.trial_paths.trial_dir / self.record_file).write_text(
                 json.dumps(record, indent=2) + "\n"
             )
         except OSError as e:
-            self.logger.debug("could not write %s: %s", RECORD_FILE, e)
+            self.logger.debug("could not write %s: %s", self.record_file, e)
 
     async def stop(self, delete: bool) -> None:
         env, self._env = self._env, None

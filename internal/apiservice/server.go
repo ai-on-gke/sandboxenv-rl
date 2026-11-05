@@ -285,9 +285,16 @@ func (s *Server) getOrCreateImageTemplate(ctx context.Context, atespace, base, n
 	if !errors.Is(err, ate.ErrAlreadyExists) {
 		return nil, toGRPCError(err)
 	}
-	// A concurrent create won the race; it built the same template.
+	// A concurrent create won the race. It may have built the template for
+	// another digest that shares the first 12 hex digits (the derived name
+	// keeps only those), so check the image as for a template that already
+	// existed.
 	if existing, err = s.client.GetActorTemplate(ctx, atespace, name); err != nil {
 		return nil, toGRPCError(err)
+	}
+	if got := firstContainerImage(existing); !sameImageDigest(got, image) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"actor template %q exists but runs %q, not %q; delete it or use another base template", name, got, image)
 	}
 	return existing, nil
 }

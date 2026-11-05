@@ -303,6 +303,24 @@ async def test_coordinator_gate_disabled_when_limit_is_zero():
     assert coord.held() == 0
 
 
+def test_missing_coordinator_is_logged_once(monkeypatch, caplog):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_ray(name, *args, **kwargs):
+        if name == "ray":
+            raise ImportError("no ray here")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_ray)
+    prov._warn_no_coordinator.cache_clear()
+    with caplog.at_level("WARNING"):
+        assert prov._coordinator("ua", 4, 1.0, "fake", "ate-env", None) is None
+        assert prov._coordinator("ua", 4, 1.0, "fake", "ate-env", None) is None
+    assert caplog.text.count("sandbox coordinator unavailable") == 1
+
+
 def _route_error():
     import grpc
     from ate_env.errors import RpcError

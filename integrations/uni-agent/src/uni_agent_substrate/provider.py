@@ -291,13 +291,20 @@ class _SandboxCoordinator:
 _COORDINATORS: dict[str, Any] = {}
 
 
+@functools.cache
+def _warn_no_coordinator(reason: str) -> None:  # once per process and reason
+    logger.warning("sandbox coordinator unavailable (%s): the startup gate and the orphan sweep are off", reason)
+
+
 def _coordinator(prefix: str, limit: int, lease_s: float, endpoint: str, atespace: str, token: str | None):
     """Handle to the job-wide coordinator actor, or None outside a Ray worker (then nothing is gated or swept)."""
     try:
         import ray
     except ImportError:
+        _warn_no_coordinator("ray is not installed")
         return None
     if not ray.is_initialized():
+        _warn_no_coordinator("ray is not initialized in this process")
         return None
     name = f"{prefix}-sandbox-coordinator"
     handle = _COORDINATORS.get(name)

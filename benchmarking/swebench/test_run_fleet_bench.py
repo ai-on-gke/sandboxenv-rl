@@ -31,7 +31,7 @@ _REPO_ROOT = _DIR.parents[1]
 if str(_DIR) not in sys.path:
     sys.path.insert(0, str(_DIR))
 
-import run_fleet_bench as rfb
+import run_fleet_bench as rfb  # noqa: E402  # after the sys.path insert above
 
 _SDK, _INFRA_ERR, _ = rfb.load_sdk()
 _PKG_NAME = _SDK.__name__
@@ -610,3 +610,156 @@ def test_standalone_plan_stages_large_payloads_to_files(tmp_path: pathlib.Path) 
     assert large_steps[0]["write"]["content"] == big_cmd
     assert large_steps[1]["run"] == "/bin/bash /tmp/ate-cmd-grade.sh"
     assert large_steps[1]["reward"] is True
+
+
+def test_task_whose_callback_raises_counts_once(tmp_path: pathlib.Path) -> None:
+    """A rollout whose plan step is malformed raises inside the fleet callback after its
+    acquire; it is one failed task and one working-set claim, not a claim counted twice."""
+    plan_json = tmp_path / "boom-plan.json"
+    plan_json.write_text(
+        json.dumps({
+            "instances": [
+                {
+                    "instance_id": f"r2e-boom-{i}",
+                    "repo": "demo/repo",
+                    "image": f"us-docker.pkg.dev/p/r2e/boom-{i}@{_digest(300 + i)}",
+                    "kind": "command",
+                    "has_reward": True,
+                    "setup": [],
+                    "steps": [
+                        {
+                            "name": "grade",
+                            "run": "echo R2E_GRADE_MARKER",
+                            "think_ms": "not-a-number",
+                            "reward": True,
+                        }
+                    ],
+                    "expected_exit_code": 0,
+                }
+                for i in range(2)
+            ]
+        }),
+        encoding="utf-8",
+    )
+    out_jsonl = tmp_path / "events.jsonl"
+    argv = [
+        "--backend=mock",
+        f"--rendered-plan={plan_json}",
+        "--run-id=py-boom",
+        "--mode=steps",
+        "--strategy=naive",
+        "--rollouts=1",
+        "--steps=1",
+        "--width=2",
+        f"--out={out_jsonl}",
+    ]
+    assert rfb.run_benchmark(argv, custom_driver=_GradedMockDriver()) == 1
+    events = [json.loads(ln) for ln in out_jsonl.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    tasks = [e for e in events if e["event"] == "task"]
+    assert len(tasks) == 2
+    assert all(not t["ok"] and "not-a-number" in t["err"] for t in tasks)
+    run_ev = next(e for e in events if e["event"] == "run")
+    barrier = next(e for e in events if e["event"] == "step_barrier")
+    for ev in (run_ev, barrier):
+        assert ev["working_set_hits"] == 2
+        assert ev["working_set_misses"] == 0
+    assert run_ev["count"] == 2
+    assert run_ev["reused"] == 2
+
+
+def _serve_fake_ate_env_api() -> tuple[Any, Any, Any, Any, int]:
+    """Start the SDK's fake ate-env-api on a background asyncio loop; returns
+    (environment service, server, loop, thread, port)."""
+    import asyncio
+    import importlib.util
+
+    import grpc.aio
+
+    spec = importlib.util.spec_from_file_location(
+        "ate_env_rl_test_fakes", _REPO_ROOT / "clients" / "python" / "tests" / "fakes.py"
+    )
+    assert spec is not None and spec.loader is not None
+    fakes = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = fakes  # its dataclasses resolve string annotations through here
+    spec.loader.exec_module(fakes)
+    gen = __import__(f"{_PKG_NAME}._gen.ateenv.v1alpha", fromlist=["env_pb2_grpc", "guest_pb2_grpc"])
+
+    class _Recording(fakes.FakeEnvironmentService):  # type: ignore[name-defined,misc]
+        def __init__(self) -> None:
+            super().__init__()
+            self.created: list[str] = []
+            self.deleted: list[str] = []
+
+        async def CreateEnvironment(self, request, context):  # noqa: N802
+            resp = await super().CreateEnvironment(request, context)
+            self.created.append(request.id)
+            return resp
+
+        async def DeleteEnvironment(self, request, context):  # noqa: N802
+            self.deleted.append(request.id)
+            return await super().DeleteEnvironment(request, context)
+
+    env_svc = _Recording()
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, name="fake-ate-env-api", daemon=True)
+    thread.start()
+
+    async def _start() -> tuple[Any, int]:
+        server = grpc.aio.server()
+        gen.env_pb2_grpc.add_EnvironmentServiceServicer_to_server(env_svc, server)
+        gen.guest_pb2_grpc.add_ProcessServiceServicer_to_server(fakes.FakeProcessService(), server)
+        gen.guest_pb2_grpc.add_FileSystemServiceServicer_to_server(fakes.FakeFileSystemService(), server)
+        port = server.add_insecure_port("127.0.0.1:0")
+        await server.start()
+        return server, port
+
+    server, port = asyncio.run_coroutine_threadsafe(_start(), loop).result(timeout=30)
+    return env_svc, server, loop, thread, port
+
+
+def test_real_substrate_driver_warm_pool_over_the_fake_api(tmp_path: pathlib.Path) -> None:
+    """naive over the real SubstrateBackendDriver and the SDK's fake ate-env-api: the warm-pool
+    events the instrumented driver derives from the driver's own pool name the actors the API
+    created, and every one of them is deleted."""
+    import asyncio
+
+    manifest = _write_r2e_manifest(tmp_path / "r2e.jsonl", count=2)
+    out_jsonl = tmp_path / "events.jsonl"
+    env_svc, server, loop, thread, port = _serve_fake_ate_env_api()
+    try:
+        argv = [
+            "--backend=substrate",
+            f"--endpoint=127.0.0.1:{port}",
+            "--atespace=ate-env",
+            "--base-template=default-template",
+            "--connections=1",
+            f"--dataset={manifest}",
+            "--trajectory=command-default",
+            "--mode=steps",
+            "--strategy=naive",
+            "--rollouts=1",
+            "--steps=1",
+            "--width=2",
+            "--create-timeout=30s",
+            "--step-timeout=30s",
+            "--run-id=realapi-t1",
+            f"--out={out_jsonl}",
+        ]
+        rc = rfb.run_benchmark(argv)
+    finally:
+        asyncio.run_coroutine_threadsafe(server.stop(None), loop).result(timeout=30)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=10)
+    assert rc == 0
+
+    events = [json.loads(ln) for ln in out_jsonl.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    creates = [e for e in events if e["event"] == "create"]
+    deletes = [e for e in events if e["event"] == "delete"]
+    assert len(env_svc.created) == 2
+    assert {e["env"] for e in creates} == set(env_svc.created)
+    assert {e["env"] for e in deletes} == set(env_svc.deleted) == set(env_svc.created)
+    assert all(e["env"].startswith("warm-") and len(e["env"]) > 5 for e in creates)
+    run_ev = next(e for e in events if e["event"] == "run")
+    assert run_ev["count"] == 2
+    assert run_ev["working_set_hits"] == 2
+    assert run_ev["working_set_misses"] == 0

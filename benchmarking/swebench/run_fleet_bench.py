@@ -1154,7 +1154,6 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
     else:
         out_path = pathlib.Path(f"{run_id}.jsonl")
 
-    passes = args.steps if args.mode == "steps" else 1
     plan_summary = {
         "msg": "plan",
         "client": "python",
@@ -1165,8 +1164,8 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
         "images": len(instances),
         "distinct_images": len(distinct_images),
         "fanout": fanout,
-        "steps": passes,
-        "environments_per_pass": len(instances) * fanout,
+        "steps": args.steps,
+        "environments": len(instances) * fanout,
         "width": args.width,
         "trajectory": plan.get("trajectory_names", args.trajectory),
         "out": str(out_path),
@@ -1199,9 +1198,9 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
     }
     stats_lock = threading.Lock()
 
-    def _execute_pass(pass_num: int) -> None:
-        step_num = pass_num if args.mode == "steps" else 0
-        pass_run_id = run_id if pass_num == 1 else f"{run_id}-s{pass_num}"
+    def _execute_run() -> None:
+        # One pass: --steps is 1 (checked above), as the Go loader's -strategy.
+        step_num = 1 if args.mode == "steps" else 0
 
         task_specs: dict[str, dict[str, Any]] = {}
         sdk_tasks: list[Any] = []
@@ -1213,9 +1212,7 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
             image_task_counts[img] = image_task_counts.get(img, 0) + fanout
             rollout_trajs = inst.get("rollouts") or []
             for k in range(fanout):
-                tid = iid if (fanout == 1 and passes == 1) else f"{iid}#r{k}"
-                if pass_num > 1:
-                    tid = f"{tid}#s{pass_num}"
+                tid = iid if fanout == 1 else f"{iid}#r{k}"
                 r_spec = rollout_trajs[k] if k < len(rollout_trajs) else inst
                 spec = {
                     "instance_id": iid,
@@ -1258,7 +1255,7 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
             acquire_timeout_s=create_timeout_s,
             ready_timeout_s=create_timeout_s,
             step_timeout_s=step_timeout_s,
-            run_id=pass_run_id,
+            run_id=run_id,
             observability=sdk.ObservabilityConfig(enable_metrics=False, enable_tracing=False),
         )
 
@@ -1303,13 +1300,6 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
                 slot_wait_ms = max(0.0, float(current_slot_wait_s.get() or 0.0) * 1000.0)
 
                 is_warm = handle.claim_source == "warm_pool"
-                with stats_lock:
-                    if is_warm:
-                        stats["ws_hits"] += 1
-                        stats["ws_reused"] += 1
-                        pass_warm_hits += 1
-                    else:
-                        stats["ws_misses"] += 1
 
                 with inst_driver._meta_lock:
                     acq_start = inst_driver.acquire_starts.get(handle.sandbox_id)
@@ -1447,6 +1437,8 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
                 recorder.record(task_ev)
                 inst_driver.mark_task_recorded(task_obj.id)
 
+                # The task and its claim count once, with its task event: here,
+                # or below for a task whose callback raised before this point.
                 with stats_lock:
                     stats["total_tasks"] += 1
                     if not ok:
@@ -1455,10 +1447,17 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
                         pass_live += 1
                     if reward == 1:
                         stats["rewarded_tasks"] += 1
+                    if is_warm:
+                        stats["ws_hits"] += 1
+                        stats["ws_reused"] += 1
+                        pass_warm_hits += 1
+                    else:
+                        stats["ws_misses"] += 1
                 return ok
 
             results = fleet.run(_process_one, concurrency=args.width)
-            # Count tasks where acquire or post-acquire runtime setup raised before _process_one ran.
+            # Tasks whose acquire, runtime setup or callback raised before the
+            # task event was recorded: one failed task and one claim each.
             for task_obj, r in zip(sdk_tasks, results, strict=False):
                 if isinstance(r, BaseException):
                     sp = task_specs.get(task_obj.id, {})
@@ -1480,15 +1479,15 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
                             fail_ev["step"] = step_num
                         recorder.record(fail_ev)
                         inst_driver.mark_task_recorded(task_obj.id)
-                    with stats_lock:
-                        stats["total_tasks"] += 1
-                        stats["failed_tasks"] += 1
-                        if claim_src == "warm_pool":
-                            stats["ws_hits"] += 1
-                            stats["ws_reused"] += 1
-                            pass_warm_hits += 1
-                        else:
-                            stats["ws_misses"] += 1
+                        with stats_lock:
+                            stats["total_tasks"] += 1
+                            stats["failed_tasks"] += 1
+                            if claim_src == "warm_pool":
+                                stats["ws_hits"] += 1
+                                stats["ws_reused"] += 1
+                                pass_warm_hits += 1
+                            else:
+                                stats["ws_misses"] += 1
 
             rep = fleet.report
             if rep is not None:
@@ -1526,8 +1525,7 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
 
     run_start = time.monotonic()
     try:
-        for pass_num in range(1, passes + 1):
-            _execute_pass(pass_num)
+        _execute_run()
 
         total_tasks = int(stats["total_tasks"])
         failed_tasks = int(stats["failed_tasks"])
@@ -1564,7 +1562,7 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
             labels["tasks_per_image"] = str(fanout)
         else:
             labels["rollouts"] = str(fanout)
-            labels["steps"] = str(passes)
+            labels["steps"] = str(args.steps)
             labels["park"] = "delete" if args.strategy == "none" else "suspend"
         if plan.get("exclude_label"):
             labels["exclude_file"] = str(plan["exclude_label"])
@@ -1582,7 +1580,7 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
         tags: dict[str, str] = {
             "load_tasks": str(len(instances)),
             "load_group_size": str(fanout),
-            "load_steps": str(passes),
+            "load_steps": str(args.steps),
             "load_tasks_per_step": str(tasks_per_step),
             "load_trajectories_per_step": str(fanout * tasks_per_step),
             "load_max_concurrent": str(args.width),
@@ -1618,7 +1616,7 @@ def run_benchmark(argv: list[str] | None = None, *, custom_driver: Any | None = 
     if args.fleet_report_out and combined_reports:
         prefix = pathlib.Path(args.fleet_report_out)
         prefix.parent.mkdir(parents=True, exist_ok=True)
-        payload = combined_reports[0] if len(combined_reports) == 1 else {"passes": combined_reports}
+        payload = combined_reports[0]
         prefix.with_name(prefix.name + ".json").write_text(
             json.dumps(payload, indent=2) + "\n", encoding="utf-8"
         )

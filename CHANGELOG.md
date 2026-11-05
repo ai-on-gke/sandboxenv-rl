@@ -7,6 +7,16 @@ user needs to know across them.
 ## Unreleased
 
 ### Added
+- `examples/Qwen3.5-397B-A17B-verl`: the agentic GRPO recipe from 2 to 16 GPU
+  nodes with profiles for Qwen3.5-35B-A3B and Qwen3.5-397B-A17B, steps of
+  thousands of trajectories, and guarded verl patches for 64K responses.
+- uni-agent provider `ate_env`: `start_wait_s` (wait for sandbox capacity
+  instead of failing), `startup_concurrency` (a job-wide start-up gate through
+  one Ray actor per job, which also reclaims orphaned environments) and
+  `stop_retry_s` (retry deletes while the actor is mid-operation).
+- `uni_agent_substrate.datasets --shuffle-seed` for datasets sorted by
+  repository; `resolve_images.sh` `MODE=hubapi` (Docker Hub tags API, no
+  pulls), `MODE=arapi` (Artifact Registry listing) and `MIRROR_NAME_SEP`.
 - Python client: `FleetConfig.node_selector` is sent as every environment's
   `worker_selector`, and `FleetConfig.placement` adds labels per task image;
   `SubstrateBackendDriver(worker_selector=, placement=)` and

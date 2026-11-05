@@ -848,9 +848,21 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 			combined.WriteByte('\n')
 		}
 	}
-	rep, err := swebench.Summarize(&combined)
+	rawCombined := combined.Bytes()
+	rep, err := swebench.Summarize(bytes.NewReader(rawCombined))
 	if err != nil {
 		return err
+	}
+	if rtFile, err := os.Open(filepath.Join(destDir, "restore_timings.jsonl")); err == nil {
+		timings, parseErr := swebench.ParseRestoreTimings(rtFile)
+		_ = rtFile.Close()
+		if parseErr == nil && len(timings) > 0 {
+			if evs, evErr := swebench.ReadEvents(bytes.NewReader(rawCombined)); evErr == nil {
+				if rb := swebench.JoinRestores(evs, timings); rb.First.Restores+rb.Wakes.Restores > 0 {
+					rep.Restores = rb
+				}
+			}
+		}
 	}
 	rep.Scopes = activeScopes
 	if ingRes != nil && len(ingRes.CustomMetrics) > 0 {

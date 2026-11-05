@@ -479,7 +479,7 @@ func TestJoinRestores(t *testing.T) {
 	if p := find(b.First, "download"); p.Count != 2 || p.MaxMS != 3000 {
 		t.Fatalf("first download: %+v", p)
 	}
-	if p := find(b.First, "total"); p.Count != 3 || p.MaxMS != 8100 {
+	if p := find(b.First, "total"); p.Count != 3 || p.P50MS != 4000 || p.P90MS <= 0 || p.MaxMS != 8100 {
 		t.Fatalf("first total: %+v", p)
 	}
 	if b.First.Phases[0].Phase != "manifest_fetch" || b.First.Phases[len(b.First.Phases)-1].Phase != "total" {

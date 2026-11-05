@@ -70,6 +70,9 @@ user needs to know across them.
 
 ### Fixed
 
+- ate-env-api: a base template whose guest command climbs out with `..`
+  (`/../ko-app/ate-env-guest`) is re-rooted under `/ate` instead of deriving
+  templates whose guest is not found at boot.
 - Python client: environments no longer outlive `teardown()`. A recycle,
   `warm_pool` call or failed warm claim that overlaps a teardown deletes its
   environment instead of pooling it, and the warm-replica gauge stays equal to

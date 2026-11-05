@@ -51,7 +51,7 @@ export PYTHONUNBUFFERED=1 HF_HOME=/workspace/hf HF_HUB_ENABLE_HF_TRANSFER=1 CUDA
 : "${ROLLOUT_HYBRID_FLAGS:=1}"           # vLLM flags for the hybrid (GDN) model; set 0 if your vLLM rejects them
 : "${ROLLOUT_DISABLE_CUSTOM_ALLREDUCE:=True}"  # NCCL all-reduce inside a replica; vLLM's IPC kernel can fail at start ("custom_all_reduce.cuh ... invalid argument")
 : "${RAY_CPUS:=64}"                      # Ray CPU slots per node: uni-agent task runners are Ray tasks (1 CPU each)
-: "${ATE_ENV_ENDPOINT:=ate-env-api.ate-env.svc:7777}"; : "${ATE_TEMPLATE:=swe-2c6g}"; : "${ACTOR_PREFIX:=ua}"
+: "${ATE_ENV_ENDPOINT:=ate-env-api.ate-env.svc:7777}"; : "${ATE_TEMPLATE:=swe-1c4g}"; : "${ACTOR_PREFIX:=ua}"
 MAX_MODEL_LEN=$((PROMPT_LENGTH + RESPONSE_LENGTH))
 mkdir -p /workspace/results /workspace/agent /workspace/data
 cd /workspace/results   # neutral cwd: the image's working directory holds a docker/ folder that shadows the docker package

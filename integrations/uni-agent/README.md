@@ -72,6 +72,9 @@ instance metadata the task needs. Substrate only accepts digest-pinned images, s
 `resolve_images.sh` resolves the tag references (`--images-out`) through an Artifact
 Registry remote repository proxying Docker Hub (`crane digest`, nothing copied) or a
 mirror (`MODE=mirror`), and `--image-digests` rewrites the rows to those references.
+`MODE=hubapi` resolves through Docker Hub's tags API (no pulls, so thousands of tags
+stay under the rate limit), `MODE=arapi` through an Artifact Registry listing, and
+`MIRROR_NAME_SEP` addresses mirrors that flatten namespace and repository into one name.
 
 ## Tests
 

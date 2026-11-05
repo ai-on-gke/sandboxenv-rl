@@ -11,6 +11,9 @@ model commit (`MODEL_REVISION` in each profile). The `ate_env` client ([`clients
 and dataset tooling ([`integrations/uni-agent`](../../integrations/uni-agent)) ship from this checkout in
 the payload ConfigMap; the pods need no access to this repository.
 
+This recipe supersedes [`examples/Qwen3.5-35B-A3B-verl`](../Qwen3.5-35B-A3B-verl/README.md): the `35b-easy`
+profile is that recipe's 2-node shape on this code, and folding the sibling into this directory is a follow-up.
+
 Same files at every scale; only `profiles/<name>.env` changes. The two 35B profiles are sized so that eight of
 them (`JOB_SUFFIX=a..h`) fill the same 16 GPU nodes as one 397B profile, generate as many trajectories per step
 and put the same peak load on the sandbox pool: eight `35b-easy` match `397b-easy`, eight `35b-v1` match `397b-v1`.
@@ -85,8 +88,9 @@ PROFILE=397b-smoke ./deploy.sh up && ./deploy.sh logs    # 16/16 nodes
   ConfigMap (thousands of entries fit).
 - Knobs are the keys of `profiles/<name>.env`, documented inline; `PROFILE_FILE=<path>` points at a copy kept
   elsewhere (your own node counts or knobs). `./deploy.sh render` prints the manifests
-  without a cluster; `DRY_RUN=1` in a profile makes the head compose and validate the verl config and exit
-  (a CPU pod is enough).
+  without a cluster; `DRY_RUN=1` in a profile makes the head compose and validate the verl config and exit.
+  The Jobs still request 8 GPUs per pod; for a GPU-free check, drop the `nvidia.com/gpu` requests and limits
+  from a copy of `job-fully-async.yaml`.
 - `GPU_POD_ENV=K=V,K2=V2` adds environment variables to the GPU pods: NCCL and Gloo settings for your
   network (`NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` on multi-NIC or dual-stack nodes, plugin toggles);
   both interface pins are also forwarded to every Ray worker.

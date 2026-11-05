@@ -18,6 +18,7 @@ internal/
   benchmarking/          # Benchmark packages: job, measure, overlay, schema, sut, swebench, trace
   hostcheck/             # HTTP middleware: DNS-rebinding defense on Host headers
   internaltest/          # Test doubles: fakecontrol, fakerouter, testcerts
+  inventory/             # Fleet inventory snapshot: v1 JSON Schema, strict decoder, Substrate state vocabulary
   mcp/                   # Streamable HTTP MCP server: maps shell and file tools to guest gRPC
   portproxy/             # HTTP/CONNECT reverse proxy: tunnels ports inside actors via atenet
   routertls/             # TLS config: dynamic SPIFFE client certificate and CA reload

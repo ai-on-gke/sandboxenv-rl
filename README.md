@@ -438,7 +438,7 @@ ate-env create dev1
 
 # Or run any digest-pinned image unmodified. ate-env-api derives a template
 # from default-template on first use (guest mounted in as an image volume)
-# and reuses it for later environments on the same image or digest.
+# and reuses it for later environments on an image with the same digest.
 ate-env create py1 --rootfs-image docker.io/library/python@sha256:<digest>
 
 # Or from the layered template above: the second runtime answers inside the

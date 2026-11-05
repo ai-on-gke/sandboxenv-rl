@@ -148,8 +148,8 @@ runnable example in [`examples/runtime-layers`](../../examples/runtime-layers).
   `worker_selector={...}` or `FleetConfig(node_selector=..., placement=...)`,
   or Go `WorkerSelector`) matched by exact equality: Substrate ANDs them with the
   base template's selector and stores them on `Actor.worker_selector`, so
-  per-environment selectors narrow the base template's pool selection (never
-  widen it) and persist across wakes. A rootfs image that needs more compute or
+  per-environment selectors narrow the base template's pool selection and
+  persist across wakes. A rootfs image that needs more compute or
   a disjoint pool still needs its own template (Option A) or a second base.
 - The rootfs image's existence is not checked at create time. A bad reference is
   reported by the actor failing to start, not by `CreateEnvironment`.

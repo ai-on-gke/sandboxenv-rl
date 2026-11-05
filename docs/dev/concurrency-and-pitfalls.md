@@ -1,7 +1,7 @@
 # System invariants and concurrency pitfalls
 
-Companion to [docs/architecture.md](../architecture.md) and
-[docs/dev/code-layout.md](./code-layout.md). Catalogs concurrency invariants across `sandboxenv-rl`.
+Companion to [architecture](../architecture.md) and [code layout](./code-layout.md). This guide
+catalogs the concurrency invariants of `sandboxenv-rl`.
 
 ## In-guest process lifecycle and signaling
 
@@ -34,9 +34,8 @@ Acquire `OutputChanged()` before reading from disk to avoid missed write notific
 - **Location**: `guest/process/service.go` (`StreamProcessOutput`), `guest/process/tracker.go`.
 - **Why**: Subscribing to `ProcessState.OutputChanged()` after reading misses concurrent disk
   writes, stalling the stream until the next write or exit.
-- **Mechanism**: `StreamProcessOutput` acquires `OutputChanged()` before reading. If zero bytes are
-  read while running, it waits on that channel; writers close the channel under mutex after
-  flushing.
+- **Mechanism**: `StreamProcessOutput` acquires `OutputChanged()` before reading and waits on it
+  when zero bytes are read while running; writers close it under mutex after flushing.
 
 ## Server networking and Substrate boundaries
 
@@ -53,8 +52,8 @@ Append `ate-target-actor` via interceptors and do not forward incoming caller me
   metadata. `internal/routertls` hot-reloads kubelet-projected `-atenet-client-cert` and
   `servicedns` `-atenet-ca-file` bundles on handshakes. `routertls.TransportCredentials`
   (`alertConn.Write`) reads pending post-handshake TLS 1.3 alerts on initial HTTP/2 write failures
-  (`EPIPE`), letting `ensureAwake` match `routertls.RejectedCertificate` on attempt 1 while
-  `DialGuest` callers receive the TLS alert error.
+  (`EPIPE`), letting `ensureAwake` match `routertls.RejectedCertificate` on the first probe, before
+  any wait, while `DialGuest` callers receive the TLS alert error.
 
 ### 5. Actor wake budgets, fail-fast start errors, and actor deletion
 
@@ -66,8 +65,9 @@ Verify readiness within wake budgets, fail fast on unrecoverable errors, and evi
   polls `GetProcess("ate-env-wake-probe")` under `DefaultWakeBudget` (5 minutes overall) and
   `DefaultWakeRunningBudget` (20 seconds once `RUNNING`).
 - **Fail-fast start errors**: `ensureAwake` exits early on unrecoverable states:
-  `routertls.RejectedCertificate` or `CRASHED` returns `codes.FailedPrecondition` (with
-  `ActorStatus.Crash.Message` and trailer `ate-env-start-failure: crashed`), `DELETING` returns
+  `routertls.RejectedCertificate` returns `codes.FailedPrecondition` with
+  `routertls.RejectionAdvice` and no trailer, `CRASHED` returns `codes.FailedPrecondition` with
+  `ActorStatus.Crash.Message` and trailer `ate-env-start-failure: crashed`, `DELETING` returns
   `codes.NotFound`, and `"no worker has room for the actor"` persisting across `WakeNoCapacityGrace`
   while not `RUNNING` (default `0` waits `WakeBudget`) returns `codes.ResourceExhausted`
   (`ate-env-start-failure: no-capacity`).
@@ -89,12 +89,11 @@ Serialize derived template creation and recovery with `imageTemplateLocks`, and 
   Substrate leaves terminal `golden_snapshot_status.error_message` failures unretried, and deleting
   an in-use template strips rootfs volumes upon resume.
 - **Mechanism**: `ensureImageTemplate` holds a per-template read lock (`imageTemplateLocks`) through
-  `CreateActor`. `getOrCreateImageTemplate` reuses an existing template as is when `sameImageDigest`
+  `CreateActor`. `getOrCreateImageTemplate` reuses an existing template when `sameImageDigest`
   matches across repository paths, returns `codes.FailedPrecondition` on mismatch, and treats
-  `codes.AlreadyExists` on `CreateActorTemplate` as success. If a golden snapshot failed at least
+  `codes.AlreadyExists` as success. When a golden snapshot failed at least
   `failedTemplateRecreateAfter` (10 minutes) ago, `ensureImageTemplate` upgrades to the write lock
-  and calls `recreateFailedImageTemplate`, which verifies zero `templateUsers` and deletes/recreates
-  by UID.
+  and calls `recreateFailedImageTemplate` to verify zero `templateUsers` and recreate by UID.
 
 ## Client connection pooling and event loops
 
@@ -103,20 +102,21 @@ Serialize derived template creation and recovery with `imageTemplateLocks`, and 
 Dispatch synchronous Python calls to a persistent `LoopRunner` background thread.
 
 - **Location**: `clients/python/src/ate_env_rl/loop_runner.py`,
-  `clients/python/src/ate_env_rl/fleet.py`, `cmd/ate-env-api/main.go`.
+  `clients/python/src/ate_env_rl/fleet.py`, `clients/python/src/ate_env_rl/backend/substrate.py`,
+  `cmd/ate-env-api/main.go`.
 - **Why**: Calling async gRPC methods via `asyncio.run()` creates a short-lived loop that destroys
   open gRPC channels on exit and corrupts HTTP/2 channel state.
-- **Mechanism**: `LoopRunner` runs a daemon thread with a persistent event loop, dispatching
-  coroutines via `asyncio.run_coroutine_threadsafe` over pooled gRPC channels
-  (`ceil(max_concurrent / 200)`) against `DefaultMaxConcurrentStreams = 4096` (vs. 250 default).
+- **Mechanism**: `LoopRunner` runs a daemon thread with a persistent event loop and dispatches
+  coroutines via `asyncio.run_coroutine_threadsafe`. `SandboxFleet` sizes connections via
+  `FleetConfig.connections` or `ceil(max_concurrent / 200)`, and `SubstrateBackendDriver` holds the
+  pooled gRPC channels against `DefaultMaxConcurrentStreams = 4096`.
 
 ### 8. Python release error tracking and teardown retries
 
 Record release errors in `RunReport` and retry unreleased actors during `fleet.teardown()`.
 
 - **Location**: `clients/python/src/ate_env_rl/backend/substrate.py`.
-- **Why**: Network interruptions during `delete` must not crash training workers, yet orphan actors
-  must not leak in Substrate.
+- **Why**: Network errors during `delete` must not crash workers or leak orphan actors.
 - **Mechanism**: `SubstrateBackendDriver` records failed deletions in `RunReport.release_errors` and
   keeps the actor in `_owned_actors`; `fleet.teardown()` retries all unreleased actors and raises
   `InfrastructureError` if any cannot be reclaimed.
@@ -126,26 +126,25 @@ Record release errors in `RunReport` and retry unreleased actors during `fleet.t
 Re-check teardown state after each await before pooling an actor, and reserve warm slots upfront.
 
 - **Location**: `clients/python/src/ate_env_rl/backend/substrate.py` (`_release_internal`,
-  `_warm_pool_internal`, `_acquire_internal`, `_reap_internal`, `_return_popped`, `_may_pool`),
+  `_warm_pool_internal`, `_acquire_internal`, `_reap_internal`, `_return_popped`,
+  `_delete_unpooled`, `_keep_for_any_reap`, `_may_pool`, `_cancel_warm_calls`),
   `clients/python/tests/test_warm_pool_accounting.py`.
-- **Why**: Recycles pop actors from `_owned_actors` while awaiting `suspend()`; pooling after a
-  concurrent `reap` leaks live actors past teardown with the warm-replica gauge reset, and
-  overlapping `warm_pool` calls reading an unreserved shortfall over-provision.
-- **Teardown & claim checks**: `reap` increments `_teardowns` on entry and exit, and `_reaping`
-  counts active reaps. Recycles, `warm_pool`, and warm claims read `_teardowns` before awaiting and
-  pool only when unchanged with `_reaping == 0` (`_may_pool`); otherwise they delete the actor. A
-  warm claim whose `get()` succeeds checks `_may_pool` and takes ownership in the same lock hold; if
-  stale, it deletes the actor if still owned (a reap of another run, or one cancelled before its
-  delete, left it alive) and claims or creates another.
+- **Why**: Recycles pop actors from `_owned_actors` during `suspend()`; pooling after a concurrent
+  `reap` leaks actors past teardown, and unreserved shortfalls over-provision.
+- **Teardown & claim checks**: `reap` increments `_teardowns` on entry and exit (`_reaping` counts
+  active reaps); recycles, `warm_pool`, and warm claims read `_teardowns` before awaiting and pool
+  only when unchanged with `_reaping == 0` (`_may_pool`), otherwise deleting the actor. A warm claim
+  whose `get()` succeeds checks `_may_pool` and takes ownership in one lock hold, or deletes any
+  stale still-owned actor and retries.
 - **Ownership & generations**: Actors stay in `_owned_actors` until deletion succeeds. A cold
   `acquire` whose create overlaps its own run's reap owns the actor under `WARM_POOL_RUN_ID` too;
-  its handle keeps the run id. Failed or cancelled deletes and recycles cancelled in `suspend()`
-  restore ownership via `_return_popped` in one lock hold (under `WARM_POOL_RUN_ID` if a reap ran
-  since the pop, else the actor's run id). Torn-down or cancelled `warm_pool` creates (deleted in
-  background tasks if a reap ran since planning) and warm actors whose `suspend()` failed are
-  likewise owned under `WARM_POOL_RUN_ID` so any run's `reap` deletes them. `_warm_inflight` tracks
-  in-flight creations per pool key, `_teardowns`, and generation (`_pool_gens`), subtracting them
-  from shortfalls; `unwarm_pool` and shrinking `resize_pool` calls delete drained actors and bump
-  `_pool_gens`. `reap` updates the warm-replica gauge alongside the cleared pool, and
-  `tests/test_warm_pool_accounting.py` exercises these interleavings with a Hypothesis state
-  machine.
+  its handle keeps the run id. `_reap_internal` clears `_warm_inflight` on entry and on exit,
+  dropping warm reservations on reap. `_warm_inflight` tracks in-flight creations per pool key,
+  `_teardowns`, and generation (`_pool_gens`), subtracting them from shortfalls; `unwarm_pool`, and
+  a `resize_pool` below pooled plus in-flight, bump `_pool_gens` (`_cancel_warm_calls`), so a
+  `warm_pool` call that started before deletes what it created (`drained` in `_warm_pool_internal`)
+  and does not pool it. `_delete_unpooled` re-tags a failed or cancelled delete of an unpooled actor
+  under `WARM_POOL_RUN_ID` unconditionally via `_keep_for_any_reap` (distinct from `release` routing
+  popped actors through `_return_popped` based on `_may_pool`). `reap` updates the warm-replica
+  gauge alongside the cleared pool, and `tests/test_warm_pool_accounting.py` exercises these
+  interleavings with a Hypothesis state machine.

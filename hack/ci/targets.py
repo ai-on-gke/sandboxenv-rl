@@ -53,7 +53,6 @@ class KindTarget:
 
     context: str
     registry: str
-    bucket_url: str
     platform: str
     rootfs_image: str | None
 

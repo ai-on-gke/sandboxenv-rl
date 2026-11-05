@@ -43,8 +43,9 @@ Environment ids are `gym-<10 hex>`; each handle remembers the atespace it was cr
 On the cluster:
 
 1. **Agent Substrate installed** (`ate-system` namespace healthy — api-server, controller,
-   atelet, atenet-router, valkey). See `hack/install-ate.sh` in the
-   [substrate repo](https://github.com/agent-substrate/substrate). The guest data
+   atelet, atenet-router, valkey). `go run ./cmd/ate-setup deploy ate-system` in a checkout of
+   the [substrate repo](https://github.com/agent-substrate/substrate) installs it; its Quickstart
+   and `cmd/ate-setup/README.md` have the flags, and `--kind` targets a Kind cluster. The guest data
    plane is gRPC through the router, which needs a substrate at or after
    [substrate#1183](https://github.com/agent-substrate/substrate/pull/1183) (h2 on the ingress,
    protocol mirrored to actors). Without it every exec and file call fails with

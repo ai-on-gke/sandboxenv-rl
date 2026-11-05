@@ -38,19 +38,11 @@ import (
 	"pgregory.net/rapid"
 )
 
-// hookControl is the fake control plane with hooks that run before a
-// template RPC is applied, to steer the interleaving of concurrent creates.
+// hookControl is the fake control plane with a hook that runs before a
+// template create is applied, to steer the interleaving of concurrent creates.
 type hookControl struct {
 	*fakecontrol.Server
-	beforeGet    func(name string)
 	beforeCreate func(name, image string)
-}
-
-func (h *hookControl) GetActorTemplate(ctx context.Context, req *ateapipb.GetActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
-	if h.beforeGet != nil {
-		h.beforeGet(req.GetActorTemplate().GetName())
-	}
-	return h.Server.GetActorTemplate(ctx, req)
 }
 
 func (h *hookControl) CreateActorTemplate(ctx context.Context, req *ateapipb.CreateActorTemplateRequest) (*ateapipb.ActorTemplate, error) {

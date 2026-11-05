@@ -70,6 +70,10 @@ user needs to know across them.
 
 ### Fixed
 
+- ate-env-api port proxy: the path form
+  (`/v1alpha/envs/<id>/ports/<port>/...`) forwards the rest of the path
+  exactly as sent; it re-escaped `! ' ( ) *` (`/report(1).txt` reached the
+  daemon as `/report%281%29.txt`) when the path held no other escape.
 - Python client: environments no longer outlive `teardown()`. A recycle,
   `warm_pool` call or failed warm claim that overlaps a teardown deletes its
   environment instead of pooling it, and the warm-replica gauge stays equal to

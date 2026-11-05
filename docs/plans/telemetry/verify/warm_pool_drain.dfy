@@ -25,7 +25,9 @@
 //      release whose delete fails or is cancelled after a reap ran, re-tag
 //      too) and AC-15.8 (a warm_pool cancelled during its creates owns what
 //      it made under WARM_POOL_RUN_ID, and an actor whose suspend() fails is
-//      owned the same way and deleted).
+//      owned the same way and deleted), and AC-15.10 (a cold acquire whose
+//      create overlaps its own run's reap owns the actor under
+//      WARM_POOL_RUN_ID).
 //
 // As in the other models, each action is the code between two awaits of
 // clients/python/src/ate_env_rl/backend/substrate.py, for one pool key and one
@@ -418,6 +420,23 @@ module WarmPoolRunIds {
     requires a !in s.live
   { s.(live := s.live + {a}) }
 
+  // A cold acquire for run r: create() returned, the driver owns the actor.
+  // An acquire that starts after its run's reap is a caller bug (the fleet is
+  // closed) and outside the model, so r in reaped here means the run's reap
+  // overlapped the create. AC-15.10 (`_run_reaped_since`): own it under WARM
+  // then; the caller's handle keeps r.
+  ghost function AcquireCommit(s: State, a: Actor, r: Run): State
+    requires a !in s.live && a !in s.owned && a !in s.releasing && r != WARM
+  {
+    var run := if r in s.reaped then WARM else r;
+    s.(live := s.live + {a}, owned := s.owned[a := run])
+  }
+
+  // Before AC-15.10's fix: owned under r even when r's reap overlapped.
+  function AcquireCommitBefore(s: State, a: Actor, r: Run): State
+    requires a !in s.live && a !in s.owned && a !in s.releasing
+  { s.(live := s.live + {a}, owned := s.owned[a := r]) }
+
   // ======================================================= #221 verifies
   lemma ReapSafe(s: State, r: Run)
     requires Inv(s) && r != WARM
@@ -471,6 +490,11 @@ module WarmPoolRunIds {
     ensures Inv(WarmSuspendFailed(s, a))
   {}
 
+  lemma AcquireCommitSafe(s: State, a: Actor, r: Run)
+    requires Inv(s) && a !in s.live && a !in s.owned && a !in s.releasing && r != WARM
+    ensures Inv(AcquireCommit(s, a, r))
+  {}
+
   lemma DeleteCancelledFixedSafe(s: State, a: Actor)
     requires Inv(s) && a in s.deleting
     ensures Inv(DeleteCancelledFixed(s, a))
@@ -514,6 +538,13 @@ module WarmPoolRunIds {
   lemma WarmCancelledBeforeSafe(s: State, made: set<Actor>, created: set<Actor>)
     requires Inv(s) && created <= made && made !! s.live
     ensures Inv(WarmCancelledBefore(s, made, created))                // fails
+  {}
+
+  // Before AC-15.10's fix: a cold acquire whose create overlapped its own
+  // run's reap stayed under the reaped run id.
+  lemma AcquireCommitBeforeSafe(s: State, a: Actor, r: Run)
+    requires Inv(s) && a !in s.live && a !in s.owned && a !in s.releasing
+    ensures Inv(AcquireCommitBefore(s, a, r))                         // fails
   {}
 
   // Before AC-15.9's fix: a cancelled delete after the run's reap kept the

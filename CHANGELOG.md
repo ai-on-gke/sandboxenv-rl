@@ -74,8 +74,16 @@ user needs to know across them.
   (`/v1alpha/envs/<id>/ports/<port>/...`) forwards the rest of the path
   exactly as sent; it re-escaped `! ' ( ) *` (`/report(1).txt` reached the
   daemon as `/report%281%29.txt`) when the path held no other escape.
+- ate-env-api: a `CreateEnvironment` whose derived image template was created
+  by a concurrent call for another image (two digests sharing their first 12
+  hex digits) fails with `FailedPrecondition` instead of running that image.
+- ate-env-api: a base template whose guest command climbs out with `..`
+  (`/../ko-app/ate-env-guest`) is re-rooted under `/ate` instead of deriving
+  templates whose guest is not found at boot.
 - Python client: environments no longer outlive `teardown()`. A recycle,
   `warm_pool` call or failed warm claim that overlaps a teardown deletes its
   environment instead of pooling it, and the warm-replica gauge stays equal to
   the warm pool. An environment whose delete fails or is cancelled stays
-  owned, and the next `reap` of any run deletes it.
+  owned, and the next `reap` of any run deletes it. An environment that an `acquire`
+  creates while its own run's teardown runs is also deleted by the next `reap`
+  of any run, unless the caller releases it first.

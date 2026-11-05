@@ -106,14 +106,17 @@ mkdir -p "${MANIFEST_DIR}"
 
 Set `R2E_LIMIT` to at least your chosen `--r2e-images` count. Build the digest-pinned R2E-Gym
 `CommandAdapter` manifest with [`../make-r2e-dataset.py`](../make-r2e-dataset.py) and
-[`../../../integrations/uni-agent/scripts/resolve_images.sh`](../../../integrations/uni-agent/scripts/resolve_images.sh):
+[`../../../integrations/uni-agent/scripts/resolve_images.sh`](../../../integrations/uni-agent/scripts/resolve_images.sh).
+The first pass lists every candidate image, not the first `R2E_LIMIT`: the manifest pass skips a
+tag whose digest an earlier tag already has, so it reads past the first `R2E_LIMIT` candidates,
+and every tag it reads must be in `r2e-images.json`. Set `MODE=hubapi` on `resolve_images.sh` to
+resolve thousands of tags in minutes; the mapping serves any later `R2E_LIMIT`.
 
 ```bash
 R2E_LIMIT=20
 
 "${ENV_REPO}/benchmarking/swebench/make-r2e-dataset.py" \
   --source r2e_gym_easy \
-  --limit "${R2E_LIMIT}" \
   --images-out "${MANIFEST_DIR}/r2e-images.txt"
 
 "${ENV_REPO}/integrations/uni-agent/scripts/resolve_images.sh" \

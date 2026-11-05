@@ -119,6 +119,62 @@ def test_extract_gold_patch_filters_tests_and_formats_hunks():
     assert "README.md" in patch_all
 
 
+def test_extract_gold_patch_added_and_deleted_files_apply(tmp_path):
+    """A commit that adds or deletes a .py file has one side missing; git apply wants /dev/null there."""
+    commit = {
+        "file_diffs": [
+            {
+                "header": {"file": {"path": "pkg/new_mod.py"}, "misc_line": "new file mode 100644"},
+                "plus_file": {"path": "b/pkg/new_mod.py"},
+                "hunks": [
+                    {
+                        "descriptor": {
+                            "old_range": {"start": 0, "length": 0},
+                            "new_range": {"start": 1, "length": 2},
+                        },
+                        "line_group": {
+                            "all_lines": [
+                                {"type": "added", "content": "def twice(x):"},
+                                {"type": "added", "content": "    return 2 * x"},
+                            ]
+                        },
+                    }
+                ],
+            },
+            {
+                "header": {"file": {"path": "pkg/old_mod.py"}, "misc_line": "deleted file mode 100644"},
+                "minus_file": {"path": "a/pkg/old_mod.py"},
+                "plus_file": None,
+                "hunks": [
+                    {
+                        "descriptor": {
+                            "old_range": {"start": 1, "length": 1},
+                            "new_range": {"start": 0, "length": 0},
+                        },
+                        "line_group": {"all_lines": [{"type": "deleted", "content": "OLD = 1"}]},
+                    }
+                ],
+            },
+        ]
+    }
+    patch = r2e.extract_gold_patch(commit)
+    assert "--- /dev/null\n+++ b/pkg/new_mod.py\n@@ -0,0 +1,2 @@\n" in patch
+    assert "--- a/pkg/old_mod.py\n+++ /dev/null\n@@ -1,1 +0,0 @@\n" in patch
+
+    repo = tmp_path / "repo"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / "pkg" / "old_mod.py").write_text("OLD = 1\n", encoding="utf-8")
+    git = ["git", "-c", "user.email=t@localhost", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run([*git, "add", "-A"], cwd=repo, check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "init"], cwd=repo, check=True)
+    patch_file = tmp_path / "gold.patch"
+    patch_file.write_text(patch, encoding="utf-8")
+    subprocess.run(["git", "apply", "--whitespace=fix", str(patch_file)], cwd=repo, check=True)
+    assert (repo / "pkg" / "new_mod.py").read_text(encoding="utf-8") == "def twice(x):\n    return 2 * x\n"
+    assert not (repo / "pkg" / "old_mod.py").exists()
+
+
 def test_build_r2e_commands_executes_setup_grade_reset_and_second_step(tmp_path):
     with pytest.raises(ValueError, match="expected_output_json"):
         r2e.build_r2e_commands("diff", {})
@@ -240,14 +296,16 @@ def _digest(n: int) -> str:
     return f"sha256:{n:064x}"
 
 
-def _easy_line(iid: str, image: str, *, empty_patch: bool = False) -> str:
+def _easy_line(
+    iid: str, image: str, *, empty_patch: bool = False, empty_expected: bool = False
+) -> str:
     parsed = {} if empty_patch else _sample_parsed_commit(include_test=False)
     inst = {
         "instance_id": iid,
         "repo_name": "demo/repo",
         "commit_hash": iid,
         "docker_image": image,
-        "expected_output_json": json.dumps({"TestCalc.test_add": "PASSED"}),
+        "expected_output_json": "{}" if empty_expected else json.dumps({"TestCalc.test_add": "PASSED"}),
         "parsed_commit_content": json.dumps(parsed),
     }
     return json.dumps({"responses_create_params": {"metadata": {"instance_dict": json.dumps(inst)}}})
@@ -261,6 +319,7 @@ def test_cli_local_jsonl_images_out_and_digests(tmp_path):
                 _easy_line("inst-b", "r2e/img-b:1"),
                 _easy_line("inst-a", "r2e/img-a:1"),
                 _easy_line("inst-empty", "r2e/img-empty:1", empty_patch=True),
+                _easy_line("inst-noexp", "r2e/img-noexp:1", empty_expected=True),
                 _easy_line("inst-dup", "r2e/img-dup:1"),
                 _easy_line("inst-excl", "r2e/img-excl:1"),
                 _easy_line("inst-missing", "r2e/img-missing:1"),
@@ -272,21 +331,56 @@ def test_cli_local_jsonl_images_out_and_digests(tmp_path):
     excl = tmp_path / "exclude.txt"
     excl.write_text("# comment\ninst-excl  offline socket test\n\n", encoding="utf-8")
 
+    # The image list carries every candidate (the manifest pass skips shared
+    # digests and reads past --limit), and excludes the rows the manifest pass
+    # excludes: an empty gold patch, an empty expected_output_json, the exclude file.
     imgs_only = tmp_path / "images-only.txt"
-    rc = r2e.main(
-        [
-            "--dataset",
-            str(src),
-            "--exclude-file",
-            str(excl),
-            "--limit",
-            "2",
-            "--images-out",
-            str(imgs_only),
-        ]
-    )
+    with pytest.raises(SystemExit) as limit_exit:
+        r2e.main(["--dataset", str(src), "--limit", "2", "--images-out", str(imgs_only)])
+    assert limit_exit.value.code == 2
+    assert not imgs_only.exists()
+    rc = r2e.main(["--dataset", str(src), "--exclude-file", str(excl), "--images-out", str(imgs_only)])
     assert rc == 0
-    assert imgs_only.read_text(encoding="utf-8").splitlines() == ["r2e/img-a:1", "r2e/img-b:1"]
+    assert imgs_only.read_text(encoding="utf-8").splitlines() == [
+        "r2e/img-a:1",
+        "r2e/img-b:1",
+        "r2e/img-dup:1",
+        "r2e/img-missing:1",
+    ]
+
+    # --limit counts written instances: a tag that shares a digest with an
+    # earlier one is skipped and the pass reads on to the next candidate.
+    shared = tmp_path / "images-shared.json"
+    shared.write_text(
+        json.dumps(
+            {
+                "r2e/img-a:1": f"us-docker.pkg.dev/p/r/img-a@{_digest(1)}",
+                "r2e/img-b:1": f"us-docker.pkg.dev/p/r/img-b@{_digest(1)}",
+                "r2e/img-dup:1": f"us-docker.pkg.dev/p/r/img-dup@{_digest(3)}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    limited = tmp_path / "limited.jsonl"
+    assert (
+        r2e.main(
+            [
+                "--dataset",
+                str(src),
+                "--exclude-file",
+                str(excl),
+                "--limit",
+                "2",
+                "--image-digests",
+                str(shared),
+                "--out",
+                str(limited),
+            ]
+        )
+        == 0
+    )
+    limited_rows = [json.loads(line) for line in limited.read_text(encoding="utf-8").splitlines()]
+    assert [r["instance_id"] for r in limited_rows] == ["inst-a", "inst-dup"]
 
     digests_file = tmp_path / "images.json"
     digests_file.write_text(
@@ -325,6 +419,7 @@ def test_cli_local_jsonl_images_out_and_digests(tmp_path):
     assert meta["instances"] == 2
     assert meta["missing_images"] == 1
     assert meta["skipped_empty_patch"] == 1
+    assert meta["skipped_empty_expected"] == 1
     assert meta["resolved_revision"].startswith("sha256:")
     assert imgs_written.read_text(encoding="utf-8").splitlines() == ["r2e/img-a:1", "r2e/img-b:1"]
 

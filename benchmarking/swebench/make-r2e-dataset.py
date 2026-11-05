@@ -22,11 +22,16 @@ without uni-agent or network access inside the sandbox.
 
 Two-step workflow with Artifact Registry proxy or mirror:
 
-    ./make-r2e-dataset.py --source r2e_gym_easy --limit 20 --images-out r2e-images.txt
+    ./make-r2e-dataset.py --source r2e_gym_easy --images-out r2e-images.txt
     ../../integrations/uni-agent/scripts/resolve_images.sh \
         r2e-images.txt REGION-docker.pkg.dev/PROJECT/dockerhub-remote r2e-images.json
     ./make-r2e-dataset.py --source r2e_gym_easy --limit 20 \
         --image-digests r2e-images.json --out r2e-20.jsonl
+
+Step one lists every candidate image, not the first --limit: step two skips a
+tag whose digest an earlier tag already has, so it reads past the first --limit
+candidates, and every tag it reads must be in --image-digests. The resolved
+mapping serves any later --limit.
 """
 
 from __future__ import annotations
@@ -142,10 +147,16 @@ def extract_gold_patch(
                 f"index {index_line.get('old_commit_hash', '')}..{index_line.get('new_commit_hash', '')}"
                 f"{' ' + mode if mode else ''}\n"
             )
+        # An added file has no minus_file and a deleted file no plus_file;
+        # git apply wants /dev/null on that side, and rejects a hunk that has
+        # no file headers at all.
         minus, plus = file_diff.get("minus_file"), file_diff.get("plus_file")
-        if minus and plus:
-            chunks.append(f"--- {minus['path']}\n+++ {plus['path']}\n")
-        for hunk in file_diff.get("hunks", []):
+        hunks = file_diff.get("hunks") or []
+        if minus or plus or hunks:
+            minus_path = (minus or {}).get("path") or "/dev/null"
+            plus_path = (plus or {}).get("path") or "/dev/null"
+            chunks.append(f"--- {minus_path}\n+++ {plus_path}\n")
+        for hunk in hunks:
             desc = hunk.get("descriptor") or {}
             chunks.append(f"@@ -{_range(desc.get('old_range'))} +{_range(desc.get('new_range'))} @@")
             chunks.append(f" {desc['section']}\n" if desc.get("section") else "\n")
@@ -275,6 +286,15 @@ def load_r2e_rows(
     return [dict(row) for row in load_dataset(dataset, split=split, revision=resolved)], resolved
 
 
+def _expected_tests(expected_output_json: Any) -> dict[str, Any]:
+    """The expected test map of a row; empty when the row has nothing to grade against."""
+    if isinstance(expected_output_json, str):
+        if not expected_output_json.strip():
+            return {}
+        expected_output_json = json.loads(expected_output_json)
+    return dict(expected_output_json or {})
+
+
 def _instance_id(example: dict[str, Any]) -> str:
     iid = str(example.get("instance_id") or "").strip()
     if not iid:
@@ -324,7 +344,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--split", default="train", help="Dataset split (default: train).")
     ap.add_argument("--revision", default=None, help="Dataset revision (commit, tag, or branch).")
-    ap.add_argument("--limit", type=int, default=0, help="Stop after N instances (0 = all).")
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Stop after N instances in --out (0 = all). Not with --images-out alone: that list carries every candidate image, because the manifest pass skips tags that share a digest and reads past the first N candidates.",
+    )
     ap.add_argument("--exclude-file", default=None, help="File of instance IDs to skip.")
     ap.add_argument(
         "--images-out",
@@ -350,6 +375,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.out and not args.images_out:
         ap.error("at least one of --out or --images-out is required")
+    if not args.out and args.limit:
+        ap.error(
+            "--limit applies to --out; --images-out alone lists every candidate image "
+            "so the manifest pass can skip tags that share a digest"
+        )
 
     dataset = args.dataset or (
         R2E_EASY_DATASET if args.source == "r2e_gym_easy" else R2E_SUBSET_DATASET
@@ -360,9 +390,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cannot load {dataset}: {exc}", file=sys.stderr)
         return 2
 
+    # Both passes select from the same candidates, filtered the same way, so
+    # every tag the manifest pass reads is in the image list of the first.
     excluded = _read_exclusions(args.exclude_file)
     candidates: list[tuple[str, dict[str, Any], str]] = []
-    skipped_empty_patch = 0
+    skipped_empty_patch = skipped_empty_expected = 0
     for row in raw_rows:
         iid = _instance_id(row)
         if not iid or iid in excluded:
@@ -371,23 +403,21 @@ def main(argv: list[str] | None = None) -> int:
         if not patch.strip():
             skipped_empty_patch += 1
             continue
+        if not _expected_tests(row.get("expected_output_json")):
+            skipped_empty_expected += 1
+            continue
         candidates.append((iid, row, patch))
     candidates.sort(key=lambda item: item[0])
 
     if args.images_out and not args.out:
-        seen_refs: list[str] = []
-        seen_set: set[str] = set()
-        for _, row, _ in candidates:
-            ref = str(row["docker_image"]).strip()
-            if ref in seen_set:
-                continue
-            seen_set.add(ref)
-            seen_refs.append(ref)
-            if args.limit and len(seen_refs) >= args.limit:
-                break
-        seen_refs.sort()
+        seen_refs = sorted({str(row["docker_image"]).strip() for _, row, _ in candidates})
         Path(args.images_out).write_text("\n".join(seen_refs) + ("\n" if seen_refs else ""), encoding="utf-8")
-        print(f"wrote {len(seen_refs)} image references to {args.images_out}", file=sys.stderr)
+        print(
+            f"wrote {len(seen_refs)} image references to {args.images_out}; "
+            f"{skipped_empty_patch} empty gold patches and {skipped_empty_expected} empty "
+            f"expected_output_json skipped",
+            file=sys.stderr,
+        )
         return 0
 
     digests: dict[str, str] | None = None
@@ -452,12 +482,14 @@ def main(argv: list[str] | None = None) -> int:
         "instances": written,
         "missing_images": missing,
         "skipped_empty_patch": skipped_empty_patch,
+        "skipped_empty_expected": skipped_empty_expected,
         "generated_at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
     }
     Path(args.out + ".meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     print(
         f"wrote {written} R2E-Gym instances to {args.out}; {missing} missing images; "
-        f"{skipped_empty_patch} empty gold patches skipped",
+        f"{skipped_empty_patch} empty gold patches and {skipped_empty_expected} empty "
+        f"expected_output_json skipped",
         file=sys.stderr,
     )
     return 1 if missing else 0

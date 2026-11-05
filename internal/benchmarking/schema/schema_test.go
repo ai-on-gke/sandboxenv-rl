@@ -43,6 +43,8 @@ func TestEmbeddedSchemasResolve(t *testing.T) {
 		"stats_row.schema.json",
 		"system_description.schema.json",
 		"trace_event.schema.json",
+		"image_placement.schema.json",
+		"preflight_coverage.schema.json",
 	}
 	for _, name := range schemas {
 		t.Run(name, func(t *testing.T) {
@@ -559,5 +561,54 @@ func roundTripJSON[T any](t *testing.T, schemaName string, val T) {
 	}
 	if _, err := DecodeJSONStrict[T](bytes.NewReader(encoded)); err != nil {
 		t.Fatalf("round-trip DecodeJSONStrict: %v", err)
+	}
+}
+
+func TestPreflightCoverageValidateEnforcesStatesAndConsistency(t *testing.T) {
+	raw := mustRead(t, "testdata/preflight_coverage.json")
+	var base PreflightCoverage
+	if err := json.Unmarshal(raw, &base); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	cases := map[string]func(c *PreflightCoverage){
+		"unknown golden state": func(c *PreflightCoverage) { c.Goldens[0].State = "skipped" },
+		"domain complete with an incomplete image": func(c *PreflightCoverage) {
+			c.Domains[1].Complete = true
+		},
+		"coverage complete with a golden not ready": func(c *PreflightCoverage) {
+			c.Domains[1].Images[0].Nodes = []string{"a", "b"}
+			c.Domains[1].Images[0].Complete = true
+			c.Domains[1].Complete = true
+			c.Complete = true // goldens[1] is failed
+		},
+		"empty node": func(c *PreflightCoverage) { c.Domains[0].Images[0].Nodes[0] = "" },
+	}
+	for name, mutate := range cases {
+		var c PreflightCoverage
+		if err := json.Unmarshal(raw, &c); err != nil {
+			t.Fatal(err)
+		}
+		mutate(&c)
+		if err := c.Validate(); err == nil {
+			t.Errorf("%s: Validate accepted it", name)
+		}
+	}
+
+	// Normalize turns nil slices into empty arrays, so the JSON matches the schema.
+	c := PreflightCoverage{SchemaVersion: SchemaVersion, RunID: "pf", StartedAt: base.StartedAt, FinishedAt: base.FinishedAt,
+		Domains: []DomainCoverage{{Name: "d0", Nodes: 1, Images: []ImageCoverage{{Image: "img", Wanted: 1}}}}}
+	c.Normalize()
+	out, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgainstJSONSchema("preflight_coverage.schema.json", out); err != nil {
+		t.Errorf("normalized empty coverage does not validate: %v\n%s", err, out)
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("normalized empty coverage: %v", err)
 	}
 }

@@ -38,7 +38,9 @@ SCHEMA_DIR = Path(__file__).resolve().parent / "v1"
 
 SCHEMA_MAP = {
     "event": "event.schema.json",
+    "image_placement": "image_placement.schema.json",
     "placement": "placement.schema.json",
+    "preflight_coverage": "preflight_coverage.schema.json",
     "report": "report.schema.json",
     "run_window": "run_window.schema.json",
     "schedule": "schedule.schema.json",

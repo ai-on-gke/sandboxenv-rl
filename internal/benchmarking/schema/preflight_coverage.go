@@ -94,15 +94,23 @@ func (c PreflightCoverage) Validate() error {
 	if c.FinishedAt.Before(c.StartedAt) {
 		return errors.New("preflight_coverage: finished_at is before started_at")
 	}
+	goldensOK := true
 	for i, g := range c.Goldens {
 		if g.Image == "" || g.State == "" {
 			return fmt.Errorf("preflight_coverage goldens[%d]: image and state are required", i)
 		}
+		if !goldenStates[g.State] {
+			return fmt.Errorf("preflight_coverage goldens[%d] (%s): state %q is not one of none, pending, ready, failed", i, g.Image, g.State)
+		}
 		if g.WaitMS < 0 {
 			return fmt.Errorf("preflight_coverage goldens[%d] (%s): wait_ms must be >= 0", i, g.Image)
 		}
+		if !GoldenSettled(g) {
+			goldensOK = false
+		}
 	}
 	names := make(map[string]bool, len(c.Domains))
+	allDomains := true
 	for i, d := range c.Domains {
 		if d.Name == "" {
 			return fmt.Errorf("preflight_coverage domains[%d]: name is required", i)
@@ -115,6 +123,7 @@ func (c PreflightCoverage) Validate() error {
 			return fmt.Errorf("preflight_coverage domains[%d] (%s): nodes must be >= 1", i, d.Name)
 		}
 		images := make(map[string]bool, len(d.Images))
+		allImages := true
 		for j, img := range d.Images {
 			if img.Image == "" {
 				return fmt.Errorf("preflight_coverage domains[%d] (%s) images[%d]: image is required", i, d.Name, j)
@@ -129,7 +138,57 @@ func (c PreflightCoverage) Validate() error {
 			if img.Complete != (len(img.Nodes) >= img.Wanted) {
 				return fmt.Errorf("preflight_coverage domains[%d] (%s) images[%d] (%s): complete disagrees with nodes (%d) and wanted (%d)", i, d.Name, j, img.Image, len(img.Nodes), img.Wanted)
 			}
+			for _, n := range img.Nodes {
+				if n == "" {
+					return fmt.Errorf("preflight_coverage domains[%d] (%s) images[%d] (%s): an empty node", i, d.Name, j, img.Image)
+				}
+			}
+			if !img.Complete {
+				allImages = false
+			}
+		}
+		if d.Complete && !allImages {
+			return fmt.Errorf("preflight_coverage domains[%d] (%s): complete with an incomplete image", i, d.Name)
+		}
+		if !d.Complete {
+			allDomains = false
 		}
 	}
+	if c.Complete && !(goldensOK && allDomains) {
+		return errors.New("preflight_coverage: complete with a golden not ready or a domain incomplete")
+	}
 	return nil
+}
+
+var goldenStates = map[string]bool{"none": true, "pending": true, "ready": true, "failed": true}
+
+// GoldenSettled reports whether a golden record needs no more waiting for
+// the run: ready, or none when goldens are disabled on the base template.
+func GoldenSettled(g GoldenRecord) bool {
+	return g.State == "ready" || (g.State == "none" && g.Error == "")
+}
+
+// Normalize replaces nil slices with empty ones, so the JSON carries [] where
+// the schema requires an array, and leaves everything else as it is.
+func (c *PreflightCoverage) Normalize() {
+	if c.Goldens == nil {
+		c.Goldens = []GoldenRecord{}
+	}
+	if c.Domains == nil {
+		c.Domains = []DomainCoverage{}
+	}
+	for i := range c.Domains {
+		d := &c.Domains[i]
+		if d.NodesSeen == nil {
+			d.NodesSeen = []string{}
+		}
+		if d.Images == nil {
+			d.Images = []ImageCoverage{}
+		}
+		for j := range d.Images {
+			if d.Images[j].Nodes == nil {
+				d.Images[j].Nodes = []string{}
+			}
+		}
+	}
 }

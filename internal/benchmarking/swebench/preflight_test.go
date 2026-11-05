@@ -372,9 +372,58 @@ func TestPreflightGoldenTimeout(t *testing.T) {
 		t.Fatalf("Run error = %v, want both goldens pending", err)
 	}
 	for _, g := range report.Goldens {
-		if g.State != "pending" || !strings.Contains(g.Error, "still pending") {
-			t.Errorf("golden = %+v, want pending with a timeout error", g)
+		if g.State != "pending" || !strings.Contains(g.Error, "still pending") || g.Template == "" {
+			t.Errorf("golden = %+v, want pending with a timeout error and the template it was ensured as", g)
 		}
+	}
+}
+
+// A round in which every probe fails ends the pair, also after a round that
+// placed some: round 1 lands both probes on one node, round 2's creates fail,
+// and no round 3 follows.
+func TestPreflightStopsWhenARoundFailsEntirely(t *testing.T) {
+	api := newPreflightFake()
+	api.goldenReadyAfter = 0
+	api.sameNode = true
+	api.createFailAfter = 2
+	report, err, _ := runPreflight(t, api, func(o *PreflightOptions) {
+		o.Images = []string{pfImgA}
+		o.Domains = []string{"d0"}
+		o.MaxRounds = 3
+	})
+	if err == nil || !strings.Contains(err.Error(), "short of their nodes") {
+		t.Fatalf("Run error = %v, want a shortfall", err)
+	}
+	ic := report.Domains[0].Images[0]
+	if ic.Rounds != 2 || ic.Probes != 4 || ic.Failed != 2 || len(ic.Nodes) != 1 || !strings.Contains(ic.Error, "no worker has room") {
+		t.Errorf("coverage = %+v, want two rounds, the second failed entirely", ic)
+	}
+	// Every created probe was deleted; the failed creates got a delete by id
+	// too, in case the server kept them.
+	deleted := map[string]bool{}
+	for _, id := range api.deleted {
+		deleted[id] = true
+	}
+	for _, id := range api.created {
+		if !deleted[id] {
+			t.Errorf("probe %s was created and not deleted", id)
+		}
+	}
+	if len(api.deleted) != 4 {
+		t.Errorf("deletes = %d, want 4: two probes and two failed creates", len(api.deleted))
+	}
+}
+
+// node_slots bounds only the domains of the pass.
+func TestPreflightNodeSlotsApplyToSelectedDomains(t *testing.T) {
+	plan := twoDomainPlan()
+	plan.Domains[1].NodeSlots = 1
+	backend := newFakeBackend(t, newPreflightFake())
+	if _, err := NewPreflightWarmer(PreflightOptions{Plan: plan, Backend: backend, ProbesPerNode: 2, Domains: []string{"d0"}}); err != nil {
+		t.Errorf("d0 alone with d1 at one slot: %v", err)
+	}
+	if _, err := NewPreflightWarmer(PreflightOptions{Plan: plan, Backend: backend, ProbesPerNode: 2}); err == nil || !strings.Contains(err.Error(), "node slots") {
+		t.Errorf("both domains: err = %v, want the node slots error", err)
 	}
 }
 

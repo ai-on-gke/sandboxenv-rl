@@ -15,7 +15,8 @@ to the framework. They are supported ([docs/support.md](../docs/support.md)).
 
 Each integration's `README.md` covers its configuration, runtime layers (`nemo-gym/layer`
 and `openhands/layer`; see [docs/rootfs-images/RUNTIMES.md](../docs/rootfs-images/RUNTIMES.md)),
-template helper scripts, unit fakes, and live `tests/test_e2e.py` targets. See
+template helper scripts, unit fakes, and, for `harbor`, `nemo-gym` and `openhands`, live
+`tests/test_e2e.py` targets. See
 [docs/dev/code-layout.md](../docs/dev/code-layout.md) for repository placement rules.
 
 ## Tests in CI
@@ -24,9 +25,9 @@ Three jobs of [`.github/workflows/ci.yaml`](../.github/workflows/ci.yaml) run th
 tests, each in a Nix `devShell` whose Python environment [`nix/python.nix`](../nix/python.nix)
 builds from `uv.lock`:
 
-- `Python client and integration tests` runs `ci-python` ([`nix/ci.nix`](../nix/ci.nix)): `ruff`
-  and `pytest` for `nemo-gym`, and for `uni-agent` on Python 3.12 in the `python-env-uni-agent`
-  environment, with `uni-agent` itself from git at the commit
+- `Python client and integration tests` runs `ci-python` ([`nix/ci.nix`](../nix/ci.nix)): `pytest`
+  for `nemo-gym`, and `pytest` and `ruff` for `uni-agent` on Python 3.12 in the
+  `python-env-uni-agent` environment, with `uni-agent` itself from git at the commit
   [`uni-agent/pyproject.toml`](./uni-agent/pyproject.toml) pins.
 - `OpenHands integration` runs `pytest` and `ruff` for `openhands` in the `.#openhands` shell.
 - `Harbor integration` runs `pytest` and `ruff` for `harbor` in the `.#harbor` shell; its trial

@@ -23,8 +23,8 @@ version tables from `system_description.json` (`bench measure -k8s`) and the pre
 >
 > - **Key numbers (`<reference-arm>`)**:
 >   - **Max concurrency observed**: `<active_sandboxes>` concurrent in-flight sandboxes
->     (`steps[].active_sandboxes`, vs `<max_concurrent>` configured [`r2e=<r2e_width>`,
->     `swe=<swe_width>`, `<per_node_concurrency>` active/node] and `standing_pool_size=<n>` /
+>     (`steps[].active_sandboxes`, vs `<max_concurrent>` configured: `r2e=<r2e_width>`,
+>     `swe=<swe_width>`, `<per_node_concurrency>` active/node, and `standing_pool_size=<n>` /
 >     `peak_parked_sandboxes=<n>`).
 >   - **`TTFI` start** (claim start -> sandbox handle ready / 1st cmd issued):
 >     `<ttfi_start_p50> / <ttfi_start_p90> ms` (`0 ms` in-band on `100%` warm-pool hits after

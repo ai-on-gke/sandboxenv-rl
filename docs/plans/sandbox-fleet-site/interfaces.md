@@ -165,17 +165,18 @@ parsed; labels pass through except keys under `ate.`; no key named `token`, `pas
 
 Identity: Kubernetes ServiceAccount `ate-env-reporter` in namespace `ate-env-reporter` labeled
 `ate.dev/api-access=true`; projected token with audience `api.ate-system.svc`; Workload Identity to
-`ate-env-reporter@<project>.iam.gserviceaccount.com` with `roles/storage.objectCreator` on the
-bucket; global AccessPolicy binding `viewer` to
+`ate-env-reporter@<project>.iam.gserviceaccount.com` with `roles/storage.objectUser` on the bucket,
+restricted by an IAM condition to `v1/inventory/<project>/<cluster>/` and
+`v1/snapshots/<project>/<cluster>/` (an overwrite needs `storage.objects.delete` next to `create`);
+global AccessPolicy binding `viewer` to
 `user:system:serviceaccount:ate-env-reporter:ate-env-reporter`; ClusterRole with `get`, `list`,
 `watch` on `workerpools.ate.dev`, `sandboxconfigs.ate.dev`, `deployments.apps`, `services`, `pods`.
 
 Behavior: one `ListActors` across atespaces and one `ListWorkers` per tick, paged at 1000;
 `ListAtespaces`, `ListActorTemplates` and `ListTags` every tenth tick or on a template-name miss;
-Kubernetes objects from informers. The tick writes `latest.json` with a single atomic object write
-and skips the write when nothing changed except `generated_at`, in which case it updates
-`generated_at` through a metadata-only write at most every interval. The reporter never calls
-`ate-env-api`.
+Kubernetes objects from informers. Each tick rewrites `latest.json` with one atomic object write,
+even when nothing but `generated_at` changed, so the object generation and the JSON `generated_at`
+move together and the site revalidates by generation. The reporter never calls `ate-env-api`.
 
 ## Event stream
 
@@ -196,12 +197,14 @@ resource.labels.container_name="ate-api-server"
 (jsonPayload.msg="Actor state changed" OR jsonPayload.msg="Actor crashed")
 ```
 
-BigQuery table `fleet.actor_events` from the Pub/Sub BigQuery subscription with the topic schema:
-`publish_time`, `project`, `cluster`, `time`, `atespace`, `actor_name`, `actor_uid`,
-`template_atespace`, `template_name`, `operation`, `state`, `trace_id`, `span_id`, `raw` (JSON). A
-small Cloud Run function or Dataflow template is not needed: the subscription's "write metadata"
-option and a topic schema carry these columns; the sink's log entry is the `raw` payload and the
-project and cluster come from the log resource labels.
+BigQuery table `fleet.actor_events` from the Pub/Sub BigQuery subscription without a topic schema:
+`subscription_name`, `message_id`, `publish_time`, `data` (JSON, the raw payload: the Cloud Logging
+`LogEntry` in phase 1, the OTLP log record in phase 2) and `attributes` (JSON). A topic schema maps
+top-level fields only and cannot flatten either payload. The typed columns `project`, `cluster`,
+`time`, `atespace`, `actor_name`, `actor_uid`, `template_atespace`, `template_name`, `operation`,
+`state`, `trace_id` and `span_id` are the view `fleet.actor_events_v`, projected from `data` with
+`JSON_VALUE`; project and cluster come from the log entry resource labels. The site queries the
+view. Phase 2 adds a second branch to the view for the OTLP record shape.
 
 Phase 2: the collector receives the OTLP log events and routes `event.name` in
 `{ate.actor.state_changed, ate.actor.crashed}` to `googlecloudpubsub` with no sampling and no

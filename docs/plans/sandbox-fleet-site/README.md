@@ -55,7 +55,8 @@ Per cluster, applied by `ate-env manifest` or the fleet's Config Sync repository
   deployment with three exporters: Cloud Trace (`otlphttp` to `telemetry.googleapis.com`),
   `google_cloud_storage` for raw spans, and `googlecloudpubsub` for actor events once Substrate
   emits them over OTLP. One replica per cluster is enough for the ate-env side; Substrate's own
-  components keep the managed collector.
+  components keep the managed collector for traces and metrics; in phase 2 only `ate-api-server`'s
+  logs go to this collector, through `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`.
 - Reporter: `cmd/ate-env-reporter`, a single-replica Deployment in its own namespace labeled
   `ate.dev/api-access=true`, reusing `internal/ate` to dial `ateapi`. It writes `latest.json` every
   interval and an hourly snapshot. Workload Identity to a service account with
@@ -63,8 +64,10 @@ Per cluster, applied by `ate-env manifest` or the fleet's Config Sync repository
   ClusterRole with `get`, `list`, `watch` on WorkerPools, SandboxConfigs, Deployments, Services and
   Pods.
 - PodMonitoring for `ate-env-api`'s metrics port, rendered by `ate-env manifest --metrics-port`.
-- Substrate configuration: `OTEL_LOGS_EXPORTER=otlp,console` in `ate-otel-config` (phase 2) and the
-  reporter's `viewer` AccessPolicy.
+- Substrate configuration: `OTEL_LOGS_EXPORTER=otlp,console` and `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`
+  on the `ate-api-server` Deployment (phase 2; not in the shared `ate-otel-config`, because the
+  managed collector does not export logs to Pub/Sub and atelet refuses per-signal endpoints that
+  differ for its relay) and the reporter's `viewer` AccessPolicy.
 
 Central, once:
 

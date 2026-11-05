@@ -55,3 +55,16 @@ Append-only. Each entry: date, who, what, why.
   `internal/fleet/v1`. "Fleet" already names the Python `SandboxFleet` and the trainer-side
   `ate_env_fleet_*` series; the snapshot is an inventory of a cluster. The package landed as pull
   request 1 of the execution plan.
+- 2026-11-05, orchestrator, from sunnylovestiramisu's review of #223: the reporter's grant is
+  `roles/storage.objectUser` under an IAM condition for its own two prefixes, because an overwrite
+  of `latest.json` needs `storage.objects.delete`, which `objectCreator` lacks. The reporter
+  rewrites `latest.json` on every tick, so the object generation moves with `generated_at` and the
+  site's revalidation holds; the metadata-only write is gone.
+- 2026-11-05, orchestrator, same review: the BigQuery subscription uses no topic schema. `data` is a
+  JSON column with the raw payload, and the typed columns are a view projected with `JSON_VALUE`,
+  because a topic schema maps top-level fields only and cannot flatten a `LogEntry` or an OTLP
+  record.
+- 2026-11-05, orchestrator, same review: in phase 2 the lifecycle records leave `ate-api-server`
+  through `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` set on that Deployment, pointing at the self-managed
+  collector. The managed collector does not export logs to Pub/Sub, and the shared `ate-otel-config`
+  cannot carry a differing per-signal endpoint without breaking atelet's relay.

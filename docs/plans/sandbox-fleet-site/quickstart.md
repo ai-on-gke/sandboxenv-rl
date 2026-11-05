@@ -53,7 +53,7 @@ it creates an export subscription, so the agent and its grants come before the s
 gcloud pubsub topics create ate-actor-events --project "$CENTRAL_PROJECT"
 bq --project_id "$CENTRAL_PROJECT" mk --dataset --location "$REGION" fleet
 bq --project_id "$CENTRAL_PROJECT" mk --table fleet.actor_events \
-  subscription_name:STRING,message_id:STRING,publish_time:TIMESTAMP,data:STRING,attributes:STRING
+  subscription_name:STRING,message_id:STRING,publish_time:TIMESTAMP,data:JSON,attributes:JSON
 gcloud services identity create --service pubsub.googleapis.com --project "$CENTRAL_PROJECT"
 NUMBER=$(gcloud projects describe "$CENTRAL_PROJECT" --format 'value(projectNumber)')
 PUBSUB_SA="serviceAccount:service-$NUMBER@gcp-sa-pubsub.iam.gserviceaccount.com"
@@ -69,6 +69,31 @@ gcloud pubsub subscriptions create ate-actor-events-gcs --topic ate-actor-events
   --cloud-storage-max-duration 1m --expiration-period never
 ```
 
+The typed view the site queries. `data` holds the Cloud Logging entry, so the keys with dots are
+quoted in the JSONPath:
+
+```bash
+cat > /tmp/actor_events_v.sql <<'SQL'
+CREATE OR REPLACE VIEW fleet.actor_events_v AS
+SELECT publish_time,
+  JSON_VALUE(data, '$.resource.labels.project_id')                 AS project,
+  JSON_VALUE(data, '$.resource.labels.cluster_name')               AS cluster,
+  TIMESTAMP(JSON_VALUE(data, '$.timestamp'))                       AS time,
+  JSON_VALUE(data, '$.jsonPayload."ate.atespace"')                 AS atespace,
+  JSON_VALUE(data, '$.jsonPayload."ate.actor.name"')               AS actor_name,
+  JSON_VALUE(data, '$.jsonPayload."ate.actor.uid"')                AS actor_uid,
+  JSON_VALUE(data, '$.jsonPayload."ate.template.atespace"')        AS template_atespace,
+  JSON_VALUE(data, '$.jsonPayload."ate.template.name"')            AS template_name,
+  JSON_VALUE(data, '$.jsonPayload."ate.actor.operation.name"')     AS operation,
+  JSON_VALUE(data, '$.jsonPayload."ate.actor.state"')              AS state,
+  JSON_VALUE(data, '$.jsonPayload.trace_id')                       AS trace_id,
+  JSON_VALUE(data, '$.jsonPayload.span_id')                        AS span_id,
+  data
+FROM fleet.actor_events;
+SQL
+bq --project_id "$CENTRAL_PROJECT" query --use_legacy_sql=false < /tmp/actor_events_v.sql
+```
+
 Phase 1 writes the raw log entry into `data`; the site parses the `ate.*` keys from it. The typed
 columns in [interfaces.md](./interfaces.md) arrive with the phase 2 topic schema.
 
@@ -80,7 +105,6 @@ for sa in ate-fleet-site ate-env-reporter ate-env-collector; do
 done
 P="$CENTRAL_PROJECT.iam.gserviceaccount.com"
 gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "serviceAccount:ate-fleet-site@$P"    --role roles/storage.objectViewer
-gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "serviceAccount:ate-env-reporter@$P"  --role roles/storage.objectCreator
 gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "serviceAccount:ate-env-collector@$P" --role roles/storage.objectCreator
 gcloud projects add-iam-policy-binding "$CENTRAL_PROJECT" --member "serviceAccount:ate-fleet-site@$P" --role roles/monitoring.viewer
 gcloud projects add-iam-policy-binding "$CENTRAL_PROJECT" --member "serviceAccount:ate-fleet-site@$P" --role roles/bigquery.jobUser
@@ -118,6 +142,17 @@ for pair in "ate-env-reporter:ate-env-reporter:ate-env-reporter" "ate-env-collec
     --role roles/iam.workloadIdentityUser --member "serviceAccount:$CLUSTER_PROJECT.svc.id.goog[$ns/$ksa]"
 done
 gcloud projects add-iam-policy-binding "$CLUSTER_PROJECT" --member "serviceAccount:ate-env-collector@$P" --role roles/cloudtrace.agent
+```
+
+The reporter writes under two prefixes of its own cluster. Overwriting `latest.json` needs
+`storage.objects.delete` as well as `storage.objects.create`, so the grant is
+`roles/storage.objectUser` with an IAM condition on those prefixes (uniform bucket-level access
+allows conditions; the Terraform can tighten this to a custom role with the two permissions):
+
+```bash
+gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "serviceAccount:ate-env-reporter@$P" \
+  --role roles/storage.objectUser \
+  --condition "title=reporter-$CLUSTER_PROJECT-$CLUSTER,expression=resource.name.startsWith(\"projects/_/buckets/$BUCKET/objects/v1/inventory/$CLUSTER_PROJECT/$CLUSTER/\") || resource.name.startsWith(\"projects/_/buckets/$BUCKET/objects/v1/snapshots/$CLUSTER_PROJECT/$CLUSTER/\")"
 ```
 
 Managed Prometheus, on a Standard cluster (Autopilot has it on):

@@ -230,7 +230,9 @@ owned (a reap of another run, or one cancelled before its delete, left it alive 
 claims or creates another. A successful claim checks `_may_pool` and takes ownership in one lock
 hold, so a reap on another thread cannot run in between (AC-15.7). A claim abandoned that way
 records one `wire_claim` sample with status `error`, as a failed claim does; the claim or create
-that follows records its own.
+that follows records its own. A cold create whose own run was reaped while it ran
+(`_run_reaped_since`: a reap of that run is running, or ended after the acquire read `_teardowns`)
+owns the actor under `WARM_POOL_RUN_ID`; the caller's handle keeps its run id (AC-15.10).
 
 A `warm_pool` call cancelled during its `create()` calls releases its reservation and owns every
 actor it sent a `create()` for under `WARM_POOL_RUN_ID`, so any run's reap deletes them; if a reap

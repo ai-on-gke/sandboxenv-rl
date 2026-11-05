@@ -646,6 +646,63 @@ async def test_warm_actor_whose_suspend_fails_is_deleted_or_left_for_any_reap(
     assert driver._owned_actors == {}
 
 
+# AC-15.10: a cold acquire whose create overlaps its own run's reap leaves the
+# environment where a later reap finds it.
+@pytest.mark.parametrize("reap_running", [False, True])
+async def test_cold_acquire_overlapping_its_runs_reap_leaves_the_actor_for_any_later_reap(
+    reap_running: bool,
+) -> None:
+    client = GatedClient()
+    driver, _ = _driver(client)
+    if reap_running:
+        # Another actor of run-1 keeps the reap in its delete() until the gate opens.
+        client.live.add("sb-old")
+        driver._owned_actors["sb-old"] = driver._make_instance("sb-old", "tmpl", run_id="run-1")
+        client.delete_gate = asyncio.Event()
+    client.create_gate = asyncio.Event()
+
+    acquire = asyncio.create_task(driver._acquire_internal("tmpl", "run-1"))
+    await _spin()  # cold create paused
+    reap = asyncio.create_task(driver.reap_async("run-1"))
+    await _spin()  # the reap's snapshot does not hold the new actor
+    client.create_gate.set()
+    instance = await acquire
+    if reap_running:
+        assert client.delete_gate is not None
+        client.delete_gate.set()
+    await reap
+
+    assert instance.run_id == "run-1"  # the caller's handle is not changed
+    assert driver._owned_actors[instance.instance_id].run_id == WARM_POOL_RUN_ID
+    assert client.live == {instance.instance_id}
+    client.delete_gate = None
+    await driver.reap_async("run-2")
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+@pytest.mark.parametrize("reaped", ["another-run-during", "own-run-before"])
+async def test_cold_acquire_keeps_its_run_id_without_an_overlapping_reap_of_its_run(
+    reaped: str,
+) -> None:
+    client = GatedClient()
+    driver, _ = _driver(client)
+    if reaped == "own-run-before":
+        await driver.reap_async("run-1")  # a fleet tears down between runs and runs again
+    client.create_gate = asyncio.Event()
+
+    acquire = asyncio.create_task(driver._acquire_internal("tmpl", "run-1"))
+    await _spin()
+    if reaped == "another-run-during":
+        await driver.reap_async("run-0")
+    client.create_gate.set()
+    instance = await acquire
+
+    assert driver._owned_actors[instance.instance_id].run_id == "run-1"
+    await driver.reap_async("run-1")
+    assert client.live == set()
+
+
 async def test_direct_reap_moves_the_gauge_with_the_pool() -> None:
     client = GatedClient()
     driver, obs = _driver(client)

@@ -300,3 +300,11 @@ Append-only. Each entry: date, who, what, why.
   so the handler now also starts `_delete_unpooled` in background tasks when `_may_pool(teardowns)`
   is false (a reap ran or is running), as the `wait=False` suspends do; a delete that fails or never
   runs leaves them owned under `WARM_POOL_RUN_ID`.
+- 2026-11-05, orchestrator: #242 fixes AC-15.10. A cold `acquire` whose create overlaps its own
+  run's reap owns the actor under `WARM_POOL_RUN_ID`, so any later reap finds it. The driver keeps,
+  per run id, the reaps in progress and the `_teardowns` value when the last one ended
+  (`_run_reaped_since`), because fleets are reused: `run()` reaps its run at the end of each pass,
+  so "this run was ever reaped" would tag every acquire of a later pass. A reap of another run does
+  not change the owner, so a reap from another fleet on the same driver never deletes an environment
+  in use. Not re-tagging when the create started after the run's reap ended (the fleet is closed):
+  that is a caller error, as for a release, and the model leaves it out.

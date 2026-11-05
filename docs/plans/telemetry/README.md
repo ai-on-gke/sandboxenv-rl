@@ -146,8 +146,9 @@ behind it.
 - Closed by #221: AC-15.1 to AC-15.6, warm-pool accounting under concurrency (P-9 to P-11).
 - Closed by #239: a warm claim whose `get()` succeeded after an overlapping reap deleted the actor
   returned a deleted environment (AC-15.7, P-24).
-- Open: an `acquire` whose cold create overlaps its own run's reap returns an environment owned
-  under the reaped run id; unless the caller releases it, no later reap deletes it (AC-15.10).
+- Closed by #242: an `acquire` whose cold create overlapped its own run's reap returned an
+  environment owned under the reaped run id; unless the caller released it, no later reap deleted it
+  (AC-15.10).
 - Closed by #240: a `warm_pool` cancelled during its `create()` calls leaked the actors already
   created (AC-15.8).
 - Closed by #238: a delete cancelled after the run's reap, or a `release` whose delete fails or is

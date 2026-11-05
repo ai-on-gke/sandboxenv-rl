@@ -1,26 +1,34 @@
 # `bench`: scenario runs and real RL training runs
 
 `bench` orchestrates two kinds of benchmark and writes every artifact into one
-directory (`-dest "$ARTIFACT_DIR"`): scenario-driven synthetic runs
-(`benchmarking/scenarios/*.yaml`) and real RL training runs, which launch a
-trainer from `examples/*-verl` and measure Substrate underneath it.
+directory (`-dest "$ARTIFACT_DIR"`). Scenario runs (`bench run -scenario`,
+`benchmarking/scenarios/*.yaml`) run in process against a local scenario
+client: provisioning is render-only, `Create` returns `env-N`, `Exec` returns
+exit 0, `Snapshot` returns `snap-<name>`; no sandbox is created and no cluster
+is called, so they exercise the orchestration and the report, not Substrate.
+Real RL training runs are a verl trainer launched from `examples/`, which
+`bench` measures around: `spinup`, `measure`, `reap`, `report` run outside the
+training Job and read what it writes.
 
 The simulated benchmark, `swebench-loader`, is a separate tool with its own
 page: [`benchmarking/swebench/README.md`](../../../benchmarking/swebench/README.md).
-It does not use `bench run`; its raw files are bundled with `bench measure`,
-`bench report` and `bench upload` so both kinds of run land in the same
-archive layout.
+It does not use `bench run`. Its documented flow runs `bench measure -k8s`
+beside `swebench-loader report` (`benchmarking/swebench/SKILL.md`); `bench
+report` reads `events/*.jsonl` under `-dest`, which the loader writes when run
+with `-events-dir`.
 
 ## Where Ray is
 
-Only the real RL path runs Ray. The verl recipes under `examples/*-verl` and
-`examples/verl_swebench` start a Ray cluster inside the training Job and the
-trainer's rollout workers call the ate-env API from Ray tasks; each example's
-README describes its Ray setup, resources and the `deploy.sh` that launches
-it. `bench` itself does not start or depend on Ray: `bench spinup`,
-`measure`, `reap` and `report` run outside the Job and read what it writes
-(`train.log`, `traces/*.jsonl`). Scenario runs and the simulated loader have
-no Ray in their path at all.
+Only the real RL path runs Ray, by two launch paths. `examples/Qwen3-1.7B-verl`
+and `examples/Qwen3.5-35B-A3B-verl` run `ray start` inside the training Job
+(`run_fully_async.sh`), launched by their `deploy.sh`. `examples/verl_swebench`
+is a KubeRay `RayJob` (`ray-job.async-verl.yaml`), applied with `kubectl apply`
+or `run-telemetry-e2e.sh`, and KubeRay creates the cluster. In both the
+trainer's rollout workers call the ate-env API from Ray tasks. `bench` itself
+does not start or depend on Ray: `bench spinup`, `measure`, `reap` and
+`report` run outside the Job and read what it writes (`train.log`,
+`traces/*.jsonl`). Scenario runs and the simulated loader have no Ray in their
+path at all.
 
 ## Subcommands
 
@@ -30,7 +38,7 @@ subcommand communicates through a single artifact directory (`-dest "$ARTIFACT_D
 
 | Subcommand | Purpose |
 |---|---|
-| `bench run` | End-to-end execution of a declarative `scenario.yaml` (resolve -> prewarm -> execute -> measure -> reap -> report) |
+| `bench run` | Runs a declarative `scenario.yaml` in process (resolve -> prewarm -> execute -> measure -> reap -> report) against the local scenario client: no sandbox is created and no cluster is called |
 | `bench resolve` | Resolve a `scenario.yaml` and dataset into a deterministic `schedule.json` |
 | `bench render` | Render Kubernetes Job manifests from a `scenario.yaml` |
 | `bench prewarm` | Prewarm templates or standing sandbox pools prior to the timed run window |

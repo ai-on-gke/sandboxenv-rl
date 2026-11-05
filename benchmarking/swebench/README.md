@@ -1,11 +1,14 @@
 # Simulated RL benchmark on Substrate (swebench-loader)
 
 This page is about one tool, `swebench-loader`: a Go program that plays the
-part of an RL trainer against the ate-env API, with real task images and no
-model. It creates sandboxes, runs commands in them, parks and wakes them,
-deletes them, and writes one event per operation with the time it took. It
-never talks to Kubernetes and it does not use Ray. The real-RL benchmark,
-which runs a trainer on Ray through the `bench` CLI, is a different page:
+part of an RL trainer, with real task images and no model. By default it
+drives the ate-env API (`-access ate-env-api`; `-access sdk` takes the same
+path); `-access direct` dials Substrate's control plane and router instead,
+and `-backend agent-sandbox` drives an Agent Sandbox gateway. It creates
+sandboxes, runs commands in them, parks and wakes them, deletes them, and
+writes one event per operation with the time it took. It never talks to
+Kubernetes and it does not use Ray. The real-RL benchmark, which `bench`
+measures around a verl trainer that runs on Ray, is a different page:
 [`cmd/benchmarking/bench/README.md`](../../cmd/benchmarking/bench/README.md).
 
 ## What this benchmark tests
@@ -17,17 +20,18 @@ are wall time as a trainer sees it, API server and network included.
 |---|---|---|
 | Cold restore: how long until a sandbox whose image is on no node can run a command | `-mode eval`, one task per image or many, on nodes that have not seen the images | `ttfi` (create start to the first command's answer), `create`, the restore phases from atelet (download, unpack, restore), pulls per start from the node cache samples |
 | Warm restore: the same when the image is already on the node | `-mode eval` with several tasks per image on a fixed pool, or a second pass | `ttfi` with unpack near zero; the gap between it and atelet's restore is the control plane |
-| Park and wake: what it costs to suspend a fleet and resume it for the next step | `-mode steps -park suspend`, with `-park-each` for a fleet larger than the running slots | `suspend`, `wake`, `step_barrier` (first task start to last task end in a step), the share of wakes that moved to another node |
+| Park and wake: what it costs to suspend a fleet and resume it for the next step | `-mode steps -park suspend`, with `-park-each` for a fleet larger than the running slots | `suspend`, `wake` p50/p95, `step_barrier` (first task start to last task end in a step), and with `-restore-log` the restore phases of each wake; a `download` phase in a wake's record is the only trace of a move to another node |
 | Image delivery: pull against streaming or another loader | `-mode eval` with the `workload-*` trajectories | `ttfi` per start and the read step's time, under the same command per mechanism |
 
-Every run also gives throughput (tasks per second follow from the width and
-the task time: the loader is closed-loop, there is no QPS flag), failures by
-cause, and the per-step table in steps mode.
+Every run also gives throughput, failures by cause, and the per-step table
+in steps mode. `eval` and `steps` are closed-loop: tasks per second follow
+from the width and the task time. `-mode open-loop -arrival-rate` sets a
+Poisson rate in tasks per second instead.
 
 The sandbox command in every shape is the trajectory. The built-in
 `workload-file-read-one` runs `true` (what `ttfi` and `wake` measure: the
-first instant the sandbox executes anything) and reads one file, so the
-numbers are the platform's and not the workload's. `swebench-gold` replays a
+first instant the sandbox executes anything) and reads one file, thus the
+numbers are the platform's. `swebench-gold` replays a
 SWE-bench solution and grades it, for correctness regressions.
 
 ## The two standard runs
@@ -36,7 +40,8 @@ SWE-bench solution and grades it, for correctness regressions.
 and current baselines; this page explains the flags. In short: the standard
 run is SWE-bench Verified (445 images) in two arms, fresh sandboxes every
 step and a parked fleet woken every step; the image-delivery standard is a
-94-image manifest at width 30, a start arm and a read arm. A quick run is:
+94-image manifest at 1.3 to 1.5 starts in flight per node (width 3 on two
+nodes, 30 on hundreds), a start arm and a read arm. A quick run is:
 
 ```bash
 kubectl -n ate-env port-forward svc/ate-env-api 7777:7777 &
@@ -47,7 +52,7 @@ go run ./cmd/benchmarking/swebench-loader report smoke.jsonl
 
 ## Where things are
 
-- `cmd/benchmarking/swebench-loader`: the binary (`run`, `report`, `plan-placement`).
+- `cmd/benchmarking/swebench-loader`: the binary (`run`, `report`, `compare`, `resolve`, `plan-placement`, `convert-trace`, `trajectory-assets`).
 - `internal/benchmarking/swebench`: the library, tested against an in-memory backend.
 - `internal/benchmarking/swebench/trajectories/`: the built-in trajectories (YAML).
 - This directory: `run-in-cluster.sh` (runs the loader as a Job next to the
@@ -55,10 +60,11 @@ go run ./cmd/benchmarking/swebench-loader report smoke.jsonl
   `sample-node-cache.sh` and `harvest-restore-timings.sh` (the two Substrate-side
   measurements), `offline-exclusions.txt`.
 
-The rest of this page: the run shapes and their flags, the events, which
-shape measures which cost, sizing, preparation, running in the cluster, the
-image-delivery workloads, the restore and cache measurements, and what to
-record with every run.
+The rest of this page, by heading: Workloads; What is measured; Cold boot,
+cold and warm restore, suspend and wake: which shape measures what; How many
+actors, and on which clusters; Prepare once per project; Run; Image-delivery
+workloads; Network and the offline exclusion list; Two things the first runs
+showed; Record with every run.
 
 ## Workloads
 

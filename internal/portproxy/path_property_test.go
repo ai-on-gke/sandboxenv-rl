@@ -40,7 +40,8 @@ func pathRestGen() *rapid.Generator[string] {
 	})
 }
 
-// Rule (Dispatch doc, portproxy.go:276-278; TestPathFormKeepsPathAsSent):
+// PP-1 (docs/plans/port-proxy/acceptance-criteria.md). Rule (Dispatch doc;
+// TestPathFormKeepsPathAsSent):
 // the daemon gets the path after the routing prefix exactly as sent. As a
 // differential: the path form delivers the same request-target as the
 // header form, which forwards r.URL untouched.

@@ -62,6 +62,9 @@ SCHEMA_VERSION = "v1"
 _RUN_ID = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 _MAX_RUN_ID = 20
 _DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
+# A probe delete on a loaded node can take minutes; the Go loader gives a
+# cleanup ten minutes (run.go cleanupTimeout), and so does this.
+_DELETE_TIMEOUT = 600.0
 
 
 # ---------------------------------------------------------------------------
@@ -286,10 +289,9 @@ def _drop_empty(d: dict[str, Any], keys: Iterable[str]) -> dict[str, Any]:
 class _Golden:
     """One image's golden while the pass runs; the coverage work waits on it."""
 
-    __slots__ = ("task", "event", "ensured", "settled", "ok", "record")
+    __slots__ = ("event", "ensured", "settled", "ok", "record")
 
-    def __init__(self, task: int, image: str, now: float):
-        self.task = task
+    def __init__(self, image: str, now: float):
         self.event = asyncio.Event()
         self.ensured = now
         self.settled = False
@@ -321,7 +323,8 @@ class PreflightWarmer:
         golden_timeout: seconds; give up on the goldens still baking once
             none became ready or failed for that long.
         golden_poll: seconds between polls of the baking goldens.
-        probe_timeout: seconds; bounds one probe's create and first command.
+        probe_timeout: seconds; bounds one probe's create, first command and
+            node read together.
         ensure_width: how many templates are ensured, and later polled, at once.
         images, domains: restrict the pass to those of the plan.
         observer: records the phases ``ensure_template``, ``preflight_golden``
@@ -409,6 +412,8 @@ class PreflightWarmer:
         self._goldens: dict[str, _Golden] = {}
         self._changed = asyncio.Event()
         self._progress = 0.0
+        # The last run's report, also after a cancel (see run()).
+        self.coverage: PreflightCoverage | None = None
 
     @property
     def images(self) -> list[str]:
@@ -426,16 +431,20 @@ class PreflightWarmer:
         """Run the pass and return the coverage report.
 
         The report is returned whether or not the pass completed; check
-        ``complete`` and ``shortfall()``. A cancelled run settles its pending
-        goldens as such and returns what it covered before re-raising.
+        ``complete`` and ``shortfall()``. A cancelled run stops its golden
+        poller, deletes the probes in flight, and re-raises; what it covered
+        until then stays in ``coverage``, with the goldens it was still
+        waiting for recorded as ``pending`` with the error ``cancelled``.
         """
         now = time.monotonic()
         coverage = PreflightCoverage(
             run_id=self.run_id, started_at=datetime.now(timezone.utc), plan=self.plan_path
         )
-        self._goldens = {img: _Golden(i, img, now) for i, img in enumerate(self._images)}
+        self._goldens = {img: _Golden(img, now) for img in self._images}
         self._changed = asyncio.Event()
         self._progress = now
+        self.coverage = coverage
+        domain_tasks: list[asyncio.Task[DomainCoverage]] = []
         try:
             await self._ensure_templates()
             poller = asyncio.create_task(self._poll_goldens())
@@ -459,6 +468,12 @@ class PreflightWarmer:
         finally:
             coverage.goldens = [self._goldens[img].record for img in self._images]
             coverage.finished_at = datetime.now(timezone.utc)
+            # What a run that ended early covered: the domains that finished.
+            coverage.domains = [
+                t.result()
+                for t in domain_tasks
+                if t.done() and not t.cancelled() and t.exception() is None
+            ]
         domains: list[DomainCoverage] = []
         for r in results:
             if isinstance(r, BaseException):
@@ -700,46 +715,52 @@ class PreflightWarmer:
 
     async def _probe(self, env_id: str, image: str, d: PlacementDomain) -> tuple[str, str]:
         """One probe: create in the domain, run the first command, read the
-        node, delete. Returns (node, error)."""
-        env = None
+        node, delete; ``probe_timeout`` bounds the three steps together.
+        Returns (node, error)."""
+        holder: list[Any] = []  # the handle once created, for the delete
         node = ""
         error = ""
         try:
             with self._phase("preflight_probe"):
-                env = await asyncio.wait_for(
-                    self.client.create(
-                        env_id,
-                        atespace=self.atespace,
-                        template_name=self.template_name,
-                        template_atespace=self.template_atespace,
-                        rootfs_image=image,
-                        worker_selector=d.selector,
-                    ),
-                    self.probe_timeout,
+                node = await asyncio.wait_for(
+                    self._probe_steps(env_id, image, d, holder), self.probe_timeout
                 )
-                # The first command returns once the restore finished: the
-                # layers and the golden snapshot are on the node by then.
-                result = await asyncio.wait_for(
-                    env.shell("true", timeout=self.probe_timeout), self.probe_timeout
-                )
-                if result.exit_code != 0:
-                    raise RuntimeError(f"first command exited {result.exit_code}")
-                info = await self.client.get(env_id, atespace=self.atespace)
-                node = info.node
-                if not node:
-                    raise RuntimeError("the environment reports no node")
         except asyncio.CancelledError:
-            await self._delete_through_cancel(env_id, env)
+            await self._delete_through_cancel(env_id, holder[0] if holder else None)
             raise
+        except asyncio.TimeoutError:
+            error = f"probe not ready after {self.probe_timeout:g}s"
         except Exception as e:
             error = str(e)
-        await self._delete_through_cancel(env_id, env)
+        await self._delete_through_cancel(env_id, holder[0] if holder else None)
         return node, error
+
+    async def _probe_steps(
+        self, env_id: str, image: str, d: PlacementDomain, holder: list[Any]
+    ) -> str:
+        env = await self.client.create(
+            env_id,
+            atespace=self.atespace,
+            template_name=self.template_name,
+            template_atespace=self.template_atespace,
+            rootfs_image=image,
+            worker_selector=d.selector,
+        )
+        holder.append(env)
+        # The first command returns once the restore finished: the layers and
+        # the golden snapshot are on the node by then.
+        result = await env.shell("true", timeout=self.probe_timeout)
+        if result.exit_code != 0:
+            raise RuntimeError(f"first command exited {result.exit_code}")
+        info = await self.client.get(env_id, atespace=self.atespace)
+        if not info.node:
+            raise RuntimeError("the environment reports no node")
+        return info.node
 
     async def _delete_through_cancel(self, env_id: str, env: Any) -> None:
         """Delete the probe and wait for it even if this task is cancelled
         again meanwhile, so a cancel mid-round strands nothing; the delete's
-        own 60 s timeout bounds the wait."""
+        own timeout bounds the wait."""
         delete = asyncio.ensure_future(self._delete(env_id, env))
         while True:
             try:
@@ -758,7 +779,7 @@ class PreflightWarmer:
             # delete goes by id when there is no handle.
             await asyncio.wait_for(
                 env.delete() if env is not None else self.client.delete(env_id, atespace=self.atespace),
-                60.0,
+                _DELETE_TIMEOUT,
             )
         except NotFoundError:
             pass

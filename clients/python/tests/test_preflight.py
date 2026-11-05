@@ -108,6 +108,14 @@ async def test_covers_every_node_of_every_domain(fake_stack, tmp_path):
     assert set(data["domains"][0]) == {"name", "nodes", "nodes_seen", "images", "complete"}
     assert set(data["domains"][0]["images"][0]) == {"image", "nodes", "wanted", "probes",
                                                    "failed", "rounds", "complete"}
+    assert data["started_at"].endswith("Z") and data["finished_at"] >= data["started_at"]
+    for g in data["goldens"]:
+        assert g["state"] in {"ready", "none", "pending", "failed"} and g["wait_ms"] >= 0
+    for d in data["domains"]:
+        assert isinstance(d["nodes"], int) and isinstance(d["complete"], bool)
+        for ic in d["images"]:
+            assert all(isinstance(ic[k], int) for k in ("wanted", "probes", "failed", "rounds"))
+            assert isinstance(ic["complete"], bool) and isinstance(ic["nodes"], list)
 
 
 async def test_streams_ready_goldens_and_gives_up_on_a_stalled_one(fake_stack):
@@ -232,7 +240,8 @@ async def test_cancel_mid_round_deletes_the_probes_and_returns_at_once(fake_stac
         return await original_get(env_id, **kw)
 
     client.get = get  # type: ignore[method-assign]
-    run = asyncio.create_task(_warmer(client, golden_timeout=30.0, probe_timeout=30.0).run())
+    warmer = _warmer(client, golden_timeout=30.0, probe_timeout=30.0)
+    run = asyncio.create_task(warmer.run())
     await asyncio.wait_for(created.wait(), 5)
     assert fakes.environments.environments, "the probes of a's first round exist"
     started = time.monotonic()
@@ -241,6 +250,11 @@ async def test_cancel_mid_round_deletes_the_probes_and_returns_at_once(fake_stac
         await run
     assert time.monotonic() - started < 5, "the cancel did not wait for golden_timeout"
     assert fakes.environments.environments == {}, "every probe was deleted"
+    # What the run covered until then is kept, with the golden it was still
+    # waiting for recorded as cancelled.
+    cov = warmer.coverage
+    assert cov is not None and cov.finished_at is not None
+    assert {g.image: (g.state, g.error) for g in cov.goldens}[IMG_B] == ("pending", "cancelled")
     assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()
                 and "preflight" in repr(t.get_coro())], "no warmer task is left pending"
 
@@ -256,4 +270,39 @@ async def test_cancel_during_the_golden_wait_returns_at_once(fake_stack):
     with pytest.raises(asyncio.CancelledError):
         await run
     assert time.monotonic() - started < 5
+    assert fakes.environments.environments == {}
+
+
+async def test_second_round_covers_the_node_the_first_missed(fake_stack):
+    client, fakes = fake_stack
+    fakes.environments.domain_nodes = dict(NODES)
+    # The first two creates of a domain land on its first node, as a
+    # scheduler that favours a warm node does; the next round spreads.
+    fakes.environments.first_node_creates = 2
+    _set_golden(fakes, IMG_A, env_pb2.GOLDEN_SNAPSHOT_STATE_READY)
+    coverage = await _warmer(client, images=[IMG_A], domains=["d0"]).run()
+    assert coverage.complete
+    ic = coverage.domains[0].images[0]
+    assert ic.rounds == 2 and ic.probes == 4 and ic.nodes == ["node-d0-1", "node-d0-2"]
+
+
+async def test_probe_timeout_bounds_the_whole_probe(fake_stack):
+    client, fakes = fake_stack
+    fakes.environments.domain_nodes = dict(NODES)
+    _set_golden(fakes, IMG_A, env_pb2.GOLDEN_SNAPSHOT_STATE_READY)
+    # The node read never answers: the probe fails at probe_timeout, counted
+    # from its create, and is deleted.
+    original_get = client.get
+
+    async def get(env_id, **kw):
+        await asyncio.sleep(10)
+        return await original_get(env_id, **kw)
+
+    client.get = get  # type: ignore[method-assign]
+    started = time.monotonic()
+    coverage = await _warmer(client, images=[IMG_A], domains=["d0"], max_rounds=1,
+                             probe_timeout=0.3).run()
+    assert time.monotonic() - started < 3
+    ic = coverage.domains[0].images[0]
+    assert not ic.complete and ic.failed == 2 and "not ready after 0.3s" in ic.error
     assert fakes.environments.environments == {}

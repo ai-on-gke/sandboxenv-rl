@@ -3008,19 +3008,19 @@ func (rep *Report) WriteText(w io.Writer) {
 		}
 		fmt.Fprintln(w)
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "restore\tphase\tcount\tp50_ms\tp95_ms\tmax_ms")
+		fmt.Fprintln(tw, "restore\tphase\tcount\tp50_ms\tp90_ms\tp95_ms\tmax_ms")
 		group := func(label string, g RestoreGroup) {
 			for _, p := range g.Phases {
-				fmt.Fprintf(tw, "%s\t%s\t%d\t%.0f\t%.0f\t%.0f\n", label, p.Phase, p.Count, p.P50MS, p.P95MS, p.MaxMS)
+				fmt.Fprintf(tw, "%s\t%s\t%d\t%.0f\t%.0f\t%.0f\t%.0f\n", label, p.Phase, p.Count, p.P50MS, p.P90MS, p.P95MS, p.MaxMS)
 			}
 			if p := g.Outside; p != nil {
-				fmt.Fprintf(tw, "%s\t%s\t%d\t%.0f\t%.0f\t%.0f\n", label, p.Phase, p.Count, p.P50MS, p.P95MS, p.MaxMS)
+				fmt.Fprintf(tw, "%s\t%s\t%d\t%.0f\t%.0f\t%.0f\t%.0f\n", label, p.Phase, p.Count, p.P50MS, p.P90MS, p.P95MS, p.MaxMS)
 			}
 			if g.Failed > 0 {
-				fmt.Fprintf(tw, "%s\tfailed\t%d\t\t\t\n", label, g.Failed)
+				fmt.Fprintf(tw, "%s\tfailed\t%d\t\t\t\t\n", label, g.Failed)
 			}
 			if g.FailedEvents > 0 {
-				fmt.Fprintf(tw, "%s\tfailed_events\t%d\t\t\t\n", label, g.FailedEvents)
+				fmt.Fprintf(tw, "%s\tfailed_events\t%d\t\t\t\t\n", label, g.FailedEvents)
 			}
 		}
 		group("first", b.First)
@@ -4259,6 +4259,7 @@ type PhaseStat struct {
 	Phase string  `json:"phase"`
 	Count int     `json:"count"`
 	P50MS float64 `json:"p50_ms"`
+	P90MS float64 `json:"p90_ms"`
 	P95MS float64 `json:"p95_ms"`
 	MaxMS float64 `json:"max_ms"`
 }
@@ -4396,7 +4397,7 @@ func phaseStats(recs []RestoreTiming) []PhaseStat {
 			continue
 		}
 		sort.Float64s(d)
-		out = append(out, PhaseStat{Phase: phase, Count: len(d), P50MS: percentile(d, 0.50), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1)})
+		out = append(out, PhaseStat{Phase: phase, Count: len(d), P50MS: percentile(d, 0.50), P90MS: percentile(d, 0.90), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1)})
 	}
 	return out
 }
@@ -4407,7 +4408,7 @@ func spanStat(name string, d []float64) *PhaseStat {
 		return nil
 	}
 	sort.Float64s(d)
-	return &PhaseStat{Phase: name, Count: len(d), P50MS: percentile(d, 0.50), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1)}
+	return &PhaseStat{Phase: name, Count: len(d), P50MS: percentile(d, 0.50), P90MS: percentile(d, 0.90), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1)}
 }
 
 // labelMatchesMode reports whether every report's mode label, where it has
@@ -4451,6 +4452,13 @@ func buildRestoreBreakdownFromSummary(rep *Report, ss map[string]schema.MetricSu
 		return nil
 	}
 	toPhaseStat := func(phase string, st schema.MetricSummary) PhaseStat {
+		p90 := st.P90
+		if p90 == 0 {
+			p90 = st.P95
+		}
+		if p90 == 0 {
+			p90 = st.Max
+		}
 		p95 := st.P95
 		if p95 == 0 {
 			p95 = st.P90
@@ -4462,6 +4470,7 @@ func buildRestoreBreakdownFromSummary(rep *Report, ss map[string]schema.MetricSu
 			Phase: phase,
 			Count: st.Count,
 			P50MS: round2(st.P50),
+			P90MS: round2(p90),
 			P95MS: round2(p95),
 			MaxMS: round2(st.Max),
 		}
@@ -4532,6 +4541,10 @@ func buildRestoreBreakdownFromSummary(rep *Report, ss map[string]schema.MetricSu
 		},
 	}
 	if evSt, ok := rep.StatFor(EventTTFI, ""); ok && evSt.Count > 0 {
+		totP90 := totalStat.P90
+		if totP90 == 0 {
+			totP90 = totalStat.P95
+		}
 		totP95 := totalStat.P95
 		if totP95 == 0 {
 			totP95 = totalStat.P90
@@ -4540,10 +4553,15 @@ func buildRestoreBreakdownFromSummary(rep *Report, ss map[string]schema.MetricSu
 			Phase: "outside",
 			Count: evSt.Count,
 			P50MS: round2(math.Max(0, evSt.P50MS-totalStat.P50)),
+			P90MS: round2(math.Max(0, evSt.P90MS-totP90)),
 			P95MS: round2(math.Max(0, evSt.P95MS-totP95)),
 			MaxMS: round2(math.Max(0, evSt.MaxMS-totalStat.Max)),
 		}
 	} else if evSt, ok := rep.StatFor(EventCreate, ""); ok && evSt.Count > 0 {
+		totP90 := totalStat.P90
+		if totP90 == 0 {
+			totP90 = totalStat.P95
+		}
 		totP95 := totalStat.P95
 		if totP95 == 0 {
 			totP95 = totalStat.P90
@@ -4552,6 +4570,7 @@ func buildRestoreBreakdownFromSummary(rep *Report, ss map[string]schema.MetricSu
 			Phase: "outside",
 			Count: evSt.Count,
 			P50MS: round2(math.Max(0, evSt.P50MS-totalStat.P50)),
+			P90MS: round2(math.Max(0, evSt.P90MS-totP90)),
 			P95MS: round2(math.Max(0, evSt.P95MS-totP95)),
 			MaxMS: round2(math.Max(0, evSt.MaxMS-totalStat.Max)),
 		}
@@ -4564,6 +4583,7 @@ func buildRestoreBreakdownFromSummary(rep *Report, ss map[string]schema.MetricSu
 					Phase: "worker_restore",
 					Count: wakeSt.Count,
 					P50MS: wakeSt.P50MS,
+					P90MS: wakeSt.P90MS,
 					P95MS: wakeSt.P95MS,
 					MaxMS: wakeSt.MaxMS,
 				},
@@ -4571,6 +4591,7 @@ func buildRestoreBreakdownFromSummary(rep *Report, ss map[string]schema.MetricSu
 					Phase: "total",
 					Count: wakeSt.Count,
 					P50MS: wakeSt.P50MS,
+					P90MS: wakeSt.P90MS,
 					P95MS: wakeSt.P95MS,
 					MaxMS: wakeSt.MaxMS,
 				},

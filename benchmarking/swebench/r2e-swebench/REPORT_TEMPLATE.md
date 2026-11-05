@@ -17,22 +17,44 @@ version tables from `system_description.json` (`bench measure -k8s`) and the pre
 | **`ate-env` version**         | `<git_sha>` (`api_image`, `guest_image`)                                                                            | `system_description.json` (`git_sha`, `sdk_version`)   |
 | **Artifact bundle**           | `<$ARTIFACT_DIR or gs://<YOUR_BENCHMARK_BUCKET>/<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>[_traced]/>` | Local path or `bench upload`                           |
 
-## Summary
+## Headline Outcome & Time Attribution Summary
 
-- **Workload and concurrency**: `<tasks>` rollouts across `<distinct_images>` distinct images
-  (`<r2e_images>` R2E-Gym + `<swe_images>` SWE-bench) at `<max_concurrent>` max concurrent sandboxes
-  (`r2e=<r2e_width>`, `swe=<swe_width>`, `<per_node_concurrency>` active/node), `<rewarded>/<tasks>`
-  rewarded (`reward_rate=<rate>`), `<failed>` failed.
-- **Start footing and pool**: `<cold boot \| cold restore \| warm restore \| wake>` (goldens
-  `<pre-baked \| baked in-band>`), `<working_set_hit_rate>%` warm hit rate,
-  `peak_active_sandboxes=<n>`, `standing_pool_size=<n>`, `peak_parked_sandboxes=<n>`.
-- **Lifecycle latencies (`<reference-arm>`)**: `actor_create` `<p50>/<p95>/<p99>` ms,
-  `sandbox_create` `<p50>/<p95>/<p99>` ms, `prewarm` `<p50>/<p95>/<p99>` ms, `ttfi` (cmd start)
-  `<p50>/<p95>/<p99>` ms, `ttfc` (cmd finished) `<p50>/<p95>/<p99>` ms, `wake` `<p50>/<p95>/<p99>`
-  ms, `suspend` `<p50>/<p95>/<p99>` ms, `delete` `<p50>/<p95>/<p99>` ms, `step_barrier`
-  `<p50>/<p95>/<p99>` ms.
-- **Strategy and client takeaway**:
-  `<1-2 sentences comparing tested strategies and Go / Go-direct / Python chains, plus dominant_bottleneck>`.
+> [!IMPORTANT]
+>
+> - **Key numbers (`<reference-arm>`)**:
+>   - **Max concurrency observed**: `<active_sandboxes>` concurrent in-flight sandboxes
+>     (`steps[].active_sandboxes`, vs `<max_concurrent>` configured [`r2e=<r2e_width>`,
+>     `swe=<swe_width>`, `<per_node_concurrency>` active/node] and `standing_pool_size=<n>` /
+>     `peak_parked_sandboxes=<n>`).
+>   - **`TTFI` start** (claim start -> sandbox handle ready / 1st cmd issued):
+>     `<ttfi_start_p50> / <ttfi_start_p90> ms` (`0 ms` in-band on `100%` warm-pool hits after
+>     upfront `create` `<create_p50>/<create_p90> ms` + `suspend` `<suspend_p50>/<suspend_p90> ms`;
+>     `<claim_p50> / <claim_p90> ms` `p50/p90` in-band on `none` via
+>     `custom_metrics.wire_claim_to_ready_ms`).
+>   - **Time to restore (`p50 / p90`)**: `<restore_total_p50> / <restore_total_p90> ms` in `atelet`
+>     (`restores.{first,wakes}.phases[total]`, `worker_restore` `<wr_p50> / <wr_p90> ms`;
+>     `~<infra_wake_p50> / <infra_wake_p90> ms` client-observed wake-to-ready including
+>     `~<wire_p50> / <wire_p90> ms` gRPC wire hop).
+> - **Workload, cache footing, and reward**: `<tasks>` rollouts across `<distinct_images>` distinct
+>   images (`<r2e_images>` R2E-Gym + `<swe_images>` SWE-bench),
+>   `<cold boot | cold restore | warm restore | wake>` (goldens `<pre-baked | baked in-band>`,
+>   `<misses_per_first_cmd>` cold `ate_imagecache` misses/start, `<working_set_hit_rate>%` warm-pool
+>   hit rate), `<rewarded>/<tasks>` rewarded (`reward_rate=<rate>`), `<failed>` failed.
+> - **Where time is actually spent (`<reference-arm>` `p50`)**:
+>   - **Host Python SDK (`ate_env_rl`)**: `<py_sdk_ms> ms (<py_sdk_pct>%)` (`0 ms` when
+>     `--client go` / `go-direct` drives the run; `python` minus `go` delta when `--client python`
+>     runs).
+>   - **Host SDK + `ate-env` + `ate` infrastructure**: `~<infra_wake_p50> ms` true wake-to-ready
+>     startup (`<restore_total_p50> ms` `atelet` restore + `~<wire_p50> ms` gRPC hop), totaling
+>     `~<r2e_infra_ms>–<swe_infra_ms> ms (<r2e_infra_pct>%–<swe_infra_pct>%)` across an entire
+>     rollout.
+>   - **Simulated LLM think (`Step.Think`)**: `<r2e_think_ms> ms (<r2e_think_pct>%)` on `r2e` and
+>     `<swe_think_ms> ms (<swe_think_pct>%)` on `swe` (`custom_metrics.llm_think_ms`).
+>   - **In-sandbox guest workload (`bash`/`git` + container `Python` `pytest` & graders)**:
+>     `~<r2e_guest_ms> ms (<r2e_guest_pct>%)` on `r2e` and `~<swe_guest_ms> ms (<swe_guest_pct>%)`
+>     on `swe`.
+> - **Strategy and client takeaway**:
+>   `<1-2 sentences comparing tested strategies (wall-clock vs standing-pool reduction and window-drain barriers) and Go / Go-direct / Python chains, plus dominant_bottleneck>`.
 
 ## 1. Cluster, node, and version specification
 
@@ -179,8 +201,9 @@ operation does not occur in the selected strategy (for example `ttfc` on `100%` 
   bottleneck `<rl_step_breakdown.dominant_bottleneck>`.
 - **Node cache and `atelet` restore sub-phases** (when `SAMPLE_CACHE=1` or `HARVEST_RESTORES=1`
   ran): `<cache.misses_per_first_cmd>` misses/start, `restores.{first,wakes}.phases[]`
-  (`manifest_fetch=<p50>/<p95>`, `download=<p50>/<p95>`, `oci_unpack=<p50>/<p95>`,
-  `worker_restore=<p50>/<p95>`), and `outside=<p50>/<p95>` ms.
+  (`p50/p90/p95`: `manifest_fetch=<p50>/<p90>/<p95>`, `download=<p50>/<p90>/<p95>`,
+  `oci_unpack=<p50>/<p90>/<p95>`, `worker_restore=<p50>/<p90>/<p95>`, `total=<p50>/<p90>/<p95>`),
+  and `outside=<p50>/<p90>/<p95>` ms.
 
 ## 4. Failures, findings, and caveats
 

@@ -79,12 +79,12 @@ kube_context() {
 }
 purge_envs() {  # environments the provider left behind (sessions cut off mid-episode)
   if [ -n "${KUBECTL_ATE:-}" ]; then
-    # only this instance's ids (<prefix>-<12 hex>, so `ua-` does not match `ua-a-...`) plus anything CRASHED; skip actors already
-    # DELETING: their delete is in progress (or stuck on a node that no longer exists) and re-issuing it only waits
-    # 16 deletes at a time: a step of thousands of sessions can leave thousands behind, and one at a time takes an hour.
-    # kubectl-ate at the pinned Substrate deletes an actor in any state (the older --any-state flag is gone).
+    # only this instance's ids, sessions <prefix>-<12 hex> and probes <prefix>-probe-<8 hex> (so `ua-` does not match
+    # `ua-a-...`), in any state but DELETING: that delete is in progress (or stuck on a node that no longer exists) and
+    # re-issuing it only waits. 16 deletes at a time: a step of thousands of sessions can leave thousands behind, and
+    # one at a time takes an hour. kubectl-ate at the pinned Substrate deletes an actor in any state (no --any-state).
     "$KUBECTL_ATE" --context "$KUBE_CONTEXT" get actors -a ate-env 2>/dev/null \
-      | awk -v p="^${ACTOR_PREFIX}-[0-9a-f]{12}$" 'NR>1 && $4 != "ACTOR_STATE_DELETING" && ($2 ~ p || $4 == "ACTOR_STATE_CRASHED") {print $2}' \
+      | awk -v p="^${ACTOR_PREFIX}-(probe-[0-9a-f]{8}|[0-9a-f]{12})$" 'NR>1 && $4 != "ACTOR_STATE_DELETING" && $2 ~ p {print $2}' \
       | xargs -r -P 16 -n 1 "$KUBECTL_ATE" --context "$KUBE_CONTEXT" delete actor -a ate-env >/dev/null 2>&1 || true
   else
     echo "note: set KUBECTL_ATE=<path to kubectl-ate> to delete leftover ${ACTOR_PREFIX}-* environments in atespace ate-env"

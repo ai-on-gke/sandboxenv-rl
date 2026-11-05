@@ -41,9 +41,10 @@ from hypothesis.stateful import (
 )
 
 from ate_env_rl.backend.substrate import SubstrateBackendDriver
-from ate_env_rl.config import ObservabilityConfig
+from ate_env_rl.config import WARM_POOL_RUN_ID, ObservabilityConfig
 from ate_env_rl.errors import NotFoundError, SandboxStartError
 from ate_env_rl.observability import Observer
+from ate_env_rl.telemetry import metrics
 
 R = 3  # replicas asked for by every warm_pool call
 
@@ -62,6 +63,7 @@ class GatedClient:
         self.delete_failures = 0  # fail this many delete() calls, then succeed
         self.get_gate: asyncio.Event | None = None
         self.get_error: Exception | None = None
+        self.suspend_error: Exception | None = None
 
     async def create(self, actor_id: str, **kw: object) -> None:
         n, self.creates = self.creates, self.creates + 1
@@ -75,6 +77,8 @@ class GatedClient:
         gate = self.suspend_gates.get(actor_id)
         if gate is not None:
             await gate.wait()
+        if self.suspend_error is not None:
+            raise self.suspend_error
 
     async def delete(self, actor_id: str, **kw: object) -> None:
         if self.delete_gate is not None:
@@ -353,6 +357,350 @@ async def test_failed_recycle_delete_after_teardown_leaves_the_actor_for_any_lat
     await driver.reap_async("run-2")
     assert client.live == set()
     assert driver._owned_actors == {}
+
+
+# AC-15.9: a cancelled cleanup delete, and a release whose delete fails while a
+# reap runs, leave the actor where a later run's reap finds it.
+async def test_cancelled_delete_after_reap_leaves_warm_actors_for_any_later_reap() -> None:
+    client = GatedClient()
+    driver, obs = _driver(client)
+    client.create_gate = asyncio.Event()
+
+    warm = asyncio.create_task(driver.warm_pool_async("tmpl", R, run_id="run-1"))
+    await _spin()  # paused in create()
+    await driver.reap_async("run-1")
+    obs.warm_reset()
+    client.delete_gate = asyncio.Event()
+    client.create_gate.set()
+    await _spin()  # paused in the deletes after the teardown
+    warm.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await warm
+    assert len(client.live) == R
+
+    client.delete_gate = None
+    await driver.reap_async("run-2")
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_release_delete_lost_during_reap_leaves_the_actor_for_any_later_reap(
+    cancel: bool,
+) -> None:
+    client = GatedClient()
+    driver, _ = _driver(client)
+    client.live.add("sb-1")
+    handle = driver._make_instance("sb-1", "tmpl", run_id="run-1")
+    driver._owned_actors["sb-1"] = handle
+    client.delete_gate = asyncio.Event()
+
+    release = asyncio.create_task(driver.release_async("sb-1"))
+    await _spin()  # paused in delete(); the actor is not owned now
+    await driver.reap_async("run-1")  # cannot see it
+    if cancel:
+        release.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await release
+    else:
+        client.delete_error = RuntimeError("unavailable")
+        client.delete_gate.set()
+        await release  # release does not raise on a failed delete
+    assert client.live == {"sb-1"}
+    assert handle.run_id == "run-1"  # the caller's handle is not changed
+
+    client.delete_gate = None
+    client.delete_error = None
+    await driver.reap_async("run-2")
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+async def test_recycle_cancelled_in_suspend_after_a_reap_leaves_the_actor_for_any_later_reap() -> None:
+    client = GatedClient()
+    driver, obs = _driver(client)
+    client.live.add("sb-1")
+    handle = driver._make_instance("sb-1", "tmpl", run_id="run-1")
+    driver._owned_actors["sb-1"] = handle
+    client.suspend_gates["sb-1"] = asyncio.Event()
+
+    recycle = asyncio.create_task(driver.release_async("sb-1", recycle=True))
+    await _spin()  # paused in suspend(); the actor is not owned now
+    await driver.reap_async("run-1")  # cannot see it
+    obs.warm_reset()
+    recycle.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await recycle
+    assert driver._owned_actors["sb-1"].run_id == WARM_POOL_RUN_ID
+    assert handle.run_id == "run-1"  # the caller's handle is not changed
+
+    await driver.reap_async("run-2")
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+async def test_warm_pool_cancelled_before_its_deletes_start_leaves_actors_for_any_later_reap() -> None:
+    client = GatedClient()
+    driver, obs = _driver(client)
+    client.create_gate = asyncio.Event()
+
+    async def never_runs(actor_id: str, why: str) -> None:
+        # Stands for a cancel that lands before any _delete_unpooled starts.
+        await asyncio.Event().wait()
+
+    driver._delete_unpooled = never_runs  # type: ignore[method-assign]
+    warm = asyncio.create_task(driver.warm_pool_async("tmpl", R, run_id="run-1"))
+    await _spin()  # paused in create()
+    await driver.reap_async("run-1")
+    obs.warm_reset()
+    client.create_gate.set()
+    await _spin()  # owned the actors, awaiting the deletes
+    warm.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await warm
+    assert len(client.live) == R
+    assert {i.run_id for i in driver._owned_actors.values()} == {WARM_POOL_RUN_ID}
+
+    await driver.reap_async("run-2")
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+async def test_release_delete_failure_without_a_reap_keeps_the_run_id() -> None:
+    client = GatedClient()
+    driver, _ = _driver(client)
+    client.live.add("sb-1")
+    driver._owned_actors["sb-1"] = driver._make_instance("sb-1", "tmpl", run_id="run-1")
+    client.delete_failures = 1
+
+    await driver.release_async("sb-1")
+    assert driver._owned_actors["sb-1"].run_id == "run-1"  # the run's own reap retries it
+    await driver.reap_async("run-1")
+    assert client.live == set()
+
+
+# AC-15.7: a warm claim whose get() returns after an overlapping reap deleted
+# the actor does not hand that actor out.
+@pytest.mark.parametrize("reap_done", [True, False])
+@pytest.mark.parametrize("owner", ["run-0", "run-1"])  # run-1: the reap skips it
+async def test_warm_claim_overlapping_a_reap_returns_a_live_environment(
+    reap_done: bool, owner: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subphases: list[tuple[str, str, str]] = []
+
+    def record(phase: str, seconds: float, status: str = "ok", *, source: str = "direct") -> None:
+        subphases.append((phase, status, source))
+
+    monkeypatch.setattr(metrics, "observe_subphase", record)
+    client = GatedClient()
+    driver, obs = _driver(client)
+    client.live.add("sb-x")
+    driver._owned_actors["sb-x"] = driver._make_instance("sb-x", "tmpl", run_id=owner)
+    driver._warm_paused_pool.setdefault(("tmpl", None), []).append("sb-x")
+    obs.warm_add("substrate", 1)
+    client.get_gate = asyncio.Event()
+
+    claim = asyncio.create_task(driver._acquire_internal("tmpl", "run-1"))
+    await _spin()  # popped sb-x, paused in get()
+    if not reap_done:
+        # run-0: pauses the reap's delete of sb-x. run-1: the reap skips sb-x
+        # and deletes nothing; this pauses the claim's own delete of it.
+        client.delete_gate = asyncio.Event()
+    reap = asyncio.create_task(driver.reap_async("run-0"))
+    await _spin()  # run-0: the reap took sb-x (still owned); run-1: it skips sb-x
+    client.get_gate.set()  # get() still succeeds
+    await _spin()
+    if not reap_done:
+        assert client.delete_gate is not None
+        client.delete_gate.set()
+    instance = await claim
+    await reap
+
+    assert instance.instance_id != "sb-x"
+    assert instance.instance_id in client.live
+    assert instance.metadata["claim_source"] == "cold_create"
+    assert "sb-x" not in client.live
+    assert set(driver._owned_actors) == {instance.instance_id}
+    # One sample for the abandoned warm claim, then the cold create's own.
+    assert subphases == [
+        ("wire_claim", "error", "warm_pool"),
+        ("wire_claim", "ok", "cold_create"),
+    ]
+
+
+class SlowCreatesClient(GatedClient):
+    """The first ``fast`` create() calls return at once; the rest wait on create_gate."""
+
+    def __init__(self, fast: int) -> None:
+        super().__init__()
+        self.fast = fast
+
+    async def create(self, actor_id: str, **kw: object) -> None:
+        if self.creates < self.fast:
+            self.creates += 1
+            self.live.add(actor_id)
+            return
+        await super().create(actor_id, **kw)
+
+    async def delete(self, actor_id: str, **kw: object) -> None:
+        if actor_id not in self.live:
+            raise NotFoundError(actor_id)
+        await super().delete(actor_id, **kw)
+
+
+class SlowSuspendsClient(SlowCreatesClient):
+    """Every create() lands; the first ``fast`` suspend() calls return, the rest wait."""
+
+    def __init__(self, fast: int) -> None:
+        super().__init__(fast=1_000)
+        self.fast_suspends = fast
+        self.suspends = 0
+        self.suspend_gate = asyncio.Event()
+
+    async def suspend(self, actor_id: str, **kw: object) -> None:
+        n, self.suspends = self.suspends, self.suspends + 1
+        if n >= self.fast_suspends:
+            await self.suspend_gate.wait()
+
+
+# AC-15.8: a warm_pool call cancelled during its create() calls leaves no live
+# actor untracked; any run's reap deletes what it made.
+async def test_cancelled_warm_pool_leaves_its_actors_for_any_reap() -> None:
+    client = SlowCreatesClient(fast=2)
+    driver, obs = _driver(client)
+    client.create_gate = asyncio.Event()
+
+    warm = asyncio.create_task(driver.warm_pool_async("tmpl", R, run_id="run-1"))
+    await _spin()  # two actors created, the third create() paused
+    assert len(client.live) == 2
+    warm.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await warm
+
+    assert client.live <= set(driver._owned_actors)  # nothing alive is untracked
+    assert _pool(driver) == []
+    assert sum(obs._warm.values()) == 0
+    assert driver._warm_inflight == {}
+    # The third id's create never landed: NotFound for the reap, not counted.
+    assert await driver.reap_async("run-2") == 2
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+async def test_warm_pool_cancelled_in_suspend_leaves_its_actors_for_any_reap() -> None:
+    client = SlowSuspendsClient(fast=2)
+    driver, obs = _driver(client)
+
+    warm = asyncio.create_task(driver.warm_pool_async("tmpl", R, run_id="run-1"))  # wait=True
+    await _spin()  # three actors created, the third suspend() paused
+    assert len(client.live) == R
+    warm.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await warm
+
+    assert client.live <= set(driver._owned_actors)
+    assert _pool(driver) == []
+    assert await driver.reap_async("run-2") == R
+    assert client.live == set()
+
+
+async def test_warm_pool_cancelled_just_before_the_runs_reap_deletes_its_actors() -> None:
+    # The reap snapshots what it deletes before the cancel handler runs, and
+    # the run is not reaped again: the handler deletes the actors itself.
+    client = SlowCreatesClient(fast=2)
+    driver, obs = _driver(client)
+    client.create_gate = asyncio.Event()
+
+    warm = asyncio.create_task(driver.warm_pool_async("tmpl", R, run_id="run-1"))
+    await _spin()  # two actors created, the third create() paused
+    warm.cancel()
+    await driver.reap_async("run-1")  # no await in between: the handler has not run
+    with pytest.raises(asyncio.CancelledError):
+        await warm
+    await asyncio.gather(*list(driver._background_tasks))
+
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+@pytest.mark.parametrize("delete_fails", [False, True])
+async def test_warm_actor_whose_suspend_fails_is_deleted_or_left_for_any_reap(
+    delete_fails: bool,
+) -> None:
+    client = GatedClient()
+    driver, obs = _driver(client)
+    client.suspend_error = RuntimeError("suspend failed")
+    if delete_fails:
+        client.delete_failures = R
+
+    await driver.warm_pool_async("tmpl", R, run_id="run-1")  # wait=True
+
+    assert _pool(driver) == []
+    assert sum(obs._warm.values()) == 0
+    assert client.live <= set(driver._owned_actors)  # nothing alive is untracked
+    if delete_fails:
+        assert len(client.live) == R
+        assert {i.run_id for i in driver._owned_actors.values()} == {WARM_POOL_RUN_ID}
+        await driver.reap_async("run-2")
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+# AC-15.10: a cold acquire whose create overlaps its own run's reap leaves the
+# environment where a later reap finds it.
+@pytest.mark.parametrize("reap_running", [False, True])
+async def test_cold_acquire_overlapping_its_runs_reap_leaves_the_actor_for_any_later_reap(
+    reap_running: bool,
+) -> None:
+    client = GatedClient()
+    driver, _ = _driver(client)
+    if reap_running:
+        # Another actor of run-1 keeps the reap in its delete() until the gate opens.
+        client.live.add("sb-old")
+        driver._owned_actors["sb-old"] = driver._make_instance("sb-old", "tmpl", run_id="run-1")
+        client.delete_gate = asyncio.Event()
+    client.create_gate = asyncio.Event()
+
+    acquire = asyncio.create_task(driver._acquire_internal("tmpl", "run-1"))
+    await _spin()  # cold create paused
+    reap = asyncio.create_task(driver.reap_async("run-1"))
+    await _spin()  # the reap's snapshot does not hold the new actor
+    client.create_gate.set()
+    instance = await acquire
+    if reap_running:
+        assert client.delete_gate is not None
+        client.delete_gate.set()
+    await reap
+
+    assert instance.run_id == "run-1"  # the caller's handle is not changed
+    assert driver._owned_actors[instance.instance_id].run_id == WARM_POOL_RUN_ID
+    assert client.live == {instance.instance_id}
+    client.delete_gate = None
+    await driver.reap_async("run-2")
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+@pytest.mark.parametrize("reaped", ["another-run-during", "own-run-before"])
+async def test_cold_acquire_keeps_its_run_id_without_an_overlapping_reap_of_its_run(
+    reaped: str,
+) -> None:
+    client = GatedClient()
+    driver, _ = _driver(client)
+    if reaped == "own-run-before":
+        await driver.reap_async("run-1")  # a fleet tears down between runs and runs again
+    client.create_gate = asyncio.Event()
+
+    acquire = asyncio.create_task(driver._acquire_internal("tmpl", "run-1"))
+    await _spin()
+    if reaped == "another-run-during":
+        await driver.reap_async("run-0")
+    client.create_gate.set()
+    instance = await acquire
+
+    assert driver._owned_actors[instance.instance_id].run_id == "run-1"
+    await driver.reap_async("run-1")
+    assert client.live == set()
 
 
 async def test_direct_reap_moves_the_gauge_with_the_pool() -> None:

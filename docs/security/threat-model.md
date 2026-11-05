@@ -146,7 +146,7 @@ container, and the guest is mounted into it as a read-only image volume.
 
 | Threat | Current mitigation | Gap |
 |---|---|---|
-| A caller runs an image of its choice under the settings of the base template (worker selector, snapshots bucket, resources) | The image must be pinned by digest. A template with that name that runs another image is refused with `FailedPrecondition`. | Any registry is accepted. |
+| A caller runs an image of its choice under the settings of the base template (worker selector, snapshots bucket, resources) | The image must be pinned by digest. A template with that name that runs another image is refused with `FailedPrecondition`, also when a concurrent create made it. | Any registry is accepted. |
 | Template growth | None. | Derived templates have no quota and no garbage collection. |
 
 Accepted risk for now: this hardening is not needed for RL at the moment. Revisit it before the

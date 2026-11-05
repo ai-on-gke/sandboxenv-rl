@@ -400,9 +400,10 @@ func parsePath(escaped, defaultAtespace string) (target, error) {
 	if t.path, err = url.PathUnescape(rest); err != nil {
 		return t, fmt.Errorf("bad path escaping: %w", err)
 	}
-	if t.rawPath == t.path {
-		t.rawPath = ""
-	}
+	// Keep rawPath even when it equals path: without it, url.EscapedPath
+	// re-escapes characters that are valid as sent (! ' ( ) *), and the
+	// daemon would get "/%21" for "/!". EscapedPath uses RawPath only when
+	// it is a valid encoding of Path.
 	return t, nil
 }
 

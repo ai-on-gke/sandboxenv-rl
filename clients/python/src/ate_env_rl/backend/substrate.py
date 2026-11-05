@@ -166,6 +166,11 @@ class SubstrateBackendDriver(BackendDriver):
         # pooling it (_may_pool).
         self._teardowns = 0
         self._reaping = 0
+        # Per run id: reaps of that run in progress, and the _teardowns
+        # value when its last reap ended. An acquire whose own run was reaped
+        # while it created the actor owns it under WARM_POOL_RUN_ID (AC-15.10).
+        self._run_reaps_running: dict[str, int] = {}
+        self._run_reap_ended: dict[str, int] = {}
         # Bumped per pool key by unwarm_pool and by a resize_pool that shrinks
         # below what is pooled and in flight: a warm_pool call that started
         # before deletes what it created instead of pooling it.
@@ -463,10 +468,42 @@ class SubstrateBackendDriver(BackendDriver):
                     raise SandboxStartError(f"Error checking warm actor {actor_id}: {e}") from e
                 finally:
                     current_warm_claim.reset(wc_token)
+                instance = self._make_instance(
+                    actor_id, template_id, run_id, rootfs_image=rootfs_image
+                )
+                instance.metadata["claim_source"] = claim_source
+                # Check for a reap and take ownership in one lock hold, so a
+                # reap on another thread cannot run in between (AC-15.7).
+                with self._lock:
+                    reaped_since = not self._may_pool(teardowns)
+                    if reaped_since:
+                        stale = self._owned_actors.get(actor_id)
+                    else:
+                        self._owned_actors[actor_id] = instance
+                if reaped_since:
+                    # A reap ran during get(). It deleted the actor if it
+                    # matched it (the actor's run, or WARM_POOL_RUN_ID); one of
+                    # another run, or a reap cancelled before its delete, left
+                    # it alive and unpooled. Do not hand it out; delete it if
+                    # it is still owned, then claim or create another.
+                    logger.info(
+                        "Teardown ran while claiming warm actor %s; not handing it out", actor_id
+                    )
+                    # One wire_claim sample for the abandoned claim, as for a
+                    # failed one; the claim that follows records its own.
+                    metrics.observe_subphase(
+                        "wire_claim",
+                        time.monotonic() - claim_start,
+                        status="error",
+                        source="warm_pool",
+                    )
+                    if stale is not None:
+                        await self._delete_unpooled(actor_id, "after teardown")
+                    continue
                 wire_dur = time.monotonic() - claim_start
                 metrics.observe("warm_claim", wire_dur)
                 metrics.observe_subphase("wire_claim", wire_dur, status="ok", source="warm_pool")
-                break
+                return instance
             else:
                 claim_source = "cold_create"
                 actor_id = f"sb-{uuid.uuid4().hex[:16]}"
@@ -528,7 +565,15 @@ class SubstrateBackendDriver(BackendDriver):
         instance = self._make_instance(actor_id, template_id, run_id, rootfs_image=rootfs_image)
         instance.metadata["claim_source"] = claim_source
         with self._lock:
-            self._owned_actors[actor_id] = instance
+            if self._run_reaped_since(run_id, teardowns):
+                # The run's own reap overlapped this create and may have
+                # missed the actor, and a fleet's last teardown reaps its run
+                # once: own it under WARM_POOL_RUN_ID, which every reap
+                # deletes. The caller's handle keeps its run_id, and its
+                # release deletes the actor as usual (AC-15.10).
+                self._own_for_any_reap(actor_id, instance)
+            else:
+                self._owned_actors[actor_id] = instance
         return instance
 
     def acquire(
@@ -607,10 +652,14 @@ class SubstrateBackendDriver(BackendDriver):
 
         sem = asyncio.Semaphore(16)
         effective_run_id = run_id or WARM_POOL_RUN_ID
+        # Every id a create() was sent for, so a cancelled call can still
+        # account for the actors it made (AC-15.8).
+        started: list[str] = []
 
         async def _warm_one() -> str | None:
             actor_id = f"warm-{uuid.uuid4().hex[:10]}"
             async with sem:
+                started.append(actor_id)
                 try:
                     drv_tok = in_driver_span.set(True)
                     try:
@@ -623,25 +672,6 @@ class SubstrateBackendDriver(BackendDriver):
                         )
                     finally:
                         in_driver_span.reset(drv_tok)
-                    if wait:
-                        await self._client_for(actor_id).suspend(actor_id, atespace=self.atespace)
-                    else:
-                        task = asyncio.create_task(
-                            self._client_for(actor_id).suspend(actor_id, atespace=self.atespace)
-                        )
-                        self._background_tasks.add(task)
-
-                        def _done(t: asyncio.Task[Any]) -> None:
-                            self._background_tasks.discard(t)
-                            if not t.cancelled() and t.exception():
-                                logger.warning(
-                                    "Background suspend for warm actor %s failed: %s",
-                                    actor_id,
-                                    t.exception(),
-                                )
-
-                        task.add_done_callback(_done)
-                    return actor_id
                 except (NotFoundError, FailedPreconditionError) as e:
                     raise SandboxStartError(
                         f"ActorTemplate '{template_id}' invalid or does not exist on Substrate server: {e}"
@@ -649,34 +679,96 @@ class SubstrateBackendDriver(BackendDriver):
                 except Exception as e:
                     logger.warning("Failed to provision warm actor %s: %s", actor_id, e)
                     return None
+                if wait:
+                    try:
+                        await self._client_for(actor_id).suspend(actor_id, atespace=self.atespace)
+                    except Exception as e:
+                        # Created but not paused: neither pooled nor returned.
+                        # Own it under WARM_POOL_RUN_ID and delete it, so a
+                        # failed delete leaves it for any reap (AC-15.8).
+                        logger.warning("Failed to suspend warm actor %s: %s", actor_id, e)
+                        with self._lock:
+                            self._owned_actors.setdefault(
+                                actor_id,
+                                self._make_instance(
+                                    actor_id,
+                                    template_id,
+                                    run_id=WARM_POOL_RUN_ID,
+                                    rootfs_image=rootfs_image,
+                                ),
+                            )
+                        await self._delete_unpooled(actor_id, "after failed warm suspend")
+                        return None
+                else:
+                    task = asyncio.create_task(
+                        self._client_for(actor_id).suspend(actor_id, atespace=self.atespace)
+                    )
+                    self._background_tasks.add(task)
+
+                    def _done(t: asyncio.Task[Any]) -> None:
+                        self._background_tasks.discard(t)
+                        if not t.cancelled() and t.exception():
+                            logger.warning(
+                                "Background suspend for warm actor %s failed: %s",
+                                actor_id,
+                                t.exception(),
+                            )
+
+                    task.add_done_callback(_done)
+                return actor_id
 
         tasks = [_warm_one() for _ in range(needed)]
         try:
             results = await asyncio.gather(*tasks, return_exceptions=True)
         except BaseException:
+            # Cancelled: the actors created so far, and any whose create() was
+            # in flight, are neither pooled nor owned. Own them under
+            # WARM_POOL_RUN_ID, so any run's reap deletes them (one that was
+            # never created is NotFound there, which counts as gone).
             with self._lock:
                 _release_reservation()
+                reaped_since = not self._may_pool(teardowns)
+                for aid in started:
+                    self._owned_actors.setdefault(
+                        aid,
+                        self._make_instance(
+                            aid, template_id, run_id=WARM_POOL_RUN_ID, rootfs_image=rootfs_image
+                        ),
+                    )
+            if reaped_since:
+                # A reap ran or is running and may have taken its snapshot
+                # before this handler, and a fleet reaps its run once: delete
+                # them now, in background tasks so the cancel is not delayed,
+                # as the wait=False suspends do. A delete that fails or never
+                # runs leaves them for any later reap (AC-15.8).
+                for aid in started:
+                    task = asyncio.create_task(
+                        self._delete_unpooled(aid, "after a cancelled warm_pool")
+                    )
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
             raise
 
         created = [r for r in results if isinstance(r, str)]
         # The reservation turns into pool entries under one lock, so a
         # concurrent warm_pool always counts these actors in one of the two.
-        instances = [
-            self._make_instance(aid, template_id, run_id=effective_run_id, rootfs_image=rootfs_image)
-            for aid in created
-        ]
         with self._lock:
             _release_reservation()
             # After a reap, unwarm_pool or a shrinking resize_pool, the pool
             # these actors were made for is gone: delete them instead.
             torn_down = not self._may_pool(teardowns)
             drained = self._pool_gens.get(pool_key, 0) != gen
-            for inst in instances:
-                # Owned either way, so a cancelled delete below leaves them
-                # for the next reap.
-                self._owned_actors[inst.instance_id] = inst
+            # Owned either way. Actors to delete are owned under
+            # WARM_POOL_RUN_ID from the start: the run's reap may already
+            # have run, and a cancel can land before any delete below starts
+            # (AC-15.9).
+            owner = WARM_POOL_RUN_ID if (torn_down or drained) else effective_run_id
+            for aid in created:
+                self._owned_actors[aid] = self._make_instance(
+                    aid, template_id, run_id=owner, rootfs_image=rootfs_image
+                )
                 if not (torn_down or drained):
-                    self._warm_paused_pool.setdefault(pool_key, []).append(inst.instance_id)
+                    self._warm_paused_pool.setdefault(pool_key, []).append(aid)
         if torn_down or drained:
             if created:
                 logger.info(
@@ -706,9 +798,9 @@ class SubstrateBackendDriver(BackendDriver):
         reap may already have missed (``why`` goes in the log).
 
         The actor leaves _owned_actors only once the delete succeeds (or finds
-        it gone). A failed delete is counted as a release failure and re-tags
-        the actor with WARM_POOL_RUN_ID, so whichever run reaps next deletes
-        it; a cancelled one leaves it owned as it was.
+        it gone). A failed delete is counted as a release failure; a failed or
+        cancelled one re-tags the actor with WARM_POOL_RUN_ID, so whichever
+        run reaps next deletes it (AC-15.5, AC-15.9).
         """
         try:
             await self._client_for(actor_id).delete(actor_id, atespace=self.atespace)
@@ -719,18 +811,46 @@ class SubstrateBackendDriver(BackendDriver):
             logger.warning("Failed deleting actor %s %s: %s", actor_id, why, e)
             self._keep_for_any_reap(actor_id)
             return
+        except BaseException:
+            # Cancelled: the run's reap may already have run, so leave the
+            # actor where any later reap finds it, then let the cancel through.
+            self._keep_for_any_reap(actor_id)
+            raise
         with self._lock:
             self._owned_actors.pop(actor_id, None)
 
-    def _keep_for_any_reap(self, actor_id: str, instance: RawSandboxInstance | None = None) -> None:
-        """Keep an actor owned under WARM_POOL_RUN_ID, which every reap deletes.
+    def _return_popped(self, actor_id: str, instance: RawSandboxInstance, teardowns: int) -> None:
+        """Own again an actor that release popped and did not delete.
+
+        A reap since the pop (one read ``teardowns``) could not see the actor,
+        and a fleet reaps its run once: then own it under WARM_POOL_RUN_ID,
+        which every reap deletes; otherwise under its own run id, for the
+        run's reap. The check and the update share one lock hold, so a reap
+        that starts in between cannot miss the actor (AC-15.9). A copy, so
+        the caller's handle keeps its run_id.
+        """
+        with self._lock:
+            if self._may_pool(teardowns):
+                self._owned_actors.setdefault(actor_id, instance)
+            else:
+                self._own_for_any_reap(actor_id, instance)
+
+    def _keep_for_any_reap(self, actor_id: str) -> None:
+        """Keep an owned actor under WARM_POOL_RUN_ID, which every reap deletes.
+
+        An actor a reap already popped is not added back.
+        """
+        with self._lock:
+            inst = self._owned_actors.get(actor_id)
+            if inst is not None:
+                self._own_for_any_reap(actor_id, inst)
+
+    def _own_for_any_reap(self, actor_id: str, instance: RawSandboxInstance) -> None:
+        """Own ``instance`` under WARM_POOL_RUN_ID. Caller holds self._lock.
 
         A copy, so the caller's handle keeps its run_id.
         """
-        with self._lock:
-            inst = self._owned_actors.get(actor_id, instance)
-            if inst is not None:
-                self._owned_actors[actor_id] = dataclasses.replace(inst, run_id=WARM_POOL_RUN_ID)
+        self._owned_actors[actor_id] = dataclasses.replace(instance, run_id=WARM_POOL_RUN_ID)
 
     def warm_pool(
         self,
@@ -892,7 +1012,6 @@ class SubstrateBackendDriver(BackendDriver):
             instance = self._owned_actors.pop(instance_id, None)
             teardowns = self._teardowns
 
-        missed_by_reap = False
         if recycle and instance:
             try:
                 await self._client_for(instance_id).suspend(instance_id, atespace=self.atespace)
@@ -909,15 +1028,14 @@ class SubstrateBackendDriver(BackendDriver):
                 # The reap could not see this actor (it was popped above), so
                 # pooling it now would outlive the teardown: delete it below.
                 logger.info("Teardown ran while recycling actor %s; deleting it", instance_id)
-                missed_by_reap = True
             except Exception as e:
                 logger.warning(
                     "Failed to suspend actor %s for recycle, deleting: %s", instance_id, e
                 )
             except BaseException:
-                # Cancelled during suspend(): keep it owned for the run's reap.
-                with self._lock:
-                    self._owned_actors.setdefault(instance_id, instance)
+                # Cancelled during suspend(): own it again, for the run's reap
+                # or, if a reap ran since the pop, for any reap.
+                self._return_popped(instance_id, instance, teardowns)
                 raise
 
         try:
@@ -926,15 +1044,11 @@ class SubstrateBackendDriver(BackendDriver):
             logger.info("Environment %s was already deleted", instance_id)
             return
         except BaseException:
-            # Keep it owned, so a reap retries the delete. The run's own reap
-            # already ran if a teardown stopped the recycle, so any run's
-            # reap must find it then.
+            # Own it again, so a reap retries the delete: the run's reap, or
+            # any reap if one ran since the pop (the recycle saw it, or it ran
+            # during this delete).
             if instance is not None:
-                if missed_by_reap:
-                    self._keep_for_any_reap(instance_id, instance)
-                else:
-                    with self._lock:
-                        self._owned_actors.setdefault(instance_id, instance)
+                self._return_popped(instance_id, instance, teardowns)
             raise
         logger.info("Deleted environment %s", instance_id)
 
@@ -951,6 +1065,7 @@ class SubstrateBackendDriver(BackendDriver):
             self._reaping += 1
             self._teardowns += 1
             self._warm_inflight.clear()
+            self._run_reaps_running[run_id] = self._run_reaps_running.get(run_id, 0) + 1
         try:
             return await self._reap_actors(run_id)
         finally:
@@ -960,6 +1075,21 @@ class SubstrateBackendDriver(BackendDriver):
                 self._reaping -= 1
                 self._teardowns += 1
                 self._warm_inflight.clear()
+                left = self._run_reaps_running.get(run_id, 1) - 1
+                if left > 0:
+                    self._run_reaps_running[run_id] = left
+                else:
+                    self._run_reaps_running.pop(run_id, None)
+                self._run_reap_ended[run_id] = self._teardowns
+
+    def _run_reaped_since(self, run_id: str, teardowns: int) -> bool:
+        """Whether a reap of ``run_id`` is running, or ended after the caller
+        read ``teardowns``: that reap may have taken its snapshot before an
+        actor the caller is about to own. Caller holds self._lock."""
+        return (
+            self._run_reaps_running.get(run_id, 0) > 0
+            or self._run_reap_ended.get(run_id, -1) > teardowns
+        )
 
     async def _reap_actors(self, run_id: str) -> int:
         with self._lock:

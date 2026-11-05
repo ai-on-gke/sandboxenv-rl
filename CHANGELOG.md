@@ -70,6 +70,10 @@ user needs to know across them.
 
 ### Fixed
 
+- ate-env-api port proxy: the path form
+  (`/v1alpha/envs/<id>/ports/<port>/...`) forwards the rest of the path
+  exactly as sent; it re-escaped `! ' ( ) *` (`/report(1).txt` reached the
+  daemon as `/report%281%29.txt`) when the path held no other escape.
 - ate-env-api: a `CreateEnvironment` whose derived image template was created
   by a concurrent call for another image (two digests sharing their first 12
   hex digits) fails with `FailedPrecondition` instead of running that image.

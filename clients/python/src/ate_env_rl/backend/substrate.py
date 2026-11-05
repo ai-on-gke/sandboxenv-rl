@@ -463,10 +463,42 @@ class SubstrateBackendDriver(BackendDriver):
                     raise SandboxStartError(f"Error checking warm actor {actor_id}: {e}") from e
                 finally:
                     current_warm_claim.reset(wc_token)
+                instance = self._make_instance(
+                    actor_id, template_id, run_id, rootfs_image=rootfs_image
+                )
+                instance.metadata["claim_source"] = claim_source
+                # Check for a reap and take ownership in one lock hold, so a
+                # reap on another thread cannot run in between (AC-15.7).
+                with self._lock:
+                    reaped_since = not self._may_pool(teardowns)
+                    if reaped_since:
+                        stale = self._owned_actors.get(actor_id)
+                    else:
+                        self._owned_actors[actor_id] = instance
+                if reaped_since:
+                    # A reap ran during get(). It deleted the actor if it
+                    # matched it (the actor's run, or WARM_POOL_RUN_ID); one of
+                    # another run, or a reap cancelled before its delete, left
+                    # it alive and unpooled. Do not hand it out; delete it if
+                    # it is still owned, then claim or create another.
+                    logger.info(
+                        "Teardown ran while claiming warm actor %s; not handing it out", actor_id
+                    )
+                    # One wire_claim sample for the abandoned claim, as for a
+                    # failed one; the claim that follows records its own.
+                    metrics.observe_subphase(
+                        "wire_claim",
+                        time.monotonic() - claim_start,
+                        status="error",
+                        source="warm_pool",
+                    )
+                    if stale is not None:
+                        await self._delete_unpooled(actor_id, "after teardown")
+                    continue
                 wire_dur = time.monotonic() - claim_start
                 metrics.observe("warm_claim", wire_dur)
                 metrics.observe_subphase("wire_claim", wire_dur, status="ok", source="warm_pool")
-                break
+                return instance
             else:
                 claim_source = "cold_create"
                 actor_id = f"sb-{uuid.uuid4().hex[:16]}"

@@ -44,6 +44,7 @@ from ate_env_rl.backend.substrate import SubstrateBackendDriver
 from ate_env_rl.config import WARM_POOL_RUN_ID, ObservabilityConfig
 from ate_env_rl.errors import NotFoundError, SandboxStartError
 from ate_env_rl.observability import Observer
+from ate_env_rl.telemetry import metrics
 
 R = 3  # replicas asked for by every warm_pool call
 
@@ -473,6 +474,55 @@ async def test_release_delete_failure_without_a_reap_keeps_the_run_id() -> None:
     assert driver._owned_actors["sb-1"].run_id == "run-1"  # the run's own reap retries it
     await driver.reap_async("run-1")
     assert client.live == set()
+
+
+# AC-15.7: a warm claim whose get() returns after an overlapping reap deleted
+# the actor does not hand that actor out.
+@pytest.mark.parametrize("reap_done", [True, False])
+@pytest.mark.parametrize("owner", ["run-0", "run-1"])  # run-1: the reap skips it
+async def test_warm_claim_overlapping_a_reap_returns_a_live_environment(
+    reap_done: bool, owner: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subphases: list[tuple[str, str, str]] = []
+
+    def record(phase: str, seconds: float, status: str = "ok", *, source: str = "direct") -> None:
+        subphases.append((phase, status, source))
+
+    monkeypatch.setattr(metrics, "observe_subphase", record)
+    client = GatedClient()
+    driver, obs = _driver(client)
+    client.live.add("sb-x")
+    driver._owned_actors["sb-x"] = driver._make_instance("sb-x", "tmpl", run_id=owner)
+    driver._warm_paused_pool.setdefault(("tmpl", None), []).append("sb-x")
+    obs.warm_add("substrate", 1)
+    client.get_gate = asyncio.Event()
+
+    claim = asyncio.create_task(driver._acquire_internal("tmpl", "run-1"))
+    await _spin()  # popped sb-x, paused in get()
+    if not reap_done:
+        # run-0: pauses the reap's delete of sb-x. run-1: the reap skips sb-x
+        # and deletes nothing; this pauses the claim's own delete of it.
+        client.delete_gate = asyncio.Event()
+    reap = asyncio.create_task(driver.reap_async("run-0"))
+    await _spin()  # run-0: the reap took sb-x (still owned); run-1: it skips sb-x
+    client.get_gate.set()  # get() still succeeds
+    await _spin()
+    if not reap_done:
+        assert client.delete_gate is not None
+        client.delete_gate.set()
+    instance = await claim
+    await reap
+
+    assert instance.instance_id != "sb-x"
+    assert instance.instance_id in client.live
+    assert instance.metadata["claim_source"] == "cold_create"
+    assert "sb-x" not in client.live
+    assert set(driver._owned_actors) == {instance.instance_id}
+    # One sample for the abandoned warm claim, then the cold create's own.
+    assert subphases == [
+        ("wire_claim", "error", "warm_pool"),
+        ("wire_claim", "ok", "cold_create"),
+    ]
 
 
 async def test_direct_reap_moves_the_gauge_with_the_pool() -> None:

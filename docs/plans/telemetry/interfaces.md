@@ -224,7 +224,14 @@ interleaving:
 | gauge on reap     | `reap` clears the pool and moves `ate_env_fleet_warm_replicas` by the same count, so a direct reap keeps gauge and pool equal without a fleet's reset (P-9)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | overlapping calls | a `warm_pool` call counts the actors other calls are still creating and does not wait for them, so it can return before the pool is full (`warm_pool_async` docstring)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 
-Open: a warm claim whose `get()` succeeds after an overlapping `reap` deleted the actor returns that
-actor, because `_teardowns` is re-checked only on the claim's failure path. A `warm_pool` cancelled
-during its `create()` calls releases its reservation but not the actors already created.
-[properties.md](./properties.md) and [verify/README.md](./verify/README.md) have the details.
+A warm claim re-checks `_may_pool` after `get()` on both paths: if a reap ran since the pop, a
+failed claim deletes the actor, and a successful one does not hand it out, deletes it if it is still
+owned (a reap of another run, or one cancelled before its delete, left it alive and unpooled), and
+claims or creates another. A successful claim checks `_may_pool` and takes ownership in one lock
+hold, so a reap on another thread cannot run in between (AC-15.7). A claim abandoned that way
+records one `wire_claim` sample with status `error`, as a failed claim does; the claim or create
+that follows records its own.
+
+Open: a `warm_pool` cancelled during its `create()` calls releases its reservation but not the
+actors already created. [properties.md](./properties.md) and [verify/README.md](./verify/README.md)
+have the details.

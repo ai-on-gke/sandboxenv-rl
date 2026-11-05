@@ -7,6 +7,13 @@ user needs to know across them.
 ## Unreleased
 
 ### Added
+- `benchmarking/swebench/run-r2e-swebench.sh`: the mixed R2E-Gym + SWE-bench
+  recipe, with `make-r2e-dataset.py` (R2E-Gym `CommandAdapter` manifests),
+  `run_fleet_bench.py` (the Python `SandboxFleet` arm) and the `r2e-swebench`
+  skill; `swebench-loader run -strategy none|naive|sliding|pipelined` and
+  `-window-size`, `swebench-loader render-plan`, `swebench-loader report -md`
+  over several runs (the arm table), and the `-atenet-*` and `-ateapi-*`
+  flags of the direct Substrate backend.
 - `examples/Qwen3.5-397B-A17B-verl`: the agentic GRPO recipe from 2 to 16 GPU
   nodes with profiles for Qwen3.5-35B-A3B and Qwen3.5-397B-A17B, steps of
   thousands of trajectories, and guarded verl patches for 64K responses.

@@ -27,6 +27,7 @@ export PYTHONUNBUFFERED=1 HF_HOME=/workspace/hf HF_HUB_ENABLE_HF_TRANSFER=1 CUDA
 : "${ROLE:=head}"; : "${NODE_WAIT_S:=3600}"; : "${RAY_HEAD_HOST:=verl-ray-head.default.svc}"; : "${RAY_PORT:=6379}"
 : "${UNI_AGENT_REF:=174b040}"                                     # uni-agent commit; its verl submodule is the verl pin (3efe38c7)
 : "${MODEL_ID:=Qwen/Qwen3.5-397B-A17B}"
+: "${MODEL_REVISION:=8472618112abcbd45acbcdc58436aff4233c23f7}"   # Hugging Face commit of MODEL_ID; every profile sets its own
 : "${NNODES_TRAIN:=8}"; : "${NNODES_ROLLOUT:=8}"; NNODES=$((NNODES_TRAIN + NNODES_ROLLOUT))
 : "${TRAIN_SOURCE:=r2e_gym}"; : "${TRAIN_DATASET:=R2E-Gym/R2E-Gym-V1}"; : "${TRAIN_SPLIT:=train}"; : "${TRAIN_SEED:=0}"; : "${TRAIN_INSTANCES:=8101}"   # whole set; one epoch = floor(TRAIN_INSTANCES / TRAIN_BATCH) steps
 : "${VAL_TASKS:=20}"
@@ -81,13 +82,15 @@ pip freeze 2>/dev/null | grep -iE '^(torch|torchvision|torchaudio|numpy|vllm|tra
 git clone -q --filter=blob:none https://github.com/verl-project/uni-agent /workspace/uni-agent
 ( cd /workspace/uni-agent && git checkout -q "$UNI_AGENT_REF" && git submodule update --init --depth 1 verl 2>&1 | tail -1 && echo "verl submodule: $(git -C verl rev-parse --short HEAD)" )
 pipq --no-deps -e /workspace/uni-agent/verl
-pipq -c /workspace/pins.txt --ignore-requires-python -e /workspace/uni-agent pydantic openai pyyaml httpx jsonschema fastapi
-pipq -c /workspace/pins.txt flash-linear-attention cupy-cuda12x datasets pyarrow
+# Versions are the ones that resolved against this image's own wheels (torch 2.11, vllm 0.24.0, transformers 5.5.3,
+# numpy 1.26) in the validated runs; bump them with the image.
+pipq -c /workspace/pins.txt --ignore-requires-python -e /workspace/uni-agent pydantic==2.13.4 openai==2.47.0 pyyaml==6.0.3 httpx==0.28.1 jsonschema==4.26.0 fastapi==0.136.3
+pipq -c /workspace/pins.txt flash-linear-attention==0.5.2 cupy-cuda12x==13.6.0 datasets==5.0.0 pyarrow==25.0.0
 # nvidia-modelopt (imported by the image's Megatron-Bridge) and swebench pull dependency trees that a
 # full resolve would break the image over (it uninstalls pinned wheels): install them without deps,
 # then their leaf dependencies under the image's pins.
-pipq --no-deps nvidia-modelopt "swebench==4.1.0"
-pipq -c /workspace/pins.txt pulp scipy docker beautifulsoup4 ghapi unidiff tenacity gitpython chardet python-dotenv rich modal   # docker: the image ships a partial module without docker.errors
+pipq --no-deps nvidia-modelopt==0.47.0 "swebench==4.1.0"
+pipq -c /workspace/pins.txt pulp==4.2.0 scipy==1.17.1 docker==7.2.0 beautifulsoup4==4.15.0 ghapi==2.1.4 unidiff==1.0.1 tenacity==9.2.1 gitpython==3.2.1 chardet==7.7.0 python-dotenv==1.2.4 rich==15.0.0 modal==1.6.2   # docker: the image ships a partial module without docker.errors
 python3 - <<'PY'
 import importlib, subprocess, sys, traceback
 PIP = {"modelopt": "nvidia-modelopt", "fla": "flash-linear-attention", "cupy": "cupy-cuda12x", "yaml": "pyyaml", "PIL": "pillow",
@@ -414,13 +417,13 @@ DRY_RUN="${DRY_RUN:-0}" python3 - <<PY
 import os, shutil, time
 from huggingface_hub import HfApi, snapshot_download
 if os.environ["DRY_RUN"] == "1":   # config + tokenizer only: enough to compose and validate the verl config
-    snapshot_download(repo_id="$MODEL_ID", local_dir="$MODEL_PATH", allow_patterns=["*.json", "*.txt", "*.py", "merges.txt"])
+    snapshot_download(repo_id="$MODEL_ID", revision="$MODEL_REVISION", local_dir="$MODEL_PATH", allow_patterns=["*.json", "*.txt", "*.py", "merges.txt"])
     print("dry run: downloaded config/tokenizer only"); raise SystemExit
-need = sum((s.size or 0) for s in HfApi().model_info("$MODEL_ID", files_metadata=True).siblings)
+need = sum((s.size or 0) for s in HfApi().model_info("$MODEL_ID", revision="$MODEL_REVISION", files_metadata=True).siblings)
 free = shutil.disk_usage("/workspace").free
 print(f"checkpoint {need/1e9:.0f} GB, free under /workspace {free/1e9:.0f} GB", flush=True)
 assert free > need * 1.15 + 50e9, "not enough ephemeral storage for the checkpoint: raise the pod's ephemeral-storage request / give the node pool local SSD"
-t = time.time(); snapshot_download(repo_id="$MODEL_ID", local_dir="$MODEL_PATH", max_workers=16)
+t = time.time(); snapshot_download(repo_id="$MODEL_ID", revision="$MODEL_REVISION", local_dir="$MODEL_PATH", max_workers=16)
 print(f"model ready: $MODEL_PATH ({(time.time()-t)/60:.1f} min, {need/1e9/max(time.time()-t,1):.2f} GB/s)", flush=True)
 PY
 # Online FP8 rollout: verl quantizes every synced weight to block-FP8 for vLLM; the modules the official

@@ -5,8 +5,9 @@ run in the same environment and decide the reward. GRPO on full weights with ver
 Megatron trainer on `NNODES_TRAIN` nodes, FP8 vLLM replicas on `NNODES_ROLLOUT` other nodes, the agent's
 tool calls and the grading in Substrate through `ate-env-api`.
 
-Pins: uni-agent `174b040` (its verl submodule `3efe38c7`), image `verlai/verl:vllm024.dev2`,
-`swebench==4.1.0`. The `ate_env` client ([`clients/python`](../../clients/python)) and the provider, task
+Pins: uni-agent `174b040` (its verl submodule `3efe38c7`), image `verlai/verl:vllm024.dev2`, the Python
+packages the install step adds (versions in `run_fully_async.sh`, resolved against that image's wheels) and the
+model commit (`MODEL_REVISION` in each profile). The `ate_env` client ([`clients/python`](../../clients/python)) and the provider, task
 and dataset tooling ([`integrations/uni-agent`](../../integrations/uni-agent)) ship from this checkout in
 the payload ConfigMap; the pods need no access to this repository.
 

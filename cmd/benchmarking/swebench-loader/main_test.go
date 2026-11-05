@@ -784,7 +784,25 @@ func TestPreflightCmd(t *testing.T) {
 	if err := preflightCmd([]string{"-plan", plan}, &stderr); err == nil {
 		t.Error("missing -events-dir and -out accepted")
 	}
-	if runMain([]string{"preflight", "-plan", plan, "-out", filepath.Join(dir, "pf.jsonl"), "-coverage-out", filepath.Join(dir, "cov.json"), "-probes-per-node", "1"}, &stderr, &stderr) != 0 {
-		t.Errorf("runMain preflight failed:\n%s", stderr.String())
+	outEvents := filepath.Join(dir, "nested", "pf.jsonl")
+	if runMain([]string{"preflight", "-plan", plan, "-run-id", "pf-out", "-out", outEvents, "-coverage-out", filepath.Join(dir, "cov.json"), "-probes-per-node", "1"}, &stderr, &stderr) != 0 {
+		t.Fatalf("runMain preflight failed:\n%s", stderr.String())
+	}
+	rawEvents, err := os.ReadFile(outEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(rawEvents)), "\n") {
+		if err := schema.ValidateAgainstJSONSchema("event.schema.json", []byte(line)); err != nil {
+			t.Errorf("preflight event %s: %v", line, err)
+		}
+	}
+	var badCovStderr bytes.Buffer
+	badCovPath := filepath.Join(outEvents, "unwritable-cov.json")
+	if err := preflightCmd([]string{"-plan", plan, "-out", filepath.Join(dir, "pf2.jsonl"), "-coverage-out", badCovPath, "-probes-per-node", "1", "-golden-poll", "1ms"}, &badCovStderr); err == nil {
+		t.Error("unwritable -coverage-out accepted")
+	}
+	if strings.Contains(badCovStderr.String(), "wrote "+badCovPath) {
+		t.Errorf("stderr falsely reported wrote %s:\n%s", badCovPath, badCovStderr.String())
 	}
 }

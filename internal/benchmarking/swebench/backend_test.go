@@ -54,11 +54,13 @@ type fakeAPI struct {
 
 	mu sync.Mutex
 	// pollsUntilExit is how many GetProcess calls a process stays running;
-	// unavailablePolls is how many GetProcess calls answer Unavailable first.
-	pollsUntilExit   int
-	unavailablePolls int
-	exitCode         int32
-	stdout, stderr   string
+	// unavailableStarts and unavailablePolls are how many StartProcess or
+	// GetProcess calls answer Unavailable first.
+	pollsUntilExit    int
+	unavailableStarts int
+	unavailablePolls  int
+	exitCode          int32
+	stdout, stderr    string
 
 	nextID    int
 	polls     map[string]int
@@ -92,6 +94,7 @@ type fakeAPI struct {
 	images map[string]string
 	// inflight and maxInflight count the environments alive per domain.
 	inflight, maxInflight map[string]int
+	onCreate              func(id string)
 }
 
 func (f *fakeAPI) CreateEnvironment(_ context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (*ateenvv1alpha.CreateEnvironmentResponse, error) {
@@ -105,14 +108,19 @@ func (f *fakeAPI) CreateEnvironment(_ context.Context, req *ateenvv1alpha.Create
 	if list := f.domainNodes[domain]; len(list) > 0 {
 		idx := 0
 		if !f.sameNode {
-			idx = f.domainCounter[domain] % len(list)
+			key := domain + "\x00" + req.GetRootfsImage()
+			idx = f.domainCounter[key] % len(list)
+			f.domainCounter[key]++
 		}
-		f.domainCounter[domain]++
 		node = list[idx]
 	}
 	f.nodes[req.GetId()] = node
 	f.inflight[domain]++
 	f.maxInflight[domain] = max(f.maxInflight[domain], f.inflight[domain])
+	cb := f.onCreate
+	if cb != nil {
+		cb(req.GetId())
+	}
 	return &ateenvv1alpha.CreateEnvironmentResponse{Environment: &ateenvv1alpha.Environment{Id: req.GetId(), Atespace: req.GetAtespace(), WorkerSelector: req.GetWorkerSelector()}}, nil
 }
 
@@ -195,6 +203,10 @@ func (f *fakeAPI) DeleteEnvironment(_ context.Context, req *ateenvv1alpha.Delete
 func (f *fakeAPI) StartProcess(_ context.Context, req *ateenvv1alpha.StartProcessRequest) (*ateenvv1alpha.Process, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.unavailableStarts > 0 {
+		f.unavailableStarts--
+		return nil, status.Error(codes.Unavailable, "router: wake timed out")
+	}
 	f.nextID++
 	id := fmt.Sprintf("p%d", f.nextID)
 	f.commands = append(f.commands, strings.Join(req.GetCommand(), " "))

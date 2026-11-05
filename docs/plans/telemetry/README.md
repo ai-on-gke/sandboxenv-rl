@@ -1,9 +1,10 @@
 # Plan: telemetry and the OpenTelemetry adapter for sandboxenv-rl
 
-Status: executed. Contracts checked against `main` at `3b03b03` (2026-10-29); the series completed
-with #186 (`9c30be1`, 2026-11-02). All six pull requests are merged. The plan was written on
-2026-10-21 against `8ff5c3e` as a proposal to replicate agent-sandbox's telemetry; this revision
-records the names, flags and families that shipped and where they differ from the proposal.
+Status: executed. Contracts checked against `main` at `3b03b03` (2026-10-29), and the warm-pool
+contract in [interfaces.md](./interfaces.md) at `d0e4802` with #238; the series completed with #186
+(`9c30be1`, 2026-11-02). All six pull requests are merged. The plan was written on 2026-10-21
+against `8ff5c3e` as a proposal to replicate agent-sandbox's telemetry; this revision records the
+names, flags and families that shipped and where they differ from the proposal.
 
 Companion documents in this directory: [prd.md](./prd.md), [execution-plan.md](./execution-plan.md),
 [interfaces.md](./interfaces.md) (the shipped contracts),
@@ -143,13 +144,16 @@ behind it.
 - No overhead measurement for telemetry off against on is recorded in the series' pull requests;
   [test-plan.md](./test-plan.md) section 7 keeps the procedure.
 - Closed by #221: AC-15.1 to AC-15.6, warm-pool accounting under concurrency (P-9 to P-11).
-- Open: a warm claim whose `get()` succeeds after an overlapping reap deleted the actor returns a
-  deleted environment (AC-15.7, P-24, `ClaimOkReturnsLive` in [verify/](./verify/README.md)).
-- Open: a `warm_pool` cancelled during its `create()` calls can leak the actors already created
-  (AC-15.8).
-- Open: a delete cancelled after the run's reap, or a `release` whose delete fails or is cancelled
-  while a reap runs, leaves the actor under the reaped run id, so no later reap deletes it (AC-15.9,
-  `DeleteCancelledSafe` and `ReleaseDeleteFailSafe` in [verify/](./verify/README.md)).
+- Closed by #239: a warm claim whose `get()` succeeded after an overlapping reap deleted the actor
+  returned a deleted environment (AC-15.7, P-24).
+- Closed by #242: an `acquire` whose cold create overlapped its own run's reap returned an
+  environment owned under the reaped run id; unless the caller released it, no later reap deleted it
+  (AC-15.10).
+- Closed by #240: a `warm_pool` cancelled during its `create()` calls leaked the actors already
+  created (AC-15.8).
+- Closed by #238: a delete cancelled after the run's reap, or a `release` whose delete fails or is
+  cancelled while a reap runs, left the actor under the reaped run id, so no later reap deleted it
+  (AC-15.9).
 - Open: with execs started concurrently on one handle, `ate_env.first_command=true` is not always on
   the first-started exec span (AC-3.4, P-14).
 - Follow-ups with criteria but no work yet: a CI-checked span inventory (AC-16), Go and Python span

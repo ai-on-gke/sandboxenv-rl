@@ -432,23 +432,16 @@ func preflightCmd(args []string, stderr io.Writer) (retErr error) {
 	// run report aggregates events/*.jsonl and must not count the probes.
 	eventsPath := *out
 	if *eventsDir != "" {
-		if err := os.MkdirAll(*eventsDir, 0o755); err != nil {
-			return err
-		}
 		eventsPath = filepath.Join(*eventsDir, "preflight-events.jsonl")
 	}
-	f, err := os.Create(eventsPath)
+	rec, err := swebench.NewFileRecorder(eventsPath, *runID)
 	if err != nil {
 		return err
 	}
-	rec := swebench.NewRecorder(f)
 	rec.SetWorker("preflight")
 	defer func() {
 		if rerr := rec.Close(); rerr != nil && retErr == nil {
 			retErr = fmt.Errorf("writing events: %w", rerr)
-		}
-		if cerr := f.Close(); cerr != nil && retErr == nil {
-			retErr = fmt.Errorf("closing %s: %w", eventsPath, cerr)
 		}
 	}()
 
@@ -476,10 +469,16 @@ func preflightCmd(args []string, stderr io.Writer) (retErr error) {
 	defer stop()
 	report, runErr := warmer.Run(ctx)
 	if report != nil {
-		if werr := swebench.WritePreflightCoverage(coveragePath, report); werr != nil && runErr == nil {
-			runErr = werr
+		wrotePath := coveragePath
+		if werr := swebench.WritePreflightCoverage(coveragePath, report); werr != nil {
+			wrotePath = ""
+			if runErr == nil {
+				runErr = werr
+			} else {
+				log.Warn("preflight: writing coverage failed", slog.String("path", coveragePath), slog.Any("err", werr))
+			}
 		}
-		printPreflightSummary(stderr, report, coveragePath)
+		printPreflightSummary(stderr, report, wrotePath)
 	}
 	return runErr
 }
@@ -511,7 +510,11 @@ func printPreflightSummary(w io.Writer, r *schema.PreflightCoverage, path string
 	if none > 0 {
 		fmt.Fprintf(w, ", %d without a golden (disabled on the template)", none)
 	}
-	fmt.Fprintf(w, "; wrote %s\n", path)
+	if path != "" {
+		fmt.Fprintf(w, "; wrote %s\n", path)
+	} else {
+		fmt.Fprintln(w)
+	}
 	for _, d := range r.Domains {
 		done := 0
 		for _, ic := range d.Images {

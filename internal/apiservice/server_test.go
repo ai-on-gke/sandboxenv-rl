@@ -22,6 +22,7 @@ import (
 	"maps"
 	"math"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1175,6 +1176,26 @@ func TestImageStatusFollowsTheDerivedTemplate(t *testing.T) {
 	}
 	if tmpl := control.Template("ate-env", testDerivedTemplate); tmpl == nil || tmpl.GetContainers()[0].GetImage() != testRootfsImage {
 		t.Errorf("derived template missing or runs another image: %v", tmpl)
+	}
+
+	// Another repository path with the same digest is the same image: the
+	// status follows the existing template, as CreateEnvironment reuses it.
+	samePath := "example.com/mirror/python@sha256:" + testRootfsImage[len(testRootfsImage)-64:]
+	st, err = client.GetImageStatus(ctx, &ateenvv1alpha.GetImageStatusRequest{RootfsImage: samePath})
+	if err != nil {
+		t.Fatalf("GetImageStatus(same digest): %v", err)
+	}
+	if !st.GetTemplateExists() || st.GetTemplate().GetName() != testDerivedTemplate {
+		t.Errorf("same-digest status: exists=%v template=%q, want true %q", st.GetTemplateExists(), st.GetTemplate().GetName(), testDerivedTemplate)
+	}
+	if n := control.TemplateCount(); n != 2 {
+		t.Errorf("template count after same-digest status = %d, want 2", n)
+	}
+
+	// A different digest on the same template name is another image.
+	otherDigest := testRootfsImage[:len(testRootfsImage)-64] + strings.Repeat("f", 64)
+	if _, err := client.GetImageStatus(ctx, &ateenvv1alpha.GetImageStatusRequest{RootfsImage: otherDigest}); status.Code(err) != codes.FailedPrecondition && err != nil {
+		t.Errorf("other digest: code %v (%v)", status.Code(err), err)
 	}
 }
 

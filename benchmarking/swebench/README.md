@@ -1,16 +1,70 @@
-# Fast Substrate RL benchmark (SWE-bench Verified)
+# Simulated RL benchmark on Substrate (swebench-loader)
 
-A loader that drives real SWE-bench task images through the ate-env API the
-way a simulated RL job does, and a report over what every phase cost. It is
-the "Fast" rung of the RL benchmark ladder: regular runs that catch
-regressions in the sandbox SDK, Substrate or the controller, on a workload
-that is the real thing rather than a Python image printing READY.
+This page is about one tool, `swebench-loader`: a Go program that plays the
+part of an RL trainer, with real task images and no model. By default it
+drives the ate-env API (`-access ate-env-api`; `-access sdk` takes the same
+path); `-access direct` dials Substrate's control plane and router instead,
+and `-backend agent-sandbox` drives an Agent Sandbox gateway. It creates
+sandboxes, runs commands in them, parks and wakes them, deletes them, and
+writes one event per operation with the time it took. It never talks to
+Kubernetes and it does not use Ray. The real-RL benchmark, which `bench`
+measures around a verl trainer that runs on Ray, is a different page:
+[`cmd/benchmarking/bench/README.md`](../../cmd/benchmarking/bench/README.md).
 
-Code: `internal/benchmarking/swebench` (library, tested against an in-memory
-backend) and `cmd/benchmarking/swebench-loader` (binary). The layout follows
-substrate's `internal/benchmarking/boomer` so a user class can be lifted into
-that harness later; Go does not allow importing another module's `internal`
-packages, so nothing is imported from it.
+## What this benchmark tests
+
+Four costs of a sandbox platform, each isolated by a run shape. The numbers
+are wall time as a trainer sees it, API server and network included.
+
+| Question | Run shape | The numbers it produces |
+|---|---|---|
+| Cold restore: how long until a sandbox whose image is on no node can run a command | `-mode eval`, one task per image or many, on nodes that have not seen the images | `ttfi` (create start to the first command's answer), `create`, the restore phases from atelet (download, unpack, restore), pulls per start from the node cache samples |
+| Warm restore: the same when the image is already on the node | `-mode eval` with several tasks per image on a fixed pool, or a second pass | `ttfi` with unpack near zero; the gap between it and atelet's restore is the control plane |
+| Park and wake: what it costs to suspend a fleet and resume it for the next step | `-mode steps -park suspend`, with `-park-each` for a fleet larger than the running slots | `suspend`, `wake` p50/p95, `step_barrier` (first task start to last task end in a step), and with `-restore-log` the restore phases of each wake; a `download` phase in a wake's record is the only trace of a move to another node |
+| Image delivery: pull against streaming or another loader | `-mode eval` with the `workload-*` trajectories | `ttfi` per start and the read step's time, under the same command per mechanism |
+
+Every run also gives throughput, failures by cause, and the per-step table
+in steps mode. `eval` and `steps` are closed-loop: tasks per second follow
+from the width and the task time. `-mode open-loop -arrival-rate` sets a
+Poisson rate in tasks per second instead.
+
+The sandbox command in every shape is the trajectory. The built-in
+`workload-file-read-one` runs `true` (what `ttfi` and `wake` measure: the
+first instant the sandbox executes anything) and reads one file, thus the
+numbers are the platform's. `swebench-gold` replays a
+SWE-bench solution and grades it, for correctness regressions.
+
+## The two standard runs
+
+`SKILL.md` in this directory names them with their manifests, flags, labels
+and current baselines; this page explains the flags. In short: the standard
+run is SWE-bench Verified (445 images) in two arms, fresh sandboxes every
+step and a parked fleet woken every step; the image-delivery standard is a
+94-image manifest at 1.3 to 1.5 starts in flight per node (width 3 on two
+nodes, 30 on hundreds), a start arm and a read arm. A quick run is:
+
+```bash
+kubectl -n ate-env port-forward svc/ate-env-api 7777:7777 &
+go run ./cmd/benchmarking/swebench-loader run -dataset swebench-verified.jsonl \
+  -images 5 -tasks-per-image 1 -width 5 -run-id smoke
+go run ./cmd/benchmarking/swebench-loader report smoke.jsonl
+```
+
+## Where things are
+
+- `cmd/benchmarking/swebench-loader`: the binary (`run`, `report`, `compare`, `resolve`, `plan-placement`, `convert-trace`, `trajectory-assets`).
+- `internal/benchmarking/swebench`: the library, tested against an in-memory backend.
+- `internal/benchmarking/swebench/trajectories/`: the built-in trajectories (YAML).
+- This directory: `run-in-cluster.sh` (runs the loader as a Job next to the
+  API), `make-dataset.py` (builds a manifest), `mirror-images.sh`,
+  `sample-node-cache.sh` and `harvest-restore-timings.sh` (the two Substrate-side
+  measurements), `offline-exclusions.txt`.
+
+The rest of this page, by heading: Workloads; What is measured; Cold boot,
+cold and warm restore, suspend and wake: which shape measures what; How many
+actors, and on which clusters; Prepare once per project; Run; Image-delivery
+workloads; Network and the offline exclusion list; Two things the first runs
+showed; Record with every run.
 
 ## Workloads
 
@@ -463,77 +517,3 @@ itself: mode, width, images, trajectory,
 dataset, tasks per image or rollouts, steps and park, connections, base
 template, exclude file, instances, and the create, step, wake-budget and
 wake-backoff timeouts. The report alone is not reproducible without them.
-
-## Unified `bench` CLI (Synthetic & Real RL)
-
-`cmd/benchmarking/bench` is the unified orchestrator for both scenario-driven
-synthetic workloads and real RL training recipes (`examples/*-verl`). Every
-subcommand communicates through a single artifact directory (`-dest "$ARTIFACT_DIR"`):
-
-| Subcommand | Purpose |
-|---|---|
-| `bench run` | End-to-end execution of a declarative `scenario.yaml` (resolve -> prewarm -> execute -> measure -> reap -> report) |
-| `bench resolve` | Resolve a `scenario.yaml` and dataset into a deterministic `schedule.json` |
-| `bench render` | Render Kubernetes Job manifests from a `scenario.yaml` |
-| `bench prewarm` | Prewarm templates or standing sandbox pools prior to the timed run window |
-| `bench spinup` | Scale `WorkerPool` (`0 -> N` `ateworker` pods), wait for `ate-env-api` + all worker pods `Ready`, and record `workerpool_spinup_wall_ms` and `worker_pod_*_ms` into `measurements.json` and `events/substrate_lifecycle.jsonl` |
-| `bench spindown` | Scale `WorkerPool` (`N -> 0` `ateworker` pods), wait for all worker pods to terminate, and record `workerpool_spindown_wall_ms` and `worker_pod_terminate_ms` into `measurements.json` and `events/substrate_lifecycle.jsonl` |
-| `bench measure` | Collect K8s (`-k8s`), Substrate (`-ate-endpoint`), Prometheus (`-prom-url`), node cache (`-sample-node-cache`), and restore timings (`-restore-log`) into `measurements.json` and `system_description.json` |
-| `bench reap` | Verify zero orphaned environments remain post-run and emit `events/reap.jsonl` |
-| `bench report` | Ingest `events/*.jsonl`, `traces/*.jsonl`, `train.log`, `measurements.json`, and `system_description.json` into `report.json` and `report.md` |
-| `bench validate` | Validate `report.json`, `measurements.json`, and `system_description.json` against strict `v1` schemas, and with `-folder` the archive folder name |
-| `bench upload` | Validate, then copy `$ARTIFACT_DIR` to `gs://<bucket>/<folder>/` |
-| `bench compare` | Diff two or more `report.json` files or artifact directories side-by-side |
-
-### 1. Synthetic / Scenario-Driven Run
-
-```bash
-ARTIFACT_DIR=/tmp/bench-run
-go run ./cmd/benchmarking/bench run \
-  -scenario benchmarking/scenarios/multi-job-swebench.yaml \
-  -dest "$ARTIFACT_DIR"
-go run ./cmd/benchmarking/bench validate -dest "$ARTIFACT_DIR"
-```
-
-### 2. Real RL Training Run (`examples/*-verl`)
-
-```bash
-ARTIFACT_DIR=/tmp/rl-bench-run
-mkdir -p "$ARTIFACT_DIR/measurements_snapshots"
-
-# 1. Spin up Substrate WorkerPool (0 -> N ateworker pods) & capture pre-run node image-cache snapshot
-go run ./cmd/benchmarking/bench spinup -namespace ate-env -workerpool default-template-workerpool -replicas 32 -dest "$ARTIFACT_DIR"
-go run ./cmd/benchmarking/bench measure -sample-node-cache "$ARTIFACT_DIR/cache_before.prom"
-
-# 2. Launch the RL recipe (with ATE_ENV_TRACE_DIR=/workspace/results/traces enabled in the Job)
-(cd examples/Qwen3-1.7B-verl && ./deploy.sh up)
-
-# 3. Sample live K8s + Substrate state while training steps are active
-kubectl -n ate-env port-forward deploy/ate-env-api 18443:8443 &
-go run ./cmd/benchmarking/bench measure -k8s -ate-endpoint 127.0.0.1:18443 \
-  -atespace ate-env -dest "$ARTIFACT_DIR"
-
-# 4. After training completes, copy train.log + traces/*.jsonl into $ARTIFACT_DIR, then reap, sample post-cache, & spin down WorkerPool (N -> 0)
-go run ./cmd/benchmarking/bench reap -ate-endpoint 127.0.0.1:18443 -atespace ate-env -prefix verl- -dest "$ARTIFACT_DIR"
-go run ./cmd/benchmarking/bench measure -sample-node-cache "$ARTIFACT_DIR/cache_after.prom"
-benchmarking/swebench/harvest-restore-timings.sh <run-id> "$ARTIFACT_DIR/restore_timings.jsonl"
-go run ./cmd/benchmarking/bench spindown -namespace ate-env -workerpool default-template-workerpool -dest "$ARTIFACT_DIR"
-
-# 5. Generate and validate report.json + report.md
-go run ./cmd/benchmarking/bench report -dest "$ARTIFACT_DIR"
-go run ./cmd/benchmarking/bench validate -dest "$ARTIFACT_DIR"
-```
-
-### 3. Archiving Results & Further Guides
-
-Archive completed `$ARTIFACT_DIR` directories to object storage under a
-consistent folder name, with `_traced` iff the run captured an SDK trace
-(`report.json` `trace_captured: true`; traced latencies include trace overhead):
-
-```text
-gs://<YOUR_BENCHMARK_BUCKET>/<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>/
-gs://<YOUR_BENCHMARK_BUCKET>/<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>_traced/
-```
-
-- **Telemetry scopes & feature debug plugins**: [`internal/benchmarking/TELEMETRY_GUIDE.md`](../../internal/benchmarking/TELEMETRY_GUIDE.md)
-- **Agent integration & execution playbook**: [`benchmarking/SKILL.md`](../SKILL.md)

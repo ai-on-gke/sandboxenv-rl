@@ -265,3 +265,46 @@ Append-only. Each entry: date, who, what, why.
   (4.11.0, the version the models were checked with) in a `.#dafny` devShell and a job of its own,
   not the default devShell: it brings the .NET SDK and Z3, which no other check needs. A download of
   the GitHub release zip would have been a second, unpinned source.
+- 2026-11-04, orchestrator: #238 fixes AC-15.9 as the model proposed. `_delete_unpooled` re-tags on
+  a cancellation as well as a failure (re-tagging an actor whose run is not reaped yet is harmless:
+  every reap deletes `WARM_POOL_RUN_ID`, the run's own included). `_release_internal` re-tags when a
+  reap ran since the pop, not only when a recycle saw the teardown; a failed release with no reap
+  keeps its run id, which a test pins. The model's gap lemmas stay as the code before the fix.
+  Review of #238 found three more paths and one race, fixed in the same pull request: a recycle
+  cancelled in `suspend()` after a reap; a `warm_pool` call cancelled after a teardown before its
+  deletes started (its actors were owned under the reaped run id until a delete failed); and a
+  release that checked `_may_pool` and updated `_owned_actors` in two lock holds, so a reap on
+  another thread could start between them. `_return_popped` now does both in one hold for every
+  release path, and torn-down or drained `warm_pool` actors are owned under `WARM_POOL_RUN_ID` from
+  the start. `missed_by_reap` is gone: a reap that the recycle saw also fails `_may_pool`.
+- 2026-11-04, orchestrator: #239 fixes AC-15.7. A warm claim whose `get()` succeeds after a reap ran
+  since the pop moves on (another pooled actor, else a cold create) instead of raising: `reap(run)`
+  clears the whole pool for every run, so a claim for another run must not fail because of it.
+  Review of #239: the popped actor is not always the reap's. A reap of another run skips an actor
+  recycled under this run, and a cancelled reap may never delete it, so the claim deletes the actor
+  if it is still owned; it also checks `_may_pool` and takes ownership in one lock hold, so a reap
+  on another thread cannot run in between. In the model `ClaimOk` deletes a stale claim's actor, as
+  `ClaimFailFixed` does. Not changed: an `acquire` that cold-creates while its own run's reap is
+  running can still end owned under the reaped run id; that is the acquire-during-teardown case, not
+  a warm claim. It is tracked as open criterion AC-15.10, which a scratch test reproduced. A stale
+  claim also records one `wire_claim` sample with status `error`, as a failed claim does.
+- 2026-11-04, orchestrator: #240 fixes AC-15.8. A `warm_pool` call cancelled during its creates owns
+  every id it sent a `create()` for under `WARM_POOL_RUN_ID`, instead of awaiting deletes in the
+  cancelled task, which would delay the cancellation. Any reap deletes them (one whose create never
+  landed is NotFound, counted as gone). The run-id model gained TRACKED (every live actor is owned
+  or being released), which made it drop `owned.Keys <= live` and `releasing.Keys <= live`: an owned
+  id may never have been created, and `ReleaseStart` can move one to releasing. Review of #240: a
+  suspend that fails after a successful create leaked the actor the same way; `_warm_one` now
+  separates the two calls and owns and deletes such an actor at once. Second review of #240: a reap
+  that snapshots before the cancel handler runs misses the actors, and a fleet reaps its run once,
+  so the handler now also starts `_delete_unpooled` in background tasks when `_may_pool(teardowns)`
+  is false (a reap ran or is running), as the `wait=False` suspends do; a delete that fails or never
+  runs leaves them owned under `WARM_POOL_RUN_ID`.
+- 2026-11-05, orchestrator: #242 fixes AC-15.10. A cold `acquire` whose create overlaps its own
+  run's reap owns the actor under `WARM_POOL_RUN_ID`, so any later reap finds it. The driver keeps,
+  per run id, the reaps in progress and the `_teardowns` value when the last one ended
+  (`_run_reaped_since`), because fleets are reused: `run()` reaps its run at the end of each pass,
+  so "this run was ever reaped" would tag every acquire of a later pass. A reap of another run does
+  not change the owner, so a reap from another fleet on the same driver never deletes an environment
+  in use. Not re-tagging when the create started after the run's reap ended (the fleet is closed):
+  that is a caller error, as for a release, and the model leaves it out.

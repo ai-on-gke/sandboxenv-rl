@@ -232,6 +232,9 @@ hold, so a reap on another thread cannot run in between (AC-15.7). A claim aband
 records one `wire_claim` sample with status `error`, as a failed claim does; the claim or create
 that follows records its own.
 
-Open: a `warm_pool` cancelled during its `create()` calls releases its reservation but not the
-actors already created. [properties.md](./properties.md) and [verify/README.md](./verify/README.md)
-have the details.
+A `warm_pool` call cancelled during its `create()` calls releases its reservation and owns every
+actor it sent a `create()` for under `WARM_POOL_RUN_ID`, so any run's reap deletes them; if a reap
+ran since the call planned, it also starts their deletes in background tasks, since that reap may
+have missed them. With `wait=True`, an actor whose `create()` succeeds and `suspend()` raises is
+owned the same way and deleted through `_delete_unpooled` (AC-15.8).
+[properties.md](./properties.md) and [verify/README.md](./verify/README.md) have the details.

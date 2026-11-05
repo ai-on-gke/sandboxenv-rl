@@ -288,3 +288,15 @@ Append-only. Each entry: date, who, what, why.
   running can still end owned under the reaped run id; that is the acquire-during-teardown case, not
   a warm claim. It is tracked as open criterion AC-15.10, which a scratch test reproduced. A stale
   claim also records one `wire_claim` sample with status `error`, as a failed claim does.
+- 2026-11-04, orchestrator: #240 fixes AC-15.8. A `warm_pool` call cancelled during its creates owns
+  every id it sent a `create()` for under `WARM_POOL_RUN_ID`, instead of awaiting deletes in the
+  cancelled task, which would delay the cancellation. Any reap deletes them (one whose create never
+  landed is NotFound, counted as gone). The run-id model gained TRACKED (every live actor is owned
+  or being released), which made it drop `owned.Keys <= live` and `releasing.Keys <= live`: an owned
+  id may never have been created, and `ReleaseStart` can move one to releasing. Review of #240: a
+  suspend that fails after a successful create leaked the actor the same way; `_warm_one` now
+  separates the two calls and owns and deletes such an actor at once. Second review of #240: a reap
+  that snapshots before the cancel handler runs misses the actors, and a fleet reaps its run once,
+  so the handler now also starts `_delete_unpooled` in background tasks when `_may_pool(teardowns)`
+  is false (a reap ran or is running), as the `wait=False` suspends do; a delete that fails or never
+  runs leaves them owned under `WARM_POOL_RUN_ID`.

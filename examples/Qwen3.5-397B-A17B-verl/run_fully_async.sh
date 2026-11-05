@@ -712,8 +712,11 @@ if [ "${DRY_RUN:-0}" = "1" ]; then
   grep -nE "trainer_mode|quantization|pipeline_model_parallel_size|num_layers_in_(first|last)|nnodes" /workspace/results/resolved_cfg.txt | head -20
   echo "=== DRY_RUN OK ==="; exit 0
 fi
+set +e   # the pipeline's exit code is captured below; set -e would exit before the DONE line and ray stop
 python3 -m verl.trainer.main_ppo --config-name=ppo_megatron_trainer "${OVERRIDES[@]}" \
   2>&1 | tee /workspace/results/train.log
 RC=${PIPESTATUS[0]}
+set -e
 ray stop --force || true          # releases the worker pods
 echo "=== DONE rc=$RC ==="
+exit "$RC"

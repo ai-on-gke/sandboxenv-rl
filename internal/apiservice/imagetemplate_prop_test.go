@@ -59,7 +59,7 @@ func genShortName(maxLen int) *rapid.Generator[string] {
 	})
 }
 
-// Rule (ImageTemplateName doc, CreateEnvironment doc, AGENTS.md): the derived
+// AE-3 (docs/plans/ate-env-api/acceptance-criteria.md). Rule (ImageTemplateName doc, CreateEnvironment doc, AGENTS.md): the derived
 // name is "<base>-<first 12 hex of the digest>": a function of base and digest
 // only (repository path and tag do not matter), and for a valid base short
 // enough it is a valid k8s short name; distinct (base, digest12) never
@@ -93,7 +93,7 @@ func TestPropImageTemplateNameIdentity(t *testing.T) {
 	})
 }
 
-// Rule: ImageTemplateName never panics and never returns an invalid name,
+// AE-3. Rule: ImageTemplateName never panics and never returns an invalid name,
 // whatever the input.
 func TestPropImageTemplateNameNeverInvalid(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
@@ -108,7 +108,7 @@ func TestPropImageTemplateNameNeverInvalid(t *testing.T) {
 	})
 }
 
-// Rule (rerootCommand doc): a guest command that pointed into the guest
+// AE-2 (docs/plans/ate-env-api/acceptance-criteria.md). Rule (rerootCommand doc): a guest command that pointed into the guest
 // image's root moves under GuestMountPath; one that cannot is an error, never
 // "a template whose guest is silently not found". Thus every accepted
 // re-rooted command[0] names, under GuestMountPath, the same file command[0]
@@ -158,7 +158,7 @@ func TestRerootKeepsDotDotUnderMount(t *testing.T) {
 	}
 }
 
-// Rule (DeriveImageTemplate doc): deriving from an already-derived template
+// AE-4 (docs/plans/ate-env-api/acceptance-criteria.md). Rule (DeriveImageTemplate doc): deriving from an already-derived template
 // changes only the container image (and the name); thus
 // Derive(Derive(base, n1, i1), n2, i2) == Derive(base, n2, i2).
 func TestPropDeriveComposes(t *testing.T) {
@@ -205,7 +205,7 @@ func TestPropDeriveComposes(t *testing.T) {
 	})
 }
 
-// Rule (sameImageDigest doc): two pinned references name the same image iff
+// AE-1 (supporting). Rule (sameImageDigest doc): two pinned references name the same image iff
 // their digests are equal, whatever the repository path.
 func TestPropSameImageDigest(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {

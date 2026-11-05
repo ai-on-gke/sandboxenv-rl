@@ -102,7 +102,7 @@ func digestOf(image string) string {
 
 var propRepos = []string{"docker.io/library/python", "example.com/mirror/python", "gcr.io/x/y/z", "localhost:5000/swe/task-1"}
 
-// Rule (CreateEnvironment doc; docs/architecture.md "If an existing derived
+// AE-1 (docs/plans/ate-env-api/acceptance-criteria.md). Rule (CreateEnvironment doc; docs/architecture.md "If an existing derived
 // template exists with the same name but runs a different rootfs image,
 // CreateEnvironment fails with codes.FailedPrecondition"; threat model: "A
 // template with that name that runs another image is refused with
@@ -243,7 +243,7 @@ func TestConcurrentCreateOnCollidingDigestFailsPrecondition(t *testing.T) {
 	}
 }
 
-// Rule (recreateFailedImageTemplate and imageTemplateLock docs): concurrent
+// AE-5 (docs/plans/ate-env-api/acceptance-criteria.md). Rule (recreateFailedImageTemplate and imageTemplateLock docs): concurrent
 // creates on a derived template whose golden snapshot failed long enough ago
 // all succeed; the template is recreated at most once (one delete, one
 // create) and only when no actor that a recreate harms uses it; afterwards

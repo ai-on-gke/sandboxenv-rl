@@ -455,12 +455,28 @@ func (s *directSubstrateSandbox) WriteFile(ctx context.Context, path string, con
 	if err != nil {
 		return err
 	}
+	const chunkSize = 64 * 1024
+	first := content
+	var rest []byte
+	if len(first) > chunkSize {
+		first, rest = content[:chunkSize], content[chunkSize:]
+	}
 	if err := stream.Send(&ateenvv1alpha.WriteFileRequest{
 		Path:  path,
 		Mode:  uint32(mode.Perm()),
-		Chunk: content,
+		Chunk: first,
 	}); err != nil {
 		return err
+	}
+	for len(rest) > 0 {
+		chunk := rest
+		if len(chunk) > chunkSize {
+			chunk = rest[:chunkSize]
+		}
+		if err := stream.Send(&ateenvv1alpha.WriteFileRequest{Chunk: chunk}); err != nil {
+			return err
+		}
+		rest = rest[len(chunk):]
 	}
 	_, err = stream.CloseAndRecv()
 	return err

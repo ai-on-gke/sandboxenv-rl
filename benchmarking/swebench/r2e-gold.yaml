@@ -39,8 +39,13 @@ steps:
     run: cd /testbed && git diff --stat HEAD && git log -1 --format=%H
     think: 2s
     expect_exit: 0
+  - name: write_grade
+    write:
+      path: /tmp/r2e-grade.sh
+      content: "{{.Command}}"
+      mode: "0755"
   - name: grade
-    run: "{{.Command}}"
+    run: /bin/bash /tmp/r2e-grade.sh
     think: 3s
     timeout: 20m
     reward: true

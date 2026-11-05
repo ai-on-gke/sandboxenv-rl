@@ -531,3 +531,82 @@ def test_real_warm_paused_pool_string_actor_ids(tmp_path: pathlib.Path) -> None:
     assert len(deletes) == 2
     assert all(e["env"].startswith("warm-") and len(e["env"]) > 5 for e in creates)
     assert all(e["env"].startswith("warm-") and len(e["env"]) > 5 for e in deletes)
+
+
+def test_standalone_plan_stages_large_payloads_to_files(tmp_path: pathlib.Path) -> None:
+    """Ensure standalone swebench-gold and oversize command-default never pass >64 KiB on argv."""
+    swe_manifest = tmp_path / "swe-large.jsonl"
+    swe_row = {
+        "instance_id": "numpy__numpy-99999",
+        "repo": "numpy/numpy",
+        "image": f"us-docker.pkg.dev/p/swe/img@{_digest(901)}",
+        "patch": "diff --git a/a.py b/a.py\n" + ("+x = 1\n" * 5000),
+        "test_patch": "diff --git a/t.py b/t.py\n",
+        "eval_script": "#!/bin/bash\npytest\n",
+        "fail_to_pass": ["test_target"],
+        "pass_to_pass": [f"numpy/tests/test_big.py::test_case_{i:04d}" for i in range(4000)],
+        "log_parser": "parse_log_pytest",
+        "eval_type": "pass_and_fail",
+    }
+    swe_manifest.write_text(json.dumps(swe_row) + "\n", encoding="utf-8")
+
+    swe_plan = rfb._load_standalone_plan(
+        dataset_path=str(swe_manifest),
+        images=0,
+        instances_csv="",
+        exclude_file="",
+        trajectory_spec="swebench-gold",
+        set_vars={},
+    )
+    swe_steps = swe_plan["instances"][0]["steps"]
+    step_by_name = {s["name"]: s for s in swe_steps}
+    assert "write-instance" in step_by_name
+    assert step_by_name["write-instance"]["write"]["path"] == "/tmp/ate-instance.json"
+    assert len(step_by_name["write-instance"]["write"]["content"]) > 200_000
+    assert "run-tests" in step_by_name
+    assert "/tmp/ate-eval.log" in step_by_name["run-tests"]["run"]
+    assert "/tmp/ate-instance.json" in step_by_name["grade"]["run"]
+    assert "/tmp/ate-eval.log" in step_by_name["grade"]["run"]
+    assert all(len(s.get("run", "")) < 256 for s in swe_steps)
+
+    cmd_manifest = tmp_path / "r2e-large.jsonl"
+    big_cmd = "# padding\n" * 8000 + "echo R2E_GRADE_MARKER"
+    assert len(big_cmd.encode("utf-8")) > rfb._MAX_INLINE_CMD_BYTES
+    cmd_rows = [
+        {
+            "instance_id": "r2e-small",
+            "repo": "demo/r2e",
+            "image": f"us-docker.pkg.dev/p/r2e/s@{_digest(902)}",
+            "kind": "command",
+            "command": "echo R2E_GRADE_MARKER",
+            "expected_exit_code": 0,
+        },
+        {
+            "instance_id": "r2e-large",
+            "repo": "demo/r2e",
+            "image": f"us-docker.pkg.dev/p/r2e/l@{_digest(903)}",
+            "kind": "command",
+            "command": big_cmd,
+            "expected_exit_code": 0,
+        },
+    ]
+    cmd_manifest.write_text("\n".join(json.dumps(r) for r in cmd_rows) + "\n", encoding="utf-8")
+
+    cmd_plan = rfb._load_standalone_plan(
+        dataset_path=str(cmd_manifest),
+        images=0,
+        instances_csv="",
+        exclude_file="",
+        trajectory_spec="",
+        set_vars={},
+    )
+    small_steps = cmd_plan["instances"][0]["steps"]
+    assert len(small_steps) == 1
+    assert small_steps[0]["run"] == "echo R2E_GRADE_MARKER"
+
+    large_steps = cmd_plan["instances"][1]["steps"]
+    assert [s["name"] for s in large_steps] == ["write-grade", "grade"]
+    assert large_steps[0]["write"]["path"] == "/tmp/ate-cmd-grade.sh"
+    assert large_steps[0]["write"]["content"] == big_cmd
+    assert large_steps[1]["run"] == "/bin/bash /tmp/ate-cmd-grade.sh"
+    assert large_steps[1]["reward"] is True

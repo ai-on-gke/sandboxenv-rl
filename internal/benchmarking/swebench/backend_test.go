@@ -435,6 +435,15 @@ func TestDirectSubstrateBackend(t *testing.T) {
 		t.Fatalf("ReadFile = %q, %v", gotBytes, err)
 	}
 
+	largePayload := strings.Repeat("echo r2e-grade-line\n", 12*1024)
+	if err := sb.WriteFile(ctx, "large-grade.sh", []byte(largePayload), 0o755); err != nil {
+		t.Fatalf("WriteFile(large): %v", err)
+	}
+	gotLarge, err := os.ReadFile(filepath.Join(workDir, "large-grade.sh"))
+	if err != nil || string(gotLarge) != largePayload {
+		t.Fatalf("ReadFile(large) len=%d err=%v, want len=%d", len(gotLarge), err, len(largePayload))
+	}
+
 	res, err := sb.Run(ctx, "printf direct-ok", 5*time.Second)
 	if err != nil {
 		t.Fatalf("Run: %v", err)

@@ -64,7 +64,15 @@ import base64, json, pathlib, re, sys
 ANSI = re.compile(r"\\x1b\\[[0-9;]*m|\\[\\d+m")
 MARKER = "short test summary info"
 log = pathlib.Path(sys.argv[1]).read_text(errors="replace")
-exp_raw = json.loads(base64.b64decode(sys.argv[2]).decode())
+try:
+    is_path = pathlib.Path(sys.argv[2]).is_file()
+except OSError:
+    is_path = False
+exp_raw = json.loads(
+    pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+    if is_path
+    else base64.b64decode(sys.argv[2]).decode("utf-8")
+)
 norm = lambda m: {ANSI.sub("", str(k)).split(" - ", 1)[0].strip(): str(v) for k, v in (m or {}).items()}
 expected = norm(exp_raw)
 expected.pop("", None)
@@ -84,6 +92,12 @@ ok = bool(expected) and obs.keys() == expected.keys() and all(obs[k] == expected
 detail = f"matched {len(expected)}/{len(expected)} tests" if ok else f"observed {len(obs)} vs expected {len(expected)} tests"
 print(json.dumps({"valid": True, "reward": 1 if ok else 0, "detail": detail}))
 """
+
+
+def _heredoc_b64_write(data: bytes, delimiter: str, quoted_dest: str) -> str:
+    """Decode base64 into quoted_dest via stdin heredoc so no argv scales with payload size."""
+    encoded = base64.encodebytes(data).decode("ascii") if data else ""
+    return f"base64 -d > {quoted_dest} <<'{delimiter}'\n{encoded}{delimiter}"
 
 
 def _looks_like_test(path: str) -> bool:
@@ -164,11 +178,9 @@ def build_r2e_commands(
     if not expected_obj:
         raise ValueError("expected_output_json must not be empty")
 
-    expected_b64 = base64.b64encode(json.dumps(expected_obj, sort_keys=True).encode()).decode(
-        "ascii"
-    )
-    patch_b64 = base64.b64encode(patch.encode()).decode("ascii")
-    grader_b64 = base64.b64encode(_INLINE_GRADER.encode()).decode("ascii")
+    expected_bytes = json.dumps(expected_obj, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    patch_bytes = patch.encode("utf-8")
+    grader_bytes = _INLINE_GRADER.encode("utf-8")
 
     hidden_clean = hidden_tests.rstrip("/")
     hidden_parent = posixpath.dirname(hidden_clean) or "/"
@@ -184,6 +196,8 @@ def build_r2e_commands(
     q_venv_py = shlex.quote(posixpath.join(venv_bin, "python"))
     q_restored = shlex.quote(posixpath.join(testbed, hidden_name))
     q_patch_file = shlex.quote(posixpath.join(work_dir, "r2e_gold.patch"))
+    q_expected_file = shlex.quote(posixpath.join(work_dir, "r2e_expected.json"))
+    q_grader_file = shlex.quote(posixpath.join(work_dir, "r2e_grade.py"))
     q_eval_log = shlex.quote(posixpath.join(work_dir, "r2e_eval.log"))
 
     setup_command = (
@@ -203,17 +217,23 @@ def build_r2e_commands(
     reset_command = (
         f"cd {q_testbed} && git reset -q --hard && git clean -qfd && rm -rf {q_restored}"
     )
-    command = (
-        f"set -e && "
-        f'export PATH={q_venv_bin}:{q_local_bin}:"${{PATH:+$PATH:}}"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin '
-        f"PAGER=cat GIT_PAGER=cat MANPAGER=cat PIP_PROGRESS_BAR=off TQDM_DISABLE=1 CI=1 && "
-        f'PY={q_venv_py}; [ -x "$PY" ] || PY=python3 && '
-        f"printf '%s' '{patch_b64}' | base64 -d > {q_patch_file} && "
-        f"cd {q_testbed} && git apply --whitespace=fix {q_patch_file} && "
-        f"rm -rf {q_restored} && tar -C {q_testbed} -xzf {q_archive} && "
-        f"(bash run_tests.sh > {q_eval_log} 2>&1 || true) && "
-        f"printf '%s' '{grader_b64}' | base64 -d | \"$PY\" - {q_eval_log} '{expected_b64}'"
-    )
+    command = "\n".join([
+        "set -e",
+        (
+            f'export PATH={q_venv_bin}:{q_local_bin}:"${{PATH:+$PATH:}}"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin '
+            "PAGER=cat GIT_PAGER=cat MANPAGER=cat PIP_PROGRESS_BAR=off TQDM_DISABLE=1 CI=1"
+        ),
+        f'PY={q_venv_py}; [ -x "$PY" ] || PY=python3',
+        _heredoc_b64_write(patch_bytes, "__R2E_PATCH_B64__", q_patch_file),
+        _heredoc_b64_write(expected_bytes, "__R2E_EXPECTED_B64__", q_expected_file),
+        _heredoc_b64_write(grader_bytes, "__R2E_GRADER_B64__", q_grader_file),
+        f"cd {q_testbed}",
+        f"git apply --whitespace=fix {q_patch_file}",
+        f"rm -rf {q_restored}",
+        f"tar -C {q_testbed} -xzf {q_archive}",
+        f"(bash run_tests.sh > {q_eval_log} 2>&1 || true)",
+        f'"$PY" {q_grader_file} {q_eval_log} {q_expected_file}',
+    ])
     return setup_command, reset_command, command
 
 

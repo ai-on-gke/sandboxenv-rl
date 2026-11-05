@@ -31,18 +31,27 @@ import (
 )
 
 type recipeFakeBackend struct {
-	mu         sync.Mutex
-	creates    int
-	awake      int
-	maxAwake   int
-	maxParked  int
-	parkedByID map[string]bool
-	opDelay    time.Duration
+	mu              sync.Mutex
+	creates         int
+	awake           int
+	maxAwake        int
+	maxParked       int
+	maxRunCmdLen    int
+	maxWrittenBytes int
+	parkedByID      map[string]bool
+	opDelay         time.Duration
+}
+
+type recipeWrittenFile struct {
+	content []byte
+	mode    fs.FileMode
 }
 
 type recipeFakeSandbox struct {
 	backend *recipeFakeBackend
 	id      string
+	mu      sync.Mutex
+	files   map[string]recipeWrittenFile
 }
 
 func (b *recipeFakeBackend) Create(_ context.Context, id, _ string) (swebench.Sandbox, error) {
@@ -82,6 +91,9 @@ func (b *recipeFakeBackend) onDelete(id string) {
 
 func (s *recipeFakeSandbox) Run(_ context.Context, command string, _ time.Duration) (swebench.Result, error) {
 	s.backend.mu.Lock()
+	if len(command) > s.backend.maxRunCmdLen {
+		s.backend.maxRunCmdLen = len(command)
+	}
 	if s.backend.parkedByID[s.id] {
 		delete(s.backend.parkedByID, s.id)
 		s.backend.awake++
@@ -101,6 +113,23 @@ func (s *recipeFakeSandbox) Run(_ context.Context, command string, _ time.Durati
 			ExitCode: 0,
 			Stdout:   `{"valid":true,"resolved":true,"f2p":"1/1","p2p":"2/2"}` + "\n",
 		}, nil
+	case strings.Contains(command, "/tmp/r2e-grade.sh"):
+		s.mu.Lock()
+		f, ok := s.files["/tmp/r2e-grade.sh"]
+		s.mu.Unlock()
+		if !ok {
+			return swebench.Result{ExitCode: 127, Stderr: "missing /tmp/r2e-grade.sh\n"}, nil
+		}
+		if f.mode.Perm() != 0o755 {
+			return swebench.Result{ExitCode: 126, Stderr: fmt.Sprintf("unexpected mode %o\n", f.mode.Perm())}, nil
+		}
+		if !strings.Contains(string(f.content), "run_tests.sh") {
+			return swebench.Result{ExitCode: 1, Stderr: "grade script missing run_tests.sh\n"}, nil
+		}
+		return swebench.Result{
+			ExitCode: 0,
+			Stdout:   `{"valid":true,"reward":1,"detail":"matched 2/2 tests"}` + "\n",
+		}, nil
 	case strings.Contains(command, "run_tests.sh"):
 		return swebench.Result{
 			ExitCode: 0,
@@ -111,7 +140,20 @@ func (s *recipeFakeSandbox) Run(_ context.Context, command string, _ time.Durati
 	}
 }
 
-func (s *recipeFakeSandbox) WriteFile(context.Context, string, []byte, fs.FileMode) error {
+func (s *recipeFakeSandbox) WriteFile(_ context.Context, path string, content []byte, mode fs.FileMode) error {
+	s.mu.Lock()
+	if s.files == nil {
+		s.files = make(map[string]recipeWrittenFile)
+	}
+	cp := append([]byte(nil), content...)
+	s.files[path] = recipeWrittenFile{content: cp, mode: mode}
+	s.mu.Unlock()
+
+	s.backend.mu.Lock()
+	if len(content) > s.backend.maxWrittenBytes {
+		s.backend.maxWrittenBytes = len(content)
+	}
+	s.backend.mu.Unlock()
 	return nil
 }
 
@@ -174,8 +216,13 @@ func TestMixedR2ESWEBench200ConcurrencyShards(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	largeR2ECmd := strings.Repeat("# numpy expected_output_json padding\n", 7500) + "/bin/bash run_tests.sh\n"
 	var r2eBuf, sweBuf bytes.Buffer
 	for i := 0; i < 20; i++ {
+		cmdStr := "/bin/bash run_tests.sh"
+		if i == 0 {
+			cmdStr = largeR2ECmd
+		}
 		r2eRec := map[string]any{
 			"kind":               "command",
 			"instance_id":        fmt.Sprintf("r2e-inst-%02d", i),
@@ -183,7 +230,7 @@ func TestMixedR2ESWEBench200ConcurrencyShards(t *testing.T) {
 			"image":              fmt.Sprintf("us-docker.pkg.dev/p/r2e/img-%02d@sha256:%064x", i, 100+i),
 			"setup_command":      "test -d /testbed",
 			"reset_command":      "cd /testbed && git reset -q --hard",
-			"command":            "/bin/bash run_tests.sh",
+			"command":            cmdStr,
 			"expected_exit_code": 0,
 		}
 		b, _ := json.Marshal(r2eRec)
@@ -274,6 +321,12 @@ func TestMixedR2ESWEBench200ConcurrencyShards(t *testing.T) {
 	}
 	if fake.creates != 200 {
 		t.Fatalf("expected 200 created sandboxes (100 swe + 100 r2e), got %d", fake.creates)
+	}
+	if fake.maxWrittenBytes < 250*1024 {
+		t.Fatalf("expected >250 KiB R2E command staged via WriteFile, got maxWrittenBytes=%d", fake.maxWrittenBytes)
+	}
+	if fake.maxRunCmdLen >= 4096 {
+		t.Fatalf("expected all Run commands to stay well under Linux MAX_ARG_STRLEN (<4 KiB), got maxRunCmdLen=%d", fake.maxRunCmdLen)
 	}
 
 	var combined bytes.Buffer

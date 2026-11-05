@@ -261,11 +261,14 @@ Copy [`./REPORT_TEMPLATE.md`](./REPORT_TEMPLATE.md) to `$ARTIFACT_DIR/BENCHMARK_
    (`cold boot`, `cold restore`, `warm restore`, or `wake`), workload parameters, and exact
    `prewarm` and `run-r2e-swebench.sh` commands.
 3. **Populate results and findings (`## 3` and `## 4`)**: Fill the multi-arm table (`3.1`) from
-   `comparison.json` / `comparison.md` (or `report.json` on single-arm runs), fill all sandbox
-   lifecycle and command latencies across `p50`, `p90`, `p95`, `p99`, and `max` (`3.2`:
+   `comparison.json` / `comparison.md`, per-arm `report.json`, and `{r2e,swe}-summary.json` (with
+   explicit `ms` vs `s` units and per-shard `r2e`/`swe` `TTFC`/`Wake`), decompose where time is
+   spent by execution layer (`3.2`: host `Go`/`Python` SDK vs `ate-env`/`ate` infra vs simulated LLM
+   think timer vs in-sandbox guest `bash`/`git` and container `Python` `pytest`/grader), fill all
+   raw sandbox lifecycle and command latencies across `p50`, `p90`, `p95`, `p99`, and `max` (`3.3`:
    `sdk_slot_wait`, `actor_create`, `sandbox_create`, `prewarm`, `ttfi` [cmd start via
    `wire_claim_to_ready_ms`], `first_cmd_exec` [`ready_to_first_cmd_ms`], `ttfc` [cmd finished via
    `stats[event="ttfi"]`], `suspend`, `wake`, `step/*`, `task/*`, `delete`, `step_barrier`), fill
-   step barrier and shard split (`3.3`, plus node cache and `atelet` restore phases when
+   step barrier and shard split (`3.4`, plus node cache and `atelet` restore phases when
    `SAMPLE_CACHE=1` or `HARVEST_RESTORES=1` ran), and summarize failures, findings, and caveats
    (`## 4`).

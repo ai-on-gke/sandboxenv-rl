@@ -74,4 +74,6 @@ user needs to know across them.
   `warm_pool` call or failed warm claim that overlaps a teardown deletes its
   environment instead of pooling it, and the warm-replica gauge stays equal to
   the warm pool. An environment whose delete fails or is cancelled stays
-  owned, and the next `reap` of any run deletes it.
+  owned, and the next `reap` of any run deletes it. An environment that an `acquire`
+  creates while its own run's teardown runs is also deleted by the next `reap`
+  of any run, unless the caller releases it first.

@@ -5,7 +5,7 @@ property tests here are proposed and not in the repository: `pgregory.net/rapid`
 and the Hypothesis tests named "Proposed test" do not exist. Two parts exist:
 
 - `clients/python/tests/test_warm_pool_accounting.py` (#221): the P-9 to P-11 stateful test
-  `test_warm_pool_accounting` and 33 plain interleaving tests. `hypothesis` is in the `dev` extra
+  `test_warm_pool_accounting` and 37 plain interleaving tests. `hypothesis` is in the `dev` extra
   since #221.
 - [verify/](./verify/README.md): hand-written Dafny models of P-1 to P-11 and of the two bugs review
   found in #221's first version. CI checks their results (AC-20).
@@ -27,7 +27,7 @@ State on `main` with #221:
 | P-24            | AC-15.7      | Fixed by #239. Before it, a warm claim whose `get()` succeeded after an overlapping reap deleted the actor returned a deleted environment.                                                                    |
 | P-10            | AC-15.8      | Fixed by #240. Before it, a `warm_pool` call cancelled during its `create()` calls leaked the actors already created: they were neither pooled nor tracked.                                                   |
 | P-10            | AC-15.9      | Fixed by #238. Before it, a delete cancelled after the run's reap, or a `release` whose delete failed or was cancelled while a reap ran, left the actor under the reaped run id, so no later reap deleted it. |
-| P-10            | AC-15.10     | Open. An `acquire` whose cold create overlaps its own run's reap returns an environment owned under the reaped run id; unless the caller releases it, no later reap deletes it.                               |
+| P-10            | AC-15.10     | Fixed by #242. Before it, an `acquire` whose cold create overlapped its own run's reap returned an environment owned under the reaped run id; unless the caller released it, no later reap deleted it.        |
 | P-21, P-22      | AC-17, AC-18 | Partial. Example tests only; the Go tests copy the Python tables by hand.                                                                                                                                     |
 
 ## Labels and cardinality (AC-9)
@@ -514,7 +514,7 @@ The requirement numbers the properties validate. Each refines the criterion of t
 | AC-15.7  | A warm claim returns a live environment.                                                                                           |
 | AC-15.8  | A `warm_pool` cancelled during `create()` leaves no live actor untracked.                                                          |
 | AC-15.9  | A delete cancelled after a reap, or a release's delete that fails during one, leaves the actor for any later reap.                 |
-| AC-15.10 | An `acquire` that completes after its own run's reap leaves its environment for a later reap (open).                               |
+| AC-15.10 | An `acquire` that completes after its own run's reap leaves its environment for a later reap.                                      |
 | AC-16.1  | A test collects every span name and attribute key the client and driver operations emit.                                           |
 | AC-16.2  | The collected set equals the documented table; CI fails on a difference.                                                           |
 | AC-17.1  | Shared operations have the same span `<op>` in both clients.                                                                       |

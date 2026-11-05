@@ -8,12 +8,12 @@ and checks the results against this file. Nothing ties them to the Python code: 
 
 ## Models
 
-| File                        | Models                                                                                                                                                                                                                                                                                                              | Expected result       |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
-| `telemetry.dfy`             | `repo_family`'s reserved-name rename and `_bounded_family` (P-1 to P-3), `inject_metadata` (P-4 to P-7), `RunReport.add_phase` with the negative-duration clamp (P-8)                                                                                                                                               | 14 verified, 0 errors |
-| `warm_pool.dfy`             | Warm-pool bookkeeping with one teardown that ends the driver. Module `WarmPool` is the design #221 ships; module `WarmPoolBefore` is the code before #221 (P-9 to P-11)                                                                                                                                             | 16 verified, 3 errors |
-| `warm_pool_generations.dfy` | Teardowns that bump a generation (`_teardowns`) and do not end the driver, a warm claim in two steps, ghost current and stale reservations, and the generation each pooled actor entered in                                                                                                                         | 32 verified, 3 errors |
-| `warm_pool_drain.dfy`       | #221's third review round and AC-15.8/15.9. Module `WarmPoolDrain`: `unwarm_pool` and a shrinking `resize_pool` that start a pool generation (`_pool_gens`), P-9, P-11 and DRAIN. Module `WarmPoolRunIds`: run ids, `reap(run)`, failed and cancelled deletes, `release`, a cancelled `warm_pool` (ORPHAN, TRACKED) | 61 verified, 9 errors |
+| File                        | Models                                                                                                                                                                                                                                                                                                                                       | Expected result        |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
+| `telemetry.dfy`             | `repo_family`'s reserved-name rename and `_bounded_family` (P-1 to P-3), `inject_metadata` (P-4 to P-7), `RunReport.add_phase` with the negative-duration clamp (P-8)                                                                                                                                                                        | 14 verified, 0 errors  |
+| `warm_pool.dfy`             | Warm-pool bookkeeping with one teardown that ends the driver. Module `WarmPool` is the design #221 ships; module `WarmPoolBefore` is the code before #221 (P-9 to P-11)                                                                                                                                                                      | 16 verified, 3 errors  |
+| `warm_pool_generations.dfy` | Teardowns that bump a generation (`_teardowns`) and do not end the driver, a warm claim in two steps, ghost current and stale reservations, and the generation each pooled actor entered in                                                                                                                                                  | 32 verified, 3 errors  |
+| `warm_pool_drain.dfy`       | #221's third review round and AC-15.8 to AC-15.10. Module `WarmPoolDrain`: `unwarm_pool` and a shrinking `resize_pool` that start a pool generation (`_pool_gens`), P-9, P-11 and DRAIN. Module `WarmPoolRunIds`: run ids, `reap(run)`, failed and cancelled deletes, `release`, a cancelled `warm_pool`, a cold `acquire` (ORPHAN, TRACKED) | 65 verified, 10 errors |
 
 Each piece of code between two `await`s is one atomic action on a shared state. Proving that every
 action keeps the invariant proves it for every interleaving of any number of concurrent calls.
@@ -34,6 +34,7 @@ action keeps the invariant proves it for every interleaving of any number of con
 | `warm_pool_drain.dfy`       | `WarmSuspendFailedBeforeSafe`       | Before #240 (AC-15.8): a warm actor whose `suspend()` failed (`wait=True`) was neither pooled, returned nor owned, so it stayed alive and untracked (TRACKED).                                     |
 | `warm_pool_drain.dfy`       | `WarmCommitDrainedBeforeSafe`       | Before #238 (AC-15.9): a `warm_pool` call torn down or drained owned its actors under its run id, so a cancel before its deletes started left them under the reaped run id (ORPHAN).               |
 | `warm_pool_drain.dfy`       | `RecycleSuspendCancelledBeforeSafe` | Before #238 (AC-15.9): a recycle cancelled in `suspend()` after a reap went back under the reaped run id (ORPHAN).                                                                                 |
+| `warm_pool_drain.dfy`       | `AcquireCommitBeforeSafe`           | Before #242 (AC-15.10): a cold `acquire` whose create overlapped its own run's reap stayed under the reaped run id (ORPHAN).                                                                       |
 | `warm_pool_drain.dfy`       | `DeleteCancelledSafe`               | Before #238 (AC-15.9): a cleanup delete (`_delete_unpooled`) cancelled after the run's reap left the actor under the reaped run id (ORPHAN).                                                       |
 | `warm_pool_drain.dfy`       | `ReleaseDeleteFailSafe`             | Before #238 (AC-15.9): a `release` whose delete failed or was cancelled while a reap ran put the actor back under the reaped run id, unless it was a recycle that saw the teardown first (ORPHAN). |
 
@@ -55,8 +56,10 @@ an actor and does not delete it (failed or cancelled delete, or a recycle cancel
 re-tags it whenever `_teardowns` changed since the pop (`_return_popped`, one atomic step under the
 lock). `WarmCancelledFixedSafe` and `WarmSuspendFailedSafe` verify #240's fix for AC-15.8: a
 cancelled `warm_pool` owns what it sent a `create()` for under `WARM_POOL_RUN_ID`, and an actor
-whose `suspend()` fails is owned the same way and deleted. `UnwarmRefillWitness`,
-`ResizeOverfillWitness` and `ReleaseOrphanWitness` verify concrete traces.
+whose `suspend()` fails is owned the same way and deleted. `AcquireCommitSafe` verifies #242's fix
+for AC-15.10: a cold `acquire` whose run was reaped during its create owns the actor under
+`WARM_POOL_RUN_ID`. `UnwarmRefillWitness`, `ResizeOverfillWitness` and `ReleaseOrphanWitness` verify
+concrete traces.
 
 ## Run
 
@@ -64,7 +67,7 @@ whose `suspend()` fails is owned the same way and deleted. `UnwarmRefillWitness`
 dafny verify telemetry.dfy                # 14 verified, 0 errors
 dafny verify warm_pool.dfy                # 16 verified, 3 errors, all in WarmPoolBefore
 dafny verify warm_pool_generations.dfy    # 32 verified, 3 errors: the three lemmas above
-dafny verify warm_pool_drain.dfy          # 61 verified, 9 errors: the nine lemmas above
+dafny verify warm_pool_drain.dfy          # 65 verified, 10 errors: the ten lemmas above
 ```
 
 ## CI

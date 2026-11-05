@@ -166,6 +166,11 @@ class SubstrateBackendDriver(BackendDriver):
         # pooling it (_may_pool).
         self._teardowns = 0
         self._reaping = 0
+        # Per run id: reaps of that run in progress, and the _teardowns
+        # value when its last reap ended. An acquire whose own run was reaped
+        # while it created the actor owns it under WARM_POOL_RUN_ID (AC-15.10).
+        self._run_reaps_running: dict[str, int] = {}
+        self._run_reap_ended: dict[str, int] = {}
         # Bumped per pool key by unwarm_pool and by a resize_pool that shrinks
         # below what is pooled and in flight: a warm_pool call that started
         # before deletes what it created instead of pooling it.
@@ -560,7 +565,15 @@ class SubstrateBackendDriver(BackendDriver):
         instance = self._make_instance(actor_id, template_id, run_id, rootfs_image=rootfs_image)
         instance.metadata["claim_source"] = claim_source
         with self._lock:
-            self._owned_actors[actor_id] = instance
+            if self._run_reaped_since(run_id, teardowns):
+                # The run's own reap overlapped this create and may have
+                # missed the actor, and a fleet's last teardown reaps its run
+                # once: own it under WARM_POOL_RUN_ID, which every reap
+                # deletes. The caller's handle keeps its run_id, and its
+                # release deletes the actor as usual (AC-15.10).
+                self._own_for_any_reap(actor_id, instance)
+            else:
+                self._owned_actors[actor_id] = instance
         return instance
 
     def acquire(
@@ -1052,6 +1065,7 @@ class SubstrateBackendDriver(BackendDriver):
             self._reaping += 1
             self._teardowns += 1
             self._warm_inflight.clear()
+            self._run_reaps_running[run_id] = self._run_reaps_running.get(run_id, 0) + 1
         try:
             return await self._reap_actors(run_id)
         finally:
@@ -1061,6 +1075,21 @@ class SubstrateBackendDriver(BackendDriver):
                 self._reaping -= 1
                 self._teardowns += 1
                 self._warm_inflight.clear()
+                left = self._run_reaps_running.get(run_id, 1) - 1
+                if left > 0:
+                    self._run_reaps_running[run_id] = left
+                else:
+                    self._run_reaps_running.pop(run_id, None)
+                self._run_reap_ended[run_id] = self._teardowns
+
+    def _run_reaped_since(self, run_id: str, teardowns: int) -> bool:
+        """Whether a reap of ``run_id`` is running, or ended after the caller
+        read ``teardowns``: that reap may have taken its snapshot before an
+        actor the caller is about to own. Caller holds self._lock."""
+        return (
+            self._run_reaps_running.get(run_id, 0) > 0
+            or self._run_reap_ended.get(run_id, -1) > teardowns
+        )
 
     async def _reap_actors(self, run_id: str) -> int:
         with self._lock:

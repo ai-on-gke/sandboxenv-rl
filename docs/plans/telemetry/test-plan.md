@@ -145,7 +145,7 @@ kubectl -n ate-system get deploy -o name | sort | diff /tmp/before-ate-system.tx
 [properties.md](./properties.md) specifies P-1 to P-20. What exists:
 
 ```bash
-# AC-15 (P-9, P-10, P-11), #221, #238 to #240: 33 plain tests and the stateful test_warm_pool_accounting.
+# AC-15 (P-9, P-10, P-11), #221, #238 to #240, #242: 37 plain tests and the stateful test_warm_pool_accounting.
 # hypothesis comes with the dev extra, so either venv works.
 /tmp/ate-base/bin/python -m pytest clients/python/tests/test_warm_pool_accounting.py -q
 
@@ -158,7 +158,7 @@ cd docs/plans/telemetry/verify
 dafny verify telemetry.dfy                # 14 verified, 0 errors
 dafny verify warm_pool.dfy                # 16 verified, 3 errors, all in WarmPoolBefore
 dafny verify warm_pool_generations.dfy    # 32 verified, 3 errors: PlanFirstCovers, ClaimFailPutBackSafe, ClaimOkReturnsLive
-dafny verify warm_pool_drain.dfy          # 61 verified, 9 errors: CommitStaleBeforeSafe, ResizeBeforeSafe, DeleteFailBeforeSafe, WarmCancelledBeforeSafe, WarmSuspendFailedBeforeSafe, WarmCommitDrainedBeforeSafe, RecycleSuspendCancelledBeforeSafe, DeleteCancelledSafe, ReleaseDeleteFailSafe
+dafny verify warm_pool_drain.dfy          # 65 verified, 10 errors: CommitStaleBeforeSafe, ResizeBeforeSafe, DeleteFailBeforeSafe, WarmCancelledBeforeSafe, WarmSuspendFailedBeforeSafe, WarmCommitDrainedBeforeSafe, RecycleSuspendCancelledBeforeSafe, DeleteCancelledSafe, ReleaseDeleteFailSafe, AcquireCommitBeforeSafe
 ```
 
 The Dafny errors are by design: each failing lemma models code before #221 or one of its review
@@ -176,9 +176,6 @@ Still proposed, not in the repository:
 - The Go properties (P-19, P-20), with
   `go test ./internal/benchmarking/swebench/... ./clients/go/... -run 'TracingIsTransparent|SpansFollowProvider'`
   after adding `pgregory.net/rapid` to `go.mod`.
-- A test for AC-15.10: a cold `acquire` paused in `create()` while its own run's `reap` runs; after
-  it returns, `reap` of a later run must leave nothing alive that the caller did not keep. It fails
-  on `main`; it belongs with the fix.
 
 ## What to write in the pull request
 

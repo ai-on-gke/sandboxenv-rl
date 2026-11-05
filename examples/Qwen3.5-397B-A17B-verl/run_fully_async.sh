@@ -68,6 +68,8 @@ ROLLOUT_WORLD=$((ROLLOUT_TP * ROLLOUT_DP))
 [ "$ROLLOUT_EP" -eq 1 ] || [ "$ROLLOUT_EP" -eq "$ROLLOUT_WORLD" ] || { echo "ROLLOUT_EP must be 1 or ROLLOUT_TP*ROLLOUT_DP (verl constraint)"; exit 2; }
 REPLICAS=$((NNODES_ROLLOUT * 8 / ROLLOUT_WORLD))
 echo "pipeline stages: $TRAIN_PP x $GPUS_PER_STAGE GPUs; vLLM replicas: $REPLICAS x $ROLLOUT_WORLD GPUs; sessions: $SESSIONS ($((SESSIONS / REPLICAS)) per replica; beyond sandbox-pool capacity they queue up to ${SANDBOX_START_WAIT_S}s)"
+[ "$SESSIONS" -le $((2 * REPLICAS * ROLLOUT_MAX_NUM_SEQS)) ] || \
+  echo "WARNING: SESSIONS=$SESSIONS is above 2 x $REPLICAS replicas x ROLLOUT_MAX_NUM_SEQS=$ROLLOUT_MAX_NUM_SEQS: sessions vLLM cannot hold wait inside it with a sandbox open and can hit SESSION_TIMEOUT_S (README: Operating at scale)"
 
 pipq() {  # quiet pip install; the whole log only when it fails (the last line alone once hid git's "could not read Username")
   local log; log=$(mktemp)
@@ -185,6 +187,174 @@ if new in s and old not in s: print("verl separate_async logger call already fix
 elif s.count(old) == 1: f.write_text(s.replace(old, new)); print("patched verl separate_async logger call (flush kwarg) on the hybrid_engine=False path")
 else: raise SystemExit("verl separate_async trainer changed; refusing to patch " + str(f))
 PY
+# 64K responses on BSHD: the micro-batch is one 73,728-token sequence, so its fp32 logits are 34 GiB per GPU at TP2 and
+# verl's log-prob step allocates a second copy of them; the caching allocator fragments around a tensor that size; and
+# every right-padded position carries pad_token_id, so EP routes all of them to one expert set (a 23 GiB activation
+# spike on one rank). Three guarded patches against the pinned verl, applied only at this length (the 32K profiles run
+# the code they were validated on): log-probs in 2,048-token chunks with the gradient written into the logits' own
+# memory, expandable_segments enabled only inside the trainer's forward-backward (pod-wide it breaks the vLLM weight
+# handoff, README), and padded token ids spread across experts. All fail loudly if a line moved.
+if [ "$MAX_MODEL_LEN" -gt 49152 ]; then
+python3 - <<'PY'
+import pathlib
+f = pathlib.Path("/workspace/uni-agent/verl/verl/workers/engine/megatron/transformer_impl.py"); s = f.read_text()
+anchor = '        assert torch.all(temperature > 0).item(), f"temperature tensor must be positive. Got {temperature}"\n'
+inject = anchor + (
+    "        if not calculate_sum_pi_squared and not distillation_use_topk and not distillation_only:\n"
+    "            log_probs, entropy = _InplaceChunkedLogitsProcessorFn.apply(logits, label, temperature, calculate_entropy, 2048)\n"
+    "            ret = {}\n"
+    "            if calculate_entropy:\n"
+    '                ret["entropy"] = entropy\n'
+    '            ret["log_probs"] = log_probs\n'
+    "            return ret\n")
+fn_def = '''
+class _InplaceChunkedLogitsProcessorFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, label, temperature, calculate_entropy: bool, chunk_size: int = 2048):
+        import torch.distributed as dist
+        from megatron.core import parallel_state as mpu
+        tp_group = mpu.get_tensor_model_parallel_group()
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        seq_len = logits.shape[1]
+        vocab_per_tp = logits.shape[-1]
+        vocab_start = tp_rank * vocab_per_tp
+        vocab_end = vocab_start + vocab_per_tp
+
+        t_full = temperature.unsqueeze(dim=-1).to(logits.dtype)
+        log_probs = torch.empty(logits.shape[:2], dtype=logits.dtype, device=logits.device)
+        entropy = torch.empty(logits.shape[:2], dtype=logits.dtype, device=logits.device) if calculate_entropy else None
+
+        for i in range(0, seq_len, chunk_size):
+            c_logits = logits[:, i : i + chunk_size, :]
+            c_label = label[:, i : i + chunk_size]
+            c_temp = t_full[:, i : i + chunk_size, :] if (t_full.ndim == 3 and t_full.shape[1] == seq_len) else t_full
+            c_logits.div_(c_temp)
+
+            logits_max = c_logits.max(dim=-1, keepdim=True).values
+            dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=tp_group)
+            exp_logits = (c_logits - logits_max).exp_()
+            sum_exp = exp_logits.sum(dim=-1, keepdim=True)
+            dist.all_reduce(sum_exp, op=dist.ReduceOp.SUM, group=tp_group)
+            log_z = logits_max + sum_exp.log()
+
+            if calculate_entropy:
+                softmax = exp_logits.div_(sum_exp)
+                sum_pz = (softmax * c_logits).sum(dim=-1, keepdim=True)
+                dist.all_reduce(sum_pz, op=dist.ReduceOp.SUM, group=tp_group)
+                entropy[:, i : i + chunk_size] = (log_z - sum_pz).squeeze(dim=-1)
+
+            target_mask = (c_label < vocab_start) | (c_label >= vocab_end)
+            masked_target = c_label.clone() - vocab_start
+            masked_target[target_mask] = 0
+            pred_logits = c_logits.gather(dim=-1, index=masked_target.unsqueeze(dim=-1)).squeeze(dim=-1)
+            pred_logits[target_mask] = 0.0
+            dist.all_reduce(pred_logits, op=dist.ReduceOp.SUM, group=tp_group)
+            log_probs[:, i : i + chunk_size] = pred_logits - log_z.squeeze(dim=-1)
+            del exp_logits, logits_max, sum_exp, log_z, pred_logits
+
+        if logits.requires_grad:
+            ctx.save_for_backward(logits, label, temperature)
+            ctx.calculate_entropy = calculate_entropy
+            ctx.chunk_size = chunk_size
+        return log_probs, entropy
+
+    @staticmethod
+    def backward(ctx, grad_log_probs, grad_entropy):
+        import torch.distributed as dist
+        from megatron.core import parallel_state as mpu
+        logits, label, temperature = ctx.saved_tensors
+        calculate_entropy = ctx.calculate_entropy
+        chunk_size = ctx.chunk_size
+        tp_group = mpu.get_tensor_model_parallel_group()
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        seq_len = logits.shape[1]
+        vocab_per_tp = logits.shape[-1]
+        vocab_start = tp_rank * vocab_per_tp
+        vocab_end = vocab_start + vocab_per_tp
+
+        t_full = temperature.unsqueeze(dim=-1).to(logits.dtype)
+        for i in range(0, seq_len, chunk_size):
+            c_logits = logits[:, i : i + chunk_size, :]
+            c_label = label[:, i : i + chunk_size]
+            c_temp = t_full[:, i : i + chunk_size, :] if (t_full.ndim == 3 and t_full.shape[1] == seq_len) else t_full
+
+            logits_max = c_logits.max(dim=-1, keepdim=True).values
+            dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=tp_group)
+            exp_logits = (c_logits - logits_max).exp_()
+            sum_exp = exp_logits.sum(dim=-1, keepdim=True)
+            dist.all_reduce(sum_exp, op=dist.ReduceOp.SUM, group=tp_group)
+            softmax = exp_logits.div_(sum_exp)
+
+            g_lp = grad_log_probs[:, i : i + chunk_size].unsqueeze(dim=-1).to(c_logits.dtype)
+            if calculate_entropy and grad_entropy is not None:
+                sum_pz = (softmax * c_logits).sum(dim=-1, keepdim=True)
+                dist.all_reduce(sum_pz, op=dist.ReduceOp.SUM, group=tp_group)
+                g_ent = grad_entropy[:, i : i + chunk_size].unsqueeze(dim=-1).to(c_logits.dtype)
+                c_logits.sub_(sum_pz).mul_(softmax).mul_(-g_ent)
+                c_logits.sub_(softmax.mul_(g_lp))
+            else:
+                c_logits.copy_(softmax.mul_(-g_lp))
+
+            target_mask = (c_label < vocab_start) | (c_label >= vocab_end)
+            masked_target = c_label.clone() - vocab_start
+            masked_target[target_mask] = 0
+            g_lp_masked = g_lp.masked_fill(target_mask.unsqueeze(dim=-1), 0.0)
+            c_logits.scatter_add_(-1, masked_target.unsqueeze(dim=-1), g_lp_masked)
+            c_logits.div_(c_temp)
+            del exp_logits, softmax, logits_max, sum_exp
+
+        return logits.view(logits.shape), None, None, None, None
+'''
+if "_InplaceChunkedLogitsProcessorFn" in s: print("verl Megatron log-probs already chunked")
+elif s.count(anchor) == 1: s = s.replace(anchor, inject, 1) + "\n" + fn_def; print("patched verl Megatron log-probs to run in 2,048-token chunks")
+else: raise SystemExit("verl Megatron logits processor changed; refusing to patch " + str(f))
+old = "        losses_reduced = forward_backward_func(\n"
+new = ("        torch.cuda.empty_cache()\n"
+       "        try:\n"
+       "            torch.cuda.memory._set_allocator_settings('expandable_segments:True')\n"
+       "        except Exception:\n"
+       "            pass\n"
+       "        losses_reduced = forward_backward_func(\n")
+if new in s: print("verl Megatron forward-backward already enables expandable segments")
+elif s.count(old) == 1: s = s.replace(old, new, 1); print("patched verl Megatron forward-backward to enable expandable segments on entry")
+else: raise SystemExit("verl Megatron forward-backward changed; refusing to patch " + str(f))
+old = ("        if enable_routing_replay:\n"
+       "            RouterReplay.clear_global_indices()\n"
+       "            RouterReplay.clear_global_router_replay_action()\n"
+       "        return output\n")
+new = ("        if enable_routing_replay:\n"
+       "            RouterReplay.clear_global_indices()\n"
+       "            RouterReplay.clear_global_router_replay_action()\n"
+       "        torch.cuda.empty_cache()\n"
+       "        try:\n"
+       "            torch.cuda.memory._set_allocator_settings('expandable_segments:False')\n"
+       "        except Exception:\n"
+       "            pass\n"
+       "        return output\n")
+if new in s: print("verl Megatron forward-backward already resets expandable segments")
+elif s.count(old) == 1: s = s.replace(old, new, 1); print("patched verl Megatron forward-backward to reset expandable segments on exit")
+else: raise SystemExit("verl Megatron forward-backward exit changed; refusing to patch " + str(f))
+f.write_text(s)
+f = pathlib.Path("/workspace/uni-agent/verl/verl/models/mcore/util.py"); s = f.read_text()
+old = ("    attention_mask = torch.zeros_like(input_ids_bshd, dtype=torch.bool)\n"
+       "    for i, seqlen in enumerate(seqlens_in_batch):\n"
+       "        attention_mask[i, :seqlen] = True\n\n"
+       "    return input_ids_bshd, attention_mask\n")
+new = ("    attention_mask = torch.zeros_like(input_ids_bshd, dtype=torch.bool)\n"
+       "    for i, seqlen in enumerate(seqlens_in_batch):\n"
+       "        attention_mask[i, :seqlen] = True\n\n"
+       "    _dp_rk = mpu.get_data_parallel_rank() if torch.distributed.is_initialized() else 0\n"
+       "    _seq_idx = torch.arange(int(input_ids_bshd.shape[1]), device=input_ids_bshd.device, dtype=input_ids_bshd.dtype).unsqueeze(0)\n"
+       "    _pseudo = (_seq_idx * 131 + _dp_rk * 997) % 32768\n"
+       "    input_ids_bshd = torch.where(attention_mask, input_ids_bshd, _pseudo)\n\n"
+       "    return input_ids_bshd, attention_mask\n")
+if new in s: print("verl BSHD padding already spreads pad ids across experts")
+elif s.count(old) == 1: f.write_text(s.replace(old, new, 1)); print("patched verl BSHD padding to spread pad token ids across experts")
+else: raise SystemExit("verl BSHD mask builder changed; refusing to patch " + str(f))
+PY
+else
+  echo "MAX_MODEL_LEN=$MAX_MODEL_LEN: long-sequence verl patches not needed"
+fi
 python3 - <<'PY'
 import importlib
 for m in ("verl.trainer.main_ppo", "fla", "megatron.bridge", "cupy", "swebench", "ate_env", "uni_agent_substrate.provider"):

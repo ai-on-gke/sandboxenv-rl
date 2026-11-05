@@ -25,10 +25,12 @@ and put the same peak load on the sandbox pool: eight `35b-easy` match `397b-eas
 `TOTAL_STEPS` defaults to one epoch of the whole training set (43 / 63 / 10 / 7; `397b-smoke` runs 2): enough
 steps for performance numbers, not for convergence, which takes about 3 epochs (DeepSWE: 200 steps x 64 prompts
 over 4,500 R2E-Gym tasks); for that, raise `trainer.total_epochs` in `run_fully_async.sh`. Validation runs once,
-after the last step. `SESSIONS` is the whole step (`TRAIN_BATCH x ROLLOUT_N`), so every trajectory starts at once instead
-of queueing on the session cap. If the sandbox system cannot hold that many environments, set `SESSIONS` to its
-maximum capacity instead; the rest of the step then waits in uni-agent, holding no sandbox. In the `v1` profiles
-the step exceeds `replicas x ROLLOUT_MAX_NUM_SEQS`, so turns beyond what vLLM admits queue inside vLLM.
+after the last step. `SESSIONS` caps the sessions in flight. The 32K profiles set it to the whole step
+(`TRAIN_BATCH x ROLLOUT_N`), so every trajectory starts at once instead of queueing on the cap. The 64K `v1` profiles
+cap it near what the rollout pool decodes at once (about 1.5 x replicas x `ROLLOUT_MAX_NUM_SEQS`, H200 values):
+beyond that a session holds a sandbox while it waits inside vLLM and runs into `SESSION_TIMEOUT_S`. If the sandbox
+system cannot hold `SESSIONS` environments, set it to the system's maximum capacity instead; the rest of the step
+waits in uni-agent, holding no sandbox.
 
 ## Prerequisites
 
@@ -112,6 +114,13 @@ PROFILE=397b-smoke ./deploy.sh up && ./deploy.sh logs    # 16/16 nodes
   so BSHD without dynamic batching; no context parallelism (`TRAIN_CP=1`); vanilla mbridge; full
   recompute; vLLM `cudagraph_mode=FULL_DECODE_ONLY` and `mamba_cache_mode=align`; MTP off. Response
   length is bounded by one GPU's activations: longer contexts need more pipeline stages, not CP.
+- **64K responses on BSHD.** The micro-batch is one 73,728-token sequence, so its fp32 logits are 34 GiB per
+  GPU at TP2 and verl's log-prob step allocates a second copy; the allocator fragments around a tensor that
+  size; and every right-padded position carries `pad_token_id`, so EP routes them all to one expert set. At
+  `MAX_MODEL_LEN` above 48K the install patches the pinned verl: log-probs in 2,048-token chunks with the
+  gradient written into the logits' own memory (peak 88 GiB on H200 instead of OOM), `expandable_segments`
+  enabled only inside the trainer's forward-backward (pod-wide it breaks the weight handoff, above), and padded
+  token ids spread across experts. The 32K profiles run the unpatched code.
 - **Episode budget** (uni-agent's 235B SWE example): 64K responses, 150 steps, 128K one knob away; clip
   0.2/0.28, lr 1e-6, weight decay 0.1.
 - **Unfinished episodes** (`MASK_UNFINISHED_EPISODE=True`): an episode that hits `AGENT_MAX_STEPS` or
@@ -125,12 +134,16 @@ PROFILE=397b-smoke ./deploy.sh up && ./deploy.sh logs    # 16/16 nodes
 
 For steps of thousands of trajectories. Profile values and Substrate settings only.
 
-- **`SESSIONS` = the step (`TRAIN_BATCH x ROLLOUT_N`).** Every trajectory starts at once and holds a sandbox for
-  its whole episode, so the sandbox pool needs about `SESSIONS + VAL_TASKS` environments. If the sandbox system
-  cannot hold that many, set `SESSIONS` to its maximum capacity instead: sessions beyond the cap wait in
-  uni-agent, holding no sandbox, and sessions beyond the pool's capacity still wait up to `SANDBOX_START_WAIT_S`
-  instead of failing. Above `replicas x ROLLOUT_MAX_NUM_SEQS`, turns queue inside vLLM. Each in-flight session is
-  a Ray task and worker process: `RAY_CPUS` >= `SESSIONS / GPU nodes`, `SESSION_TIMEOUT_S` covers wait plus episode.
+- **`SESSIONS` is bounded twice.** Every in-flight session holds a sandbox for its whole episode, so the sandbox
+  pool needs about `SESSIONS + VAL_TASKS` environments; and a vLLM replica holds only `ROLLOUT_MAX_NUM_SEQS`
+  sequences in its KV cache (vLLM logs the number at start as "Maximum concurrency for N tokens per request":
+  64 for the 397B replica and 32 for the 35B replica at 73K context on H200). Set `SESSIONS` to the smaller of
+  the sandbox capacity and about 1.5 x replicas x `ROLLOUT_MAX_NUM_SEQS`; the margin keeps the replicas busy
+  while sessions run tool calls. Sessions beyond the cap wait in uni-agent, holding no sandbox; sessions beyond
+  the pool's capacity still wait up to `SANDBOX_START_WAIT_S` instead of failing. Uncapped, a first `397b-v1`
+  run lost 191 sessions to `SESSION_TIMEOUT_S`; capped, 12,288 v1 episodes ran with none. Each in-flight
+  session is a Ray task and worker process: `RAY_CPUS` >= `SESSIONS / GPU nodes`, `SESSION_TIMEOUT_S` covers
+  wait plus episode.
 - **The startup wave is gated job-wide.** The provider applies `SANDBOX_STARTUP_CONCURRENCY` through one
   Ray actor per job (uni-agent's own semaphore is per process), keeps waiting on the same environment when
   a wake is merely slow, retries deletes Substrate rejects as "another operation is in progress", and
@@ -186,9 +199,10 @@ For steps of thousands of trajectories. Profile values and Substrate settings on
 - Environments have no egress. Thinking stays on. Unfinished episodes are masked (`MASK_UNFINISHED_EPISODE`).
 - The install step applies guarded fixes to the pinned verl (each refuses to apply if the code changed):
   three for the FP8 rollout of Qwen3.5's HF layout (layer count under `text_config`, module lookup through
-  vLLM's name mapper, per-expert split of fused expert tensors), the fully-masked-batch guard, and the
-  `hybrid_engine=False` logging call. The FP8 exclusion list is generated from `config.json` and matches
-  Qwen's official FP8 checkpoints.
+  vLLM's name mapper, per-expert split of fused expert tensors), the fully-masked-batch guard, the
+  `hybrid_engine=False` logging call, and above 48K context the three long-sequence patches (chunked
+  log-probs, scoped `expandable_segments`, padded-id spread). The FP8 exclusion list is generated from
+  `config.json` and matches Qwen's official FP8 checkpoints.
 - Only the WorkerPool is configured on the Substrate side. Re-apply after a Substrate reinstall.
 - Provider environments are named `ua-*` (`ua-<JOB_SUFFIX>-*` with a suffix); `deploy.sh up` / `down` purge
   this instance's leftovers when `KUBECTL_ATE` is set.

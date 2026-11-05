@@ -52,19 +52,21 @@ go run ./cmd/benchmarking/swebench-loader report smoke.jsonl
 
 ## Where things are
 
-- `cmd/benchmarking/swebench-loader`: the binary (`run`, `report`, `compare`, `resolve`, `plan-placement`, `convert-trace`, `trajectory-assets`).
+- `cmd/benchmarking/swebench-loader`: the binary (`run`, `render-plan`, `report`, `compare`, `resolve`, `plan-placement`, `convert-trace`, `trajectory-assets`).
 - `internal/benchmarking/swebench`: the library, tested against an in-memory backend.
 - `internal/benchmarking/swebench/trajectories/`: the built-in trajectories (YAML).
 - This directory: `run-in-cluster.sh` (runs the loader as a Job next to the
   API), `make-dataset.py` (builds a manifest), `mirror-images.sh`,
   `sample-node-cache.sh` and `harvest-restore-timings.sh` (the two Substrate-side
-  measurements), `offline-exclusions.txt`.
+  measurements), `offline-exclusions.txt`; `run-r2e-swebench.sh` and
+  `run_fleet_bench.py` (the mixed R2E-Gym and SWE-bench sweeps, Go and Python
+  `SandboxFleet` arms; see the last section and [`r2e-swebench/SKILL.md`](./r2e-swebench/SKILL.md)).
 
 The rest of this page, by heading: Workloads; What is measured; Cold boot,
 cold and warm restore, suspend and wake: which shape measures what; How many
 actors, and on which clusters; Prepare once per project; Run; Image-delivery
 workloads; Network and the offline exclusion list; Two things the first runs
-showed; Record with every run.
+showed; Record with every run; R2E-Gym and SWE-bench sweeps.
 
 ## Workloads
 
@@ -477,81 +479,6 @@ dataset, tasks per image or rollouts, steps and park, connections, base
 template, exclude file, instances, and the create, step, wake-budget and
 wake-backoff timeouts. The report alone is not reproducible without them.
 
-## Unified `bench` CLI (Synthetic & Real RL)
-
-`cmd/benchmarking/bench` is the unified orchestrator for both scenario-driven
-synthetic workloads and real RL training recipes (`examples/*-verl`). Every
-subcommand communicates through a single artifact directory (`-dest "$ARTIFACT_DIR"`):
-
-| Subcommand | Purpose |
-|---|---|
-| `bench run` | End-to-end execution of a declarative `scenario.yaml` (resolve -> prewarm -> execute -> measure -> reap -> report) |
-| `bench resolve` | Resolve a `scenario.yaml` and dataset into a deterministic `schedule.json` |
-| `bench render` | Render Kubernetes Job manifests from a `scenario.yaml` |
-| `bench prewarm` | Prewarm templates or standing sandbox pools prior to the timed run window |
-| `bench spinup` | Scale `WorkerPool` (`0 -> N` `ateworker` pods), wait for `ate-env-api` + all worker pods `Ready`, and record `workerpool_spinup_wall_ms` and `worker_pod_*_ms` into `measurements.json` and `events/substrate_lifecycle.jsonl` |
-| `bench spindown` | Scale `WorkerPool` (`N -> 0` `ateworker` pods), wait for all worker pods to terminate, and record `workerpool_spindown_wall_ms` and `worker_pod_terminate_ms` into `measurements.json` and `events/substrate_lifecycle.jsonl` |
-| `bench measure` | Collect K8s (`-k8s`), Substrate (`-ate-endpoint`), Prometheus (`-prom-url`), node cache (`-sample-node-cache`), and restore timings (`-restore-log`) into `measurements.json` and `system_description.json` |
-| `bench reap` | Verify zero orphaned environments remain post-run and emit `events/reap.jsonl` |
-| `bench report` | Ingest `events/*.jsonl`, `traces/*.jsonl`, `train.log`, `measurements.json`, and `system_description.json` into `report.json` and `report.md` |
-| `bench validate` | Validate `report.json`, `measurements.json`, and `system_description.json` against strict `v1` schemas, and with `-folder` the archive folder name |
-| `bench upload` | Validate, then copy `$ARTIFACT_DIR` to `gs://<bucket>/<folder>/` |
-| `bench compare` | Diff two or more `report.json` files or artifact directories side-by-side |
-
-### 1. Synthetic / Scenario-Driven Run
-
-```bash
-ARTIFACT_DIR=/tmp/bench-run
-go run ./cmd/benchmarking/bench run \
-  -scenario benchmarking/scenarios/multi-job-swebench.yaml \
-  -dest "$ARTIFACT_DIR"
-go run ./cmd/benchmarking/bench validate -dest "$ARTIFACT_DIR"
-```
-
-### 2. Real RL Training Run (`examples/*-verl`)
-
-```bash
-ARTIFACT_DIR=/tmp/rl-bench-run
-mkdir -p "$ARTIFACT_DIR/measurements_snapshots"
-
-# 1. Spin up Substrate WorkerPool (0 -> N ateworker pods) & capture pre-run node image-cache snapshot
-go run ./cmd/benchmarking/bench spinup -namespace ate-env -workerpool default-template-workerpool -replicas 32 -dest "$ARTIFACT_DIR"
-go run ./cmd/benchmarking/bench measure -sample-node-cache "$ARTIFACT_DIR/cache_before.prom"
-
-# 2. Launch the RL recipe (with ATE_ENV_TRACE_DIR=/workspace/results/traces enabled in the Job)
-(cd examples/Qwen3-1.7B-verl && ./deploy.sh up)
-
-# 3. Sample live K8s + Substrate state while training steps are active
-kubectl -n ate-env port-forward deploy/ate-env-api 18443:8443 &
-go run ./cmd/benchmarking/bench measure -k8s -ate-endpoint 127.0.0.1:18443 \
-  -atespace ate-env -dest "$ARTIFACT_DIR"
-
-# 4. After training completes, copy train.log + traces/*.jsonl into $ARTIFACT_DIR, then reap, sample post-cache, & spin down WorkerPool (N -> 0)
-go run ./cmd/benchmarking/bench reap -ate-endpoint 127.0.0.1:18443 -atespace ate-env -prefix verl- -dest "$ARTIFACT_DIR"
-go run ./cmd/benchmarking/bench measure -sample-node-cache "$ARTIFACT_DIR/cache_after.prom"
-benchmarking/swebench/harvest-restore-timings.sh <run-id> "$ARTIFACT_DIR/restore_timings.jsonl"
-go run ./cmd/benchmarking/bench spindown -namespace ate-env -workerpool default-template-workerpool -dest "$ARTIFACT_DIR"
-
-# 5. Generate and validate report.json + report.md
-go run ./cmd/benchmarking/bench report -dest "$ARTIFACT_DIR"
-go run ./cmd/benchmarking/bench validate -dest "$ARTIFACT_DIR"
-```
-
-### 3. Archiving Results & Further Guides
-
-Archive completed `$ARTIFACT_DIR` directories to object storage under a
-consistent folder name, with `_traced` iff the run captured an SDK trace
-(`report.json` `trace_captured: true`; traced latencies include trace overhead):
-
-```text
-gs://<YOUR_BENCHMARK_BUCKET>/<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>/
-gs://<YOUR_BENCHMARK_BUCKET>/<YYYY-MM-DD>_<model-family>-<size>_<dataset>_<nickname>_traced/
-```
-
-- **Mixed R2E-Gym + SWE-bench recipe & agent skill**: [`benchmarking/swebench/r2e-swebench/SKILL.md`](./r2e-swebench/SKILL.md)
-- **Telemetry scopes & feature debug plugins**: [`internal/benchmarking/TELEMETRY_GUIDE.md`](../../internal/benchmarking/TELEMETRY_GUIDE.md)
-- **Agent integration & execution playbook**: [`benchmarking/SKILL.md`](../SKILL.md)
-
 ## R2E-Gym and SWE-bench sweeps
 
 Run mixed R2E-Gym and SWE-bench Verified sweeps across warm-pool strategies and
@@ -663,19 +590,3 @@ telemetry:
 | `CONNECTIONS`, `WAKE_BUDGET`, `CREATE_TIMEOUT`, `STEP_TIMEOUT`, `START_TIMEOUT` | `8`, `5m`, `5m`, `15m`, `600` | Sharded gRPC channel count, per-operation timeouts, and in-cluster pod start timeout in seconds. |
 | `SWE_EXCLUDE_FILE`, `R2E_EXCLUDE_FILE` | `offline-exclusions.txt`, unset | Per-dataset instance exclusion files (set `SWE_EXCLUDE_FILE=""` to disable exclusions). |
 | `SAMPLE_CACHE`, `HARVEST_RESTORES`, `HARVEST_INTERVAL_MIN` | `0`, `0`, `10` | Set to `1` to scrape `atelet` `ate_imagecache_requests_total` (`cache_before.prom`, `cache_after.prom`) and harvest `atelet` restore phases (`restore_timings.jsonl`). |
-
-## Overview
-
-A loader that drives real R2E-Gym and SWE-bench task images through the `ate-env` API (or directly against Substrate) the
-way a simulated RL job does, and a report over what every phase cost. It is
-the "Fast" rung of the RL benchmark ladder: regular runs that catch
-regressions in the sandbox SDK, Substrate or the controller, on a workload
-that is the real thing rather than a Python image printing READY.
-
-Code: `internal/benchmarking/swebench` (library, tested against an in-memory
-backend), `cmd/benchmarking/swebench-loader` (Go binary), and
-`benchmarking/swebench/run_fleet_bench.py` (Python `ate_env_rl` `SandboxFleet`
-driver). The layout follows
-substrate's `internal/benchmarking/boomer` so a user class can be lifted into
-that harness later; Go does not allow importing another module's `internal`
-packages, so nothing is imported from it.

@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/env/internal/ate"
+	"github.com/agent-substrate/env/internal/routertls"
 	"github.com/agent-substrate/env/internal/telemetry"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
@@ -67,6 +68,11 @@ type Server struct {
 	// WakeRunningBudget bounds the wait once the control plane reports the
 	// environment RUNNING; see ensureAwake. Zero means DefaultWakeRunningBudget.
 	WakeRunningBudget time.Duration
+	// WakeNoCapacityGrace, when positive, fails a guest call with
+	// ResourceExhausted once the router has said for this long that no
+	// worker has room for the environment; see ensureAwake. Zero (the
+	// default) keeps waiting for the whole WakeBudget.
+	WakeNoCapacityGrace time.Duration
 	// Info is the build and configuration GetServerInfo reports.
 	Info ServerInfo
 	// RouterTLS, when set, is the client TLS configuration for the router's
@@ -181,9 +187,10 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 	}
 
 	opts := ate.CreateOptions{
-		ID:       req.GetId(),
-		Template: templateName,
-		Atespace: atespace,
+		ID:             req.GetId(),
+		Template:       templateName,
+		Atespace:       atespace,
+		WorkerSelector: req.GetWorkerSelector(),
 	}
 	if err := s.client.Create(ctx, opts); err != nil {
 		return nil, toGRPCError(err)
@@ -197,7 +204,8 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 				Name:     templateName,
 				Atespace: atespace,
 			},
-			Status: ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_UNSPECIFIED,
+			Status:         ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_UNSPECIFIED,
+			WorkerSelector: req.GetWorkerSelector(),
 		},
 	}, nil
 }
@@ -243,12 +251,14 @@ func (s *Server) ensureImageTemplate(ctx context.Context, atespace, base, image 
 }
 
 // getOrCreateImageTemplate returns the derived template name, creating it
-// from base when it does not exist.
+// from base when it does not exist. A template that runs the same digest
+// under another repository path is reused: the digest pins the bytes, and
+// datasets list one image under many paths.
 func (s *Server) getOrCreateImageTemplate(ctx context.Context, atespace, base, name, image string) (*ateapipb.ActorTemplate, error) {
 	existing, err := s.client.GetActorTemplate(ctx, atespace, name)
 	switch {
 	case err == nil:
-		if got := firstContainerImage(existing); got != image {
+		if got := firstContainerImage(existing); !sameImageDigest(got, image) {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"actor template %q exists but runs %q, not %q; delete it or use another base template", name, got, image)
 		}
@@ -275,9 +285,16 @@ func (s *Server) getOrCreateImageTemplate(ctx context.Context, atespace, base, n
 	if !errors.Is(err, ate.ErrAlreadyExists) {
 		return nil, toGRPCError(err)
 	}
-	// A concurrent create won the race; it built the same template.
+	// A concurrent create won the race. It may have built the template for
+	// another digest that shares the first 12 hex digits (the derived name
+	// keeps only those), so check the image as for a template that already
+	// existed.
 	if existing, err = s.client.GetActorTemplate(ctx, atespace, name); err != nil {
 		return nil, toGRPCError(err)
+	}
+	if got := firstContainerImage(existing); !sameImageDigest(got, image) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"actor template %q exists but runs %q, not %q; delete it or use another base template", name, got, image)
 	}
 	return existing, nil
 }
@@ -287,6 +304,21 @@ func firstContainerImage(t *ateapipb.ActorTemplate) string {
 		return ""
 	}
 	return t.GetContainers()[0].GetImage()
+}
+
+// sameImageDigest reports whether two digest-pinned references name the same
+// image, whatever their repository paths. An unpinned reference matches
+// nothing.
+func sameImageDigest(a, b string) bool {
+	da, err := ImageDigest(a)
+	if err != nil {
+		return false
+	}
+	db, err := ImageDigest(b)
+	if err != nil {
+		return false
+	}
+	return da == db
 }
 
 // GetEnvironment retrieves the status and configuration of an existing environment.
@@ -319,7 +351,16 @@ func (s *Server) SuspendEnvironment(ctx context.Context, req *ateenvv1alpha.Susp
 		atespace = DefaultAtespace
 	}
 
-	if err := s.client.Suspend(ctx, atespace, req.GetId()); err != nil {
+	var err error
+	switch req.GetMode() {
+	case ateenvv1alpha.SuspendMode_SUSPEND_MODE_UNSPECIFIED, ateenvv1alpha.SuspendMode_SUSPEND_MODE_DURABLE:
+		err = s.client.Suspend(ctx, atespace, req.GetId())
+	case ateenvv1alpha.SuspendMode_SUSPEND_MODE_LOCAL:
+		err = s.client.SuspendLocal(ctx, atespace, req.GetId())
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "mode %d is not a SuspendMode", req.GetMode())
+	}
+	if err != nil {
 		return nil, toGRPCError(err)
 	}
 
@@ -616,7 +657,7 @@ func (s *Server) guestConn(ctx context.Context, atespace, id string) (*grpc.Clie
 // the pod identity certificate when RouterTLS is set, else plaintext.
 func (s *Server) routerCredentials() credentials.TransportCredentials {
 	if s.RouterTLS != nil {
-		return credentials.NewTLS(s.RouterTLS)
+		return routertls.TransportCredentials(s.RouterTLS)
 	}
 	return insecure.NewCredentials()
 }
@@ -639,8 +680,21 @@ func ActorToEnvironment(actor *ateapipb.Actor) *ateenvv1alpha.Environment {
 			Name:     templateName,
 			Atespace: templateAtespace,
 		},
-		Status: ActorStatusToEnvStatus(actor.GetStatus()),
+		Status:         ActorStatusToEnvStatus(actor.GetStatus()),
+		Node:           actorNode(actor.GetStatus()),
+		WorkerSelector: actor.GetWorkerSelector().GetMatchLabels(),
 	}
+}
+
+// actorNode is the node an actor is on: the one hosting its worker, or its
+// local snapshot while it is suspended (assigned_node), which the worker
+// assignment confirms while it runs. Empty before the first placement and
+// after a detach.
+func actorNode(st *ateapipb.ActorStatus) string {
+	if node := st.GetAssignedNode(); node != "" {
+		return node
+	}
+	return st.GetWorkerAssignment().GetNodeName()
 }
 
 // ActorStatusToEnvStatus maps an ateapipb ActorStatus to an ateenvv1alpha EnvironmentStatus.
@@ -656,10 +710,16 @@ func ActorStatusToEnvStatus(st *ateapipb.ActorStatus) ateenvv1alpha.EnvironmentS
 	case ateapipb.ActorState_ACTOR_STATE_SUSPENDING:
 		return ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDING
 	case ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
-		// Since substrate#2620 a paused actor is SUSPENDED too, with a
-		// node-local latest snapshot; Substrate has no PAUSED or PAUSING
-		// state. ate-env never pauses, so ENVIRONMENT_STATUS_PAUSED and
-		// _PAUSING are no longer produced.
+		// Since substrate#2620 a paused actor is SUSPENDED too; Substrate has
+		// no PAUSED or PAUSING state. The latest snapshot tells the two
+		// apart: a local suspend (SUSPEND_MODE_LOCAL) leaves it on a node
+		// with its upload pending, and the actor resumes on that node only.
+		// Once the upload lands the environment is SUSPENDED like any other.
+		// ENVIRONMENT_STATUS_PAUSING is never produced: Substrate reports
+		// SUSPENDING for both modes.
+		if localOnly(latestSnapshot(st)) {
+			return ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_PAUSED
+		}
 		return ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_SUSPENDED
 	case ateapipb.ActorState_ACTOR_STATE_CRASHED:
 		return ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_CRASHED
@@ -668,6 +728,25 @@ func ActorStatusToEnvStatus(st *ateapipb.ActorStatus) ateenvv1alpha.EnvironmentS
 	default:
 		return ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_UNSPECIFIED
 	}
+}
+
+// latestSnapshot returns the actor's snapshot with the highest generation, or
+// nil when it has none.
+func latestSnapshot(st *ateapipb.ActorStatus) *ateapipb.Snapshot {
+	var latest *ateapipb.Snapshot
+	for _, snap := range st.GetSnapshots() {
+		if latest == nil || snap.GetGeneration() > latest.GetGeneration() {
+			latest = snap
+		}
+	}
+	return latest
+}
+
+// localOnly reports whether snap exists on a node and not yet in object
+// storage: what a local suspend leaves until its background upload lands.
+func localOnly(snap *ateapipb.Snapshot) bool {
+	return snap.GetLocality() != "" &&
+		snap.GetDurableSnapshot().GetState() != ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED
 }
 
 func toGRPCError(err error) error {

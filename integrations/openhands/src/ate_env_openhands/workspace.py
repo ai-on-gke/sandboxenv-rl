@@ -55,7 +55,7 @@ from typing import TYPE_CHECKING, Any
 
 import grpc
 import httpx
-from ate_env import EnvError, EnvironmentStatus, NotFoundError, RpcError
+from ate_env_rl import EnvError, EnvironmentStatus, NotFoundError, RpcError
 from openhands.sdk.logger import get_logger
 from openhands.sdk.workspace import RemoteWorkspace
 from pydantic import Field, PrivateAttr, field_serializer

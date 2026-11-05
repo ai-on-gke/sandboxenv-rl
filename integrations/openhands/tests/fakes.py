@@ -44,9 +44,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import grpc
 import grpc.aio
-from ate_env import EnvironmentStatus
-from ate_env._gen.ateenv.v1alpha import env_pb2, env_pb2_grpc
-from ate_env.loop_runner import LoopRunner
+from ate_env_rl import EnvironmentStatus
+from ate_env_rl._gen.ateenv.v1alpha import env_pb2, env_pb2_grpc
+from ate_env_rl.loop_runner import LoopRunner
 
 DEFAULT_ATESPACE = "ate-env"
 DEFAULT_TEMPLATE = "default-template"

@@ -14,7 +14,7 @@
 
 """One background event loop, and one ate-env client per endpoint, for all workspaces.
 
-The OpenHands workspace API is synchronous and ``ate_env.Client`` is asyncio
+The OpenHands workspace API is synchronous and ``ate_env_rl.Client`` is asyncio
 gRPC. A fleet of workspaces shares one loop thread and one channel per
 (endpoint, token) instead of a thread and a channel each. ``close_all``,
 registered with ``atexit``, closes the channels and stops the thread.
@@ -30,8 +30,8 @@ from collections import OrderedDict
 from collections.abc import Coroutine
 from typing import Any
 
-from ate_env import Client
-from ate_env.loop_runner import LoopRunner
+from ate_env_rl import Client
+from ate_env_rl.loop_runner import LoopRunner
 
 _lock = threading.Lock()
 _runner: LoopRunner | None = None

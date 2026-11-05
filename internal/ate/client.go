@@ -31,10 +31,12 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"strings"
 	"sync"
 
+	"github.com/agent-substrate/env/internal/routertls"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
@@ -157,7 +159,13 @@ func New(opts Options) (*Client, error) {
 		creds = credentials.NewTLS(&tls.Config{InsecureSkipVerify: opts.SkipVerify})
 	}
 
-	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
+	// svc/api in ate-system is headless, so the DNS resolver sees every
+	// ate-api-server pod. The default pick_first policy would still pin
+	// this client to one of them.
+	dialOpts := []grpc.DialOption{
+		grpc.WithTransportCredentials(creds),
+		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig":[{"round_robin":{}}]}`),
+	}
 	if opts.BearerTokenFile != "" {
 		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(fileTokenCreds{path: opts.BearerTokenFile}))
 	}
@@ -224,7 +232,7 @@ func (c *Client) DialGuest(atespace, id string) (*grpc.ClientConn, error) {
 	targetActor := atespace + "/" + id
 	routerCreds := insecure.NewCredentials()
 	if c.opts.RouterTLS != nil {
-		routerCreds = credentials.NewTLS(c.opts.RouterTLS)
+		routerCreds = routertls.TransportCredentials(c.opts.RouterTLS)
 	}
 	dialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(routerCreds),
@@ -287,6 +295,10 @@ type CreateOptions struct {
 	ID       string
 	Template string
 	Atespace string
+	// WorkerSelector, when non-empty, is the actor's own worker selector:
+	// labels the worker pool must carry, matched by exact equality and ANDed
+	// by Substrate with the template's selector.
+	WorkerSelector map[string]string
 }
 
 // Create registers a new actor from opts and starts it. ID and Template are
@@ -316,6 +328,9 @@ func (c *Client) Create(ctx context.Context, opts CreateOptions) error {
 			Atespace: atespace,
 			Name:     opts.Template,
 		},
+	}
+	if len(opts.WorkerSelector) > 0 {
+		actor.WorkerSelector = &ateapipb.Selector{MatchLabels: maps.Clone(opts.WorkerSelector)}
 	}
 	if _, err := c.control.CreateActor(ctx, &ateapipb.CreateActorRequest{Actor: actor}); err != nil {
 		return fmt.Errorf("ate: creating %q: %w", opts.ID, wrapGRPCError(err))
@@ -364,15 +379,30 @@ func (c *Client) List(ctx context.Context, atespace string) ([]*ateapipb.Actor, 
 // Suspend checkpoints and stops the actor with ID in atespace.
 // If atespace is empty, DefaultAtespace is used.
 //
-// The suspend is synchronous: it returns once the snapshot is in durable
-// storage, thus a suspended environment survives the loss of its node.
-// Substrate's default became asynchronous in substrate#2805 (the snapshot
-// stays on the node and uploads in the background); ate-env keeps the
-// durable behavior it always had.
+// The suspend is durable: it returns once the snapshot is in object storage,
+// thus a suspended environment survives the loss of its node. Substrate's
+// default became asynchronous in substrate#2805 (the snapshot stays on the
+// node and uploads in the background); ate-env keeps the durable behavior it
+// always had here and offers the other as SuspendLocal.
 func (c *Client) Suspend(ctx context.Context, atespace, id string) error {
+	return c.suspend(ctx, atespace, id, ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS)
+}
+
+// SuspendLocal checkpoints and stops the actor with ID in atespace and returns
+// once the snapshot is on the worker's node; the upload to object storage goes
+// on in the background. Until it lands the actor resumes on that node only,
+// and a node lost before then takes the snapshot with it. One
+// checkpoint-and-resume cycle is cheaper than with Suspend, which is what a
+// caller that parks an environment between every command wants.
+// If atespace is empty, DefaultAtespace is used.
+func (c *Client) SuspendLocal(ctx context.Context, atespace, id string) error {
+	return c.suspend(ctx, atespace, id, ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS)
+}
+
+func (c *Client) suspend(ctx context.Context, atespace, id string, mode ateapipb.DurabilityMode) error {
 	req := &ateapipb.SuspendActorRequest{
 		Actor:   c.ref(atespace, id),
-		Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
+		Options: &ateapipb.SuspendOptions{Mode: mode},
 	}
 	if _, err := c.control.SuspendActor(ctx, req); err != nil {
 		return fmt.Errorf("ate: suspending %q: %w", id, wrapGRPCError(err))

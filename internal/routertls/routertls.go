@@ -25,14 +25,20 @@
 package routertls
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
+
+	"google.golang.org/grpc/credentials"
 )
 
 // Options name the files and the router.
@@ -81,6 +87,77 @@ func (o Options) Identity() (string, error) {
 // fixes it.
 func RejectedCertificate(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "remote error: tls:")
+}
+
+// TransportCredentials wraps credentials.NewTLS(cfg) so gRPC client dials
+// report post-handshake TLS 1.3 alerts. In TLS 1.3 the client finishes
+// Handshake before the router verifies the client certificate. grpc-go then
+// writes the HTTP/2 client preface and flushes the initial SETTINGS frame
+// before awaiting its reader goroutine. If the router has already sent a TLS
+// alert and closed the socket, the second write fails with EPIPE and hides
+// the alert. When a write fails before any peer bytes arrive, alertConn
+// performs a short-deadline read to return a pending TLS alert.
+func TransportCredentials(cfg *tls.Config) credentials.TransportCredentials {
+	return &alertCreds{TransportCredentials: credentials.NewTLS(cfg)}
+}
+
+type alertCreds struct {
+	credentials.TransportCredentials
+}
+
+func (c *alertCreds) ClientHandshake(ctx context.Context, authority string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	conn, info, err := c.TransportCredentials.ClientHandshake(ctx, authority, rawConn)
+	if err != nil {
+		return nil, nil, err
+	}
+	return wrapAlertConn(conn), info, nil
+}
+
+func (c *alertCreds) Clone() credentials.TransportCredentials {
+	return &alertCreds{TransportCredentials: c.TransportCredentials.Clone()}
+}
+
+type sysConn = syscall.Conn
+
+type alertConn struct {
+	net.Conn
+	probeDone atomic.Bool
+}
+
+type alertSyscallConn struct {
+	*alertConn
+	sysConn
+}
+
+func wrapAlertConn(conn net.Conn) net.Conn {
+	ac := &alertConn{Conn: conn}
+	if sc, ok := conn.(syscall.Conn); ok {
+		return &alertSyscallConn{alertConn: ac, sysConn: sc}
+	}
+	return ac
+}
+
+const postHandshakeAlertReadTimeout = 50 * time.Millisecond
+
+func (c *alertConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.probeDone.Store(true)
+	}
+	return n, err
+}
+
+func (c *alertConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if err == nil || RejectedCertificate(err) || errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded) || c.probeDone.Swap(true) {
+		return n, err
+	}
+	_ = c.Conn.SetReadDeadline(time.Now().Add(postHandshakeAlertReadTimeout))
+	var one [1]byte
+	if _, rerr := c.Conn.Read(one[:]); RejectedCertificate(rerr) {
+		return n, rerr
+	}
+	return n, err
 }
 
 // RejectionAdvice is what an operator must check when the router rejects

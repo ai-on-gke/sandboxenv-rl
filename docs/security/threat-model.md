@@ -72,6 +72,7 @@ update this document in the same pull request. The pull request template asks fo
 | DNS rebinding: a page on an attacker's name resolves to the forwarded listener and becomes same-origin | None. | The listener does not check the `Host` header. The MCP handler sets `DisableLocalhostProtection: true`. |
 | The port proxy reaches the guest port | The port proxy refuses port 80, where the guest listens. | — |
 | Resource exhaustion | The port proxy bounds its idle tunnels with `idleTunnelsPerPort`, `idleTunnelsTotal` and `idleTunnelTimeout` in `internal/portproxy/portproxy.go`. Worker capacity bounds the running actors. | A token holder can create environments without a quota or a rate limit; suspended environments keep their snapshots in the bucket. The MCP handler keeps one server for each environment, and the client keeps one guest connection for each environment. Neither is evicted while the process runs. |
+| Control-plane detail in guest-call errors | A guest call to an environment that cannot start reports why: for one that the control plane moved to CRASHED while it was waking, the error carries Substrate's crash reason (`ActorStatus.crash.message`, at most 4096 characters), and with `--wake-no-capacity-grace` a call that no worker has room for carries the router's no-capacity text. Only a caller that may call that environment, thus one that has the token, gets it. The `ate-env-start-failure` trailer carries only `crashed` or `no-capacity`. | Some crash reasons include an atelet error verbatim, such as the error of a failed restore, and a message can name a node or a snapshot. A caller sees that detail for its own environments; it does not reveal other environments or credentials. |
 
 ## Boundary 2: ate-env-api to the Substrate control plane
 
@@ -117,6 +118,13 @@ What ate-env does not control: Substrate writes and reads the snapshots. The ope
 access control, the encryption and the retention of the bucket. What stays in the bucket after an
 environment or a template is deleted follows Substrate.
 
+A local suspend (`SuspendEnvironment` with `mode: SUSPEND_MODE_LOCAL`, `ate-env suspend --mode
+local`) returns before the upload: the snapshot sits on the worker's node, under Substrate's state
+directory, until atelet's background upload lands. That is the same data the bucket holds, for a
+shorter time, on the host that already ran the environment's memory; ate-env adds no reader to it,
+and the node's own access control applies. What a local suspend does trade is availability: a node
+lost before the upload lands takes the snapshot, and the environment, with it.
+
 Operator requirements:
 
 - Grant access to the bucket only to the Substrate identities that write and read snapshots. Block
@@ -128,6 +136,7 @@ Operator requirements:
 | Threat | Current mitigation | Gap |
 |---|---|---|
 | A reader of the bucket gets the memory, files and credentials of environments | The operator's bucket settings. | ate-env does not check the access control, the encryption or the retention of the bucket. |
+| A reader of a worker node gets the snapshot of a locally suspended environment before its upload lands | The snapshot sits where the running environment's memory sat; the node's own access control. A durable suspend uploads before it returns, but atelet keeps a local copy of the snapshot on the node until the actor detaches, thus both modes leave snapshot files on the worker node. | A node lost before the upload lands loses the environment (availability, not confidentiality). |
 
 ## On-demand rootfs images
 
@@ -137,7 +146,7 @@ container, and the guest is mounted into it as a read-only image volume.
 
 | Threat | Current mitigation | Gap |
 |---|---|---|
-| A caller runs an image of its choice under the settings of the base template (worker selector, snapshots bucket, resources) | The image must be pinned by digest. A template with that name that runs another image is refused with `FailedPrecondition`. | Any registry is accepted. |
+| A caller runs an image of its choice under the settings of the base template (worker selector, snapshots bucket, resources) | The image must be pinned by digest. A template with that name that runs another image is refused with `FailedPrecondition`, also when a concurrent create made it. | Any registry is accepted. |
 | Template growth | None. | Derived templates have no quota and no garbage collection. |
 
 Accepted risk for now: this hardening is not needed for RL at the moment. Revisit it before the
@@ -196,8 +205,8 @@ error. This is a compatibility risk, not a boundary of this threat model.
 | Item | Current state | Gap |
 |---|---|---|
 | Images | A template mounts the guest into a rootfs image only when the guest is pinned by digest. `.ko.yaml` pins the guest base image by digest. The README asks for the worker image by digest. | — |
-| Releases | `.github/workflows/release.yaml` signs the images with cosign keyless signing (GitHub Actions OIDC). Its actions are pinned by commit SHA. | This repository has published no release yet. |
-| Dependencies | `ate-env-api` links `prometheus/client_golang`, the OpenTelemetry SDK and OTLP/gRPC trace exporter, and `otelgrpc`; they run only when metrics or tracing is on. `uv.lock` pins every Python dependency of `clients/python` and the `integrations/*` projects (one uv workspace; `integrations/nemo-gym` and the others get `ate-env-client` from it as a workspace member) by version and SHA-256, and the Nix envs CI runs are built from it; uni-agent, a git dependency, is pinned by commit. `flake.lock` pins the toolchain (Go, the Python interpreters, uv, ko, kind, kubectl) and the Nix inputs; `go.mod`/`go.sum` pin the Go modules and the protobuf generators. Dependabot covers Go modules (`gomod`), `uv.lock` (`uv`; `openhands-*`, `uni-agent` and `grpcio-tools` are moved by hand), GitHub Actions, the OpenHands layer's base images (`docker`) and `flake.lock` (`nix`); see `.github/dependabot.yml`. `integrations/harbor` is a workspace member too; its `harbor` dependency is pinned to one minor in its `pyproject.toml` and bumped by hand (see Harbor integration). | — |
+| Releases | `.github/workflows/release.yaml` signs container images and CLI release blobs/checksums with Cosign keyless signing (GitHub Actions OIDC) and optionally publishes the Python client (`ate-env-rl`) to PyPI when `vars.PYPI_PUBLISH_ENABLED == 'true'` (or via manual tag `workflow_dispatch` with `publish_pypi=true`) using OIDC Trusted Publishing (`pypa/gh-action-pypi-publish`, `environment: pypi`, `refs/tags/<tag>` checkout, and PEP 440 tag/wheel version verification). Actions are pinned by commit SHA. | This repository has published no release yet; before the first release, repository settings must configure a `v*` tag ruleset, and before enabling `PYPI_PUBLISH_ENABLED=true`, restrict the `pypi` GitHub Environment to `v*` tags with required reviewers (see `docs/release.md`). |
+| Dependencies | `ate-env-api` links `prometheus/client_golang`, the OpenTelemetry SDK and OTLP/gRPC trace exporter, and `otelgrpc`; they run only when metrics or tracing is on. `uv.lock` pins every Python dependency of `clients/python` and the `integrations/*` projects (one uv workspace; `integrations/nemo-gym` and the others get `ate-env-rl` from it as a workspace member) by version and SHA-256, and the Nix envs CI runs are built from it; uni-agent, a git dependency, is pinned by commit. `flake.lock` pins the toolchain (Go, the Python interpreters, uv, ko, kind, kubectl) and the Nix inputs; `go.mod`/`go.sum` pin the Go modules and the protobuf generators. Dependabot covers Go modules (`gomod`), `uv.lock` (`uv`; `openhands-*`, `uni-agent` and `grpcio-tools` are moved by hand), GitHub Actions, the OpenHands layer's base images (`docker`) and `flake.lock` (`nix`); see `.github/dependabot.yml`. `integrations/harbor` is a workspace member too; its `harbor` dependency is pinned to one minor in its `pyproject.toml` and bumped by hand (see Harbor integration). | — |
 | Integrations and examples | The code in `integrations/` is maintained. | The code in `examples/` is not supported: it gets no security fixes and no compatibility promise. |
 
 ## Known gaps

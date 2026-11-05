@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package swebench holds the data types of the Fast Substrate RL benchmark on
+// Package swebench holds the data types of the simulated RL benchmark on
 // SWE-bench Verified, and the runner that drives them through the ate-env API.
 //
 //   - Instance and LoadDataset: the JSONL manifest, one record per SWE-bench

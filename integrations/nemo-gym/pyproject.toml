@@ -18,14 +18,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nemo-gym-substrate"
-version = "0.2.0"
+version = "0.3.0"
 description = "NeMo Gym sandbox provider backed by Agent Substrate actors (via ate-env)"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
-# ate-env-client is this repo's Python client (clients/python); it is not on
-# PyPI yet, so install it from the checkout first: pip install ./clients/python
-dependencies = ["ate-env-client>=0.1.0", "grpcio>=1.84"]
+# ate-env-rl is this repo's Python client (clients/python); if not yet on
+# PyPI, install it from the checkout first: pip install ./clients/python
+dependencies = ["ate-env-rl", "grpcio>=1.84"]
 
 [project.optional-dependencies]
 # The real deployment target. Without it the package falls back to local
@@ -39,7 +39,7 @@ substrate = "nemo_gym_substrate.provider:SubstrateSandboxProvider"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-# ate-env-client is not published; resolve it from this checkout so
+# Resolve ate-env-rl from this checkout so
 # `uv run --extra test pytest` works without a prior pip install.
 [tool.uv.sources]
-ate-env-client = { workspace = true }
+ate-env-rl = { workspace = true }

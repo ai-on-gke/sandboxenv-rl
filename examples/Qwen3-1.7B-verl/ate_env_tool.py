@@ -99,7 +99,7 @@ class _EnvPool:
     """Warm pool of ate-env environments shared by the tool instances on one event loop."""
 
     def __init__(self, endpoint: str, max_envs: int, rootfs_image: str | None, prefix: str):
-        from ate_env import Client  # grpc client, installed in the rollout image
+        from ate_env_rl import Client  # grpc client, installed in the rollout image
 
         self.endpoint = endpoint
         self.prefix = prefix
@@ -176,7 +176,7 @@ def _delete_pools_at_exit() -> None:
     _POOLS.clear()
     if not any(by_endpoint.values()):
         return
-    from ate_env import Client
+    from ate_env_rl import Client
 
     async def delete_all():
         for endpoint, ids in by_endpoint.items():

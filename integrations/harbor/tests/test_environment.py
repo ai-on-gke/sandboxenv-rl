@@ -17,21 +17,23 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
 import shutil
 import stat
+import tarfile
 import time
 from pathlib import Path
 
 import pytest
-from ate_env import FailedPreconditionError, RpcError
+from ate_env_rl import FailedPreconditionError, RpcError
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.config import ResourceMode
 
 from ate_env_harbor import AteEnvEnvironment
-from ate_env_harbor.environment import RECORD_FILE, WHOAMI_COMMAND
+from ate_env_harbor.environment import RECORD_FILE, WHOAMI_COMMAND, pack_dir_as_root
 
 from .conftest import ALPINE
 
@@ -61,7 +63,7 @@ async def test_start_creates_from_the_digest_and_the_class_template(fake, make_e
         assert fake.state.creates == [
             {"id": env.env_id, "atespace": "ate-env", "template": "harbor-c1-m512", "rootfs_image": ALPINE}
         ]
-        assert env.env_id.startswith("hb-echo-abcdef-env")
+        assert env.env_id.startswith("hb-echo-abcdef")
         assert "true" in commands(fake) and WHOAMI_COMMAND in commands(fake)
         record = json.loads((env.trial_paths.trial_dir / RECORD_FILE).read_text())
         assert record["id"] == env.env_id
@@ -73,6 +75,62 @@ async def test_start_creates_from_the_digest_and_the_class_template(fake, make_e
         await env.stop(delete=True)
     assert fake.state.deletes == [env.env_id]
     assert fake.state.envs == {}
+
+
+async def test_separate_verifier_environment_keeps_its_own_record(fake, make_env, tmp_path):
+    # Harbor's separate verifier mode starts a second environment for the same
+    # trial directory; found live: its record overwrote the agent's.
+    from harbor.models.trial.paths import TrialPaths
+
+    paths = TrialPaths(trial_dir=tmp_path / "echo__AbCdEf")  # Harbor names the trial dir after the trial
+    paths.mkdir()
+    agent = make_env(session_id="echo__AbCdEf__env")
+    verifier = make_env(session_id="echo__AbCdEf__verifier__trial")
+    agent.trial_paths = verifier.trial_paths = paths
+    await agent.start(force_build=False)
+    await verifier.start(force_build=False)
+    try:
+        assert agent.record_file == "ate_env.json" and verifier.record_file == "ate_env.verifier.trial.json"
+        a = json.loads((paths.trial_dir / "ate_env.json").read_text())
+        v = json.loads((paths.trial_dir / "ate_env.verifier.trial.json").read_text())
+        assert (a["id"], a["session_id"]) == (agent.env_id, "echo__AbCdEf__env")
+        assert (v["id"], v["session_id"]) == (verifier.env_id, "echo__AbCdEf__verifier__trial")
+    finally:
+        await agent.stop(delete=True)
+        await verifier.stop(delete=True)
+
+
+def test_record_file_survives_harbor_truncation_and_multi_step_verifiers(fake, make_env, tmp_path):
+    # Harbor 0.25 truncates a separate verifier's session id to 63 characters:
+    # safe[:53] + "__" + sha1[:8] (trial.py, _separate_verifier_session_id),
+    # which cuts "__verifier__" off for trial names of 42 characters or more.
+    import hashlib
+
+    from harbor.models.trial.paths import TrialPaths
+
+    trial_name = "swebench-verified-django-django-16379-fix__aBcDeFg"  # 50 characters
+    assert len(trial_name) == 50
+    paths = TrialPaths(trial_dir=tmp_path / trial_name)
+    paths.mkdir()
+
+    def verifier_session(key: str) -> str:
+        raw = f"{trial_name}__verifier__{key}"
+        safe = "".join(c if c.isalnum() or c in "-._" else "_" for c in raw)
+        return safe if len(safe) <= 63 else safe[:53] + "__" + hashlib.sha1(raw.encode()).hexdigest()[:8]
+
+    agent = make_env(session_id=f"{trial_name}__env")
+    step_a = make_env(session_id=verifier_session("grade"))
+    step_b = make_env(session_id=verifier_session("lint"))
+    for env in (agent, step_a, step_b):
+        env.trial_paths = paths
+    assert "__verifier__" not in step_a.session_id  # the marker is cut off
+    assert agent.record_file == "ate_env.json"
+    assert step_a.record_file.startswith("ate_env.verifier.") and step_a.record_file.endswith(".json")
+    assert step_a.record_file != step_b.record_file != agent.record_file
+    # A short trial name keeps the step name readable.
+    short = make_env(session_id="echo__AbCdEf__verifier__grade")
+    short.trial_paths = TrialPaths(trial_dir=tmp_path / "echo__AbCdEf")
+    assert short.record_file == "ate_env.verifier.grade.json"
 
 
 async def test_environment_dir_is_uploaded_to_the_workdir(fake, make_env):
@@ -328,6 +386,40 @@ async def test_shared_client_cache_evicts_closed_loops(fake):
     assert not any(bound.is_closed() for _, bound in _client._clients.values())
 
 
+def test_uploaded_archives_are_owned_by_root(tmp_path):
+    # GNU tar extracting as root restores the archived owner; inside an actor
+    # a chown to the host's uid fails. Pack with root ownership instead.
+    src = tmp_path / "src"
+    (src / "sub").mkdir(parents=True)
+    (src / "empty").mkdir()
+    (src / "a.sh").write_text("#!/bin/sh\n")
+    (src / "a.sh").chmod(0o750)
+    (src / "link").symlink_to("a.sh")
+    with tarfile.open(fileobj=io.BytesIO(pack_dir_as_root(src)), mode="r:gz") as tar:
+        members = {m.name: m for m in tar.getmembers()}
+    assert set(members) == {".", "./sub", "./empty", "./a.sh", "./link"}
+    assert all(m.uid == 0 and m.gid == 0 and m.uname == "root" and m.gname == "root" for m in members.values())
+    assert members["./a.sh"].mode & 0o777 == 0o750
+    assert members["./link"].issym() and members["./link"].linkname == "a.sh"
+    assert members["./empty"].isdir()
+
+
+def test_pack_dir_as_root_follows_a_symlinked_source_dir(tmp_path):
+    # tar.add on a symlinked source_dir archives "." as a SYMLINK member and
+    # GNU tar then fails to extract it into an existing directory. The top
+    # level is resolved; symlinks inside the tree stay symlinks.
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "a.sh").write_text("#!/bin/sh\n")
+    (real / "link").symlink_to("a.sh")
+    (tmp_path / "alias").symlink_to(real, target_is_directory=True)
+    with tarfile.open(fileobj=io.BytesIO(pack_dir_as_root(tmp_path / "alias")), mode="r:gz") as tar:
+        members = {m.name: m for m in tar.getmembers()}
+    assert set(members) == {".", "./a.sh", "./link"}
+    assert members["."].isdir()
+    assert members["./link"].issym() and members["./link"].linkname == "a.sh"
+
+
 async def test_download_dir_of_a_missing_directory_fails_clearly(fake, make_env, tmp_path):
     env = make_env()
     await env.start(force_build=False)
@@ -515,3 +607,132 @@ async def test_preflight_checks_the_api_from_the_environment(fake, monkeypatch):
 
 def test_task_dir_fixture_is_the_echo_task(task_dir: Path):
     assert (task_dir / "tests" / "test.sh").exists()
+
+
+# --- tools as a second layer: tool_paths ---
+
+
+def _layer(tmp_path: Path) -> Path:
+    tools = tmp_path / "layer" / "bin"
+    tools.mkdir(parents=True)
+    tool = tools / "hb-tool"
+    tool.write_text("#!/bin/sh\necho from-layer\n")
+    tool.chmod(0o755)
+    return tools
+
+
+async def test_tool_paths_go_first_on_path_for_every_exec(fake, make_env, tmp_path):
+    tools = _layer(tmp_path)
+    env = make_env(tool_paths=str(tools))
+    await env.start(force_build=False)
+    try:
+        result = await env.exec("hb-tool")
+        assert (result.return_code, result.stdout.strip()) == (0, "from-layer")
+        command = fake.state.execs[-1]["command"][-1]
+        assert command.startswith("PATH=") and str(tools) in command and command.endswith("; hb-tool")
+        assert "${PATH:+:$PATH}" in command
+        result = await env.exec('echo "$PATH"')
+        assert result.stdout.startswith(f"{tools}:")
+        # An empty PATH gets the tools alone: no trailing colon, no cwd on PATH.
+        result = await env.exec("sh -c 'unset PATH; " + env._tooled('echo "$PATH"') + "'")
+        assert result.stdout.strip() == str(tools)
+        record = json.loads((env.trial_paths.trial_dir / RECORD_FILE).read_text())
+        assert record["tool_paths"] == [str(tools)]
+        assert record["tool_paths_profile"] == env._tool_paths_profile
+    finally:
+        await env.stop(delete=True)
+
+
+def test_tool_paths_accepts_a_list_or_a_colon_separated_string(fake, make_env):
+    assert make_env(tool_paths="/opt/a/bin:/opt/b/bin").tool_paths == ("/opt/a/bin", "/opt/b/bin")
+    assert make_env(tool_paths=["/opt/a/bin"]).tool_paths == ("/opt/a/bin",)
+    assert make_env(tool_paths=["/opt/a/bin:/opt/b/bin"]).tool_paths == ("/opt/a/bin", "/opt/b/bin")
+    assert make_env().tool_paths == ()
+    with pytest.raises(ValueError, match="absolute"):
+        make_env(tool_paths="opt/a/bin")
+    with pytest.raises(ValueError, match="absolute"):
+        make_env(tool_paths=["/opt/a/bin:rel"])  # a list item that hides a relative path
+
+
+async def test_missing_tool_path_fails_start_and_deletes_the_environment(fake, make_env, tmp_path):
+    absent = tmp_path / "no-layer" / "bin"
+    env = make_env(tool_paths=str(absent))
+    with pytest.raises(RuntimeError, match="--layer"):
+        await env.start(force_build=False)
+    assert fake.state.deletes == [env.env_id]
+    assert fake.state.envs == {}
+
+
+async def test_tool_paths_survive_the_user_switch(fake, make_env, tmp_path):
+    fake.state.whoami = "app"
+    bin_dir = minimal_bin(tmp_path)
+    sudo = bin_dir / "sudo"
+    sudo.write_text('#!/bin/sh\nshift 3\nexec env -i PATH="$PATH" "$@"\n')  # resets the environment, like sudo
+    sudo.chmod(0o755)
+    fake.state.child_path = str(bin_dir)
+    tools = _layer(tmp_path)
+    env = make_env(tool_paths=str(tools))
+    await env.start(force_build=False)
+    try:
+        result = await env.exec("hb-tool", user="root")
+        assert (result.return_code, result.stdout.strip()) == (0, "from-layer")
+    finally:
+        await env.stop(delete=True)
+
+
+async def test_file_helpers_see_the_tool_path(fake, make_env, tmp_path):
+    tools = _layer(tmp_path)
+    env = make_env(tool_paths=str(tools))
+    await env.start(force_build=False)
+    try:
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a").write_text("a")
+        await env.upload_dir(src, str(tmp_path / "dst"))
+        unpack = [c for c in commands(fake) if "tar -xzf" in c][-1]
+        assert unpack.startswith("PATH=") and str(tools) in unpack
+        assert (tmp_path / "dst" / "a").read_text() == "a"
+        await env.download_dir(str(tmp_path / "dst"), tmp_path / "back")
+        pack, cleanup = [c for c in commands(fake) if "tar -czf" in c or c.endswith(".tgz")][-2:]
+        assert pack.startswith("PATH=") and cleanup.startswith("PATH=") and "rm -f" in cleanup
+    finally:
+        await env.stop(delete=True)
+
+
+async def test_tool_paths_profile_gives_login_shells_the_tools(fake, make_env, tmp_path):
+    tools = _layer(tmp_path)
+    profile = tmp_path / "etc" / "profile.d" / "zz-harbor-tools.sh"
+    env = make_env(tool_paths=str(tools), tool_paths_profile=str(profile))
+    await env.start(force_build=False)
+    try:
+        text = profile.read_text()
+        assert text.splitlines()[-1] == f"PATH={tools}${{PATH:+:$PATH}}; export PATH"
+        # What /etc/profile does on Debian and Alpine: set PATH, then source the drop-in.
+        result = await env.exec(f"PATH=/usr/bin:/bin; . {profile}; command -v hb-tool; echo \"$PATH\"")
+        assert result.stdout.splitlines() == [f"{tools}/hb-tool", f"{tools}:/usr/bin:/bin"]
+    finally:
+        await env.stop(delete=True)
+
+
+async def test_tool_paths_profile_is_a_warning_when_not_writable(fake, make_env, tmp_path, caplog):
+    tools = _layer(tmp_path)
+    env = make_env(tool_paths=str(tools), tool_paths_profile="/dev/null/zz-harbor-tools.sh")
+    with caplog.at_level(logging.WARNING):
+        await env.start(force_build=False)
+    try:
+        assert "could not write /dev/null/zz-harbor-tools.sh" in caplog.text
+        assert (await env.exec("hb-tool")).stdout.strip() == "from-layer"
+    finally:
+        await env.stop(delete=True)
+
+
+async def test_tool_paths_profile_can_be_disabled(fake, make_env, tmp_path):
+    tools = _layer(tmp_path)
+    env = make_env(tool_paths=str(tools), tool_paths_profile="")
+    await env.start(force_build=False)
+    try:
+        assert not any(w[0].endswith("zz-harbor-tools.sh") for w in fake.state.writes)
+        record = json.loads((env.trial_paths.trial_dir / RECORD_FILE).read_text())
+        assert record["tool_paths_profile"] is None
+    finally:
+        await env.stop(delete=True)

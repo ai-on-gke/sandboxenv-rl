@@ -16,7 +16,7 @@
 
 import pytest
 
-from ate_env import FleetConfig, SandboxFleet, Task
+from ate_env_rl import FleetConfig, SandboxFleet, Task
 
 
 def _handle():

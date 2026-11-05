@@ -16,9 +16,9 @@ import asyncio
 
 import pytest
 
-from ate_env.async_fleet import AsyncSandboxFleet
-from ate_env.config import FleetConfig
-from ate_env.types import Task
+from ate_env_rl.async_fleet import AsyncSandboxFleet
+from ate_env_rl.config import FleetConfig
+from ate_env_rl.types import Task
 
 
 @pytest.mark.asyncio
@@ -147,7 +147,7 @@ async def test_async_fleet_step_timeout_applies_to_handle():
 
 @pytest.mark.asyncio
 async def test_acquire_batch_releases_acquired_handles_on_partial_failure():
-    from ate_env.errors import SandboxStartError
+    from ate_env_rl.errors import SandboxStartError
 
     cfg = FleetConfig(backend="mock")
     fleet = AsyncSandboxFleet(cfg)
@@ -171,7 +171,7 @@ async def test_acquire_batch_releases_acquired_handles_on_partial_failure():
 @pytest.mark.asyncio
 async def test_acquire_batch_partial_failure_releases_through_the_fleet():
     """The cleanup releases go through fleet.release, so the report and metrics see them."""
-    from ate_env.errors import SandboxStartError
+    from ate_env_rl.errors import SandboxStartError
 
     fleet = AsyncSandboxFleet(FleetConfig(backend="mock"))
     tasks = [Task(id=f"t-{i}", image="img-1") for i in range(3)]

@@ -20,7 +20,7 @@ This repo started in October 2026 as a copy of [agent-substrate/env](https://git
 with its history, its pull requests (recreated here with an `[env#N]` title prefix) and its open
 issues. agent-substrate/env is being repurposed, and the RL work continues here. The components keep
 their ate-env names: the `ate-env`, `ate-env-api` and `ate-env-guest` binaries and images, the
-`ate_env` Python package and the `ateenv.v1alpha` API. The Go module path is still
+`ate_env_rl` Python package and the `ateenv.v1alpha` API. The Go module path is still
 `github.com/agent-substrate/env`.
 
 The focus moves from a general environment service to RL training and evaluation:
@@ -54,48 +54,73 @@ See [docs/architecture.md](./docs/architecture.md) for the full system design an
 |---|---|
 | [`cmd/ate-env`](./cmd/ate-env) | CLI: create, suspend and delete environments, run commands, move files, and print the Kubernetes and Substrate manifests. |
 | [`cmd/ate-env-api`](./cmd/ate-env-api) | The API service: environment lifecycle, guest calls, MCP and the port proxy. |
-| [`cmd/ate-env-guest`](./cmd/ate-env-guest) | The daemon inside each environment: processes and files. |
-| [`clients/python`](./clients/python/README.md) | Python client, import name `ate_env`: `Client` and `Env` for single environments, and the fleet SDK. |
-| [`clients/go`](./clients/go) | Go client. |
-| [`integrations/`](#integrations) | Framework integrations. |
-| [`examples/`](#examples) | Runnable examples. |
-| [`benchmarking/`](./benchmarking/swebench/README.md), [`cmd/benchmarking`](./cmd/benchmarking), [`internal/benchmarking`](./internal/benchmarking/DESIGN.md) | The SWE-bench loader, its scripts and the benchmark design. |
-| [`docs/`](./docs) | Architecture, glossary, rootfs images, runtime layers, the [metrics reference](./docs/metrics.md), the [threat model](./docs/security/threat-model.md), developer guides, and how releases are cut. |
+| [`cmd/ate-env-guest`](./cmd/ate-env-guest), [`guest/`](./guest) | The daemon inside each environment (a PID 1 init with sidecar supervision) and its services: `guest/process` and `guest/filesystem`. |
+| [`cmd/benchmarking`](./cmd/benchmarking) | The benchmark binaries: `swebench-loader` and the `bench` harness. |
+| [`clients/`](./clients/README.md) | The Go client (package `env`) and the Python client `ate_env_rl` with the fleet SDK. |
+| [`integrations/`](./integrations/README.md) | Framework integrations: Harbor, NeMo Gym, OpenHands, uni-agent. |
+| [`examples/`](./examples/README.md) | Runnable examples, from a Go MCP client to multi-node agentic GRPO recipes. Not supported. |
+| [`benchmarking/`](./benchmarking/README.md) | The SWE-bench loader scripts, the `bench` scenarios, the telemetry report tool and the benchmarking skills. |
+| [`internal/`](./internal) | The packages the binaries are built from: `apiservice` (the gRPC server), `ate` (the Substrate client), `mcp`, `portproxy`, `routertls`, `hostcheck`, `telemetry`, `tool`, `unknownfields`, `benchmarking/*`, the test doubles in `internaltest` (`fakecontrol`, `fakerouter`, `testcerts`) and a lifecycle walkthrough in `examples/env`. |
+| [`proto/ateenv/v1alpha`](./proto/ateenv/v1alpha) | The `ateenv.v1alpha` API: `env.proto` (`EnvironmentService`) and `guest.proto` (`ProcessService`, `FileSystemService`), with the generated Go stubs. |
+| [`docs/`](./docs) | [Architecture](./docs/architecture.md), [glossary](./docs/glossary.md), [observability](./docs/observability.md), the [metrics reference](./docs/metrics.md), [rootfs images and runtime layers](./docs/rootfs-images/README.md), the [threat model](./docs/security/threat-model.md), [support](./docs/support.md), [releases](./docs/release.md), the developer guides in [`docs/dev`](./docs/dev), the maintenance chores in [`docs/chores`](./docs/chores), and the plans in [`docs/plans`](./docs/plans). |
+| [`hack/`](./hack) | Repository scripts, checks and generators: the CI runners in [`hack/ci`](./hack/ci) (the Kind e2e run, the smoke test, pin and Substrate head checks), release automation in [`hack/release`](./hack/release), license boilerplate, [`hack/verify`](./hack/verify) and `metrics-docs` (renders `docs/metrics.md`). |
+| [`nix/`](./nix), [`flake.nix`](./flake.nix), [`uv.lock`](./uv.lock) | The Nix flake: the `devShell`s, the Python environments built from `uv.lock` (`python.nix`), and the CI scripts `ci-go`, `ci-python`, `ci-e2e` and `ci-release` (`ci.nix`). |
+| [`tests/telemetry`](./tests/telemetry) | The OpenTelemetry collector configuration of the telemetry acceptance run. |
+| [`.github/`](./.github) | CI and release workflows, Dependabot, code owners, the pull request template. |
+| [`AGENTS.md`](./AGENTS.md), [`.agents/skills`](./.agents/skills) | Instructions for coding agents and the repository skills. [`CHANGELOG.md`](./CHANGELOG.md) collects user-visible changes. |
+
+Each of `clients/`, `integrations/`, `examples/` and `benchmarking/` has a README that
+lists what is inside.
 
 ## Examples
 
+[`examples/README.md`](./examples/README.md) lists each example with what it needs and how to run
+it.
+
 | Example | What it shows |
 |---|---|
-| [`examples/grpo`](examples/grpo/README.md) | A real RL loop: TRL's GRPOTrainer trains Qwen2.5-0.5B on MBPP, and each completion runs in an environment that computes the reward. Covers the park/wake pattern, with the fleet suspended after each step. CPU only. |
-| [`examples/runtime-layers`](examples/runtime-layers/README.md) | An unmodified rootfs image with a second runtime injected as a layer and supervised as a sidecar. |
-| [`examples/harbor`](examples/harbor/README.md) | Terminal-Bench 2.0 on ate-env through the Harbor provider: prebuilt images, resource class templates, `run-tb2.sh` around `harbor run`, and the comparison with Docker. |
-| [`examples/mcp`](examples/mcp/main.go) | Go: connect to an environment's MCP endpoint, list the tools and call them. |
-| [`examples/guest-daemon`](examples/guest-daemon/README.md) | Go: run the guest gRPC services standalone, without a cluster. |
-| [`examples/Qwen3.5-35B-A3B-verl`](examples/Qwen3.5-35B-A3B-verl/README.md) | Agentic GRPO on real SWE tasks: verl `separate_async` with a Megatron trainer and vLLM rollouts on separate nodes, a uni-agent ReAct agent whose tools and hidden-test grading run in environments. Two 8-GPU nodes. |
-| [`examples/openhands`](examples/openhands/README.md) | OpenHands agents and tools on the agent-server that a runtime layer mounts into any task image, through `integrations/openhands`. |
+| [`examples/grpo`](./examples/grpo/README.md) | A real RL loop: TRL's GRPOTrainer trains Qwen2.5-0.5B on MBPP, and each completion runs in an environment that computes the reward. Covers the park/wake pattern, with the fleet suspended after each step. CPU only. |
+| [`examples/runtime-layers`](./examples/runtime-layers/README.md) | An unmodified rootfs image with a second runtime injected as a layer and supervised as a sidecar. |
+| [`examples/harbor`](./examples/harbor/README.md) | Terminal-Bench 2.0 on ate-env through the Harbor provider: prebuilt images, resource class templates, `run-tb2.sh` around `harbor run`, and the comparison with Docker. |
+| [`examples/harbor-tools-layer`](./examples/harbor-tools-layer/README.md) | Harbor with tools as a second layer: a static tmux and asciinema layer mounted into every task image, the class templates registered with `--layer`, and `harbor run` with the layer first on `PATH`, thus terminus-2 installs nothing. |
+| [`examples/mcp`](./examples/mcp/main.go) | Go: connect to an environment's MCP endpoint, list the tools and call them. |
+| [`examples/guest-daemon`](./examples/guest-daemon/README.md) | Go: run the guest gRPC services standalone, without a cluster. |
+| [`examples/Qwen3.5-35B-A3B-verl`](./examples/Qwen3.5-35B-A3B-verl/README.md) | Agentic GRPO on real SWE tasks: verl `separate_async` with a Megatron trainer and vLLM rollouts on separate nodes, a uni-agent ReAct agent whose tools and hidden-test grading run in environments. Two 8-GPU nodes. |
+| [`examples/openhands`](./examples/openhands/README.md) | OpenHands agents and tools on the agent-server that a runtime layer mounts into any task image, through `integrations/openhands`. |
+| [`examples/Qwen3-1.7B-verl`](./examples/Qwen3-1.7B-verl/README.md) | Agentic GRPO on MATH with verl `fully_async_policy`: the model writes Python that runs in an environment through a verl tool. Trainer and rollouts on separate GPU nodes. |
+| [`examples/verl_swebench`](./examples/verl_swebench/README.md) | A GRPO-style asynchronous rollout loop on Ray that grades SWE-bench candidate patches in environments with the `ate_env_rl` client and its SWE-bench adapter. |
 
 ## Integrations
 
+[`integrations/README.md`](./integrations/README.md) lists what each package contains and how it is
+installed and tested.
+
 | Integration | Framework | What it does |
 |---|---|---|
-| [`integrations/nemo-gym`](integrations/nemo-gym/README.md) | [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) | Sandbox provider `substrate`, registered through the `nemo_gym.sandbox_providers` entry point, with no change to NeMo Gym. `endpoint()` reaches a daemon inside the sandbox through the port proxy, and [`layer/`](integrations/nemo-gym/layer) is that daemon for NeMo: NeMo Skills' sandbox server and NeMo Gym's exec server injected into any task image. |
-| [`integrations/uni-agent`](integrations/uni-agent/README.md) | [uni-agent](https://github.com/verl-project/uni-agent) | Sandbox provider `ate_env` plus an `r2e_gym` task that hides the tests, lets the agent work, then grades in the same environment; dataset and image tooling for R2E-Gym, SWE-reBench and SWE-bench rows. Used by `examples/Qwen3.5-35B-A3B-verl`. |
-| [`integrations/openhands`](integrations/openhands/README.md) | [OpenHands](https://github.com/OpenHands/software-agent-sdk) | `AteEnvWorkspace`, an OpenHands `RemoteWorkspace` that mirrors OpenHands' `AgentSandboxWorkspace` and runs the agent-server in any unmodified task image (glibc 2.31 or newer). |
-| [`integrations/harbor`](integrations/harbor/README.md) | [Harbor](https://github.com/harbor-framework/harbor) | `AteEnvEnvironment`, a Harbor environment provider: `harbor run ... -e ate_env_harbor:AteEnvEnvironment` runs each trial in an ate-env environment from a digest-pinned task image, with no change to Harbor. |
+| [`integrations/nemo-gym`](./integrations/nemo-gym/README.md) | [NeMo Gym](https://github.com/NVIDIA-NeMo/Gym) | Sandbox provider `substrate`, registered through the `nemo_gym.sandbox_providers` entry point, with no change to NeMo Gym. `endpoint()` reaches a daemon inside the sandbox through the port proxy, and [`layer/`](./integrations/nemo-gym/layer) is that daemon for NeMo: NeMo Skills' sandbox server and NeMo Gym's exec server injected into any task image. |
+| [`integrations/uni-agent`](./integrations/uni-agent/README.md) | [uni-agent](https://github.com/verl-project/uni-agent) | Sandbox provider `ate_env` plus an `r2e_gym` task that hides the tests, lets the agent work, then grades in the same environment; dataset and image tooling for R2E-Gym, SWE-reBench and SWE-bench rows. Used by `examples/Qwen3.5-35B-A3B-verl`. |
+| [`integrations/openhands`](./integrations/openhands/README.md) | [OpenHands](https://github.com/OpenHands/software-agent-sdk) | `AteEnvWorkspace`, an OpenHands `RemoteWorkspace` that mirrors OpenHands' `AgentSandboxWorkspace` and runs the agent-server in any unmodified task image (glibc 2.31 or newer). |
+| [`integrations/harbor`](./integrations/harbor/README.md) | [Harbor](https://github.com/harbor-framework/harbor) | `AteEnvEnvironment`, a Harbor environment provider: `harbor run ... -e ate_env_harbor:AteEnvEnvironment` runs each trial in an ate-env environment from a digest-pinned task image, with no change to Harbor. |
 
 ## Benchmarks
 
-[`swebench-loader`](benchmarking/swebench/README.md) drives SWE-bench Verified task images through
+[`swebench-loader`](./benchmarking/swebench/README.md) drives SWE-bench Verified task images through
 the API the way a simulated RL job does: `eval` mode creates, replays, grades and deletes each task,
 and `steps` mode creates a fleet once and parks it between training steps. Image-delivery workloads
 compare image pull, image streaming and other loaders on the same images. The report breaks down
 what each phase cost.
-[`internal/benchmarking/DESIGN.md`](internal/benchmarking/DESIGN.md) specifies the benchmark system.
+The [`bench`](./cmd/benchmarking/bench) harness runs the scenarios in
+[`benchmarking/scenarios`](./benchmarking/scenarios) (`resolve`, `render`, `prewarm`, `spinup`,
+`spindown`, `measure`, `reap`, `report`, `validate`, `upload`, `compare` and `run`), and
+[`benchmarking/telemetry_report`](./benchmarking/telemetry_report) renders one run's
+report, spans and scrapes as one HTML page.
+[`internal/benchmarking/DESIGN.md`](./internal/benchmarking/DESIGN.md) specifies the benchmark
+system; [`benchmarking/README.md`](./benchmarking/README.md) lists the scripts and tools.
 
 ## Support
 
 The components, the clients, the integrations and the `ateenv.v1alpha` API are supported;
-`examples/` and `internal/examples/` are not. [docs/support.md](docs/support.md) says what
+`examples/` and `internal/examples/` are not. [docs/support.md](./docs/support.md) says what
 supported means for each path.
 
 ## Get started
@@ -138,7 +163,7 @@ Drive environments from Python with the fleet SDK (`pip install ./clients/python
 ```python
 import os
 
-from ate_env import FleetConfig, SandboxFleet, Task
+from ate_env_rl import FleetConfig, SandboxFleet, Task
 
 config = FleetConfig(endpoint="127.0.0.1:7777", auth_token=os.environ["SUBSTRATE_ENV_AUTH_TOKEN"])
 with SandboxFleet(config) as fleet:
@@ -168,13 +193,22 @@ template's `workerSelector` matches, and on any pool at all without a selector. 
 WorkerPool `ate-env/workerpool: <pool>` and each template selects that label, thus actors stay on
 their pool and its sandbox class; `--workerpool` on `ate-env manifest template` names the pool to select:
 it defaults to `default-template-workerpool`, the pool `ate-env manifest` creates by default, whatever
-the template is named. Pass it when you deploy with another `--template` or `--workerpool`. The templates also use
+the template is named. Pass it when you deploy with another `--template` or `--workerpool`. An
+environment can narrow its template's pools further: `worker_selector` on `CreateEnvironment`
+(`ate-env create --worker-selector key=value`) is ANDed with the template's selector and applies to the
+environment's wakes too, thus a job can keep an image's environments on the pools that already hold
+the image; `ate-env get <id>` shows the node an environment is on. The templates also use
 `snapshotConfig` and `wakeupProbe` and declare CPU and memory limits, and `--worker-image` must be the
 `ateworker-gvisor` image built from the Substrate version on the cluster.
 
-`ate-env-api` suspends synchronously: a suspend returns once the snapshot is in object storage, thus a
+`ate-env-api` suspends durably by default: a suspend returns once the snapshot is in object storage, thus a
 suspended environment survives the loss of its node. Substrate's own default became asynchronous in
-[`b40d34f1`](https://github.com/agent-substrate/substrate/commit/b40d34f1).
+[`b40d34f1`](https://github.com/agent-substrate/substrate/commit/b40d34f1). `SuspendEnvironment` takes a
+`mode`: `SUSPEND_MODE_LOCAL` (`ate-env suspend --mode local`, `Client.suspend(mode=SuspendMode.LOCAL)`,
+`Client.SuspendLocal` in Go) returns once the snapshot is on the node and leaves the upload in the
+background; the environment resumes on that node until the upload lands and reports `PAUSED` meanwhile.
+One park-and-resume cycle is cheaper this way, which is what a loop that parks a sandbox between every
+command wants; a node lost before the upload lands takes the snapshot with it.
 
 Substrate enforces authorization by default. `ate-env-api` runs as its own ServiceAccount
 (`ate-env/ate-env-api`) and needs the editor role on each atespace it creates environments in; the
@@ -284,8 +318,22 @@ be longer than the image pull plus the template's wakeup-probe timeout (`ate-env
 --wakeup-timeout`), because the control plane reports RUNNING only after the probe passes. The 5m
 default covers the 120 s timeout of a `--sidecar-readyz` template plus three minutes for the pull;
 raise it if you set a longer `--wakeup-timeout`. Otherwise the first guest call after a slow wake
-fails with `Unavailable`, and a retry succeeds once the environment is up. A crashed or deleted
-environment fails a guest call at once. Port-proxy requests wait on the router instead (see
+fails with `Unavailable`, and a retry succeeds once the environment is up. A deleted environment
+fails a guest call at once with `NotFound`.
+
+Two start failures also end the wait at once, because waiting cannot fix them, and mark the call's
+trailing metadata with `ate-env-start-failure`, so a client can retry the work on a fresh
+environment instead of scoring it:
+
+| Failure | Status | `ate-env-start-failure` | When |
+|---|---|---|---|
+| The control plane moved the environment to CRASHED while it was waking | `FailedPrecondition`, with the control plane's crash reason | `crashed` | always |
+| No worker has room to run the environment | `ResourceExhausted` | `no-capacity` | only with `--wake-no-capacity-grace`, after the router has said so for that long |
+
+`--wake-no-capacity-grace` defaults to 0: a full fleet keeps waiting for the whole `--wake-budget`,
+since capacity can come back as nodes scale up or other environments stop. The Python SDK turns
+both into a retryable `SandboxStartError` whose `reason` is the trailer's value. Port-proxy requests
+wait on the router instead (see
 [Reaching a service inside an environment](#reaching-a-service-inside-an-environment)).
 
 `ate-env-api` can export traces and serve Prometheus metrics; both are off by default:
@@ -397,6 +445,11 @@ ate-env create web1 --template layered
 ate-env web1 shell '/opt/web/bin/busybox wget -qO- http://127.0.0.1:44772/etc/os-release'
 ate-env create node1 --template layered --rootfs-image docker.io/library/node@sha256:<digest>
 
+# Or keep the environment on the worker pools that carry a label (for example
+# the pools that already hold the image); ANDed with the template's selector.
+ate-env create t1 --rootfs-image docker.io/library/python@sha256:<digest> --worker-selector ate-env/domain=d0
+ate-env get t1    # template, status, the node it is on, the selector
+
 # Execute a shell command inside the environment.
 ate-env dev1 shell 'echo hello > /note.txt'
 
@@ -434,8 +487,8 @@ $ ate-env suspend dev1
 $ ate-env delete dev1
 ```
 
-Subcommand names (`create`, `delete`, `suspend`, `manifest`, `server-info`, `help`, `completion`) are
-reserved: `ate-env create` rejects them as environment IDs, because `ate-env <id> ...` cannot reach
+Subcommand names (`create`, `get`, `delete`, `suspend`, `manifest`, `server-info`, `help`,
+`completion`) are reserved: `ate-env create` rejects them as environment IDs, because `ate-env <id> ...` cannot reach
 such an environment.
 
 `ate-env` provides help text:
@@ -550,9 +603,9 @@ Manages the lifecycle of isolated execution environments (defined in [`proto/ate
 | --- | ----------- |
 | `CreateEnvironment` | Creates and starts a new environment actor from an ActorTemplate, or from a digest-pinned `rootfs_image` on top of one: the template becomes the base, the image the container, and the guest is mounted in as a read-only image volume |
 | `GetEnvironment` | Retrieves environment details and status |
-| `SuspendEnvironment` | Suspends and checkpoints the environment to snapshot storage |
+| `SuspendEnvironment` | Suspends and checkpoints the environment: to snapshot storage by default, or to its node first with `mode: SUSPEND_MODE_LOCAL` (the upload follows in the background) |
 | `DeleteEnvironment` | Deletes the environment permanently |
-| `GetServerInfo` | Reports the server implementation (`sandboxenv-rl`), its version, the version of the `go.ate.dev/substrate` module it was built against, and its optional features (`rootfs_image`, `pty`, and `port_proxy` when enabled); answered by `ate-env-api` itself. The Substrate version is a build fact, not the version of the control plane the server talks to; Substrate has no RPC that reports that. `ate-env server-info --json` prints the four fields as one JSON object |
+| `GetServerInfo` | Reports the server implementation (`sandboxenv-rl`), its version, the version of the `go.ate.dev/substrate` module it was built against, and its optional features (`rootfs_image`, `pty`, `suspend_mode`, and `port_proxy` when enabled); answered by `ate-env-api` itself. The Substrate version is a build fact, not the version of the control plane the server talks to; Substrate has no RPC that reports that. `ate-env server-info --json` prints the four fields as one JSON object |
 
 ### ProcessService
 
@@ -815,7 +868,7 @@ CI_RUNNER=docker make ci
 - **`auto` (default):** Runs via Nix (`nix develop -c <cmd>`) if `nix` is installed, else via Docker if `docker` is available.
 - **`nix`:** Runs impurely using `nix develop -c` without whitelisting or clearing the environment. Every Python env is built by Nix from `uv.lock` ([`nix/python.nix`](nix/python.nix), with uv2nix), with this repository's projects installed editable; besides the default devShell, `nix develop .#openhands` (Python 3.13) and `nix develop .#uni-agent` (Python 3.12) carry the integrations' envs, and `ci-python` builds the base and uni-agent envs it needs (`nix build .#python-env-base .#python-env-uni-agent`) on first use, so other commands don't pay for them. After editing a `pyproject.toml`, run `uv lock` in the devShell and commit `uv.lock` (see [check-pins.md](docs/chores/check-pins.md)).
 - **`docker`:** Automatically builds `sandboxenv-rl-ci:local` from a copy of the tree and runs the command in a container. The Nix store and the Go and other caches live in named volumes (`sandboxenv-rl-nix`, `sandboxenv-rl-cache`), so like on a Nix host, the first run builds the devShell and later runs add only what changed. `docker volume rm sandboxenv-rl-nix` reclaims the space. Commands that write files (`make protos`, `make update-pins`) return a `git diff` that is applied on the host as you, so file ownership stays yours. Note that passing `--docker-socket` (used only by `make ci-e2e` in the Docker runner) mounts `/var/run/docker.sock`, which grants the container root-equivalent access to the host; `make smoke` uses `--host-network` instead. Both share the host network and mount the host kubeconfig read-only (a single file; a colon-separated `KUBECONFIG` isn't mounted), so `REUSE_CLUSTER` works under Docker too.
-- **`host`:** Executes the command directly on the host, with whatever is on `PATH`. Targets that only need Go and Python work without Nix or Docker: `make protos` needs Go (`GOTOOLCHAIN` fetches the version `go.mod` asks for) and `grpcio-tools` (`uv sync --package ate-env-client --extra dev`, or `pip install -e 'clients/python[dev]'`); buf and the protoc plugins come from `go.mod` through `go tool`. The `ci-*`, `smoke`, `check-pins`, `update-pins`, `check-substrate-head` and `lint-actions-locally` commands are scripts the devShell provides, so with `host` they only work inside `nix develop`.
+- **`host`:** Executes the command directly on the host, with whatever is on `PATH`. Targets that only need Go and Python work without Nix or Docker: `make protos` needs Go (`GOTOOLCHAIN` fetches the version `go.mod` asks for) and `grpcio-tools` (`uv sync --package ate-env-rl --extra dev`, or `pip install -e 'clients/python[dev]'`); buf and the protoc plugins come from `go.mod` through `go tool`. The `ci-*`, `smoke`, `check-pins`, `update-pins`, `check-substrate-head` and `lint-actions-locally` commands are scripts the devShell provides, so with `host` they only work inside `nix develop`.
 
 > [!NOTE]
 > Online GitHub Actions security audits (such as ref-version-mismatch and impostor-commit) are covered by the organization's required GitHub Actions scan on pull requests. `make lint-actions-locally` runs zizmor in `--offline` mode alongside actionlint.

@@ -18,7 +18,7 @@ import pickle
 
 import pytest
 
-from ate_env import (
+from ate_env_rl import (
     CommandExecutionError,
     CommandStartError,
     CommandTimeoutError,
@@ -28,11 +28,11 @@ from ate_env import (
     SandboxProtocolError,
     SandboxUnavailableError,
 )
-from ate_env.exceptions import TimeoutError as SdkTimeoutError
-from ate_env.runtime.base import (
+from ate_env_rl.exceptions import TimeoutError as SdkTimeoutError
+from ate_env_rl.runtime.base import (
     command_to_argv,
 )
-from ate_env.runtime.mock import MockRuntimeHook
+from ate_env_rl.runtime.mock import MockRuntimeHook
 
 
 def test_exec_result_invariants():

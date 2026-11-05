@@ -20,6 +20,7 @@ require (
 	google.golang.org/protobuf v1.36.12
 	k8s.io/api v0.37.1
 	k8s.io/apimachinery v0.37.1
+	pgregory.net/rapid v1.2.0
 	sigs.k8s.io/yaml v1.6.0
 )
 

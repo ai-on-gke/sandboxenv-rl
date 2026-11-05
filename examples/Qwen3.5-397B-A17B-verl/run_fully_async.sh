@@ -34,8 +34,9 @@ export PYTHONUNBUFFERED=1 HF_HOME=/workspace/hf HF_HUB_ENABLE_HF_TRANSFER=1 CUDA
 # TOTAL_STEPS: default one epoch (253 = floor(8101 / 32)): enough for performance numbers, not for convergence. 2 = smoke
 # (plumbing). Full ~ 3 epochs (DeepSWE: 200 steps x 64 prompts over 4,500 R2E-Gym tasks); needs trainer.total_epochs=3 below.
 : "${TOTAL_STEPS:=253}"
-# One session per trajectory, so a whole step (TRAIN_BATCH x ROLLOUT_N) starts at once instead of queueing on the cap.
-# If the sandbox system cannot hold that many environments, set SESSIONS to its maximum capacity instead.
+# Default: one session per trajectory, so a whole step (TRAIN_BATCH x ROLLOUT_N) starts at once instead of queueing on the
+# cap. Cap it at the sandbox system's capacity if that is smaller, and at long contexts near what the vLLM replicas hold
+# at once (about 1.5 x replicas x ROLLOUT_MAX_NUM_SEQS, see profiles/397b-v1.env and README "Operating at scale").
 : "${SESSIONS:=$((TRAIN_BATCH * ROLLOUT_N))}"; : "${GATEWAYS:=4}"; : "${AGENT_WORKERS:=4}"; : "${AGENT_MAX_STEPS:=150}"
 : "${MASK_UNFINISHED_EPISODE:=True}"  # True: episodes that hit AGENT_MAX_STEPS/RESPONSE_LENGTH keep their reward in the GRPO
                                       # group but train on no tokens; needs a budget most episodes finish within
@@ -312,8 +313,8 @@ old = "        losses_reduced = forward_backward_func(\n"
 new = ("        torch.cuda.empty_cache()\n"
        "        try:\n"
        "            torch.cuda.memory._set_allocator_settings('expandable_segments:True')\n"
-       "        except Exception:\n"
-       "            pass\n"
+       "        except Exception as exc:\n"
+       "            logger.warning_once(f'expandable_segments could not be enabled for forward-backward: {exc!r}')\n"
        "        losses_reduced = forward_backward_func(\n")
 if new in s: print("verl Megatron forward-backward already enables expandable segments")
 elif s.count(old) == 1: s = s.replace(old, new, 1); print("patched verl Megatron forward-backward to enable expandable segments on entry")
@@ -328,8 +329,8 @@ new = ("        if enable_routing_replay:\n"
        "        torch.cuda.empty_cache()\n"
        "        try:\n"
        "            torch.cuda.memory._set_allocator_settings('expandable_segments:False')\n"
-       "        except Exception:\n"
-       "            pass\n"
+       "        except Exception as exc:\n"
+       "            logger.warning_once(f'expandable_segments could not be reset after forward-backward: {exc!r}')\n"
        "        return output\n")
 if new in s: print("verl Megatron forward-backward already resets expandable segments")
 elif s.count(old) == 1: s = s.replace(old, new, 1); print("patched verl Megatron forward-backward to reset expandable segments on exit")

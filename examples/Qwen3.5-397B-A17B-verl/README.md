@@ -26,8 +26,8 @@ and put the same peak load on the sandbox pool: eight `35b-easy` match `397b-eas
 steps for performance numbers, not for convergence, which takes about 3 epochs (DeepSWE: 200 steps x 64 prompts
 over 4,500 R2E-Gym tasks); for that, raise `trainer.total_epochs` in `run_fully_async.sh`. Validation runs once,
 after the last step. `SESSIONS` caps the sessions in flight. The 32K profiles set it to the whole step
-(`TRAIN_BATCH x ROLLOUT_N`), so every trajectory starts at once instead of queueing on the cap. The 64K `v1` profiles
-cap it near what the rollout pool decodes at once (about 1.5 x replicas x `ROLLOUT_MAX_NUM_SEQS`, H200 values):
+(`TRAIN_BATCH x ROLLOUT_N`), so every trajectory starts at once instead of queueing on the cap. The 64K `397b-v1`
+profile caps it near what the rollout pool decodes at once (about 1.5 x replicas x `ROLLOUT_MAX_NUM_SEQS`, H200 values):
 beyond that a session holds a sandbox while it waits inside vLLM and runs into `SESSION_TIMEOUT_S`. If the sandbox
 system cannot hold `SESSIONS` environments, set it to the system's maximum capacity instead; the rest of the step
 waits in uni-agent, holding no sandbox.
@@ -137,7 +137,7 @@ For steps of thousands of trajectories. Profile values and Substrate settings on
 - **`SESSIONS` is bounded twice.** Every in-flight session holds a sandbox for its whole episode, so the sandbox
   pool needs about `SESSIONS + VAL_TASKS` environments; and a vLLM replica holds only `ROLLOUT_MAX_NUM_SEQS`
   sequences in its KV cache (vLLM logs the number at start as "Maximum concurrency for N tokens per request":
-  64 for the 397B replica and 32 for the 35B replica at 73K context on H200). Set `SESSIONS` to the smaller of
+  64 for the 397B replica at 73K context on H200). Set `SESSIONS` to the smaller of
   the sandbox capacity and about 1.5 x replicas x `ROLLOUT_MAX_NUM_SEQS`; the margin keeps the replicas busy
   while sessions run tool calls. Sessions beyond the cap wait in uni-agent, holding no sandbox; sessions beyond
   the pool's capacity still wait up to `SANDBOX_START_WAIT_S` instead of failing. Uncapped, a first `397b-v1`

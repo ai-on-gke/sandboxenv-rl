@@ -99,7 +99,7 @@ check_substrate() {
 up_job() {  # ConfigMaps: run script, task config, image map, the code the pods install, and the profile
   local tmp; tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
   tar -C "$REPO/integrations" -czf "$tmp/uni-agent-substrate.tgz" uni-agent
-  tar -C "$REPO/clients" --exclude=build --exclude='*.egg-info' --exclude=__pycache__ --exclude=.venv -czf "$tmp/ate-client.tgz" python   # the ate_env client: no run-time GitHub access in the pods
+  tar -C "$REPO/clients" --exclude=build --exclude='*.egg-info' --exclude=__pycache__ --exclude=.venv -czf "$tmp/ate-client.tgz" python   # the ate_env_rl client: no run-time GitHub access in the pods
   gzip -9 -c "$IMAGES_JSON" > "$tmp/images.json.gz"     # thousands of images exceed the 1 MiB ConfigMap limit uncompressed
   $K -n default create configmap "$JOB" \
       --from-file=run_fully_async.sh="$HERE/run_fully_async.sh" --from-file=task_config.yaml="$HERE/task_config.yaml" \

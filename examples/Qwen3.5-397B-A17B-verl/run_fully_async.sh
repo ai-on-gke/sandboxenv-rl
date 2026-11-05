@@ -109,7 +109,7 @@ for mod in ("megatron.bridge.models.conversion.auto_bridge", "swebench.harness.g
             tried.add(pkg); print(f"{mod}: installing missing leaf {pkg}", flush=True)
             subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "-c", "/workspace/pins.txt", pkg])
 PY
-mkdir -p /workspace/ate-client && tar -C /workspace/ate-client -xzf /workspace/cfg/ate-client.tgz && pipq /workspace/ate-client/python   # ate_env client from this checkout (deploy.sh payload)
+mkdir -p /workspace/ate-client && tar -C /workspace/ate-client -xzf /workspace/cfg/ate-client.tgz && pipq /workspace/ate-client/python   # ate_env_rl client from this checkout (deploy.sh payload)
 tar -C /workspace/agent -xzf /workspace/cfg/uni-agent-substrate.tgz && pipq --no-deps -e /workspace/agent/uni-agent
 echo "import uni_agent_substrate._register" > "$(python3 -c 'import site; print(site.getsitepackages()[0])')/uni_agent_substrate.pth"
 if [ -n "$ROLLOUT_QUANT" ]; then
@@ -361,7 +361,7 @@ else
 fi
 python3 - <<'PY'
 import importlib
-for m in ("verl.trainer.main_ppo", "fla", "megatron.bridge", "cupy", "swebench", "ate_env", "uni_agent_substrate.provider"):
+for m in ("verl.trainer.main_ppo", "fla", "megatron.bridge", "cupy", "swebench", "ate_env_rl", "uni_agent_substrate.provider"):
     importlib.import_module(m)
 from uni_agent.sandbox.registry import get_sandbox_cls; from uni_agent.tasks.registry import get_task_cls
 import verl, vllm, transformers
@@ -378,8 +378,8 @@ if [ "$ROLE" = "head" ] && [ "${DRY_RUN:-0}" != "1" ]; then
   # environment up to SANDBOX_START_WAIT_S; anything else fails the launch before the model pull.
   python3 - "$ATE_ENV_ENDPOINT" "$ATE_TEMPLATE" "$PROBE_IMAGE" "$ACTOR_PREFIX" "$SANDBOX_START_WAIT_S" <<'PY'
 import asyncio, os, sys, time, uuid
-from ate_env import Client
-from ate_env.errors import EnvError
+from ate_env_rl import Client
+from ate_env_rl.errors import EnvError
 endpoint, template, image, prefix, wait_s = sys.argv[1:6]
 async def probe():
     token = os.environ.get("SUBSTRATE_ENV_AUTH_TOKEN") or None   # the caller token ate-env-api may require (deploy.sh forwards it)

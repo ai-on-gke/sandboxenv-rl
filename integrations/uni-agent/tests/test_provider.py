@@ -71,7 +71,7 @@ async def test_failed_start_deletes_the_environment(fake_stack):
 
 
 def _capacity_error():
-    from ate_env.errors import RpcError
+    from ate_env_rl.errors import RpcError
 
     return RpcError("environment ate-env/ua-x did not answer within the wake budget of 2m0s while SUSPENDED (19 attempts): "
                     "rpc error: code = Unavailable desc = actor ate-env/ua-x unavailable: no worker has room for the actor")
@@ -107,7 +107,7 @@ async def test_start_gives_up_on_capacity_after_start_wait(fake_stack, monkeypat
         raise _capacity_error()
 
     monkeypatch.setattr(sb, "_exec", always_full)
-    from ate_env.errors import RpcError
+    from ate_env_rl.errors import RpcError
 
     with pytest.raises(RpcError):
         await sb.start()
@@ -131,7 +131,7 @@ async def test_start_does_not_retry_non_capacity_errors(fake_stack, monkeypatch)
 
 
 def _slow_wake_error():
-    from ate_env.errors import RpcError
+    from ate_env_rl.errors import RpcError
 
     return RpcError("environment ate-env/ua-x did not answer within the wake budget of 2m0s while RESUMING (17 attempts): "
                     "rpc error: code = Unavailable desc = ")
@@ -168,7 +168,7 @@ async def test_slow_wake_gives_up_at_start_wait(fake_stack, monkeypatch):
         raise _slow_wake_error()
 
     monkeypatch.setattr(sb, "_exec", never_wakes)
-    from ate_env.errors import RpcError
+    from ate_env_rl.errors import RpcError
 
     with pytest.raises(RpcError):
         await sb.start()
@@ -177,7 +177,7 @@ async def test_slow_wake_gives_up_at_start_wait(fake_stack, monkeypatch):
 
 def _busy_error():
     import grpc
-    from ate_env.errors import RpcError
+    from ate_env_rl.errors import RpcError
 
     return RpcError('ate: suspending "ua-x": rpc error: code = Aborted desc = another operation is in progress for this actor',
                     grpc.StatusCode.ABORTED)
@@ -258,7 +258,7 @@ class _FakeDeleteClient:
 async def test_coordinator_reclaims_expired_and_abandoned_environments():
     import asyncio
 
-    from ate_env.errors import FailedPreconditionError, NotFoundError
+    from ate_env_rl.errors import FailedPreconditionError, NotFoundError
 
     coord = prov._SandboxCoordinator(limit=0, lease_s=1, atespace="ate-env", sweep_s=3600)
     client = coord._client = _FakeDeleteClient(fail={"ua-busy": [_busy_error()], "ua-gone": NotFoundError("gone")})
@@ -323,7 +323,7 @@ def test_missing_coordinator_is_logged_once(monkeypatch, caplog):
 
 def _route_error():
     import grpc
-    from ate_env.errors import RpcError
+    from ate_env_rl.errors import RpcError
 
     return RpcError("environment ate-env/ua-x did not answer within the running budget of 20s while RUNNING (7 attempts): "
                     "rpc error: code = Unavailable desc = upstream connect error or disconnect/reset before headers",
@@ -354,7 +354,7 @@ async def test_exec_retries_a_transient_route_error_at_start(fake_stack, monkeyp
         raise _route_error()
 
     monkeypatch.setattr(env, "start_process", always_down)
-    from ate_env.errors import RpcError
+    from ate_env_rl.errors import RpcError
 
     with pytest.raises(RpcError):
         await sb._exec(["true"])
@@ -362,7 +362,7 @@ async def test_exec_retries_a_transient_route_error_at_start(fake_stack, monkeyp
 
 
 def test_error_classification():
-    from ate_env.errors import RpcError
+    from ate_env_rl.errors import RpcError
 
     assert prov._is_pool_full(_capacity_error()) and not prov._is_slow_wake(_capacity_error())
     assert prov._is_slow_wake(_slow_wake_error()) and not prov._is_pool_full(_slow_wake_error())

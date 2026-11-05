@@ -61,7 +61,7 @@ async def test_start_creates_from_the_digest_and_the_class_template(fake, make_e
         assert fake.state.creates == [
             {"id": env.env_id, "atespace": "ate-env", "template": "harbor-c1-m512", "rootfs_image": ALPINE}
         ]
-        assert env.env_id.startswith("hb-echo-abcdef-env")
+        assert env.env_id.startswith("hb-echo-abcdef")
         assert "true" in commands(fake) and WHOAMI_COMMAND in commands(fake)
         record = json.loads((env.trial_paths.trial_dir / RECORD_FILE).read_text())
         assert record["id"] == env.env_id
@@ -80,7 +80,7 @@ async def test_separate_verifier_environment_keeps_its_own_record(fake, make_env
     # trial directory; found live: its record overwrote the agent's.
     from harbor.models.trial.paths import TrialPaths
 
-    paths = TrialPaths(trial_dir=tmp_path / "one-trial")
+    paths = TrialPaths(trial_dir=tmp_path / "echo__AbCdEf")  # Harbor names the trial dir after the trial
     paths.mkdir()
     agent = make_env(session_id="echo__AbCdEf__env")
     verifier = make_env(session_id="echo__AbCdEf__verifier__trial")
@@ -106,8 +106,8 @@ def test_record_file_survives_harbor_truncation_and_multi_step_verifiers(fake, m
 
     from harbor.models.trial.paths import TrialPaths
 
-    trial_name = "swebench-verified-django-django-16379__aBcDeFg"  # 47 characters
-    assert len(trial_name) >= 42
+    trial_name = "swebench-verified-django-django-16379-fix__aBcDeFg"  # 50 characters
+    assert len(trial_name) == 50
     paths = TrialPaths(trial_dir=tmp_path / trial_name)
     paths.mkdir()
 

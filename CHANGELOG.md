@@ -70,6 +70,9 @@ user needs to know across them.
 
 ### Fixed
 
+- ate-env-api: a `CreateEnvironment` whose derived image template was created
+  by a concurrent call for another image (two digests sharing their first 12
+  hex digits) fails with `FailedPrecondition` instead of running that image.
 - ate-env-api: a base template whose guest command climbs out with `..`
   (`/../ko-app/ate-env-guest`) is re-rooted under `/ate` instead of deriving
   templates whose guest is not found at boot.

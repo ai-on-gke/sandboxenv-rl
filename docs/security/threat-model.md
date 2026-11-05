@@ -24,8 +24,13 @@ update this document in the same pull request. The pull request template asks fo
   `X-Env-Port`, path form `/v1alpha/envs/{id}/ports/{port}/...`).
 - **Lifecycle calls** (create, get, suspend, delete) go to the Substrate control plane over TLS
   with a bearer token.
-- **Guest calls, MCP and the port proxy** go to the atenet router over plaintext gRPC or HTTP
-  CONNECT. The router forwards them to the actor that the `ate-target-actor` header names.
+- **Guest calls, MCP and the port proxy** go to the atenet router over mutual TLS (HTTPS for guest
+  gRPC on port 443 and TLS HTTP CONNECT on port 8444) when `-atenet-client-cert` and
+  `-atenet-ca-file` are set, which `ate-env manifest` enables by default using kubelet-projected pod
+  identity (`podidentity.podcert.ate.dev/identity`) and `servicedns`
+  (`servicedns.podcert.ate.dev/identity`) bundles reloaded at each handshake; without
+  `-atenet-client-cert`, `ate-env-api` dials plaintext ports 80 and 8081 (served only by test
+  fakes). The router forwards requests to the actor named in the `ate-target-actor` header.
 - **Telemetry**, off by default: with `--metrics-listen-addr`, `ate-env-api` serves Prometheus
   metrics on a second plaintext listener; with `--enable-tracing`, it exports traces over OTLP and
   passes the caller's W3C trace context on to the control plane and the guests (see
@@ -69,7 +74,7 @@ update this document in the same pull request. The pull request template asks fo
 | One caller acts on the environments of another caller | None. | One shared token. No per-caller identity and no authorization: each token holder can use each environment. |
 | Reach beyond the environments of ate-env | Lifecycle calls use the `ate-env-api` identity, which the access policy limits to its atespaces. The port proxy forwards only to the atespaces that `--port-proxy-atespaces` names (default `ate-env`) and answers 403 for the others. | Guest calls and MCP go to the router. The control plane is asked only while an environment wakes. Thus these paths reach any actor that the router serves, in any atespace, including actors that ate-env did not create. With `--port-proxy-atespaces='*'`, the port proxy does the same. |
 | A web page drives the API through a port-forward (CSRF) | The port proxy path form refuses a state-changing request or a WebSocket handshake from another origin (`--port-proxy-trusted-origins` adds origins). The header form needs custom headers, and MCP needs a JSON content type: a browser sends either one to another origin only after a CORS preflight, which the API never approves. | — |
-| DNS rebinding: a page on an attacker's name resolves to the forwarded listener and becomes same-origin | None. | The listener does not check the `Host` header. The MCP handler sets `DisableLocalhostProtection: true`. |
+| DNS rebinding: a page on an attacker's name resolves to the forwarded listener and becomes same-origin | `internal/hostcheck.Checker` wraps every HTTP route on the listener (`/healthz`, MCP, and both header and path forms of the port proxy) and returns `403 Forbidden` unless `r.Host` is an IP address, `localhost` or `*.localhost`, an in-cluster name of `--service-name` (`ate-env-api` by default), or a host listed in `--allowed-hosts` (`--api-allowed-hosts` in the manifest). The MCP handler sets `DisableLocalhostProtection: true` because `hostcheck` enforces this check in front of it. | `Host` validation is a browser defense, not an authentication layer: non-browser clients can set `Host` arbitrarily (caller authentication is `--auth-token-file`). The raw gRPC handler on `/` stays unwrapped so gRPC clients can send their dial target as `:authority` (guarded by bearer auth). |
 | The port proxy reaches the guest port | The port proxy refuses port 80, where the guest listens. | — |
 | Resource exhaustion | The port proxy bounds its idle tunnels with `idleTunnelsPerPort`, `idleTunnelsTotal` and `idleTunnelTimeout` in `internal/portproxy/portproxy.go`. Worker capacity bounds the running actors. | A token holder can create environments without a quota or a rate limit; suspended environments keep their snapshots in the bucket. The MCP handler keeps one server for each environment, and the client keeps one guest connection for each environment. Neither is evicted while the process runs. |
 | Control-plane detail in guest-call errors | A guest call to an environment that cannot start reports why: for one that the control plane moved to CRASHED while it was waking, the error carries Substrate's crash reason (`ActorStatus.crash.message`, at most 4096 characters), and with `--wake-no-capacity-grace` a call that no worker has room for carries the router's no-capacity text. Only a caller that may call that environment, thus one that has the token, gets it. The `ate-env-start-failure` trailer carries only `crashed` or `no-capacity`. | Some crash reasons include an atelet error verbatim, such as the error of a failed restore, and a message can name a node or a snapshot. A caller sees that detail for its own environments; it does not reveal other environments or credentials. |
@@ -85,7 +90,7 @@ update this document in the same pull request. The pull request template asks fo
 
 | Threat | Current mitigation | Gap |
 |---|---|---|
-| Use of a guest without the API | The router runs in `ate-system`, and the guest listens only inside the actor. | The connections to the router are plaintext. The guest does not authenticate callers: a client that reaches an actor through the router can run commands as the guest user. |
+| Use of a guest without the API | The router runs in `ate-system`; its TLS listeners (the only ones Substrate v0.6.0+ serves) require a client certificate whose SPIFFE ID (`spiffe://cluster.local/ns/<namespace>/sa/ate-env-api`) is listed in `--ingress-allowed-spiffe-ids`, which `ate-env manifest` mounts by default, and the guest listens only inside the actor on port 80. | Without `-atenet-client-cert` (`--api-router-tls=false`), `ate-env-api` dials plaintext ports that only test fakes serve (calls against a Substrate v0.6.0+ router fail rather than downgrade). Inside the cluster between the router and the actor, traffic on port 80 is unauthenticated HTTP/h2c and the guest does not authenticate callers: any workload permitted to reach the router (or an actor's network directly) can run commands as the guest user. |
 | Code in an environment attacks the node or other environments | Each actor runs in gVisor, the sandbox class of the WorkerPool. | ate-env sets no actor egress policy. Egress follows the Substrate defaults. |
 | Processes escape supervision | When the guest is PID 1, it runs as an init: it reaps orphans and forwards signals. A process timeout kills the process group. The guest refuses PTY window sizes that do not fit the 16-bit kernel fields. | — |
 | A sidecar gains extra privilege | Only a template author sets sidecars (`--sidecar`, `--sidecar-readyz`), and that author already controls the image and its command. Sidecars run inside the CPU and memory limits of the actor. | A sidecar runs in the same container as the code in the environment. A shared credential in the environment of a sidecar, such as the OpenHands session key, is thus readable by that code. Refer to the OpenHands agent-server. |
@@ -142,11 +147,14 @@ Operator requirements:
 
 `CreateEnvironment` with `rootfs_image` makes `ate-env-api` derive an ActorTemplate named
 `<base>-<first 12 hex digits of the digest>` from the base template. The image replaces the
-container, and the guest is mounted into it as a read-only image volume.
+container, and the guest is mounted into it as a read-only image volume. `CreateEnvironment` also
+accepts optional `worker_selector` labels (`Actor.worker_selector`), and `GetEnvironment` reports
+both `node` and `worker_selector`.
 
 | Threat | Current mitigation | Gap |
 |---|---|---|
-| A caller runs an image of its choice under the settings of the base template (worker selector, snapshots bucket, resources) | The image must be pinned by digest. A template with that name that runs another image is refused with `FailedPrecondition`, also when a concurrent create made it. | Any registry is accepted. |
+| A caller runs an image of its choice under the settings of the base template (worker selector, snapshots bucket, resources) | The image must be pinned by digest. If `<base>-<12 hex>` already exists, `ate-env-api` reuses it when its container image carries the same SHA-256 digest (even under another repository path, keeping the existing template's reference) and refuses a different digest with `FailedPrecondition`, including when a concurrent create made it. | Any registry is accepted. |
+| A caller steers environments across worker pools (`worker_selector`) or inspects placement (`node`) | Substrate ANDs `CreateEnvironmentRequest.worker_selector` with the base template's `WorkerSelector`, so per-environment selectors narrow the allowed worker pools and persist across wakes. | Any token holder can restrict its environments to a subset of the base template's pools and read the hosting Kubernetes node name from `Environment.node`. |
 | Template growth | None. | Derived templates have no quota and no garbage collection. |
 
 Accepted risk for now: this hardening is not needed for RL at the moment. Revisit it before the
@@ -215,8 +223,11 @@ error. This is a compatibility risk, not a boundary of this threat model.
    is not made with `ate-env manifest` has no authentication unless it sets `-auth-token-file`.
 2. Guest calls and MCP reach any actor that the router serves; the access policy does not limit
    them. The port proxy reaches the atespaces that `--port-proxy-atespaces` names.
-3. DNS rebinding is not blocked: the listener has no `Host` check, and MCP localhost protection is
-   off.
+3. HTTP `Host` validation (`internal/hostcheck`) blocks browser DNS rebinding across `/healthz`,
+   MCP, and the port proxy, but the gRPC handler on `/` stays unwrapped and non-browser clients can
+   set `Host` arbitrarily (relying on `-auth-token-file`). Between the `atenet` router and the
+   actor, traffic on port 80 is unauthenticated HTTP/h2c and the guest does not authenticate
+   callers.
 4. `ate-env-api` does not verify the TLS certificate of the control plane by default.
 5. Environment creation has no quota and no rate limit. The MCP server cache and the guest
    connection pool grow with each environment.

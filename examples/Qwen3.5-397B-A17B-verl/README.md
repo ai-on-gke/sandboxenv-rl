@@ -11,8 +11,10 @@ model commit (`MODEL_REVISION` in each profile). The `ate_env_rl` client ([`clie
 and dataset tooling ([`integrations/uni-agent`](../../integrations/uni-agent)) ship from this checkout in
 the payload ConfigMap; the pods need no access to this repository.
 
-This recipe supersedes [`examples/Qwen3.5-35B-A3B-verl`](../Qwen3.5-35B-A3B-verl/README.md): the `35b-easy`
-profile is that recipe's 2-node shape on this code, and folding the sibling into this directory is a follow-up.
+[`examples/Qwen3.5-35B-A3B-verl`](../Qwen3.5-35B-A3B-verl/README.md) runs one 35B loop on its own; the 35B
+profiles here are meant to run eight at a time (`JOB_SUFFIX`), many RL loops that put one 397B run's load on
+the same hardware and sandbox pool. The two share most of their code; extracting it while keeping the two
+purposes is a follow-up.
 
 Same files at every scale; only `profiles/<name>.env` changes. The two 35B profiles are sized so that eight of
 them (`JOB_SUFFIX=a..h`) fill the same 16 GPU nodes as one 397B profile, generate as many trajectories per step

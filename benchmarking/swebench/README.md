@@ -1,39 +1,146 @@
-# Fast Substrate RL benchmark (SWE-bench Verified)
+# Fast Substrate RL benchmark (R2E-Gym and SWE-bench Verified)
 
-A loader that drives real SWE-bench task images through the ate-env API the
+## How to run
+
+Run mixed R2E-Gym and SWE-bench Verified sweeps across warm-pool strategies and
+SDK/API client chains with [`./run-r2e-swebench.sh`](./run-r2e-swebench.sh) (see
+[`./r2e-swebench/SKILL.md`](./r2e-swebench/SKILL.md) for dataset manifest
+generation and [`./r2e-swebench/REPORT_TEMPLATE.md`](./r2e-swebench/REPORT_TEMPLATE.md)
+for the report template):
+
+```bash
+export KO_DOCKER_REPO=us-central1-docker.pkg.dev/PROJECT/bench
+export MANIFEST_DIR=/tmp/r2eswe-manifests
+export ARTIFACT_DIR=/tmp/r2eswe-run
+
+# 1. Validate manifests, trajectories, shard widths, and <63-char actor names offline:
+benchmarking/swebench/run-r2e-swebench.sh dry-run \
+  --r2e-dataset "${MANIFEST_DIR}/r2e.jsonl" \
+  --swe-dataset "${MANIFEST_DIR}/swebench.jsonl" \
+  --concurrency 200 \
+  --images 20 \
+  --rollouts-per-image 5 \
+  --client all \
+  --strategy all \
+  --artifact-dir /tmp/r2eswe-dry
+
+# 2. Bake derived ActorTemplate golden snapshots and warm node caches once before timing:
+benchmarking/swebench/run-r2e-swebench.sh prewarm \
+  --r2e-dataset "${MANIFEST_DIR}/r2e.jsonl" \
+  --swe-dataset "${MANIFEST_DIR}/swebench.jsonl" \
+  --concurrency 200 \
+  --images 20 \
+  --rollouts-per-image 5 \
+  --artifact-dir "${ARTIFACT_DIR}"
+
+# 3. Run the timed benchmark (single arm or multi-arm sweep) and generate reports:
+SAMPLE_CACHE=1 HARVEST_RESTORES=1 \
+benchmarking/swebench/run-r2e-swebench.sh run \
+  --r2e-dataset "${MANIFEST_DIR}/r2e.jsonl" \
+  --swe-dataset "${MANIFEST_DIR}/swebench.jsonl" \
+  --concurrency 200 \
+  --images 20 \
+  --rollouts-per-image 5 \
+  --client all \
+  --strategy all \
+  --window-size 0 \
+  --workload graded \
+  --mode steps \
+  --steps 1 \
+  --park suspend \
+  --step-pause 0s \
+  --api-service ate-env-api \
+  --run-id r2eswe \
+  --execution in-cluster \
+  --artifact-dir "${ARTIFACT_DIR}"
+```
+
+### `run-r2e-swebench.sh` subcommands and flags
+
+CLI flags override their matching environment variables. Pass extra
+`swebench-loader` flags after `--` (`-set KEY=VALUE` and `-label KEY=VALUE` also
+forward to `--client python`).
+
+| Flag / subcommand | Environment variable | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `dry-run \| prewarm \| run` | - | `run` | Subcommand: validate plans offline (`dry-run`), bake goldens and warm caches (`prewarm`), or execute timed shards and reports (`run`). |
+| `--r2e-dataset PATH` | `R2E_DATASET` | required | Digest-pinned R2E-Gym JSONL manifest path (`make-r2e-dataset.py`). |
+| `--swe-dataset PATH` | `SWE_DATASET` | required | Digest-pinned SWE-bench Verified JSONL manifest path (`make-dataset.py`). |
+| `-c, --concurrency N` | `MAX_CONCURRENCY` | `200` | Total active sandboxes across both `r2e` and `swe` shards (`>= 2`). |
+| `--r2e-width N` | `R2E_WIDTH` | proportional split | Active sandbox cap for the R2E-Gym shard. |
+| `--swe-width N` | `SWE_WIDTH` | proportional split | Active sandbox cap for the SWE-bench shard. |
+| `-i, --images N` | `IMAGES` | `20` | Distinct images selected per dataset (`N` R2E-Gym + `N` SWE-bench = `2N` total). |
+| `--r2e-images N` | `R2E_IMAGES` | `--images` (`20`) | Distinct images selected from `--r2e-dataset`. |
+| `--swe-images N` | `SWE_IMAGES` | `--images` (`20`) | Distinct images selected from `--swe-dataset`. |
+| `-r, --rollouts-per-image N` (`--rollouts N`) | `ROLLOUTS_PER_IMAGE` | `ceil(shard_width / shard_images)` | Replica rollouts (`steps` mode) or eval tasks (`eval` mode) per image. |
+| `--r2e-rollouts N` | `R2E_FANOUT` | `--rollouts-per-image` | Replica rollouts per R2E-Gym image. |
+| `--swe-rollouts N` | `SWE_FANOUT` | `--rollouts-per-image` | Replica rollouts per SWE-bench image. |
+| `--strategy STRATEGY` | `STRATEGY` | unset | Warm-pool orchestration strategy: `none`, `naive`, `sliding`, `pipelined`, `all`, or comma-separated list (`CSV`). |
+| `--window-size N` | `WINDOW_SIZE` | `0` (auto `1..8`) | Distinct-image window size for `sliding` and `pipelined` (`0` picks `clamp(ceil(images/2), 1, 8)`). |
+| `--client, --chain CHAIN` | `CLIENT` | `go` | Client and API chain: `go` (Go SDK -> `ate-env-api`), `go-direct` (`DirectSubstrateBackend` -> `ateapi` + `atenet-router`), `python` (`ate_env_rl` `SandboxFleet` -> `ate-env-api`), `all`, or `CSV` (`all` includes `go-direct` when `--control-addr` is set). |
+| `--workload graded\|io` | `WORKLOAD` | `graded` | Trajectory profile: `graded` (`r2e-gold.yaml` + `swebench-gold`) or `io` (`IO_TRAJECTORY`, default `workload-file-read`). |
+| `--mode steps\|eval\|open-loop` | `MODE` | `steps` | Loader execution mode (`--strategy` and `--client python` support `steps` and `eval`). |
+| `--steps N` | `STEPS` | `4` (`1` with `--strategy` or `python`) | Passes in `steps` mode (`--strategy` and `--client python` are single-pass and require `1`). |
+| `--park POLICY` | `PARK` | `suspend` | Park policy in `steps` mode (`suspend`, `delete`, or `none`). |
+| `--step-pause DUR` | `STEP_PAUSE` | `0s` | Pause before parking at step boundaries (for example `5s`). |
+| `--execution in-cluster\|local` | `EXECUTION` | `in-cluster` if `KO_DOCKER_REPO` set, else `local` | Run loader shards as Kubernetes `Job`s in `NAMESPACE` or as local processes. |
+| `--artifact-dir DIR` | `ARTIFACT_DIR` | `/tmp/<RUN_ID>` | Output directory outside the git checkout for `events/`, `arms/`, `report.{json,md}`, and `comparison.{txt,json,md}`. |
+| `--run-id ID` | `RUN_ID` | `r2eswe` | DNS-label prefix (`<= 14` characters) for `Job` and actor names. |
+| `--api-service NAME` | `API_SERVICE` | `ate-env-api` | In-cluster `ate-env-api` Kubernetes `Service` name (`<API_SERVICE>.<NAMESPACE>.svc:7777`). |
+| `--auth-token-file PATH` | `AUTH_TOKEN_FILE` | unset | Bearer token file for `ate-env-api` in `--execution local` mode (in-cluster `Job`s use `AUTH_TOKEN_SECRET`). |
+| `--python-bin PATH` | `PYTHON_BIN` | `python3` | Python interpreter for `dry-run` and `--execution local --client python` (`grpcio>=1.84`, `protobuf>=7.35`). |
+| `--python-image IMAGE` | `PYTHON_LOADER_IMAGE` | built via `KO_DOCKER_REPO` | Prebuilt container image for in-cluster `--client python` `Job`s. |
+| `--control-addr ADDR` | `CONTROL_ADDR` | unset | Substrate `ateapi` gRPC `host:port` (required for `--client go-direct`). |
+| `--router-addr ADDR` | `ROUTER_ADDR` | unset | Substrate `atenet-router` `host:port` override for `--client go-direct`. |
+| `--atenet-client-cert PATH` | `ATENET_CLIENT_CERT` | unset | Client mTLS PEM bundle (cert + key) for `atenet-router` in `--client go-direct`. |
+| `--atenet-ca-file PATH` | `ATENET_CA_FILE` | unset | CA PEM bundle verifying `atenet-router` TLS in `--client go-direct`. |
+| `--atenet-server-name NAME` | `ATENET_SERVER_NAME` | unset | TLS SNI server name override for `atenet-router` in `--client go-direct`. |
+| `--ateapi-token-file PATH` | `ATEAPI_TOKEN_FILE` | unset | Bearer token file for `ateapi` in `--client go-direct`. |
+| `--ateapi-ca-file PATH` | `ATEAPI_CA_FILE` | unset | CA PEM bundle verifying `ateapi` TLS in `--client go-direct`. |
+| `-h, --help` | - | - | Print command usage and flags. |
+
+Additional environment variables for cluster targeting, timeouts, and node
+telemetry:
+
+| Environment variable | Default | Description |
+| :--- | :--- | :--- |
+| `KO_DOCKER_REPO` | unset | OCI registry prefix for `ko` Go loader and Docker Python fleet images; selects `--execution in-cluster` by default. |
+| `CONTEXT`, `NAMESPACE`, `ATESPACE` | current context, `ate-env`, `$NAMESPACE` | `kubectl` context, Kubernetes namespace for `Job`s and `API_SERVICE`, and Substrate atespace. |
+| `BASE_TEMPLATE` | `default-template` | Base `ActorTemplate` from which per-image templates (`<BASE_TEMPLATE>-<12hex>`) derive. |
+| `ENDPOINT`, `AUTH_TOKEN_SECRET` | `localhost:7777`, unset | Local `ate-env-api` address (`--execution local`), and Kubernetes `Secret` (`key: token`) mounted as `SUBSTRATE_ENV_AUTH_TOKEN` in-cluster. |
+| `CONNECTIONS`, `WAKE_BUDGET`, `CREATE_TIMEOUT`, `STEP_TIMEOUT`, `START_TIMEOUT` | `8`, `5m`, `5m`, `15m`, `600` | Sharded gRPC channel count, per-operation timeouts, and in-cluster pod start timeout in seconds. |
+| `SWE_EXCLUDE_FILE`, `R2E_EXCLUDE_FILE` | `offline-exclusions.txt`, unset | Per-dataset instance exclusion files (set `SWE_EXCLUDE_FILE=""` to disable exclusions). |
+| `SAMPLE_CACHE`, `HARVEST_RESTORES`, `HARVEST_INTERVAL_MIN` | `0`, `0`, `10` | Set to `1` to scrape `atelet` `ate_imagecache_requests_total` (`cache_before.prom`, `cache_after.prom`) and harvest `atelet` restore phases (`restore_timings.jsonl`). |
+
+## Overview
+
+A loader that drives real R2E-Gym and SWE-bench task images through the `ate-env` API (or directly against Substrate) the
 way a simulated RL job does, and a report over what every phase cost. It is
 the "Fast" rung of the RL benchmark ladder: regular runs that catch
 regressions in the sandbox SDK, Substrate or the controller, on a workload
 that is the real thing rather than a Python image printing READY.
 
 Code: `internal/benchmarking/swebench` (library, tested against an in-memory
-backend) and `cmd/benchmarking/swebench-loader` (binary). The layout follows
+backend), `cmd/benchmarking/swebench-loader` (Go binary), and
+`benchmarking/swebench/run_fleet_bench.py` (Python `ate_env_rl` `SandboxFleet`
+driver). The layout follows
 substrate's `internal/benchmarking/boomer` so a user class can be lifted into
 that harness later; Go does not allow importing another module's `internal`
 packages, so nothing is imported from it.
 
 ## Workloads
 
-Both are parameters of one binary. Images, fan-out, width, steps and the
-trajectory are all flags, so the smoke test and the 500-wide run differ only
-in numbers.
+Images, fan-out, width, steps, strategy, and trajectory are all flags, so a
+smoke test and a 500-wide run differ only in numbers.
 
-| Shape | Flags | What happens |
+| Shape | Command / flags | What happens |
 |---|---|---|
+| mixed R2E-Gym + SWE-bench strategy & client sweep | `benchmarking/swebench/run-r2e-swebench.sh run --r2e-dataset r2e.jsonl --swe-dataset swebench.jsonl --concurrency 200 --images 20 --rollouts-per-image 5 --client all --strategy all` | Drives concurrent `job=r2e` (`r2e-gold.yaml`) and `job=swe` (`swebench-gold`) shards across `--client <go\|go-direct\|python\|all>` and `--strategy <none\|naive\|sliding\|pipelined\|all>`, emitting per-arm `bench report` bundles under `$ARTIFACT_DIR/arms/<arm>/` and `comparison.{txt,json,md}`. |
+| single-shard strategy sweep (`none`, `naive`, `sliding`, `pipelined`) | `-mode steps -steps 1 -images 20 -rollouts 5 -width 100 -strategy pipelined -window-size 8` | Single-pass sweep of the four warm-pool orchestration strategies on `swebench-loader`: `none` (on-demand create and delete per rollout), `naive` (prewarm and suspend all `images * rollouts` sandboxes upfront), `sliding` (warm `window-size` distinct images, execute, retire, advance), or `pipelined` (double-buffer window `N+1` prefetch behind window `N` execution while sharing `-width`). |
 | eval (SWE-bench Verified evaluation) | `-mode eval -images 500 -tasks-per-image 6 -width 500` | 500 in flight. Each task: create from the image, replay the trajectory, record the reward, delete. With the offline exclusion list the 500 become 445 images and 2,670 tasks; the loader prints the reduced count. |
 | steps (training loop) | `-mode steps -images 500 -rollouts 2 -steps 8 -park suspend` | 1,000 environments created once. Each step replays the trajectory on all of them, waits for the last (the barrier), then parks the fleet. `-park` is `suspend`, `delete` or `none`. |
 | steps, parked one by one (fleet larger than the slots) | `-mode steps -images 500 -rollouts 16 -steps 8 -park suspend -width 64 -park-each` | 8,000 environments, created on their first step. Each environment is parked as soon as its own step ends instead of after the whole fleet's, so at most 64 are awake at once and the fleet can be many times the running slots: the shape of a trainer that releases a sandbox at the end of its episode, and the way to measure how many parked environments a node can hold. The barrier includes the parking and there is no `park` event. |
 | steps with a window (pools per step) | `-mode steps -images-per-step 32 -rollouts 16 -steps 6 -park delete` | Each step takes the next 32 images (wrapping around the dataset), creates 16 fresh environments per image, 512 in all, runs the step behind a barrier, and retires them. Nothing survives a step, so every task pays the cold path, and a new image is a new derived template and a golden bake on first use: the shape of a trainer that creates and retires pools every step. Run several loaders at once, one run id each, for several jobs on one cluster. |
-| strategy sweep (`none`, `naive`, `sliding`, `pipelined`) | `-mode steps -steps 1 -images 20 -rollouts 5 -width 100 -strategy pipelined -window-size 8` | Single-pass sweep of the four warm-pool orchestration strategies matching Python `SandboxFleet`: `none` (on-demand create and delete per rollout), `naive` (prewarm and suspend all `images * rollouts` sandboxes upfront), `sliding` (warm `window-size` distinct images, execute, retire, advance), or `pipelined` (double-buffer window `N+1` prefetch behind window `N` execution while sharing `-width`). |
-
-`benchmarking/swebench/run-r2e-swebench.sh` orchestrates mixed R2E-Gym and SWE-bench sweeps across
-`--strategy <none|naive|sliding|pipelined|all>` and `--client <go|go-direct|python|all>`:
-`go` drives `swebench-loader` through the Go SDK (`clients/go`) and `ate-env-api`, `go-direct`
-drives `DirectSubstrateBackend` (`-backend=substrate -access=direct`) directly against Substrate
-`ateapi` and `atenet-router`, and `python` renders trajectories with `swebench-loader render-plan`
-and drives Python `SandboxFleet` (`benchmarking/swebench/run_fleet_bench.py`) through `ate-env-api`.
-Multi-arm runs emit per-arm `bench report` bundles under `$ARTIFACT_DIR/arms/<arm>/` and top-level
-`comparison.{txt,json,md}` tables.
 
 The trajectory is YAML (`internal/benchmarking/swebench/trajectories/`,
 or `-trajectory FILE`). The built-in `swebench-gold` does what a SWE agent

@@ -57,6 +57,27 @@ func TestDeriveImageTemplateKeepsResources(t *testing.T) {
 	}
 }
 
+// A derived template stores its snapshots where its base does: it carries
+// the base's snapshotConfig.storageLocation when the base sets one, and none
+// when the base sets none, because Substrate rejects the field without its
+// PerTemplateSnapshotLocation preview gate (substrate#3357).
+func TestDeriveImageTemplateStorageLocationFollowsBase(t *testing.T) {
+	for _, location := range []string{"gs://b/p/", ""} {
+		base := modeABase()
+		base.SnapshotConfig.StorageLocation = location
+		got, err := DeriveImageTemplate(base, "default-template-0123456789ab", testRootfsImage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if l := got.GetSnapshotConfig().GetStorageLocation(); l != location {
+			t.Errorf("base storageLocation %q: derived storageLocation = %q, want the base's", location, l)
+		}
+		if !proto.Equal(got.GetSnapshotConfig(), base.GetSnapshotConfig()) {
+			t.Errorf("base storageLocation %q: derived snapshotConfig = %v, want the base's %v", location, got.GetSnapshotConfig(), base.GetSnapshotConfig())
+		}
+	}
+}
+
 func TestImageDigestAndTemplateName(t *testing.T) {
 	name, err := ImageTemplateName("default-template", testRootfsImage)
 	if err != nil {

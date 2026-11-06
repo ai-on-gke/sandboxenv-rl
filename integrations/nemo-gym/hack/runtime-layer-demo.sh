@@ -22,17 +22,19 @@
 # through the path form. Deletes the environment on exit; keeps the template.
 #
 # Required:  LAYER_IMAGE (digest-pinned nemo-runtime-layer), GUEST_IMAGE
-#            (digest-pinned ate-env-guest), SNAPSHOTS_BUCKET, ROOTFS_IMAGE
+#            (digest-pinned ate-env-guest), ROOTFS_IMAGE
 #            (digest-pinned task image, e.g. python:3.12-slim@sha256:...)
 # Optional:  TEMPLATE (gym-nemo), ATESPACE (ate-env), SUBSTRATE_ENV_API
 #            (127.0.0.1:7777, ate-env-api reached by port-forward), PORT
 #            (6000), EXEC_PORT (unset: no exec server), FORCE=1 (recreate the
-#            template), ATE_ENV, KUBECTL_ATE
+#            template), ATE_ENV, KUBECTL_ATE, SNAPSHOTS_BUCKET (per-template
+#            snapshot location, needs ate-api-server's
+#            PerTemplateSnapshotLocation preview gate; unset: the install-wide
+#            --snapshot-location)
 set -euo pipefail
 
 : "${LAYER_IMAGE:?set LAYER_IMAGE to the digest-pinned nemo-runtime-layer image}"
 : "${GUEST_IMAGE:?set GUEST_IMAGE to the digest-pinned ate-env-guest image}"
-: "${SNAPSHOTS_BUCKET:?set SNAPSHOTS_BUCKET to the snapshot object-storage URL}"
 : "${ROOTFS_IMAGE:?set ROOTFS_IMAGE to a digest-pinned task image}"
 TEMPLATE=${TEMPLATE:-gym-nemo}
 ATESPACE=${ATESPACE:-ate-env}
@@ -63,7 +65,7 @@ else
   # without one never bakes its golden snapshot. Other task images derive
   # from this base and inherit the layer.
   "${ATE_ENV}" manifest template --template "${TEMPLATE}" --atespace "${ATESPACE}" \
-    --guest-image "${GUEST_IMAGE}" --snapshots-bucket "${SNAPSHOTS_BUCKET}" \
+    --guest-image "${GUEST_IMAGE}" ${SNAPSHOTS_BUCKET:+--snapshots-bucket "${SNAPSHOTS_BUCKET}"} \
     --rootfs-image "${ROOTFS_IMAGE}" \
     --layer "nemo=${LAYER_IMAGE}=/opt/nemo" "${sidecars[@]}" \
     | "${KUBECTL_ATE}" create actor-template -f - >/dev/null

@@ -362,9 +362,6 @@ func (c *templateConfig) resolveImages() error {
 binaries default it to the ate-env-guest image published with the release
 (see docs/release.md), or build and push your own with make images`)
 	}
-	if c.snapshotsBucket == "" {
-		return errors.New("--snapshots-bucket is required; use an object-storage bucket (e.g. gs://bucket/prefix/)")
-	}
 	if c.rootfsImage != "" {
 		if _, err := apiservice.ImageDigest(c.rootfsImage); err != nil {
 			return fmt.Errorf("--rootfs-image: %w", err)
@@ -613,7 +610,7 @@ It prints YAML to stdout without touching the cluster.`,
 	cmd.Flags().StringVar(&tCfg.atespace, "atespace", apiservice.DefaultAtespace, "Substrate atespace for the ActorTemplate")
 	cmd.Flags().StringVar(&tCfg.guestImage, "guest-image", defaultGuestImage, imageDefaultHelp("digest-pinned ate-env-guest image (repo@sha256:...)", defaultGuestImage))
 	cmd.Flags().StringSliceVar(&tCfg.guestCommand, "guest-command", []string{"/ko-app/ate-env-guest"}, "guest container entrypoint")
-	cmd.Flags().StringVar(&tCfg.snapshotsBucket, "snapshots-bucket", "", "object-storage bucket (with optional prefix) for actor snapshots, e.g. gs://bucket/prefix/")
+	cmd.Flags().StringVar(&tCfg.snapshotsBucket, "snapshots-bucket", "", "object-storage bucket (with optional prefix) the template's snapshots go to instead of the install-wide one, e.g. gs://bucket/prefix/, set as snapshotConfig.storageLocation. Needs ate-api-server's PerTemplateSnapshotLocation preview gate (ate-setup --preview) and kubectl-ate --preview on the create; without the gate Substrate ignores it (before substrate d86746d8) or rejects the template (from d86746d8). ate-env-api cannot derive image templates from a base with it: it does not opt in to preview, thus each create with a rootfs image on that base fails. Unset (the default), the template sets no location and its snapshots go under ate-api-server's --snapshot-location")
 	cmd.Flags().StringVar(&tCfg.rootfsImage, "rootfs-image", "", "digest-pinned image to run unmodified; the guest is mounted into it as a read-only image volume at "+apiservice.GuestMountPath)
 	cmd.Flags().StringVar(&tCfg.workspace, "workspace", "", "workspace root inside the actor, passed to the guest as -workspace (default: the guest's default)")
 	cmd.Flags().StringArrayVar(&tCfg.layers, "layer", nil, "extra runtime mounted as a read-only image volume, as name=image@sha256:...=/mount/path (repeatable)")
@@ -847,6 +844,11 @@ func buildActorTemplate(cfg templateConfig) *ateapipb.ActorTemplate {
 			},
 		}},
 		SnapshotConfig: &ateapipb.SnapshotConfig{
+			// Empty unless --snapshots-bucket names one: Substrate honors a
+			// template's location only with its PerTemplateSnapshotLocation
+			// preview gate, and rejects it without the gate since
+			// substrate#3357. An empty field is omitted, so the template's
+			// snapshots go under ate-api-server's --snapshot-location.
 			StorageLocation: cfg.snapshotsBucket,
 			// Environments must come back from suspend with their process
 			// state intact. MEMORY is also the server default, but the API

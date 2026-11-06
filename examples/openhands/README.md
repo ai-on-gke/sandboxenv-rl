@@ -129,7 +129,6 @@ images:
 ```bash
 kubectl -n ate-env port-forward deploy/ate-env-api 7777:7777 &
 GUEST_IMAGE=<registry>/ate-env-guest@sha256:<digest> \
-SNAPSHOTS_BUCKET=<object-storage-url> \
 LAYER_IMAGE=<registry>/oh-agent-server-layer@sha256:<digest> \
 IMAGES="docker.io/library/ubuntu@sha256:<digest> docker.io/library/node@sha256:<digest>" \
 examples/openhands/demo.sh

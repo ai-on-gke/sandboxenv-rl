@@ -83,9 +83,44 @@ func TestTemplateConfigResolveImages(t *testing.T) {
 	}
 	cfg = testTemplateConfig()
 	cfg.snapshotsBucket = ""
-	if err := cfg.resolveImages(); err == nil {
-		t.Error("resolveImages with a missing snapshots bucket: want error, got nil")
+	if err := cfg.resolveImages(); err != nil {
+		t.Errorf("resolveImages without a snapshots bucket: %v; the flag is optional", err)
 	}
+}
+
+// Without ate-api-server's PerTemplateSnapshotLocation preview gate,
+// Substrate ignores snapshotConfig.storageLocation at the pin and rejects it
+// from substrate#3357, thus the template sets it only when
+// --snapshots-bucket names one.
+func TestManifestTemplateStorageLocationOptIn(t *testing.T) {
+	render := func(t *testing.T, extra ...string) string {
+		t.Helper()
+		cmd := newManifestCommand()
+		var buf bytes.Buffer
+		cmd.SetOut(&buf)
+		cmd.SetArgs(append([]string{"template", "--guest-image=example.com/guest@sha256:aaaa"}, extra...))
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("execute manifest template %v: %v", extra, err)
+		}
+		return buf.String()
+	}
+
+	t.Run("without --snapshots-bucket", func(t *testing.T) {
+		out := render(t)
+		if strings.Contains(out, "storageLocation") {
+			t.Errorf("template without --snapshots-bucket sets storageLocation:\n%s", out)
+		}
+		// The rest of snapshotConfig stays.
+		if !strings.Contains(out, "preferredFidelity: SNAPSHOT_FIDELITY_MEMORY") {
+			t.Errorf("template lost preferredFidelity:\n%s", out)
+		}
+	})
+	t.Run("with --snapshots-bucket", func(t *testing.T) {
+		out := render(t, "--snapshots-bucket=gs://bucket/prefix/")
+		if !strings.Contains(out, "storageLocation: gs://bucket/prefix/") {
+			t.Errorf("template with --snapshots-bucket lacks its storageLocation:\n%s", out)
+		}
+	})
 }
 
 func TestBuildManifests(t *testing.T) {

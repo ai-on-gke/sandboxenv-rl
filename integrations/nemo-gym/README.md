@@ -60,8 +60,7 @@ On the cluster:
    kubectl get pods -n ate-env   # api + warm workers Running
    # once ate-env-api is Running (it creates the ate-env atespace templates live in):
    ate-env manifest template \
-     --guest-image  <ate-env-guest image> \
-     --snapshots-bucket gs://<bucket>/ate-env/ | kubectl-ate create actor-template -f -
+     --guest-image  <ate-env-guest image> | kubectl-ate create actor-template -f -
    ```
 
    If your `ateapi` requires authentication (it does on any standard install), the
@@ -109,8 +108,7 @@ runtime layer, then map it under `create.image_templates`:
 ate-env manifest template --template gym-py312 \
   --rootfs-image   docker.io/library/python@sha256:<digest> \
   --guest-image    <registry>/ate-env-guest@sha256:<digest> \
-  --workspace      /workspace \
-  --snapshots-bucket <object-storage-url> | kubectl-ate create actor-template -f -
+  --workspace      /workspace | kubectl-ate create actor-template -f -
 ```
 
 **Bake the guest into the image** (legacy, for control planes without image volumes):
@@ -320,8 +318,7 @@ crane digest <registry>/nemo-runtime-layer:<tag>   # templates take the digest, 
      --rootfs-image   docker.io/library/python@sha256:<digest> \
      --layer          nemo=<registry>/nemo-runtime-layer@sha256:<digest>=/opt/nemo \
      --sidecar        '/opt/nemo/python/bin/python3 -m nemo_runtime.sandbox_server --host 0.0.0.0 --port 6000' \
-     --sidecar-readyz http://127.0.0.1:6000/health \
-     --snapshots-bucket gs://<bucket>/ate-env/ | kubectl-ate create actor-template -f -
+     --sidecar-readyz http://127.0.0.1:6000/health | kubectl-ate create actor-template -f -
    ```
 
    Add a second `--sidecar`/`--sidecar-readyz` pair for the exec server when a recipe needs it.

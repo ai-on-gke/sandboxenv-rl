@@ -174,9 +174,10 @@ supported means for each path.
 ## Get started
 
 You need a cluster with Agent Substrate at or after
-[`48f5744c`](https://github.com/agent-substrate/substrate/commit/48f5744c), a snapshots bucket,
-`kubectl` with `kubectl-ate`, Go, [ko](https://ko.build), and Python 3.10 or later for the SDK. No
-release has been published yet; see [docs/release.md](./docs/release.md) for the release process.
+[`48f5744c`](https://github.com/agent-substrate/substrate/commit/48f5744c), a snapshots bucket
+(the install's `--snapshot-location`), `kubectl` with `kubectl-ate`, Go, [ko](https://ko.build),
+and Python 3.10 or later for the SDK. No release has been published yet; see
+[docs/release.md](./docs/release.md) for the release process.
 Build the CLI and images from source:
 
 ```bash
@@ -192,8 +193,7 @@ kubectl ate create atespace ate-env
 ate-env manifest access-policy | kubectl ate create access-policy -a ate-env -f -
 ate-env manifest --api-image <api-image> --worker-image <ateworker-gvisor-image> | kubectl apply -f -
 ate-env manifest auth-secret | kubectl create -f -   # the caller token; create it once
-ate-env manifest template --guest-image <guest-image> --snapshots-bucket <object-storage-url> \
-  | kubectl-ate create actor-template -f -
+ate-env manifest template --guest-image <guest-image> | kubectl-ate create actor-template -f -
 ```
 
 Try an environment. `ate-env-api` requires the token from the Secret:
@@ -228,7 +228,8 @@ Then pick an [example](#examples) or an [integration](#integrations).
 ## Deployment guide
 
 Prerequisites: a cluster with [Agent Substrate](https://github.com/agent-substrate/substrate)
-installed and a snapshots bucket. ate-env is built against Substrate
+installed and a snapshots bucket, set as the install's `--snapshot-location` (`SNAPSHOT_LOCATION`
+for ate-setup). ate-env is built against Substrate
 [`475f49b0`](https://github.com/agent-substrate/substrate/commit/475f49b0) (2026-10-28, Go module
 `go.ate.dev/substrate`), and the cluster must run Substrate at or after
 [`48f5744c`](https://github.com/agent-substrate/substrate/commit/48f5744c) (2026-10-22): that commit
@@ -286,6 +287,16 @@ When you upgrade an existing cluster across these changes:
   is, thus registering the base again does not change it. To give a `--sidecar-readyz` template
   the 120 s default, delete the base and its derived templates (`<base>-<12 hex digits>`), then
   register the base again; `ate-env-api` derives each image template again from the new base.
+- A base registered by an earlier ate-env build carries `snapshotConfig.storageLocation`, because
+  `--snapshots-bucket` was required, and each template `ate-env-api` derives from it copies the
+  field. On a cluster that runs Substrate at or after
+  [`d86746d8`](https://github.com/agent-substrate/substrate/commit/d86746d8) without the
+  `PerTemplateSnapshotLocation` preview gate, or on any cluster with the gate on, Substrate rejects
+  each new derived template with `InvalidArgument` (`storage_location: Forbidden`). With the gate on,
+  this is because `ate-env-api` does not opt in to preview features (see
+  [step 2](#2-register-the-actortemplate-in-substrate)). Delete the base and its derived templates
+  (`<base>-<12 hex digits>`) with `kubectl-ate delete actor-template`, then register the base again
+  without `--snapshots-bucket`.
 
 ### 1. Deploy the Kubernetes Resources
 
@@ -426,9 +437,24 @@ generate the Substrate ActorTemplate manifest:
 ```bash
 # --guest-image is the ate-env-guest image that `make images` printed.
 ate-env manifest template \
-  --guest-image    <registry>/ate-env-guest@sha256:<digest> \
-  --snapshots-bucket <object-storage-url> | kubectl-ate create actor-template -f -
+  --guest-image    <registry>/ate-env-guest@sha256:<digest> | kubectl-ate create actor-template -f -
 ```
+
+The template sets no `snapshotConfig.storageLocation`, thus its snapshots, and those of the
+templates `ate-env-api` derives from it, go under the install's `--snapshot-location`. An install
+with the `PerTemplateSnapshotLocation` preview gate can run without `--snapshot-location`; there
+Substrate rejects a template without a location with `FailedPrecondition`.
+
+`--snapshots-bucket <object-storage-url>` sets a location for this template instead. Substrate
+honors it only with the `PerTemplateSnapshotLocation` preview gate (ate-setup
+`--preview=PerTemplateSnapshotLocation`), and the create then needs `kubectl-ate --preview`.
+Without the gate, Substrate before
+[`d86746d8`](https://github.com/agent-substrate/substrate/commit/d86746d8) ignores the field, and
+Substrate from `d86746d8` rejects the template. Even with the gate, `ate-env-api` cannot derive
+image templates from such a base: it does not opt in to preview features, thus Substrate rejects
+the derived template's `storageLocation` with `Forbidden`, and each create with a `rootfs_image`
+on that base fails. Use `--snapshots-bucket` only for a base that you do not create image
+environments from.
 
 Each actor gets 2 CPUs and 4 GiB unless you pass `--cpu` and `--memory` (Kubernetes quantities such as
 `500m` or `8Gi`; CPU at most `999.999`, as Substrate requires). Substrate requires both limits and books them against worker capacity; templates
@@ -441,8 +467,7 @@ it with `--rootfs-image`: the guest is then mounted into it as a read-only OCI i
 ```bash
 ate-env manifest template --template py312 \
   --rootfs-image   docker.io/library/python@sha256:<digest> \
-  --guest-image    <registry>/ate-env-guest@sha256:<digest> \
-  --snapshots-bucket <object-storage-url> | kubectl-ate create actor-template -f -
+  --guest-image    <registry>/ate-env-guest@sha256:<digest> | kubectl-ate create actor-template -f -
 ```
 
 A second runtime rides along the same way: `--layer` mounts its image read-only next to the
@@ -460,8 +485,7 @@ ate-env manifest template --template layered \
   --guest-image    <registry>/ate-env-guest@sha256:<digest> \
   --layer          web=docker.io/library/busybox@sha256:<digest of the 1.37-musl tag>=/opt/web \
   --sidecar        '/opt/web/bin/busybox httpd -f -p 44772 -h /' \
-  --sidecar-readyz http://127.0.0.1:44772/etc/hostname \
-  --snapshots-bucket <object-storage-url> | kubectl-ate create actor-template -f -
+  --sidecar-readyz http://127.0.0.1:44772/etc/hostname | kubectl-ate create actor-template -f -
 ```
 
 Layers must be self-contained: the `1.37-musl` busybox is static, while the glibc build fails

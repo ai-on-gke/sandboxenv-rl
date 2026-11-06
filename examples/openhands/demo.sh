@@ -45,12 +45,14 @@
 #
 # Required:
 #   GUEST_IMAGE       digest-pinned ate-env-guest image (with the -sidecar flags)
-#   SNAPSHOTS_BUCKET  object-storage URL for actor snapshots
 #   LAYER_IMAGE       digest-pinned layer image built from ../../integrations/openhands/layer/Dockerfile
 #   IMAGES            space-separated digest-pinned images to run the
 #                     agent-server in; any image with /bin/sh and glibc 2.31
 #                     or newer
 # Optional:
+#   SNAPSHOTS_BUCKET  per-template snapshot location (--snapshots-bucket); needs
+#                     ate-api-server's PerTemplateSnapshotLocation preview gate.
+#                     Unset: ate-api-server's install-wide --snapshot-location
 #   BASE_IMAGE        digest-pinned glibc image the base template runs in
 #                     (default debian:bookworm-slim, pinned). The base
 #                     template bakes its own golden snapshot with the layer
@@ -84,7 +86,6 @@ set -euo pipefail
 umask 077
 
 : "${GUEST_IMAGE:?set GUEST_IMAGE to the digest-pinned ate-env-guest image}"
-: "${SNAPSHOTS_BUCKET:?set SNAPSHOTS_BUCKET to the snapshot object-storage URL}"
 : "${LAYER_IMAGE:?set LAYER_IMAGE to the digest-pinned agent-server layer image}"
 : "${IMAGES:?set IMAGES to one or more digest-pinned images}"
 PORT=${PORT:-8000}
@@ -211,7 +212,7 @@ else
   step "register ${ATESPACE}/${TEMPLATE}: ${BASE_IMAGE%%@*} + guest + agent-server layer on port ${PORT}"
   "${ATE_ENV}" manifest template --template "${TEMPLATE}" --atespace "${ATESPACE}" \
     --rootfs-image "${BASE_IMAGE}" \
-    --guest-image "${GUEST_IMAGE}" --snapshots-bucket "${SNAPSHOTS_BUCKET}" \
+    --guest-image "${GUEST_IMAGE}" ${SNAPSHOTS_BUCKET:+--snapshots-bucket "${SNAPSHOTS_BUCKET}"} \
     --layer "oh=${LAYER_IMAGE}=/opt/oh" \
     --sidecar "/opt/oh/python/bin/python3 -m openhands.agent_server --host 0.0.0.0 --port ${PORT}" \
     --sidecar-readyz "http://127.0.0.1:${PORT}/health" \

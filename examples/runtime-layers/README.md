@@ -16,7 +16,6 @@ inherited, and deletes what it created.
 kubectl -n ate-env port-forward svc/ate-env-api 7777:7777 &
 
 GUEST_IMAGE=<registry>/ate-env-guest@sha256:<digest> \
-SNAPSHOTS_BUCKET=<object-storage-url> \
 ROOTFS_IMAGE=docker.io/library/python@sha256:<digest> \
 LAYER_IMAGE=docker.io/library/busybox@sha256:<digest of the 1.37-musl tag> \
 OTHER_IMAGE=docker.io/library/node@sha256:<digest> \

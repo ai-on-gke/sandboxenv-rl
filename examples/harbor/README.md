@@ -75,13 +75,11 @@ builds on your machine.
 Substrate requires CPU and memory limits on every template, so each (cpus,
 memory_mb) pair a task asks for needs a base template named for it. The script
 prints one `ate-env manifest template` command per class the dataset uses; the
-flags after `--` go on each, at least the guest image and the snapshots bucket
-from your deployment:
+flags after `--` go on each, at least the guest image from your deployment:
 
 ```bash
 integrations/harbor/hack/register-templates.sh ./tb2/terminal-bench -- \
-  --guest-image <registry>/ate-env-guest@sha256:<digest> \
-  --snapshots-bucket <object-storage-url> | sh
+  --guest-image <registry>/ate-env-guest@sha256:<digest> | sh
 ```
 
 Without a class template the provider falls back to `default-template` with a

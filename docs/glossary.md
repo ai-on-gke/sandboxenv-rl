@@ -7,8 +7,9 @@ for control-plane terms.
 ## API resources and handles
 
 - **Environment**: The protobuf wire representation of one sandboxed execution environment
-  (`proto/ateenv/v1alpha/env.proto`), corresponding 1:1 to a Substrate actor. Distinct from client
-  handles `Env` and `SandboxHandle`.
+  (`proto/ateenv/v1alpha/env.proto`), corresponding 1:1 to a Substrate actor, carrying status,
+  hosting `node`, and optional `worker_selector`. Distinct from client handles `Env` and
+  `SandboxHandle`.
 - **Env**: The low-level client handle (`clients/go.Env` and `ate_env_rl.Env`) for managing a single
   environment (`start_process`, `shell`, `read_file`, `write_file`, `suspend`, `delete`). Neither
   SDK defines a class named `Environment`.
@@ -22,7 +23,8 @@ for control-plane terms.
   to `"default-template"` via `internal/apiservice.DefaultTemplate`.
 - **Derived template**: An `ActorTemplate` named `<base>-<digest:12>` generated on demand by
   `internal/apiservice/imagetemplate.go` when `CreateEnvironmentRequest` specifies a custom
-  `rootfs_image`.
+  `rootfs_image`. Reused when a later request carries the same digest under another repository path
+  (`sameImageDigest`).
 - **Rootfs image**: A digest-pinned (`@sha256:...`) OCI container image used as the actor root
   filesystem, into which `ate-env-guest` is injected at `/ate` (`GuestMountPath`).
 - **Runtime layer**: An extra digest-pinned OCI image volume mounted at a user-specified path inside

@@ -155,18 +155,7 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 	if s.Metrics != nil {
 		start = requestedAt(ctx, time.Now())
 	}
-	tmpl := req.GetTemplate()
-	templateName := tmpl.GetName()
-	if templateName == "" {
-		templateName = DefaultTemplate
-	}
-	atespace := req.GetAtespace()
-	if atespace == "" {
-		atespace = tmpl.GetAtespace()
-	}
-	if atespace == "" {
-		atespace = DefaultAtespace
-	}
+	templateName, atespace := templateDefaults(req.GetTemplate(), req.GetAtespace())
 	if s.Metrics != nil {
 		defer func() {
 			if retErr != nil {
@@ -178,7 +167,7 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 	}
 
 	if image := req.GetRootfsImage(); image != "" {
-		name, release, err := s.ensureImageTemplate(ctx, atespace, templateName, image)
+		name, _, release, err := s.ensureImageTemplate(ctx, atespace, templateName, image)
 		if err != nil {
 			return nil, err
 		}
@@ -210,27 +199,112 @@ func (s *Server) CreateEnvironment(ctx context.Context, req *ateenvv1alpha.Creat
 	}, nil
 }
 
+// templateDefaults resolves a request's base template name and atespace the
+// way CreateEnvironment does: the template name defaults to DefaultTemplate,
+// the atespace to the template's, then to DefaultAtespace.
+func templateDefaults(tmpl *ateenvv1alpha.Template, atespace string) (name, space string) {
+	name = tmpl.GetName()
+	if name == "" {
+		name = DefaultTemplate
+	}
+	space = atespace
+	if space == "" {
+		space = tmpl.GetAtespace()
+	}
+	if space == "" {
+		space = DefaultAtespace
+	}
+	return name, space
+}
+
+// GetImageStatus reports the template derived for a rootfs image and the
+// state of its golden snapshot, without creating anything.
+func (s *Server) GetImageStatus(ctx context.Context, req *ateenvv1alpha.GetImageStatusRequest) (*ateenvv1alpha.ImageStatus, error) {
+	base, atespace := templateDefaults(req.GetTemplate(), req.GetAtespace())
+	name, err := ImageTemplateName(base, req.GetRootfsImage())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	tmpl, err := s.client.GetActorTemplate(ctx, atespace, name)
+	if err != nil && !errors.Is(err, ate.ErrNotFound) {
+		return nil, toGRPCError(err)
+	}
+	// The same conflict a create reports: a template under the derived name
+	// that runs another image is not this image's template.
+	if got := firstContainerImage(tmpl); tmpl != nil && !sameImageDigest(got, req.GetRootfsImage()) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"actor template %q exists but runs %q, not %q; delete it or use another base template", name, got, req.GetRootfsImage())
+	}
+	return imageStatus(req.GetRootfsImage(), atespace, name, tmpl), nil
+}
+
+// EnsureImageTemplate creates the template derived for a rootfs image when
+// it is missing, which starts its golden snapshot bake, and reports it. It
+// takes the same path a create does, so a template whose bake failed is
+// recreated under the same rules, but no actor is created.
+func (s *Server) EnsureImageTemplate(ctx context.Context, req *ateenvv1alpha.EnsureImageTemplateRequest) (*ateenvv1alpha.ImageStatus, error) {
+	base, atespace := templateDefaults(req.GetTemplate(), req.GetAtespace())
+	name, tmpl, release, err := s.ensureImageTemplate(ctx, atespace, base, req.GetRootfsImage())
+	if err != nil {
+		return nil, err
+	}
+	release()
+	return imageStatus(req.GetRootfsImage(), atespace, name, tmpl), nil
+}
+
+// imageStatus is the ImageStatus for the derived template tmpl, nil when it
+// does not exist. The golden state follows Substrate's
+// golden_snapshot_status: a tag means READY, an error message FAILED, a
+// template with neither is still baking, and a template whose golden
+// snapshots are disabled reports NONE, because none will come.
+func imageStatus(image, atespace, name string, tmpl *ateapipb.ActorTemplate) *ateenvv1alpha.ImageStatus {
+	out := &ateenvv1alpha.ImageStatus{
+		RootfsImage: image,
+		Template:    &ateenvv1alpha.Template{Name: name, Atespace: atespace},
+		Golden:      ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_NONE,
+	}
+	if tmpl == nil {
+		return out
+	}
+	out.TemplateExists = true
+	if tmpl.GetSnapshotConfig().GetGoldenSnapshotConfig().GetMode() == ateapipb.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_DISABLED {
+		return out
+	}
+	golden := tmpl.GetStatus().GetGoldenSnapshotStatus()
+	switch {
+	case golden.GetErrorMessage() != "":
+		out.Golden = ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_FAILED
+		out.GoldenError = golden.GetErrorMessage()
+	case golden.GetGoldenTag().GetName() != "":
+		out.Golden = ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_READY
+		out.GoldenTag = golden.GetGoldenTag().GetName()
+	default:
+		out.Golden = ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_PENDING
+	}
+	return out
+}
+
 // ensureImageTemplate returns the name of the ActorTemplate that runs image
 // on top of base, creating it from base on first use. The derived template
 // lives in the environment's atespace, next to base. The caller must call
 // release once its actor is created: until then, this process does not
 // delete the template (see recreateFailedImageTemplate).
-func (s *Server) ensureImageTemplate(ctx context.Context, atespace, base, image string) (name string, release func(), err error) {
+func (s *Server) ensureImageTemplate(ctx context.Context, atespace, base, image string) (name string, tmpl *ateapipb.ActorTemplate, release func(), err error) {
 	name, err = ImageTemplateName(base, image)
 	if err != nil {
-		return "", nil, status.Error(codes.InvalidArgument, err.Error())
+		return "", nil, nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	lock := s.imageTemplates.get(atespace, name)
 	if err := lock.rlock(ctx); err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
-	tmpl, err := s.getOrCreateImageTemplate(ctx, atespace, base, name, image)
+	tmpl, err = s.getOrCreateImageTemplate(ctx, atespace, base, name, image)
 	if err != nil {
 		lock.mu.RUnlock()
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	if !lock.recreateDue(tmpl, time.Now()) {
-		return name, lock.mu.RUnlock, nil
+		return name, tmpl, lock.mu.RUnlock, nil
 	}
 	lock.mu.RUnlock()
 
@@ -238,16 +312,16 @@ func (s *Server) ensureImageTemplate(ctx context.Context, atespace, base, image 
 	err = s.recreateFailedImageTemplate(ctx, lock, atespace, base, name, image)
 	lock.mu.Unlock()
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	if err := lock.rlock(ctx); err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
-	if _, err := s.getOrCreateImageTemplate(ctx, atespace, base, name, image); err != nil {
+	if tmpl, err = s.getOrCreateImageTemplate(ctx, atespace, base, name, image); err != nil {
 		lock.mu.RUnlock()
-		return "", nil, err
+		return "", nil, nil, err
 	}
-	return name, lock.mu.RUnlock, nil
+	return name, tmpl, lock.mu.RUnlock, nil
 }
 
 // getOrCreateImageTemplate returns the derived template name, creating it

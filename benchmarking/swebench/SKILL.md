@@ -28,11 +28,13 @@ is one command.
    workers -o yaml`, shows each worker's `capacity`. With no limits on the WorkerPool template
    each worker registers the node's allocatable, so N workers on one node each claim the whole
    node. Set `spec.template.resources.limits` on the pool for a fixed slot count.
-3. **Every template has a golden before a restore measurement.** Count templates against
-   templates with a golden tag: `kubectl-ate get actor-templates -a ATESPACE -o json`, field
-   `.actorTemplates[].status.goldenSnapshotStatus.goldenTag.name`; a template whose bake failed
-   has `.errorMessage` instead and never gets a tag, so compare against the count without an
-   error rather than the total. Goldens bake at 5 concurrent per ateapi replica, about two
+3. **Every template has a golden before a restore measurement.** Ask the API per image:
+   `ate-env image-status <image>` prints `golden: ready|pending|failed` for the derived template
+   (`--ensure` creates a missing template, which starts the bake, with no environment); poll
+   until every image is `ready`. Without the API: `kubectl-ate get actor-templates -a ATESPACE -o json`,
+   field `.actorTemplates[].status.goldenSnapshotStatus.goldenTag.name`; a template whose bake
+   failed has `.errorMessage` instead and never gets a tag, so compare against the count without
+   an error rather than the total. Goldens bake at 5 concurrent per ateapi replica, about two
    minutes each; thousands of new templates mean hours. An actor whose template has no golden
    boots from the image, silently. Wait for the counts to match, or scale `ate-api-server`
    replicas, or label the run a cold boot.

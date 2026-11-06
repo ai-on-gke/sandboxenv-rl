@@ -10,10 +10,18 @@ user needs to know across them.
 - `benchmarking/swebench/run-r2e-swebench.sh`: the mixed R2E-Gym + SWE-bench
   recipe, with `make-r2e-dataset.py` (R2E-Gym `CommandAdapter` manifests),
   `run_fleet_bench.py` (the Python `SandboxFleet` arm) and the `r2e-swebench`
-  skill; `swebench-loader run -strategy none|naive|sliding|pipelined` and
+  skill and `REPORT_TEMPLATE.md`; `swebench-loader run -strategy none|naive|sliding|pipelined` and
   `-window-size`, `swebench-loader render-plan`, `swebench-loader report -md`
   over several runs (the arm table), and the `-atenet-*` and `-ateapi-*`
   flags of the direct Substrate backend.
+- ate-env-api: `GetImageStatus` and `EnsureImageTemplate`, the ActorTemplate
+  derived for a `rootfs_image` and the state of its golden snapshot (`NONE`,
+  `PENDING`, `READY` with the tag, `FAILED` with the reason); ensure creates
+  the template, which starts the bake, with no environment. Feature
+  `image_status`; `ate-env image-status <image> [--ensure]` (`image-status` joins
+  the reserved environment ids); the Python
+  client's `image_status()` and `ImageStatus`; the Go client's `ImageStatus`
+  and `EnsureImageTemplate`.
 - `examples/Qwen3.5-397B-A17B-verl`: the agentic GRPO recipe from 2 to 16 GPU
   nodes with profiles for Qwen3.5-35B-A3B and Qwen3.5-397B-A17B, steps of
   thousands of trajectories, and guarded verl patches for 64K responses.
@@ -87,6 +95,10 @@ user needs to know across them.
 
 ### Fixed
 
+- ate-env-api: a guest call whose caller context cancels or expires while its
+  wake probe is parked at the router returns `Canceled` or `DeadlineExceeded`
+  instead of treating the unwoken environment as awake and recording
+  `create_to_ready` and `wake_wait` as ready.
 - ate-env-api port proxy: the path form
   (`/v1alpha/envs/<id>/ports/<port>/...`) forwards the rest of the path
   exactly as sent; it re-escaped `! ' ( ) *` (`/report(1).txt` reached the

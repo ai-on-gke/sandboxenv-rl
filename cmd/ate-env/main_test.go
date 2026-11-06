@@ -387,7 +387,7 @@ func TestServerInfoCommand(t *testing.T) {
 		"server: sandboxenv-rl\n",
 		"version: v9.9.9\n",
 		"substrate_version: ",
-		"features: rootfs_image, pty, suspend_mode, port_proxy\n",
+		"features: rootfs_image, pty, suspend_mode, image_status, port_proxy\n",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("server-info output missing %q:\n%s", want, out.String())
@@ -425,7 +425,7 @@ func TestServerInfoCommandJSON(t *testing.T) {
 		t.Fatalf("output is not one JSON object: %v\n%s", err, out.String())
 	}
 	if got.Server != "sandboxenv-rl" || got.Version != "v9.9.9" || got.SubstrateVersion == "" ||
-		strings.Join(got.Features, ",") != "rootfs_image,pty,suspend_mode,port_proxy" {
+		strings.Join(got.Features, ",") != "rootfs_image,pty,suspend_mode,image_status,port_proxy" {
 		t.Errorf("server-info --json = %+v", got)
 	}
 }
@@ -487,5 +487,26 @@ func TestParseWorkerSelector(t *testing.T) {
 		if _, err := parseWorkerSelector([]string{bad}); err == nil {
 			t.Errorf("parseWorkerSelector(%q) accepted, want an error", bad)
 		}
+	}
+}
+
+func TestImageStatusCommandFlags(t *testing.T) {
+	args := []string{"image-status", "example.com/task@sha256:abc", "--ensure", "--template", "layered", "--json"}
+	root := newRootCommand(args)
+	cmd, _, err := root.Find(args[:1])
+	if err != nil {
+		t.Fatalf("root.Find failed: %v", err)
+	}
+	if err := cmd.ParseFlags(args[2:]); err != nil {
+		t.Fatalf("parsing flags: %v", err)
+	}
+	if got, _ := cmd.Flags().GetBool("ensure"); !got {
+		t.Error("--ensure not set")
+	}
+	if got, _ := cmd.Flags().GetString("template"); got != "layered" {
+		t.Errorf("--template = %q", got)
+	}
+	if got, _ := cmd.Flags().GetBool("json"); !got {
+		t.Error("--json not set")
 	}
 }

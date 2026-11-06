@@ -526,8 +526,6 @@ benchmarking/swebench/run-r2e-swebench.sh run \
   --workload graded \
   --mode steps \
   --steps 1 \
-  --park suspend \
-  --step-pause 0s \
   --api-service ate-env-api \
   --run-id r2eswe \
   --execution in-cluster \

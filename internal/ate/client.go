@@ -182,6 +182,16 @@ func New(opts Options) (*Client, error) {
 	}, nil
 }
 
+// NewControlClient returns a Client backed directly by control, without
+// opening a gRPC transport connection. Callers in unit tests use it to drive
+// control-plane logic inside testing/synctest bubbles without OS sockets.
+func NewControlClient(control ateapipb.ControlClient) *Client {
+	return &Client{
+		opts:    Options{HostSuffix: DefaultHostSuffix},
+		control: control,
+	}
+}
+
 // Close releases the control-plane connection and any cached guest connections.
 func (c *Client) Close() error {
 	c.mu.Lock()
@@ -190,6 +200,9 @@ func (c *Client) Close() error {
 	}
 	c.guestPool = nil
 	c.mu.Unlock()
+	if c.conn == nil {
+		return nil
+	}
 	return c.conn.Close()
 }
 

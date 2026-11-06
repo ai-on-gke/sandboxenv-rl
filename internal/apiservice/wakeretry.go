@@ -99,7 +99,9 @@ func setStartFailure(ctx context.Context, reason string) {
 // ensureAwake sends a trivial request to the environment's guest over conn
 // and repeats it while the router answers Unavailable, which is what an
 // expired parking budget and a guest that is not yet listening both look
-// like. It returns when the guest answers anything else, when the actor has
+// like. A Canceled or DeadlineExceeded probe answer also ends the wait,
+// returning ctx's status when ctx has ended or the probe error directly. It
+// returns when the guest answers any other status, when the actor has
 // crashed, when ctx ends, or when a budget is spent: WakeBudget bounds the
 // whole wait, and WakeRunningBudget bounds the part of it that starts with
 // the first attempt that sees the actor RUNNING, so a long suspended phase
@@ -120,7 +122,26 @@ func setStartFailure(ctx context.Context, reason string) {
 // With Metrics set, a wait (a first probe that found the guest unreachable)
 // is observed in ate_env_api_wake_wait_seconds with its outcome, and the
 // guest's first answer after CreateEnvironment ends create_to_ready.
-func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespace, id string) (retErr error) {
+func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespace, id string) error {
+	client := ateenvv1alpha.NewProcessServiceClient(conn)
+	probe := func(ctx context.Context) error {
+		_, err := client.GetProcess(ctx, &ateenvv1alpha.GetProcessRequest{ProcessId: "ate-env-wake-probe"})
+		return err
+	}
+	readStatus := func(ctx context.Context) (*ateapipb.ActorStatus, error) {
+		return s.actorStatus(ctx, atespace, id)
+	}
+	return s.awaitWake(ctx, atespace, id, probe, readStatus)
+}
+
+// awaitWake is ensureAwake with its two reads passed in: probe sends the
+// trivial guest request through the router, and readStatus reads the actor's
+// status from the control plane. The property test in
+// wakeretry_property_test.go drives it with scripted answers on a fake clock.
+func (s *Server) awaitWake(ctx context.Context, atespace, id string,
+	probe func(context.Context) error,
+	readStatus func(context.Context) (*ateapipb.ActorStatus, error),
+) (retErr error) {
 	start := time.Now()
 	waited, outcome := false, telemetry.WakeOutcomeError
 	defer func() {
@@ -148,13 +169,19 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 	// the router parks a probe for its parking budget before it answers
 	// no-room, so that wait counts toward the grace.
 	var noCapacitySince time.Time
-	probe := ateenvv1alpha.NewProcessServiceClient(conn)
 	backoff := wakeRetryInitialBackoff
 	for attempt := 1; ; attempt++ {
 		probeStart := time.Now()
-		_, err := probe.GetProcess(ctx, &ateenvv1alpha.GetProcessRequest{ProcessId: "ate-env-wake-probe"})
+		err := probe(ctx)
 		probeDone := time.Now()
-		if status.Code(err) != codes.Unavailable {
+		switch status.Code(err) {
+		case codes.Unavailable:
+		case codes.Canceled, codes.DeadlineExceeded:
+			if ctx.Err() != nil {
+				return status.FromContextError(ctx.Err()).Err()
+			}
+			return err
+		default:
 			// Anything else, NotFound for the probe id included, came from
 			// the guest itself.
 			return nil
@@ -166,7 +193,7 @@ func (s *Server) ensureAwake(ctx context.Context, conn *grpc.ClientConn, atespac
 				identityNote(s.RouterIdentity), err, routertls.RejectionAdvice)
 		}
 		waited = true
-		st, serr := s.actorStatus(ctx, atespace, id)
+		st, serr := readStatus(ctx)
 		if serr != nil {
 			return serr
 		}

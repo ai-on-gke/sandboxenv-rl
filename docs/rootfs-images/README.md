@@ -20,9 +20,11 @@ process  = /ate/ko-app/ate-env-guest, from a second image mounted read-only at /
 
 Substrate materializes both at actor start. Everything else about the template
 (worker selector, snapshot settings, resources, readiness probe)
-is the same as for a guest-image template, and the guest behaves identically:
-the environment's `shell`, process and file APIs, MCP, and suspend and resume
-all work unchanged.
+is the same as for a guest-image template, and `CreateEnvironment` can also
+pass per-environment `worker_selector` labels (`--worker-selector`) that narrow
+the base template's pool selection via logical AND and persist across wakes.
+The guest behaves identically: the environment's `shell`, process and file APIs,
+MCP, and suspend and resume all work unchanged.
 
 ## Prerequisites
 
@@ -80,8 +82,9 @@ env = await client.create("py1", rootfs_image="docker.io/library/python@sha256:<
 ```
 
 ```go
-client.Create(ctx, &ateenvv1alpha.CreateEnvironmentRequest{
-    Id: "py1", Image: "docker.io/library/python@sha256:<digest>",
+_, err := client.Create(ctx, &ateenvv1alpha.CreateEnvironmentRequest{
+    Id:          "py1",
+    RootfsImage: "docker.io/library/python@sha256:<digest>",
 })
 ```
 
@@ -90,7 +93,9 @@ What happens on the server:
 1. The request's template (default `default-template`) is the **base**. It must
    exist in the environment's atespace.
 2. `ate-env-api` looks for a template named `<base>-<first 12 hex digits of the
-   digest>` next to the base. If it exists and runs that image, it is reused.
+   digest>` next to the base. If it exists and runs an image with the same
+   `@sha256:...` digest, even under another repository path, it is reused as is,
+   keeping the existing template's image reference.
 3. Otherwise the server derives it from the base and creates it: same worker
    selector, snapshot and sandbox settings, env and readiness; the rootfs image as
    the container; the base's guest image as a volume at `/ate`; the command
@@ -110,7 +115,11 @@ kubectl-ate get actor-template --atespace ate-env
 ```
 
 A fresh template shows `Failed` in that listing for a few seconds while its
-golden bakes, then `Ready`. Environments can be created in the meantime.
+golden bakes, then `Ready`. Environments can be created in the meantime. The API
+answers the same question per image: `ate-env image-status <image>` reports the
+derived template and `golden: none|pending|ready|failed`, and `--ensure` creates
+the template without creating an environment, so a job can start the bakes for
+its whole image set up front and wait for `ready` before it measures first boots.
 
 ## A second runtime
 
@@ -125,7 +134,7 @@ runnable example in [`examples/runtime-layers`](../../examples/runtime-layers).
 |---|---|
 | `InvalidArgument: image ... is not pinned by digest` | Pass `repo@sha256:<64 hex>`; tags are rejected before anything is created |
 | `FailedPrecondition: base actor template ... not found` | Register the base in the environment's atespace first (`ate-env manifest template`) |
-| `FailedPrecondition: actor template ... exists but runs ...` | The derived name is taken by a template with a different image; delete it or use another base name |
+| `FailedPrecondition: actor template ... exists but runs ...` | The derived name is taken by a template whose image has a different digest; delete it or use another base name |
 | `InvalidArgument: ... cannot re-root command ...` | The base's command is not an absolute path to the guest (a shell wrapper); fix the base template |
 | Environment never serves, derived template stays `Failed` | The rootfs image could not be pulled or does not start the guest (port 80 taken, no exec permission); check the worker pod logs |
 
@@ -137,8 +146,14 @@ runnable example in [`examples/runtime-layers`](../../examples/runtime-layers).
 - Bumping the guest means a new base template (templates are immutable), and a
   new base name yields new derived names. Existing derived templates keep the
   guest they were built with.
-- Resources and worker selector come from the base, and the sandbox from the worker pool; a rootfs image
-  that needs more is served by registering its own template (Option A) or a
-  second base.
+- Resources and base worker selector come from the base, and the sandbox from the
+  worker pool. `CreateEnvironment` also accepts optional `worker_selector`
+  labels (`ate-env create --worker-selector key=value`, Python
+  `worker_selector={...}` or `FleetConfig(node_selector=..., placement=...)`,
+  or Go `WorkerSelector`) matched by exact equality: Substrate ANDs them with the
+  base template's selector and stores them on `Actor.worker_selector`, so
+  per-environment selectors narrow the base template's pool selection and
+  persist across wakes. A rootfs image that needs more compute or
+  a disjoint pool still needs its own template (Option A) or a second base.
 - The rootfs image's existence is not checked at create time. A bad reference is
   reported by the actor failing to start, not by `CreateEnvironment`.

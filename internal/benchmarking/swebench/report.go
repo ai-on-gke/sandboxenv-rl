@@ -1465,14 +1465,16 @@ func (b *Builder) Finish() *Report {
 	return &rep
 }
 
+// inferParkMode is the run's park mode: the loader's park label on the run
+// event (Config.labels), else the name of the park event, else what the
+// suspend and fork events imply. The label is the only record under
+// -park-each, which parks inside the barrier and writes no park event.
 func inferParkMode(rep *Report) string {
 	if rep == nil {
 		return "ephemeral"
 	}
-	if rep.RunTags != nil {
-		if p := strings.TrimSpace(rep.RunTags["park"]); p != "" && p != "none" {
-			return p
-		}
+	if p := strings.TrimSpace(rep.Labels["park"]); p != "" && p != "none" {
+		return p
 	}
 	for _, s := range rep.Stats {
 		if s.Event == EventPark && s.Name != "" && s.Name != "none" && s.Count > 0 {

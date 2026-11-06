@@ -16,6 +16,8 @@ package swebench
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"reflect"
@@ -740,5 +742,54 @@ func TestBuildMultiJobWorkingSetAndRunDuration(t *testing.T) {
 	}
 	if len(rep.Steps) != 1 || rep.Steps[0].BarrierMS != 1300 || rep.Steps[0].WorkingSetHits != 7 || rep.Steps[0].StandingPoolSize != 10 {
 		t.Fatalf("multi-job step[0] = %+v, want barrier=1300 hits=7 pool=10", rep.Steps)
+	}
+}
+
+// A -park-each run parks inside the barrier and records no park event, so
+// the report takes the park mode from the run's park label: report.json,
+// the lifecycle policy and the setup table all name the mode the run used.
+func TestParkEachRunReportsParkMode(t *testing.T) {
+	for _, park := range []Park{ParkSuspendAsync, ParkSuspendSync} {
+		t.Run(string(park), func(t *testing.T) {
+			f := newFake()
+			var out bytes.Buffer
+			cfg := baseConfig(t, f, &out)
+			cfg.Mode = ModeSteps
+			cfg.Rollouts = 1
+			cfg.Steps = 2
+			cfg.Park = park
+			cfg.ParkEach = true
+			if _, err := Run(context.Background(), cfg); err != nil {
+				t.Fatal(err)
+			}
+			rep := Build(parseEvents(t, out.String()))
+			for _, s := range rep.Stats {
+				if s.Event == EventPark {
+					t.Fatalf("-park-each recorded a park event %q", s.Name)
+				}
+			}
+			if st, ok := rep.StatFor(EventSuspend, ""); !ok || st.Count == 0 {
+				t.Fatal("no suspend events: the fallback would not be exercised")
+			}
+			if rep.ParkMode != string(park) {
+				t.Fatalf("park_mode %q, want %s from the park label", rep.ParkMode, park)
+			}
+			if rep.LifecyclePolicy == nil || rep.LifecyclePolicy.ParkMode != string(park) {
+				t.Fatalf("lifecycle policy %+v, want park_mode %s", rep.LifecyclePolicy, park)
+			}
+			js, err := json.Marshal(rep)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := `"park_mode":"` + string(park) + `"`; !strings.Contains(string(js), want) {
+				t.Fatalf("report.json lacks %s", want)
+			}
+			rep.AttachClusterTelemetry(&schema.SystemDescription{SchemaVersion: schema.SchemaVersion}, nil)
+			var md bytes.Buffer
+			rep.WriteMarkdown(&md)
+			if want := "(`park_mode=" + string(park) + "`"; !strings.Contains(md.String(), want) {
+				t.Fatalf("lifecycle table lacks %s:\n%s", want, md.String())
+			}
+		})
 	}
 }

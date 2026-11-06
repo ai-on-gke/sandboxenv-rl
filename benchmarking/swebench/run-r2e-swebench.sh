@@ -1001,8 +1001,8 @@ mode_args_for_go() {
           echo "STEP_PAUSE (${STEP_PAUSE}) holds all ${fleet} shard environments awake until the step barrier, exceeding shard width ${shard_width}; omit --step-pause or raise --concurrency" >&2
           exit 2
         fi
-        if [[ "${PARK}" != "suspend" && "${PARK}" != "delete" ]]; then
-          echo "PARK=${PARK} holds all ${fleet} shard environments awake until the step barrier, exceeding shard width ${shard_width}; use --park suspend or --park delete, or raise --concurrency" >&2
+        if [[ "${PARK}" != "suspend" && "${PARK}" != "suspend-sync" && "${PARK}" != "suspend-async" && "${PARK}" != "delete" ]]; then
+          echo "PARK=${PARK} holds all ${fleet} shard environments awake until the step barrier, exceeding shard width ${shard_width}; use --park suspend, suspend-sync, suspend-async or delete, or raise --concurrency" >&2
           exit 2
         fi
         MODE_ARGS+=("-park-each")

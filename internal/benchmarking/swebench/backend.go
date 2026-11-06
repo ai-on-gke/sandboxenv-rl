@@ -22,10 +22,12 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"slices"
 	"sync/atomic"
 	"time"
 
 	env "github.com/agent-substrate/env/clients/go"
+	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/benchmarking/schema"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"google.golang.org/grpc/codes"
@@ -55,8 +57,10 @@ type ModeSuspender interface {
 	SuspendWithMode(ctx context.Context, async bool) error
 }
 
-// AsyncSuspender is an optional interface implemented by Sandboxes that support
-// non-blocking asynchronous checkpointing (DURABILITY_MODE_ASYNCHRONOUS).
+// AsyncSuspender is an optional interface implemented by Sandboxes that
+// support a local suspend: the call returns once the snapshot is on the node
+// and the upload goes on in the background (SUSPEND_MODE_LOCAL through
+// ate-env-api, DURABILITY_MODE_ASYNCHRONOUS with direct Substrate access).
 type AsyncSuspender interface {
 	SuspendAsync(ctx context.Context) error
 }
@@ -246,9 +250,35 @@ func (b *EnvBackend) Delete(ctx context.Context, id string) error {
 	return b.pick().Delete(ctx, b.atespace, id)
 }
 
-// SuspendWithMode suspends the environment with id via the ate-env API.
-func (b *EnvBackend) SuspendWithMode(ctx context.Context, id string, _ bool) error {
+// SuspendWithMode suspends the environment with id via the ate-env API:
+// durably (the call returns once the snapshot is in object storage) or, with
+// async, locally (SuspendLocal: the call returns once the snapshot is on the
+// node and the upload goes on in the background).
+func (b *EnvBackend) SuspendWithMode(ctx context.Context, id string, async bool) error {
+	if async {
+		return b.pick().SuspendLocal(ctx, b.atespace, id)
+	}
 	return b.pick().Suspend(ctx, b.atespace, id)
+}
+
+// CheckSuspendLocal fails when the ate-env-api does not serve the suspend
+// mode SuspendLocal sends (the suspend_mode feature of GetServerInfo), so a
+// run that parks with suspend-async stops before it starts instead of failing
+// every suspend with InvalidArgument.
+func (b *EnvBackend) CheckSuspendLocal(ctx context.Context) error {
+	// The first connection, so the check does not advance the round robin;
+	// every connection names the same endpoint.
+	info, err := b.clients[0].ServerInfo(ctx)
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			return fmt.Errorf("this ate-env-api predates GetServerInfo and cannot suspend locally; use -park suspend: %w", err)
+		}
+		return fmt.Errorf("checking the ate-env-api for suspend modes: %w", err)
+	}
+	if !slices.Contains(info.GetFeatures(), apiservice.FeatureSuspendMode) {
+		return fmt.Errorf("ate-env-api %s %s does not serve %s, which -park suspend-async needs; use -park suspend or upgrade it", info.GetServer(), info.GetVersion(), apiservice.FeatureSuspendMode)
+	}
+	return nil
 }
 
 // Prewarm ensures derived ActorTemplates exist for each image by creating and
@@ -509,11 +539,20 @@ func (s envSandbox) WriteFile(ctx context.Context, path string, content []byte, 
 	return s.e.WriteFile(ctx, path, bytes.NewReader(content), mode)
 }
 
+// Suspend parks durably: the call returns once the snapshot is in object
+// storage.
 func (s envSandbox) Suspend(ctx context.Context) error { return s.e.Suspend(ctx) }
 
-func (s envSandbox) SuspendAsync(ctx context.Context) error { return s.e.Suspend(ctx) }
+// SuspendAsync parks locally (SuspendLocal): the call returns once the
+// snapshot is on the node, and the upload goes on in the background.
+func (s envSandbox) SuspendAsync(ctx context.Context) error { return s.e.SuspendLocal(ctx) }
 
-func (s envSandbox) SuspendWithMode(ctx context.Context, _ bool) error {
+// SuspendWithMode parks durably, or locally with async; see Suspend and
+// SuspendAsync.
+func (s envSandbox) SuspendWithMode(ctx context.Context, async bool) error {
+	if async {
+		return s.e.SuspendLocal(ctx)
+	}
 	return s.e.Suspend(ctx)
 }
 

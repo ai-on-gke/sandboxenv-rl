@@ -1,0 +1,125 @@
+{
+  "schema_version": "v1",
+  "generated_at": "2026-11-03T12:00:05Z",
+  "project": "example-project",
+  "cluster": "bench-1",
+  "location": "us-central1",
+  "reporter": {
+    "version": "v0.1.0",
+    "commit": "abc1234",
+    "interval_s": 5
+  },
+  "atespaces": [
+    {
+      "name": "ate-env",
+      "create_time": "2026-11-03T12:00:00Z"
+    }
+  ],
+  "templates": [
+    {
+      "atespace": "ate-env",
+      "name": "default-template",
+      "guest_image": "example.com/ate-env-guest@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "workerpool": "default-template-workerpool",
+      "golden_state": "none",
+      "create_time": "2026-11-03T12:00:00Z"
+    },
+    {
+      "atespace": "ate-env",
+      "name": "default-template-1a2b3c4d5e6f",
+      "base": "default-template",
+      "rootfs_image": "example.com/python@sha256:1a2b3c4d5e6f0000000000000000000000000000000000000000000000000000",
+      "guest_image": "example.com/ate-env-guest@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "workerpool": "default-template-workerpool",
+      "golden_state": "ready",
+      "create_time": "2026-11-03T12:00:01Z"
+    }
+  ],
+  "tags": [
+    {
+      "atespace": "ate-env",
+      "name": "golden-default-template-1a2b3c4d5e6f",
+      "source_actor": "golden-7f3e",
+      "create_time": "2026-11-03T12:00:02Z"
+    }
+  ],
+  "workerpools": [
+    {
+      "namespace": "ate-env",
+      "name": "default-template-workerpool",
+      "replicas": 4,
+      "ready_replicas": 4,
+      "sandbox_class": "gvisor",
+      "sandbox_config": "gvisor-default",
+      "worker_image": "example.com/ateworker-gvisor@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "workers": [
+    {
+      "name": "w-0a1b2c",
+      "namespace": "ate-env",
+      "pool": "default-template-workerpool",
+      "pod": "default-template-workerpool-7c9d8-x2k4q",
+      "node": "gke-bench-1-pool-1-abcd",
+      "state": "active",
+      "capacity": {
+        "cpu_m": 8000,
+        "memory_bytes": 34359738368
+      },
+      "allocated": {
+        "cpu_m": 2000,
+        "memory_bytes": 4294967296
+      }
+    }
+  ],
+  "actors": [
+    {
+      "uid": "8f2a0001",
+      "atespace": "ate-env",
+      "name": "env-001",
+      "template": "default-template-1a2b3c4d5e6f",
+      "state": "running",
+      "assigned_node": "gke-bench-1-pool-1-abcd",
+      "worker": "w-0a1b2c",
+      "create_time": "2026-11-03T12:00:03Z",
+      "update_time": "2026-11-03T12:00:04Z",
+      "labels": {
+        "example.com/run-id": "r-1"
+      }
+    },
+    {
+      "uid": "8f2a0002",
+      "atespace": "ate-env",
+      "name": "env-002",
+      "template": "default-template-1a2b3c4d5e6f",
+      "source_tag": "golden-default-template-1a2b3c4d5e6f",
+      "state": "crashed",
+      "create_time": "2026-11-03T12:00:03Z",
+      "update_time": "2026-11-03T12:00:05Z",
+      "crash": {
+        "message": "atelet: restore failed: snapshot download timed out",
+        "crash_time": "2026-11-03T12:00:05Z"
+      }
+    }
+  ],
+  "deployments": [
+    {
+      "namespace": "ate-env",
+      "name": "ate-env-api",
+      "image": "example.com/ate-env-api@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "version": "v0.1.0",
+      "ready": 1,
+      "tracing": true,
+      "metrics_port": 9090
+    }
+  ],
+  "counts": {
+    "actors_by_state": {
+      "crashed": 1,
+      "running": 1
+    },
+    "actors_by_atespace": {
+      "ate-env": 2
+    }
+  }
+}

@@ -1192,10 +1192,11 @@ func TestImageStatusFollowsTheDerivedTemplate(t *testing.T) {
 		t.Errorf("template count after same-digest status = %d, want 2", n)
 	}
 
-	// A different digest on the same template name is another image.
-	otherDigest := testRootfsImage[:len(testRootfsImage)-64] + strings.Repeat("f", 64)
-	if _, err := client.GetImageStatus(ctx, &ateenvv1alpha.GetImageStatusRequest{RootfsImage: otherDigest}); status.Code(err) != codes.FailedPrecondition && err != nil {
-		t.Errorf("other digest: code %v (%v)", status.Code(err), err)
+	// A different digest whose first 12 hex digits match derives the same
+	// template name, which an existing template running another image holds.
+	otherDigest := testRootfsImage[:len(testRootfsImage)-52] + strings.Repeat("f", 52)
+	if _, err := client.GetImageStatus(ctx, &ateenvv1alpha.GetImageStatusRequest{RootfsImage: otherDigest}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("other digest: code %v (%v), want FailedPrecondition", status.Code(err), err)
 	}
 }
 

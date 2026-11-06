@@ -389,6 +389,27 @@ func (c *Client) List(ctx context.Context, atespace string) ([]*ateapipb.Actor, 
 	}
 }
 
+// ListWorkers returns every worker the control plane knows, following its
+// pagination. Workers are global: listing them takes the global viewer
+// role, and a caller without it gets PermissionDenied.
+func (c *Client) ListWorkers(ctx context.Context) ([]*ateapipb.Worker, error) {
+	var workers []*ateapipb.Worker
+	token := ""
+	for {
+		resp, err := c.control.ListWorkers(ctx, &ateapipb.ListWorkersRequest{
+			Options: &ateapipb.ListOptions{PageToken: token},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("ate: listing workers: %w", wrapGRPCError(err))
+		}
+		workers = append(workers, resp.GetWorkers()...)
+		token = resp.GetNextPageToken()
+		if token == "" {
+			return workers, nil
+		}
+	}
+}
+
 // Suspend checkpoints and stops the actor with ID in atespace.
 // If atespace is empty, DefaultAtespace is used.
 //
@@ -410,6 +431,23 @@ func (c *Client) Suspend(ctx context.Context, atespace, id string) error {
 // If atespace is empty, DefaultAtespace is used.
 func (c *Client) SuspendLocal(ctx context.Context, atespace, id string) error {
 	return c.suspend(ctx, atespace, id, ateapipb.DurabilityMode_DURABILITY_MODE_ASYNCHRONOUS)
+}
+
+// Resume wakes an actor through the control plane and returns it placed:
+// Substrate's ResumeActor returns once the actor is RUNNING and its template's
+// wakeup probe answered, or fails (the actor is CRASHED then). A new actor is
+// born suspended and unplaced; nothing but a resume, the router's on a guest
+// call or this one, puts it on a node. The caller's role must allow it
+// (editor of the atespace).
+func (c *Client) Resume(ctx context.Context, atespace, id string) (*ateapipb.Actor, error) {
+	if id == "" {
+		return nil, errors.New("ate: id is required")
+	}
+	resp, err := c.control.ResumeActor(ctx, &ateapipb.ResumeActorRequest{Actor: c.ref(atespace, id)})
+	if err != nil {
+		return nil, fmt.Errorf("ate: resuming %q: %w", id, wrapGRPCError(err))
+	}
+	return resp.GetActor(), nil
 }
 
 func (c *Client) suspend(ctx context.Context, atespace, id string, mode ateapipb.DurabilityMode) error {

@@ -76,6 +76,7 @@ from .types import (
     FleetPlan,
     GoldenSnapshotState,
     ImageStatus,
+    PlacementDomain,
     PlacementSpec,
     PlanEntry,
     ProcessInfo,
@@ -89,6 +90,8 @@ from .types import (
     SuspendMode,
     Task,
     Template,
+    WarmImageCoverage,
+    WarmProbe,
 )
 
 __all__ = [
@@ -141,6 +144,9 @@ __all__ = [
     "ProcessState",
     "GoldenSnapshotState",
     "ImageStatus",
+    "PlacementDomain",
+    "WarmImageCoverage",
+    "WarmProbe",
     "ServerInfo",
     "ShellResult",
     "Signal",

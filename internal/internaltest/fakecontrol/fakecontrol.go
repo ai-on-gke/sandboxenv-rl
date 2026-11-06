@@ -15,7 +15,10 @@
 // Package fakecontrol implements an in-memory fake of the Substrate ateapi
 // Control service for tests. It mimics the control plane's lifecycle
 // semantics: actors are created suspended, resume/suspend/pause flip
-// status, and, like Substrate v0.6.0, an actor in any state can be deleted.
+// status, and, like Substrate v0.6.0, an actor in any state can be deleted
+// (a CRASHED one too, unless KeepCrashed mirrors today's refusal). Tests
+// inject the failures of a control plane under load with FailCreates,
+// FailResumes and FailDeletes.
 package fakecontrol
 
 import (
@@ -67,6 +70,103 @@ type Server struct {
 	listCalls int
 	// SuspendModes records the durability mode of each SuspendActor call.
 	SuspendModes []ateapipb.DurabilityMode
+	// created records every actor CreateActor accepted, for Created.
+	created []*ateapipb.Actor
+	// workers are the Workers ListWorkers reports (AddWorker seeds them).
+	// CreateActor places an actor whose selector some ACTIVE worker's labels
+	// carry on such a worker, round-robin among them (always the first with
+	// SameNode): status.assigned_node and worker_assignment.node_name are
+	// set. With no workers, or none matching, the actor stays unplaced.
+	workers      []*ateapipb.Worker
+	placeCounter int
+	SameNode     bool
+	// PendingGets makes each new actor report RESUMING for that many GetActor
+	// calls before RUNNING, as a fresh actor does while its wakeup probe runs.
+	PendingGets int
+	pendingGets map[string]int
+	// DenyListWorkers makes ListWorkers fail with PermissionDenied, as
+	// Substrate does for an identity without the global viewer role.
+	DenyListWorkers bool
+	// BornSuspended makes CreateActor leave a new actor SUSPENDED and
+	// unplaced, as Substrate does: only ResumeActor (the router's wake on a
+	// guest call, or a direct resume) places it on a worker and runs it. Off,
+	// a new actor is RUNNING and placed at once, a shortcut most tests rely
+	// on; a test of a path that must resume turns this on.
+	BornSuspended bool
+	resumes       int
+	// failCreates, failResumes and failDeletes make the next calls of
+	// CreateActor, ResumeActor and DeleteActor fail, as a control plane
+	// under load does; see FailCreates, FailResumes and FailDeletes.
+	failCreates, failResumes, failDeletes injectedFailure
+	// KeepCrashed makes DeleteActor refuse a CRASHED actor with
+	// FailedPrecondition, as Substrate does today (its DeleteVolumes
+	// prerequisite is not met); off, an actor in any state is deleted.
+	KeepCrashed bool
+	// creates and deletes count the CreateActor and DeleteActor calls,
+	// failed ones too; maxActors is the most actors that existed at once.
+	creates, deletes, maxActors int
+}
+
+// injectedFailure fails the next n calls of one RPC with code and msg.
+type injectedFailure struct {
+	n    int
+	code codes.Code
+	msg  string
+}
+
+// take returns the injected error and spends one failure, or nil when none
+// is left. Called with the lock held.
+func (f *injectedFailure) take() error {
+	if f.n <= 0 {
+		return nil
+	}
+	f.n--
+	return status.Error(f.code, f.msg)
+}
+
+// FailCreates makes the next n CreateActor calls fail with code and msg,
+// before anything is stored, as a transient failure under load does.
+func (s *Server) FailCreates(n int, code codes.Code, msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failCreates = injectedFailure{n: n, code: code, msg: msg}
+}
+
+// FailResumes makes the next n ResumeActor calls fail with code and msg,
+// leaving the actor as it was.
+func (s *Server) FailResumes(n int, code codes.Code, msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failResumes = injectedFailure{n: n, code: code, msg: msg}
+}
+
+// FailDeletes makes the next n DeleteActor calls fail with code, leaving the
+// actor in place.
+func (s *Server) FailDeletes(n int, code codes.Code) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failDeletes = injectedFailure{n: n, code: code, msg: "injected delete failure"}
+}
+
+// Creates and Deletes are how many CreateActor and DeleteActor calls the fake
+// took, failed ones included.
+func (s *Server) Creates() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.creates
+}
+
+func (s *Server) Deletes() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deletes
+}
+
+// MaxActors is the most actors that existed at once.
+func (s *Server) MaxActors() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maxActors
 }
 
 // New returns an empty fake control server.
@@ -76,6 +176,119 @@ func New() *Server {
 		atespaces: make(map[string]*ateapipb.Atespace),
 		templates: make(map[string]*ateapipb.ActorTemplate),
 	}
+}
+
+// AddWorker seeds a Worker, as a WorkerPool's pod registers one.
+func (s *Server) AddWorker(w *ateapipb.Worker) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.workers = append(s.workers, proto.Clone(w).(*ateapipb.Worker))
+}
+
+// Worker builds an ACTIVE worker of pool in namespace on node with labels
+// and an actor capacity of slots (0: none reported), for AddWorker.
+func Worker(namespace, pool, node string, labels map[string]string, slots int32) *ateapipb.Worker {
+	w := &ateapipb.Worker{
+		Metadata:        &ateapipb.ResourceMetadata{Name: pool + "-" + node},
+		WorkerNamespace: namespace,
+		WorkerPool:      pool,
+		WorkerPod:       pool + "-" + node,
+		NodeName:        node,
+		Labels:          labels,
+		Status:          &ateapipb.WorkerStatus{State: ateapipb.WorkerState_WORKER_STATE_ACTIVE},
+	}
+	if slots > 0 {
+		w.Status.Capacity = &ateapipb.WorkerResources{Actors: slots}
+	}
+	return w
+}
+
+func (s *Server) ListWorkers(ctx context.Context, req *ateapipb.ListWorkersRequest) (*ateapipb.ListWorkersResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.DenyListWorkers {
+		return nil, status.Error(codes.PermissionDenied, "not allowed to list workers")
+	}
+	resp := &ateapipb.ListWorkersResponse{}
+	for _, w := range s.workers {
+		resp.Workers = append(resp.Workers, proto.Clone(w).(*ateapipb.Worker))
+	}
+	return resp, nil
+}
+
+func (s *Server) GetWorker(ctx context.Context, req *ateapipb.GetWorkerRequest) (*ateapipb.Worker, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, w := range s.workers {
+		if w.GetMetadata().GetName() == req.GetWorker().GetName() {
+			return proto.Clone(w).(*ateapipb.Worker), nil
+		}
+	}
+	return nil, status.Errorf(codes.NotFound, "worker %q not found", req.GetWorker().GetName())
+}
+
+// place assigns a new actor to a worker whose labels carry its selector,
+// when there is one. Called with the lock held.
+func (s *Server) place(a *ateapipb.Actor) {
+	var candidates []*ateapipb.Worker
+	for _, w := range s.workers {
+		if w.GetStatus().GetState() != ateapipb.WorkerState_WORKER_STATE_ACTIVE {
+			continue
+		}
+		ok := true
+		for k, v := range a.GetWorkerSelector().GetMatchLabels() {
+			if w.GetLabels()[k] != v {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			candidates = append(candidates, w)
+		}
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	idx := 0
+	if !s.SameNode {
+		idx = s.placeCounter % len(candidates)
+	}
+	s.placeCounter++
+	w := candidates[idx]
+	a.Status.AssignedNode = w.GetNodeName()
+	a.Status.WorkerAssignment = &ateapipb.WorkerAssignment{
+		WorkerNamespace: w.GetWorkerNamespace(),
+		WorkerPool:      w.GetWorkerPool(),
+		WorkerPod:       w.GetWorkerPod(),
+		NodeName:        w.GetNodeName(),
+	}
+}
+
+// ActorCount is how many actors exist.
+func (s *Server) ActorCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.actors)
+}
+
+// Created returns a copy of every actor CreateActor accepted, in order,
+// whether or not it still exists.
+func (s *Server) Created() []*ateapipb.Actor {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*ateapipb.Actor, 0, len(s.created))
+	for _, a := range s.created {
+		out = append(out, clone(a))
+	}
+	return out
+}
+
+// RemoveTemplate drops a stored ActorTemplate, as a delete behind the API's
+// back would.
+func (s *Server) RemoveTemplate(atespace, name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.templates, key(atespace, name))
 }
 
 // AddTemplate seeds an ActorTemplate, as an operator would have registered it.
@@ -426,16 +639,27 @@ func (s *Server) GetActor(ctx context.Context, req *ateapipb.GetActorRequest) (*
 	if err != nil {
 		return nil, err
 	}
+	k := key(req.GetActor().GetAtespace(), req.GetActor().GetName())
+	if n := s.pendingGets[k]; n > 0 && a.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RUNNING {
+		s.pendingGets[k] = n - 1
+		pending := clone(a)
+		pending.Status.State = ateapipb.ActorState_ACTOR_STATE_RESUMING
+		return pending, nil
+	}
 	return clone(a), nil
 }
 
 func (s *Server) CreateActor(ctx context.Context, req *ateapipb.CreateActorRequest) (*ateapipb.Actor, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.creates++
 	actor := req.GetActor()
 	name := actor.GetMetadata().GetName()
 	if name == "" {
 		return nil, status.Error(codes.InvalidArgument, "metadata.name is required")
+	}
+	if err := s.failCreates.take(); err != nil {
+		return nil, err
 	}
 	k := key(actor.GetMetadata().GetAtespace(), name)
 	if _, ok := s.actors[k]; ok {
@@ -446,7 +670,21 @@ func (s *Server) CreateActor(ctx context.Context, req *ateapipb.CreateActorReque
 	}
 	a := clone(actor)
 	a.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING}
+	if s.BornSuspended {
+		a.Status.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+	} else {
+		s.place(a)
+	}
+	delete(s.pendingGets, k)
+	if s.PendingGets > 0 {
+		if s.pendingGets == nil {
+			s.pendingGets = map[string]int{}
+		}
+		s.pendingGets[k] = s.PendingGets
+	}
 	s.actors[k] = a
+	s.maxActors = max(s.maxActors, len(s.actors))
+	s.created = append(s.created, clone(a))
 	return clone(a), nil
 }
 
@@ -457,15 +695,52 @@ func (s *Server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorReque
 	if err != nil {
 		return nil, err
 	}
-	a.Status = &ateapipb.ActorStatus{
-		State: ateapipb.ActorState_ACTOR_STATE_RUNNING,
-		WorkerAssignment: &ateapipb.WorkerAssignment{
-			WorkerNamespace: "ate-system",
-			WorkerPod:       "worker-0",
-			WorkerPodIps:    []string{"10.0.0.1"},
-		},
+	s.resumes++
+	if err := s.failResumes.take(); err != nil {
+		return nil, err
 	}
+	if s.BornSuspended {
+		// Place as Substrate does: on a worker whose labels carry the
+		// actor's selector; none is RESOURCE_EXHAUSTED, as a pool with no
+		// room is. A RUNNING actor is returned as it is.
+		if a.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RUNNING {
+			return &ateapipb.ResumeActorResponse{Actor: clone(a)}, nil
+		}
+		a.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING}
+		s.place(a)
+		if a.Status.WorkerAssignment == nil {
+			a.Status.State = ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+			return nil, status.Errorf(codes.ResourceExhausted, "no worker matches the selector of actor %q", req.GetActor().GetName())
+		}
+		resp := clone(a)
+		// A slow start (PendingGets): the resume answers before the actor
+		// runs, and GetActor reports RESUMING for the next PendingGets
+		// reads, as it does after a create.
+		if s.pendingGets[key(req.GetActor().GetAtespace(), req.GetActor().GetName())] > 0 {
+			resp.Status.State = ateapipb.ActorState_ACTOR_STATE_RESUMING
+		}
+		return &ateapipb.ResumeActorResponse{Actor: resp}, nil
+	}
+	// Placed at create (BornSuspended off): keep the placement, so the
+	// node the create chose is the node the resume reports.
+	if a.Status == nil || a.Status.WorkerAssignment == nil {
+		a.Status = &ateapipb.ActorStatus{
+			WorkerAssignment: &ateapipb.WorkerAssignment{
+				WorkerNamespace: "ate-system",
+				WorkerPod:       "worker-0",
+				WorkerPodIps:    []string{"10.0.0.1"},
+			},
+		}
+	}
+	a.Status.State = ateapipb.ActorState_ACTOR_STATE_RUNNING
 	return &ateapipb.ResumeActorResponse{Actor: clone(a)}, nil
+}
+
+// Resumes is how many ResumeActor calls the fake took.
+func (s *Server) Resumes() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.resumes
 }
 
 func (s *Server) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
@@ -532,14 +807,23 @@ func (s *Server) CompleteUpload(name string) {
 func (s *Server) DeleteActor(ctx context.Context, req *ateapipb.DeleteActorRequest) (*ateapipb.Actor, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.deletes++
 	ref := req.GetActor()
 	a, err := s.get(ref)
 	if err != nil {
 		return nil, err
 	}
+	if err := s.failDeletes.take(); err != nil {
+		return nil, err
+	}
 	// Like Substrate v0.6.0, DeleteActor takes an actor in any state: it
-	// terminates the workload itself.
+	// terminates the workload itself. Except, today, a CRASHED one, with
+	// KeepCrashed.
+	if s.KeepCrashed && a.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_CRASHED {
+		return nil, status.Errorf(codes.FailedPrecondition, "DeleteVolumes prerequisite not met for Actor: %s (got: %v)", ref.GetName(), a.GetStatus().GetState())
+	}
 	delete(s.actors, key(ref.GetAtespace(), ref.GetName()))
+	delete(s.pendingGets, key(ref.GetAtespace(), ref.GetName()))
 	return clone(a), nil
 }
 

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -695,6 +696,12 @@ func GoldenSettled(g schema.GoldenRecord) bool { return schema.GoldenSettled(g) 
 
 // shortfall summarises what kept the pass from completing.
 func (w *PreflightWarmer) shortfall(r *schema.PreflightCoverage) string {
+	return preflightShortfall(r)
+}
+
+// preflightShortfall names what a pre-flight report is missing: goldens not
+// ready, (image, domain) pairs short of their nodes, or an interruption.
+func preflightShortfall(r *schema.PreflightCoverage) string {
 	var parts []string
 	notReady := 0
 	for _, g := range r.Goldens {
@@ -754,4 +761,21 @@ func WritePreflightCoverage(path string, c *schema.PreflightCoverage) error {
 		return err
 	}
 	return writeJSONFile(path, c)
+}
+
+// ReadPreflightCoverage reads and validates a preflight-coverage.json.
+func ReadPreflightCoverage(path string) (*schema.PreflightCoverage, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	c, err := schema.DecodeJSONStrict[schema.PreflightCoverage](f)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := c.Validate(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return &c, nil
 }

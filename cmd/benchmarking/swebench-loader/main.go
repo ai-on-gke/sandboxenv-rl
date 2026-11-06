@@ -222,11 +222,14 @@ func datasetLabel(dataset string) string {
 // is a var's effective value under set.KEY. The exclude file and the
 // instance list are named by their file name or count plus a digest of their
 // ids, so two lists of one length differ.
-func ownLabels(dataset string, connections int, baseTemplate, excludeFile string, exclude, instances []string, vars map[string]string) map[string]string {
+func ownLabels(dataset string, connections int, baseTemplate, excludeFile, placement string, exclude, instances []string, vars map[string]string) map[string]string {
 	l := map[string]string{
 		"dataset":       datasetLabel(dataset),
 		"connections":   strconv.Itoa(connections),
 		"base_template": baseTemplate,
+	}
+	if placement != "" {
+		l["placement"] = filepath.Base(placement)
 	}
 	for k, v := range vars {
 		l["set."+k] = v
@@ -238,6 +241,29 @@ func ownLabels(dataset string, connections int, baseTemplate, excludeFile string
 		l["instances"] = strconv.Itoa(len(instances)) + "@" + idsDigest(instances)
 	}
 	return l
+}
+
+// placementMissing lists the selected images the plan neither places nor
+// lists as unplaced, sorted: a run with -placement must know every image's
+// fate, or the plan is for another dataset.
+func placementMissing(plan *schema.ImagePlacement, selected []swebench.Instance) []string {
+	known := map[string]bool{}
+	for _, e := range plan.Images {
+		known[e.Image] = true
+	}
+	for _, u := range plan.Unplaced {
+		known[u.Image] = true
+	}
+	seen := map[string]bool{}
+	var missing []string
+	for _, inst := range selected {
+		if !known[inst.Image] && !seen[inst.Image] {
+			seen[inst.Image] = true
+			missing = append(missing, inst.Image)
+		}
+	}
+	slices.Sort(missing)
+	return missing
 }
 
 // idsDigest is the first eight hex digits of the SHA-256 of the sorted ids.
@@ -809,6 +835,7 @@ func runCmd(args []string) (retErr error) {
 		groupSize        = fs.Int("group-size", 0, "steps: group size per sampled task when resolving a schedule (0 uses -rollouts).")
 		stepPause        = fs.Duration("step-pause", 0, "steps: simulated trainer pause between steps.")
 		prefetch         = fs.Bool("prefetch", false, "steps: asynchronously prewarm next step's prefetch_images off the critical path.")
+		placementPath    = fs.String("placement", "", "image-placement.json from plan-placement: each create carries the worker selector of one of its image's domains, round-robin, so environments land where the pre-flight put the image. ate-env API backend only.")
 		createTimeout    = fs.Duration("create-timeout", 5*time.Minute, "Deadline for one create call.")
 		stepTimeout      = fs.Duration("step-timeout", 10*time.Minute, "Default deadline for a run step without its own timeout.")
 		wakeBudget       = fs.Duration("wake-budget", 3*time.Minute, "How long a task's first command is retried while the environment is still waking or its image is still being baked.")
@@ -1047,13 +1074,28 @@ func runCmd(args []string) (retErr error) {
 		WakeBackoff:   *wakeBackoff,
 		Keep:          *keep,
 		Labels:        labels,
-		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids, effective),
+		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, *placementPath, exclude, ids, effective),
 	}
 	// The checks Run makes before it touches the API, here so -dry-run makes
 	// them too: the run id, the longest actor name against Substrate's 63
 	// characters, the -label keys, and the mode, strategy and park flags.
 	if err := swebench.ValidateConfig(cfg); err != nil {
 		return err
+	}
+	// The placement plan is read and checked before -dry-run returns and
+	// whatever backend runs, so a dry run and the CLI tests see its errors.
+	var placement *schema.ImagePlacement
+	if *placementPath != "" {
+		if err := swebench.ValidatePlacementDriver(*backendFlag, *accessFlag, true); err != nil {
+			return err
+		}
+		if placement, err = swebench.ReadImagePlacement(*placementPath); err != nil {
+			return err
+		}
+		if missing := placementMissing(placement, selected); len(missing) > 0 {
+			return fmt.Errorf("-placement %s neither places nor lists as unplaced %d of the %d selected images (first: %s): plan them, or run without -placement", *placementPath, len(missing), len(selected), missing[0])
+		}
+		log.Info("placement", slog.String("plan", *placementPath), slog.Int("images", len(placement.Images)), slog.Int("domains", len(placement.Domains)), slog.Int("unplaced", len(placement.Unplaced)))
 	}
 	if *dryRun {
 		return nil
@@ -1084,6 +1126,7 @@ func runCmd(args []string) (retErr error) {
 			WarmPool:         *warmPool,
 			Connections:      *connections,
 			AuthToken:        authToken,
+			Placement:        placement,
 		})
 		if err != nil {
 			return err
@@ -1246,6 +1289,7 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 		tag            = fs.String("tag", "", "Optional tag for stats.jsonl.")
 		validate       = fs.Bool("validate", false, "Evaluate Validity Rules 1-7 and exit non-zero on failure.")
 		footing        = fs.String("footing", "", "Expected footing for Validity Rule 1 (warm | cold).")
+		preflightCov   = fs.String("preflight-coverage", "", "preflight-coverage.json of the pre-flight that ran before the run; Rule 1 takes a complete pre-flight as prewarm evidence on warm footing and fails on an incomplete one.")
 		minReward      = fs.Float64("min-reward-rate", 0, "Minimum reward rate for Validity Rule 2.")
 		minTasks       = fs.Int("min-tasks", 0, "Minimum task count for Validity Rule 3.")
 		maxFailCr      = fs.Float64("max-failed-create-ratio", -1, "Maximum failed create ratio for Validity Rule 4.")
@@ -1276,8 +1320,8 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 		if len(files) > 0 || *in != "" {
 			return fmt.Errorf("with -arm, give every events file inside an -arm value")
 		}
-		if *unresolved != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" || *top > 0 {
-			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log and -top take one events file, not -arm")
+		if *unresolved != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" || *preflightCov != "" || *top > 0 {
+			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log, -preflight-coverage and -top take one events file, not -arm")
 		}
 		return reportArms(arms, *jsonOut, stdout)
 	}
@@ -1362,8 +1406,8 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 	if len(reps) > 1 {
 		// Several runs: one table, a column per run, for the same workload on
 		// different clusters or builds.
-		if *unresolved != "" || (*cacheBefore != "" && !*validate) || (*cacheAfter != "" && !*validate) || *restoreLog != "" || *top > 0 {
-			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log and -top take one events file")
+		if *unresolved != "" || (*cacheBefore != "" && !*validate) || (*cacheAfter != "" && !*validate) || *restoreLog != "" || *preflightCov != "" || *top > 0 {
+			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log, -preflight-coverage and -top take one events file")
 		}
 		swebench.WriteComparison(stdout, reps, labels)
 		if *mdOut != "" && *thresholds == "" {
@@ -1457,6 +1501,8 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 			OrphanCount:     *orphanCount,
 			CacheBeforePath: *cacheBefore,
 			CacheAfterPath:  *cacheAfter,
+
+			PreflightCoveragePath: *preflightCov,
 		}
 		if *maxFailCr >= 0 {
 			valOpts.MaxFailedCreateRatio = *maxFailCr

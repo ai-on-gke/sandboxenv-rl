@@ -173,7 +173,7 @@ var LoaderLabelKeys = []string{
 	"mode", "strategy", "window_size", "width", "images", "trajectory", "tasks_per_image", "rollouts", "steps", "park",
 	"create_timeout", "step_timeout", "wake_budget", "wake_backoff",
 	"dataset", "connections", "base_template", "exclude_file", "instances", "seed", "images_per_step",
-	"park_each",
+	"park_each", "placement",
 }
 
 // labels describes the run for its run event.

@@ -33,6 +33,7 @@ import (
 	env "github.com/agent-substrate/env/clients/go"
 	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/ate"
+	"github.com/agent-substrate/env/internal/benchmarking/schema"
 	"github.com/agent-substrate/env/internal/routertls"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
@@ -61,6 +62,9 @@ type BackendDriverOptions struct {
 	AteapiTokenFile  string
 	AteapiCAFile     string
 	AteapiSkipVerify *bool
+	// Placement, when set, steers each image's environments into the domains
+	// an image placement plan assigns it (EnvBackend only).
+	Placement *schema.ImagePlacement
 }
 
 type nopCloser struct{}
@@ -89,10 +93,26 @@ func ValidateBackendDriverFlags(backend, access string) error {
 	}
 }
 
+// ValidatePlacementDriver refuses a placement plan on any driver but the
+// ate-env API over Substrate: only that one sends a per-environment worker
+// selector. Backend and access default to that driver when empty.
+func ValidatePlacementDriver(backend, access string, hasPlacement bool) error {
+	if !hasPlacement {
+		return nil
+	}
+	if (backend != "" && backend != "substrate") || (access != "" && access != "ate-env-api") {
+		return fmt.Errorf("a placement plan needs the ate-env API backend (-backend substrate -access ate-env-api); %s/%s cannot place environments", backend, access)
+	}
+	return nil
+}
+
 // NewBackendDriver constructs the requested Backend implementation and an
 // io.Closer for releasing its underlying connections.
 func NewBackendDriver(opts BackendDriverOptions) (Backend, io.Closer, error) {
 	if err := ValidateBackendDriverFlags(opts.Backend, opts.Access); err != nil {
+		return nil, nil, err
+	}
+	if err := ValidatePlacementDriver(opts.Backend, opts.Access, opts.Placement != nil); err != nil {
 		return nil, nil, err
 	}
 	switch opts.Backend {
@@ -173,7 +193,11 @@ func NewBackendDriver(opts BackendDriverOptions) (Backend, io.Closer, error) {
 			}
 			return b, b, nil
 		}
-		b, err := NewEnvBackend(opts.Endpoint, opts.Atespace, opts.BaseTemplate, opts.Connections, opts.AuthToken)
+		var envOpts []EnvBackendOption
+		if opts.Placement != nil {
+			envOpts = append(envOpts, WithPlacement(opts.Placement))
+		}
+		b, err := NewEnvBackend(opts.Endpoint, opts.Atespace, opts.BaseTemplate, opts.Connections, opts.AuthToken, envOpts...)
 		if err != nil {
 			return nil, nil, err
 		}

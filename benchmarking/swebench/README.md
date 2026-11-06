@@ -344,6 +344,15 @@ go run ./cmd/benchmarking/swebench-loader report smoke.jsonl
 `-dry-run` loads and renders everything and prints the plan without touching
 the API. `-keep` leaves the fleet in place for inspection.
 
+After a pre-flight (step 5 above), `-placement image-placement.json` makes
+every create carry the worker selector of one of its image's domains,
+round-robin per image, so the environments land on the nodes that already
+hold the image; images the plan left unplaced get no selector. It needs the
+ate-env API backend. Give the report the pre-flight's result too:
+`swebench-loader report run.jsonl -validate -footing warm -preflight-coverage preflight-coverage.json`
+takes a complete pre-flight as Validity Rule 1's prewarm evidence and fails
+on an incomplete one, naming the shortfall.
+
 When ate-env-api requires a bearer token (`-auth-token-file` on the API), give
 the loader the same token: `-auth-token-file PATH`, or the
 `SUBSTRATE_ENV_AUTH_TOKEN` environment variable that the `ate-env` CLI also

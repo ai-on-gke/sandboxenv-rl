@@ -470,7 +470,8 @@ environment see. A secret that only the runtime needs, such as its API key, goes
 ate-env-api starts or their children. A command that runs as the same user can still read it from
 the sidecar's `/proc/<pid>/environ`, and each viewer of the atespace reads it in the template; see
 [docs/security/threat-model.md](docs/security/threat-model.md). `--sidecar-env` needs a guest image
-with its support.
+with its support: the template also carries the guest flag `-sidecar-env-required`, thus an older
+guest exits at start instead of running the sidecars without the values.
 
 Layers must be self-contained: the `1.37-musl` busybox is static, while the glibc build fails
 on images with an older libc. The runnable version is

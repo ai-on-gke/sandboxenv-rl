@@ -125,14 +125,20 @@ ate-env manifest template --template oh-agent-server \
 `ATE_SIDECAR_ENV_OH_SESSION_API_KEYS_0`; the guest removes it from its own environment at start and
 adds it, as `OH_SESSION_API_KEYS_0`, to the sidecar's environment only. Thus the commands that
 ate-env-api starts in the environment (`ate-env exec`, the clients, the fleet's `handle.exec`, the
-R2E-Gym adapter) and their children do not inherit it. It needs a `--guest-image` built with
-`--sidecar-env` support: an older guest does not give the key to the agent-server, which then does
-not start. A command that runs as the same user can still read the key from the agent-server's
-`/proc/<pid>/environ` (see Limits).
+R2E-Gym adapter) and their children do not inherit it. A command that runs as the same user can
+still read the key from the agent-server's `/proc/<pid>/environ` (see Limits).
+
+`--sidecar-env` needs a `--guest-image` built with its support. The template also carries the guest
+flag `-sidecar-env-required`. A guest older than this change does not know that flag and exits at
+start, thus the actor crashes and the environment does not start. Without that guard, an older guest
+would start the agent-server without `OH_SESSION_API_KEYS_0`, and the agent-server would then accept
+each request without a key while `/health` still answers. A new guest also exits when the flag is set
+and the container has no `ATE_SIDECAR_ENV_` variable.
 
 This is the counterpart of agent-sandbox's SandboxTemplate and warm pool. Further agent-server
-settings are more `--env` flags; each command in the environment sees those. The first environment created from an image derives a template
-for it (layer, sidecar and settings included); later ones reuse it.
+settings are more `--env` flags; each command in the environment sees those. The first environment
+created from an image derives a template for it (layer, sidecar and settings included); later ones
+reuse it.
 
 The base template runs in a glibc image of its own (`--rootfs-image`), because its golden actor
 starts the layer too. Without it, the container image is the guest image, which has no C library for
@@ -141,18 +147,19 @@ and `bash`, 26 MB compressed for amd64) is the smallest common image that meets 
 floor; any image that meets the floor works. An environment created without `image=` runs in this
 base image. A template derived for a task image replaces only the image: the guest volume, the layer
 and the sidecar stay. A base registered earlier without `--rootfs-image` keeps a crashed golden
-actor: delete it and register it again with the same session key. Its `<base>-<12 hex digits>`
-templates can stay, because a template derived from the new base is identical to one derived from
-the old base. Delete them only to make Substrate bake their golden snapshots again, or when the
-session key changes, because each derived template copies the key.
+actor: delete it and register it again with the same session key. If the old base already uses
+`--sidecar-env`, its `<base>-<12 hex digits>` templates can stay, because a template derived from
+the new base is identical to one derived from the old base. Delete them only to make Substrate bake
+their golden snapshots again, or when the session key changes, because each derived template copies
+the key. The cluster runs under [Verified](#verified) came before this base image and do not test
+it.
 
 A base template registered before `--sidecar-env` has the key in `--env`, thus each command in its
-environments, and in the environments of each template derived from it, gets the key. Register it
-again: delete the base and each `<base>-<12 hex digits>` template, then register the base with
-`--sidecar-env` as above. The derived templates must go too, because they copy the key in `--env`
-and creates reuse them by name. `examples/openhands/demo.sh` prints a note for such a base, and
-`RECREATE=1` does both steps. The cluster runs under
-[Verified](#verified) came before this base image and do not test it.
+environments, and in the environments of each template derived from it, gets the key. Delete the
+base and each `<base>-<12 hex digits>` template, then register the base again with `--sidecar-env`
+as above. The derived templates must go too, because they copy the key in `--env` and creates reuse
+them by name. This also holds for a base without `--rootfs-image` that has the key in `--env`.
+`examples/openhands/demo.sh` prints a note for such a base, and `RECREATE=1` does both steps.
 
 ## 4. Use `AteEnvWorkspace`
 

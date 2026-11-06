@@ -152,10 +152,12 @@ uses. The demo hands the session key and the API token to curl in a header file 
 on exit), not on its command line; the template registration still passes the key in an argument of
 `ate-env manifest template`.
 
-The demo registers the key with `--sidecar-env`, thus the guest gives it to the agent-server only, and
-the commands that ate-env-api starts in the environment do
-not inherit it. This needs a `GUEST_IMAGE` built with `--sidecar-env` support; with an older guest the
-agent-server does not get the key and does not start. A base template registered before this change
+The demo registers the key with `--sidecar-env`, thus the guest gives it to the agent-server only,
+and the commands that ate-env-api starts in the environment do not inherit it. This needs a
+`GUEST_IMAGE` built with `--sidecar-env` support. The template carries the guest flag
+`-sidecar-env-required`, which an older guest does not know: it exits at start, the actor crashes,
+and the environment does not start. Without that guard, the agent-server would run without the key
+and accept each request. The demo also requires 401 for its call without the key. A base template registered before this change
 has the key in `--env`, and so has each template derived from it: each command in their environments
 gets the key. The demo prints a note when it reuses such a base; run it again with `RECREATE=1` (and
 `SESSION_KEY`, if other clients use the key) to delete them and register the base with

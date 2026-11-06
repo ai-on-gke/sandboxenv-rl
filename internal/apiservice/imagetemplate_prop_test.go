@@ -132,8 +132,21 @@ func TestPropImageTemplateNameNeverInvalid(t *testing.T) {
 func TestPropRerootStaysUnderMount(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		segs := rapid.SliceOfN(rapid.SampledFrom([]string{"ko-app", "usr", "bin", "..", ".", "", "x"}), 0, 5).Draw(t, "segs")
-		cmd0 := "/" + strings.Join(append(segs, guestBinaryName), "/")
+		// Mostly the guest binary, sometimes another file, sometimes a
+		// relative path (a shell wrapper's "sh -c ..." is the real case).
+		last := rapid.SampledFrom([]string{guestBinaryName, guestBinaryName, guestBinaryName, "sh", guestBinaryName + "2"}).Draw(t, "last")
+		cmd0 := strings.Join(append(segs, last), "/")
+		if rapid.IntRange(0, 4).Draw(t, "rooted") > 0 {
+			cmd0 = "/" + cmd0
+		}
+		rooted := strings.HasPrefix(cmd0, "/") // an empty first segment roots it too
 		out, err := rerootCommand([]string{cmd0, "-flag"})
+		// Accepted exactly when command[0] is an absolute path to the guest
+		// binary (rerootCommand doc). Checked both ways: a regression that
+		// rejected every command must fail here, not skip.
+		if wantOK := rooted && last == guestBinaryName; (err == nil) != wantOK {
+			t.Fatalf("rerootCommand(%q): err = %v, want accepted = %v", cmd0, err, wantOK)
+		}
 		if err != nil {
 			return
 		}

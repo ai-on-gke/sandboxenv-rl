@@ -24,10 +24,15 @@ version tables from `system_description.json` (`bench measure -k8s`) and the pre
 > - **What ran**:
 >   `<prewarmer loader (swebench-loader plan-placement + preflight or bench prewarm) across <distinct_images> distinct images (<r2e_images> R2E-Gym + <swe_images> SWE-bench) x <sandbox_nodes> sandbox nodes (<golden + node-cache coverage, misses_per_first_cmd cold misses>) + <strategies tested, e.g. 4 pool strategies (none, naive, sliding, pipelined)> in swebench-loader / run_fleet_bench.py via the sandboxenv-rl SDK (--client <go | go-direct | python | all>) at concurrency=<max_concurrent> (<tasks> rollouts/arm, <rewarded>/<tasks> rewarded, <failed> failed)>`.
 > - **Key numbers (`<reference-arm>`; drill-down in Sections `3.1`–`3.4`)**:
+>   - **Wall clock**: `<arm_wall_s> s` (`<tasks_per_min>` tasks/min; `r2e=<r2e_wall_s> s`,
+>     `swe=<swe_wall_s> s`; `<num_arms>`-arm sweep `<sweep_active_s> s` active / `<sweep_wall_s> s`
+>     calendar wall, plus `<prewarm_wall_s> s` upfront prewarm).
 >   - **Max concurrency observed**: `<active_sandboxes>` concurrent in-flight sandboxes
 >     (`standing_pool=<n>`).
 >   - **`TTFI` — `cmd started`** (sandbox requested -> container restored & 1st cmd started,
 >     `p50 / p90`): `<ttfi_p50> / <ttfi_p90> ms`.
+>   - **`TTFC` — `cmd complete`** (sandbox requested -> 1st cmd complete, `p50 / p90`):
+>     `<ttfc_p50> / <ttfc_p90> ms` (`r2e=<r2e_ttfc_p50> ms`, `swe=<swe_ttfc_p50> ms`).
 >   - **Time to restore (`p50 / p90`)**: `<restore_total_p50> / <restore_total_p90> ms` in `atelet`.
 > - **Where time is actually spent (`<reference-arm>` `p50`)**:
 >   - **Host Python SDK (`ate_env_rl`)**: `<py_sdk_ms> ms (<py_sdk_pct>%)` (`0 ms` when
@@ -105,6 +110,8 @@ Populate from `$ARTIFACT_DIR/comparison.json` / `comparison.md`, per-arm `report
 `{r2e,swe}-summary.json`. `Wall (s)` is in **seconds (`s`)**; every latency column is `p50/p95/p99`
 (or `p50` where noted) in **milliseconds (`ms`)**:
 
+- **`Wall` (`s`: arm [`r2e` / `swe`])**: Concurrent arm wall clock (`report.json` `run_ms / 1000` =
+  `max(r2e, swe)`), followed by per-shard `r2e` and `swe` wall clock from `{r2e,swe}-summary.json`.
 - **`Handle claim` (`ms`)**: Sandbox requested -> `SUSPENDED` actor handle returned
   (`wire_claim_to_ready_*` on `none`; `0` at rollout start on warm-pool hits after upfront
   `Create` + `Suspend` prewarm; container has not booted yet).
@@ -116,9 +123,9 @@ Populate from `$ARTIFACT_DIR/comparison.json` / `comparison.md`, per-arm `report
   (`stats[event="ttfi"]` on `none` or `stats[event="wake"]` on warm-pool strategies, including
   `step=baseline` execution inside the sandbox).
 
-| Arm     | Client     | Strategy     |       Active / Pool | Tasks (fail) |   Reward | Wall (`s`) | Tasks/min | Warm hit | Prewarm `Create` (`ms`) | Prewarm `Suspend` (`ms`) | `Handle` claim (`ms`) | `TTFI` — `cmd started` (`p50/p90/p95 ms`) | `TTFC` — `cmd complete` (`ms`) | `TTFC` — `cmd complete` (`p50 ms`: `r2e` / `swe`) |     `Delete` (`ms`) |
-| :------ | :--------- | :----------- | ------------------: | -----------: | -------: | ---------: | --------: | -------: | ----------------------: | -----------------------: | --------------------: | ----------------------------------------: | -----------------------------: | ------------------------------------------------: | ------------------: |
-| `<arm>` | `<client>` | `<strategy>` | `<active> / <pool>` |  `<n> (<f>)` | `<rate>` |    `<sec>` |   `<tpm>` | `<pct>%` |     `<p50>/<p95>/<p99>` |      `<p50>/<p95>/<p99>` |   `<p50>/<p95>/<p99>` |                       `<p50>/<p90>/<p95>` |            `<p50>/<p95>/<p99>` |                             `<r2e_p50>/<swe_p50>` | `<p50>/<p95>/<p99>` |
+| Arm     | Client     | Strategy     |       Active / Pool | Tasks (fail) |   Reward | Wall (`s`: arm [`r2e`/`swe`]) | Tasks/min | Warm hit | Prewarm `Create` (`ms`) | Prewarm `Suspend` (`ms`) | `Handle` claim (`ms`) | `TTFI` — `cmd started` (`p50/p90/p95 ms`) | `TTFC` — `cmd complete` (`ms`) | `TTFC` — `cmd complete` (`p50 ms`: `r2e` / `swe`) |     `Delete` (`ms`) |
+| :------ | :--------- | :----------- | ------------------: | -----------: | -------: | ----------------------------: | --------: | -------: | ----------------------: | -----------------------: | --------------------: | ----------------------------------------: | -----------------------------: | ------------------------------------------------: | ------------------: |
+| `<arm>` | `<client>` | `<strategy>` | `<active> / <pool>` |  `<n> (<f>)` | `<rate>` |     `<sec> (<r2e_s>/<swe_s>)` |   `<tpm>` | `<pct>%` |     `<p50>/<p95>/<p99>` |      `<p50>/<p95>/<p99>` |   `<p50>/<p95>/<p99>` |                       `<p50>/<p90>/<p95>` |            `<p50>/<p95>/<p99>` |                             `<r2e_p50>/<swe_p50>` | `<p50>/<p95>/<p99>` |
 
 ### 3.2 Where time is spent: layer attribution (`Go` vs `Python` vs `ate` infra vs guest workload)
 
@@ -154,6 +161,14 @@ zero-compute `write_*` steps (`stats[event="step", name="write_patch"]`) or OTel
 | **Total in-rollout span (`task` `p50`)**      | **All layers**               | **Rollout start -> reward verdict (`stats[event="task"]`)**                  |           **`<ms> ms (100%)`** |           **`<ms> ms (100%)`** |
 | _Out-of-band pool lifecycle_                  | Host SDK + `ate` infra       | Upfront `create` + `suspend` + post-rollout `delete` outside `task` span     |        `+<ms> ms outside task` |        `+<ms> ms outside task` |
 
+#### C. End-to-end arm and sweep wall-clock (`Wall (s)`) breakdown
+
+| Arm / phase               | Arm wall (`s`) | `r2e` / `swe` shard wall (`s`) | Upfront pool prewarm (`s`) | Ideal slot-busy work (`sum(task)/width`, `s`) | Straggler / window-barrier idle (`s`) | Post-rollout teardown (`s`) |
+| :------------------------ | -------------: | -----------------------------: | -------------------------: | --------------------------------------------: | ------------------------------------: | --------------------------: |
+| `<arm>`                   |        `<sec>` |            `<r2e_s> / <swe_s>` |                    `<sec>` |                           `<r2e_s> / <swe_s>` |                   `<r2e_s> / <swe_s>` |                     `<sec>` |
+| _Upfront prewarm_         |        `<sec>` |                            `-` |     `<plan + prewarm sec>` |                                           `-` |                                   `-` |                         `-` |
+| _Sweep total (`<N>` arm)_ |        `<sec>` |      `<active_s> / <cal_wall>` |     `<inter-arm overhead>` |                                           `-` |                                   `-` |                         `-` |
+
 ### 3.3 Raw sandbox lifecycle and command latencies (`<reference-arm>`)
 
 Populate from `$ARTIFACT_DIR/[arms/<arm>/]report.json` (`stats[]`, `headline_baseline`,
@@ -182,12 +197,13 @@ operation does not occur in the selected strategy (for example `ttfc` on `100%` 
 | `task` (`swebench-gold`) | End-to-end SWE-bench rollout                              | `stats[event="task", name="swebench-gold"]`                        | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
 | `delete`                 | `DeleteEnvironment` / `DeleteActor`                       | `stats[event="delete"]`                                            | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
 | `step_barrier`           | First rollout start -> last rollout finish in step        | `stats[event="step_barrier"]`                                      | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
+| `run` (wall clock)       | Per-shard benchmark wall clock (`r2e` / `swe`)            | `stats[event="run"]` / `{r2e,swe}-summary.json` (`run_ms`)         | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
 
 ### 3.4 Step barrier, shard split, and optional node telemetry
 
-| Step |  Live | Tasks | Barrier (ms) | Park (ms) | Rollout p50 / p99 / p100 (ms) | Skew (`p100/p50`) | LLM think (ms) | Env wait (ms) | Env overhead (%) |
-| ---: | ----: | ----: | -----------: | --------: | ----------------------------: | ----------------: | -------------: | ------------: | ---------------: |
-|  `1` | `<n>` | `<n>` |  `<barrier>` |  `<park>` |      `<p50> / <p99> / <p100>` |         `<skew>x` |   `<think_ms>` |   `<wait_ms>` |         `<pct>%` |
+| Step |  Live | Tasks | Wall (`s`: arm [`r2e`/`swe`]) | Barrier (ms) | Park (ms) | Rollout p50 / p99 / p100 (ms) | Skew (`p100/p50`) | LLM think (ms) | Env wait (ms) | Env overhead (%) |
+| ---: | ----: | ----: | ----------------------------: | -----------: | --------: | ----------------------------: | ----------------: | -------------: | ------------: | ---------------: |
+|  `1` | `<n>` | `<n>` |     `<sec> (<r2e_s>/<swe_s>)` |  `<barrier>` |  `<park>` |      `<p50> / <p99> / <p100>` |         `<skew>x` |   `<think_ms>` |   `<wait_ms>` |         `<pct>%` |
 
 - **Shard split and contention**: `job=r2e` `<r2e_rewarded>/<r2e_tasks>` (`reward_rate=<rate>`),
   `job=swe` `<swe_rewarded>/<swe_tasks>` (`reward_rate=<rate>`), `slot_wait_p95_ms=<p95>`, dominant

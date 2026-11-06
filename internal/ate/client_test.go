@@ -366,6 +366,10 @@ func TestNewControlClientInSynctest(t *testing.T) {
 		if _, err := raw.ListActors(ctx, &ateapipb.ListActorsRequest{Atespace: "bubble-space"}); err != nil {
 			bt.Fatalf("ListActors: %v", err)
 		}
+		ctrl.AddWorker(fakecontrol.Worker("ate-system", "pool", "node-1", nil, 4))
+		if workers, err := client.ListWorkers(ctx); err != nil || len(workers) != 1 {
+			bt.Fatalf("ListWorkers: %v, %d workers, want 1", err, len(workers))
+		}
 		if err := client.Delete(ctx, "bubble-space", "a1"); err != nil {
 			bt.Fatalf("Delete: %v", err)
 		}
@@ -384,6 +388,7 @@ func TestNewControlClientInSynctest(t *testing.T) {
 			"SuspendActor":   func() error { _, err := raw.SuspendActor(cancelled, &ateapipb.SuspendActorRequest{}); return err },
 			"DeleteActor":    func() error { _, err := raw.DeleteActor(cancelled, &ateapipb.DeleteActorRequest{}); return err },
 			"ListActors":     func() error { _, err := raw.ListActors(cancelled, &ateapipb.ListActorsRequest{}); return err },
+			"ListWorkers":    func() error { _, err := raw.ListWorkers(cancelled, &ateapipb.ListWorkersRequest{}); return err },
 			"CreateAtespace": func() error { _, err := raw.CreateAtespace(cancelled, &ateapipb.CreateAtespaceRequest{}); return err },
 			"GetAtespace":    func() error { _, err := raw.GetAtespace(cancelled, &ateapipb.GetAtespaceRequest{}); return err },
 			"GetActorTemplate": func() error {

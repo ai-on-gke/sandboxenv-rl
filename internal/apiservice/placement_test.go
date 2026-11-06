@@ -234,10 +234,12 @@ func TestWarmImageResolvesNodesFromTheWorkersAndRefusesWithoutThem(t *testing.T)
 	if err != nil || !cov.GetComplete() || cov.GetWanted() != 2 {
 		t.Errorf("d1 with nodes 0: err=%v coverage=%v, want 2 wanted and complete", err, cov)
 	}
-	// An empty selector means the template's own pools: all four nodes.
+	// An empty selector means the template's own pools: all four schedulable
+	// nodes, and the probes land on those (never on the worker without
+	// capacity or the draining one).
 	_, cov, err = warm(t, client, &ateenvv1alpha.WarmImageRequest{RootfsImage: testRootfsImage, ProbesPerNode: 1})
-	if err != nil || !cov.GetComplete() || cov.GetWanted() != 4 {
-		t.Errorf("template pools with nodes 0: err=%v coverage=%v, want 4 wanted and complete", err, cov)
+	if err != nil || !cov.GetComplete() || cov.GetWanted() != 4 || !slices.Equal(cov.GetNodes(), []string{"node-d0-1", "node-d0-2", "node-d1-1", "node-d1-2"}) {
+		t.Errorf("template pools with nodes 0: err=%v coverage=%v, want the 4 schedulable nodes and complete", err, cov)
 	}
 	// A selector no worker carries.
 	_, _, err = warm(t, client, &ateenvv1alpha.WarmImageRequest{RootfsImage: testRootfsImage, WorkerSelector: map[string]string{"ate-env/domain": "d9"}})

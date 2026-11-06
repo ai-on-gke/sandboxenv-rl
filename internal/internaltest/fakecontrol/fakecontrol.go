@@ -73,10 +73,11 @@ type Server struct {
 	// created records every actor CreateActor accepted, for Created.
 	created []*ateapipb.Actor
 	// workers are the Workers ListWorkers reports (AddWorker seeds them).
-	// CreateActor places an actor whose selector some ACTIVE worker's labels
-	// carry on such a worker, round-robin among them (always the first with
-	// SameNode): status.assigned_node and worker_assignment.node_name are
-	// set. With no workers, or none matching, the actor stays unplaced.
+	// CreateActor places an actor whose selector some ACTIVE worker with an
+	// actor capacity carries in its labels on such a worker, round-robin
+	// among them (always the first with SameNode): status.assigned_node and
+	// worker_assignment.node_name are set. With no workers, or none
+	// matching, the actor stays unplaced.
 	workers      []*ateapipb.Worker
 	placeCounter int
 	SameNode     bool
@@ -228,11 +229,13 @@ func (s *Server) GetWorker(ctx context.Context, req *ateapipb.GetWorkerRequest) 
 }
 
 // place assigns a new actor to a worker whose labels carry its selector,
-// when there is one. Called with the lock held.
+// when there is one. As Substrate's room check, it skips a worker without an
+// actor capacity (registered, none reported yet) and one not ACTIVE. Called
+// with the lock held.
 func (s *Server) place(a *ateapipb.Actor) {
 	var candidates []*ateapipb.Worker
 	for _, w := range s.workers {
-		if w.GetStatus().GetState() != ateapipb.WorkerState_WORKER_STATE_ACTIVE {
+		if w.GetStatus().GetState() != ateapipb.WorkerState_WORKER_STATE_ACTIVE || w.GetStatus().GetCapacity().GetActors() <= 0 {
 			continue
 		}
 		ok := true
@@ -545,6 +548,13 @@ func (c inProcessControlClient) DeleteActorTemplate(ctx context.Context, in *ate
 		return nil, err
 	}
 	return c.s.DeleteActorTemplate(ctx, in)
+}
+
+func (c inProcessControlClient) ListWorkers(ctx context.Context, in *ateapipb.ListWorkersRequest, _ ...grpc.CallOption) (*ateapipb.ListWorkersResponse, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	return c.s.ListWorkers(ctx, in)
 }
 
 func selfSignedCert() (tls.Certificate, error) {

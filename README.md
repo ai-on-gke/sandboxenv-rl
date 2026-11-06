@@ -577,15 +577,17 @@ Usage:
   ate-env [command]
 
 Available Commands:
-  completion  Generate the autocompletion script for the specified shell
-  create       Create and start an environment
-  delete       Delete an environment
-  get          Show an environment: template, status, node and worker selector
-  help         Help about any command
-  image-status Show the template derived for a rootfs image and whether its golden snapshot is ready
-  manifest     Generate Kubernetes manifests to deploy the system
-  server-info  Show the ate-env-api server's version and features
-  suspend      Suspend an environment
+  completion        Generate the autocompletion script for the specified shell
+  create            Create and start an environment
+  delete            Delete an environment
+  get               Show an environment: template, status, node and worker selector
+  help              Help about any command
+  image-status      Show the template derived for a rootfs image and whether its golden snapshot is ready
+  manifest          Generate Kubernetes manifests to deploy the system
+  placement-domains List the worker pools a worker selector can address: labels, nodes, slots per node
+  server-info       Show the ate-env-api server's version and features
+  suspend           Suspend an environment
+  warm-image        Put an image's layers and golden snapshot on every node of a worker pool before a run
 
 Flags:
   -h, --help      help for ate-env
@@ -682,7 +684,7 @@ Manages the lifecycle of isolated execution environments (defined in [`proto/ate
 | `WarmImage` | Server-streaming: puts one digest-pinned `rootfs_image` on every node of one domain before a run. Creates probe environments with the worker selector, resumes them and holds them until the control plane reports them `RUNNING` (the layers and the golden snapshot are on the node by then), reads their nodes, deletes them, and repeats until every node ran the image or `max_rounds` is spent; streams a probe per environment and ends with the coverage. A probe's create, resume and delete are retried on the transient failures of a control plane under load, within the probe's timeout; the probes a call could not delete are listed in the coverage's `undeleted_probes` for a sweep, and the server caps the probes in flight per node of one selector across calls (`-warm-max-probes-per-node`). `nodes` 0 counts the matching workers' nodes, which takes the same role |
 | `SuspendEnvironment` | Suspends and checkpoints the environment: to snapshot storage by default, or to its node first with `mode: SUSPEND_MODE_LOCAL` (the upload follows in the background) |
 | `DeleteEnvironment` | Deletes the environment permanently |
-| `GetServerInfo` | Reports the server implementation (`sandboxenv-rl`), its version, the version of the `go.ate.dev/substrate` module it was built against, and its optional features (`rootfs_image`, `pty`, `suspend_mode`, and `port_proxy` when enabled); answered by `ate-env-api` itself. The Substrate version is a build fact, not the version of the control plane the server talks to; Substrate has no RPC that reports that. `ate-env server-info --json` prints the four fields as one JSON object |
+| `GetServerInfo` | Reports the server implementation (`sandboxenv-rl`), its version, the version of the `go.ate.dev/substrate` module it was built against, and its optional features (`rootfs_image`, `pty`, `suspend_mode`, `image_status`, `placement_domains`, `warm_image`, and `port_proxy` when enabled); answered by `ate-env-api` itself. The Substrate version is a build fact, not the version of the control plane the server talks to; Substrate has no RPC that reports that. `ate-env server-info --json` prints the four fields as one JSON object |
 
 ### ProcessService
 

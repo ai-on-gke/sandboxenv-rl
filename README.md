@@ -313,26 +313,41 @@ and its node pools created after that, or the mount fails with
 `MountVolume.SetUp failed: unimplemented`; Substrate's `setup-gcp create
 cluster` does both, and its
 [README](https://github.com/agent-substrate/substrate/blob/v0.6.0/tools/setup-gcp/README.md)
-has the details. Versions below 1.36 are not supported. The API's identity
-is `spiffe://cluster.local/ns/<namespace>/sa/ate-env-api`, and `ate-env
-manifest` prints the exact ID. Add it to the Substrate install's allow-list,
-one comma-separated value that becomes the router's whole
-`--ingress-allowed-spiffe-ids`, so keep the IDs already on it, and rerun the
-deploy for a running install:
+has the details. Versions below 1.36 are not supported.
+
+You must put the API's SPIFFE ID on the router's ingress allow-list. The ID is
+`spiffe://cluster.local/ns/<namespace>/sa/ate-env-api`, thus
+`spiffe://cluster.local/ns/ate-env/sa/ate-env-api` in the default namespace, and
+`ate-env manifest` prints the exact ID. If you also use `kubectl ate proxy actor`,
+add `spiffe://cluster.local/ns/ate-system/sa/atenet-client`, the ID that command
+presents. The value is one comma-separated list that becomes the router's whole
+`--ingress-allowed-spiffe-ids`, thus keep the IDs already on it. Rerun the deploy
+for a running install:
 
 ```bash
 # In the Substrate checkout.
-ATE_INGRESS_ALLOWED_SPIFFE_IDS=spiffe://cluster.local/ns/ate-env/sa/ate-env-api,<existing IDs> \
+ATE_INGRESS_ALLOWED_SPIFFE_IDS=spiffe://cluster.local/ns/ate-env/sa/ate-env-api,spiffe://cluster.local/ns/ate-system/sa/atenet-client,<existing IDs> \
   go run ./cmd/ate-setup deploy ate-system
 ```
 
 Editing the `atenet-router` Deployment's `--ingress-allowed-spiffe-ids`
-argument does the same by hand. ate-setup requires the list for its default
-Envoy ingress dataplane, which enforces it. Without the ID, or when the
-router does not trust the podidentity signer, the router rejects the API's
-certificate: guest calls fail at once with `FailedPrecondition` naming the ID
-and what to check, the port proxy answers 502 with the same cause, and the
-API logs the ID it presents at startup. `--api-router-tls=false` leaves the
+argument does the same by hand. ate-setup does not check the list: since
+Substrate [`c093a40c`](https://github.com/agent-substrate/substrate/commit/c093a40c)
+an install without it succeeds. The router then starts but serves no TLS
+listener at all, thus no client reaches any actor. The two mistakes fail
+differently:
+
+- **Empty list.** The connection to the router is refused. Creates succeed,
+  then each guest call retries as if the environment were still waking and
+  fails with `Unavailable: environment ... did not answer within the ...
+  budget ...` and a `connection refused` cause. The port proxy answers 502
+  (`is unreachable`).
+- **List without the API's ID**, or a router that does not trust the
+  podidentity signer. The router rejects the API's certificate. Guest calls
+  fail at once with `FailedPrecondition` naming the ID and what to check, and
+  the port proxy answers 502 with the same cause.
+
+The API logs the ID it presents at startup. `--api-router-tls=false` leaves the
 API on the router's plaintext addresses, which no Substrate release serves
 since v0.6.0, the first this build pairs with; it exists for the test fakes,
 and the API warns at startup when it runs that way.

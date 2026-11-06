@@ -52,9 +52,11 @@ This document is the canonical reference for common failure modes, diagnostic st
 ### Router TLS and SPIFFE authorization
 - **Symptom:** Remote shell execution or file I/O fails with `FailedPrecondition` or `Unavailable: connection reset by peer` when talking through the `atenet` router.
 - **Cause:** Substrate v0.6.0+ enforces mutual TLS (mTLS) and SPIFFE ID authorization on the router. Calls from `ate-env-api` to guest actors must present a certificate whose SPIFFE ID matches `ATE_INGRESS_ALLOWED_SPIFFE_IDS`.
-- **Fix:** Verify that the router's allowed SPIFFE IDs include the `ate-env-api` service account identity:
+- **Symptom:** Creates succeed, but each guest call retries for the wake budget and then fails with `Unavailable` and `connection refused`; the port proxy answers 502.
+- **Cause:** The router's allow-list is empty. ate-setup does not check it (since Substrate [`c093a40c`](https://github.com/agent-substrate/substrate/commit/c093a40c)), and a router without it serves no TLS listener, thus no client reaches any actor.
+- **Fix:** Set the router's allowed SPIFFE IDs to include the `ate-env-api` service account identity, plus `atenet-client` if you use `kubectl ate proxy actor`, and rerun `ate-setup deploy`:
   ```bash
-  export ATE_INGRESS_ALLOWED_SPIFFE_IDS="spiffe://cluster.local/ns/ate-env/sa/ate-env-api,spiffe://cluster.local/ns/ate-system/sa/default"
+  export ATE_INGRESS_ALLOWED_SPIFFE_IDS="spiffe://cluster.local/ns/ate-env/sa/ate-env-api,spiffe://cluster.local/ns/ate-system/sa/atenet-client"
   ```
   In automated Kind runs, [`hack/ci/e2e.py`](../../hack/ci/e2e.py) configures this automatically.
 

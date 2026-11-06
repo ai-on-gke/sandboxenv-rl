@@ -24,13 +24,13 @@ image check as the mitigation for "a caller runs an image of its choice".
 
 ### Criteria
 
-| ID   | Criterion                                                                                                                                                                                                                                            | Status        | Tests                                                                                                                             |
-| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| AE-1 | A `CreateEnvironment` that succeeds runs the image it asked for. A derived template that runs another image is refused with `FailedPrecondition`, whether it existed before the call or a concurrent create made it.                                 | met by #244   | `TestPropConcurrentCreatesUseRequestedImage`, `TestConcurrentCreateOnCollidingDigestFailsPrecondition`, `TestPropSameImageDigest` |
-| AE-2 | A derived template's guest command resolves under `/ate` for every base command `rerootCommand` accepts, so the guest is found at boot.                                                                                                              | met by #244   | `TestPropRerootStaysUnderMount`, `TestRerootKeepsDotDotUnderMount`                                                                |
-| AE-3 | The derived name is `<base>-<first 12 hex digits>`: the same for any repository path or tag of one digest, always a valid Kubernetes name of at most 63 characters, and never a panic or an invalid name for any input.                              | met on `main` | `TestPropImageTemplateNameIdentity`, `TestPropImageTemplateNameNeverInvalid`                                                      |
-| AE-4 | Deriving from a derived template equals deriving from its base: `Derive(Derive(b, n1, i1), n2, i2) == Derive(b, n2, i2)`. The base is never changed and volume names stay unique.                                                                    | met on `main` | `TestPropDeriveComposes`                                                                                                          |
-| AE-5 | Concurrent creates on a derived template whose golden snapshot failed all succeed. The template is deleted and recreated at most once, only when no actor a recreate harms uses it, no actor is created while it is absent, and exactly one remains. | met on `main` | `TestPropConcurrentRecreate`                                                                                                      |
+| ID   | Criterion                                                                                                                                                                                                                                                                                                                                                            | Status        | Tests                                                                                                                             |
+| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| AE-1 | A `CreateEnvironment` that succeeds runs the image it asked for. A derived template that runs another image is refused with `FailedPrecondition`, whether it existed before the call or a concurrent create made it.                                                                                                                                                 | met by #244   | `TestPropConcurrentCreatesUseRequestedImage`, `TestConcurrentCreateOnCollidingDigestFailsPrecondition`, `TestPropSameImageDigest` |
+| AE-2 | A derived template's guest command resolves under `/ate` for every base command `rerootCommand` accepts, so the guest is found at boot.                                                                                                                                                                                                                              | met by #244   | `TestPropRerootStaysUnderMount`, `TestRerootKeepsDotDotUnderMount`                                                                |
+| AE-3 | The derived name is `<base>-<first 12 hex digits>`: the same for any repository path or tag of one digest, always a valid Kubernetes name of at most 63 characters, and never a panic or an invalid name for any input.                                                                                                                                              | met on `main` | `TestPropImageTemplateNameIdentity`, `TestPropImageTemplateNameNeverInvalid`                                                      |
+| AE-4 | Deriving from a derived template equals deriving from its base: `Derive(Derive(b, n1, i1), n2, i2) == Derive(b, n2, i2)`. The base is never changed, and the derived template is one Substrate accepts: unique volume names, and the guest volume alone at `/ate`. A base whose volume or mount already takes the guest's name or `/ate` is refused with the reason. | met by #263   | `TestPropDeriveComposes`, `TestDeriveImageTemplateRefusesClashWithGuestSlot`                                                      |
+| AE-5 | Concurrent creates on a derived template whose golden snapshot failed all succeed. The template is deleted and recreated at most once, only when no actor a recreate harms uses it, no actor is created while it is absent, and exactly one remains.                                                                                                                 | met on `main` | `TestPropConcurrentRecreate`                                                                                                      |
 
 ### What the property tests found
 
@@ -45,8 +45,16 @@ image check as the mitigation for "a caller runs an image of its choice".
   `TestPropRerootStaysUnderMount`, which draws paths with `..`, `.` and empty segments. The example
   tests used clean paths only.
 
-Neither `AE-1` nor `AE-2` is a clock bug, so `testing/synctest` alone would not have generated those
-inputs.
+- **AE-4.** For a base that runs the guest as its container image, `DeriveImageTemplate` added the
+  guest volume and its `/ate` mount without checking that the base left room for them. A base with a
+  non-image volume named `guest`, or a mount at or under `/ate`, derived a template with two `guest`
+  volumes or nested mounts, which Substrate rejects, so every `rootfs_image` create on that base
+  failed with an error about a template the operator never wrote. Found by `TestPropDeriveComposes`
+  once its generator drew such bases; it had only drawn `modeABase` with fixed volume names and
+  paths.
+
+Neither `AE-1`, `AE-2` nor `AE-4` is a clock bug, so `testing/synctest` alone would not have
+generated those inputs.
 
 ## Wake budgets, fail-fast, and cancellation
 

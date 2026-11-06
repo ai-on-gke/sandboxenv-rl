@@ -88,6 +88,10 @@ user needs to know across them.
 
 ### Fixed
 
+- ate-env-api: deriving an image template from a base that already has a
+  non-image volume named `guest`, or a mount at or under `/ate`, fails with
+  `InvalidArgument` naming the clash, instead of creating a template that
+  Substrate rejects for a duplicate volume or nested mounts.
 - ate-env-api: a guest call whose caller context cancels or expires while its
   wake probe is parked at the router returns `Canceled` or `DeadlineExceeded`
   instead of treating the unwoken environment as awake and recording

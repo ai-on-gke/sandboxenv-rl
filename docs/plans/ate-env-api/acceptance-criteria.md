@@ -1,11 +1,11 @@
 # ate-env-api: acceptance criteria
 
 Status: `AE-1` and `AE-2` met by #244, which fixed two bugs that property tests found against them.
-`AE-3` to `AE-5` and `WF-1` to `WF-6` plus `WF-8` met on `main` (`#202` wake budgets and `#222`
-fail-fast on crash and no capacity). `WF-7` met by #255, which fixed a wake-probe cancellation bug
-found by property and state-machine tests in `internal/apiservice`. Every criterion in this file is
-scoped to the Go `ate-env-api` server and names the tests that check it on every pull request in the
-Go job (`go test -race ./...`).
+`AE-3` to `AE-5` and `WF-1` to `WF-6` plus `WF-8` met on `main` (`#86` wake budgets, `#202` the
+five-minute default, and `#222` fail-fast on crash and no capacity). `WF-7` met by #255, which fixed
+a wake-probe cancellation bug found by property and state-machine tests in `internal/apiservice`.
+Every criterion in this file is scoped to the Go `ate-env-api` server and names the tests that check
+it on every pull request in the Go job (`go test -race ./...`).
 
 ## Derived image templates
 

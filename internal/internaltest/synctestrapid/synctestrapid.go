@@ -32,7 +32,9 @@
 //     only when its panic traceback matches the original failure's traceback
 //     (shrinker.accept), so stopTest, invalidData, and unexpected panics must
 //     re-panic from distinct frames outside the bubble after bt.Cleanup hooks
-//     drain parked goroutines.
+//     drain parked goroutines. Within one class, all rt.Fatalf calls share
+//     repanicStopTest's traceback, so rapid may shrink to a smaller input that
+//     fails a different assertion site.
 package synctestrapid
 
 import (
@@ -47,9 +49,10 @@ import (
 // Check runs a rapid property where every generated test case (and every
 // shrinking attempt) executes inside a fresh testing/synctest bubble.
 //
-// Register cleanup hooks on bt (via bt.Cleanup) to close any open test gate
-// channels or cancel contexts so goroutines parked inside the bubble can exit
-// cleanly when an invariant fails mid-sequence.
+// Assert through rt; use bt for Cleanup only, because failing bt aborts the
+// outer test via synctest.Test without shrinking. Register cleanup hooks on bt
+// to close open gate channels or cancel contexts so goroutines parked inside
+// the bubble exit cleanly when an assertion fails mid-sequence.
 func Check(t *testing.T, prop func(bt *testing.T, rt *rapid.T)) {
 	t.Helper()
 	check(t, t, prop)
@@ -59,7 +62,8 @@ func Check(t *testing.T, prop func(bt *testing.T, rt *rapid.T)) {
 // sequence (and each shrink attempt) executes inside a fresh testing/synctest
 // bubble. Actions spawn goroutines, release channel gates, or advance the
 // bubble's fake clock with time.Sleep, calling synctest.Wait() to reach exact
-// runtime quiescence before Check verifies invariants.
+// runtime quiescence before Check verifies invariants. Assert through rt; use
+// bt for Cleanup only.
 func Repeat(t *testing.T, newMachine func(bt *testing.T, rt *rapid.T) rapid.StateMachine) {
 	t.Helper()
 	repeat(t, t, newMachine)

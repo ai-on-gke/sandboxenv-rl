@@ -62,6 +62,9 @@ type BackendDriverOptions struct {
 	AteapiTokenFile  string
 	AteapiCAFile     string
 	AteapiSkipVerify *bool
+	// DeleteRate caps the environment deletes per second through the
+	// ate-env-api backend (WithDeleteRate); 0 removes the cap.
+	DeleteRate float64
 	// Placement, when set, steers each image's environments into the domains
 	// an image placement plan assigns it (EnvBackend only).
 	Placement *schema.ImagePlacement
@@ -193,7 +196,7 @@ func NewBackendDriver(opts BackendDriverOptions) (Backend, io.Closer, error) {
 			}
 			return b, b, nil
 		}
-		var envOpts []EnvBackendOption
+		envOpts := []EnvBackendOption{WithDeleteRate(opts.DeleteRate)}
 		if opts.Placement != nil {
 			envOpts = append(envOpts, WithPlacement(opts.Placement))
 		}

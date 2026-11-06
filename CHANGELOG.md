@@ -7,6 +7,7 @@ user needs to know across them.
 ## Unreleased
 
 ### Added
+
 - `benchmarking/swebench/run-r2e-swebench.sh`: the mixed R2E-Gym + SWE-bench
   recipe, with `make-r2e-dataset.py` (R2E-Gym `CommandAdapter` manifests),
   `run_fleet_bench.py` (the Python `SandboxFleet` arm) and the `r2e-swebench`
@@ -14,6 +15,11 @@ user needs to know across them.
   `-window-size`, `swebench-loader render-plan`, `swebench-loader report -md`
   over several runs (the arm table), and the `-atenet-*` and `-ateapi-*`
   flags of the direct Substrate backend.
+- swebench-loader: `run -delete-rate` caps the environment deletes per second
+  through ate-env-api (default 200; 0 removes the cap), and a delete the
+  bucket rate-limits (429, `ResourceExhausted`) is retried with backoff for
+  up to two minutes instead of failing. The run records the cap as the
+  `delete_rate` label, so `report -arm` keeps runs with different caps apart.
 - `swebench-loader run -placement image-placement.json`: each create carries
   the worker selector of one of its image's domains, round-robin per image
   (`EnvBackend` `WithPlacement`); `report -preflight-coverage` feeds the
@@ -109,6 +115,11 @@ user needs to know across them.
 
 ### Fixed
 
+- swebench-loader `-park-each`: the last step deletes each environment right
+  after its replay instead of suspending it (unless `-keep`). A 37,000
+  environment run suspended them all, one more snapshot upload each. The
+  cleanup then deleted them in one burst at about 1,850 per second; 15,031
+  deletes failed on GCS 429 and leaked.
 - swebench-loader: `-park suspend-async` suspends locally through ate-env-api
   (`SuspendLocal`: the call returns once the snapshot is on the node and the
   upload goes on in the background), as it already did through direct

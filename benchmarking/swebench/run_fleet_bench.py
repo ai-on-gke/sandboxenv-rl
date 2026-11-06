@@ -79,6 +79,7 @@ LOADER_LABEL_KEYS = frozenset({
     "wake_backoff",
     "dataset",
     "connections",
+    "delete_rate",
     "base_template",
     "exclude_file",
     "instances",

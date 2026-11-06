@@ -89,7 +89,7 @@ smoke test and a 500-wide run differ only in numbers.
 | single-shard strategy sweep (`none`, `naive`, `sliding`, `pipelined`) | `-mode steps -steps 1 -images 20 -rollouts 5 -width 100 -strategy pipelined -window-size 8` | Single-pass sweep of the four warm-pool orchestration strategies on `swebench-loader`: `none` (on-demand create and delete per rollout), `naive` (prewarm and suspend all `images * rollouts` sandboxes upfront), `sliding` (warm `window-size` distinct images, execute, retire, advance), or `pipelined` (double-buffer window `N+1` prefetch behind window `N` execution while sharing `-width`). |
 | eval (SWE-bench Verified evaluation) | `-mode eval -images 500 -tasks-per-image 6 -width 500` | 500 in flight. Each task: create from the image, replay the trajectory, record the reward, delete. With the offline exclusion list the 500 become 445 images and 2,670 tasks; the loader prints the reduced count. |
 | steps (training loop) | `-mode steps -images 500 -rollouts 2 -steps 8 -park suspend` | 1,000 environments created once. Each step replays the trajectory on all of them, waits for the last (the barrier), then parks the fleet. `-park` is `suspend`, `suspend-sync`, `suspend-async`, `fork`, `delete` or `none`. |
-| steps, parked one by one (fleet larger than the slots) | `-mode steps -images 500 -rollouts 16 -steps 8 -park suspend -width 64 -park-each` | 8,000 environments, created on their first step. Each environment is parked as soon as its own step ends instead of after the whole fleet's, so at most 64 are awake at once and the fleet can be many times the running slots: the shape of a trainer that releases a sandbox at the end of its episode, and the way to measure how many parked environments a node can hold. The barrier includes the parking and there is no `park` event. With `-park suspend-async` each parked environment stays pinned to its node until its upload lands; a wake that finds no room on that node pays the detach (Substrate issue #3482; `docs/plans/preflight-warmer.md`). |
+| steps, parked one by one (fleet larger than the slots) | `-mode steps -images 500 -rollouts 16 -steps 8 -park suspend -width 64 -park-each` | 8,000 environments, created on their first step. Each environment is parked as soon as its own step ends instead of after the whole fleet's, so at most 64 are awake at once and the fleet can be many times the running slots: the shape of a trainer that releases a sandbox at the end of its episode, and the way to measure how many parked environments a node can hold. The barrier includes the parking and there is no `park` event. On the last step each environment is deleted right after its replay instead of parked (unless `-keep`), so the run ends with no cleanup burst. With `-park suspend-async` each parked environment stays pinned to its node until its upload lands; a wake that finds no room on that node pays the detach (Substrate issue #3482; `docs/plans/preflight-warmer.md`). |
 | steps with a window (pools per step) | `-mode steps -images-per-step 32 -rollouts 16 -steps 6 -park delete` | Each step takes the next 32 images (wrapping around the dataset), creates 16 fresh environments per image, 512 in all, runs the step behind a barrier, and retires them. Nothing survives a step, so every task pays the cold path, and a new image is a new derived template and a golden bake on first use: the shape of a trainer that creates and retires pools every step. Run several loaders at once, one run id each, for several jobs on one cluster. |
 
 The trajectory is YAML (`internal/benchmarking/swebench/trajectories/`,
@@ -117,7 +117,7 @@ API server included, which is what a trainer sees):
 | `wake` | first command after a suspend park, including the wake it triggers |
 | `step` (by name) | each trajectory step, with exit code; the reward step carries the reward and an output tail |
 | `task` | one replay end to end, ok and reward |
-| `suspend`, `delete` | the calls |
+| `suspend`, `delete` | the calls. Through ate-env-api a `delete` also includes its wait in the `-delete-rate` queue and any retry backoff, and so does the `park_s` of a `-park delete` run: the standard run's startup arm retires 890 environments per step, and at 200 per second with a burst of 200 the queue alone adds at least 3.4 s per step |
 | `step_barrier` | steps mode: first task start to last task end in a training step |
 | `park` | steps mode: parking the whole fleet; absent with `-park-each`, where the barrier includes the parking |
 | `run` | the whole run |
@@ -131,11 +131,11 @@ tasks, failures, barrier, park and wake p50/p95. `-json` then writes the
 summaries as an array. Files go before the flags.
 
 Every run event carries labels: the loader's own (mode, width, images,
-trajectory, dataset, the shape flags, connections, base template, exclude
-file, instances and the timeouts) plus any `run -label KEY=VALUE`, which is
-where the Substrate commit, the cluster and the arm go. A `-label` with a key
-the loader records itself is refused, so the same-workload check below cannot
-be overridden. The report prints
+trajectory, dataset, the shape flags, connections, delete rate, base
+template, exclude file, instances and the timeouts) plus any
+`run -label KEY=VALUE`, which is where the Substrate commit, the cluster and
+the arm go. A `-label` with a key the loader records itself is refused, so
+the same-workload check below cannot be overridden. The report prints
 them under its header, and the comparison shows one row per label key, so a
 column's provenance is in the table. `report -arm pull=p1.jsonl,p2.jsonl
 -arm stream=s1.jsonl,s2.jsonl` gives one column per arm, in flag order. Two
@@ -200,11 +200,12 @@ flag.
 ## How many actors, and on which clusters
 
 Every environment the loader creates is one Substrate actor. Three flags
-set how many:
+set how many, and one paces their deletes:
 
 | Flag | Controls |
 |---|---|
 | `-width` | actors in flight at once; also the cap on parallel creates |
+| `-delete-rate` | most environment deletes per second through ate-env-api, per loader process (several loaders at once add their caps up), 200 by default; 0 removes the cap. The bucket rate-limits snapshot deletes, and a delete it refuses (429, `ResourceExhausted`) is retried with backoff for up to two minutes. The queue wait and the backoff count in the `delete` event and in the `park_s` of a `-park delete` run; the run records the cap as the `delete_rate` label |
 | `-tasks-per-image` | eval: actors created per image, each a full create, replay, delete |
 | `-rollouts` | steps: actors per image kept alive across the training steps |
 
@@ -528,10 +529,10 @@ The bundle built with `bench measure -k8s` records the cluster, node pools,
 Kubernetes and Substrate versions and the loader commit; pass the arm as a
 `run -label` and record by hand what neither records: boot disk type and size,
 CPU family, workers per node, bucket region. The loader records its own flags
-itself: mode, width, images, trajectory,
-dataset, tasks per image or rollouts, steps and park, connections, base
-template, exclude file, instances, and the create, step, wake-budget and
-wake-backoff timeouts. The report alone is not reproducible without them.
+itself: mode, width, images, trajectory, dataset, tasks per image or
+rollouts, steps and park, connections, delete rate, base template, exclude
+file, instances, and the create, step, wake-budget and wake-backoff timeouts.
+The report alone is not reproducible without them.
 
 ## R2E-Gym and SWE-bench sweeps
 

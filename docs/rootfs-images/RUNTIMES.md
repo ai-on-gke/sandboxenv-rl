@@ -23,7 +23,13 @@ The guest is the container's only process by contract, which is why it is the
 one that supervises the others. Sidecars run without a shell or `PATH` lookup,
 so the binary is an absolute path into its mount, and the rootfs image needs
 nothing for it beyond, for a binary that is not statically linked, a
-compatible C library (the OpenHands layer needs glibc 2.31 or newer). They inherit the container's user, environment and filesystem, plus the `--sidecar-env` variables. The commands that ate-env-api starts do not get those variables; they run as the same user, thus they can still read them from `/proc/<pid>/environ` of a sidecar or of the guest.
+compatible C library (the OpenHands layer needs glibc 2.31 or newer). They
+inherit the container's user, environment and filesystem, plus the
+`--sidecar-env` variables. The commands that ate-env-api starts do not get
+those variables, but they run as the same user as the sidecars: root today, at
+the Substrate pin; the image's `USER` after the Substrate bump that runs
+containers as it. Thus they can still read them from `/proc/<pid>/environ` of
+a sidecar or of the guest.
 
 Template derivation keeps all of it. A base with layers yields derived
 templates with the same layers and the same guest flags, so environments

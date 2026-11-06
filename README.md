@@ -466,9 +466,12 @@ ate-env manifest template --template layered \
 
 A runtime's settings are `--env NAME=VALUE` flags, which the sidecars and each command in the
 environment see. A secret that only the runtime needs, such as its API key, goes in
-`--sidecar-env NAME=VALUE`: the guest gives it to the sidecars only, not to the commands that
-ate-env-api starts or their children. A command that runs as the same user can still read it from
-the sidecar's `/proc/<pid>/environ`, and each viewer of the atespace reads it in the template; see
+`--sidecar-env NAME=VALUE`: the container carries it as `ATE_SIDECAR_ENV_NAME`, and the guest
+removes it from its own environment before it starts anything and gives `NAME` to the sidecars
+only, not to the commands that ate-env-api starts or their children. A command in the environment
+can still read it from the sidecar's `/proc/<pid>/environ`: today, at the Substrate pin, the guest,
+the sidecars and the commands run as root; after the Substrate bump that runs containers as the
+image's `USER`, they share that one user. Each viewer of the atespace reads it in the template; see
 [docs/security/threat-model.md](docs/security/threat-model.md). `--sidecar-env` needs a guest image
 with its support: the template also carries the guest flag `-sidecar-env-required`, thus an older
 guest exits at start instead of running the sidecars without the values.

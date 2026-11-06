@@ -28,6 +28,15 @@ user needs to know across them.
   (default 2) caps the probes in flight per node of one worker selector
   across calls; a request's `probes_per_node` above it is refused, and the
   coverage's `waited` is the time its rounds waited for slots.
+- `swebench-loader preflight`, the PreflightWarmer: from an image placement
+  plan, ensures each image's derived template, then per domain, as each
+  golden becomes ready, probes every node of the domain with the image
+  (creates placed by the domain's worker selector, node read back) until
+  each node has run it, `-image-concurrency` images at once;
+  `preflight-events.jsonl` and `preflight-coverage.json`. `EnvBackend` gains
+  `CreateWith(CreateOptions{WorkerSelector})`, `Node`, `ImageStatus` and
+  `EnsureImageTemplate` (the `ImageWarmer` interface); `domains.json` takes
+  an optional `node_slots` per domain.
 - ate-env-api: `GetImageStatus` and `EnsureImageTemplate`, the ActorTemplate
   derived for a `rootfs_image` and the state of its golden snapshot (`NONE`,
   `PENDING`, `READY` with the tag, `FAILED` with the reason); ensure creates

@@ -76,6 +76,8 @@ func runMain(args []string, stdout, stderr io.Writer) int {
 		err = resolveCmd(args[1:])
 	case "plan-placement":
 		err = planPlacementCmd(args[1:], stderr)
+	case "preflight":
+		err = preflightCmd(args[1:], stderr)
 	case "convert-trace":
 		err = convertTraceCmd(args[1:])
 	case "report", "compare":
@@ -244,7 +246,7 @@ func idsDigest(ids []string) string {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage: swebench-loader run [flags] | swebench-loader resolve [flags] | swebench-loader plan-placement [flags] | swebench-loader convert-trace [flags] | swebench-loader report FILE... [-json OUT] | swebench-loader trajectory-assets FILE")
+	fmt.Fprintln(w, "usage: swebench-loader run [flags] | swebench-loader resolve [flags] | swebench-loader plan-placement [flags] | swebench-loader preflight [flags] | swebench-loader convert-trace [flags] | swebench-loader report FILE... [-json OUT] | swebench-loader trajectory-assets FILE")
 }
 
 // planPlacementCmd writes image-placement.json: which placement domains hold
@@ -356,6 +358,188 @@ func planPlacementCmd(args []string, stderr io.Writer) error {
 		fmt.Fprintf(stderr, "  unplaced: %s: %s\n", u.Image, u.Reason)
 	}
 	return nil
+}
+
+// testPreflightBackend replaces the ate-env backend in the preflight
+// subcommand's tests.
+var testPreflightBackend swebench.ImageWarmer
+
+// preflightCmd runs the PreflightWarmer over an image placement plan: it
+// ensures each image's derived template, waits for the golden, and probes
+// every node of every domain with the image, so the run that follows finds
+// the layers and the golden snapshot on the node.
+func preflightCmd(args []string, stderr io.Writer) (retErr error) {
+	fs := flag.NewFlagSet("preflight", flag.ContinueOnError)
+	var (
+		plan          = fs.String("plan", "", "image-placement.json from plan-placement. Required.")
+		endpoint      = fs.String("endpoint", "127.0.0.1:7777", "ate-env-api address.")
+		atespace      = fs.String("atespace", "ate-env", "Substrate atespace of the environments and templates.")
+		baseTemplate  = fs.String("base-template", "default-template", "Base ActorTemplate the derived templates come from.")
+		connections   = fs.Int("connections", 1, "gRPC connections to ate-env-api.")
+		authTokenFile = fs.String("auth-token-file", "", "File with the ate-env-api bearer token; SUBSTRATE_ENV_AUTH_TOKEN otherwise.")
+		runID         = fs.String("run-id", "pf", "Prefix of the probe environment names (at most 20 characters).")
+		eventsDir     = fs.String("events-dir", "", "Directory for preflight-events.jsonl and preflight-coverage.json; required unless -out is given.")
+		out           = fs.String("out", "", "Events file to write instead of -events-dir.")
+		coverageOut   = fs.String("coverage-out", "", "Where to write preflight-coverage.json; default <events-dir>/preflight-coverage.json.")
+		probesPerNode = fs.Int("probes-per-node", 2, "Probes a round starts per node of a domain; the round holds them until all are placed.")
+		imageConc     = fs.Int("image-concurrency", 4, "Images a domain warms at once; node_slots in the plan caps it at node_slots / probes-per-node.")
+		maxRounds     = fs.Int("max-rounds", 3, "Rounds per (image, domain) before the pair is reported short.")
+		goldenTimeout = fs.Duration("golden-timeout", 30*time.Minute, "Give up on the goldens still baking once none became ready for this long.")
+		goldenPoll    = fs.Duration("golden-poll", 10*time.Second, "How often to poll a baking golden.")
+		probeTimeout  = fs.Duration("probe-timeout", 10*time.Minute, "Bound on one probe's create and first command.")
+		images        = fs.String("images", "", "Comma-separated images to restrict the pass to; default every image of the plan.")
+		domains       = fs.String("domains", "", "Comma-separated domains to restrict the pass to; default every domain of the plan.")
+	)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("preflight takes no positional arguments, got %q", fs.Args())
+	}
+	if *plan == "" {
+		return fmt.Errorf("-plan is required")
+	}
+	if *eventsDir == "" && *out == "" {
+		return fmt.Errorf("-events-dir or -out is required")
+	}
+	if *eventsDir != "" && *out != "" {
+		return fmt.Errorf("-events-dir and -out exclude each other")
+	}
+	placement, err := swebench.ReadImagePlacement(*plan)
+	if err != nil {
+		return err
+	}
+	coveragePath := *coverageOut
+	if coveragePath == "" {
+		if *eventsDir != "" {
+			coveragePath = filepath.Join(*eventsDir, "preflight-coverage.json")
+		} else {
+			coveragePath = "preflight-coverage.json"
+		}
+	}
+
+	var backend swebench.ImageWarmer
+	if testPreflightBackend != nil {
+		backend = testPreflightBackend
+	} else {
+		authToken, err := resolveAuthToken(*authTokenFile, os.Getenv)
+		if err != nil {
+			return err
+		}
+		b, err := swebench.NewEnvBackend(*endpoint, *atespace, *baseTemplate, *connections, authToken)
+		if err != nil {
+			return err
+		}
+		defer b.Close()
+		backend = b
+	}
+
+	// The events go next to the run's events/ directory, not into it: the
+	// run report aggregates events/*.jsonl and must not count the probes.
+	eventsPath := *out
+	if *eventsDir != "" {
+		eventsPath = filepath.Join(*eventsDir, "preflight-events.jsonl")
+	}
+	rec, err := swebench.NewFileRecorder(eventsPath, *runID)
+	if err != nil {
+		return err
+	}
+	rec.SetWorker("preflight")
+	defer func() {
+		if rerr := rec.Close(); rerr != nil && retErr == nil {
+			retErr = fmt.Errorf("writing events: %w", rerr)
+		}
+	}()
+
+	log := slog.New(slog.NewJSONHandler(stderr, nil))
+	warmer, err := swebench.NewPreflightWarmer(swebench.PreflightOptions{
+		Plan:             placement,
+		PlanPath:         *plan,
+		Backend:          backend,
+		Recorder:         rec,
+		Logger:           log,
+		RunID:            *runID,
+		ProbesPerNode:    *probesPerNode,
+		ImageConcurrency: *imageConc,
+		MaxRounds:        *maxRounds,
+		GoldenTimeout:    *goldenTimeout,
+		GoldenPoll:       *goldenPoll,
+		ProbeTimeout:     *probeTimeout,
+		Images:           splitList(*images),
+		Domains:          splitList(*domains),
+	})
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	report, runErr := warmer.Run(ctx)
+	if report != nil {
+		wrotePath := coveragePath
+		if werr := swebench.WritePreflightCoverage(coveragePath, report); werr != nil {
+			wrotePath = ""
+			if runErr == nil {
+				runErr = werr
+			} else {
+				log.Warn("preflight: writing coverage failed", slog.String("path", coveragePath), slog.Any("err", werr))
+			}
+		}
+		printPreflightSummary(stderr, report, wrotePath)
+	}
+	return runErr
+}
+
+func splitList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	for _, v := range strings.Split(s, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func printPreflightSummary(w io.Writer, r *schema.PreflightCoverage, path string) {
+	ready, none := 0, 0
+	for _, g := range r.Goldens {
+		switch {
+		case g.State == "ready":
+			ready++
+		case swebench.GoldenSettled(g):
+			none++
+		}
+	}
+	fmt.Fprintf(w, "pre-flight %s: goldens %d/%d ready", map[bool]string{true: "complete", false: "INCOMPLETE"}[r.Complete], ready, len(r.Goldens))
+	if none > 0 {
+		fmt.Fprintf(w, ", %d without a golden (disabled on the template)", none)
+	}
+	if path != "" {
+		fmt.Fprintf(w, "; wrote %s\n", path)
+	} else {
+		fmt.Fprintln(w)
+	}
+	for _, d := range r.Domains {
+		done := 0
+		for _, ic := range d.Images {
+			if ic.Complete {
+				done++
+			}
+		}
+		fmt.Fprintf(w, "  %s: %d/%d images on all %d nodes (%d seen)\n", d.Name, done, len(d.Images), d.Nodes, len(d.NodesSeen))
+		for _, ic := range d.Images {
+			if !ic.Complete {
+				fmt.Fprintf(w, "    short: %s on %d/%d nodes after %d rounds, %d/%d probes failed%s\n", ic.Image, len(ic.Nodes), ic.Wanted, ic.Rounds, ic.Failed, ic.Probes, map[bool]string{true: ": " + ic.Error, false: ""}[ic.Error != ""])
+			}
+		}
+	}
+	for _, g := range r.Goldens {
+		if !swebench.GoldenSettled(g) {
+			fmt.Fprintf(w, "  golden %s: %s %s\n", g.Image, g.State, g.Error)
+		}
+	}
 }
 
 // assetsCmd prints the files a trajectory's write steps name, one per line,

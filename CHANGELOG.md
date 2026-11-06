@@ -28,6 +28,12 @@ user needs to know across them.
   (default 2) caps the probes in flight per node of one worker selector
   across calls; a request's `probes_per_node` above it is refused, and the
   coverage's `waited` is the time its rounds waited for slots.
+
+- swebench-loader: `run -delete-rate` caps the environment deletes per second
+  through ate-env-api (default 200; 0 removes the cap), and a delete the
+  bucket rate-limits (429, `ResourceExhausted`) is retried with backoff for
+  up to two minutes instead of failing. The run records the cap as the
+  `delete_rate` label, so `report -arm` keeps runs with different caps apart.
 - `swebench-loader run -placement image-placement.json`: each create carries
   the worker selector of one of its image's domains, round-robin per image
   (`EnvBackend` `WithPlacement`); `report -preflight-coverage` feeds the
@@ -123,6 +129,22 @@ user needs to know across them.
 
 ### Fixed
 
+- swebench-loader `-park-each`: the last step deletes each environment right
+  after its replay instead of suspending it (unless `-keep`). A 37,000
+  environment run suspended them all, one more snapshot upload each. The
+  cleanup then deleted them in one burst at about 1,850 per second; 15,031
+  deletes failed on GCS 429 and leaked.
+- swebench-loader: `-park suspend-async` suspends locally through ate-env-api
+  (`SuspendLocal`: the call returns once the snapshot is on the node and the
+  upload goes on in the background), as it already did through direct
+  Substrate access. It sent a durable suspend and waited for the upload: p50
+  0.8 s, p95 9 s, max 46.5 s over 180,000 suspends in one run. `-park-each`
+  parks with `suspend-sync` and `suspend-async`, which it silently skipped,
+  and rejects `fork`. A run that parks with `suspend-async` or `fork` (whose
+  park is a local suspend too) checks that ate-env-api serves `suspend_mode`
+  before it starts. `report` takes `park_mode` from the run's `park` label,
+  so a `-park-each` run, which records no `park` event, reports
+  `suspend-async` or `suspend-sync` instead of `suspend`.
 - ate-env-api: deriving an image template from a base that already has a
   non-image volume named `guest`, or a mount at or under `/ate`, fails with
   `InvalidArgument` naming the clash, instead of creating a template that

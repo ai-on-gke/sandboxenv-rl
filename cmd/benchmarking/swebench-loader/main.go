@@ -218,11 +218,14 @@ func datasetLabel(dataset string) string {
 // rest come from Config.labels); every key is in swebench.LoaderLabelKeys or
 // is a var's effective value under set.KEY. The exclude file and the
 // instance list are named by their file name or count plus a digest of their
-// ids, so two lists of one length differ.
-func ownLabels(dataset string, connections int, baseTemplate, excludeFile, placement string, exclude, instances []string, vars map[string]string) map[string]string {
+// ids, so two lists of one length differ. The delete rate is recorded as
+// given, 0 for no cap, so report -arm keeps runs with different caps apart:
+// the cap's queue is in their delete and park times.
+func ownLabels(dataset string, connections int, deleteRate float64, baseTemplate, excludeFile, placement string, exclude, instances []string, vars map[string]string) map[string]string {
 	l := map[string]string{
 		"dataset":       datasetLabel(dataset),
 		"connections":   strconv.Itoa(connections),
+		"delete_rate":   strconv.FormatFloat(max(deleteRate, 0), 'g', -1, 64),
 		"base_template": baseTemplate,
 	}
 	if placement != "" {
@@ -705,7 +708,7 @@ func runCmd(args []string) (retErr error) {
 		tasksPerImage = fs.Int("tasks-per-image", 1, "eval: replays per image.")
 		rollouts      = fs.Int("rollouts", 2, "steps: environments per image.")
 		steps         = fs.Int("steps", 8, "steps: training steps.")
-		park          = fs.String("park", string(swebench.ParkSuspend), "steps: what happens between steps: suspend, suspend-sync, suspend-async, fork, delete or none.")
+		park          = fs.String("park", string(swebench.ParkSuspend), "steps: what happens between steps. suspend and suspend-sync are durable: the call returns once the snapshot is in object storage. suspend-async is local: the call returns once the snapshot is on the node and the upload goes on in the background. fork replaces each environment per step (through ate-env-api a new environment created from the image; with -access direct a fork of its base) and parks it locally. delete deletes, and the next step creates again. none keeps the fleet running. Through ate-env-api a local suspend needs a server that serves suspend_mode, which the run checks before it starts.")
 		imagesPerStep = fs.Int("images-per-step", 0, "steps: each step takes the next N images (wrapping around the dataset) with fresh environments, retired after the step: the create-and-retire-pools-per-step shape; needs -park delete. 0 keeps one fleet across the steps.")
 		parkEach      = fs.Bool("park-each", false, "steps: park each environment as soon as its step ends instead of after the whole fleet's step, so at most -width are awake at once and the fleet can be larger than the running slots; the barrier then includes the parking.")
 		schedulePath  = fs.String("schedule", "", "steps: path to a pre-resolved schedule.json.")
@@ -719,6 +722,7 @@ func runCmd(args []string) (retErr error) {
 		stepTimeout   = fs.Duration("step-timeout", 10*time.Minute, "Default deadline for a run step without its own timeout.")
 		wakeBudget    = fs.Duration("wake-budget", 3*time.Minute, "How long a task's first command is retried while the environment is still waking or its image is still being baked.")
 		wakeBackoff   = fs.Duration("wake-backoff", swebench.DefaultWakeBackoff, "Initial pause between wake retries; doubles up to five times this.")
+		deleteRate    = fs.Float64("delete-rate", swebench.DefaultDeleteRate, "Most environment deletes per second per loader process, through ate-env-api; the bucket rate-limits snapshot deletes, and a delete it refuses is retried with backoff for up to two minutes. 0 removes the cap. Recorded as the delete_rate label.")
 		runID         = fs.String("run-id", "", "Run id, prefix of every environment name: lowercase letters, digits and '-', at most 20 characters; default swe-<unix time>.")
 		out           = fs.String("out", "", "JSONL events file; default <run-id>.jsonl in the working directory.")
 		eventsDir     = fs.String("events-dir", "", "Optional base directory for per-worker event shards (events/<worker>.jsonl).")
@@ -917,6 +921,7 @@ func runCmd(args []string) (retErr error) {
 			WarmPool:     *warmPool,
 			Connections:  *connections,
 			AuthToken:    authToken,
+			DeleteRate:   *deleteRate,
 			Placement:    placement,
 		})
 		if err != nil {
@@ -1010,7 +1015,7 @@ func runCmd(args []string) (retErr error) {
 		WakeBackoff:   *wakeBackoff,
 		Keep:          *keep,
 		Labels:        labels,
-		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, *placementPath, exclude, ids, effective),
+		Invocation:    ownLabels(*dataset, *connections, *deleteRate, *baseTemplate, *excludeFile, *placementPath, exclude, ids, effective),
 	})
 	endTS := time.Now().UTC()
 	_ = rec.Flush()

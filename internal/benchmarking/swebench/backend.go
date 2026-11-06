@@ -22,12 +22,16 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	env "github.com/agent-substrate/env/clients/go"
+	"github.com/agent-substrate/env/internal/apiservice"
 	"github.com/agent-substrate/env/internal/benchmarking/schema"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
+	"golang.org/x/time/rate"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -55,8 +59,10 @@ type ModeSuspender interface {
 	SuspendWithMode(ctx context.Context, async bool) error
 }
 
-// AsyncSuspender is an optional interface implemented by Sandboxes that support
-// non-blocking asynchronous checkpointing (DURABILITY_MODE_ASYNCHRONOUS).
+// AsyncSuspender is an optional interface implemented by Sandboxes that
+// support a local suspend: the call returns once the snapshot is on the node
+// and the upload goes on in the background (SUSPEND_MODE_LOCAL through
+// ate-env-api, DURABILITY_MODE_ASYNCHRONOUS with direct Substrate access).
 type AsyncSuspender interface {
 	SuspendAsync(ctx context.Context) error
 }
@@ -172,6 +178,7 @@ type EnvBackend struct {
 	atespace         string
 	baseTemplate     string
 	minPoll, maxPoll time.Duration
+	deletes          deleteLimits
 
 	placement *schema.ImagePlacement
 	placeMu   sync.Mutex
@@ -201,16 +208,119 @@ func (b *EnvBackend) selectorFor(image string) map[string]string {
 	return maps.Clone(d.Selector)
 }
 
+// DefaultDeleteRate is the loader's default cap on the environment deletes an
+// ate-env-api backend issues per second, across all its connections. A
+// delete removes the environment's snapshots from the bucket, and the bucket
+// rate-limits deletes: a cleanup of 37,000 environments at about 1,850
+// deletes per second lost 15,031 of them to GCS 429s. 200 per second clears
+// that cleanup in about three minutes, inside the loader's ten-minute cleanup
+// budget, and leaves room under the bucket's limit for Substrate's own
+// snapshot traffic.
+const DefaultDeleteRate = 200
+
+// WithDeleteRate caps the environment deletes the backend issues at perSecond
+// across all its connections, with a burst of one second's worth; 0 removes
+// the cap. See DefaultDeleteRate.
+func WithDeleteRate(perSecond float64) EnvBackendOption {
+	return func(b *EnvBackend) {
+		if perSecond <= 0 {
+			b.deletes.limiter = nil
+			return
+		}
+		b.deletes.limiter = rate.NewLimiter(rate.Limit(perSecond), max(1, int(perSecond)))
+	}
+}
+
+// deleteLimits is how an EnvBackend paces and retries its deletes. The zero
+// value neither paces nor retries.
+type deleteLimits struct {
+	limiter *rate.Limiter // nil: no cap
+	// budget bounds the retries of one delete; minWait is the first pause
+	// between attempts, doubling up to maxWait.
+	budget, minWait, maxWait time.Duration
+}
+
+const (
+	deleteRetryBudget = 2 * time.Minute
+	deleteBackoffMin  = time.Second
+	deleteBackoffMax  = 30 * time.Second
+)
+
+func defaultDeleteLimits() deleteLimits {
+	return deleteLimits{budget: deleteRetryBudget, minWait: deleteBackoffMin, maxWait: deleteBackoffMax}
+}
+
+// do runs one delete under the cap and retries it on the errors a
+// rate-limited bucket surfaces (isRetryableDelete) until the budget or ctx
+// ends. The budget starts with the first attempt, after the cap's queue. A
+// NotFound after a retry is success: an earlier attempt deleted the
+// environment and its answer was lost. A NotFound on the first attempt is
+// returned as it is, so a caller still learns of a name that was never there.
+func (l deleteLimits) do(ctx context.Context, del func(context.Context) error) error {
+	var deadline time.Time
+	wait := l.minWait
+	for attempt := 0; ; attempt++ {
+		if l.limiter != nil {
+			if err := l.limiter.Wait(ctx); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return fmt.Errorf("delete rate cap: %w", err)
+			}
+		}
+		if attempt == 0 {
+			deadline = time.Now().Add(l.budget)
+		}
+		err := del(ctx)
+		if err == nil || (attempt > 0 && isNotFound(err)) {
+			return nil
+		}
+		if l.budget <= 0 || !isRetryableDelete(err) || ctx.Err() != nil || time.Now().Add(wait).After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(wait):
+		}
+		wait = min(wait*2, l.maxWait)
+	}
+}
+
+// isRetryableDelete reports whether a failed delete is worth another try:
+// the codes isTransient retries, ResourceExhausted, and a message that
+// carries the bucket's own rate-limit error under another code. Where each
+// comes from: Substrate's DeleteActor returns the delete workflow's joined
+// errors uncoded, the snapshot release among them, and ate-env-api's
+// toGRPCError maps an uncoded or Unknown error to Internal, which
+// isTransient covers; a coded error ate-env-api passes through unchanged,
+// which is where a ResourceExhausted arrives. The message carries the
+// environment id too, so a bare "429" is not matched: a run id such as
+// swe-1794290000 contains one.
+func isRetryableDelete(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	if st.Code() == codes.ResourceExhausted || isTransient(err) {
+		return true
+	}
+	msg := st.Message()
+	return strings.Contains(msg, "Error 429") || strings.Contains(msg, "rateLimitExceeded")
+}
+
 // NewEnvBackend dials the ate-env API over connections connections (at
 // least one). Environments are created in atespace from baseTemplate with
 // the task image as rootfs; the API derives and bakes one template per
 // distinct image on first use. A non-empty authToken is sent as the bearer
 // token on each call, for an ate-env-api that runs with -auth-token-file.
+// Deletes retry the errors a rate-limited bucket surfaces and, with
+// WithDeleteRate, are capped per second.
 func NewEnvBackend(endpoint, atespace, baseTemplate string, connections int, authToken string, opts ...EnvBackendOption) (*EnvBackend, error) {
 	if connections < 1 {
 		connections = 1
 	}
-	b := &EnvBackend{atespace: atespace, baseTemplate: baseTemplate}
+	b := &EnvBackend{atespace: atespace, baseTemplate: baseTemplate, deletes: defaultDeleteLimits()}
 	for _, opt := range opts {
 		opt(b)
 	}
@@ -241,14 +351,42 @@ func (b *EnvBackend) pick() *env.Client {
 	return b.clients[int(b.next.Add(1)-1)%len(b.clients)]
 }
 
-// Delete implements Backend.
+// Delete implements Backend, under the backend's delete cap and retries.
 func (b *EnvBackend) Delete(ctx context.Context, id string) error {
-	return b.pick().Delete(ctx, b.atespace, id)
+	return b.deletes.do(ctx, func(ctx context.Context) error {
+		return b.pick().Delete(ctx, b.atespace, id)
+	})
 }
 
-// SuspendWithMode suspends the environment with id via the ate-env API.
-func (b *EnvBackend) SuspendWithMode(ctx context.Context, id string, _ bool) error {
+// SuspendWithMode suspends the environment with id via the ate-env API:
+// durably (the call returns once the snapshot is in object storage) or, with
+// async, locally (SuspendLocal: the call returns once the snapshot is on the
+// node and the upload goes on in the background).
+func (b *EnvBackend) SuspendWithMode(ctx context.Context, id string, async bool) error {
+	if async {
+		return b.pick().SuspendLocal(ctx, b.atespace, id)
+	}
 	return b.pick().Suspend(ctx, b.atespace, id)
+}
+
+// CheckSuspendLocal fails when the ate-env-api does not serve the suspend
+// mode SuspendLocal sends (the suspend_mode feature of GetServerInfo), so a
+// run that parks with suspend-async stops before it starts instead of failing
+// every suspend with InvalidArgument.
+func (b *EnvBackend) CheckSuspendLocal(ctx context.Context) error {
+	// The first connection, so the check does not advance the round robin;
+	// every connection names the same endpoint.
+	info, err := b.clients[0].ServerInfo(ctx)
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			return fmt.Errorf("this ate-env-api predates GetServerInfo and cannot suspend locally; use -park suspend: %w", err)
+		}
+		return fmt.Errorf("checking the ate-env-api for suspend modes: %w", err)
+	}
+	if !slices.Contains(info.GetFeatures(), apiservice.FeatureSuspendMode) {
+		return fmt.Errorf("ate-env-api %s %s does not serve %s, which -park suspend-async needs; use -park suspend or upgrade it", info.GetServer(), info.GetVersion(), apiservice.FeatureSuspendMode)
+	}
+	return nil
 }
 
 // Prewarm ensures derived ActorTemplates exist for each image by creating and
@@ -287,7 +425,7 @@ func (b *EnvBackend) CreateWith(ctx context.Context, id, image string, opts Crea
 	if err != nil {
 		return nil, fmt.Errorf("create %s: %w", id, err)
 	}
-	return envSandbox{e: e, minPoll: b.minPoll, maxPoll: b.maxPoll}, nil
+	return envSandbox{e: e, minPoll: b.minPoll, maxPoll: b.maxPoll, deletes: b.deletes}, nil
 }
 
 // Node implements ImageWarmer.
@@ -348,6 +486,7 @@ func imageStateFrom(st *ateenvv1alpha.ImageStatus) ImageState {
 type envSandbox struct {
 	e                *env.Env
 	minPoll, maxPoll time.Duration
+	deletes          deleteLimits
 }
 
 const (
@@ -509,12 +648,21 @@ func (s envSandbox) WriteFile(ctx context.Context, path string, content []byte, 
 	return s.e.WriteFile(ctx, path, bytes.NewReader(content), mode)
 }
 
+// Suspend parks durably: the call returns once the snapshot is in object
+// storage.
 func (s envSandbox) Suspend(ctx context.Context) error { return s.e.Suspend(ctx) }
 
-func (s envSandbox) SuspendAsync(ctx context.Context) error { return s.e.Suspend(ctx) }
+// SuspendAsync parks locally (SuspendLocal): the call returns once the
+// snapshot is on the node, and the upload goes on in the background.
+func (s envSandbox) SuspendAsync(ctx context.Context) error { return s.e.SuspendLocal(ctx) }
 
-func (s envSandbox) SuspendWithMode(ctx context.Context, _ bool) error {
+// SuspendWithMode parks durably, or locally with async; see Suspend and
+// SuspendAsync.
+func (s envSandbox) SuspendWithMode(ctx context.Context, async bool) error {
+	if async {
+		return s.e.SuspendLocal(ctx)
+	}
 	return s.e.Suspend(ctx)
 }
 
-func (s envSandbox) Delete(ctx context.Context) error { return s.e.Delete(ctx) }
+func (s envSandbox) Delete(ctx context.Context) error { return s.deletes.do(ctx, s.e.Delete) }

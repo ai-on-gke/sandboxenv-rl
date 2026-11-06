@@ -80,6 +80,15 @@ user needs to know across them.
 
 ### Fixed
 
+- swebench-loader: `-park suspend-async` suspends locally through ate-env-api
+  (`SuspendLocal`: the call returns once the snapshot is on the node and the
+  upload goes on in the background), as it already did through direct
+  Substrate access. It sent a durable suspend and waited for the upload: p50
+  0.8 s, p95 9 s, max 46.5 s over 180,000 suspends in one run. `-park-each`
+  parks with `suspend-sync` and `suspend-async`, which it silently skipped,
+  and rejects `fork`. A run that parks with `suspend-async` or `fork` (whose
+  park is a local suspend too) checks that ate-env-api serves `suspend_mode`
+  before it starts.
 - ate-env-api port proxy: the path form
   (`/v1alpha/envs/<id>/ports/<port>/...`) forwards the rest of the path
   exactly as sent; it re-escaped `! ' ( ) *` (`/report(1).txt` reached the

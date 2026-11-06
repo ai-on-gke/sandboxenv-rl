@@ -52,12 +52,19 @@ const (
 type Park string
 
 const (
-	ParkNone         Park = "none"          // environments stay running
-	ParkSuspend      Park = "suspend"       // SuspendEnvironment; the next command wakes it
-	ParkSuspendSync  Park = "suspend-sync"  // SuspendEnvironment synchronously at step barrier
-	ParkSuspendAsync Park = "suspend-async" // SuspendEnvironment asynchronously on task completion
-	ParkFork         Park = "fork"          // Fork from golden base snapshot per step
-	ParkDelete       Park = "delete"        // DeleteEnvironment; the next step creates again
+	ParkNone Park = "none" // environments stay running
+	// ParkSuspend is a durable suspend: the call returns once the snapshot
+	// is in object storage. The next command wakes the environment.
+	ParkSuspend Park = "suspend"
+	// ParkSuspendSync is the schedule's name for the same durable suspend.
+	ParkSuspendSync Park = "suspend-sync"
+	// ParkSuspendAsync is a local suspend (the SDK's SuspendLocal): the call
+	// returns once the snapshot is on the node, and the upload goes on in
+	// the background. Until it lands the environment resumes on that node
+	// only.
+	ParkSuspendAsync Park = "suspend-async"
+	ParkFork         Park = "fork"   // Fork from golden base snapshot per step
+	ParkDelete       Park = "delete" // DeleteEnvironment; the next step creates again
 )
 
 // Config is one run. Every field that shapes the load is a parameter so the
@@ -94,7 +101,7 @@ type Config struct {
 	// Width environments are awake at once and the fleet can be larger than
 	// the running slots: the shape of a trainer that releases a sandbox at
 	// the end of its episode. The step barrier then includes the parking and
-	// there is no park event. Requires ParkSuspend or ParkDelete, and not
+	// there is no park event. Requires a suspend park or ParkDelete, and not
 	// ImagesPerStep, which retires its environments anyway.
 	ParkEach bool
 
@@ -292,8 +299,8 @@ func (c *Config) validate() error {
 		if c.ImagesPerStep > len(c.Instances) {
 			return fmt.Errorf("images per step (%d) is more than the %d instances; a window must not repeat an instance within one step", c.ImagesPerStep, len(c.Instances))
 		}
-		if c.ParkEach && c.Park == ParkNone {
-			return errors.New("park each needs park mode suspend or delete")
+		if c.ParkEach && (c.Park == ParkNone || c.Park == ParkFork) {
+			return errors.New("park each needs park mode suspend, suspend-sync, suspend-async or delete")
 		}
 		if c.ParkEach && c.ImagesPerStep > 0 {
 			return errors.New("park each keeps one fleet across the steps; it cannot be combined with images per step")
@@ -438,6 +445,16 @@ func Run(ctx context.Context, cfg Config) (*Summary, error) {
 		return nil, err
 	}
 	cfg.defaults()
+	// ParkSuspendAsync, and the park after a fork, send local suspends, which
+	// need an ate-env-api that serves suspend_mode. Fail once here rather
+	// than on every park.
+	if cfg.Mode == ModeSteps && (cfg.Park == ParkSuspendAsync || cfg.Park == ParkFork) {
+		if eb, ok := cfg.Backend.(*EnvBackend); ok {
+			if err := eb.CheckSuspendLocal(ctx); err != nil {
+				return nil, err
+			}
+		}
+	}
 	r := &runner{cfg: &cfg, rec: cfg.Recorder, log: cfg.Logger}
 
 	if cfg.usesWorkingSet() {
@@ -987,8 +1004,10 @@ func (r *runner) stepParkEach(ctx context.Context, envs []*environment, step int
 			return
 		}
 		switch r.cfg.Park {
-		case ParkSuspend:
-			r.suspend(ctx, e, step)
+		case ParkSuspend, ParkSuspendSync:
+			r.suspendWithMode(ctx, e, step, false)
+		case ParkSuspendAsync:
+			r.suspendWithMode(ctx, e, step, true)
 		case ParkDelete:
 			r.remove(ctx, e, step)
 		}
@@ -1519,10 +1538,6 @@ func isTransient(err error) bool {
 		return true
 	}
 	return false
-}
-
-func (r *runner) suspend(ctx context.Context, e *environment, step int) {
-	r.suspendWithMode(ctx, e, step, false)
 }
 
 func (r *runner) suspendWithMode(ctx context.Context, e *environment, step int, async bool) {

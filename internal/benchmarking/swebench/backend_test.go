@@ -15,6 +15,7 @@
 package swebench
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -67,6 +69,18 @@ type fakeAPI struct {
 	deleted   []string
 	commands  []string
 	suspended []string
+	// suspendModes is the mode of each SuspendEnvironment call, in order.
+	suspendModes []ateenvv1alpha.SuspendMode
+	// features, when set, is what GetServerInfo reports; nil leaves it
+	// Unimplemented, as an ate-env-api that predates the RPC answers.
+	features []string
+}
+
+func (f *fakeAPI) GetServerInfo(context.Context, *ateenvv1alpha.GetServerInfoRequest) (*ateenvv1alpha.GetServerInfoResponse, error) {
+	if f.features == nil {
+		return nil, status.Error(codes.Unimplemented, "unknown method GetServerInfo")
+	}
+	return &ateenvv1alpha.GetServerInfoResponse{Server: "sandboxenv-rl", Version: "test", Features: f.features}, nil
 }
 
 func (f *fakeAPI) CreateEnvironment(_ context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (*ateenvv1alpha.CreateEnvironmentResponse, error) {
@@ -80,6 +94,7 @@ func (f *fakeAPI) SuspendEnvironment(_ context.Context, req *ateenvv1alpha.Suspe
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.suspended = append(f.suspended, req.GetId())
+	f.suspendModes = append(f.suspendModes, req.GetMode())
 	return &ateenvv1alpha.SuspendEnvironmentResponse{}, nil
 }
 
@@ -340,6 +355,45 @@ func TestNewEnvBackendSendsTheAuthToken(t *testing.T) {
 	}
 }
 
+// CheckSuspendLocal passes on a server that lists suspend_mode and fails,
+// naming the feature, on one that does not or that predates GetServerInfo.
+func TestEnvBackendCheckSuspendLocal(t *testing.T) {
+	ctx := context.Background()
+	if err := newFakeBackend(t, &fakeAPI{features: []string{"rootfs_image", "suspend_mode"}}).CheckSuspendLocal(ctx); err != nil {
+		t.Fatalf("server with suspend_mode: %v", err)
+	}
+	err := newFakeBackend(t, &fakeAPI{features: []string{"rootfs_image"}}).CheckSuspendLocal(ctx)
+	if err == nil || !strings.Contains(err.Error(), "suspend_mode") {
+		t.Fatalf("server without suspend_mode: %v, want an error naming the feature", err)
+	}
+	err = newFakeBackend(t, &fakeAPI{}).CheckSuspendLocal(ctx)
+	if status.Code(err) != codes.Unimplemented || !strings.Contains(err.Error(), "-park suspend") {
+		t.Fatalf("server without GetServerInfo: %v, want Unimplemented and the fallback", err)
+	}
+}
+
+// A steps run that parks with suspend-async or fork through an ate-env-api
+// that does not serve suspend_mode fails before it creates anything.
+func TestRunChecksSuspendLocalBeforeStarting(t *testing.T) {
+	for _, park := range []Park{ParkSuspendAsync, ParkFork} {
+		api := &fakeAPI{features: []string{"rootfs_image"}}
+		b := newFakeBackend(t, api)
+		var out bytes.Buffer
+		cfg := baseConfig(t, b, &out)
+		cfg.Mode = ModeSteps
+		cfg.Rollouts = 1
+		cfg.Steps = 2
+		cfg.Park = park
+		_, err := Run(context.Background(), cfg)
+		if err == nil || !strings.Contains(err.Error(), "suspend_mode") {
+			t.Fatalf("%s: Run = %v, want the suspend_mode error", park, err)
+		}
+		if len(api.created) != 0 {
+			t.Fatalf("%s: created %v before the check", park, api.created)
+		}
+	}
+}
+
 func TestEnvBackendSuspendAndPrewarm(t *testing.T) {
 	api := &fakeAPI{}
 	b := newFakeBackend(t, api)
@@ -358,8 +412,26 @@ func TestEnvBackendSuspendAndPrewarm(t *testing.T) {
 	if err := sb.(ModeSuspender).SuspendWithMode(ctx, false); err != nil {
 		t.Fatalf("SuspendWithMode(false): %v", err)
 	}
-	if len(api.suspended) != 3 {
-		t.Fatalf("suspended = %v, want 3 calls", api.suspended)
+	if err := sb.(ModeSuspender).SuspendWithMode(ctx, true); err != nil {
+		t.Fatalf("SuspendWithMode(true): %v", err)
+	}
+	if err := b.SuspendWithMode(ctx, "e1", true); err != nil {
+		t.Fatalf("backend SuspendWithMode(true): %v", err)
+	}
+	if len(api.suspended) != 5 {
+		t.Fatalf("suspended = %v, want 5 calls", api.suspended)
+	}
+	// Suspend and SuspendWithMode(false) send no mode (durable on any
+	// server); SuspendAsync and SuspendWithMode(true) send the local mode.
+	want := []ateenvv1alpha.SuspendMode{
+		ateenvv1alpha.SuspendMode_SUSPEND_MODE_UNSPECIFIED,
+		ateenvv1alpha.SuspendMode_SUSPEND_MODE_LOCAL,
+		ateenvv1alpha.SuspendMode_SUSPEND_MODE_UNSPECIFIED,
+		ateenvv1alpha.SuspendMode_SUSPEND_MODE_LOCAL,
+		ateenvv1alpha.SuspendMode_SUSPEND_MODE_LOCAL,
+	}
+	if !slices.Equal(api.suspendModes, want) {
+		t.Fatalf("suspend modes = %v, want %v", api.suspendModes, want)
 	}
 	if err := b.Prewarm(ctx, []string{"reg/img@" + goodDigest}); err != nil {
 		t.Fatalf("Prewarm: %v", err)

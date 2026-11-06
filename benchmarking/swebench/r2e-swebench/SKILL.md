@@ -280,7 +280,9 @@ Copy [`./REPORT_TEMPLATE.md`](./REPORT_TEMPLATE.md) to `$ARTIFACT_DIR/BENCHMARK_
    idle) to Sections `3.1`–`3.4`; also record headline time attribution across `Go`/`Python`/`ate`
    infra/LLM think/guest workload, workload parameters, and exact `prewarm` and
    `run-r2e-swebench.sh` commands.
-3. **Populate results and findings (`## 3` and `## 4`)**: Fill the multi-arm table (`3.1`) from
+3. **Populate results and findings (`## 3` and `## 4`)**: Fill the strategy multi-arm table and
+   grouped `xychart-beta` time histograms (`3.1`, with Y-axis `Time (ms)` / `Time (s)` and X-axis
+   `Test Strategy / Category` across startup lifecycle, `TTFC`, and shard/arm wall clock) from
    `comparison.json` / `comparison.md`, per-arm `report.json`, and `{r2e,swe}-summary.json` (with
    explicit `ms` vs `s` units, arm + `r2e`/`swe` shard `Wall (s)`, and per-shard `r2e`/`swe` `TTFC`
    [`cmd complete`]), decompose where time is spent by execution layer (`3.2`: first-command `TTFC`,

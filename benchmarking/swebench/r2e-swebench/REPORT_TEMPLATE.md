@@ -104,7 +104,7 @@ version tables from `system_description.json` (`bench measure -k8s`) and the pre
 
 ## 3. Results
 
-### 3.1 Multi-arm comparison
+### 3.1 Strategy multi-arm comparison
 
 Populate from `$ARTIFACT_DIR/comparison.json` / `comparison.md`, per-arm `report.json`, and
 `{r2e,swe}-summary.json`. `Wall (s)` is in **seconds (`s`)**; every latency column is `p50/p95/p99`
@@ -126,6 +126,43 @@ Populate from `$ARTIFACT_DIR/comparison.json` / `comparison.md`, per-arm `report
 | Arm     | Client     | Strategy     |       Active / Pool | Tasks (fail) |   Reward | Wall (`s`: arm [`r2e`/`swe`]) | Tasks/min | Warm hit | Prewarm `Create` (`ms`) | Prewarm `Suspend` (`ms`) | `Handle` claim (`ms`) | `TTFI` — `cmd started` (`p50/p90/p95 ms`) | `TTFC` — `cmd complete` (`ms`) | `TTFC` — `cmd complete` (`p50 ms`: `r2e` / `swe`) |     `Delete` (`ms`) |
 | :------ | :--------- | :----------- | ------------------: | -----------: | -------: | ----------------------------: | --------: | -------: | ----------------------: | -----------------------: | --------------------: | ----------------------------------------: | -----------------------------: | ------------------------------------------------: | ------------------: |
 | `<arm>` | `<client>` | `<strategy>` | `<active> / <pool>` |  `<n> (<f>)` | `<rate>` |     `<sec> (<r2e_s>/<swe_s>)` |   `<tpm>` | `<pct>%` |     `<p50>/<p95>/<p99>` |      `<p50>/<p95>/<p99>` |   `<p50>/<p95>/<p99>` |                       `<p50>/<p90>/<p95>` |            `<p50>/<p95>/<p99>` |                             `<r2e_p50>/<swe_p50>` | `<p50>/<p95>/<p99>` |
+
+Populate the grouped bar histograms below with one `bar [...]` series per arm in table row order
+(for example left-to-right: `none`, `naive`, `sliding`, `pipelined`) and adjust each `y-axis` max to
+fit your run:
+
+```mermaid
+xychart-beta
+  title "Startup & Sandbox Lifecycle by Test Strategy / Category (ms — left-to-right: none, naive, sliding, pipelined)"
+  x-axis "Test Strategy / Category" ["In-Band Claim p50", "Upfront Prewarm p50", "atelet Restore p50", "TTFI cmd started p50", "TTFI cmd started p90", "Delete p50"]
+  y-axis "Time (ms)" 0 --> 300
+  bar [0, 0, 0, 0, 0, 0]
+  bar [0, 0, 0, 0, 0, 0]
+  bar [0, 0, 0, 0, 0, 0]
+  bar [0, 0, 0, 0, 0, 0]
+```
+
+```mermaid
+xychart-beta
+  title "TTFC — 1st Cmd Complete by Test Strategy / Category (ms — left-to-right: none, naive, sliding, pipelined)"
+  x-axis "Test Strategy / Category" ["TTFC r2e p50", "TTFC All p50", "TTFC swe p50", "TTFC All p95"]
+  y-axis "Time (ms)" 0 --> 4500
+  bar [0, 0, 0, 0]
+  bar [0, 0, 0, 0]
+  bar [0, 0, 0, 0]
+  bar [0, 0, 0, 0]
+```
+
+```mermaid
+xychart-beta
+  title "Shard & Arm Wall Clock by Test Strategy / Category (s — left-to-right: none, naive, sliding, pipelined)"
+  x-axis "Test Strategy / Category" ["r2e Shard Wall (s)", "swe Shard / Arm Wall (s)"]
+  y-axis "Time (s)" 0 --> 400
+  bar [0, 0]
+  bar [0, 0]
+  bar [0, 0]
+  bar [0, 0]
+```
 
 ### 3.2 Where time is spent: layer attribution (`Go` vs `Python` vs `ate` infra vs guest workload)
 

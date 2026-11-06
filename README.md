@@ -3,41 +3,88 @@
 > [!WARNING]
 > This is an alpha API and is likely to change until v1.0 is released.
 
-Sandboxed execution environments for reinforcement learning (RL) on
-[Agent Substrate](https://github.com/agent-substrate/substrate). Each rollout, eval task or agent
-episode gets its own isolated, stateful environment: a Substrate actor that runs in gVisor and is
-driven remotely through a gRPC API, a CLI, a Python fleet SDK or MCP.
+## Overview
 
-RL jobs create many environments per step and leave most of them idle while the model generates.
-Substrate fits that shape. A suspended environment lives as a snapshot and holds no worker, and the
-next command resumes it, thus a job can park its environments between steps. Later environments on
-the same image restore a golden snapshot instead of booting. This repo adds the environment API,
-the fleet SDK, the framework integrations and the benchmarks on top.
+`sandboxenv-rl` provides remote, stateful sandboxed execution environments for reinforcement
+learning (RL) trainers, evaluation harnesses, and agent frameworks on
+[Agent Substrate](https://github.com/agent-substrate/substrate). Callers create and drive fleets
+of sandboxes over gRPC, HTTP/MCP, or the Python and Go SDKs with no direct Kubernetes management.
 
-## What changed
+Each environment is an isolated gVisor actor running `ate-env-guest`, which executes commands,
+streams output, and transfers files, and the port proxy on `ate-env-api` reaches any TCP port
+inside the actor through the router. Between steps a caller suspends the environment
+(`SuspendEnvironment`) to a checkpoint snapshot, which frees the worker. The next guest call
+resumes it, and new environments on a derived template restore its golden snapshot from object
+storage (`gs://`) to skip a cold boot.
 
-This repo started in October 2026 as a copy of [agent-substrate/env](https://github.com/agent-substrate/env),
-with its history, its pull requests (recreated here with an `[env#N]` title prefix) and its open
-issues. agent-substrate/env is being repurposed, and the RL work continues here. The components keep
-their ate-env names: the `ate-env`, `ate-env-api` and `ate-env-guest` binaries and images, the
-`ate_env_rl` Python package and the `ateenv.v1alpha` API. The Go module path is still
-`github.com/agent-substrate/env`.
+## Feature tour
 
-The focus moves from a general environment service to RL training and evaluation:
-
-| Area | What it adds |
-|---|---|
-| Fleet SDK | `SandboxFleet` and `AsyncSandboxFleet` in [`clients/python`](clients/python/README.md): acquire sandboxes for tasks by image, run tasks with the `naive`, `sliding` or `pipelined` strategy, pre-warm images, release and recycle. |
-| Any task image | `rootfs_image` runs a digest-pinned image unmodified: `ate-env-api` derives an ActorTemplate per image and mounts the guest into it as an image volume. Runtime layers and sidecars add a second runtime to any image ([docs/rootfs-images](docs/rootfs-images/README.md)). |
-| Daemons inside an environment | A port proxy on `ate-env-api` reaches any port in an environment by header or by path, WebSockets included ([details](#reaching-a-service-inside-an-environment)). |
-| Framework integrations | A [NeMo Gym](integrations/nemo-gym/README.md) sandbox provider, a [uni-agent](integrations/uni-agent/README.md) sandbox provider with an R2E-Gym task graded by hidden tests in the same environment, an [OpenHands](integrations/openhands/README.md) workspace, a [Harbor](integrations/harbor/README.md) environment provider and a [GRPO](examples/grpo/README.md) training loop on TRL. |
-| Benchmarks | A [SWE-bench Verified loader](benchmarking/swebench/README.md) that drives real task images the way an RL job does, and the [design](internal/benchmarking/DESIGN.md) of the benchmark system. |
-| Platform | Built against Substrate `475f49b0` (`ate.dev/v1` CRDs and `substrate.ateapi.v1.Control`): the WorkerPool chooses the sandbox, each template selects its pool by label, suspends are durable, and `ate-env-api` runs as its own identity under Substrate authorization. The guest runs as a PID 1 init that reaps orphans, and it allocates PTYs. The cluster must run Substrate at or after `48f5744c` (`ate.dev/v1` CRDs and `/substrate.ateapi.v1.Control` gRPC paths). `ate-env-api` reaches actors through the router's TLS listeners with its pod identity certificate (`ate-env manifest --api-router-tls`, on by default), so the install must list `spiffe://cluster.local/ns/ate-env/sa/ate-env-api` in the router's ingress allow-list. |
+- **Fleet SDK** ([clients/python](./clients/python/README.md)): `SandboxFleet` and
+  `AsyncSandboxFleet` orchestrate batches across warm pools using `LookaheadWarmer`, step
+  strategies (`none`, `naive`, `sliding`, `pipelined`), and per-image worker scheduling via
+  `FleetConfig.placement` and `node_selector`.
+- **Any task image** ([docs/rootfs-images](./docs/rootfs-images/README.md)): Passing a
+  digest-pinned `rootfs_image` causes `ate-env-api` to derive an `ActorTemplate` from the
+  request's template (`default-template` by default), mount `ate-env-guest` as an image volume, and
+  cache one golden snapshot per derived template while leaving the container image unmodified.
+- **Suspend modes and parking** ([docs/architecture.md](./docs/architecture.md)):
+  `SuspendEnvironment` supports `SUSPEND_MODE_DURABLE` (waiting for object storage via
+  `DURABILITY_MODE_SYNCHRONOUS`) and `SUSPEND_MODE_LOCAL` (`SuspendLocal` in Go, returning once
+  checkpointed on the node while uploading in the background) so jobs park sandboxes between
+  steps.
+- **Daemons inside an environment**
+  ([port proxy and MCP](#reaching-a-service-inside-an-environment)): `ate-env-api` exposes an
+  HTTP/WebSocket port proxy (by header or URL path) and a streamable HTTP MCP server for reaching
+  services and tool servers running inside an actor.
+- **Runtime layers and sidecars**
+  ([docs/rootfs-images/RUNTIMES.md](./docs/rootfs-images/RUNTIMES.md)): Template authors inject
+  secondary toolchains or language runtimes into any base image with `--layer`, or run companion
+  daemons inside the same actor with `--sidecar` and `--sidecar-readyz`.
+- **Framework integrations** ([integrations](./integrations/README.md)): Drop-in providers integrate
+  with [NeMo Gym](./integrations/nemo-gym/README.md),
+  [uni-agent](./integrations/uni-agent/README.md),
+  [OpenHands](./integrations/openhands/README.md), and
+  [Harbor](./integrations/harbor/README.md) with no changes to those frameworks.
+- **Benchmarking and placement** ([benchmarking/swebench](./benchmarking/swebench/README.md),
+  [bench harness](./cmd/benchmarking/bench/README.md)): `swebench-loader` runs SWE-bench Verified
+  images in `eval` and `steps` modes, `plan-placement` maps task images to placement domains under
+  node cache budgets, and the `bench` harness measures lifecycle phases.
 
 ## Architecture
 
 See [docs/architecture.md](./docs/architecture.md) for the full system design and
 [docs/glossary.md](./docs/glossary.md) for terminology.
+
+System overview:
+
+```
+╭─────────────────────────╮
+│ Trainer / Eval / Agent  │   ╭──────────────────────╮
+│ · NeMo Gym · uni-agent  ├──▶│ Clients & Fleet SDK  │
+│ · OpenHands · Harbor    │   │  SandboxFleet / Go   │
+╰─────────────────────────╯   │  LookaheadWarmer     │   gRPC / MCP
+                              │  ate-env CLI         ├────────┐
+╭─────────────────────────╮   ╰──────────────────────╯        │
+│ Benchmarks              │                                   ▼
+│ · swebench-loader &     ├─────────────────────────▶ ╭─────────────────────────╮
+│   plan-placement        │                           │ ate-env-api             │
+│ · bench harness         │                           │ · lifecycle & guest RPC │
+╰─────────────────────────╯                           │ · port proxy & MCP      │
+                                                      │ · derived templates     │
+╭─────────────────────────╮   ╭──────────────────╮    ╰───────┬─────────┬───────╯
+│ Snapshot Store (gs://)  │◀──┤ ateapi           │◀───────────┘         │
+│ · golden snapshots      │   │ control plane    │                      │ mTLS
+│ · actor checkpoints     │   ╰────────┬─────────╯                      ▼
+╰────────────▲────────────╯            │                      ╭──────────────────╮
+             │                         ▼                      │ atenet router    │
+             │                ╭──────────────────╮            ╰─────────┬────────╯
+             └────────────────┤ WorkerPools      │◀─────────────────────┘
+                              │  gVisor actors   │
+                              │  └ ate-env-guest │
+                              ╰──────────────────╯
+```
+
+Request-path zoom:
 
 ```
  ╭──────────────╮    ╭──────────────╮ lifecycle  ╭────────────╮
@@ -52,7 +99,7 @@ See [docs/architecture.md](./docs/architecture.md) for the full system design an
 
 | Path | What it is |
 |---|---|
-| [`cmd/ate-env`](./cmd/ate-env) | CLI: create, suspend and delete environments, run commands, move files, and print the Kubernetes and Substrate manifests. |
+| [`cmd/ate-env`](./cmd/ate-env) | CLI: create, get, suspend and delete environments, run commands, move files, and print the Kubernetes and Substrate manifests. |
 | [`cmd/ate-env-api`](./cmd/ate-env-api) | The API service: environment lifecycle, guest calls, MCP and the port proxy. |
 | [`cmd/ate-env-guest`](./cmd/ate-env-guest), [`guest/`](./guest) | The daemon inside each environment (a PID 1 init with sidecar supervision) and its services: `guest/process` and `guest/filesystem`. |
 | [`cmd/benchmarking`](./cmd/benchmarking) | The benchmark binaries: `swebench-loader` and the `bench` harness. |
@@ -128,8 +175,9 @@ supported means for each path.
 
 You need a cluster with Agent Substrate at or after
 [`48f5744c`](https://github.com/agent-substrate/substrate/commit/48f5744c), a snapshots bucket,
-`kubectl` with `kubectl-ate`, Go, [ko](https://ko.build), and Python 3.10 or later for the SDK. This
-repo publishes no release binaries or images yet, thus build them:
+`kubectl` with `kubectl-ate`, Go, [ko](https://ko.build), and Python 3.10 or later for the SDK. No
+release has been published yet; see [docs/release.md](./docs/release.md) for the release process.
+Build the CLI and images from source:
 
 ```bash
 git clone https://github.com/ai-on-gke/sandboxenv-rl && cd sandboxenv-rl
@@ -437,7 +485,7 @@ ate-env create dev1
 
 # Or run any digest-pinned image unmodified. ate-env-api derives a template
 # from default-template on first use (guest mounted in as an image volume)
-# and reuses it for later environments on the same image.
+# and reuses it for later environments on an image with the same digest.
 ate-env create py1 --rootfs-image docker.io/library/python@sha256:<digest>
 
 # Or from the layered template above: the second runtime answers inside the
@@ -510,6 +558,7 @@ Available Commands:
   completion  Generate the autocompletion script for the specified shell
   create      Create and start an environment
   delete      Delete an environment
+  get         Show an environment: template, status, node and worker selector
   help        Help about any command
   manifest    Generate Kubernetes manifests to deploy the system
   server-info Show the ate-env-api server's version and features
@@ -827,6 +876,8 @@ make ci
 make ci-go
 make ci-python
 make ci-openhands
+make ci-harbor
+make ci-dafny
 make ci-e2e
 
 # Run Go and Python test suites with coverage and generate reports (see docs/chores/coverage.md)
@@ -941,3 +992,11 @@ kubectl ate delete actor-template -a ate-env default-template
 kubectl ate delete access-policy -a ate-env
 kubectl ate delete atespace ate-env
 ```
+
+## Origin
+
+This repository started in October 2026 from
+[agent-substrate/env](https://github.com/agent-substrate/env) with its git history, its pull
+requests (recreated here with an `[env#N]` title prefix) and its open issues. The components keep
+the `ate-env`, `ate-env-api`, and `ate-env-guest` names, the `ate_env_rl` Python package, the
+`ateenv.v1alpha` API, and the `github.com/agent-substrate/env` Go module path.

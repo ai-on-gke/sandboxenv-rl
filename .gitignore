@@ -5,6 +5,7 @@ coverage/
 .coverage.*
 !.coveragerc
 .hypothesis/
+testdata/rapid/
 result
 result*
 node_modules/

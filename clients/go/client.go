@@ -317,7 +317,10 @@ func (c *Client) ListPlacementDomains(ctx context.Context, req *ateenvv1alpha.Li
 	if req == nil {
 		req = &ateenvv1alpha.ListPlacementDomainsRequest{}
 	}
-	ctx, span := c.tracer.startRPC(ctx, opListPlacementDomains, "ListPlacementDomains")
+	ctx, span := c.tracer.startRPC(ctx, opListPlacementDomains, "ListPlacementDomains",
+		AttrTemplateName.String(req.GetTemplate().GetName()),
+		AttrTemplateAtespace.String(req.GetTemplate().GetAtespace()),
+		AttrAtespace.String(req.GetAtespace()))
 	defer func() { endSpan(span, err) }()
 	resp, err := c.grpc.ListPlacementDomains(c.withAuth(ctx), req)
 	if err != nil {

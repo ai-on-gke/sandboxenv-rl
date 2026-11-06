@@ -499,7 +499,13 @@ class Client:
             template = env_pb2.Template(name=template_name or "", atespace=template_atespace or "")
         req = env_pb2.ListPlacementDomainsRequest(template=template, atespace=atespace or "")
         with self._rpc_span(
-            "list_placement_domains", "ListPlacementDomains", lambda: {}
+            "list_placement_domains",
+            "ListPlacementDomains",
+            lambda: {
+                "ate.template.name": template_name,
+                "ate.template.atespace": template_atespace,
+                "ate.atespace": atespace,
+            },
         ):
             try:
                 resp = await self._environments.ListPlacementDomains(
@@ -534,8 +540,10 @@ class Client:
         probe as it settles. ``nodes`` 0 counts the nodes of the workers the
         selector matches, which takes the global viewer role; pass it
         otherwise. The server's defaults apply to the zero knobs: 2 probes
-        per node, 3 rounds, a 10 minute probe timeout, run id ``warm``. Wait
-        for the golden (``image_status``) first when the run relies on it.
+        per node, 3 rounds, a 10 minute probe timeout, a run id of ``warm``
+        and a random suffix (unique per call, so two calls never name a probe
+        alike). Wait for the golden (``image_status``) first when the run
+        relies on it.
         The call lasts for the rounds: minutes for a cold image.
         """
         template = None

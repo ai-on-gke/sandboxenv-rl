@@ -117,12 +117,21 @@ ate-env manifest template --template oh-agent-server \
   --layer          oh=<registry>/oh-agent-server-layer@sha256:<digest>=/opt/oh \
   --sidecar        '/opt/oh/python/bin/python3 -m openhands.agent_server --host 0.0.0.0 --port 8000' \
   --sidecar-readyz http://127.0.0.1:8000/health \
-  --env            OH_SESSION_API_KEYS_0=<key> \
+  --sidecar-env    OH_SESSION_API_KEYS_0=<key> \
   --snapshots-bucket <object-storage-url> | kubectl-ate create actor-template -f -
 ```
 
+`--sidecar-env` gives the session key to the agent-server only. The template carries it as
+`ATE_SIDECAR_ENV_OH_SESSION_API_KEYS_0`; the guest removes it from its own environment at start and
+adds it, as `OH_SESSION_API_KEYS_0`, to the sidecar's environment only. Thus the commands that
+ate-env-api starts in the environment (`ate-env exec`, the clients, the fleet's `handle.exec`, the
+R2E-Gym adapter) and their children do not inherit it. It needs a `--guest-image` built with
+`--sidecar-env` support: an older guest does not give the key to the agent-server, which then does
+not start. A command that runs as the same user can still read the key from the agent-server's
+`/proc/<pid>/environ` (see Limits).
+
 This is the counterpart of agent-sandbox's SandboxTemplate and warm pool. Further agent-server
-settings are more `--env` flags. The first environment created from an image derives a template
+settings are more `--env` flags; each command in the environment sees those. The first environment created from an image derives a template
 for it (layer, sidecar and settings included); later ones reuse it.
 
 The base template runs in a glibc image of its own (`--rootfs-image`), because its golden actor
@@ -135,7 +144,14 @@ and the sidecar stay. A base registered earlier without `--rootfs-image` keeps a
 actor: delete it and register it again with the same session key. Its `<base>-<12 hex digits>`
 templates can stay, because a template derived from the new base is identical to one derived from
 the old base. Delete them only to make Substrate bake their golden snapshots again, or when the
-session key changes, because each derived template copies the key. The cluster runs under
+session key changes, because each derived template copies the key.
+
+A base template registered before `--sidecar-env` has the key in `--env`, thus each command in its
+environments, and in the environments of each template derived from it, gets the key. Register it
+again: delete the base and each `<base>-<12 hex digits>` template, then register the base with
+`--sidecar-env` as above. The derived templates must go too, because they copy the key in `--env`
+and creates reuse them by name. `examples/openhands/demo.sh` prints a note for such a base, and
+`RECREATE=1` does both steps. The cluster runs under
 [Verified](#verified) came before this base image and do not test it.
 
 ## 4. Use `AteEnvWorkspace`
@@ -486,13 +502,19 @@ to this package. They do not test those changes.
   actor, and it costs a worker. Close the conversation before `pause()` (see `pause()` above).
 
 - One API key per template, and in practice one per atespace: the key is in the template's container
-  environment. Each viewer of the atespace can read it with `GetActorTemplate`, and each template
+  environment, under `ATE_SIDECAR_ENV_`. Each viewer of the atespace can read it with `GetActorTemplate`, and each template
   derived per task image copies it. Substrate's `EnvVar` has a name and a value only: logs redact
   the value, reads do not, and a template cannot refer to a secret. Use a dedicated atespace for
   these environments, and add it to `ate-env manifest --port-proxy-atespaces` (for example
   `--port-proxy-atespaces=ate-env,oh-envs`): the port proxy forwards only to the atespaces listed
   there, default `ate-env`, and answers 403 for the others. Refer to the OpenHands agent-server in the
   [threat model](../../docs/security/threat-model.md#the-openhands-agent-server).
+- The commands that ate-env-api starts do not inherit the key, and the agent-server removes it from
+  the commands that it starts. But all of them run in the same container as the agent-server, and
+  as the same user: the guest starts the agent-server and the commands as the container's user.
+  Such a command can read the key from
+  `/proc/<pid>/environ` of the agent-server or of the guest, which keeps the environment it was
+  started with. Treat the key as readable by code in the environment.
 - The agent-server runs as the image's user and keeps its state under that user's home. The first
   environment on a node pulls the layer.
 - A daemon reached through ate-env-api must listen on all interfaces, not 127.0.0.1: the router

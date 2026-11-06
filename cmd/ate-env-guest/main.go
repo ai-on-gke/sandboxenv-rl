@@ -16,7 +16,8 @@
 // and exposes command execution and filesystem access over gRPC
 // (ProcessService and FileSystemService) with HTTP readiness probe support.
 // It can also start and supervise extra runtimes next to itself (-sidecar),
-// folding their readiness into /readyz (-sidecar-readyz).
+// folding their readiness into /readyz (-sidecar-readyz). Container variables
+// named with the sidecarenv.Prefix go only to those runtimes.
 package main
 
 import (
@@ -35,6 +36,7 @@ import (
 	"time"
 
 	"github.com/agent-substrate/env/guest"
+	"github.com/agent-substrate/env/internal/sidecarenv"
 	"github.com/agent-substrate/env/internal/telemetry"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
@@ -42,6 +44,10 @@ import (
 
 func main() {
 	runIfPID1()
+	// Take the sidecar-only variables out of this process's environment
+	// before anything is started, thus the commands of the process service
+	// and their children never inherit them. Only the sidecars get them.
+	sidecarEnv := sidecarenv.Take()
 
 	listen := flag.String("listen", ":80", "address to serve the guest API on")
 	logDir := flag.String("log-dir", "", "directory for process logs (defaults to /var/log/ate-jobs or temporary dir)")
@@ -137,7 +143,7 @@ func main() {
 		supervisors.Add(1)
 		go func() {
 			defer supervisors.Done()
-			runSidecar(ctx, argv, log.Printf)
+			runSidecar(ctx, argv, sidecarEnv, log.Printf)
 		}()
 	}
 

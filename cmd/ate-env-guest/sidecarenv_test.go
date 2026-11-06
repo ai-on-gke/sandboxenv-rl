@@ -1,0 +1,203 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/agent-substrate/env/internal/sidecarenv"
+	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+// runMainEnv makes the test binary run the guest's main instead of the tests,
+// thus a test can start the real guest as a child process with an
+// environment of its own.
+const runMainEnv = "ATE_ENV_GUEST_TEST_RUN_MAIN"
+
+func TestMain(m *testing.M) {
+	if os.Getenv(runMainEnv) == "1" {
+		os.Unsetenv(runMainEnv)
+		main()
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
+var listeningOn = regexp.MustCompile(`ate-env-guest listening on (\S+)`)
+
+// The guest gives a sidecar-only variable to its sidecars, and not to the
+// commands it starts for the process service or to their children, with or
+// without request env. A plain container variable reaches both, which shows
+// that the commands do inherit the guest's environment.
+func TestSidecarEnvReachesOnlySidecars(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("no /bin/sh on this host")
+	}
+	const secret = "s3cret-sidecar-only"
+	dir := t.TempDir()
+	sidecarOut := filepath.Join(dir, "sidecar.env")
+	script := filepath.Join(dir, "sidecar.sh")
+	if err := os.WriteFile(script, []byte("env > "+sidecarOut+".tmp && mv "+sidecarOut+".tmp "+sidecarOut+"\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-listen=127.0.0.1:0", "-log-dir="+dir, "-workspace="+dir, "-sidecar=/bin/sh "+script)
+	cmd.Env = append(os.Environ(),
+		runMainEnv+"=1",
+		"PLAIN_VAR=visible",
+		sidecarenv.Prefix+"OH_SESSION_API_KEYS_0="+secret,
+	)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		done := make(chan struct{})
+		go func() { _ = cmd.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			_ = cmd.Process.Kill()
+		}
+	})
+	addrCh := make(chan string, 1)
+	go func() {
+		sc := bufio.NewScanner(stderr)
+		for sc.Scan() {
+			if m := listeningOn.FindStringSubmatch(sc.Text()); m != nil {
+				addrCh <- m[1]
+			}
+		}
+	}()
+	var addr string
+	select {
+	case addr = <-addrCh:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the guest did not report its listen address")
+	}
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	client := ateenvv1alpha.NewProcessServiceClient(conn)
+
+	for _, reqEnv := range []map[string]string{nil, {"REQ_VAR": "1"}} {
+		out := runInGuest(t, client, reqEnv, "echo SELF; env; echo CHILD; /bin/sh -c env")
+		if strings.Contains(out, secret) || strings.Contains(out, "OH_SESSION_API_KEYS_0") || strings.Contains(out, sidecarenv.Prefix) {
+			t.Errorf("request env %v: an exec'd command or its child sees the sidecar-only variable:\n%s", reqEnv, out)
+		}
+		if strings.Count(out, "PLAIN_VAR=visible") != 2 {
+			t.Errorf("request env %v: want PLAIN_VAR in the command's and its child's environment:\n%s", reqEnv, out)
+		}
+	}
+
+	var sidecar []byte
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if sidecar, err = os.ReadFile(sidecarOut); err == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("the sidecar did not write its environment: %v", err)
+	}
+	lines := strings.Split(string(sidecar), "\n")
+	has := func(kv string) bool {
+		for _, l := range lines {
+			if l == kv {
+				return true
+			}
+		}
+		return false
+	}
+	if !has("OH_SESSION_API_KEYS_0=" + secret) {
+		t.Errorf("the sidecar's environment lacks OH_SESSION_API_KEYS_0:\n%s", sidecar)
+	}
+	if !has("PLAIN_VAR=visible") {
+		t.Errorf("the sidecar's environment lacks the guest's plain variable:\n%s", sidecar)
+	}
+	if strings.Contains(string(sidecar), sidecarenv.Prefix) {
+		t.Errorf("the sidecar's environment has the prefixed variable:\n%s", sidecar)
+	}
+
+	// What remains, as docs/security/threat-model.md says: the environment
+	// that a process was started with stays in /proc/<pid>/environ. The
+	// guest removes the variable from the environment it gives to commands,
+	// not from that memory, and a sidecar gets it through its environment.
+	if runtime.GOOS == "linux" {
+		environ, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", cmd.Process.Pid))
+		if err != nil {
+			t.Fatalf("reading the guest's /proc environ: %v", err)
+		}
+		if !strings.Contains(string(environ), sidecarenv.Prefix+"OH_SESSION_API_KEYS_0="+secret) {
+			t.Errorf("the guest's /proc/<pid>/environ no longer has the variable; update the threat model")
+		}
+	}
+}
+
+// runInGuest runs script with /bin/sh through the guest's process service and
+// returns its stdout.
+func runInGuest(t *testing.T, client ateenvv1alpha.ProcessServiceClient, env map[string]string, script string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	p, err := client.StartProcess(ctx, &ateenvv1alpha.StartProcessRequest{Command: []string{"/bin/sh", "-c", script}, Env: env})
+	if err != nil {
+		t.Fatalf("StartProcess: %v", err)
+	}
+	stream, err := client.StreamProcessOutput(ctx, &ateenvv1alpha.StreamProcessOutputRequest{ProcessId: p.GetProcessId(), Follow: true})
+	if err != nil {
+		t.Fatalf("StreamProcessOutput: %v", err)
+	}
+	var out strings.Builder
+	for {
+		msg, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("StreamProcessOutput: %v", err)
+		}
+		out.Write(msg.GetStdout())
+		if e := msg.GetExit(); e != nil {
+			if e.GetExitCode() != 0 {
+				t.Fatalf("command exited %d:\n%s", e.GetExitCode(), out.String())
+			}
+			break
+		}
+	}
+	return out.String()
+}

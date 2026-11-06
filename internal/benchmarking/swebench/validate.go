@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
 
 	"github.com/agent-substrate/env/internal/benchmarking/schema"
@@ -279,10 +280,16 @@ func Validate(rep *Report, opts ValidateOptions) schema.ReportValidity {
 	// the node cache delta.
 	switch opts.Footing {
 	case "warm":
-		if coverage != nil && !coverage.Complete {
-			reasons = append(reasons, "rule 1 (footing=warm): the pre-flight is incomplete: "+preflightShortfall(coverage))
-		}
-		if prewarmCount == 0 && (coverage == nil || !coverage.Complete) {
+		if coverage != nil {
+			if !coverage.Complete {
+				reasons = append(reasons, "rule 1 (footing=warm): the pre-flight is incomplete: "+preflightShortfall(coverage))
+			}
+			// A pre-flight over a subset (-images, -domains) is complete for
+			// what it ran; the run's images must all be in it.
+			if missing := preflightMissingImages(coverage, rep.DistinctImages); len(missing) > 0 {
+				reasons = append(reasons, fmt.Sprintf("rule 1 (footing=warm): the pre-flight did not cover %d of the run's %d images (first: %s)", len(missing), len(rep.DistinctImages), missing[0]))
+			}
+		} else if prewarmCount == 0 {
 			reasons = append(reasons, "rule 1 (footing=warm): expected prewarm events, found 0")
 		}
 		if hasCacheDelta && hitsDelta <= 0 {
@@ -296,7 +303,11 @@ func Validate(rep *Report, opts ValidateOptions) schema.ReportValidity {
 			reasons = append(reasons, fmt.Sprintf("rule 1 (footing=cold): expected 0 prewarm events, found %d", prewarmCount))
 		}
 		if coverage != nil {
-			reasons = append(reasons, "rule 1 (footing=cold): a pre-flight ran before the run ("+opts.PreflightCoveragePath+")")
+			source := opts.PreflightCoveragePath
+			if source == "" {
+				source = "run " + coverage.RunID
+			}
+			reasons = append(reasons, "rule 1 (footing=cold): a pre-flight ran before the run ("+source+")")
 		}
 		if hasCacheDelta && hitsDelta > 0 {
 			reasons = append(reasons, fmt.Sprintf("rule 1 (footing=cold): expected 0 node cache hit delta on cold footing, got hits_delta=%d", hitsDelta))
@@ -506,4 +517,27 @@ func ValidateReportOrEvents(reportPath, eventsPath, schedulePath string, opts Va
 	}
 	v := Validate(rep, opts)
 	return rep, v, nil
+}
+
+// preflightMissingImages lists the run's images that no domain of the
+// pre-flight covered completely, sorted. An image the plan left unplaced is
+// not in the coverage either: it boots cold by design, and warm footing does
+// not hold for it.
+func preflightMissingImages(c *schema.PreflightCoverage, images []string) []string {
+	covered := map[string]bool{}
+	for _, d := range c.Domains {
+		for _, ic := range d.Images {
+			if ic.Complete {
+				covered[ic.Image] = true
+			}
+		}
+	}
+	var missing []string
+	for _, img := range images {
+		if !covered[img] {
+			missing = append(missing, img)
+		}
+	}
+	sort.Strings(missing)
+	return missing
 }

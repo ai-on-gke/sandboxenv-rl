@@ -547,6 +547,7 @@ func TestCompareThresholdsPassAndFail(t *testing.T) {
 func TestValidateRule1ReadsThePreflightCoverage(t *testing.T) {
 	now := time.Now()
 	complete := &schema.PreflightCoverage{SchemaVersion: schema.SchemaVersion, RunID: "pf", StartedAt: now, FinishedAt: now, Complete: true,
+		Goldens: []schema.GoldenRecord{{Image: "img", State: "ready"}},
 		Domains: []schema.DomainCoverage{{Name: "d0", Nodes: 1, NodesSeen: []string{"n0"}, Complete: true,
 			Images: []schema.ImageCoverage{{Image: "img", Nodes: []string{"n0"}, Wanted: 1, Probes: 1, Complete: true}}}}}
 	incomplete := &schema.PreflightCoverage{SchemaVersion: schema.SchemaVersion, RunID: "pf", StartedAt: now, FinishedAt: now, Complete: false,
@@ -561,20 +562,34 @@ func TestValidateRule1ReadsThePreflightCoverage(t *testing.T) {
 		}
 		return false
 	}
+	if err := complete.Validate(); err != nil {
+		t.Fatalf("complete fixture: %v", err)
+	}
 	// A complete pre-flight stands in for prewarm events on warm footing.
-	v := Validate(&Report{}, ValidateOptions{Footing: "warm", PreflightCoverage: complete})
-	if has(v, "expected prewarm events") || has(v, "pre-flight is incomplete") {
+	v := Validate(&Report{DistinctImages: []string{"img"}}, ValidateOptions{Footing: "warm", PreflightCoverage: complete})
+	if has(v, "expected prewarm events") || has(v, "pre-flight is incomplete") || has(v, "did not cover") {
 		t.Errorf("warm + complete pre-flight: %v", v.Reasons)
 	}
-	// An incomplete one fails warm footing and names the shortfall.
-	v = Validate(&Report{PrewarmCount: 3}, ValidateOptions{Footing: "warm", PreflightCoverage: incomplete})
-	if !has(v, "pre-flight is incomplete") || !has(v, "1 goldens not ready") || !has(v, "1 (image, domain) pairs short") {
+	// A pre-flight over a subset is complete for what it ran; the run's other
+	// images are not covered.
+	v = Validate(&Report{DistinctImages: []string{"img", "other"}}, ValidateOptions{Footing: "warm", PreflightCoverage: complete})
+	if !has(v, "did not cover 1 of the run's 2 images (first: other)") {
+		t.Errorf("warm + partial pre-flight: %v", v.Reasons)
+	}
+	// An incomplete one fails warm footing and names the shortfall, once:
+	// no prewarm-event reason doubles it when there are none.
+	v = Validate(&Report{PrewarmCount: 0, DistinctImages: []string{"img"}}, ValidateOptions{Footing: "warm", PreflightCoverage: incomplete})
+	if !has(v, "pre-flight is incomplete") || !has(v, "1 goldens not ready") || !has(v, "1 (image, domain) pairs short") || has(v, "expected prewarm events") {
 		t.Errorf("warm + incomplete pre-flight: %v", v.Reasons)
 	}
-	// Any pre-flight contradicts cold footing.
+	// Any pre-flight contradicts cold footing; without a path the run id names it.
 	v = Validate(&Report{}, ValidateOptions{Footing: "cold", PreflightCoverage: complete, PreflightCoveragePath: "cov.json"})
-	if !has(v, "a pre-flight ran before the run") {
+	if !has(v, "a pre-flight ran before the run (cov.json)") {
 		t.Errorf("cold + pre-flight: %v", v.Reasons)
+	}
+	v = Validate(&Report{}, ValidateOptions{Footing: "cold", PreflightCoverage: complete})
+	if !has(v, "a pre-flight ran before the run (run pf)") {
+		t.Errorf("cold + pre-flight without a path: %v", v.Reasons)
 	}
 	// A missing file is a rule 1 reason, not a crash.
 	v = Validate(&Report{}, ValidateOptions{Footing: "warm", PreflightCoveragePath: filepath.Join(t.TempDir(), "none.json")})

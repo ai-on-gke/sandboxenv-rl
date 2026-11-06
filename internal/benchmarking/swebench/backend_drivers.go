@@ -84,14 +84,27 @@ func ValidateBackendDriverFlags(backend, access string) error {
 	}
 }
 
+// ValidatePlacementDriver refuses a placement plan on any driver but the
+// ate-env API over Substrate: only that one sends a per-environment worker
+// selector. Backend and access default to that driver when empty.
+func ValidatePlacementDriver(backend, access string, hasPlacement bool) error {
+	if !hasPlacement {
+		return nil
+	}
+	if (backend != "" && backend != "substrate") || (access != "" && access != "ate-env-api") {
+		return fmt.Errorf("a placement plan needs the ate-env API backend (-backend substrate -access ate-env-api); %s/%s cannot place environments", backend, access)
+	}
+	return nil
+}
+
 // NewBackendDriver constructs the requested Backend implementation and an
 // io.Closer for releasing its underlying connections.
 func NewBackendDriver(opts BackendDriverOptions) (Backend, io.Closer, error) {
 	if err := ValidateBackendDriverFlags(opts.Backend, opts.Access); err != nil {
 		return nil, nil, err
 	}
-	if opts.Placement != nil && (opts.Backend == "agent-sandbox" || opts.Access == "direct") {
-		return nil, nil, fmt.Errorf("a placement plan needs the ate-env API backend (-backend substrate -access ate-env-api); %s/%s cannot place environments", opts.Backend, opts.Access)
+	if err := ValidatePlacementDriver(opts.Backend, opts.Access, opts.Placement != nil); err != nil {
+		return nil, nil, err
 	}
 	switch opts.Backend {
 	case "agent-sandbox":

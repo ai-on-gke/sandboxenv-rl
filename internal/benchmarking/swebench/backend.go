@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"sync/atomic"
 	"time"
 
@@ -196,7 +197,8 @@ func (b *EnvBackend) selectorFor(image string) map[string]string {
 	if d == nil {
 		return nil
 	}
-	return d.Selector
+	// A copy: the request keeps it, and the plan's map is shared by every create.
+	return maps.Clone(d.Selector)
 }
 
 // NewEnvBackend dials the ate-env API over connections connections (at

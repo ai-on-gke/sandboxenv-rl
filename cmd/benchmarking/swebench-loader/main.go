@@ -219,11 +219,14 @@ func datasetLabel(dataset string) string {
 // is a var's effective value under set.KEY. The exclude file and the
 // instance list are named by their file name or count plus a digest of their
 // ids, so two lists of one length differ.
-func ownLabels(dataset string, connections int, baseTemplate, excludeFile string, exclude, instances []string, vars map[string]string) map[string]string {
+func ownLabels(dataset string, connections int, baseTemplate, excludeFile, placement string, exclude, instances []string, vars map[string]string) map[string]string {
 	l := map[string]string{
 		"dataset":       datasetLabel(dataset),
 		"connections":   strconv.Itoa(connections),
 		"base_template": baseTemplate,
+	}
+	if placement != "" {
+		l["placement"] = filepath.Base(placement)
 	}
 	for k, v := range vars {
 		l["set."+k] = v
@@ -235,6 +238,29 @@ func ownLabels(dataset string, connections int, baseTemplate, excludeFile string
 		l["instances"] = strconv.Itoa(len(instances)) + "@" + idsDigest(instances)
 	}
 	return l
+}
+
+// placementMissing lists the selected images the plan neither places nor
+// lists as unplaced, sorted: a run with -placement must know every image's
+// fate, or the plan is for another dataset.
+func placementMissing(plan *schema.ImagePlacement, selected []swebench.Instance) []string {
+	known := map[string]bool{}
+	for _, e := range plan.Images {
+		known[e.Image] = true
+	}
+	for _, u := range plan.Unplaced {
+		known[u.Image] = true
+	}
+	seen := map[string]bool{}
+	var missing []string
+	for _, inst := range selected {
+		if !known[inst.Image] && !seen[inst.Image] {
+			seen[inst.Image] = true
+			missing = append(missing, inst.Image)
+		}
+	}
+	slices.Sort(missing)
+	return missing
 }
 
 // idsDigest is the first eight hex digits of the SHA-256 of the sorted ids.
@@ -857,6 +883,21 @@ func runCmd(args []string) (retErr error) {
 		slog.Int("images_per_step", *imagesPerStep),
 		slog.Int("environments", environments), slog.Int("width", *width), slog.Int("steps", *steps),
 		slog.String("park", *park), slog.String("trajectory", *trajectory), slog.String("out", *out))
+	// The placement plan is read and checked before -dry-run returns and
+	// whatever backend runs, so a dry run and the CLI tests see its errors.
+	var placement *schema.ImagePlacement
+	if *placementPath != "" {
+		if err := swebench.ValidatePlacementDriver(*backendFlag, *accessFlag, true); err != nil {
+			return err
+		}
+		if placement, err = swebench.ReadImagePlacement(*placementPath); err != nil {
+			return err
+		}
+		if missing := placementMissing(placement, selected); len(missing) > 0 {
+			return fmt.Errorf("-placement %s neither places nor lists as unplaced %d of the %d selected images (first: %s): plan them, or run without -placement", *placementPath, len(missing), len(selected), missing[0])
+		}
+		log.Info("placement", slog.String("plan", *placementPath), slog.Int("images", len(placement.Images)), slog.Int("domains", len(placement.Domains)), slog.Int("unplaced", len(placement.Unplaced)))
+	}
 	if *dryRun {
 		return nil
 	}
@@ -865,13 +906,6 @@ func runCmd(args []string) (retErr error) {
 	if testBackendOverride != nil {
 		backend = testBackendOverride
 	} else {
-		var placement *schema.ImagePlacement
-		if *placementPath != "" {
-			if placement, err = swebench.ReadImagePlacement(*placementPath); err != nil {
-				return err
-			}
-			log.Info("placement", slog.String("plan", *placementPath), slog.Int("images", len(placement.Images)), slog.Int("domains", len(placement.Domains)), slog.Int("unplaced", len(placement.Unplaced)))
-		}
 		drv, closer, err := swebench.NewBackendDriver(swebench.BackendDriverOptions{
 			Backend:      *backendFlag,
 			Access:       *accessFlag,
@@ -976,7 +1010,7 @@ func runCmd(args []string) (retErr error) {
 		WakeBackoff:   *wakeBackoff,
 		Keep:          *keep,
 		Labels:        labels,
-		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids, effective),
+		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, *placementPath, exclude, ids, effective),
 	})
 	endTS := time.Now().UTC()
 	_ = rec.Flush()
@@ -1097,8 +1131,8 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 		if len(files) > 0 || *in != "" {
 			return fmt.Errorf("with -arm, give every events file inside an -arm value")
 		}
-		if *unresolved != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" || *top > 0 {
-			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log and -top take one events file, not -arm")
+		if *unresolved != "" || *cacheBefore != "" || *cacheAfter != "" || *restoreLog != "" || *preflightCov != "" || *top > 0 {
+			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log, -preflight-coverage and -top take one events file, not -arm")
 		}
 		return reportArms(arms, *jsonOut, stdout)
 	}
@@ -1183,8 +1217,8 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 	if len(reps) > 1 {
 		// Several runs: one table, a column per run, for the same workload on
 		// different clusters or builds.
-		if *unresolved != "" || (*cacheBefore != "" && !*validate) || (*cacheAfter != "" && !*validate) || *restoreLog != "" || *top > 0 {
-			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log and -top take one events file")
+		if *unresolved != "" || (*cacheBefore != "" && !*validate) || (*cacheAfter != "" && !*validate) || *restoreLog != "" || *preflightCov != "" || *top > 0 {
+			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log, -preflight-coverage and -top take one events file")
 		}
 		swebench.WriteComparison(stdout, reps, labels)
 		if *thresholds != "" {

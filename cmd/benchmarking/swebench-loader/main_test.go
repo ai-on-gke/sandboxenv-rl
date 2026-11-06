@@ -812,3 +812,84 @@ func TestPreflightCmd(t *testing.T) {
 		t.Errorf("stderr falsely reported wrote %s:\n%s", badCovPath, badCovStderr.String())
 	}
 }
+
+// writeParkEachRun writes a complete -park-each steps run: two steps on one
+// environment, parked inside the barrier (suspend events, no park event),
+// with the loader's labels on the run event.
+func writeParkEachRun(t *testing.T, dir, name, runID, park string) string {
+	t.Helper()
+	labels := map[string]string{"mode": "steps", "width": "1", "images": "1", "trajectory": "t",
+		"rollouts": "1", "steps": "2", "park": park, "park_each": "true"}
+	var buf bytes.Buffer
+	for _, e := range []swebench.Event{
+		{RunID: runID, Event: swebench.EventCreate, Env: "e1", Step: 1, DurMS: 100, OK: true},
+		{RunID: runID, Event: swebench.EventTask, Env: "e1", Step: 1, DurMS: 50, OK: true},
+		{RunID: runID, Event: swebench.EventSuspend, Env: "e1", Step: 1, DurMS: 20, OK: true},
+		{RunID: runID, Event: swebench.EventBarrier, Step: 1, DurMS: 200, OK: true, Count: 1},
+		{RunID: runID, Event: swebench.EventWake, Env: "e1", Step: 2, DurMS: 30, OK: true},
+		{RunID: runID, Event: swebench.EventTask, Env: "e1", Step: 2, DurMS: 50, OK: true},
+		{RunID: runID, Event: swebench.EventSuspend, Env: "e1", Step: 2, DurMS: 20, OK: true},
+		{RunID: runID, Event: swebench.EventBarrier, Step: 2, DurMS: 120, OK: true, Count: 1},
+		{RunID: runID, Event: swebench.EventDelete, Env: "e1", Step: 2, DurMS: 10, OK: true},
+		{RunID: runID, Event: swebench.EventRun, Name: "steps", DurMS: 1000, OK: true, Count: 2, Labels: labels},
+	} {
+		b, err := json.Marshal(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.Write(b)
+		buf.WriteByte('\n')
+	}
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// A -park-each run records no park event; report and report -arm take the
+// park mode from the run's park label, not from the suspend events.
+func TestReportParkModeFromLabel(t *testing.T) {
+	dir := t.TempDir()
+	a := writeParkEachRun(t, dir, "a.jsonl", "r1", "suspend-async")
+	b := writeParkEachRun(t, dir, "b.jsonl", "r2", "suspend-async")
+
+	single := filepath.Join(dir, "report.json")
+	if err := reportCmd([]string{a, "-json", single}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(single)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rep swebench.Report
+	if err := json.Unmarshal(raw, &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.ParkMode != "suspend-async" || rep.LifecyclePolicy == nil || rep.LifecyclePolicy.ParkMode != "suspend-async" {
+		t.Fatalf("report.json park_mode %q lifecycle %+v, want suspend-async", rep.ParkMode, rep.LifecyclePolicy)
+	}
+
+	arms := filepath.Join(dir, "arms.json")
+	var text bytes.Buffer
+	if err := reportCmd([]string{"-arm", "local=" + a + "," + b, "-json", arms}, &text); err != nil {
+		t.Fatal(err)
+	}
+	flat := strings.Join(strings.Fields(text.String()), " ")
+	for _, want := range []string{"reps 2", "park suspend-async", "park_each true"} {
+		if !strings.Contains(flat, want) {
+			t.Errorf("-arm output lacks %q:\n%s", want, text.String())
+		}
+	}
+	raw, err = os.ReadFile(arms)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reps []swebench.Report
+	if err := json.Unmarshal(raw, &reps); err != nil {
+		t.Fatal(err)
+	}
+	if len(reps) != 1 || reps[0].ParkMode != "suspend-async" || reps[0].LifecyclePolicy == nil || reps[0].LifecyclePolicy.ParkMode != "suspend-async" {
+		t.Fatalf("-arm -json: %+v", reps)
+	}
+}

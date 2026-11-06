@@ -105,7 +105,9 @@ user needs to know across them.
   parks with `suspend-sync` and `suspend-async`, which it silently skipped,
   and rejects `fork`. A run that parks with `suspend-async` or `fork` (whose
   park is a local suspend too) checks that ate-env-api serves `suspend_mode`
-  before it starts.
+  before it starts. `report` takes `park_mode` from the run's `park` label,
+  so a `-park-each` run, which records no `park` event, reports
+  `suspend-async` or `suspend-sync` instead of `suspend`.
 - ate-env-api: deriving an image template from a base that already has a
   non-image volume named `guest`, or a mount at or under `/ate`, fails with
   `InvalidArgument` naming the clash, instead of creating a template that

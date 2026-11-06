@@ -447,8 +447,9 @@ func Run(ctx context.Context, cfg Config) (*Summary, error) {
 	cfg.defaults()
 	// ParkSuspendAsync, and the park after a fork, send local suspends, which
 	// need an ate-env-api that serves suspend_mode. Fail once here rather
-	// than on every park.
-	if cfg.Mode == ModeSteps && (cfg.Park == ParkSuspendAsync || cfg.Park == ParkFork) {
+	// than on every park. One step without -park-each parks nothing (the
+	// last step is never parked), so it needs no check.
+	if cfg.Mode == ModeSteps && (cfg.Park == ParkSuspendAsync || cfg.Park == ParkFork) && (cfg.Steps > 1 || cfg.ParkEach) {
 		if eb, ok := cfg.Backend.(*EnvBackend); ok {
 			if err := eb.CheckSuspendLocal(ctx); err != nil {
 				return nil, err

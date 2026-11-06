@@ -54,8 +54,10 @@ type ModeSuspender interface {
 	SuspendWithMode(ctx context.Context, async bool) error
 }
 
-// AsyncSuspender is an optional interface implemented by Sandboxes that support
-// non-blocking asynchronous checkpointing (DURABILITY_MODE_ASYNCHRONOUS).
+// AsyncSuspender is an optional interface implemented by Sandboxes that
+// support a local suspend: the call returns once the snapshot is on the node
+// and the upload goes on in the background (SUSPEND_MODE_LOCAL through
+// ate-env-api, DURABILITY_MODE_ASYNCHRONOUS with direct Substrate access).
 type AsyncSuspender interface {
 	SuspendAsync(ctx context.Context) error
 }

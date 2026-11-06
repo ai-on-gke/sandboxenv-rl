@@ -522,6 +522,20 @@ func TestRunChecksSuspendLocalBeforeStarting(t *testing.T) {
 			t.Fatalf("%s: created %v before the check", park, api.created)
 		}
 	}
+	// One step without -park-each never parks, so the same server serves it.
+	api := &fakeAPI{features: []string{"rootfs_image"}}
+	var out bytes.Buffer
+	cfg := baseConfig(t, newFakeBackend(t, api), &out)
+	cfg.Mode = ModeSteps
+	cfg.Rollouts = 1
+	cfg.Steps = 1
+	cfg.Park = ParkSuspendAsync
+	if _, err := Run(context.Background(), cfg); err != nil {
+		t.Fatalf("one step, no park: Run = %v, want no suspend_mode check", err)
+	}
+	if len(api.created) == 0 || len(api.suspendModes) != 0 {
+		t.Fatalf("one step, no park: created %v, suspend modes %v; want creates and no suspend", api.created, api.suspendModes)
+	}
 }
 
 func TestEnvBackendSuspendAndPrewarm(t *testing.T) {

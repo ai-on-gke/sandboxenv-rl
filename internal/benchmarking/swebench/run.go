@@ -79,6 +79,12 @@ type Config struct {
 	Logger     *slog.Logger
 
 	Mode Mode
+	// Strategy, when non-empty, selects the warm-pool orchestration strategy
+	// (none, naive, sliding, or pipelined) matching Python SandboxFleet.
+	Strategy Strategy
+	// WindowSize bounds the number of distinct images warmed per batch in
+	// StrategySliding and StrategyPipelined (0 uses DefaultWindowSize).
+	WindowSize int
 	// Width is the most tasks in flight at once (the "500 wide").
 	Width int
 	// TasksPerImage is the eval mode fan-out per image.
@@ -171,7 +177,7 @@ func (c *Config) trajectoryNames() string {
 // and on every -set value, recorded as set.KEY. An operator -label may not use
 // one of them, nor the set. prefix.
 var LoaderLabelKeys = []string{
-	"mode", "width", "images", "trajectory", "tasks_per_image", "rollouts", "steps", "park",
+	"mode", "strategy", "window_size", "width", "images", "trajectory", "tasks_per_image", "rollouts", "steps", "park",
 	"create_timeout", "step_timeout", "wake_budget", "wake_backoff",
 	"dataset", "connections", "delete_rate", "base_template", "exclude_file", "instances", "seed", "images_per_step",
 	"park_each", "placement",
@@ -189,6 +195,12 @@ func (c *Config) labels() map[string]string {
 		"wake_budget":    c.WakeBudget.String(),
 		"wake_backoff":   c.WakeBackoff.String(),
 	}
+	if c.Strategy != "" {
+		l["strategy"] = string(c.Strategy)
+		if c.Strategy == StrategySliding || c.Strategy == StrategyPipelined {
+			l["window_size"] = strconv.Itoa(c.effectiveWindowSize())
+		}
+	}
 	if len(c.Trajectories) > 1 {
 		l["seed"] = strconv.FormatInt(c.Seed, 10)
 	}
@@ -198,7 +210,13 @@ func (c *Config) labels() map[string]string {
 	case ModeSteps:
 		l["rollouts"] = strconv.Itoa(c.Rollouts)
 		l["steps"] = strconv.Itoa(c.Steps)
-		l["park"] = string(c.Park)
+		parkLbl := string(c.Park)
+		if c.Strategy == StrategyNone {
+			parkLbl = string(ParkDelete)
+		} else if c.Strategy != "" {
+			parkLbl = string(ParkSuspend)
+		}
+		l["park"] = parkLbl
 		if c.ImagesPerStep > 0 {
 			l["images_per_step"] = strconv.Itoa(c.ImagesPerStep)
 		}
@@ -233,11 +251,54 @@ type Summary struct {
 }
 
 func (c *Config) usesWorkingSet() bool {
+	if c.Strategy != "" {
+		return false
+	}
 	return c.Mode == ModeSteps && (c.Schedule != nil || c.TasksPerStep > 0 || c.GroupSize > 0 ||
 		c.StepPause > 0 || c.Prefetch)
 }
 
 func (c *Config) validate() error {
+	if err := ValidateStrategy(c.Strategy); err != nil {
+		return err
+	}
+	if c.WindowSize < 0 {
+		return errors.New("window size must be >= 0")
+	}
+	if c.WindowSize > 0 && c.Strategy != StrategySliding && c.Strategy != StrategyPipelined {
+		return errors.New("window size applies to sliding or pipelined strategy")
+	}
+	if c.Strategy != "" && c.Mode == ModeOpenLoop {
+		return errors.New("strategy applies to eval or steps mode, not open-loop")
+	}
+	if c.Strategy != "" && c.Mode == ModeSteps && c.Steps > 1 {
+		return errors.New("strategy is single-pass (requires -steps 1 in steps mode; omit -strategy for multi-step reset loops)")
+	}
+	if c.Strategy != "" {
+		// A strategy owns the lifecycle: it parks by suspend (delete for
+		// none) and runs one pass, so the step loop's settings have nothing
+		// to act on. Refuse them rather than record a park or a pause that
+		// did not happen.
+		if c.Mode == ModeSteps {
+			if c.Park == "" {
+				c.Park = c.strategyPark()
+			} else if c.Park != c.strategyPark() {
+				return fmt.Errorf("strategy %s parks by %s; park mode %s cannot apply (omit -park with -strategy)", c.Strategy, c.strategyPark(), c.Park)
+			}
+		}
+		switch {
+		case c.StepPause > 0:
+			return errors.New("step pause belongs to the step loop; it cannot be combined with a strategy")
+		case c.ParkEach:
+			return errors.New("park each belongs to the step loop; it cannot be combined with a strategy")
+		case c.ImagesPerStep > 0:
+			return errors.New("images per step belongs to the step loop; it cannot be combined with a strategy")
+		case c.Prefetch:
+			return errors.New("prefetch belongs to the schedule's step loop; a strategy prefetches by its window (pipelined)")
+		case c.Schedule != nil:
+			return errors.New("a schedule drives the step loop; it cannot be combined with a strategy")
+		}
+	}
 	if c.Schedule != nil && c.Mode == ModeSteps && len(c.Schedule.Jobs) > 0 {
 		if c.Rollouts < 1 {
 			c.Rollouts = 1
@@ -338,7 +399,9 @@ func (c *Config) validate() error {
 // delete park gives the environments of later steps.
 func (c *Config) longestName() string {
 	k, suffix := c.TasksPerImage-1, ""
-	if c.Mode == ModeSteps {
+	if c.Strategy != "" {
+		k = c.strategyFanout() - 1 // one pass: no step suffix
+	} else if c.Mode == ModeSteps {
 		k = c.Rollouts - 1
 		if (c.Park == ParkDelete || c.Park == ParkFork || c.ImagesPerStep > 0) && c.Steps > 1 {
 			suffix = fmt.Sprintf("-s%d", c.Steps)
@@ -423,6 +486,9 @@ type environment struct {
 	wsFresh       bool
 	wsWake        bool
 	slotWaitMS    float64
+	// inWarmPool is set by a strategy run while the environment sits
+	// suspended in its warm pool; see warmPoolStats.
+	inWarmPool bool
 }
 
 type runner struct {
@@ -435,6 +501,29 @@ type runner struct {
 	failed   int
 	rewarded int
 	wsStats  WorkingSetStats
+}
+
+// ValidateConfig checks cfg as Run does before it touches the backend: the
+// run id, the longest environment name against Substrate's 63 characters,
+// the label keys, and the mode, strategy and park settings against each
+// other. It is the check behind swebench-loader run -dry-run, which has no
+// backend; a nil Backend passes.
+func ValidateConfig(cfg Config) error {
+	if cfg.Backend == nil {
+		cfg.Backend = noBackend{}
+	}
+	return cfg.validate()
+}
+
+// noBackend stands in for the backend during ValidateConfig; nothing calls it.
+type noBackend struct{}
+
+func (noBackend) Create(context.Context, string, string) (Sandbox, error) {
+	return nil, errors.New("no backend: validate only")
+}
+
+func (noBackend) Delete(context.Context, string) error {
+	return errors.New("no backend: validate only")
 }
 
 // Run executes the configured workload and returns its summary. A non-nil
@@ -458,9 +547,15 @@ func Run(ctx context.Context, cfg Config) (*Summary, error) {
 	}
 	r := &runner{cfg: &cfg, rec: cfg.Recorder, log: cfg.Logger}
 
-	if cfg.usesWorkingSet() {
+	if cfg.Strategy != "" || cfg.usesWorkingSet() {
 		start := time.Now()
-		if err := r.runScheduledSteps(ctx); err != nil {
+		var err error
+		if cfg.Strategy != "" {
+			err = r.runStrategy(ctx)
+		} else {
+			err = r.runScheduledSteps(ctx)
+		}
+		if err != nil {
 			return nil, err
 		}
 		dur := time.Since(start)
@@ -560,7 +655,11 @@ func (c *Config) buildRunLoadTags() map[string]string {
 	}
 	tasksPerStep := c.TasksPerStep
 	if tasksPerStep < 1 {
-		tasksPerStep = len(c.Instances)
+		if c.Strategy == StrategySliding || c.Strategy == StrategyPipelined {
+			tasksPerStep = min(len(c.Instances), c.effectiveWindowSize())
+		} else {
+			tasksPerStep = len(c.Instances)
+		}
 	}
 	tags["load_tasks"] = fmt.Sprintf("%d", len(c.Instances))
 	tags["load_group_size"] = fmt.Sprintf("%d", groupSize)

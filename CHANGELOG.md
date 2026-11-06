@@ -8,6 +8,13 @@ user needs to know across them.
 
 ### Added
 
+- `benchmarking/swebench/run-r2e-swebench.sh`: the mixed R2E-Gym + SWE-bench
+  recipe, with `make-r2e-dataset.py` (R2E-Gym `CommandAdapter` manifests),
+  `run_fleet_bench.py` (the Python `SandboxFleet` arm) and the `r2e-swebench`
+  skill and `REPORT_TEMPLATE.md`; `swebench-loader run -strategy none|naive|sliding|pipelined` and
+  `-window-size`, `swebench-loader render-plan`, `swebench-loader report -md`
+  over several runs (the arm table), and the `-atenet-*` and `-ateapi-*`
+  flags of the direct Substrate backend.
 - swebench-loader: `run -delete-rate` caps the environment deletes per second
   through ate-env-api (default 200; 0 removes the cap), and a delete the
   bucket rate-limits (429, `ResourceExhausted`) is retried with backoff for

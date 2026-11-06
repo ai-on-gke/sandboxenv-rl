@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -480,7 +481,7 @@ func TestJoinRestores(t *testing.T) {
 	if p := find(b.First, "download"); p.Count != 2 || p.MaxMS != 3000 {
 		t.Fatalf("first download: %+v", p)
 	}
-	if p := find(b.First, "total"); p.Count != 3 || p.MaxMS != 8100 {
+	if p := find(b.First, "total"); p.Count != 3 || p.P50MS != 4000 || p.P90MS <= 0 || p.MaxMS != 8100 {
 		t.Fatalf("first total: %+v", p)
 	}
 	if b.First.Phases[0].Phase != "manifest_fetch" || b.First.Phases[len(b.First.Phases)-1].Phase != "total" {
@@ -683,6 +684,64 @@ func TestActiveVsPausedSandboxesAndConcurrencyCap(t *testing.T) {
 	}
 	if rep.LifecyclePolicy == nil || rep.LifecyclePolicy.Mode != "warm_pool" || rep.LifecyclePolicy.ParkMode != "suspend-sync" || rep.LifecyclePolicy.PerStepWarming != "wake_on_demand" {
 		t.Fatalf("unexpected LifecyclePolicy for warm run: %+v", rep.LifecyclePolicy)
+	}
+}
+
+func TestBuildMultiJobWorkingSetAndRunDuration(t *testing.T) {
+	t0 := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	events := []Event{
+		{
+			Time: t0.Add(100 * time.Millisecond), RunID: "swe-shard", Job: "swe",
+			Event: EventTask, Step: 1, DurMS: 800, OK: true, Reward: intp(1),
+		},
+		{
+			Time: t0.Add(900 * time.Millisecond), RunID: "swe-shard", Job: "swe",
+			Event: EventBarrier, Step: 1, DurMS: 900, OK: true, Count: 4,
+			WorkingSetHits: 4, WorkingSetMisses: 0, WorkingSetHitRate: 1.0,
+			StandingPoolSize: 4, Created: 4, Reused: 4, Retired: 4, PrefetchLeadMarginMS: 25,
+		},
+		{
+			Time: t0.Add(950 * time.Millisecond), RunID: "swe-shard", Job: "swe",
+			Event: EventRun, Name: "steps", DurMS: 950, OK: true,
+			WorkingSetHits: 4, WorkingSetMisses: 0, WorkingSetHitRate: 1.0,
+			StandingPoolSize: 4, Created: 4, Reused: 4, Retired: 4, PrefetchLeadMarginMS: 25,
+		},
+		{
+			Time: t0.Add(120 * time.Millisecond), RunID: "r2e-shard", Job: "r2e",
+			Event: EventTask, Step: 1, DurMS: 1100, OK: true, Reward: intp(1),
+		},
+		{
+			Time: t0.Add(1300 * time.Millisecond), RunID: "r2e-shard", Job: "r2e",
+			Event: EventBarrier, Step: 1, DurMS: 1300, OK: true, Count: 6,
+			WorkingSetHits: 3, WorkingSetMisses: 3, WorkingSetHitRate: 0.5,
+			StandingPoolSize: 6, Created: 6, Reused: 3, Retired: 6, PrefetchLeadMarginMS: 40,
+		},
+		{
+			Time: t0.Add(1400 * time.Millisecond), RunID: "r2e-shard", Job: "r2e",
+			Event: EventRun, Name: "steps", DurMS: 1400, OK: true,
+			WorkingSetHits: 3, WorkingSetMisses: 3, WorkingSetHitRate: 0.5,
+			StandingPoolSize: 6, Created: 6, Reused: 3, Retired: 6, PrefetchLeadMarginMS: 40,
+		},
+	}
+	rep := Build(events)
+	if rep.RunMS != 1400 {
+		t.Fatalf("multi-job RunMS = %v, want max shard duration 1400", rep.RunMS)
+	}
+	if rep.WorkingSetHits != 7 || rep.WorkingSetMisses != 3 {
+		t.Fatalf("multi-job hits/misses = %d/%d, want 7/3", rep.WorkingSetHits, rep.WorkingSetMisses)
+	}
+	if math.Abs(rep.WorkingSetHitRate-0.7) > 1e-6 {
+		t.Fatalf("multi-job hit rate = %v, want 0.7", rep.WorkingSetHitRate)
+	}
+	if rep.StandingPoolSize != 10 || rep.Created != 10 || rep.Reused != 7 || rep.Retired != 10 {
+		t.Fatalf("multi-job pool/created/reused/retired = %d/%d/%d/%d, want 10/10/7/10",
+			rep.StandingPoolSize, rep.Created, rep.Reused, rep.Retired)
+	}
+	if rep.PrefetchLeadMarginMS != 65 {
+		t.Fatalf("multi-job PrefetchLeadMarginMS = %v, want 65", rep.PrefetchLeadMarginMS)
+	}
+	if len(rep.Steps) != 1 || rep.Steps[0].BarrierMS != 1300 || rep.Steps[0].WorkingSetHits != 7 || rep.Steps[0].StandingPoolSize != 10 {
+		t.Fatalf("multi-job step[0] = %+v, want barrier=1300 hits=7 pool=10", rep.Steps)
 	}
 }
 

@@ -745,6 +745,15 @@ func TestDirectSubstrateBackend(t *testing.T) {
 		t.Fatalf("ReadFile = %q, %v", gotBytes, err)
 	}
 
+	largePayload := strings.Repeat("echo r2e-grade-line\n", 12*1024)
+	if err := sb.WriteFile(ctx, "large-grade.sh", []byte(largePayload), 0o755); err != nil {
+		t.Fatalf("WriteFile(large): %v", err)
+	}
+	gotLarge, err := os.ReadFile(filepath.Join(workDir, "large-grade.sh"))
+	if err != nil || string(gotLarge) != largePayload {
+		t.Fatalf("ReadFile(large) len=%d err=%v, want len=%d", len(gotLarge), err, len(largePayload))
+	}
+
 	res, err := sb.Run(ctx, "printf direct-ok", 5*time.Second)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -940,6 +949,39 @@ func TestNewBackendDriver(t *testing.T) {
 	}
 	if _, _, err := NewBackendDriver(BackendDriverOptions{Backend: "substrate", Access: "bogus"}); err == nil {
 		t.Fatal("expected error for unknown access")
+	}
+
+	// 5. invalid ateapi CA file fails loudly
+	badCA := filepath.Join(t.TempDir(), "bad-ca.pem")
+	if err := os.WriteFile(badCA, []byte("not-a-pem"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := NewBackendDriver(BackendDriverOptions{
+		Backend:      "substrate",
+		Access:       "direct",
+		ControlAddr:  controlAddr,
+		RouterAddr:   routerAddr,
+		AteapiCAFile: badCA,
+	}); err == nil {
+		t.Fatal("expected error for invalid AteapiCAFile PEM")
+	}
+
+	// 6. missing base template on DirectSubstrateBackend fails loudly instead of silently ignoring image
+	bMissing, err := NewDirectSubstrateBackend(DirectSubstrateOptions{
+		ATEOptions: ate.Options{
+			ControlAddr: controlAddr,
+			RouterAddr:  routerAddr,
+			SkipVerify:  true,
+		},
+		Atespace:     "ate-env",
+		BaseTemplate: "nonexistent-base-template",
+	})
+	if err != nil {
+		t.Fatalf("NewDirectSubstrateBackend: %v", err)
+	}
+	defer bMissing.Close()
+	if _, err := bMissing.Create(context.Background(), "sb-missing", "us-docker.pkg.dev/p/r/img@sha256:0000000000000000000000000000000000000000000000000000000000000001"); err == nil {
+		t.Fatal("expected Create to fail when base template is missing")
 	}
 }
 

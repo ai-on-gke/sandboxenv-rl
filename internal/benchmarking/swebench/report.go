@@ -43,6 +43,7 @@ type Stat struct {
 	P50MS  float64 `json:"p50_ms"`
 	P90MS  float64 `json:"p90_ms,omitempty"`
 	P95MS  float64 `json:"p95_ms"`
+	P99MS  float64 `json:"p99_ms,omitempty"`
 	MaxMS  float64 `json:"max_ms"`
 	// Retried counts ttfi and wake events that took more than one attempt:
 	// the environment was not serving when first asked.
@@ -97,6 +98,7 @@ type StepRolloutBreakdown struct {
 	P50MS          float64 `json:"p50_ms"`
 	P90MS          float64 `json:"p90_ms"`
 	P95MS          float64 `json:"p95_ms"`
+	P99MS          float64 `json:"p99_ms,omitempty"`
 	P100MS         float64 `json:"p100_ms"`
 	StragglerSkew  float64 `json:"straggler_skew"`
 	BarrierMS      float64 `json:"barrier_ms"`
@@ -148,26 +150,35 @@ type HeadlineBaseline struct {
 	TTFIP50MS             float64 `json:"ttfi_p50_ms,omitempty"`
 	TTFIP90MS             float64 `json:"ttfi_p90_ms,omitempty"`
 	TTFIP95MS             float64 `json:"ttfi_p95_ms,omitempty"`
+	TTFIP99MS             float64 `json:"ttfi_p99_ms,omitempty"`
 	TTFIMaxMS             float64 `json:"ttfi_max_ms,omitempty"`
 	SDKSlotWaitP50MS      float64 `json:"sdk_slot_wait_p50_ms,omitempty"`
 	SDKSlotWaitP95MS      float64 `json:"sdk_slot_wait_p95_ms,omitempty"`
+	SDKSlotWaitP99MS      float64 `json:"sdk_slot_wait_p99_ms,omitempty"`
 	WireClaimToReadyP50MS float64 `json:"wire_claim_to_ready_p50_ms,omitempty"`
 	WireClaimToReadyP95MS float64 `json:"wire_claim_to_ready_p95_ms,omitempty"`
+	WireClaimToReadyP99MS float64 `json:"wire_claim_to_ready_p99_ms,omitempty"`
 	ReadyToFirstCmdP50MS  float64 `json:"ready_to_first_cmd_p50_ms,omitempty"`
 	ReadyToFirstCmdP95MS  float64 `json:"ready_to_first_cmd_p95_ms,omitempty"`
+	ReadyToFirstCmdP99MS  float64 `json:"ready_to_first_cmd_p99_ms,omitempty"`
 	CreateP50MS           float64 `json:"create_p50_ms,omitempty"`
 	CreateP95MS           float64 `json:"create_p95_ms,omitempty"`
+	CreateP99MS           float64 `json:"create_p99_ms,omitempty"`
 	WakeP50MS             float64 `json:"wake_p50_ms,omitempty"`
 	WakeP95MS             float64 `json:"wake_p95_ms,omitempty"`
+	WakeP99MS             float64 `json:"wake_p99_ms,omitempty"`
 	ExecP50MS             float64 `json:"exec_p50_ms,omitempty"`
 	ExecP95MS             float64 `json:"exec_p95_ms,omitempty"`
+	ExecP99MS             float64 `json:"exec_p99_ms,omitempty"`
 	SuspendP50MS          float64 `json:"suspend_p50_ms,omitempty"`
 	SuspendP95MS          float64 `json:"suspend_p95_ms,omitempty"`
+	SuspendP99MS          float64 `json:"suspend_p99_ms,omitempty"`
 	SuspendSizeMBP50      float64 `json:"suspend_size_mb_p50,omitempty"`
 	SuspendSizeMBP95      float64 `json:"suspend_size_mb_p95,omitempty"`
 	CheckpointMBS         float64 `json:"checkpoint_mb_s,omitempty"`
 	DeleteP50MS           float64 `json:"delete_p50_ms,omitempty"`
 	DeleteP95MS           float64 `json:"delete_p95_ms,omitempty"`
+	DeleteP99MS           float64 `json:"delete_p99_ms,omitempty"`
 }
 
 // RLStepBreakdown summarizes the RL training step wall-clock breakdown and
@@ -477,6 +488,47 @@ type jobAccum struct {
 	ttfi     []float64
 }
 
+type wsSnapshot struct {
+	hits                 int
+	misses               int
+	standingPoolSize     int
+	created              int
+	reused               int
+	retired              int
+	prefetchLeadMarginMS float64
+	releaseOverlapMS     float64
+}
+
+func sumWSSnapshots(m map[string]wsSnapshot) (out wsSnapshot, hitRate float64) {
+	for _, s := range m {
+		out.hits += s.hits
+		out.misses += s.misses
+		out.standingPoolSize += s.standingPoolSize
+		out.created += s.created
+		out.reused += s.reused
+		out.retired += s.retired
+		out.prefetchLeadMarginMS += s.prefetchLeadMarginMS
+		out.releaseOverlapMS += s.releaseOverlapMS
+	}
+	if total := out.hits + out.misses; total > 0 {
+		hitRate = float64(out.hits) / float64(total)
+	}
+	return out, hitRate
+}
+
+func maxFloat64(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	mx := xs[0]
+	for _, v := range xs[1:] {
+		if v > mx {
+			mx = v
+		}
+	}
+	return mx
+}
+
 // Builder folds a stream of events into a Report without materializing the full
 // event slice in memory.
 type Builder struct {
@@ -500,6 +552,8 @@ type Builder struct {
 	stepThinkPool      map[int][]float64
 	customMetrics      map[string][]float64
 	jobs               map[string]*jobAccum
+	jobRunWS           map[string]wsSnapshot
+	stepJobBarrierWS   map[int]map[string]wsSnapshot
 	slotWaits          []float64
 	stepSlotWaits      map[int][]float64
 	stepCreates        map[int][]float64
@@ -551,6 +605,8 @@ func NewBuilder() *Builder {
 		stepThinkPool:      map[int][]float64{},
 		customMetrics:      map[string][]float64{},
 		jobs:               map[string]*jobAccum{},
+		jobRunWS:           map[string]wsSnapshot{},
+		stepJobBarrierWS:   map[int]map[string]wsSnapshot{},
 		stepSlotWaits:      map[int][]float64{},
 		stepCreates:        map[int][]float64{},
 		stepJobTasks:       map[int]map[string]int{},
@@ -887,6 +943,18 @@ func (b *Builder) Add(e Event) {
 		b.rep.Retired = e.Retired
 		b.rep.PrefetchLeadMarginMS = e.PrefetchLeadMarginMS
 		b.rep.ReleaseOverlapMS = e.ReleaseOverlapMS
+		if e.Job != "" {
+			b.jobRunWS[e.Job] = wsSnapshot{
+				hits:                 e.WorkingSetHits,
+				misses:               e.WorkingSetMisses,
+				standingPoolSize:     e.StandingPoolSize,
+				created:              e.Created,
+				reused:               e.Reused,
+				retired:              e.Retired,
+				prefetchLeadMarginMS: e.PrefetchLeadMarginMS,
+				releaseOverlapMS:     e.ReleaseOverlapMS,
+			}
+		}
 		for tk, tv := range e.Tags {
 			b.runTags[tk] = tv
 		}
@@ -967,6 +1035,21 @@ func (b *Builder) Add(e Event) {
 		st.Retired = e.Retired
 		st.PrefetchLeadMarginMS = e.PrefetchLeadMarginMS
 		st.ReleaseOverlapMS = e.ReleaseOverlapMS
+		if e.Job != "" {
+			if b.stepJobBarrierWS[e.Step] == nil {
+				b.stepJobBarrierWS[e.Step] = map[string]wsSnapshot{}
+			}
+			b.stepJobBarrierWS[e.Step][e.Job] = wsSnapshot{
+				hits:                 e.WorkingSetHits,
+				misses:               e.WorkingSetMisses,
+				standingPoolSize:     e.StandingPoolSize,
+				created:              e.Created,
+				reused:               e.Reused,
+				retired:              e.Retired,
+				prefetchLeadMarginMS: e.PrefetchLeadMarginMS,
+				releaseOverlapMS:     e.ReleaseOverlapMS,
+			}
+		}
 		if e.Step > 0 && len(e.Metrics) > 0 {
 			if b.trainerStepMetrics[e.Step] == nil {
 				b.trainerStepMetrics[e.Step] = make(map[string]float64, len(e.Metrics))
@@ -1068,7 +1151,23 @@ func (b *Builder) Finish() *Report {
 	if rep.Tasks > 0 {
 		rep.RewardRate = float64(rep.Rewarded) / float64(rep.Tasks)
 	}
-	rep.RunMS = median(b.runs)
+	if len(b.jobs) > 1 {
+		rep.RunMS = maxFloat64(b.runs)
+	} else {
+		rep.RunMS = median(b.runs)
+	}
+	if len(b.jobRunWS) > 1 {
+		wsSum, hitRate := sumWSSnapshots(b.jobRunWS)
+		rep.WorkingSetHits = wsSum.hits
+		rep.WorkingSetMisses = wsSum.misses
+		rep.WorkingSetHitRate = hitRate
+		rep.StandingPoolSize = wsSum.standingPoolSize
+		rep.Created = wsSum.created
+		rep.Reused = wsSum.reused
+		rep.Retired = wsSum.retired
+		rep.PrefetchLeadMarginMS = wsSum.prefetchLeadMarginMS
+		rep.ReleaseOverlapMS = wsSum.releaseOverlapMS
+	}
 	rep.Labels = b.labels.merged()
 	for _, k := range b.order {
 		d := b.durs[k]
@@ -1084,6 +1183,7 @@ func (b *Builder) Finish() *Report {
 			P50MS:   percentile(d, 0.50),
 			P90MS:   percentile(d, 0.90),
 			P95MS:   percentile(d, 0.95),
+			P99MS:   percentile(d, 0.99),
 			MaxMS:   percentile(d, 1),
 			Retried: b.retried[k],
 		}
@@ -1155,8 +1255,25 @@ func (b *Builder) Finish() *Report {
 		cp.WakeP50MS = percentile(w, 0.5)
 		cp.WakeP95MS = percentile(w, 0.95)
 		if len(b.barriers[step]) > 0 {
-			cp.BarrierMS = median(b.barriers[step])
+			if len(b.jobs) > 1 {
+				cp.BarrierMS = maxFloat64(b.barriers[step])
+			} else {
+				cp.BarrierMS = median(b.barriers[step])
+			}
 			s.BarrierMS = cp.BarrierMS
+		}
+		if jw := b.stepJobBarrierWS[step]; len(jw) > 1 {
+			wsSum, hitRate := sumWSSnapshots(jw)
+			cp.WorkingSetHits = wsSum.hits
+			cp.WorkingSetMisses = wsSum.misses
+			cp.WorkingSetHitRate = hitRate
+			cp.StandingPoolSize = wsSum.standingPoolSize
+			cp.Created = wsSum.created
+			cp.Reused = wsSum.reused
+			cp.Retired = wsSum.retired
+			cp.PrefetchLeadMarginMS = wsSum.prefetchLeadMarginMS
+			cp.ReleaseOverlapMS = wsSum.releaseOverlapMS
+			*s = cp
 		}
 		if len(b.parks[step]) > 0 {
 			cp.ParkMS = median(b.parks[step])
@@ -1468,6 +1585,7 @@ func buildStepRolloutBreakdown(step int, samples []taskRolloutSample, extraThink
 	p50 := percentile(durs, 0.50)
 	p90 := percentile(durs, 0.90)
 	p95 := percentile(durs, 0.95)
+	p99 := percentile(durs, 0.99)
 	p100 := durs[n-1]
 
 	var skew float64
@@ -1503,6 +1621,7 @@ func buildStepRolloutBreakdown(step int, samples []taskRolloutSample, extraThink
 		P50MS:          round1(p50),
 		P90MS:          round1(p90),
 		P95MS:          round1(p95),
+		P99MS:          round1(p99),
 		P100MS:         round1(p100),
 		StragglerSkew:  skew,
 		BarrierMS:      round1(barrier),
@@ -1532,7 +1651,11 @@ func buildTrainerRolloutBreakdown(step int, tm map[string]float64, barrierWallMS
 	} else if v, ok := tm["fully_async/processing_time/tp99"]; ok && v > 0 {
 		p95MS = v * 1000.0
 	}
-	p100MS := p95MS
+	p99MS := p95MS
+	if v, ok := tm["fully_async/processing_time/tp99"]; ok && v > 0 {
+		p99MS = v * 1000.0
+	}
+	p100MS := p99MS
 	if v, ok := tm["fully_async/processing_time/max"]; ok && v > 0 {
 		p100MS = v * 1000.0
 	}
@@ -1573,6 +1696,7 @@ func buildTrainerRolloutBreakdown(step int, tm map[string]float64, barrierWallMS
 		P50MS:          round1(p50MS),
 		P90MS:          round1(p95MS),
 		P95MS:          round1(p95MS),
+		P99MS:          round1(p99MS),
 		P100MS:         round1(p100MS),
 		StragglerSkew:  skew,
 		BarrierMS:      round1(barrier),
@@ -1595,36 +1719,44 @@ func (b *Builder) buildHeadlineBaseline(rep *Report) *HeadlineBaseline {
 		hb.TTFIP50MS = st.P50MS
 		hb.TTFIP90MS = st.P90MS
 		hb.TTFIP95MS = st.P95MS
+		hb.TTFIP99MS = st.P99MS
 		hb.TTFIMaxMS = st.MaxMS
 	}
 	if cm, ok := rep.CustomMetrics["sdk_slot_wait_ms"]; ok && cm.Count > 0 {
 		hb.SDKSlotWaitP50MS = cm.P50
 		hb.SDKSlotWaitP95MS = cm.P95
+		hb.SDKSlotWaitP99MS = cm.P99
 	} else if len(b.slotWaits) > 0 {
 		sw := append([]float64(nil), b.slotWaits...)
 		sort.Float64s(sw)
 		hb.SDKSlotWaitP50MS = round1(percentile(sw, 0.50))
 		hb.SDKSlotWaitP95MS = round1(percentile(sw, 0.95))
+		hb.SDKSlotWaitP99MS = round1(percentile(sw, 0.99))
 	}
 	if cm, ok := rep.CustomMetrics["wire_claim_to_ready_ms"]; ok && cm.Count > 0 {
 		hb.WireClaimToReadyP50MS = cm.P50
 		hb.WireClaimToReadyP95MS = cm.P95
+		hb.WireClaimToReadyP99MS = cm.P99
 	}
 	if cm, ok := rep.CustomMetrics["ready_to_first_cmd_ms"]; ok && cm.Count > 0 {
 		hb.ReadyToFirstCmdP50MS = cm.P50
 		hb.ReadyToFirstCmdP95MS = cm.P95
+		hb.ReadyToFirstCmdP99MS = cm.P99
 	}
 	if st, ok := rep.StatFor(EventCreate, ""); ok {
 		hb.CreateP50MS = st.P50MS
 		hb.CreateP95MS = st.P95MS
+		hb.CreateP99MS = st.P99MS
 		if hb.WireClaimToReadyP50MS == 0 {
 			hb.WireClaimToReadyP50MS = st.P50MS
 			hb.WireClaimToReadyP95MS = st.P95MS
+			hb.WireClaimToReadyP99MS = st.P99MS
 		}
 	}
 	if st, ok := rep.StatFor(EventWake, ""); ok {
 		hb.WakeP50MS = st.P50MS
 		hb.WakeP95MS = st.P95MS
+		hb.WakeP99MS = st.P99MS
 	}
 	for _, execName := range []struct {
 		ev   string
@@ -1639,12 +1771,14 @@ func (b *Builder) buildHeadlineBaseline(rep *Report) *HeadlineBaseline {
 		if st, ok := rep.StatFor(execName.ev, execName.name); ok && st.Count > 0 {
 			hb.ExecP50MS = st.P50MS
 			hb.ExecP95MS = st.P95MS
+			hb.ExecP99MS = st.P99MS
 			break
 		}
 	}
 	if st, ok := rep.StatFor(EventSuspend, ""); ok {
 		hb.SuspendP50MS = st.P50MS
 		hb.SuspendP95MS = st.P95MS
+		hb.SuspendP99MS = st.P99MS
 		hb.SuspendSizeMBP50 = st.SizeMBP50
 		hb.SuspendSizeMBP95 = st.SizeMBP95
 		hb.CheckpointMBS = st.CheckpointMBS
@@ -1652,6 +1786,7 @@ func (b *Builder) buildHeadlineBaseline(rep *Report) *HeadlineBaseline {
 	if st, ok := rep.StatFor(EventDelete, ""); ok {
 		hb.DeleteP50MS = st.P50MS
 		hb.DeleteP95MS = st.P95MS
+		hb.DeleteP99MS = st.P99MS
 	}
 
 	claims := b.createTimes
@@ -2875,19 +3010,19 @@ func (rep *Report) WriteText(w io.Writer) {
 		}
 		fmt.Fprintln(w)
 		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "restore\tphase\tcount\tp50_ms\tp95_ms\tmax_ms")
+		fmt.Fprintln(tw, "restore\tphase\tcount\tp50_ms\tp90_ms\tp95_ms\tmax_ms")
 		group := func(label string, g RestoreGroup) {
 			for _, p := range g.Phases {
-				fmt.Fprintf(tw, "%s\t%s\t%d\t%.0f\t%.0f\t%.0f\n", label, p.Phase, p.Count, p.P50MS, p.P95MS, p.MaxMS)
+				fmt.Fprintf(tw, "%s\t%s\t%d\t%.0f\t%.0f\t%.0f\t%.0f\n", label, p.Phase, p.Count, p.P50MS, p.P90MS, p.P95MS, p.MaxMS)
 			}
 			if p := g.Outside; p != nil {
-				fmt.Fprintf(tw, "%s\t%s\t%d\t%.0f\t%.0f\t%.0f\n", label, p.Phase, p.Count, p.P50MS, p.P95MS, p.MaxMS)
+				fmt.Fprintf(tw, "%s\t%s\t%d\t%.0f\t%.0f\t%.0f\t%.0f\n", label, p.Phase, p.Count, p.P50MS, p.P90MS, p.P95MS, p.MaxMS)
 			}
 			if g.Failed > 0 {
-				fmt.Fprintf(tw, "%s\tfailed\t%d\t\t\t\n", label, g.Failed)
+				fmt.Fprintf(tw, "%s\tfailed\t%d\t\t\t\t\n", label, g.Failed)
 			}
 			if g.FailedEvents > 0 {
-				fmt.Fprintf(tw, "%s\tfailed_events\t%d\t\t\t\n", label, g.FailedEvents)
+				fmt.Fprintf(tw, "%s\tfailed_events\t%d\t\t\t\t\n", label, g.FailedEvents)
 			}
 		}
 		group("first", b.First)
@@ -2944,28 +3079,28 @@ func (rep *Report) WriteMarkdown(w io.Writer) {
 
 	if rep.ScopeEnabled(schema.ScopeUserSandbox) {
 		fmt.Fprintln(w, "## Operation Latencies")
-		fmt.Fprintln(w, "| Event | Name | Count | Fail | Retried | P50 (ms) | P90 (ms) | P95 (ms) | Max (ms) |")
-		fmt.Fprintln(w, "|---|---|---:|---:|---:|---:|---:|---:|---:|")
+		fmt.Fprintln(w, "| Event | Name | Count | Fail | Retried | P50 (ms) | P90 (ms) | P95 (ms) | P99 (ms) | Max (ms) |")
+		fmt.Fprintln(w, "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
 		for _, st := range rep.Stats {
-			fmt.Fprintf(w, "| %s | %s | %d | %d | %d | %.1f | %.1f | %.1f | %.1f |\n",
-				st.Event, st.Name, st.Count, st.Failed, st.Retried, st.P50MS, st.P90MS, st.P95MS, st.MaxMS)
+			fmt.Fprintf(w, "| %s | %s | %d | %d | %d | %.1f | %.1f | %.1f | %.1f | %.1f |\n",
+				st.Event, st.Name, st.Count, st.Failed, st.Retried, st.P50MS, st.P90MS, st.P95MS, st.P99MS, st.MaxMS)
 		}
 	}
 
 	if rep.ScopeEnabled(schema.ScopeRL) && len(rep.RolloutBreakdown) > 0 {
 		fmt.Fprintln(w, "\n## Per-Step Rollout Decomposition")
-		fmt.Fprintln(w, "| Step | Tasks | P50 (ms) | P90 (ms) | P95 (ms) | P100 (ms) | Straggler Skew (p100/p50) | Barrier (ms) | LLM Think (ms) | Env Wait (ms) | Env Overhead (%) |")
-		fmt.Fprintln(w, "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+		fmt.Fprintln(w, "| Step | Tasks | P50 (ms) | P90 (ms) | P95 (ms) | P99 (ms) | P100 (ms) | Straggler Skew (p100/p50) | Barrier (ms) | LLM Think (ms) | Env Wait (ms) | Env Overhead (%) |")
+		fmt.Fprintln(w, "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 		for _, rb := range rep.RolloutBreakdown {
-			fmt.Fprintf(w, "| %d | %d | %.1f | %.1f | %.1f | %.1f | %.2f | %.1f | %.1f | %.1f | %.1f%% |\n",
-				rb.Step, rb.Tasks, rb.P50MS, rb.P90MS, rb.P95MS, rb.P100MS, rb.StragglerSkew, rb.BarrierMS, rb.LLMThinkMS, rb.EnvWaitMS, rb.EnvOverheadPct)
+			fmt.Fprintf(w, "| %d | %d | %.1f | %.1f | %.1f | %.1f | %.1f | %.2f | %.1f | %.1f | %.1f | %.1f%% |\n",
+				rb.Step, rb.Tasks, rb.P50MS, rb.P90MS, rb.P95MS, rb.P99MS, rb.P100MS, rb.StragglerSkew, rb.BarrierMS, rb.LLMThinkMS, rb.EnvWaitMS, rb.EnvOverheadPct)
 		}
 	}
 
 	if len(rep.CustomMetrics) > 0 {
 		fmt.Fprintln(w, "\n## Custom Metrics")
-		fmt.Fprintln(w, "| Metric | Count | Min | P50 | P90 | P95 | Max |")
-		fmt.Fprintln(w, "|---|---:|---:|---:|---:|---:|---:|")
+		fmt.Fprintln(w, "| Metric | Count | Min | P50 | P90 | P95 | P99 | Max |")
+		fmt.Fprintln(w, "|---|---:|---:|---:|---:|---:|---:|---:|")
 		var keys []string
 		for k := range rep.CustomMetrics {
 			keys = append(keys, k)
@@ -2973,8 +3108,8 @@ func (rep *Report) WriteMarkdown(w io.Writer) {
 		sort.Strings(keys)
 		for _, k := range keys {
 			cm := rep.CustomMetrics[k]
-			fmt.Fprintf(w, "| %s | %d | %.1f | %.1f | %.1f | %.1f | %.1f |\n",
-				k, cm.Count, cm.Min, cm.P50, cm.P90, cm.P95, cm.Max)
+			fmt.Fprintf(w, "| %s | %d | %.1f | %.1f | %.1f | %.1f | %.1f | %.1f |\n",
+				k, cm.Count, cm.Min, cm.P50, cm.P90, cm.P95, cm.P99, cm.Max)
 		}
 	}
 
@@ -3082,15 +3217,15 @@ func (rep *Report) WriteMarkdown(w io.Writer) {
 		fmt.Fprintf(w, "| Peak Acquisition Throughput | %.2f claims/s |\n", hb.PeakClaimsPerSec)
 		fmt.Fprintf(w, "| Sustained Acquisition Throughput | %.2f claims/s |\n", hb.SustainedClaimsPerSec)
 		fmt.Fprintf(w, "| Task Throughput | %.2f tasks/min |\n", hb.TasksPerMin)
-		fmt.Fprintf(w, "| TTFI (p50 / p90 / p95 / max) | %.1f / %.1f / %.1f / %.1f ms |\n", hb.TTFIP50MS, hb.TTFIP90MS, hb.TTFIP95MS, hb.TTFIMaxMS)
-		fmt.Fprintf(w, "| TTFI Sub-phase: SDK Slot Wait (p50 / p95) | %.1f / %.1f ms |\n", hb.SDKSlotWaitP50MS, hb.SDKSlotWaitP95MS)
-		fmt.Fprintf(w, "| TTFI Sub-phase: Wire Claim-to-Ready (p50 / p95) | %.1f / %.1f ms |\n", hb.WireClaimToReadyP50MS, hb.WireClaimToReadyP95MS)
-		fmt.Fprintf(w, "| TTFI Sub-phase: Ready-to-First-Command (p50 / p95) | %.1f / %.1f ms |\n", hb.ReadyToFirstCmdP50MS, hb.ReadyToFirstCmdP95MS)
-		fmt.Fprintf(w, "| Create Latency (p50 / p95) | %.1f / %.1f ms |\n", hb.CreateP50MS, hb.CreateP95MS)
-		fmt.Fprintf(w, "| Wake Latency (p50 / p95) | %.1f / %.1f ms |\n", hb.WakeP50MS, hb.WakeP95MS)
-		fmt.Fprintf(w, "| Exec Latency (p50 / p95) | %.1f / %.1f ms |\n", hb.ExecP50MS, hb.ExecP95MS)
-		fmt.Fprintf(w, "| Suspend Latency (p50 / p95) | %.1f / %.1f ms |\n", hb.SuspendP50MS, hb.SuspendP95MS)
-		fmt.Fprintf(w, "| Delete Latency (p50 / p95) | %.1f / %.1f ms |\n", hb.DeleteP50MS, hb.DeleteP95MS)
+		fmt.Fprintf(w, "| TTFI (p50 / p90 / p95 / p99 / max) | %.1f / %.1f / %.1f / %.1f / %.1f ms |\n", hb.TTFIP50MS, hb.TTFIP90MS, hb.TTFIP95MS, hb.TTFIP99MS, hb.TTFIMaxMS)
+		fmt.Fprintf(w, "| TTFI Sub-phase: SDK Slot Wait (p50 / p95 / p99) | %.1f / %.1f / %.1f ms |\n", hb.SDKSlotWaitP50MS, hb.SDKSlotWaitP95MS, hb.SDKSlotWaitP99MS)
+		fmt.Fprintf(w, "| TTFI Sub-phase: Wire Claim-to-Ready (p50 / p95 / p99) | %.1f / %.1f / %.1f ms |\n", hb.WireClaimToReadyP50MS, hb.WireClaimToReadyP95MS, hb.WireClaimToReadyP99MS)
+		fmt.Fprintf(w, "| TTFI Sub-phase: Ready-to-First-Command (p50 / p95 / p99) | %.1f / %.1f / %.1f ms |\n", hb.ReadyToFirstCmdP50MS, hb.ReadyToFirstCmdP95MS, hb.ReadyToFirstCmdP99MS)
+		fmt.Fprintf(w, "| Create Latency (p50 / p95 / p99) | %.1f / %.1f / %.1f ms |\n", hb.CreateP50MS, hb.CreateP95MS, hb.CreateP99MS)
+		fmt.Fprintf(w, "| Wake Latency (p50 / p95 / p99) | %.1f / %.1f / %.1f ms |\n", hb.WakeP50MS, hb.WakeP95MS, hb.WakeP99MS)
+		fmt.Fprintf(w, "| Exec Latency (p50 / p95 / p99) | %.1f / %.1f / %.1f ms |\n", hb.ExecP50MS, hb.ExecP95MS, hb.ExecP99MS)
+		fmt.Fprintf(w, "| Suspend Latency (p50 / p95 / p99) | %.1f / %.1f / %.1f ms |\n", hb.SuspendP50MS, hb.SuspendP95MS, hb.SuspendP99MS)
+		fmt.Fprintf(w, "| Delete Latency (p50 / p95 / p99) | %.1f / %.1f / %.1f ms |\n", hb.DeleteP50MS, hb.DeleteP95MS, hb.DeleteP99MS)
 	}
 
 	if rep.ScopeEnabled(schema.ScopeRL) && rep.RLBreakdown != nil {
@@ -3231,12 +3366,14 @@ func WriteStatsJSONL(path string, s *Report, runID, testName, tag string) error 
 		trialMeas["ttfi_p50_ms"] = st.P50MS
 		trialMeas["ttfi_p90_ms"] = st.P90MS
 		trialMeas["ttfi_p95_ms"] = st.P95MS
+		trialMeas["ttfi_p99_ms"] = st.P99MS
 		trialMeas["ttfi_max_ms"] = st.MaxMS
 	}
 	if st, ok := s.StatFor(EventWake, ""); ok {
 		trialMeas["wake_p50_ms"] = st.P50MS
 		trialMeas["wake_p90_ms"] = st.P90MS
 		trialMeas["wake_p95_ms"] = st.P95MS
+		trialMeas["wake_p99_ms"] = st.P99MS
 		trialMeas["wake_max_ms"] = st.MaxMS
 	}
 	rows = append(rows, schema.StatsRow{
@@ -3259,6 +3396,7 @@ func WriteStatsJSONL(path string, s *Report, runID, testName, tag string) error 
 			phaseMeas[st.Name+"_p50_ms"] = st.P50MS
 			phaseMeas[st.Name+"_p90_ms"] = st.P90MS
 			phaseMeas[st.Name+"_p95_ms"] = st.P95MS
+			phaseMeas[st.Name+"_p99_ms"] = st.P99MS
 			phaseMeas[st.Name+"_max_ms"] = st.MaxMS
 		}
 	}
@@ -3332,6 +3470,7 @@ func WriteStatsJSONL(path string, s *Report, runID, testName, tag string) error 
 				"p50_ms": st.P50MS,
 				"p90_ms": st.P90MS,
 				"p95_ms": st.P95MS,
+				"p99_ms": st.P99MS,
 				"max_ms": st.MaxMS,
 			},
 			Labels: lbl,
@@ -3695,6 +3834,72 @@ func WriteComparison(w io.Writer, reps []*Report, names []string) {
 		})
 	}
 	tw.Flush()
+}
+
+// WriteComparisonMarkdown writes the arm table of a strategy or client sweep,
+// one row per run: its client and strategy labels, tasks, failures, reward
+// rate, wall clock, throughput, warm-pool hit rate, peak active sandboxes,
+// standing pool and the TTFC (event="ttfi") and wake (cmd complete) percentiles;
+// then WriteComparison's text table in a code block. run-r2e-swebench.sh writes
+// it to comparison.md.
+func WriteComparisonMarkdown(w io.Writer, reps []*Report, names []string) {
+	labels := columnLabels(reps, names)
+	fmt.Fprintln(w, "# Multi-Arm Strategy & Client Chain Comparison")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "| Arm | Client | Strategy | Tasks | Failed | Reward Rate | Wall Clock (s) | Throughput (tasks/min) | Warm Hit Rate | Peak Active | Standing Pool | TTFC (cmd complete) p50/p95/p99 | Wake (cmd complete) p50/p95/p99 |")
+	fmt.Fprintln(w, "| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- |")
+	for i, r := range reps {
+		client := r.Labels["client"]
+		if client == "" {
+			client = "-"
+		}
+		strategy := r.Labels["strategy"]
+		if strategy == "" {
+			strategy = r.Mode
+		}
+		if strategy == "" {
+			strategy = "-"
+		}
+		hitRate, pool := "-", "-"
+		if r.WorkingSetHits+r.WorkingSetMisses > 0 || r.StandingPoolSize > 0 {
+			hitRate = fmt.Sprintf("%.1f%%", r.WorkingSetHitRate*100)
+			pool = strconv.Itoa(r.StandingPoolSize)
+		}
+		tpm := r.ThroughputTasksPerMin()
+		if r.Headline != nil && r.Headline.TasksPerMin > 0 {
+			tpm = r.Headline.TasksPerMin
+		}
+		fmt.Fprintf(w, "| `%s` | `%s` | `%s` | %d | %d | %.3f | %.1f | %.1f | %s | %d | %s | %s | %s |\n",
+			labels[i], client, strategy, r.Tasks, r.Failed, r.RewardRate, r.RunMS/1000, tpm,
+			hitRate, r.PeakActiveSandboxes, pool, percentileCell(r, "ttfi"), percentileCell(r, "wake"))
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "## Detailed Event Breakdown (`swebench-loader report`)")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "```text")
+	var text bytes.Buffer
+	WriteComparison(&text, reps, names)
+	fmt.Fprintln(w, strings.TrimRight(text.String(), "\n"))
+	fmt.Fprintln(w, "```")
+}
+
+// percentileCell is the p50/p95/p99 cell of the unnamed stat of event in the
+// arm table; "-" when the run has none, and no latency when no call succeeded.
+func percentileCell(r *Report, event string) string {
+	for _, s := range r.Stats {
+		if s.Event != event || s.Name != "" {
+			continue
+		}
+		if s.Count == s.Failed {
+			return fmt.Sprintf("-/-/- (n=%d, f=%d)", s.Count, s.Failed)
+		}
+		p99 := s.P99MS
+		if p99 == 0 {
+			p99 = s.P95MS
+		}
+		return fmt.Sprintf("%.0f/%.0f/%.0f ms (n=%d)", s.P50MS, s.P95MS, p99, s.Count)
+	}
+	return "-"
 }
 
 // columnLabels heads each column with its run id, or with the file name when
@@ -4122,6 +4327,7 @@ type PhaseStat struct {
 	Phase string  `json:"phase"`
 	Count int     `json:"count"`
 	P50MS float64 `json:"p50_ms"`
+	P90MS float64 `json:"p90_ms"`
 	P95MS float64 `json:"p95_ms"`
 	MaxMS float64 `json:"max_ms"`
 }
@@ -4259,7 +4465,7 @@ func phaseStats(recs []RestoreTiming) []PhaseStat {
 			continue
 		}
 		sort.Float64s(d)
-		out = append(out, PhaseStat{Phase: phase, Count: len(d), P50MS: percentile(d, 0.50), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1)})
+		out = append(out, PhaseStat{Phase: phase, Count: len(d), P50MS: percentile(d, 0.50), P90MS: percentile(d, 0.90), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1)})
 	}
 	return out
 }
@@ -4270,7 +4476,7 @@ func spanStat(name string, d []float64) *PhaseStat {
 		return nil
 	}
 	sort.Float64s(d)
-	return &PhaseStat{Phase: name, Count: len(d), P50MS: percentile(d, 0.50), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1)}
+	return &PhaseStat{Phase: name, Count: len(d), P50MS: percentile(d, 0.50), P90MS: percentile(d, 0.90), P95MS: percentile(d, 0.95), MaxMS: percentile(d, 1)}
 }
 
 // labelMatchesMode reports whether every report's mode label, where it has
@@ -4314,6 +4520,13 @@ func buildRestoreBreakdownFromSummary(rep *Report, ss map[string]schema.MetricSu
 		return nil
 	}
 	toPhaseStat := func(phase string, st schema.MetricSummary) PhaseStat {
+		p90 := st.P90
+		if p90 == 0 {
+			p90 = st.P95
+		}
+		if p90 == 0 {
+			p90 = st.Max
+		}
 		p95 := st.P95
 		if p95 == 0 {
 			p95 = st.P90
@@ -4325,6 +4538,7 @@ func buildRestoreBreakdownFromSummary(rep *Report, ss map[string]schema.MetricSu
 			Phase: phase,
 			Count: st.Count,
 			P50MS: round2(st.P50),
+			P90MS: round2(p90),
 			P95MS: round2(p95),
 			MaxMS: round2(st.Max),
 		}
@@ -4395,6 +4609,10 @@ func buildRestoreBreakdownFromSummary(rep *Report, ss map[string]schema.MetricSu
 		},
 	}
 	if evSt, ok := rep.StatFor(EventTTFI, ""); ok && evSt.Count > 0 {
+		totP90 := totalStat.P90
+		if totP90 == 0 {
+			totP90 = totalStat.P95
+		}
 		totP95 := totalStat.P95
 		if totP95 == 0 {
 			totP95 = totalStat.P90
@@ -4403,10 +4621,15 @@ func buildRestoreBreakdownFromSummary(rep *Report, ss map[string]schema.MetricSu
 			Phase: "outside",
 			Count: evSt.Count,
 			P50MS: round2(math.Max(0, evSt.P50MS-totalStat.P50)),
+			P90MS: round2(math.Max(0, evSt.P90MS-totP90)),
 			P95MS: round2(math.Max(0, evSt.P95MS-totP95)),
 			MaxMS: round2(math.Max(0, evSt.MaxMS-totalStat.Max)),
 		}
 	} else if evSt, ok := rep.StatFor(EventCreate, ""); ok && evSt.Count > 0 {
+		totP90 := totalStat.P90
+		if totP90 == 0 {
+			totP90 = totalStat.P95
+		}
 		totP95 := totalStat.P95
 		if totP95 == 0 {
 			totP95 = totalStat.P90
@@ -4415,6 +4638,7 @@ func buildRestoreBreakdownFromSummary(rep *Report, ss map[string]schema.MetricSu
 			Phase: "outside",
 			Count: evSt.Count,
 			P50MS: round2(math.Max(0, evSt.P50MS-totalStat.P50)),
+			P90MS: round2(math.Max(0, evSt.P90MS-totP90)),
 			P95MS: round2(math.Max(0, evSt.P95MS-totP95)),
 			MaxMS: round2(math.Max(0, evSt.MaxMS-totalStat.Max)),
 		}
@@ -4427,6 +4651,7 @@ func buildRestoreBreakdownFromSummary(rep *Report, ss map[string]schema.MetricSu
 					Phase: "worker_restore",
 					Count: wakeSt.Count,
 					P50MS: wakeSt.P50MS,
+					P90MS: wakeSt.P90MS,
 					P95MS: wakeSt.P95MS,
 					MaxMS: wakeSt.MaxMS,
 				},
@@ -4434,6 +4659,7 @@ func buildRestoreBreakdownFromSummary(rep *Report, ss map[string]schema.MetricSu
 					Phase: "total",
 					Count: wakeSt.Count,
 					P50MS: wakeSt.P50MS,
+					P90MS: wakeSt.P90MS,
 					P95MS: wakeSt.P95MS,
 					MaxMS: wakeSt.MaxMS,
 				},

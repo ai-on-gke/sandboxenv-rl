@@ -142,6 +142,9 @@ func TestMultiWorkerShardMergeAndExactPercentiles(t *testing.T) {
 	if ttfi.P95MS != 7000.0 {
 		t.Errorf("ttfi.P95MS = %v, want exact combined 7000.0", ttfi.P95MS)
 	}
+	if ttfi.P99MS != 7000.0 {
+		t.Errorf("ttfi.P99MS = %v, want exact combined 7000.0", ttfi.P99MS)
+	}
 	if ttfi.MaxMS != 7000.0 {
 		t.Errorf("ttfi.MaxMS = %v, want 7000.0", ttfi.MaxMS)
 	}

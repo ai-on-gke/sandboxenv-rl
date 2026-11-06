@@ -9,7 +9,9 @@ Use this skill when asked to measure startup, restore, wake or density on Substr
 model: the Fast, ML Bench, high-cardinality and density rows of the RL benchmark plan. For
 hooking up a real RL recipe or the `bench` harness and its bundles, use `benchmarking/SKILL.md`.
 For which run shape measures what, read "Cold boot, cold and warm restore, suspend and wake" in
-`README.md` in this directory; this skill does not repeat it.
+`README.md` in this directory; this skill does not repeat it. For a mixed two-shard R2E-Gym and
+SWE-bench run with configurable concurrency, image count, and rollouts per image, use
+[`./r2e-swebench/SKILL.md`](./r2e-swebench/SKILL.md).
 
 ## 1. Check the cluster before the first run
 

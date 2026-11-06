@@ -24,6 +24,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -72,6 +73,8 @@ func runMain(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "run":
 		err = runCmd(args[1:])
+	case "render-plan":
+		err = renderPlanCmd(args[1:])
 	case "resolve":
 		err = resolveCmd(args[1:])
 	case "plan-placement":
@@ -275,7 +278,117 @@ func idsDigest(ids []string) string {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, "usage: swebench-loader run [flags] | swebench-loader resolve [flags] | swebench-loader plan-placement [flags] | swebench-loader preflight [flags] | swebench-loader convert-trace [flags] | swebench-loader report FILE... [-json OUT] | swebench-loader trajectory-assets FILE")
+	fmt.Fprintln(w, "usage: swebench-loader run [flags] | swebench-loader render-plan [flags] | swebench-loader resolve [flags] | swebench-loader plan-placement [flags] | swebench-loader preflight [flags] | swebench-loader convert-trace [flags] | swebench-loader report FILE... [-json OUT] | swebench-loader trajectory-assets FILE")
+}
+
+func renderPlanCmd(args []string) error {
+	fs := flag.NewFlagSet("render-plan", flag.ContinueOnError)
+	var (
+		dataset     = fs.String("dataset", "", "JSONL manifest of instances; a path or an https URL. Required.")
+		images      = fs.Int("images", 0, "Use the first N instances of the dataset; 0 means all.")
+		instances   = fs.String("instances", "", "Comma-separated instance ids to use instead of the first N.")
+		excludeFile = fs.String("exclude-file", "", "File of instance ids to leave out, one per line.")
+		trajectory  = fs.String("trajectory", swebench.DefaultTrajectory, fmt.Sprintf("Trajectory file or built-in name (%s); a comma-separated list mixes them.", strings.Join(swebench.Names(), ", ")))
+		seed        = fs.Int64("seed", 1, "Seed for trajectory mix assignment.")
+		fanout      = fs.Int("fanout", 1, "Rollouts / tasks per image when rendering a trajectory mix.")
+		out         = fs.String("out", "", "Output path for rendered plan JSON. Required.")
+		vars        = labelFlags{}
+	)
+	fs.Var(vars, "set", "KEY=VALUE for the trajectories' var function, repeatable.")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dataset == "" {
+		return fmt.Errorf("-dataset is required")
+	}
+	if *out == "" {
+		return fmt.Errorf("-out is required")
+	}
+	all, err := swebench.LoadDataset(*dataset)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	if *instances != "" {
+		ids = strings.Split(*instances, ",")
+	}
+	var exclude []string
+	if *excludeFile != "" {
+		if exclude, err = swebench.ReadIDList(*excludeFile); err != nil {
+			return err
+		}
+	}
+	selected, err := swebench.Select(all, ids, exclude, *images)
+	if err != nil {
+		return err
+	}
+	if *images > 0 && len(selected) < *images && len(ids) == 0 {
+		fmt.Fprintf(os.Stderr, "note: %d instances requested, %d available after the exclude list\n", *images, len(selected))
+	}
+	trajSpec := *trajectory
+	if trajSpec == swebench.DefaultTrajectory && len(selected) > 0 && selected[0].Kind == swebench.CommandKind {
+		trajSpec = swebench.CommandTrajectoryName
+	}
+	var trajs []*swebench.Trajectory
+	for _, source := range strings.Split(trajSpec, ",") {
+		if source = strings.TrimSpace(source); source == "" {
+			continue
+		}
+		t, err := swebench.LoadTrajectory(source)
+		if err != nil {
+			return err
+		}
+		t.Vars = vars
+		if err := swebench.RequireGrading(selected, t); err != nil {
+			return err
+		}
+		for _, in := range selected {
+			if _, err := t.Render(in); err != nil {
+				return err
+			}
+		}
+		trajs = append(trajs, t)
+	}
+	if len(trajs) == 0 {
+		return fmt.Errorf("-trajectory names no trajectory")
+	}
+	effective := map[string]string{}
+	if len(selected) > 0 {
+		for _, t := range trajs {
+			u, err := t.VarsUsed(selected[0])
+			if err != nil {
+				return err
+			}
+			maps.Copy(effective, u)
+		}
+	}
+	for _, k := range slices.Sorted(maps.Keys(vars)) {
+		if _, ok := effective[k]; !ok {
+			return fmt.Errorf("-set %s: no trajectory reads it (they read: %s)", k, strings.Join(slices.Sorted(maps.Keys(effective)), ", "))
+		}
+	}
+	var excludeLbl, instancesLbl string
+	if *excludeFile != "" {
+		excludeLbl = filepath.Base(*excludeFile) + "@" + idsDigest(exclude)
+	}
+	if len(ids) > 0 {
+		instancesLbl = strconv.Itoa(len(ids)) + "@" + idsDigest(ids)
+	}
+	plan, err := swebench.BuildRenderedPlan(
+		*dataset,
+		datasetLabel(*dataset),
+		excludeLbl,
+		instancesLbl,
+		selected,
+		trajs,
+		*seed,
+		*fanout,
+		effective,
+	)
+	if err != nil {
+		return err
+	}
+	return swebench.WriteRenderedPlan(*out, plan)
 }
 
 // planPlacementCmd writes image-placement.json: which placement domains hold
@@ -687,65 +800,111 @@ func resolveCmd(args []string) error {
 func runCmd(args []string) (retErr error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	var (
-		backendFlag   = fs.String("backend", "substrate", "Backend driver: substrate | agent-sandbox.")
-		accessFlag    = fs.String("access", "ate-env-api", "Access path: ate-env-api | direct | sdk.")
-		endpoint      = fs.String("endpoint", "localhost:7777", "ate-env API or Agent Sandbox gateway address (host:port or URL).")
-		controlAddr   = fs.String("control-addr", "", "Direct Substrate control plane address (defaults to -endpoint when -access=direct).")
-		routerAddr    = fs.String("router-addr", "", "Direct Substrate atenet router address (when -access=direct).")
-		warmPool      = fs.String("warm-pool", "", "SandboxWarmPool name (when -backend=agent-sandbox).")
-		connections   = fs.Int("connections", 4, "gRPC connections to the API, handed out round-robin per environment; a Service balances per connection, so use at least the number of API replicas.")
-		atespace      = fs.String("atespace", "ate-env", "Atespace the environments are created in.")
-		baseTemplate  = fs.String("base-template", "default-template", "Base ActorTemplate the per-image templates derive from (ate-env manifest template).")
-		dataset       = fs.String("dataset", "", "JSONL manifest of SWE-bench instances; a path or an https URL. Required.")
-		images        = fs.Int("images", 0, "Use the first N instances of the dataset; 0 means all.")
-		instances     = fs.String("instances", "", "Comma-separated instance ids to use instead of the first N.")
-		excludeFile   = fs.String("exclude-file", "", "File of instance ids to leave out, one per line; text after the id is a comment.")
-		trajectory    = fs.String("trajectory", swebench.DefaultTrajectory, fmt.Sprintf("Trajectory file or built-in name (%s); a comma-separated list mixes them, one per environment, drawn with -seed.", strings.Join(swebench.Names(), ", ")))
-		seed          = fs.Int64("seed", 1, "Seed for the trajectory mix and schedule/open-loop RNG, so reps assign the same trajectory to the same environment.")
-		mode          = fs.String("mode", string(swebench.ModeEval), "eval, steps, or open-loop (Poisson arrivals at -arrival-rate).")
-		width         = fs.Int("width", 50, "Most tasks in flight at once.")
-		arrivalRate   = fs.Float64("arrival-rate", 0, "open-loop: Poisson task arrival rate in tasks/sec.")
-		tasksPerImage = fs.Int("tasks-per-image", 1, "eval: replays per image.")
-		rollouts      = fs.Int("rollouts", 2, "steps: environments per image.")
-		steps         = fs.Int("steps", 8, "steps: training steps.")
-		park          = fs.String("park", string(swebench.ParkSuspend), "steps: what happens between steps. suspend and suspend-sync are durable: the call returns once the snapshot is in object storage. suspend-async is local: the call returns once the snapshot is on the node and the upload goes on in the background. fork replaces each environment per step (through ate-env-api a new environment created from the image; with -access direct a fork of its base) and parks it locally. delete deletes, and the next step creates again. none keeps the fleet running. Through ate-env-api a local suspend needs a server that serves suspend_mode, which the run checks before it starts.")
-		imagesPerStep = fs.Int("images-per-step", 0, "steps: each step takes the next N images (wrapping around the dataset) with fresh environments, retired after the step: the create-and-retire-pools-per-step shape; needs -park delete. 0 keeps one fleet across the steps.")
-		parkEach      = fs.Bool("park-each", false, "steps: park each environment as soon as its step ends instead of after the whole fleet's step, so at most -width are awake at once and the fleet can be larger than the running slots; the barrier then includes the parking.")
-		schedulePath  = fs.String("schedule", "", "steps: path to a pre-resolved schedule.json.")
-		resolveOut    = fs.String("resolve-out", "", "steps: write the resolved schedule.json to this path before running.")
-		tasksPerStep  = fs.Int("tasks-per-step", 0, "steps: tasks sampled per step when resolving a schedule (0 means all selected instances).")
-		groupSize     = fs.Int("group-size", 0, "steps: group size per sampled task when resolving a schedule (0 uses -rollouts).")
-		stepPause     = fs.Duration("step-pause", 0, "steps: simulated trainer pause between steps.")
-		prefetch      = fs.Bool("prefetch", false, "steps: asynchronously prewarm next step's prefetch_images off the critical path.")
-		placementPath = fs.String("placement", "", "image-placement.json from plan-placement: each create carries the worker selector of one of its image's domains, round-robin, so environments land where the pre-flight put the image. ate-env API backend only.")
-		createTimeout = fs.Duration("create-timeout", 5*time.Minute, "Deadline for one create call.")
-		stepTimeout   = fs.Duration("step-timeout", 10*time.Minute, "Default deadline for a run step without its own timeout.")
-		wakeBudget    = fs.Duration("wake-budget", 3*time.Minute, "How long a task's first command is retried while the environment is still waking or its image is still being baked.")
-		wakeBackoff   = fs.Duration("wake-backoff", swebench.DefaultWakeBackoff, "Initial pause between wake retries; doubles up to five times this.")
-		deleteRate    = fs.Float64("delete-rate", swebench.DefaultDeleteRate, "Most environment deletes per second per loader process, through ate-env-api; the bucket rate-limits snapshot deletes, and a delete it refuses is retried with backoff for up to two minutes. 0 removes the cap. Recorded as the delete_rate label.")
-		runID         = fs.String("run-id", "", "Run id, prefix of every environment name: lowercase letters, digits and '-', at most 20 characters; default swe-<unix time>.")
-		out           = fs.String("out", "", "JSONL events file; default <run-id>.jsonl in the working directory.")
-		eventsDir     = fs.String("events-dir", "", "Optional base directory for per-worker event shards (events/<worker>.jsonl).")
-		worker        = fs.String("worker", "", "Optional worker shard name stamped on emitted events.")
-		jobName       = fs.String("job", "", "Optional job name stamped on emitted events.")
-		runWindow     = fs.String("run-window", "", "Optional path to write run_window.json.")
-		statsOut      = fs.String("stats-out", "", "Optional path to write flat stats.jsonl rows after the run.")
-		testName      = fs.String("test-name", "", "Optional test_name for run_window.json and stats.jsonl.")
-		tag           = fs.String("tag", "", "Optional tag for run_window.json and stats.jsonl.")
-		validate      = fs.Bool("validate", false, "Evaluate Validity Rules 1-7 after the run and fail if invalid.")
-		convertTrace  = fs.String("convert-trace", "", "Convert a trace.jsonl file into schedule.json and trajectory.yaml before running (or exit if -dataset is omitted).")
-		traceOut      = fs.String("trace-out", "", "Output directory for -convert-trace artifacts.")
-		keep          = fs.Bool("keep", false, "Leave the environments in place when the run ends.")
-		dryRun        = fs.Bool("dry-run", false, "Load and render everything, print the plan and exit without touching the API.")
-		authTokenFile = fs.String("auth-token-file", "", "File that holds the bearer token for ate-env-api; surrounding whitespace is ignored. Without it, SUBSTRATE_ENV_AUTH_TOKEN is used when set.")
-		labels        = labelFlags{}
-		vars          = labelFlags{}
-		enableTracing = fs.Bool("enable-tracing", false, "Also export every event as an OpenTelemetry span over OTLP/gRPC, configured by OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_EXPORTER_OTLP_INSECURE, all under one swebench-loader.run span per run. The JSONL is the same either way.")
+		backendFlag      = fs.String("backend", "substrate", "Backend driver: substrate | agent-sandbox.")
+		accessFlag       = fs.String("access", "ate-env-api", "Access path: ate-env-api | direct | sdk.")
+		endpoint         = fs.String("endpoint", "localhost:7777", "ate-env API or Agent Sandbox gateway address (host:port or URL).")
+		controlAddr      = fs.String("control-addr", "", "Direct Substrate control plane address (defaults to -endpoint when -access=direct).")
+		routerAddr       = fs.String("router-addr", "", "Direct Substrate atenet router address (when -access=direct).")
+		atenetClientCert = fs.String("atenet-client-cert", "", "Path to client TLS cert+key bundle for atenet-router mTLS (when -access=direct).")
+		atenetCAFile     = fs.String("atenet-ca-file", "", "Path to CA trust bundle for atenet-router TLS (when -access=direct).")
+		atenetServerName = fs.String("atenet-server-name", "atenet-router.ate-system.svc", "TLS server name for atenet-router verification (when -access=direct).")
+		ateapiTokenFile  = fs.String("ateapi-token-file", "", "Path to bearer token file for direct Substrate ateapi RPCs (when -access=direct).")
+		ateapiCAFile     = fs.String("ateapi-ca-file", "", "Path to CA trust bundle for direct Substrate ateapi TLS verification (when -access=direct).")
+		ateapiSkipVerify = fs.Bool("ateapi-skip-verify", true, "Skip TLS certificate verification on direct Substrate ateapi RPCs when -ateapi-ca-file is unset.")
+		warmPool         = fs.String("warm-pool", "", "SandboxWarmPool name (when -backend=agent-sandbox).")
+		connections      = fs.Int("connections", 4, "gRPC connections to the API, handed out round-robin per environment; a Service balances per connection, so use at least the number of API replicas.")
+		atespace         = fs.String("atespace", "ate-env", "Atespace the environments are created in.")
+		baseTemplate     = fs.String("base-template", "default-template", "Base ActorTemplate the per-image templates derive from (ate-env manifest template).")
+		dataset          = fs.String("dataset", "", "JSONL manifest of SWE-bench instances; a path or an https URL. Required.")
+		images           = fs.Int("images", 0, "Use the first N instances of the dataset; 0 means all.")
+		instances        = fs.String("instances", "", "Comma-separated instance ids to use instead of the first N.")
+		excludeFile      = fs.String("exclude-file", "", "File of instance ids to leave out, one per line; text after the id is a comment.")
+		trajectory       = fs.String("trajectory", swebench.DefaultTrajectory, fmt.Sprintf("Trajectory file or built-in name (%s); a comma-separated list mixes them, one per environment, drawn with -seed.", strings.Join(swebench.Names(), ", ")))
+		seed             = fs.Int64("seed", 1, "Seed for the trajectory mix and schedule/open-loop RNG, so reps assign the same trajectory to the same environment.")
+		mode             = fs.String("mode", string(swebench.ModeEval), "eval, steps, or open-loop (Poisson arrivals at -arrival-rate).")
+		strategy         = fs.String("strategy", "", "Warm-pool orchestration strategy: none, naive, sliding, or pipelined (matches Python SandboxFleet).")
+		windowSize       = fs.Int("window-size", 0, "sliding/pipelined: distinct images per warm window (0 chooses min(8, ceil(images/2))).")
+		width            = fs.Int("width", 50, "Most tasks in flight at once.")
+		arrivalRate      = fs.Float64("arrival-rate", 0, "open-loop: Poisson task arrival rate in tasks/sec.")
+		tasksPerImage    = fs.Int("tasks-per-image", 1, "eval: replays per image.")
+		rollouts         = fs.Int("rollouts", 2, "steps: environments per image.")
+		steps            = fs.Int("steps", 8, "steps: training steps.")
+		park             = fs.String("park", string(swebench.ParkSuspend), "steps: what happens between steps. suspend and suspend-sync are durable: the call returns once the snapshot is in object storage. suspend-async is local: the call returns once the snapshot is on the node and the upload goes on in the background. fork replaces each environment per step (through ate-env-api a new environment created from the image; with -access direct a fork of its base) and parks it locally. delete deletes, and the next step creates again. none keeps the fleet running. Through ate-env-api a local suspend needs a server that serves suspend_mode, which the run checks before it starts.")
+		imagesPerStep    = fs.Int("images-per-step", 0, "steps: each step takes the next N images (wrapping around the dataset) with fresh environments, retired after the step: the create-and-retire-pools-per-step shape; needs -park delete. 0 keeps one fleet across the steps.")
+		parkEach         = fs.Bool("park-each", false, "steps: park each environment as soon as its step ends instead of after the whole fleet's step, so at most -width are awake at once and the fleet can be larger than the running slots; the barrier then includes the parking.")
+		schedulePath     = fs.String("schedule", "", "steps: path to a pre-resolved schedule.json.")
+		resolveOut       = fs.String("resolve-out", "", "steps: write the resolved schedule.json to this path before running.")
+		tasksPerStep     = fs.Int("tasks-per-step", 0, "steps: tasks sampled per step when resolving a schedule (0 means all selected instances).")
+		groupSize        = fs.Int("group-size", 0, "steps: group size per sampled task when resolving a schedule (0 uses -rollouts).")
+		stepPause        = fs.Duration("step-pause", 0, "steps: simulated trainer pause between steps.")
+		prefetch         = fs.Bool("prefetch", false, "steps: asynchronously prewarm next step's prefetch_images off the critical path.")
+		placementPath    = fs.String("placement", "", "image-placement.json from plan-placement: each create carries the worker selector of one of its image's domains, round-robin, so environments land where the pre-flight put the image. ate-env API backend only.")
+		createTimeout    = fs.Duration("create-timeout", 5*time.Minute, "Deadline for one create call.")
+		stepTimeout      = fs.Duration("step-timeout", 10*time.Minute, "Default deadline for a run step without its own timeout.")
+		wakeBudget       = fs.Duration("wake-budget", 3*time.Minute, "How long a task's first command is retried while the environment is still waking or its image is still being baked.")
+		wakeBackoff      = fs.Duration("wake-backoff", swebench.DefaultWakeBackoff, "Initial pause between wake retries; doubles up to five times this.")
+		deleteRate       = fs.Float64("delete-rate", swebench.DefaultDeleteRate, "Most environment deletes per second per loader process, through ate-env-api; the bucket rate-limits snapshot deletes, and a delete it refuses is retried with backoff for up to two minutes. 0 removes the cap. Recorded as the delete_rate label.")
+		runID            = fs.String("run-id", "", "Run id, prefix of every environment name: lowercase letters, digits and '-', at most 20 characters; default swe-<unix time>.")
+		out              = fs.String("out", "", "JSONL events file; default <run-id>.jsonl in the working directory.")
+		eventsDir        = fs.String("events-dir", "", "Optional base directory for per-worker event shards (events/<worker>.jsonl).")
+		worker           = fs.String("worker", "", "Optional worker shard name stamped on emitted events.")
+		jobName          = fs.String("job", "", "Optional job name stamped on emitted events.")
+		runWindow        = fs.String("run-window", "", "Optional path to write run_window.json.")
+		statsOut         = fs.String("stats-out", "", "Optional path to write flat stats.jsonl rows after the run.")
+		testName         = fs.String("test-name", "", "Optional test_name for run_window.json and stats.jsonl.")
+		tag              = fs.String("tag", "", "Optional tag for run_window.json and stats.jsonl.")
+		validate         = fs.Bool("validate", false, "Evaluate Validity Rules 1-7 after the run and fail if invalid.")
+		convertTrace     = fs.String("convert-trace", "", "Convert a trace.jsonl file into schedule.json and trajectory.yaml before running (or exit if -dataset is omitted).")
+		traceOut         = fs.String("trace-out", "", "Output directory for -convert-trace artifacts.")
+		keep             = fs.Bool("keep", false, "Leave the environments in place when the run ends.")
+		dryRun           = fs.Bool("dry-run", false, "Load and render everything, print the plan and exit without touching the API.")
+		authTokenFile    = fs.String("auth-token-file", "", "File that holds the bearer token for ate-env-api; surrounding whitespace is ignored. Without it, SUBSTRATE_ENV_AUTH_TOKEN is used when set.")
+		labels           = labelFlags{}
+		vars             = labelFlags{}
+		enableTracing    = fs.Bool("enable-tracing", false, "Also export every event as an OpenTelemetry span over OTLP/gRPC, configured by OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_EXPORTER_OTLP_INSECURE, all under one swebench-loader.run span per run. The JSONL is the same either way.")
 	)
 	fs.Var(vars, "set", "KEY=VALUE for the trajectories' var function, repeatable, e.g. READ_FILE=/testbed/setup.py or COMPILE_DIR=/testbed; a workload's defaults are in its file. A key no trajectory reads is an error; each value is recorded as a set.KEY label.")
 	fs.Var(labels, "label", "KEY=VALUE recorded on the run event, repeatable: the Substrate commit, the cluster, the arm. The loader records its own flags itself (mode, width, images, trajectory, dataset, the shape flags, connections, base-template, exclude-file, instances and the timeouts); a -label with one of those keys is refused, so report -arm can trust them.")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	visited := map[string]bool{}
+	fs.Visit(func(fl *flag.Flag) {
+		visited[fl.Name] = true
+	})
+	if err := swebench.ValidateStrategy(swebench.Strategy(*strategy)); err != nil {
+		return err
+	}
+	if *windowSize < 0 {
+		return fmt.Errorf("-window-size must be >= 0, got %d", *windowSize)
+	}
+	if *windowSize > 0 && swebench.Strategy(*strategy) != swebench.StrategySliding && swebench.Strategy(*strategy) != swebench.StrategyPipelined {
+		return fmt.Errorf("-window-size applies to -strategy sliding or pipelined")
+	}
+	if *strategy != "" {
+		if swebench.Mode(*mode) == swebench.ModeOpenLoop {
+			return fmt.Errorf("-strategy applies to -mode eval or steps, not open-loop")
+		}
+		if visited["rollouts"] && !visited["tasks-per-image"] && swebench.Mode(*mode) == swebench.ModeEval {
+			*tasksPerImage = *rollouts
+		}
+		// A strategy owns the lifecycle: it parks by suspend (delete for
+		// none) and runs one pass. The step loop's flags would be recorded
+		// as labels of a run that never acted on them, so they are refused.
+		for _, name := range []string{"park", "step-pause", "park-each", "images-per-step", "prefetch", "schedule"} {
+			if visited[name] {
+				return fmt.Errorf("-%s belongs to the step loop; -strategy %s parks by %s and runs one pass (omit -%s)",
+					name, *strategy, strategyPark(swebench.Strategy(*strategy)), name)
+			}
+		}
+		if swebench.Mode(*mode) == swebench.ModeSteps {
+			if !visited["steps"] {
+				*steps = 1
+			} else if *steps > 1 {
+				return fmt.Errorf("-strategy is single-pass (requires -steps 1 in steps mode; omit -strategy for multi-step reset loops)")
+			}
+			*park = string(strategyPark(swebench.Strategy(*strategy)))
+		}
 	}
 	if *convertTrace != "" {
 		targetDir := *traceOut
@@ -883,10 +1042,50 @@ func runCmd(args []string) (retErr error) {
 	if *imagesPerStep > 0 {
 		environments = *imagesPerStep * fanout // per step
 	}
-	log.Info("plan", slog.String("run", *runID), slog.String("mode", *mode), slog.Int("images", len(selected)),
+	log.Info("plan", slog.String("run", *runID), slog.String("mode", *mode),
+		slog.String("strategy", *strategy), slog.Int("window_size", *windowSize),
+		slog.Int("images", len(selected)),
 		slog.Int("images_per_step", *imagesPerStep),
 		slog.Int("environments", environments), slog.Int("width", *width), slog.Int("steps", *steps),
 		slog.String("park", *park), slog.String("trajectory", *trajectory), slog.String("out", *out))
+	cfg := swebench.Config{
+		RunID:         *runID,
+		Dataset:       *dataset,
+		Instances:     selected,
+		Trajectory:    traj,
+		Trajectories:  trajs,
+		Seed:          *seed,
+		Logger:        log,
+		Mode:          swebench.Mode(*mode),
+		Strategy:      swebench.Strategy(*strategy),
+		WindowSize:    *windowSize,
+		Width:         *width,
+		ArrivalRate:   *arrivalRate,
+		TasksPerImage: *tasksPerImage,
+		Rollouts:      *rollouts,
+		Steps:         *steps,
+		Park:          swebench.Park(*park),
+		ImagesPerStep: *imagesPerStep,
+		ParkEach:      *parkEach,
+		Schedule:      sched,
+		TasksPerStep:  *tasksPerStep,
+		GroupSize:     *groupSize,
+		StepPause:     *stepPause,
+		Prefetch:      *prefetch,
+		CreateTimeout: *createTimeout,
+		StepTimeout:   *stepTimeout,
+		WakeBudget:    *wakeBudget,
+		WakeBackoff:   *wakeBackoff,
+		Keep:          *keep,
+		Labels:        labels,
+		Invocation:    ownLabels(*dataset, *connections, *deleteRate, *baseTemplate, *excludeFile, *placementPath, exclude, ids, effective),
+	}
+	// The checks Run makes before it touches the API, here so -dry-run makes
+	// them too: the run id, the longest actor name against Substrate's 63
+	// characters, the -label keys, and the mode, strategy and park flags.
+	if err := swebench.ValidateConfig(cfg); err != nil {
+		return err
+	}
 	// The placement plan is read and checked before -dry-run returns and
 	// whatever backend runs, so a dry run and the CLI tests see its errors.
 	var placement *schema.ImagePlacement
@@ -910,19 +1109,29 @@ func runCmd(args []string) (retErr error) {
 	if testBackendOverride != nil {
 		backend = testBackendOverride
 	} else {
+		var skipVerifyPtr *bool
+		if visited["ateapi-skip-verify"] {
+			skipVerifyPtr = ateapiSkipVerify
+		}
 		drv, closer, err := swebench.NewBackendDriver(swebench.BackendDriverOptions{
-			Backend:      *backendFlag,
-			Access:       *accessFlag,
-			Endpoint:     *endpoint,
-			ControlAddr:  *controlAddr,
-			RouterAddr:   *routerAddr,
-			Atespace:     *atespace,
-			BaseTemplate: *baseTemplate,
-			WarmPool:     *warmPool,
-			Connections:  *connections,
-			AuthToken:    authToken,
-			DeleteRate:   *deleteRate,
-			Placement:    placement,
+			Backend:          *backendFlag,
+			Access:           *accessFlag,
+			Endpoint:         *endpoint,
+			ControlAddr:      *controlAddr,
+			RouterAddr:       *routerAddr,
+			AtenetClientCert: *atenetClientCert,
+			AtenetCAFile:     *atenetCAFile,
+			AtenetServerName: *atenetServerName,
+			AteapiTokenFile:  *ateapiTokenFile,
+			AteapiCAFile:     *ateapiCAFile,
+			AteapiSkipVerify: skipVerifyPtr,
+			Atespace:         *atespace,
+			BaseTemplate:     *baseTemplate,
+			WarmPool:         *warmPool,
+			Connections:      *connections,
+			AuthToken:        authToken,
+			DeleteRate:       *deleteRate,
+			Placement:        placement,
 		})
 		if err != nil {
 			return err
@@ -985,38 +1194,9 @@ func runCmd(args []string) (retErr error) {
 	defer stop()
 
 	startTS := time.Now().UTC()
-	sum, err := swebench.Run(ctx, swebench.Config{
-		RunID:         *runID,
-		Dataset:       *dataset,
-		Backend:       backend,
-		Instances:     selected,
-		Trajectory:    traj,
-		Trajectories:  trajs,
-		Seed:          *seed,
-		Recorder:      rec,
-		Logger:        log,
-		Mode:          swebench.Mode(*mode),
-		Width:         *width,
-		ArrivalRate:   *arrivalRate,
-		TasksPerImage: *tasksPerImage,
-		Rollouts:      *rollouts,
-		Steps:         *steps,
-		Park:          swebench.Park(*park),
-		ImagesPerStep: *imagesPerStep,
-		ParkEach:      *parkEach,
-		Schedule:      sched,
-		TasksPerStep:  *tasksPerStep,
-		GroupSize:     *groupSize,
-		StepPause:     *stepPause,
-		Prefetch:      *prefetch,
-		CreateTimeout: *createTimeout,
-		StepTimeout:   *stepTimeout,
-		WakeBudget:    *wakeBudget,
-		WakeBackoff:   *wakeBackoff,
-		Keep:          *keep,
-		Labels:        labels,
-		Invocation:    ownLabels(*dataset, *connections, *deleteRate, *baseTemplate, *excludeFile, *placementPath, exclude, ids, effective),
-	})
+	cfg.Backend = backend
+	cfg.Recorder = rec
+	sum, err := swebench.Run(ctx, cfg)
 	endTS := time.Now().UTC()
 	_ = rec.Flush()
 
@@ -1072,6 +1252,15 @@ func runCmd(args []string) (retErr error) {
 	return nil
 }
 
+// strategyPark is the park policy a strategy run reports: none deletes each
+// environment after its replay, the others suspend into the warm pool.
+func strategyPark(s swebench.Strategy) swebench.Park {
+	if s == swebench.StrategyNone {
+		return swebench.ParkDelete
+	}
+	return swebench.ParkSuspend
+}
+
 func reportCmd(args []string, ws ...io.Writer) error {
 	var stdout io.Writer = os.Stdout
 	if len(ws) > 0 && ws[0] != nil {
@@ -1092,7 +1281,7 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 		eventsGlob     = fs.String("events-glob", "", "Glob pattern for multi-worker event shards (e.g. 'events/*.jsonl').")
 		jsonOut        = fs.String("json", "", "Also write the summary as JSON to this path (an array when several files are given).")
 		out            = fs.String("out", "", "Alias for -json: write the summary as JSON to this path.")
-		mdOut          = fs.String("md", "", "Optional path to write Markdown report (including ## Validity).")
+		mdOut          = fs.String("md", "", "Optional path to write a Markdown report: one run's report (including ## Validity); for several runs the arm table over the text comparison, or with -thresholds the regression verdict.")
 		unresolved     = fs.String("unresolved", "", "Write the unresolved instances to this path in -exclude-file format; one file only.")
 		unresNote      = fs.String("unresolved-note", "Instances graded unresolved", "First comment line of the -unresolved file.")
 		cacheBefore    = fs.String("cache-before", "", "Node cache sample taken before the run (benchmarking/swebench/sample-node-cache.sh); with -cache-after, the report adds the run's cache misses. One file only.")
@@ -1226,6 +1415,13 @@ func reportCmdWithIO(args []string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("-unresolved, -cache-before, -cache-after, -restore-log, -preflight-coverage and -top take one events file")
 		}
 		swebench.WriteComparison(stdout, reps, labels)
+		if *mdOut != "" && *thresholds == "" {
+			var md bytes.Buffer
+			swebench.WriteComparisonMarkdown(&md, reps, labels)
+			if err := os.WriteFile(*mdOut, md.Bytes(), 0o644); err != nil {
+				return err
+			}
+		}
 		if *thresholds != "" {
 			th, err := swebench.LoadThresholds(*thresholds)
 			if err != nil {

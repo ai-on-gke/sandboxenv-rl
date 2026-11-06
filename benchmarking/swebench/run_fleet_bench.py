@@ -385,7 +385,7 @@ def _load_standalone_plan(
                 cmd_steps: list[dict[str, Any]] = [
                     {
                         "name": "write-grade",
-                        "write": {"path": "/tmp/ate-cmd-grade.sh", "content": cmd, "mode": "0755"},
+                        "write": {"path": "/tmp/ate-cmd-grade.sh", "content": cmd},
                     },
                     {
                         "name": "grade",

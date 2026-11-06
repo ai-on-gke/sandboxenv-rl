@@ -120,7 +120,9 @@ func (s *recipeFakeSandbox) Run(_ context.Context, command string, _ time.Durati
 		if !ok {
 			return swebench.Result{ExitCode: 127, Stderr: "missing /tmp/r2e-grade.sh\n"}, nil
 		}
-		if f.mode.Perm() != 0o755 {
+		// /bin/bash reads the script; the write step sets no mode, so the
+		// WriteSpec default applies (and the Python arm runs no chmod).
+		if f.mode.Perm() != 0o644 {
 			return swebench.Result{ExitCode: 126, Stderr: fmt.Sprintf("unexpected mode %o\n", f.mode.Perm())}, nil
 		}
 		if !strings.Contains(string(f.content), "run_tests.sh") {

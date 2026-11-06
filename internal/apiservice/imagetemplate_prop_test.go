@@ -46,6 +46,20 @@ func genRepo() *rapid.Generator[string] {
 	})
 }
 
+// genDigestLike draws a digest equal to d, one sharing d's first
+// imageTemplateDigestLen hex digits, or an unrelated one. Independent draws
+// almost never collide (16^12 prefixes), so a property about equal or
+// colliding digests needs them drawn on purpose.
+func genDigestLike(d string) *rapid.Generator[string] {
+	return rapid.OneOf(
+		rapid.Just(d),
+		rapid.Custom(func(t *rapid.T) string {
+			return d[:imageTemplateDigestLen] + genDigest().Draw(t, "tail")[imageTemplateDigestLen:]
+		}),
+		genDigest(),
+	)
+}
+
 func genShortName(maxLen int) *rapid.Generator[string] {
 	return rapid.Custom(func(t *rapid.T) string {
 		n := rapid.IntRange(1, maxLen).Draw(t, "len")
@@ -80,9 +94,11 @@ func TestPropImageTemplateNameIdentity(t *testing.T) {
 		if n1 != base+"-"+d[:12] || len(n1) > 63 || !shortName.MatchString(n1) {
 			t.Fatalf("bad derived name %q", n1)
 		}
-		// Injectivity over (base, digest12).
-		base2 := genShortName(50).Draw(t, "base2")
-		d2 := genDigest().Draw(t, "digest2")
+		// Injectivity over (base, digest12). Draw base2 and d2 equal to, or
+		// colliding with, base and d on purpose: drawn independently, the
+		// "same name" side of the check below never happens.
+		base2 := rapid.OneOf(rapid.Just(base), genShortName(50)).Draw(t, "base2")
+		d2 := genDigestLike(d).Draw(t, "digest2")
 		m, err := ImageTemplateName(base2, r1+"@sha256:"+d2)
 		if err != nil {
 			t.Fatal(err)
@@ -209,7 +225,10 @@ func TestPropDeriveComposes(t *testing.T) {
 // their digests are equal, whatever the repository path.
 func TestPropSameImageDigest(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		d1, d2 := genDigest().Draw(t, "d1"), genDigest().Draw(t, "d2")
+		// d2 is often d1 itself: "same digest, other repository path" is the
+		// case sameImageDigest exists for, and independent draws never hit it.
+		d1 := genDigest().Draw(t, "d1")
+		d2 := genDigestLike(d1).Draw(t, "d2")
 		a := genRepo().Draw(t, "a") + "@sha256:" + d1
 		b := genRepo().Draw(t, "b") + "@sha256:" + d2
 		if sameImageDigest(a, b) != (d1 == d2) || !sameImageDigest(a, a) || sameImageDigest(a, b) != sameImageDigest(b, a) {

@@ -139,7 +139,8 @@ It also takes `BASE_IMAGE` (the glibc image the base template runs in, default a
 `debian:bookworm-slim`), `PORT`, `AGENT_SERVER_ENV` (extra `NAME=VALUE` settings), `COMMAND`,
 `WORKDIR`, `API_TOKEN` (when ate-env-api runs with `-auth-token-file`) and `KEEP=1` (leave the
 environments up for the SDK scripts); see its header. It exits 1 if any agent-server did not
-answer, or if a command that ate-env-api starts in an environment sees the session key.
+answer, did not answer 401 to its call without the key, or if a command that ate-env-api starts in
+an environment sees the session key.
 
 Templates are immutable and the session key is in them, also in the per-image templates that
 creates derive (`<base>-<12 hex digits of the image digest>`). The demo reuses an existing base

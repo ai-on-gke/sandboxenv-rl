@@ -24,7 +24,8 @@
 # outside (health, a command, a file download, a call without the key),
 # checks that a command started through ate-env-api does not see the session
 # key, and deletes the environments, unless KEEP=1. It exits 1 if any
-# agent-server did not answer or any such command saw the key.
+# agent-server did not answer or did not answer 401 without the key, or if
+# any such command saw the key.
 #
 # Templates are immutable and carry the session key, and the first create from
 # each image derives a template (<base>-<12 hex digits of the image digest>)
@@ -46,9 +47,12 @@
 #
 # The template carries the session key with --sidecar-env: the guest gives it
 # to the agent-server only, not to the commands that ate-env-api starts in the
-# environment. This needs a GUEST_IMAGE built with --sidecar-env support; an
-# older guest does not give the key to the agent-server, which then does not
-# start. A base template registered before with the key in --env keeps it in
+# environment. This needs a GUEST_IMAGE built with --sidecar-env support. The
+# template also carries the guest flag -sidecar-env-required, which an older
+# guest does not know: it exits at start, the actor crashes, and the
+# environment does not answer. Without that guard, the agent-server would run
+# without the key and accept each request; the demo also requires 401 for its
+# call without the key. A base template registered before with the key in --env keeps it in
 # the environment of each command, and so does each template derived from it,
 # which creates reuse by name. The script prints a note; RECREATE=1 deletes
 # them all and registers the base again.
@@ -287,16 +291,22 @@ for image in "${images[@]}"; do
     python3 -c 'import json,sys; r=json.load(sys.stdin); print(r.get("stdout", r).rstrip()); print("exit:", r.get("exit_code"))'
   echo "-- file download (/etc/os-release, first line):"
   oh "${id}" "http://${API}/api/file/download?path=/etc/os-release" | head -1
-  echo "-- without the session key:"
-  curl -sS -o /dev/null -w 'HTTP %{http_code}\n' -X POST -H 'Content-Type: application/json' \
+  echo "-- without the session key (want HTTP 401):"
+  nokey=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
     -H "X-Env-Id: ${id}" -H "X-Env-Atespace: ${ATESPACE}" -H "X-Env-Port: ${PORT}" \
-    -H "@${headers}/proxy" -d '{"command": "true"}' "http://${API}/api/bash/execute_bash_command"
+    -H "@${headers}/proxy" -d '{"command": "true"}' "http://${API}/api/bash/execute_bash_command" || true)
+  echo "HTTP ${nokey}"
+  if [ "${nokey}" != 401 ]; then
+    echo "the agent-server in ${id} answered HTTP ${nokey} without the session key, want 401: it may run without a key" >&2
+    failed=$((failed + 1))
+  fi
   echo "-- the session key in the environment of a command that ate-env-api starts (want absent):"
   key_seen=$("${ATE_ENV}" "${id}" --api "${API}" --atespace "${ATESPACE}" shell \
     'if env | grep -q SESSION_API_KEY; then echo present; else echo absent; fi' || echo "check failed")
   echo "${key_seen}"
   if [ "${key_seen}" != absent ]; then
-    echo "a command in ${id} sees the session key; register the base again with RECREATE=1" >&2
+    echo "a command in ${id} sees the session key (${key_seen}). Causes: a base registered with the key in --env" >&2
+    echo "(register it again with RECREATE=1), or a GUEST_IMAGE without --sidecar-env support (use a newer one)" >&2
     failed=$((failed + 1))
   fi
 done
@@ -310,6 +320,6 @@ else
   step "done; deleting the environments (the templates stay for reuse)"
 fi
 if [ "${failed}" -gt 0 ]; then
-  echo "${failed} check(s) failed in ${n} environment(s): an agent-server did not answer or a command saw the session key" >&2
+  echo "${failed} check(s) failed in ${n} environment(s): an agent-server did not answer, answered without the key, or a command saw the session key" >&2
   exit 1
 fi

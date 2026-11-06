@@ -1,6 +1,6 @@
 # sandboxenv-rl architecture
 
-Status: describes `main` at `39e8ad4`. Re-check the claims in §Components when `internal/ate` or
+Status: describes `main` at `b815e71`. Re-check the claims in §Components when `internal/ate` or
 `internal/apiservice` changes. Companion to [README.md](../README.md) (how to use it) and
 [docs/glossary.md](./glossary.md).
 
@@ -75,7 +75,8 @@ child processes, and serves `ProcessService` and `FileSystemService`.
 
 - **Owns**: All communication with Substrate's `ateapi` control plane and pooled guest connections
   for `internal/mcp`.
-- **Calls**: `ateapi` control plane over gRPC (`:443`) and `atenet` router.
+- **Calls**: `ateapi` control plane over gRPC (`:443`, round-robin load balanced) and `atenet`
+  router.
 - **Must not do**: Must not bypass `internal/routertls` when dialing `atenet`. `internal/routertls`
   loads the kubelet-projected pod identity certificate bundle (`-atenet-client-cert`, 24h lifetime,
   renewed 30m early) and servicedns trust bundle (`-atenet-ca-file`), reloading changed files on TLS
@@ -116,7 +117,7 @@ child processes, and serves `ProcessService` and `FileSystemService`.
 
 ### CLI, SDKs, and integrations
 
-- **`cmd/ate-env`**: CLI for environment lifecycle (`create`, `suspend`, `delete`), server
+- **`cmd/ate-env`**: CLI for environment lifecycle (`create`, `get`, `suspend`, `delete`), server
   inspection (`server-info`, `newServerInfoCommand`; `image-status`, `newImageStatusCommand`),
   interactive shell (`shell`), file transfer (`read`, `write`), and manifest generation
   (`ate-env manifest`).
@@ -139,8 +140,11 @@ child processes, and serves `ProcessService` and `FileSystemService`.
   `measure`, `reap`, `report`) backed by
   `internal/benchmarking/{job,measure,overlay,schema,sut,trace}` and scenario manifests in
   `benchmarking/scenarios/`.
-- **`cmd/benchmarking/swebench-loader`**: Drives evaluation trajectories across either freshly
-  created actors (`eval` mode) or persistent parked actors (`steps` mode).
+- **`cmd/benchmarking/swebench-loader`**: Drives evaluation trajectories across `eval`, `steps`, and
+  `open-loop` modes (`run`), resolves schedules (`resolve`), plans image placement under node cache
+  budgets (`plan-placement`, `swebench.PlanImagePlacement`), extracts trajectory assets
+  (`trajectory-assets`), converts traces (`convert-trace`), and writes or compares reports
+  (`report`, `compare`).
 - **`internal/benchmarking/swebench`**: Emits structured JSONL events (`EventRun`, `EventCreate`,
   `EventTTFI`, `EventWake`, `EventStep`, `EventTask`, `EventSuspend`, `EventDelete`, `EventBarrier`,
   `EventPark`).
@@ -159,12 +163,12 @@ sequenceDiagram
   participant ATE as internal/ate.Client
   participant Control as Substrate ateapi
 
-  Client->>API: CreateEnvironment(template, rootfs_image)
+  Client->>API: CreateEnvironment(template, rootfs_image, worker_selector)
   API->>API: ensureImageTemplate acquires imageTemplateLock (imageTemplateLocks)
   API->>API: ImageTemplateName(base, rootfs_image) -> "<base>-<digest:12>"
   API->>ATE: GetActorTemplate(atespace, derived_name)
   alt Derived template exists
-    Note over API: Return FailedPrecondition if rootfs_image mismatches
+    Note over API: Return FailedPrecondition if digest mismatches (sameImageDigest)
     Note over API,Control: recreateFailedImageTemplate if golden snapshot failed >= failedTemplateRecreateAfter and unused
   else Derived template missing (ErrNotFound)
     API->>ATE: GetActorTemplate(atespace, base)
@@ -173,7 +177,7 @@ sequenceDiagram
     API->>ATE: CreateActorTemplate(derived)
     Note over ATE,Control: Idempotent if concurrent request created template
   end
-  API->>ATE: Create(atespace, actor_id, template_name)
+  API->>ATE: Create(atespace, actor_id, template_name, worker_selector)
   ATE->>Control: CreateActor(atespace, actor_id, template)
   Control-->>ATE: Actor record
   ATE-->>API: Success
@@ -189,8 +193,12 @@ Key non-obvious points:
   acquires the write lock, deletes the failed template by UID, and recreates it from base.
 - The base template must exist beforehand (`codes.FailedPrecondition` if missing); any runtime
   layers declared on the base template carry over into the derived template.
-- If an existing derived template exists with the same name but runs a different rootfs image,
-  `CreateEnvironment` fails with `codes.FailedPrecondition`.
+- If an existing derived template runs an image with the same digest under another repository path
+  (`sameImageDigest`), `CreateEnvironment` reuses it; if the digest differs, it fails with
+  `codes.FailedPrecondition`.
+- Optional `worker_selector` labels on `CreateEnvironment` pass to `Actor.worker_selector`
+  (narrowing the template's worker pools across creation and wakes), and `GetEnvironment` reports
+  the actor's hosting `node` (`actorNode`).
 - `ate-env-api` returns `ENVIRONMENT_STATUS_UNSPECIFIED` immediately; the actor boots
   asynchronously.
 
@@ -234,6 +242,11 @@ Key non-obvious points:
   `GetProcess("ate-env-wake-probe")` across two budgets: `DefaultWakeBudget` (5 minutes bounds the
   whole wait) and `DefaultWakeRunningBudget` (20 seconds bounds the wait once `RUNNING` is
   observed).
+- `ensureAwake` fails fast on unrecoverable states: `routertls.RejectedCertificate` or `CRASHED`
+  returns `codes.FailedPrecondition`, `DELETING` returns `codes.NotFound`, and sustained no-capacity
+  responses over a positive `WakeNoCapacityGrace` (`-wake-no-capacity-grace`) return
+  `codes.ResourceExhausted`. Crash and no-capacity failures attach trailing metadata
+  `StartFailureKey` (`ate-env-start-failure`: `"crashed"` or `"no-capacity"`).
 - The connection closes with `defer conn.Close()` when the RPC completes.
 
 ### 3. Suspend and delete an environment

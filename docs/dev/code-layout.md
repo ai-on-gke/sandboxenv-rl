@@ -18,6 +18,7 @@ internal/
   benchmarking/          # Benchmark packages: job, measure, overlay, schema, sut, swebench, trace
   hostcheck/             # HTTP middleware: DNS-rebinding defense on Host headers
   internaltest/          # Test doubles: fakecontrol, fakerouter, testcerts
+  inventory/             # Fleet inventory snapshot: v1 JSON Schema, strict decoder, Substrate state vocabulary
   mcp/                   # Streamable HTTP MCP server: maps shell and file tools to guest gRPC
   portproxy/             # HTTP/CONNECT reverse proxy: tunnels ports inside actors via atenet
   routertls/             # TLS config: dynamic SPIFFE client certificate and CA reload
@@ -43,8 +44,8 @@ clients/
 integrations/            # Framework integrations: harbor (Harbor), nemo-gym (NeMo Gym), openhands, uni-agent (R2E-Gym)
 benchmarking/            # Benchmark scenarios (scenarios/), SWE-bench (swebench/), telemetry report (telemetry_report/)
 docs/                    # Architecture, glossary, release, rootfs images, security, dev guides
-examples/                # Examples: grpo, harbor, openhands, verl_swebench, Qwen3-1.7B-verl, Qwen3.5-35B-A3B-verl, runtime-layers, guest-daemon, mcp
-hack/                    # Repository scripts: CI runners (ci/), verification (verify/, boilerplate/)
+examples/                # Examples: grpo, harbor, harbor-tools-layer, openhands, verl_swebench, Qwen3-1.7B-verl, Qwen3.5-35B-A3B-verl, runtime-layers, guest-daemon, mcp
+hack/                    # Repository scripts: CI (ci/), release (release/), verification (verify/, boilerplate/)
 ```
 
 ## Decision rules
@@ -68,15 +69,15 @@ never to Substrate directly.
 
 ### `internal/` vs. `guest/`
 
-Put code in `internal/` if it is private to binaries in this repository (`ate-env-guest` shares
-`internal/telemetry` and `internal/unknownfields`). Put in-actor service implementations in
-`guest/`. `guest/` and `cmd/ate-env-guest` must not import control-plane packages (`internal/ate` or
-`go.ate.dev/substrate`).
+Put code in `internal/` if it is private to binaries in this repository (`guest/` imports
+`internal/unknownfields`; `cmd/ate-env-guest` imports `internal/telemetry`). Put in-actor services
+in `guest/`. `guest/` and `cmd/ate-env-guest` must not import `internal/ate` or
+`go.ate.dev/substrate`.
 
 ### New binary vs. new package
 
-Create a new binary under `cmd/<binary-name>` only when shipping an independently deployed daemon or
-CLI tool. For library logic, add a package under `internal/<package-name>`.
+Create a `cmd/<binary-name>` binary only for an independently deployed daemon or CLI; place library
+code under `internal/<package-name>`.
 
 ### Where protos and generated stubs go
 

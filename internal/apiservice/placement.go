@@ -282,7 +282,9 @@ func parseWarmOptions(req *ateenvv1alpha.WarmImageRequest, maxPerNode int) (warm
 // the selector matches (ANDed with the derived template's own selector),
 // which takes ListPlacementDomains's permission. No command runs in the
 // guest. A probe whose name exists already is another call's or a user's:
-// it is reported as a failed create and left alone.
+// it is reported as a failed create and left alone, unless an earlier create
+// attempt of the probe was cut off and may have made it (the run id is
+// unique per call, so the name is then this call's).
 //
 // Errors: InvalidArgument for a bad request, or probes_per_node above the
 // server's cap; FailedPrecondition when the base template is missing, the
@@ -320,6 +322,11 @@ func (s *Server) WarmImage(req *ateenvv1alpha.WarmImageRequest, stream grpc.Serv
 	width := wanted * opts.probesPerNode
 	if width > MaxWarmProbes {
 		return status.Errorf(codes.InvalidArgument, "%d nodes x %d probes per node exceed the %d probes a round may start", wanted, opts.probesPerNode, MaxWarmProbes)
+	}
+	// The atespace once, before the rounds: a probe's create is then one
+	// CreateActor call, whose failure says whether the probe may exist.
+	if err := s.client.EnsureAtespace(ctx, atespace); err != nil {
+		return toGRPCError(err)
 	}
 
 	cov := &ateenvv1alpha.WarmImageCoverage{Wanted: int32(wanted), Nodes: []string{}, UndeletedProbes: []string{}}
@@ -589,8 +596,9 @@ type warmResult struct {
 	node string
 	dur  time.Duration
 	err  error
-	// created: the call made the probe (or may have: a create that failed
-	// for any reason but AlreadyExists), so the call deletes it.
+	// created: the call made the probe, or may have (its last create
+	// attempt was cut off, see createMayHaveLanded), so the call deletes it.
+	// A create the control plane refused made nothing to delete.
 	created bool
 }
 
@@ -605,24 +613,27 @@ func (s *Server) warmProbe(ctx context.Context, atespace, template string, selec
 	defer cancel()
 	r = warmResult{id: id}
 	opts := ate.CreateOptions{ID: id, Template: template, Atespace: atespace, WorkerSelector: selector}
-	err := warmRetry(pctx, warmCreateAttemptTimeout, func(ctx context.Context, attempt int) error {
-		err := s.client.Create(ctx, opts)
-		// An attempt that failed past its deadline may have landed: the
-		// name a retry finds taken is this call's then (a run id is unique
-		// per call), not a user's, and the probe goes on.
-		if attempt > 1 && grpcCode(err) == codes.AlreadyExists {
+	// cut: an attempt was cut off and may have made the actor all the same.
+	// The name a later attempt finds taken is this call's then (a run id is
+	// unique per call), not a user's, and the probe goes on. Without such an
+	// attempt, a name that exists is another call's probe or a user's
+	// environment: a final failure, and not this call's to delete. The
+	// atespace exists (WarmImage ensured it), so each attempt is one
+	// CreateActor call and its failure is that call's.
+	cut := false
+	err := warmRetry(pctx, warmCreateAttemptTimeout, func(ctx context.Context, _ int) error {
+		err := s.client.CreateActor(ctx, opts)
+		if err == nil || (cut && grpcCode(err) == codes.AlreadyExists) {
 			return nil
 		}
+		cut = cut || createMayHaveLanded(err)
 		return err
 	})
+	r.created = err == nil || createMayHaveLanded(err)
 	if err != nil {
-		// A name that exists is another call's probe or a user's
-		// environment: not this call's to delete.
-		r.created = grpcCode(err) != codes.AlreadyExists
 		r.err = fmt.Errorf("create: %w", err)
 		return r
 	}
-	r.created = true
 	// A new actor is suspended and unplaced; ResumeActor places it and
 	// returns once the template's wakeup probe answered (or fails, with the
 	// actor CRASHED), so the response carries the node most of the time. No
@@ -655,6 +666,20 @@ func grpcCode(err error) codes.Code {
 		return c
 	}
 	return status.Code(errors.Unwrap(err))
+}
+
+// createMayHaveLanded reports whether a CreateActor that failed with err may
+// have made the actor all the same: the call was cut off (an api server
+// restarting, the attempt's deadline, the probe's budget or the stream
+// ending) rather than refused, and the control plane may have kept the
+// actor. A refusal (InvalidArgument, FailedPrecondition, AlreadyExists,
+// ResourceExhausted, PermissionDenied, ...) made nothing.
+func createMayHaveLanded(err error) bool {
+	switch grpcCode(err) {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
+		return true
+	}
+	return false
 }
 
 // warmRetryable reports whether err is one of the transient failures a

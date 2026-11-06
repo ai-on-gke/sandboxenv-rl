@@ -314,24 +314,43 @@ type CreateOptions struct {
 	WorkerSelector map[string]string
 }
 
-// Create registers a new actor from opts and starts it. ID and Template are
-// required. Atespace is the Substrate atespace the actor and template live in.
-func (c *Client) Create(ctx context.Context, opts CreateOptions) error {
-	if opts.ID == "" {
-		return errors.New("ate: CreateOptions.ID is required")
+// check validates opts and returns the atespace with the default applied.
+func (o CreateOptions) check() (string, error) {
+	if o.ID == "" {
+		return "", errors.New("ate: CreateOptions.ID is required")
 	}
-	if opts.Template == "" {
-		return errors.New("ate: CreateOptions.Template is required")
+	if o.Template == "" {
+		return "", errors.New("ate: CreateOptions.Template is required")
 	}
-	atespace := opts.Atespace
-	if atespace == "" {
-		atespace = DefaultAtespace
+	if o.Atespace == "" {
+		return DefaultAtespace, nil
 	}
+	return o.Atespace, nil
+}
 
+// Create registers a new actor from opts and starts it, creating its
+// atespace first when it is missing. ID and Template are required. Atespace
+// is the Substrate atespace the actor and template live in.
+func (c *Client) Create(ctx context.Context, opts CreateOptions) error {
+	atespace, err := opts.check()
+	if err != nil {
+		return err
+	}
 	if err := c.EnsureAtespace(ctx, atespace); err != nil {
 		return fmt.Errorf("ate: creating %q: %w", opts.ID, err)
 	}
+	return c.CreateActor(ctx, opts)
+}
 
+// CreateActor registers a new actor from opts with one CreateActor call, in
+// an atespace the caller knows exists (EnsureAtespace): an error is that
+// call's, so a caller that retries can tell a refusal from a call cut off.
+// ID and Template are required.
+func (c *Client) CreateActor(ctx context.Context, opts CreateOptions) error {
+	atespace, err := opts.check()
+	if err != nil {
+		return err
+	}
 	actor := &ateapipb.Actor{
 		Metadata: &ateapipb.ResourceMetadata{
 			Atespace: atespace,

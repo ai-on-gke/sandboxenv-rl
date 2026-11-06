@@ -390,35 +390,94 @@ func TestWarmImageRefusesASelectorThatContradictsTheTemplate(t *testing.T) {
 
 // A probe name that exists already is another call's probe or a user's
 // environment: the create fails, is reported, and the environment is left as
-// it was.
+// it was, whether the first attempt found the name taken or a retry did after
+// an attempt the control plane refused (a refusal made nothing). Only a
+// retry after an attempt cut off, which may have made the actor, claims the
+// name: the run id is unique per call.
 func TestWarmImageLeavesAnExistingEnvironmentAlone(t *testing.T) {
+	apiservice.SetWarmTimings(t, 10*time.Millisecond, 50*time.Millisecond, time.Second)
+	for name, tc := range map[string]struct {
+		inject  func(*fakecontrol.Server)
+		creates int
+		claimed bool
+	}{
+		"name taken at once": {func(*fakecontrol.Server) {}, 1, false},
+		"name taken after a refusal": {func(c *fakecontrol.Server) {
+			c.FailCreates(1, codes.FailedPrecondition, "actor template not found; ObjectRef: ate-env/"+testDerivedTemplate)
+		}, 2, false},
+		"name taken after a create cut off": {func(c *fakecontrol.Server) {
+			c.FailCreates(1, codes.Unavailable, "graceful_stop")
+		}, 2, true},
+	} {
+		client, control := newTestEnv(t)
+		seedDomains(t, control)
+		if _, err := control.CreateActor(context.Background(), &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+			Metadata:       &ateapipb.ResourceMetadata{Atespace: "ate-env", Name: "pf-x-1-0"},
+			ActorTemplate:  &ateapipb.ObjectRef{Atespace: "ate-env", Name: testDerivedTemplate},
+			WorkerSelector: &ateapipb.Selector{MatchLabels: map[string]string{"ate-env/domain": "d0"}},
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		tc.inject(control)
+		seeded := control.Creates()
+		probes, cov, err := warm(t, client, &ateenvv1alpha.WarmImageRequest{
+			RootfsImage:    testRootfsImage,
+			WorkerSelector: map[string]string{"ate-env/domain": "d0"},
+			Nodes:          1,
+			ProbesPerNode:  1,
+			MaxRounds:      1,
+			RunId:          "pf-x",
+		})
+		if err != nil {
+			t.Fatalf("%s: WarmImage: %v", name, err)
+		}
+		if n := control.Creates() - seeded; n != tc.creates {
+			t.Errorf("%s: %d creates, want %d", name, n, tc.creates)
+		}
+		if tc.claimed {
+			// The cut-off create landed: the probe is this call's, runs and
+			// is deleted.
+			if len(probes) != 1 || probes[0].GetError() != "" || !cov.GetComplete() {
+				t.Errorf("%s: probes = %v coverage = %v, want the probe claimed and the coverage complete", name, probes, cov)
+			}
+			if n := control.Resumes(); n != 1 {
+				t.Errorf("%s: %d resumes, want 1", name, n)
+			}
+			if n := control.ActorCount(); n != 0 {
+				t.Errorf("%s: %d actors left, want 0", name, n)
+			}
+			continue
+		}
+		if len(probes) != 1 || !strings.Contains(probes[0].GetError(), "create: ") || !strings.Contains(probes[0].GetError(), "already exists") || cov.GetFailed() != 1 || cov.GetComplete() {
+			t.Errorf("%s: probes = %v coverage = %v, want one failed create and no coverage", name, probes, cov)
+		}
+		if n := control.ActorCount(); n != 1 {
+			t.Errorf("%s: %d actors left, want the pre-existing one", name, n)
+		}
+		if n := control.Resumes(); n != 0 {
+			t.Errorf("%s: %d resumes, want none: the environment is not this call's", name, n)
+		}
+		if n := control.Deletes(); n != 0 {
+			t.Errorf("%s: %d deletes, want none: the environment is not this call's", name, n)
+		}
+	}
+}
+
+// The atespace is ensured once, before the rounds: a server that may not
+// create it fails the call before any probe, instead of failing each probe's
+// create.
+func TestWarmImageEnsuresTheAtespaceBeforeTheRounds(t *testing.T) {
 	client, control := newTestEnv(t)
 	seedDomains(t, control)
-	if _, err := control.CreateActor(context.Background(), &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
-		Metadata:      &ateapipb.ResourceMetadata{Atespace: "ate-env", Name: "pf-x-1-0"},
-		ActorTemplate: &ateapipb.ObjectRef{Atespace: "ate-env", Name: testDerivedTemplate},
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	probes, cov, err := warm(t, client, &ateenvv1alpha.WarmImageRequest{
-		RootfsImage:    testRootfsImage,
-		WorkerSelector: map[string]string{"ate-env/domain": "d0"},
-		Nodes:          1,
-		ProbesPerNode:  1,
-		MaxRounds:      1,
-		RunId:          "pf-x",
+	control.DenyCreateAtespace = true
+	probes, _, err := warm(t, client, &ateenvv1alpha.WarmImageRequest{
+		RootfsImage: testRootfsImage, WorkerSelector: map[string]string{"ate-env/domain": "d0"}, ProbesPerNode: 1, MaxRounds: 1,
 	})
-	if err != nil {
-		t.Fatalf("WarmImage: %v", err)
+	if status.Code(err) != codes.PermissionDenied || len(probes) != 0 {
+		t.Errorf("err = %v, %d probes, want PermissionDenied before any probe", err, len(probes))
 	}
-	if len(probes) != 1 || !strings.Contains(probes[0].GetError(), "create: ") || cov.GetFailed() != 1 || cov.GetComplete() {
-		t.Errorf("probes = %v coverage = %v, want one failed create and no coverage", probes, cov)
-	}
-	if n := control.ActorCount(); n != 1 {
-		t.Errorf("%d actors left, want the pre-existing one", n)
-	}
-	if n := control.Resumes(); n != 0 {
-		t.Errorf("%d resumes, want none: the environment is not this call's", n)
+	if n := control.Creates(); n != 0 {
+		t.Errorf("%d creates, want none", n)
 	}
 }
 
@@ -558,6 +617,10 @@ func TestWarmImageDoesNotRetryFinalCreateFailures(t *testing.T) {
 		}
 		if n := control.Creates(); n != 2 {
 			t.Errorf("%s: %d creates, want 2: no retry", name, n)
+		}
+		// The refused probe made nothing to delete; the other probe is deleted.
+		if n := control.Deletes(); n != 1 {
+			t.Errorf("%s: %d deletes, want 1: a refused create is not deleted", name, n)
 		}
 		if len(probes) != 2 || control.ActorCount() != 0 {
 			t.Errorf("%s: probes = %v, %d actors left, want 2 probes and none left", name, probes, control.ActorCount())

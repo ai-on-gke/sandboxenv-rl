@@ -67,7 +67,6 @@ from .lookahead import LookaheadWarmer, WarmReport
 from .observability import Observer, RunReport
 from .preflight import (
     ImagePlacement,
-    PlacementDomain,
     PlacementEntry,
     PreflightCoverage,
     PreflightWarmer,
@@ -117,7 +116,6 @@ __all__ = [
     "PreflightWarmer",
     "PreflightCoverage",
     "ImagePlacement",
-    "PlacementDomain",
     "PlacementEntry",
     # Telemetry
     "TracerConfig",

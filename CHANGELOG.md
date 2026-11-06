@@ -18,7 +18,9 @@ user needs to know across them.
   `ate-env manifest access-policy --global` prints the global viewer binding
   listing workers takes; Go client `ListPlacementDomains`, `WarmImage`; Python
   `list_placement_domains()`, `warm_image()`, `PlacementDomain`, `WarmProbe`,
-  `WarmImageCoverage`. A probe's create and resume are retried within the
+  `WarmImageCoverage`; an `ImagePlacement` plan's domains are `PlacementDomain`
+  too, thus a plan can carry what `list_placement_domains()` returns. A
+  probe's create and resume are retried within the
   probe's timeout on the transient failures of a loaded control plane
   (`Unavailable`, `DeadlineExceeded`, a derived template not visible yet),
   its delete on `Aborted`, `Unavailable` and `ResourceExhausted`; the probes

@@ -184,10 +184,14 @@ class PlacementDomain:
     equal to them keeps an environment in the pool. ``nodes`` and ``workers``
     count the active ones; ``node_slots`` is the environments one node runs
     at once, 0 when unknown.
+
+    An ``ImagePlacement`` plan's domains are this type too: the plan file
+    carries ``name``, ``selector``, ``nodes`` and ``node_slots``, thus
+    ``worker_namespace`` and ``workers`` keep their defaults there.
     """
 
     name: str
-    worker_namespace: str
+    worker_namespace: str = ""
     selector: Mapping[str, str] = field(default_factory=dict, hash=False)
     nodes: int = 0
     workers: int = 0

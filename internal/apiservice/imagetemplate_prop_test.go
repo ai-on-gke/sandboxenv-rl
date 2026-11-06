@@ -189,49 +189,142 @@ func TestRerootKeepsDotDotUnderMount(t *testing.T) {
 
 // AE-4 (docs/plans/ate-env-api/acceptance-criteria.md). Rule (DeriveImageTemplate doc): deriving from an already-derived template
 // changes only the container image (and the name); thus
-// Derive(Derive(base, n1, i1), n2, i2) == Derive(base, n2, i2).
+// Derive(Derive(base, n1, i1), n2, i2) == Derive(base, n2, i2). The base is
+// never changed, and a derived template is one Substrate can run with the
+// guest found (checkDerivedTemplate); a base that already claims the guest's
+// volume name or mount path may be refused instead.
 func TestPropDeriveComposes(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		base := modeABase()
-		nLayers := rapid.IntRange(0, 2).Draw(t, "layers")
-		for i := range nLayers {
-			name := rapid.SampledFrom([]string{"execd", "py", "tools"}).Draw(t, "layer") + string(rune('a'+i))
-			base.Volumes = append(base.Volumes, &ateapipb.Volume{Name: name, Image: &ateapipb.ImageVolumeSource{Reference: "example.com/l@sha256:" + genDigest().Draw(t, "ld")}})
-			base.Containers[0].VolumeMounts = append(base.Containers[0].VolumeMounts, &ateapipb.VolumeMount{Name: name, MountPath: "/opt/" + name})
-		}
-		if rapid.Bool().Draw(t, "nocmd") {
-			base.Containers[0].Command = nil
-		}
+		base := genBaseTemplate().Draw(t, "base")
 		i1 := genRepo().Draw(t, "r1") + "@sha256:" + genDigest().Draw(t, "d1")
 		i2 := genRepo().Draw(t, "r2") + "@sha256:" + genDigest().Draw(t, "d2")
 		before := proto.Clone(base)
+		once, err := DeriveImageTemplate(base, "n2", i2)
+		if !proto.Equal(base, before) {
+			t.Fatal("base mutated")
+		}
+		if err != nil {
+			// Refusing is allowed only for a base whose volumes or mounts
+			// already claim the guest's name or mount path; an ordinary
+			// base must derive.
+			if !claimsGuestSlot(base) {
+				t.Fatalf("ordinary base refused: %v", err)
+			}
+			return
+		}
+		checkDerivedTemplate(t, once, i2)
 		d1, err := DeriveImageTemplate(base, "n1", i1)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("derive n1 failed after n2 succeeded: %v", err)
 		}
 		twice, err := DeriveImageTemplate(d1, "n2", i2)
 		if err != nil {
 			t.Fatal(err)
 		}
-		once, err := DeriveImageTemplate(base, "n2", i2)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !proto.Equal(base, before) {
-			t.Fatal("base mutated")
-		}
 		if !proto.Equal(twice, once) {
 			t.Fatalf("derive does not compose:\n twice=%v\n once=%v", twice, once)
 		}
-		// Volume names stay unique.
-		seen := map[string]bool{}
-		for _, v := range once.GetVolumes() {
-			if seen[v.GetName()] {
-				t.Fatalf("duplicate volume %q", v.GetName())
-			}
-			seen[v.GetName()] = true
-		}
 	})
+}
+
+// genBaseTemplate draws a valid guest-as-image base template (the shape
+// `ate-env manifest template` writes): modeABase with one to three
+// containers, zero to three extra volumes with distinct names, of image or
+// durable-dir kind, mounted into the first container at distinct paths, and
+// maybe no command. Names and mount paths include the guest's own
+// (GuestVolumeName, GuestMountPath and under it): those are the inputs where
+// adding the guest volume can clash, since Substrate requires unique volume
+// names and mounts that do not nest.
+func genBaseTemplate() *rapid.Generator[*ateapipb.ActorTemplate] {
+	return rapid.Custom(func(t *rapid.T) *ateapipb.ActorTemplate {
+		base := modeABase()
+		for i := range rapid.IntRange(0, 2).Draw(t, "sidecars") {
+			base.Containers = append(base.Containers, &ateapipb.Container{
+				Name: "side" + string(rune('a'+i)), Image: "example.com/side@sha256:" + genDigest().Draw(t, "sd"),
+			})
+		}
+		names := rapid.SliceOfNDistinct(rapid.SampledFrom([]string{"execd", "py", "tools", "cache", GuestVolumeName}), 0, 3, rapid.ID[string]).Draw(t, "volumes")
+		paths := map[string]bool{}
+		c := base.Containers[0]
+		for _, name := range names {
+			v := &ateapipb.Volume{Name: name}
+			// An image volume named GuestVolumeName is the other base shape
+			// (guest already mounted), which Derive(Derive(...)) covers.
+			if name != GuestVolumeName && rapid.Bool().Draw(t, "image") {
+				v.Image = &ateapipb.ImageVolumeSource{Reference: "example.com/l@sha256:" + genDigest().Draw(t, "ld")}
+			} else {
+				v.DurableDir = &ateapipb.DurableDirVolumeSource{}
+			}
+			base.Volumes = append(base.Volumes, v)
+			p := rapid.SampledFrom([]string{"/opt/" + name, GuestMountPath, GuestMountPath + "/sub"}).Draw(t, "mount")
+			if paths[p] {
+				p = "/opt/" + name
+			}
+			paths[p] = true
+			c.VolumeMounts = append(c.VolumeMounts, &ateapipb.VolumeMount{Name: name, MountPath: p})
+		}
+		if rapid.Bool().Draw(t, "nocmd") {
+			c.Command = nil
+		}
+		return base
+	})
+}
+
+// claimsGuestSlot reports whether base already has a volume named
+// GuestVolumeName or a first-container mount at or under GuestMountPath.
+func claimsGuestSlot(base *ateapipb.ActorTemplate) bool {
+	for _, v := range base.GetVolumes() {
+		if v.GetName() == GuestVolumeName {
+			return true
+		}
+	}
+	for _, m := range base.GetContainers()[0].GetVolumeMounts() {
+		if m.GetMountPath() == GuestMountPath || strings.HasPrefix(m.GetMountPath(), GuestMountPath+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// checkDerivedTemplate asserts that a derived template is one Substrate can
+// run with the guest found: unique volume names, every mount naming a
+// volume, unique mount paths per container, the first container running
+// image, and exactly one image volume named GuestVolumeName mounted at
+// GuestMountPath in the first container and nothing else mounted at or under
+// it (Substrate rejects nested mounts).
+func checkDerivedTemplate(t *rapid.T, tmpl *ateapipb.ActorTemplate, image string) {
+	vols := map[string]*ateapipb.Volume{}
+	for _, v := range tmpl.GetVolumes() {
+		if vols[v.GetName()] != nil {
+			t.Fatalf("duplicate volume %q in %v", v.GetName(), tmpl.GetVolumes())
+		}
+		vols[v.GetName()] = v
+	}
+	for _, c := range tmpl.GetContainers() {
+		paths := map[string]bool{}
+		for _, m := range c.GetVolumeMounts() {
+			if vols[m.GetName()] == nil {
+				t.Fatalf("container %q mounts missing volume %q", c.GetName(), m.GetName())
+			}
+			if paths[m.GetMountPath()] {
+				t.Fatalf("container %q mounts two volumes at %q: %v", c.GetName(), m.GetMountPath(), c.GetVolumeMounts())
+			}
+			paths[m.GetMountPath()] = true
+		}
+	}
+	c := tmpl.GetContainers()[0]
+	if c.GetImage() != image {
+		t.Fatalf("first container runs %q, want %q", c.GetImage(), image)
+	}
+	if g := vols[GuestVolumeName]; g == nil || g.GetImage() == nil {
+		t.Fatalf("no guest image volume %q in %v", GuestVolumeName, tmpl.GetVolumes())
+	}
+	for _, m := range c.GetVolumeMounts() {
+		atMount := m.GetMountPath() == GuestMountPath || strings.HasPrefix(m.GetMountPath(), GuestMountPath+"/")
+		if (m.GetName() == GuestVolumeName) != (m.GetMountPath() == GuestMountPath) || (atMount && m.GetName() != GuestVolumeName) {
+			t.Fatalf("guest not alone at %s: %v", GuestMountPath, c.GetVolumeMounts())
+		}
+	}
 }
 
 // AE-1 (supporting). Rule (sameImageDigest doc): two pinned references name the same image iff

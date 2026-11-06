@@ -705,7 +705,7 @@ func runCmd(args []string) (retErr error) {
 		tasksPerImage = fs.Int("tasks-per-image", 1, "eval: replays per image.")
 		rollouts      = fs.Int("rollouts", 2, "steps: environments per image.")
 		steps         = fs.Int("steps", 8, "steps: training steps.")
-		park          = fs.String("park", string(swebench.ParkSuspend), "steps: what happens between steps: suspend, suspend-sync, suspend-async, fork, delete or none.")
+		park          = fs.String("park", string(swebench.ParkSuspend), "steps: what happens between steps. suspend and suspend-sync are durable: the call returns once the snapshot is in object storage. suspend-async is local: the call returns once the snapshot is on the node and the upload goes on in the background. fork replaces each environment per step (through ate-env-api a new environment created from the image; with -access direct a fork of its base) and parks it locally. delete deletes, and the next step creates again. none keeps the fleet running. Through ate-env-api a local suspend needs a server that serves suspend_mode, which the run checks before it starts.")
 		imagesPerStep = fs.Int("images-per-step", 0, "steps: each step takes the next N images (wrapping around the dataset) with fresh environments, retired after the step: the create-and-retire-pools-per-step shape; needs -park delete. 0 keeps one fleet across the steps.")
 		parkEach      = fs.Bool("park-each", false, "steps: park each environment as soon as its step ends instead of after the whole fleet's step, so at most -width are awake at once and the fleet can be larger than the running slots; the barrier then includes the parking.")
 		schedulePath  = fs.String("schedule", "", "steps: path to a pre-resolved schedule.json.")

@@ -438,6 +438,8 @@ func TestTracingCallerConnSpansMatchPythonClient(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("ab", 32)
 	// The image is only recorded; whether the server accepts it is not tested.
 	_, _ = c.Create(t.Context(), &ateenvv1alpha.CreateEnvironmentRequest{Id: "tagged", RootfsImage: "registry.example/repo:v1@" + digest})
+	_, _ = c.ImageStatus(t.Context(), &ateenvv1alpha.GetImageStatusRequest{RootfsImage: "registry.example/repo@" + digest})
+	_, _ = c.EnsureImageTemplate(t.Context(), &ateenvv1alpha.EnsureImageTemplateRequest{RootfsImage: "registry.example/repo@" + digest})
 
 	spans := map[string][]sdktrace.ReadOnlySpan{}
 	for _, s := range rec.Ended() {
@@ -448,7 +450,8 @@ func TestTracingCallerConnSpansMatchPythonClient(t *testing.T) {
 	for op, method := range map[string]string{
 		"create_environment": "CreateEnvironment", "get_environment": "GetEnvironment",
 		"suspend_environment": "SuspendEnvironment", "delete_environment": "DeleteEnvironment",
-		"get_server_info": "GetServerInfo",
+		"get_server_info":  "GetServerInfo",
+		"get_image_status": "GetImageStatus", "ensure_image_template": "EnsureImageTemplate",
 	} {
 		if len(spans[prefix+op]) == 0 {
 			t.Errorf("no %s span", op)

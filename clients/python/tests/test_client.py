@@ -20,6 +20,7 @@ import pytest
 from ate_env_rl import (
     Client,
     EnvironmentStatus,
+    GoldenSnapshotState,
     InvalidArgumentError,
     NotFoundError,
     RpcError,
@@ -179,7 +180,7 @@ async def test_server_info(fake_stack):
         server="sandboxenv-rl",
         version="v0.0.0-fake",
         substrate_version="unknown",
-        features=("rootfs_image", "pty", "suspend_mode"),
+        features=("rootfs_image", "pty", "suspend_mode", "image_status"),
     )
     assert "pty" in info.features
 
@@ -401,3 +402,42 @@ async def test_get_reports_node(fake_stack):
     assert (await client.get("dev1")).node == ""
     fakes.environments.environments[("ate-env", "dev1")].node = "gke-pool-a-7"
     assert (await client.get("dev1")).node == "gke-pool-a-7"
+
+
+IMAGE = "docker.io/library/python@sha256:" + "0123456789abcdef" * 4
+
+
+async def test_image_status_reports_a_missing_template_without_creating_it(fake_stack):
+    client, fakes = fake_stack
+    status = await client.image_status(IMAGE)
+    assert status.rootfs_image == IMAGE
+    assert status.template.name == "default-template-0123456789ab"
+    assert status.template.atespace == "ate-env"
+    assert status.template_exists is False
+    assert status.golden is GoldenSnapshotState.NONE
+    assert fakes.environments.image_templates == {}
+
+
+async def test_image_status_ensure_derives_the_template_and_reports_the_bake(fake_stack):
+    client, fakes = fake_stack
+    status = await client.image_status(IMAGE, ensure=True, template_name="layered")
+    assert status.template.name == "layered-0123456789ab"
+    assert status.template_exists is True
+    assert status.golden is GoldenSnapshotState.PENDING
+    key = ("ate-env", "layered-0123456789ab")
+    fakes.environments.image_templates[key].golden = env_pb2.GOLDEN_SNAPSHOT_STATE_READY
+    fakes.environments.image_templates[key].golden_tag = "golden-7"
+    status = await client.image_status(IMAGE, template_name="layered")
+    assert status.golden is GoldenSnapshotState.READY
+    assert status.golden_tag == "golden-7"
+    fakes.environments.image_templates[key].golden = env_pb2.GOLDEN_SNAPSHOT_STATE_FAILED
+    fakes.environments.image_templates[key].golden_error = "GoldenActorCrashed: boom"
+    status = await client.image_status(IMAGE, template_name="layered")
+    assert status.golden is GoldenSnapshotState.FAILED
+    assert status.golden_error == "GoldenActorCrashed: boom"
+
+
+async def test_image_status_rejects_an_unpinned_image(fake_stack):
+    client, _ = fake_stack
+    with pytest.raises(InvalidArgumentError):
+        await client.image_status("docker.io/library/python:3.11")

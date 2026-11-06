@@ -501,6 +501,54 @@ routed through `image_templates` or `Task.template` sends no image, thus only
 `node_selector` applies to it. `client.get(id).node` reports the node an
 environment landed on.
 
+### Warm the nodes before a run with `PreflightWarmer`
+
+An image's first boot on a node pulls and unpacks the image and fetches the
+golden snapshot; the boots after it restore in seconds. `PreflightWarmer` pays
+that first boot before the run, for every image on every node of the worker
+pools that will run it. It takes an image placement plan (`image-placement.json`
+from `swebench-loader plan-placement`: each image assigned to placement
+domains, worker pools a per-environment worker selector addresses) and drives
+the low-level `Client`:
+
+```python
+import asyncio
+from ate_env_rl import Client, ImagePlacement, PreflightWarmer
+
+async def main():
+    client = Client("127.0.0.1:7777")
+    plan = ImagePlacement.from_file("image-placement.json")
+    warmer = PreflightWarmer(client, plan, run_id="pf-7", probes_per_node=2)
+    coverage = await warmer.run()
+    coverage.write("preflight-coverage.json")
+    print(coverage.shortfall())      # "complete", or what is missing
+    await client.close()
+
+asyncio.run(main())
+```
+
+It ensures each image's derived template (`client.image_status(ensure=True)`),
+which starts the golden bake, then warms every domain in parallel: as soon as
+an image's golden is ready it creates probe environments with the domain's
+worker selector, round after round, until every node of the domain has run
+the image once. A domain warms `image_concurrency` (4) images at once; a
+domain's `node_slots`, when the plan has it, caps that at `node_slots //
+probes_per_node`. Each probe's first command returns when the layers and the
+golden snapshot are on its node; the node is read back with `client.get()` and
+the probe deleted. `golden_timeout` (30 min) gives up on the goldens still
+baking once none became ready or failed for that long; a template with goldens disabled
+is recorded as `none` and warmed by cold boots.
+
+`PreflightCoverage` is the result: per image the golden's state, per domain
+the nodes seen and per image the nodes covered, probes, rounds and failures;
+`complete` says whether the run can expect warm first boots everywhere.
+`write()` produces the same `preflight-coverage.json` (`schema_version: v1`) as
+the Go loader's pre-flight writes, so the two reports read alike. An
+`Observer` passed in records the phases `ensure_template`, `preflight_golden`
+and `preflight_probe`. The probes are deleted: `plan-placement` keeps each
+node's assigned images under atelet's image-cache GC low watermark, so the
+layers stay until the run.
+
 ### Follow a trainer's batch stream with `LookaheadWarmer`
 
 An RL trainer owns its step loop. It knows the next batch or two ahead, and
@@ -559,7 +607,7 @@ pip install './clients/python[tracing,metrics]'
 
 **Run report** (always on, no dependency). After `fleet.run(...)`,
 `fleet.report` is a `RunReport` with per-phase count, total and max
-(`preflight`, `plan`, `ensure_template`, `warm_pool`, `acquire`,
+(`preflight`, `plan`, `ensure_template`, `preflight_golden`, `preflight_probe`, `warm_pool`, `acquire`,
 `process`, `recycle`, `release`, `teardown`), claims, task outcomes and
 warm replicas:
 

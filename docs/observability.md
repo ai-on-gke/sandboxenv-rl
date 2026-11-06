@@ -205,6 +205,8 @@ NeMo Gym rollout benchmark (`integrations/nemo-gym/benchmarks/rollout_bench.py`,
 | `preflight` | the backend's connectivity, permission and capacity checks |
 | `plan` | sizing the run: one entry per image, resolving its template |
 | `ensure_template` | resolving or creating the template for an image, once per image |
+| `preflight_golden` | `PreflightWarmer`: from an image's template being ensured to its golden snapshot settling (ready, none, failed, or given up) |
+| `preflight_probe` | `PreflightWarmer`: one probe environment, from its create to the node read back |
 | `warm_pool` | bringing an image's warm pool to its size |
 | `acquire` | getting a ready environment for a task (create, or claim from the pool) |
 | `process` | the caller's work on one task (`process_fn`) |

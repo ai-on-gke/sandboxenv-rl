@@ -270,6 +270,8 @@ class RunReport:
         "preflight",
         "plan",
         "ensure_template",
+        "preflight_golden",
+        "preflight_probe",
         "warm_pool",
         "acquire",
         "process",
@@ -457,18 +459,30 @@ class Observer:
                 status = status_of(e)
                 raise
             finally:
-                dur = time.monotonic() - start
-                if self.metrics:
-                    self._phase_latency.labels(
-                        phase=name,
-                        backend=backend,
-                        family=family,
-                        strategy=self._strategy,
-                        status=status,
-                    ).observe(dur)
-                if self._in_run and self.report is not None:
-                    with self._lock:
-                        self.report.add_phase(name, dur)
+                self.record_phase(
+                    name, time.monotonic() - start, backend=backend, family=family, status=status
+                )
+
+    def record_phase(
+        self, name: str, dur: float, *, backend: str = "-", family: str = "-", status: str = "ok"
+    ) -> None:
+        """Record a phase of ``dur`` seconds that was timed elsewhere.
+
+        ``phase()`` is the usual way; this is for a duration that spans
+        callbacks, such as the wait for a golden snapshot the PreflightWarmer
+        settles from a poller.
+        """
+        if self.metrics:
+            self._phase_latency.labels(
+                phase=name,
+                backend=backend,
+                family=family,
+                strategy=self._strategy,
+                status=status,
+            ).observe(dur)
+        if self._in_run and self.report is not None:
+            with self._lock:
+                self.report.add_phase(name, dur)
 
     @contextlib.contextmanager
     def run(self, strategy: str, *, backend: str = "-") -> Iterator[RunReport]:

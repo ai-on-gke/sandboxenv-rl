@@ -70,6 +70,13 @@ user needs to know across them.
   `worker_selector`, and `FleetConfig.placement` adds labels per task image;
   `SubstrateBackendDriver(worker_selector=, placement=)` and
   `worker_selector_for(image)`.
+- Python client: `ate_env_rl.PreflightWarmer` fills the node caches an image
+  placement plan (`ImagePlacement`, from `image-placement.json`) describes:
+  ensures each image's derived template, then per domain, as each golden
+  becomes ready, probes every node with the image and deletes the probes;
+  `PreflightCoverage` writes `preflight-coverage.json` in the loader's schema.
+  `Observer.record_phase()` and the phases `preflight_golden`,
+  `preflight_probe`.
 - `swebench-loader plan-placement`: an image placement plan
   (`image-placement.json`) that assigns each task image to placement domains
   (worker pools a per-environment worker selector addresses) under each

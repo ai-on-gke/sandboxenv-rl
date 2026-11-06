@@ -59,8 +59,8 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
         self.environments: dict[tuple[str, str], env_pb2.Environment] = {}
         self.last_create_request: env_pb2.CreateEnvironmentRequest | None = None
         self.last_suspend_request: env_pb2.SuspendEnvironmentRequest | None = None
-        # Placement, for ListPlacementDomains and WarmImage: the nodes behind
-        # each value of the ate-env/domain selector label, the slots per node
+        # Placement, for creates, ListPlacementDomains and WarmImage: the nodes
+        # behind each value of the ate-env/domain selector label, the slots per node
         # per domain, whether the global role is missing, whether every probe
         # lands on the first node, and the WarmImage requests seen.
         self.domain_nodes: dict[str, list[str]] = {}
@@ -73,6 +73,9 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
         # reports waited for probe slots.
         self.warm_undeleted: list[str] = []
         self.warm_waited = 0.0
+        # An environment created without a known domain reports no node, as
+        # before its placement; creates hand the domain's nodes out round-robin.
+        self.first_node_creates = 0
 
     async def CreateEnvironment(self, request, context):
         self.last_create_request = request
@@ -105,6 +108,14 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
             status=env_pb2.ENVIRONMENT_STATUS_RUNNING,
         )
         environment.worker_selector.update(request.worker_selector)
+        domain = request.worker_selector.get("ate-env/domain", "")
+        if nodes := self.domain_nodes.get(domain):
+            n = self._domain_counter.get(domain, 0)
+            # The first first_node_creates creates of a domain all land on its
+            # first node, as a scheduler that favours a warm node does; the
+            # rest go round-robin.
+            environment.node = nodes[0 if n < self.first_node_creates else n % len(nodes)]
+            self._domain_counter[domain] = n + 1
         self.environments[key] = environment
         return env_pb2.CreateEnvironmentResponse(environment=environment)
 

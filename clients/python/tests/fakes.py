@@ -52,6 +52,12 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
         self.environments: dict[tuple[str, str], env_pb2.Environment] = {}
         self.last_create_request: env_pb2.CreateEnvironmentRequest | None = None
         self.last_suspend_request: env_pb2.SuspendEnvironmentRequest | None = None
+        # Placement: the nodes behind each value of the ate-env/domain selector
+        # label, handed out round-robin per create; an environment created
+        # without a known domain reports no node, as before its placement.
+        self.domain_nodes: dict[str, list[str]] = {}
+        self._domain_counter: dict[str, int] = {}
+        self.first_node_creates = 0
 
     async def CreateEnvironment(self, request, context):
         self.last_create_request = request
@@ -84,6 +90,14 @@ class FakeEnvironmentService(env_pb2_grpc.EnvironmentServiceServicer):
             status=env_pb2.ENVIRONMENT_STATUS_RUNNING,
         )
         environment.worker_selector.update(request.worker_selector)
+        domain = request.worker_selector.get("ate-env/domain", "")
+        if nodes := self.domain_nodes.get(domain):
+            n = self._domain_counter.get(domain, 0)
+            # The first first_node_creates creates of a domain all land on its
+            # first node, as a scheduler that favours a warm node does; the
+            # rest go round-robin.
+            environment.node = nodes[0 if n < self.first_node_creates else n % len(nodes)]
+            self._domain_counter[domain] = n + 1
         self.environments[key] = environment
         return env_pb2.CreateEnvironmentResponse(environment=environment)
 

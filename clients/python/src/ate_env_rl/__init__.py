@@ -65,6 +65,13 @@ from .fleet import SandboxFleet
 from .handle import SandboxHandle
 from .lookahead import LookaheadWarmer, WarmReport
 from .observability import Observer, RunReport
+from .preflight import (
+    ImagePlacement,
+    PlacementDomain,
+    PlacementEntry,
+    PreflightCoverage,
+    PreflightWarmer,
+)
 
 # Types
 from .types import (
@@ -104,6 +111,11 @@ __all__ = [
     "SandboxHandle",
     "LookaheadWarmer",
     "WarmReport",
+    "PreflightWarmer",
+    "PreflightCoverage",
+    "ImagePlacement",
+    "PlacementDomain",
+    "PlacementEntry",
     # Telemetry
     "TracerConfig",
     "ObservabilityConfig",

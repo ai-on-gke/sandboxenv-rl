@@ -113,11 +113,13 @@ OH_SESSION_API_KEYS_0=<key>`). The workspace reaches the agent-server through th
 
 A snapshot holds the memory and the files of an environment, and thus the credentials that callers
 put in it. Golden snapshots of templates and the snapshots of suspended environments go to the
-bucket that `ate-env manifest template --snapshots-bucket` names.
+Substrate install's `--snapshot-location`, or, on an install with the `PerTemplateSnapshotLocation`
+preview gate, to the bucket that `ate-env manifest template --snapshots-bucket` names.
 
 What ate-env controls: `ate-env manifest template` writes the bucket URL into the template's
-`snapshotConfig.storageLocation`, and templates that `ate-env-api` derives keep it. `ate-env-api`
-does not read or write the bucket itself.
+`snapshotConfig.storageLocation` only when `--snapshots-bucket` is set, and templates that
+`ate-env-api` derives keep the base's value, or its absence. `ate-env-api` does not read or write
+the bucket itself.
 
 What ate-env does not control: Substrate writes and reads the snapshots. The operator owns the
 access control, the encryption and the retention of the bucket. What stays in the bucket after an

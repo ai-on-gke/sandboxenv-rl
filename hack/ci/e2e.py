@@ -249,8 +249,6 @@ def deploy_manifests(
             f"{tmpl}-workerpool",
             "--guest-image",
             imgs["guest"],
-            "--snapshots-bucket",
-            target.bucket_url,
             "--env",
             f"E2E_TEMPLATE_MARKER={TEMPLATE_MARKER}",
         ],

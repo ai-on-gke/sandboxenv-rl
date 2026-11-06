@@ -135,6 +135,12 @@ func ValidateArtifactBundle(destDir string, opts swebench.ValidateOptions, folde
 	}
 	opts.TraceCaptured = opts.TraceCaptured || traceCaptured
 	opts.TraceFileCount = len(traceFiles)
+	// A pre-flight's coverage file in the bundle feeds Rule 1 without a flag.
+	if opts.PreflightCoverage == nil && opts.PreflightCoveragePath == "" {
+		if p := filepath.Join(destDir, "preflight-coverage.json"); fileExists(p) {
+			opts.PreflightCoveragePath = p
+		}
+	}
 
 	if strings.TrimSpace(folderName) != "" {
 		if err := ValidateGCSFolderName(folderName, traceCaptured); err != nil {
@@ -530,4 +536,9 @@ func uploadCmd(args []string, stdout, stderr io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "uploaded %s to %s\n", *destDir, destURI)
 	return nil
+}
+
+func fileExists(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && !info.IsDir()
 }

@@ -61,9 +61,9 @@ Verify readiness within wake budgets, fail fast on unrecoverable errors, and evi
 
 - **Location**: `internal/apiservice/wakeretry.go` (`ensureAwake`, `StartFailureKey`),
   `internal/ate/client.go` (`Delete`, `evictGuest`).
-- **Wake budgets**: Traffic to a suspended actor triggers restoration in `atenet`. `ensureAwake`
-  polls `GetProcess("ate-env-wake-probe")` under `DefaultWakeBudget` (5 minutes overall) and
-  `DefaultWakeRunningBudget` (20 seconds once `RUNNING`).
+- **Wake budgets**: Traffic to a suspended actor resumes it in `atenet`. `ensureAwake` polls
+  `GetProcess("ate-env-wake-probe")` under `DefaultWakeBudget` (5m) and `DefaultWakeRunningBudget`
+  (20s once `RUNNING`), returning `Canceled` or `DeadlineExceeded` probe errors immediately.
 - **Fail-fast start errors**: `ensureAwake` exits early on unrecoverable states:
   `routertls.RejectedCertificate` returns `codes.FailedPrecondition` with
   `routertls.RejectionAdvice` and no trailer, `CRASHED` returns `codes.FailedPrecondition` with
@@ -72,8 +72,8 @@ Verify readiness within wake budgets, fail fast on unrecoverable errors, and evi
   while not `RUNNING` (default `0` waits `WakeBudget`) returns `codes.ResourceExhausted`
   (`ate-env-start-failure: no-capacity`).
 - **Delete sequence**: `internal/ate.Client.Delete` calls `DeleteActor` directly in any state
-  including `CRASHED` (terminating workloads, releasing worker slots, and deleting snapshots without
-  pre-suspending) and calls `evictGuest` to close and drop the pooled `guestPool` connection.
+  including `CRASHED` (terminating workloads, releasing slots, and deleting snapshots without
+  pre-suspending) and calls `evictGuest` to drop the pooled `guestPool` connection.
 
 ### 6. Idempotent derived `ActorTemplate` creation and failed golden-snapshot recovery
 

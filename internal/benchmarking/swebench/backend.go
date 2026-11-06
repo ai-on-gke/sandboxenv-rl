@@ -21,16 +21,19 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	env "github.com/agent-substrate/env/clients/go"
+	"github.com/agent-substrate/env/internal/benchmarking/schema"
 	ateenvv1alpha "github.com/agent-substrate/env/proto/ateenv/v1alpha"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"sync"
 )
 
 // Result is what a Run step returned.
@@ -148,6 +151,17 @@ func WithPollBounds(minPoll, maxPoll time.Duration) EnvBackendOption {
 	}
 }
 
+// WithPlacement makes Create steer each image's environments into the
+// domains an image placement plan assigns it: the per-environment worker
+// selector of one of the image's domains, round-robin per image. Images the
+// plan does not place get no selector.
+func WithPlacement(plan *schema.ImagePlacement) EnvBackendOption {
+	return func(b *EnvBackend) {
+		b.placement = plan
+		b.placeNext = map[string]int{}
+	}
+}
+
 // EnvBackend is the Backend over the ate-env API through the Go SDK.
 //
 // It holds several connections and hands them out round-robin per
@@ -161,6 +175,33 @@ type EnvBackend struct {
 	baseTemplate     string
 	minPoll, maxPoll time.Duration
 	deletes          deleteLimits
+
+	placement *schema.ImagePlacement
+	placeMu   sync.Mutex
+	placeNext map[string]int
+}
+
+// selectorFor is the worker selector Create sends for image under the
+// placement plan: the next of the image's domains, round-robin; nil without
+// a plan or for an image the plan does not place.
+func (b *EnvBackend) selectorFor(image string) map[string]string {
+	if b.placement == nil {
+		return nil
+	}
+	entry := b.placement.Entry(image)
+	if entry == nil || len(entry.Domains) == 0 {
+		return nil
+	}
+	b.placeMu.Lock()
+	i := b.placeNext[image]
+	b.placeNext[image] = i + 1
+	b.placeMu.Unlock()
+	d := b.placement.Domain(entry.Domains[i%len(entry.Domains)])
+	if d == nil {
+		return nil
+	}
+	// A copy: the request keeps it, and the plan's map is shared by every create.
+	return maps.Clone(d.Selector)
 }
 
 // DefaultDeleteRate is the loader's default cap on the environment deletes an
@@ -336,9 +377,10 @@ func (b *EnvBackend) Prewarm(ctx context.Context, images []string) error {
 }
 
 // Create implements Backend. The environment keeps the connection it was
-// created on for the rest of its life.
+// created on for the rest of its life. With a placement plan (WithPlacement)
+// it lands in one of the image's domains.
 func (b *EnvBackend) Create(ctx context.Context, id, image string) (Sandbox, error) {
-	return b.CreateWith(ctx, id, image, CreateOptions{})
+	return b.CreateWith(ctx, id, image, CreateOptions{WorkerSelector: b.selectorFor(image)})
 }
 
 // CreateWith implements ImageWarmer: Create with options.

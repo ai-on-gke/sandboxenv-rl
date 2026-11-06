@@ -223,3 +223,30 @@ func TestDeriveImageTemplateKeepsRuntimeLayers(t *testing.T) {
 		t.Errorf("second derivation altered layers or command: %v", again)
 	}
 }
+
+// A guest-as-image base that already uses the guest's volume name or mount
+// path cannot take the guest volume: Substrate requires unique volume names
+// and mounts that do not nest. Derive refuses it with the reason instead of
+// returning a template Substrate rejects. (Found by TestPropDeriveComposes.)
+func TestDeriveImageTemplateRefusesClashWithGuestSlot(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		volume string
+		mount  string
+		want   string
+	}{
+		{"volume named guest", GuestVolumeName, "/data", "not an image volume"},
+		{"mount at the guest path", "data", GuestMountPath, "overlaps the guest mount"},
+		{"mount under the guest path", "data", GuestMountPath + "/cache", "overlaps the guest mount"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := modeABase()
+			base.Volumes = append(base.Volumes, &ateapipb.Volume{Name: tc.volume, DurableDir: &ateapipb.DurableDirVolumeSource{}})
+			base.Containers[0].VolumeMounts = append(base.Containers[0].VolumeMounts, &ateapipb.VolumeMount{Name: tc.volume, MountPath: tc.mount})
+			_, err := DeriveImageTemplate(base, "default-template-0123456789ab", testRootfsImage)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("DeriveImageTemplate: err = %v, want one containing %q", err, tc.want)
+			}
+		})
+	}
+}

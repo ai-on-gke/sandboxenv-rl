@@ -466,7 +466,7 @@ func TestStepsSuspendPark(t *testing.T) {
 }
 
 func TestStepsParkEachBoundsAwakeEnvironments(t *testing.T) {
-	for _, park := range []Park{ParkSuspend, ParkDelete} {
+	for _, park := range []Park{ParkSuspend, ParkSuspendSync, ParkSuspendAsync, ParkDelete} {
 		t.Run(string(park), func(t *testing.T) {
 			f := newFake()
 			var out bytes.Buffer
@@ -493,13 +493,18 @@ func TestStepsParkEachBoundsAwakeEnvironments(t *testing.T) {
 			}
 			wakes, ttfis := stat(rep, EventWake).Count, stat(rep, EventTTFI).Count
 			switch park {
-			case ParkSuspend:
+			case ParkSuspend, ParkSuspendSync, ParkSuspendAsync:
 				if len(f.created) != 9 || wakes != 18 || ttfis != 9 {
 					t.Fatalf("created %d wakes %d ttfis %d, want 9 created once, 18 wakes, 9 ttfis", len(f.created), wakes, ttfis)
 				}
+				// suspend and suspend-sync park durably, suspend-async locally.
+				want, other := f.suspended, f.suspendedAsync
+				if park == ParkSuspendAsync {
+					want, other = f.suspendedAsync, f.suspended
+				}
 				for id, n := range f.created {
-					if n != 1 || f.suspended[id] != 2 || f.deleted[id] != 1 {
-						t.Fatalf("env %s created %d suspended %d deleted %d, want 1, 2 (the last step deletes instead) and 1", id, n, f.suspended[id], f.deleted[id])
+					if n != 1 || want[id] != 2 || other[id] != 0 || f.deleted[id] != 1 {
+						t.Fatalf("env %s created %d parked %d (other mode %d) deleted %d, want 1, 2 in the %s mode (the last step deletes instead), 0 and 1", id, n, want[id], other[id], f.deleted[id], park)
 					}
 				}
 				// The last step's deletes happen inside the step: every delete
@@ -764,6 +769,7 @@ func TestConfigValidation(t *testing.T) {
 		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 0; c.Steps = 1 },
 		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 1; c.Steps = 1; c.Park = "bogus" },
 		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 1; c.Steps = 1; c.Park = ParkNone; c.ParkEach = true },
+		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 1; c.Steps = 1; c.Park = ParkFork; c.ParkEach = true },
 		func(c *Config) {
 			c.Mode = ModeSteps
 			c.Rollouts = 1

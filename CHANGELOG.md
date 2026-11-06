@@ -14,6 +14,15 @@ user needs to know across them.
   `-window-size`, `swebench-loader render-plan`, `swebench-loader report -md`
   over several runs (the arm table), and the `-atenet-*` and `-ateapi-*`
   flags of the direct Substrate backend.
+- `swebench-loader preflight`, the PreflightWarmer: from an image placement
+  plan, ensures each image's derived template, then per domain, as each
+  golden becomes ready, probes every node of the domain with the image
+  (creates placed by the domain's worker selector, node read back) until
+  each node has run it, `-image-concurrency` images at once;
+  `preflight-events.jsonl` and `preflight-coverage.json`. `EnvBackend` gains
+  `CreateWith(CreateOptions{WorkerSelector})`, `Node`, `ImageStatus` and
+  `EnsureImageTemplate` (the `ImageWarmer` interface); `domains.json` takes
+  an optional `node_slots` per domain.
 - ate-env-api: `GetImageStatus` and `EnsureImageTemplate`, the ActorTemplate
   derived for a `rootfs_image` and the state of its golden snapshot (`NONE`,
   `PENDING`, `READY` with the tag, `FAILED` with the reason); ensure creates
@@ -95,6 +104,10 @@ user needs to know across them.
 
 ### Fixed
 
+- ate-env-api: deriving an image template from a base that already has a
+  non-image volume named `guest`, or a mount at or under `/ate`, fails with
+  `InvalidArgument` naming the clash, instead of creating a template that
+  Substrate rejects for a duplicate volume or nested mounts.
 - ate-env-api: a guest call whose caller context cancels or expires while its
   wake probe is parked at the router returns `Canceled` or `DeadlineExceeded`
   instead of treating the unwoken environment as awake and recording

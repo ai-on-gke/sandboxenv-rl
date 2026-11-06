@@ -466,7 +466,7 @@ func TestStepsSuspendPark(t *testing.T) {
 }
 
 func TestStepsParkEachBoundsAwakeEnvironments(t *testing.T) {
-	for _, park := range []Park{ParkSuspend, ParkDelete} {
+	for _, park := range []Park{ParkSuspend, ParkSuspendSync, ParkSuspendAsync, ParkDelete} {
 		t.Run(string(park), func(t *testing.T) {
 			f := newFake()
 			var out bytes.Buffer
@@ -493,14 +493,36 @@ func TestStepsParkEachBoundsAwakeEnvironments(t *testing.T) {
 			}
 			wakes, ttfis := stat(rep, EventWake).Count, stat(rep, EventTTFI).Count
 			switch park {
-			case ParkSuspend:
+			case ParkSuspend, ParkSuspendSync, ParkSuspendAsync:
 				if len(f.created) != 9 || wakes != 18 || ttfis != 9 {
 					t.Fatalf("created %d wakes %d ttfis %d, want 9 created once, 18 wakes, 9 ttfis", len(f.created), wakes, ttfis)
 				}
+				// suspend and suspend-sync park durably, suspend-async locally.
+				want, other := f.suspended, f.suspendedAsync
+				if park == ParkSuspendAsync {
+					want, other = f.suspendedAsync, f.suspended
+				}
 				for id, n := range f.created {
-					if n != 1 || f.suspended[id] != 3 || f.deleted[id] != 1 {
-						t.Fatalf("env %s created %d suspended %d deleted %d, want 1, 3 (the last step parks too) and 1", id, n, f.suspended[id], f.deleted[id])
+					if n != 1 || want[id] != 2 || other[id] != 0 || f.deleted[id] != 1 {
+						t.Fatalf("env %s created %d parked %d (other mode %d) deleted %d, want 1, 2 in the %s mode (the last step deletes instead), 0 and 1", id, n, want[id], other[id], f.deleted[id], park)
 					}
+				}
+				// The last step's deletes happen inside the step: every delete
+				// event precedes the step's barrier event.
+				events := parseEvents(t, out.String())
+				lastBarrier, deletesBefore := -1, 0
+				for i, ev := range events {
+					if ev.Event == EventBarrier && ev.Step == 3 {
+						lastBarrier = i
+					}
+				}
+				for _, ev := range events[:lastBarrier+1] {
+					if ev.Event == EventDelete && ev.Step == 3 {
+						deletesBefore++
+					}
+				}
+				if lastBarrier < 0 || deletesBefore != 9 {
+					t.Fatalf("%d of 9 last-step deletes recorded before the step 3 barrier (at %d); the rest ran in the cleanup", deletesBefore, lastBarrier)
 				}
 			case ParkDelete:
 				if len(f.created) != 27 || wakes != 0 || ttfis != 27 {
@@ -510,6 +532,55 @@ func TestStepsParkEachBoundsAwakeEnvironments(t *testing.T) {
 					if n != 1 || f.deleted[id] != 1 {
 						t.Fatalf("env %s created %d deleted %d", id, n, f.deleted[id])
 					}
+				}
+			}
+		})
+	}
+}
+
+// With Keep the last step leaves the fleet in place on both park modes, as
+// the barrier path does: a suspend park parks it like the other steps, a
+// delete park leaves it awake.
+func TestStepsParkEachKeepParksTheLastStep(t *testing.T) {
+	for _, park := range []Park{ParkSuspend, ParkDelete} {
+		t.Run(string(park), func(t *testing.T) {
+			f := newFake()
+			var out bytes.Buffer
+			cfg := baseConfig(t, f, &out)
+			cfg.Mode = ModeSteps
+			cfg.Rollouts = 2 // 6 environments
+			cfg.Steps = 2
+			cfg.Park = park
+			cfg.ParkEach = true
+			cfg.Keep = true
+			if _, err := Run(context.Background(), cfg); err != nil {
+				t.Fatal(err)
+			}
+			switch park {
+			case ParkSuspend:
+				if len(f.created) != 6 || len(f.deleted) != 0 {
+					t.Fatalf("created %d deleted %v, want 6 created and none deleted", len(f.created), f.deleted)
+				}
+				for id, n := range f.suspended {
+					if n != 2 {
+						t.Fatalf("env %s suspended %d times, want 2 (every step parks under -keep)", id, n)
+					}
+				}
+			case ParkDelete:
+				// Step 1 retires its 6; step 2 creates 6 more and leaves them
+				// awake, as the barrier path's -park delete -keep does.
+				left := 0
+				for id, n := range f.created {
+					if n != 1 || f.deleted[id] > 1 {
+						t.Fatalf("env %s created %d deleted %d", id, n, f.deleted[id])
+					}
+					if f.deleted[id] == 0 {
+						left++
+					}
+				}
+				if len(f.created) != 12 || left != 6 || len(f.suspended) != 0 || f.awake.Load() != 6 {
+					t.Fatalf("created %d left %d suspended %d awake %d, want 12 created, 6 left awake, none suspended",
+						len(f.created), left, len(f.suspended), f.awake.Load())
 				}
 			}
 		})
@@ -698,6 +769,7 @@ func TestConfigValidation(t *testing.T) {
 		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 0; c.Steps = 1 },
 		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 1; c.Steps = 1; c.Park = "bogus" },
 		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 1; c.Steps = 1; c.Park = ParkNone; c.ParkEach = true },
+		func(c *Config) { c.Mode = ModeSteps; c.Rollouts = 1; c.Steps = 1; c.Park = ParkFork; c.ParkEach = true },
 		func(c *Config) {
 			c.Mode = ModeSteps
 			c.Rollouts = 1

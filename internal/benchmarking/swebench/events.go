@@ -37,7 +37,7 @@ import (
 // Event names. Every timed operation of a run is one of these.
 const (
 	EventCreate  = "create"       // CreateEnvironment call
-	EventTTFI    = "ttfi"         // create start to the first command's return
+	EventTTFI    = "ttfi"         // time to first instruction: the ask for a sandbox (slot wait, then claim) to the first command being issued
 	EventWake    = "wake"         // first command after a park, including the wake it triggers
 	EventStep    = "step"         // one trajectory step (name is the step name)
 	EventTask    = "task"         // one trajectory replay end to end

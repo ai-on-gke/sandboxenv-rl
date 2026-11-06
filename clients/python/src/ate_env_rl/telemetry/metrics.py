@@ -199,7 +199,7 @@ SUBPHASE_FAMILIES: dict[str, tuple[str, str]] = {
     ),
     "ttfi": (
         "ate_env_client_ttfi_seconds",
-        "Time from sandbox request until the first command begins execution",
+        "Time from the ask for a sandbox (before any slot wait) until the first command is issued",
     ),
     "grade": (
         "ate_env_client_grade_seconds",

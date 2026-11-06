@@ -187,7 +187,10 @@ func TestRealJobDriverVeRLAndTraceIngestion(t *testing.T) {
 	if rep.Tasks != 1 || rep.AcquisitionSources["warm_pool"] < 1 {
 		t.Fatalf("unexpected Tasks/AcquisitionSources: tasks=%d sources=%+v", rep.Tasks, rep.AcquisitionSources)
 	}
-	if rep.Headline == nil || rep.Headline.TTFIP50MS != 565.0 || rep.Headline.WireClaimToReadyP50MS != 145.0 || rep.Headline.ReadyToFirstCmdP50MS != 420.0 {
+	// ttfi ends when the first command is issued: the exec record ends at
+	// +1.000 s with dur 420 ms, so it started at +0.580 s; claim 145 ms +
+	// 580 ms gap = 725 ms; the 420 ms round trip itself is not in ttfi.
+	if rep.Headline == nil || rep.Headline.TTFIP50MS != 725.0 || rep.Headline.WireClaimToReadyP50MS != 145.0 || rep.Headline.ReadyToFirstCmdP50MS != 580.0 {
 		t.Fatalf("unexpected Headline TTFI breakdown: %+v", rep.Headline)
 	}
 	if rep.RLBreakdown == nil || rep.RLBreakdown.ParamSyncP50MS != 2340.0 || rep.RLBreakdown.RewardP50MS <= 0 {

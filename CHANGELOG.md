@@ -17,6 +17,15 @@ user needs to know across them.
 - `uni_agent_substrate.datasets --shuffle-seed` for datasets sorted by
   repository; `resolve_images.sh` `MODE=hubapi` (Docker Hub tags API, no
   pulls), `MODE=arapi` (Artifact Registry listing) and `MIRROR_NAME_SEP`.
+- Python client: `ate_env_client_ttfi_seconds` (time to first instruction:
+  the ask for a sandbox to the first command being issued) and
+  `ate_env_client_{grade,read_file,write_file}_seconds` histograms, so the
+  sandbox latency breakdown exists without a trace; `exec(..., phase="grade")`
+  marks a grading command explicitly.
+- `bench report` reads the Prometheus histograms (`bench measure` scrapes
+  them) before trace-derived stats; traces are the fallback. The `ttfi`
+  event from traces and the loader now ends when the first command is
+  issued, matching the histogram.
 - Python client: `FleetConfig.node_selector` is sent as every environment's
   `worker_selector`, and `FleetConfig.placement` adds labels per task image;
   `SubstrateBackendDriver(worker_selector=, placement=)` and

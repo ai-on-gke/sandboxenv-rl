@@ -88,24 +88,53 @@ func promBucketQuantile(buckets map[float64]float64, total float64, phi float64)
 	return finiteLEs[len(finiteLEs)-1]
 }
 
+// windowed reports whether a cumulative Prometheus series (a histogram's
+// _bucket/_count/_sum or a _total counter) carries the two samples a run
+// window needs. A single value is the counter's total since the process
+// started, so an ate-env-api scraped once after the run would report every
+// run it ever served; such a series is skipped rather than misread.
+func windowed(ps schema.PrometheusSeries) bool {
+	return len(ps.Values) >= 2
+}
+
 // PromHistogramStat computes an OpStat (in milliseconds) from Prometheus cumulative
 // histogram series (`<baseName>_bucket`, `<baseName>_count`, `<baseName>_sum`) or
-// pre-aggregated MetricSummary entries in Measurements.
+// pre-aggregated MetricSummary entries in Measurements. Histogram series count
+// only when windowed (two samples); the quantiles are bucket estimates in the
+// manner of histogram_quantile, so MaxMS is left 0: a histogram holds no
+// observed maximum, only an upper bucket bound.
 func PromHistogramStat(meas *schema.Measurements, baseName string, labelFilter map[string]string) (Stat, bool) {
+	st, _, ok := promHistogram(meas, baseName, labelFilter)
+	return st, ok
+}
+
+// promHistogramDetail carries what Stat has no field for.
+type promHistogramDetail struct {
+	SumMS float64
+	P99MS float64
+}
+
+func promHistogram(meas *schema.Measurements, baseName string, labelFilter map[string]string) (Stat, promHistogramDetail, bool) {
+	var detail promHistogramDetail
 	if meas == nil {
-		return Stat{}, false
+		return Stat{}, detail, false
 	}
 	bucketName := baseName + "_bucket"
 	countName := baseName + "_count"
+	sumName := baseName + "_sum"
 	buckets := make(map[float64]float64)
-	var infCount float64
-	var errCount float64
-	var explicitCount float64
-	var sawBucket bool
+	var infCount, infErrCount float64
+	var explicitCount, explicitErrCount float64
+	var sumSeconds float64
+	var sawBucket, sawSum bool
 
+	isErr := func(labels map[string]string) bool {
+		return labels != nil && (labels["status"] == "error" || labels["outcome"] == "error")
+	}
 	for _, ps := range meas.PromMetrics {
-		if (ps.Name == bucketName || ps.Name == baseName) && ps.Labels != nil && ps.Labels["le"] != "" {
-			if !labelsMatch(ps.Labels, labelFilter) {
+		switch {
+		case (ps.Name == bucketName || ps.Name == baseName) && ps.Labels != nil && ps.Labels["le"] != "":
+			if !labelsMatch(ps.Labels, labelFilter) || !windowed(ps) {
 				continue
 			}
 			sawBucket = true
@@ -115,8 +144,8 @@ func PromHistogramStat(meas *schema.Measurements, baseName string, labelFilter m
 			if leStr == "+Inf" || leStr == "Inf" || leStr == "+inf" {
 				le = math.Inf(1)
 				infCount += delta
-				if ps.Labels["status"] == "error" || ps.Labels["outcome"] == "error" {
-					errCount += delta
+				if isErr(ps.Labels) {
+					infErrCount += delta
 				}
 			} else {
 				parsed, err := strconv.ParseFloat(leStr, 64)
@@ -126,32 +155,41 @@ func PromHistogramStat(meas *schema.Measurements, baseName string, labelFilter m
 				le = parsed
 			}
 			buckets[le] += delta
-		} else if ps.Name == countName && labelsMatch(ps.Labels, labelFilter) {
+		case ps.Name == countName && labelsMatch(ps.Labels, labelFilter) && windowed(ps):
 			delta := promSeriesWindowDelta(ps)
 			explicitCount += delta
-			if ps.Labels != nil && (ps.Labels["status"] == "error" || ps.Labels["outcome"] == "error") {
-				errCount += delta
+			if isErr(ps.Labels) {
+				explicitErrCount += delta
 			}
+		case (ps.Name == sumName || (ps.Name == baseName && (ps.Labels == nil || ps.Labels["le"] == ""))) && labelsMatch(ps.Labels, labelFilter) && windowed(ps):
+			// queries.yaml scrapes <family>_sum under the family's base name.
+			sawSum = true
+			sumSeconds += promSeriesWindowDelta(ps)
 		}
 	}
 
-	totalCount := infCount
+	// Errors come from one source: the +Inf bucket when buckets exist (it is
+	// the histogram's own count), else the _count series. queries.yaml
+	// scrapes both, so adding them would count every error twice.
+	totalCount, errCount := infCount, infErrCount
 	if totalCount == 0 && explicitCount > 0 {
-		totalCount = explicitCount
+		totalCount, errCount = explicitCount, explicitErrCount
 	}
 	if sawBucket && totalCount > 0 {
 		p50 := promBucketQuantile(buckets, totalCount, 0.50) * 1000.0
 		p90 := promBucketQuantile(buckets, totalCount, 0.90) * 1000.0
 		p95 := promBucketQuantile(buckets, totalCount, 0.95) * 1000.0
-		maxMS := promBucketQuantile(buckets, totalCount, 0.999) * 1000.0
+		detail.P99MS = round2(promBucketQuantile(buckets, totalCount, 0.99) * 1000.0)
+		if sawSum {
+			detail.SumMS = round2(sumSeconds * 1000.0)
+		}
 		return Stat{
 			Count:  int(math.Round(totalCount)),
 			Failed: int(math.Round(errCount)),
 			P50MS:  round2(p50),
 			P90MS:  round2(p90),
 			P95MS:  round2(p95),
-			MaxMS:  round2(maxMS),
-		}, true
+		}, detail, true
 	}
 
 	// Check pre-aggregated MetricSummary maps (CustomMetrics / ServerSummary).
@@ -165,32 +203,38 @@ func PromHistogramStat(meas *schema.Measurements, baseName string, labelFilter m
 			if p95 == 0 {
 				p95 = summary.P90
 			}
+			detail.SumMS, detail.P99MS = summary.Sum, summary.P99
 			return Stat{
 				Count: summary.Count,
 				P50MS: round2(summary.P50),
 				P90MS: round2(summary.P90),
 				P95MS: round2(p95),
 				MaxMS: round2(summary.Max),
-			}, true
+			}, detail, true
 		}
 		if summary, ok := m[baseName]; ok && summary.Count > 0 {
 			p95 := summary.P95
 			if p95 == 0 {
 				p95 = summary.P90
 			}
+			detail.SumMS, detail.P99MS = summary.Sum*1000.0, summary.P99*1000.0
 			return Stat{
 				Count: summary.Count,
 				P50MS: round2(summary.P50 * 1000.0),
 				P90MS: round2(summary.P90 * 1000.0),
 				P95MS: round2(p95 * 1000.0),
 				MaxMS: round2(summary.Max * 1000.0),
-			}, true
+			}, detail, true
 		}
 	}
 
-	return Stat{}, false
+	return Stat{}, detail, false
 }
 
+// upsertStatPrimary puts a metrics-derived stat in place of the trace-derived
+// one for the same event: metrics first, since traces add latency of their
+// own and are often not captured at all. Size and retry fields the metrics
+// do not carry are kept from the trace stat.
 func (rep *Report) upsertStatPrimary(st Stat) {
 	if st.Count <= 0 {
 		return
@@ -213,12 +257,14 @@ func (rep *Report) upsertStatPrimary(st Stat) {
 	rep.Stats = append(rep.Stats, st)
 }
 
-func statToMetricSummaryMS(st Stat) schema.MetricSummary {
+func statToMetricSummaryMS(st Stat, d promHistogramDetail) schema.MetricSummary {
 	return schema.MetricSummary{
 		Count: st.Count,
+		Sum:   d.SumMS,
 		P50:   st.P50MS,
 		P90:   st.P90MS,
 		P95:   st.P95MS,
+		P99:   d.P99MS,
 		Max:   st.MaxMS,
 		Unit:  "ms",
 	}
@@ -239,14 +285,14 @@ func (rep *Report) ApplyMetricsPrimaryWithTraceFallback(meas *schema.Measurement
 		}
 
 		// 1. Sub-phase metrics for TTFI breakdown.
-		if sw, ok := PromHistogramStat(meas, "ate_env_client_slot_wait_seconds", nil); ok {
-			rep.CustomMetrics["sdk_slot_wait_ms"] = statToMetricSummaryMS(sw)
+		if sw, d, ok := promHistogram(meas, "ate_env_client_slot_wait_seconds", nil); ok {
+			rep.CustomMetrics["sdk_slot_wait_ms"] = statToMetricSummaryMS(sw, d)
 		}
-		if wc, ok := PromHistogramStat(meas, "ate_env_client_wire_claim_seconds", nil); ok {
-			rep.CustomMetrics["wire_claim_to_ready_ms"] = statToMetricSummaryMS(wc)
+		if wc, d, ok := promHistogram(meas, "ate_env_client_wire_claim_seconds", nil); ok {
+			rep.CustomMetrics["wire_claim_to_ready_ms"] = statToMetricSummaryMS(wc, d)
 		}
-		if rf, ok := PromHistogramStat(meas, "ate_env_client_ready_to_first_command_seconds", nil); ok {
-			rep.CustomMetrics["ready_to_first_cmd_ms"] = statToMetricSummaryMS(rf)
+		if rf, d, ok := promHistogram(meas, "ate_env_client_ready_to_first_command_seconds", nil); ok {
+			rep.CustomMetrics["ready_to_first_cmd_ms"] = statToMetricSummaryMS(rf, d)
 		}
 
 		// 2. Primary operation & phase latency stats (metrics-first, trace fallback).
@@ -355,74 +401,22 @@ func (rep *Report) ApplyMetricsPrimaryWithTraceFallback(meas *schema.Measurement
 	rep.refreshHeadlineFromReport()
 }
 
+// refreshHeadlineFromReport rebuilds the headline from the report's stats and
+// custom metrics with the one set of rules (buildHeadlineBaseline), keeping
+// the claim-rate fields, which only the event stream can supply.
 func (rep *Report) refreshHeadlineFromReport() {
 	if rep == nil {
 		return
 	}
-	if rep.Headline == nil {
-		rep.Headline = &HeadlineBaseline{}
-	}
-	hb := rep.Headline
-	if rep.Tasks > 0 {
-		hb.TasksPerMin = rep.ThroughputTasksPerMin()
-	}
-	if st, ok := rep.StatFor(EventTTFI, ""); ok && st.Count > 0 {
-		hb.TTFIP50MS = st.P50MS
-		hb.TTFIP90MS = st.P90MS
-		hb.TTFIP95MS = st.P95MS
-		hb.TTFIMaxMS = st.MaxMS
-	}
-	if cm, ok := rep.CustomMetrics["sdk_slot_wait_ms"]; ok && cm.Count > 0 {
-		hb.SDKSlotWaitP50MS = cm.P50
-		hb.SDKSlotWaitP95MS = cm.P95
-	}
-	if cm, ok := rep.CustomMetrics["wire_claim_to_ready_ms"]; ok && cm.Count > 0 {
-		hb.WireClaimToReadyP50MS = cm.P50
-		hb.WireClaimToReadyP95MS = cm.P95
-	}
-	if cm, ok := rep.CustomMetrics["ready_to_first_cmd_ms"]; ok && cm.Count > 0 {
-		hb.ReadyToFirstCmdP50MS = cm.P50
-		hb.ReadyToFirstCmdP95MS = cm.P95
-	}
-	if st, ok := rep.StatFor(EventCreate, ""); ok && st.Count > 0 {
-		hb.CreateP50MS = st.P50MS
-		hb.CreateP95MS = st.P95MS
-		if hb.WireClaimToReadyP50MS == 0 {
-			hb.WireClaimToReadyP50MS = st.P50MS
-			hb.WireClaimToReadyP95MS = st.P95MS
+	old := rep.Headline
+	hb := (&Builder{}).buildHeadlineBaseline(rep)
+	if old != nil {
+		hb.ClaimsCount = old.ClaimsCount
+		hb.PeakClaimsPerSec = old.PeakClaimsPerSec
+		hb.SustainedClaimsPerSec = old.SustainedClaimsPerSec
+		if hb.TasksPerMin == 0 {
+			hb.TasksPerMin = old.TasksPerMin
 		}
 	}
-	if st, ok := rep.StatFor(EventWake, ""); ok && st.Count > 0 {
-		hb.WakeP50MS = st.P50MS
-		hb.WakeP95MS = st.P95MS
-	}
-	for _, execName := range []struct {
-		ev   string
-		name string
-	}{
-		{EventStep, "exec"},
-		{EventStep, "agent_exec"},
-		{EventPhase, "agent_exec"},
-		{EventStep, "patch"},
-		{EventStep, "setup"},
-	} {
-		if st, ok := rep.StatFor(execName.ev, execName.name); ok && st.Count > 0 {
-			hb.ExecP50MS = st.P50MS
-			hb.ExecP95MS = st.P95MS
-			break
-		}
-	}
-	if st, ok := rep.StatFor(EventSuspend, ""); ok && st.Count > 0 {
-		hb.SuspendP50MS = st.P50MS
-		hb.SuspendP95MS = st.P95MS
-		if st.SizeMBP50 > 0 {
-			hb.SuspendSizeMBP50 = st.SizeMBP50
-			hb.SuspendSizeMBP95 = st.SizeMBP95
-			hb.CheckpointMBS = st.CheckpointMBS
-		}
-	}
-	if st, ok := rep.StatFor(EventDelete, ""); ok && st.Count > 0 {
-		hb.DeleteP50MS = st.P50MS
-		hb.DeleteP95MS = st.P95MS
-	}
+	rep.Headline = hb
 }

@@ -554,6 +554,15 @@ recording, even for a later fleet with `enable_metrics=False`. The fleet records
 records `ate_env_client_{acquire,exec,suspend,warm_claim,release}_seconds`
 (`warm_claim` is the time to validate a warm claim; the resume itself
 happens on the first guest request, so it lands in the first `exec`).
+Each `SandboxHandle` also records, with `status` and `source` labels,
+`ate_env_client_ttfi_seconds` (time to first instruction: from the ask for a
+sandbox, before any slot wait, to the first command being issued; the boot or
+wake wait the server performs inside that first call is not included, see
+`ate_env_api_create_to_ready_seconds` for it), and
+`ate_env_client_{grade,read_file,write_file}_seconds` for those operations.
+A command counts as grading when `exec(..., phase="grade")` says so; without
+`phase`, commands naming `run_tests.sh` or `/eval.sh`
+(`SandboxHandle.DEFAULT_GRADE_COMMAND_MARKERS`) do, and `phase=""` opts out.
 Collectors register on the first metrics-enabled `Observer`, never at
 import. Labels are limited to `phase`, `backend` (`substrate` or `mock`),
 `family` (the task's repo family, see `ate_env_rl.observability.repo_family`),

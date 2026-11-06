@@ -126,8 +126,12 @@ spans carry its own `run`, `env` and `instance`.
   `ate_env_fleet_task_latency_seconds`, `ate_env_fleet_run_latency_seconds`,
   `ate_env_fleet_claims_total`, `ate_env_fleet_tasks_total`,
   `ate_env_fleet_release_failures_total`, `ate_env_fleet_warm_replicas`,
-  `ate_env_client_{acquire,exec,suspend,warm_claim,release}_seconds`, and the
-  claim sub-phases `ate_env_client_{slot_wait,wire_claim,ready_to_first_command}_seconds`):
+  `ate_env_client_{acquire,exec,suspend,warm_claim,release}_seconds`, the
+  claim sub-phases `ate_env_client_{slot_wait,wire_claim,ready_to_first_command}_seconds`,
+  `ate_env_client_ttfi_seconds` (time to first instruction: the ask for a
+  sandbox to the first command being issued) and the per-operation
+  `ate_env_client_{grade,read_file,write_file}_seconds`, all with `status` and
+  `source` labels):
   the [Python client README](../clients/python/README.md#observability).
 
 Collectors register on the first metrics-enabled `Observer`, never at import,

@@ -69,17 +69,26 @@ class SandboxHandle:
     tracer: Any = field(default=None, repr=False, compare=False)
     claim_source: str = field(default="direct", repr=False, compare=False)
     _acquired_at: float = field(default_factory=time.monotonic, init=False, repr=False, compare=False)
+    # When the caller asked the fleet for a sandbox (before any slot wait).
+    # None for a handle built outside a fleet: no ttfi sample then, rather
+    # than one that merely repeats ready_to_first_command.
     _acquire_started_at: float | None = field(default=None, repr=False, compare=False)
     _first_command_started: bool = field(default=False, init=False, repr=False, compare=False)
 
-    def __post_init__(self) -> None:
-        if self._acquire_started_at is None:
-            self._acquire_started_at = self._acquired_at
+    # Commands that grade a task when the caller passes no ``phase``: the
+    # SWE-bench / R2E graders. ``exec(..., phase="grade")`` is the explicit
+    # signal; other harnesses should use it rather than extend this list.
+    DEFAULT_GRADE_COMMAND_MARKERS: tuple[str, ...] = ("run_tests.sh", "/eval.sh")
 
-    @staticmethod
-    def _is_grade_command(command: str | list[str]) -> bool:
+    @classmethod
+    def _is_grade_command(cls, command: str | list[str]) -> bool:
         parts = [command] if isinstance(command, str) else [str(c) for c in command]
-        return any("run_tests.sh" in p or "/eval.sh" in p for p in parts)
+        return any(m in p for p in parts for m in cls.DEFAULT_GRADE_COMMAND_MARKERS)
+
+    def _exec_phase(self, command: str | list[str], phase: str | None) -> str | None:
+        if phase is not None:
+            return phase or None
+        return "grade" if self._is_grade_command(command) else None
 
     def _span_ids(self) -> dict[str, Any]:
         return {
@@ -91,6 +100,15 @@ class SandboxHandle:
         }
 
     def _note_first_command(self) -> bool:
+        """Mark the first command and record its wait metrics.
+
+        ``ttfi`` (time to first instruction) runs from the ask for a sandbox
+        to the moment the first command is issued. The boot or wake wait that
+        ate-env-api performs inside that first call is not visible here, so
+        ``ttfi`` understates the time until the instruction actually runs by
+        up to the first command's round trip; the server's
+        ``ate_env_api_create_to_ready_seconds`` sizes that wait.
+        """
         first = not self._first_command_started
         if first:
             self._first_command_started = True
@@ -109,6 +127,34 @@ class SandboxHandle:
                     source=self.claim_source,
                 )
         return first
+
+    @staticmethod
+    def _exec_status(res: ExecResult, check: bool) -> str:
+        # A timeout is an error whatever ``check`` says; a non-zero exit is
+        # one only when the caller asked for it to be.
+        if res.timed_out or (check and res.exit_code != 0):
+            return "error"
+        return "ok"
+
+    def _record_exec_phases(self, phase: str | None, started: float, status: str) -> None:
+        if phase == "grade":
+            metrics.observe_subphase(
+                "grade", max(0.0, time.monotonic() - started), status=status, source=self.claim_source
+            )
+
+    def _raise_for_result(self, command: str | list[str], res: ExecResult, to_s: float, check: bool) -> None:
+        if check and res.timed_out:
+            raise CommandTimeoutError(
+                f"Command '{command}' timed out after {to_s:g}s:\n"
+                f"STDOUT: {res.stdout}\nSTDERR: {res.stderr}",
+                result=res,
+            )
+        if check and res.exit_code != 0:
+            raise CommandExecutionError(
+                f"Command '{command}' failed with exit code {res.exit_code}:\n"
+                f"STDOUT: {res.stdout}\nSTDERR: {res.stderr}",
+                result=res,
+            )
 
     def _exec_span(self, command: str | list[str], *, first: bool) -> Any:
         if not self.tracer:
@@ -158,6 +204,7 @@ class SandboxHandle:
         env: dict[str, str] | None = None,
         timeout_s: float | None = None,
         check: bool = True,
+        phase: str | None = None,
     ) -> ExecResult:
         """Execute command inside the sandbox.
 
@@ -165,6 +212,10 @@ class SandboxHandle:
         (CommandTimeoutError if the command hit its deadline).
         Infrastructure failures always raise InfrastructureError, regardless
         of ``check``.
+        ``phase`` names what the command is for in the benchmark metrics:
+        ``"grade"`` records it in ``ate_env_client_grade_seconds`` as well as
+        in the exec family. Unset, commands matching
+        ``DEFAULT_GRADE_COMMAND_MARKERS`` count as grading; ``""`` opts out.
         Returns ExecResult.
         """
         first = self._note_first_command()
@@ -182,35 +233,18 @@ class SandboxHandle:
                     instance=self.task.id if self.task else None,
                     image=self.task.image if self.task else None,
                     run_id=self.run_id,
+                    phase=self._exec_phase(command, phase),
                 )
                 res = self.runtime.exec(command, cwd=cwd, env=env, timeout_s=to_s)
-                if check and (res.timed_out or res.exit_code != 0):
-                    status = "error"
+                status = self._exec_status(res, check)
                 self._exec_result_attrs(span, res, check)
         except BaseException:
             status = "error"
             raise
         finally:
             in_handle_span.reset(token)
-            if self._is_grade_command(command):
-                metrics.observe_subphase(
-                    "grade",
-                    max(0.0, time.monotonic() - cmd_t0),
-                    status=status,
-                    source=self.claim_source,
-                )
-        if check and res.timed_out:
-            raise CommandTimeoutError(
-                f"Command '{command}' timed out after {to_s:g}s:\n"
-                f"STDOUT: {res.stdout}\nSTDERR: {res.stderr}",
-                result=res,
-            )
-        if check and res.exit_code != 0:
-            raise CommandExecutionError(
-                f"Command '{command}' failed with exit code {res.exit_code}:\n"
-                f"STDOUT: {res.stdout}\nSTDERR: {res.stderr}",
-                result=res,
-            )
+            self._record_exec_phases(self._exec_phase(command, phase), cmd_t0, status)
+        self._raise_for_result(command, res, to_s, check)
         return res
 
     async def exec_async(
@@ -220,8 +254,9 @@ class SandboxHandle:
         env: dict[str, str] | None = None,
         timeout_s: float | None = None,
         check: bool = True,
+        phase: str | None = None,
     ) -> ExecResult:
-        """Asynchronously execute command inside the sandbox."""
+        """Asynchronously execute command inside the sandbox; see ``exec``."""
         first = self._note_first_command()
         to_s = self.default_timeout_s if timeout_s is None else timeout_s
         token = in_handle_span.set(True)
@@ -237,35 +272,18 @@ class SandboxHandle:
                     instance=self.task.id if self.task else None,
                     image=self.task.image if self.task else None,
                     run_id=self.run_id,
+                    phase=self._exec_phase(command, phase),
                 )
                 res = await self.runtime.exec_async(command, cwd=cwd, env=env, timeout_s=to_s)
-                if check and (res.timed_out or res.exit_code != 0):
-                    status = "error"
+                status = self._exec_status(res, check)
                 self._exec_result_attrs(span, res, check)
         except BaseException:
             status = "error"
             raise
         finally:
             in_handle_span.reset(token)
-            if self._is_grade_command(command):
-                metrics.observe_subphase(
-                    "grade",
-                    max(0.0, time.monotonic() - cmd_t0),
-                    status=status,
-                    source=self.claim_source,
-                )
-        if check and res.timed_out:
-            raise CommandTimeoutError(
-                f"Command '{command}' timed out after {to_s:g}s:\n"
-                f"STDOUT: {res.stdout}\nSTDERR: {res.stderr}",
-                result=res,
-            )
-        if check and res.exit_code != 0:
-            raise CommandExecutionError(
-                f"Command '{command}' failed with exit code {res.exit_code}:\n"
-                f"STDOUT: {res.stdout}\nSTDERR: {res.stderr}",
-                result=res,
-            )
+            self._record_exec_phases(self._exec_phase(command, phase), cmd_t0, status)
+        self._raise_for_result(command, res, to_s, check)
         return res
 
     def write_file(self, path: str, content: bytes | str) -> None:

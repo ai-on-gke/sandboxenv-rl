@@ -153,7 +153,7 @@ def test_metric_cache_does_not_outlive_a_custom_registry():
 
 
 def test_subphase_families_and_handle_recording(monkeypatch):
-    from ate_env import FleetConfig, SandboxFleet, Task
+    from ate_env_rl import FleetConfig, SandboxFleet, Task
 
     for phase in (
         "slot_wait",
@@ -171,7 +171,9 @@ def test_subphase_families_and_handle_recording(monkeypatch):
 
     handle = SandboxFleet(FleetConfig(backend="mock")).acquire(Task(id="t1", image="img"))
     handle.exec("echo hi", check=False)
-    handle.exec("bash /testbed/run_tests.sh", check=False)
+    handle.exec("bash /testbed/run_tests.sh", check=False)  # default marker -> grade
+    handle.exec("pytest -q", check=False, phase="grade")  # explicit signal -> grade
+    handle.exec("bash /testbed/run_tests.sh", check=False, phase="")  # opt out
     handle.write_file("/tmp/a.txt", "hello")
     assert handle.read_file_bytes("/tmp/a.txt") == b"hello"
     handle.release()
@@ -179,7 +181,44 @@ def test_subphase_families_and_handle_recording(monkeypatch):
     sub = metrics.get_recorded_summary()["subphases"]
     assert sub["ttfi:mock"]["count"] == 1
     assert sub["ready_to_first_command:mock"]["count"] == 1
-    assert sub["grade:mock"]["count"] == 1
+    assert sub["grade:mock"]["count"] == 2
     assert sub["write_file:mock"]["count"] == 1
     assert sub["read_file:mock"]["count"] == 1
+
+
+def test_handle_without_acquire_start_records_no_ttfi(monkeypatch):
+    """A handle built outside a fleet knows no ask time: no ttfi sample, rather
+    than one that repeats ready_to_first_command under the ttfi family."""
+    from ate_env_rl import FleetConfig, SandboxFleet, Task
+    from ate_env_rl.handle import SandboxHandle
+
+    metrics.reset_recorded_metrics()
+    monkeypatch.setattr(metrics, "is_measure_mode", lambda: True)
+    fleet = SandboxFleet(FleetConfig(backend="mock"))
+    inner = fleet.acquire(Task(id="t2", image="img"))
+    outside = SandboxHandle(
+        sandbox_id=inner.sandbox_id, endpoint=inner.endpoint, task=inner.task, run_id=inner.run_id,
+        backend=inner.backend, runtime=inner.runtime, claim_source="mock",
+    )
+    outside.exec("true", check=False)
+    sub = metrics.get_recorded_summary()["subphases"]
+    assert "ttfi:mock" not in sub
+    assert sub["ready_to_first_command:mock"]["count"] == 1
+    inner.release()
+
+
+def test_timed_out_exec_records_error_status_regardless_of_check(monkeypatch):
+    from ate_env_rl import FleetConfig, SandboxFleet, Task
+    from ate_env_rl.types import ExecResult
+
+    metrics.reset_recorded_metrics()
+    monkeypatch.setattr(metrics, "is_measure_mode", lambda: True)
+    handle = SandboxFleet(FleetConfig(backend="mock")).acquire(Task(id="t3", image="img"))
+    monkeypatch.setattr(
+        handle.runtime, "exec",
+        lambda *a, **k: ExecResult(exit_code=None, stdout="", stderr="", timed_out=True),
+    )
+    handle.exec("sleep 999", check=False, phase="grade")
+    sub = metrics.get_recorded_summary()["subphases"]
+    assert sub["grade:mock"]["error"] == 1 and sub["grade:mock"]["ok"] == 0
 

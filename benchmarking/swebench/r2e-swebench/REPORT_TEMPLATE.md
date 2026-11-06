@@ -26,17 +26,17 @@ version tables from `system_description.json` (`bench measure -k8s`) and the pre
 > - **Key numbers (`<reference-arm>`; drill-down in Sections `3.1`–`3.4`)**:
 >   - **Max concurrency observed**: `<active_sandboxes>` concurrent in-flight sandboxes
 >     (`standing_pool=<n>`).
->   - **`TTFI` start** (sandbox requested -> container restored & 1st cmd starts running,
->     `p50 / p90`): `<ttfi_start_p50> / <ttfi_start_p90> ms`.
+>   - **`TTFI` — `cmd started`** (sandbox requested -> container restored & 1st cmd started,
+>     `p50 / p90`): `<ttfi_p50> / <ttfi_p90> ms`.
 >   - **Time to restore (`p50 / p90`)**: `<restore_total_p50> / <restore_total_p90> ms` in `atelet`.
 > - **Where time is actually spent (`<reference-arm>` `p50`)**:
 >   - **Host Python SDK (`ate_env_rl`)**: `<py_sdk_ms> ms (<py_sdk_pct>%)` (`0 ms` when
 >     `--client go` / `go-direct` drives the run; `python` minus `go` delta when `--client python`
 >     runs).
->   - **Host SDK + `ate-env` + `ate` infrastructure**: `<ttfi_start_p50> ms` true `TTFI` startup
->     (`<restore_total_p50> ms` `atelet` restore + `<wake_route_p50> ms` demand-wake routing),
->     totaling `~<r2e_infra_ms>–<swe_infra_ms> ms (<r2e_infra_pct>%–<swe_infra_pct>%)` across an
->     entire rollout.
+>   - **Host SDK + `ate-env` + `ate` infrastructure**: `<ttfi_p50> ms` `TTFI` (`cmd started`)
+>     startup (`<restore_total_p50> ms` `atelet` restore + `<wake_route_p50> ms` demand-wake
+>     routing), totaling `~<r2e_infra_ms>–<swe_infra_ms> ms (<r2e_infra_pct>%–<swe_infra_pct>%)`
+>     across an entire rollout.
 >   - **Simulated LLM think (`Step.Think`)**: `<r2e_think_ms> ms (<r2e_think_pct>%)` on `r2e` and
 >     `<swe_think_ms> ms (<swe_think_pct>%)` on `swe` (`custom_metrics.llm_think_ms`).
 >   - **In-sandbox guest workload (`bash`/`git` + container `Python` `pytest` & graders)**:
@@ -108,16 +108,17 @@ Populate from `$ARTIFACT_DIR/comparison.json` / `comparison.md`, per-arm `report
 - **`Handle claim` (`ms`)**: Sandbox requested -> `SUSPENDED` actor handle returned
   (`wire_claim_to_ready_*` on `none`; `0` at rollout start on warm-pool hits after upfront
   `Create` + `Suspend` prewarm; container has not booted yet).
-- **`TTFI` start (`p50/p90/p95 ms`)**: Sandbox requested -> container restored and 1st command
-  starts running inside the guest (join `events/*.jsonl` `ttfi`/`wake` start `ts - dur_ms` to
+- **`TTFI` — `cmd started` (`p50/p90/p95 ms`)**: Sandbox requested -> container restored and 1st
+  command started inside the guest (join `events/*.jsonl` `ttfi`/`wake` start `ts - dur_ms` to
   `atelet_restores.jsonl` `time`, or sum `handle_claim` + demand-wake routing + `atelet` `total`
   restore).
-- **`TTFC / Wake` 1st cmd (`ms`)**: Client `stats[event="ttfi"]` (`none`) or `stats[event="wake"]`
-  (warm-pool strategies), which **includes execution of `step=baseline`** inside the sandbox.
+- **`TTFC` — `cmd complete` (`ms`)**: Sandbox requested -> 1st command complete
+  (`stats[event="ttfi"]` on `none` or `stats[event="wake"]` on warm-pool strategies, including
+  `step=baseline` execution inside the sandbox).
 
-| Arm     | Client     | Strategy     |       Active / Pool | Tasks (fail) |   Reward | Wall (`s`) | Tasks/min | Warm hit | Prewarm `Create` (`ms`) | Prewarm `Suspend` (`ms`) | `Handle` claim (`ms`) | `TTFI` start (`p50/p90/p95 ms`) | `TTFC` / `Wake` combined (`ms`) | `TTFC` / `Wake` (`p50 ms`: `r2e` / `swe`) |     `Delete` (`ms`) |
-| :------ | :--------- | :----------- | ------------------: | -----------: | -------: | ---------: | --------: | -------: | ----------------------: | -----------------------: | --------------------: | ------------------------------: | ------------------------------: | ----------------------------------------: | ------------------: |
-| `<arm>` | `<client>` | `<strategy>` | `<active> / <pool>` |  `<n> (<f>)` | `<rate>` |    `<sec>` |   `<tpm>` | `<pct>%` |     `<p50>/<p95>/<p99>` |      `<p50>/<p95>/<p99>` |   `<p50>/<p95>/<p99>` |             `<p50>/<p90>/<p95>` |             `<p50>/<p95>/<p99>` |                     `<r2e_p50>/<swe_p50>` | `<p50>/<p95>/<p99>` |
+| Arm     | Client     | Strategy     |       Active / Pool | Tasks (fail) |   Reward | Wall (`s`) | Tasks/min | Warm hit | Prewarm `Create` (`ms`) | Prewarm `Suspend` (`ms`) | `Handle` claim (`ms`) | `TTFI` — `cmd started` (`p50/p90/p95 ms`) | `TTFC` — `cmd complete` (`ms`) | `TTFC` — `cmd complete` (`p50 ms`: `r2e` / `swe`) |     `Delete` (`ms`) |
+| :------ | :--------- | :----------- | ------------------: | -----------: | -------: | ---------: | --------: | -------: | ----------------------: | -----------------------: | --------------------: | ----------------------------------------: | -----------------------------: | ------------------------------------------------: | ------------------: |
+| `<arm>` | `<client>` | `<strategy>` | `<active> / <pool>` |  `<n> (<f>)` | `<rate>` |    `<sec>` |   `<tpm>` | `<pct>%` |     `<p50>/<p95>/<p99>` |      `<p50>/<p95>/<p99>` |   `<p50>/<p95>/<p99>` |                       `<p50>/<p90>/<p95>` |            `<p50>/<p95>/<p99>` |                             `<r2e_p50>/<swe_p50>` | `<p50>/<p95>/<p99>` |
 
 ### 3.2 Where time is spent: layer attribution (`Go` vs `Python` vs `ate` infra vs guest workload)
 
@@ -126,19 +127,19 @@ Decompose latencies by execution layer so host SDK (`Go` `clients/go` vs `Python
 / `git` / container `Python` `pytest`) are never conflated. Anchor single-RPC data-plane wire hop on
 zero-compute `write_*` steps (`stats[event="step", name="write_patch"]`) or OTel spans.
 
-#### A. First-command (`TTFC` / `Wake`) decomposition (`p50 ms`)
+#### A. First-command (`TTFC` — `cmd complete`) decomposition (`p50 ms`)
 
-| Execution layer                     | Runtime / component                           | What happens                                                            | `<cold/none> r2e` (`ms`) | `<cold/none> swe` (`ms`) | `<warm/ref> r2e` (`ms`) | `<warm/ref> swe` (`ms`) | Share of `TTFC`/`Wake` |
-| :---------------------------------- | :-------------------------------------------- | :---------------------------------------------------------------------- | -----------------------: | -----------------------: | ----------------------: | ----------------------: | ---------------------: |
-| **Host Python SDK**                 | Host `Python` (`ate_env_rl`)                  | `0.0` on `--client go`/`go-direct`; `python` minus `go` delta if run    |                   `<ms>` |                   `<ms>` |                  `<ms>` |                  `<ms>` |               `<pct>%` |
-| **Host client queue**               | Host `Go` / `Python` driver                   | Concurrency slot wait (`custom_metrics.sdk_slot_wait_ms`)               |                   `<ms>` |                   `<ms>` |                  `<ms>` |                  `<ms>` |               `<pct>%` |
-| **Control-plane handle claim**      | Client -> `ate-env-api` -> `ateapi`           | `CreateActor` `SUSPENDED` handle (`0.0` in-band on warm-pool hits)      |                   `<ms>` |                   `<ms>` |                  `<ms>` |                  `<ms>` |               `<pct>%` |
-| **Node image cache check**          | `atelet` (`Go` node daemon)                   | `manifest_fetch` + `download` + `oci_unpack` (`restores.*.phases`)      |                   `<ms>` |                   `<ms>` |                  `<ms>` |                  `<ms>` |               `<pct>%` |
-| **Sandbox snapshot restore**        | `atelet` + `ateworker` (`ate` infra)          | Restore container rootfs + memory (`worker_restore` + `sandbox_assets`) |                   `<ms>` |                   `<ms>` |                  `<ms>` |                  `<ms>` |               `<pct>%` |
-| **Demand-wake routing & proxy**     | Client -> `ate-env-api` -> `atenet` -> `ate`  | `atenet` mTLS wake trigger + `ResumeActor` + gRPC hop                   |                   `<ms>` |                   `<ms>` |                  `<ms>` |                  `<ms>` |               `<pct>%` |
-| **Subtotal — True `TTFI` start**    | **Host SDK + `ate-env` + `ate` infra**        | **Sandbox restored, routed, and starting 1st cmd in guest**             |               **`<ms>`** |               **`<ms>`** |              **`<ms>`** |              **`<ms>`** |           **`<pct>%`** |
-| **In-sandbox 1st cmd (`baseline`)** | **Guest `bash` / `git` / container `Python`** | `outside` minus gRPC wire (`git add -A && git commit` / `.venv` prep)   |                   `<ms>` |                   `<ms>` |                  `<ms>` |                  `<ms>` |               `<pct>%` |
-| **Total `TTFC` / `Wake` (`p50`)**   | **End-to-end measured**                       | **`stats[event="ttfi"]` or `stats[event="wake"]`**                      |               **`<ms>`** |               **`<ms>`** |              **`<ms>`** |              **`<ms>`** |             **`100%`** |
+| Execution layer                            | Runtime / component                           | What happens                                                            | `<cold/none> r2e` (`ms`) | `<cold/none> swe` (`ms`) | `<warm/ref> r2e` (`ms`) | `<warm/ref> swe` (`ms`) | Share of `TTFC` |
+| :----------------------------------------- | :-------------------------------------------- | :---------------------------------------------------------------------- | -----------------------: | -----------------------: | ----------------------: | ----------------------: | --------------: |
+| **Host Python SDK**                        | Host `Python` (`ate_env_rl`)                  | `0.0` on `--client go`/`go-direct`; `python` minus `go` delta if run    |                   `<ms>` |                   `<ms>` |                  `<ms>` |                  `<ms>` |        `<pct>%` |
+| **Host client queue**                      | Host `Go` / `Python` driver                   | Concurrency slot wait (`custom_metrics.sdk_slot_wait_ms`)               |                   `<ms>` |                   `<ms>` |                  `<ms>` |                  `<ms>` |        `<pct>%` |
+| **Control-plane handle claim**             | Client -> `ate-env-api` -> `ateapi`           | `CreateActor` `SUSPENDED` handle (`0.0` in-band on warm-pool hits)      |                   `<ms>` |                   `<ms>` |                  `<ms>` |                  `<ms>` |        `<pct>%` |
+| **Node image cache check**                 | `atelet` (`Go` node daemon)                   | `manifest_fetch` + `download` + `oci_unpack` (`restores.*.phases`)      |                   `<ms>` |                   `<ms>` |                  `<ms>` |                  `<ms>` |        `<pct>%` |
+| **Sandbox snapshot restore**               | `atelet` + `ateworker` (`ate` infra)          | Restore container rootfs + memory (`worker_restore` + `sandbox_assets`) |                   `<ms>` |                   `<ms>` |                  `<ms>` |                  `<ms>` |        `<pct>%` |
+| **Demand-wake routing & proxy**            | Client -> `ate-env-api` -> `atenet` -> `ate`  | `atenet` mTLS wake trigger + `ResumeActor` + gRPC hop                   |                   `<ms>` |                   `<ms>` |                  `<ms>` |                  `<ms>` |        `<pct>%` |
+| **Subtotal — `TTFI` (`cmd started`)**      | **Host SDK + `ate-env` + `ate` infra**        | **Sandbox restored, routed, and 1st cmd started in guest**              |               **`<ms>`** |               **`<ms>`** |              **`<ms>`** |              **`<ms>`** |    **`<pct>%`** |
+| **In-sandbox 1st cmd (`baseline`)**        | **Guest `bash` / `git` / container `Python`** | `outside` minus gRPC wire (`git add -A && git commit` / `.venv` prep)   |                   `<ms>` |                   `<ms>` |                  `<ms>` |                  `<ms>` |        `<pct>%` |
+| **Total — `TTFC` (`cmd complete`, `p50`)** | **End-to-end measured**                       | **`stats[event="ttfi"]` or `stats[event="wake"]` (1st cmd complete)**   |               **`<ms>`** |               **`<ms>`** |              **`<ms>`** |              **`<ms>`** |      **`100%`** |
 
 #### B. Full single-rollout (`task`) time budget (`<reference-arm>` `p50`)
 
@@ -167,11 +168,11 @@ operation does not occur in the selected strategy (for example `ttfc` on `100%` 
 | `sandbox_create`         | `CreateEnvironment` / SDK sandbox claim                   | `stats[event="create"]`                                            | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
 | `prewarm`                | Warm-pool sandbox create + suspend                        | `stats[event="prewarm"]` or summed `create + suspend`              | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
 | `handle_claim`           | Sandbox requested -> `SUSPENDED` handle returned          | `custom_metrics.wire_claim_to_ready_ms` (`0` on warm-pool hit)     | `<n>` |    `-` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
-| `ttfi` (cmd start)       | Sandbox requested -> container restored & 1st cmd running | `events/*.jsonl` (`ts - dur_ms`) -> `atelet_restores.jsonl` `time` | `<n>` |    `-` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
-| `first_cmd_exec`         | First command issued -> first command finished            | `custom_metrics.ready_to_first_cmd_ms` / `stats[step/baseline]`    | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
-| `ttfc` (cmd finished)    | Sandbox requested -> first command finished               | `stats[event="ttfi"]`                                              | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
+| `ttfi` (`cmd started`)   | Sandbox requested -> container restored & 1st cmd started | `events/*.jsonl` (`ts - dur_ms`) -> `atelet_restores.jsonl` `time` | `<n>` |    `-` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
+| `first_cmd_exec`         | First command issued -> first command complete            | `custom_metrics.ready_to_first_cmd_ms` / `stats[step/baseline]`    | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
+| `ttfc` (`cmd complete`)  | Sandbox requested -> first command complete               | `stats[event="ttfi"]`                                              | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
 | `suspend`                | `SuspendEnvironment` checkpoint                           | `stats[event="suspend"]`                                           | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
-| `wake`                   | First command on parked sandbox (issue -> finished)       | `stats[event="wake"]`                                              | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
+| `wake` (`cmd complete`)  | First command on parked sandbox (issue -> complete)       | `stats[event="wake"]`                                              | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
 | `step` (`explore`)       | In-sandbox repository exploration command                 | `stats[event="step", name="explore"]`                              | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
 | `step` (`read_files`)    | In-sandbox file reads                                     | `stats[event="step", name="read_files"]`                           | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |
 | `step` (`apply_patch`)   | Gold patch write + `git apply`                            | `stats[event="step", name="apply_patch"]`                          | `<n>` |  `<f>` |  `<p50>` |  `<p90>` |  `<p95>` |  `<p99>` |  `<max>` |

@@ -616,7 +616,7 @@ func TestAllStrategiesRenderPlanAndDirectDriverValidation(t *testing.T) {
 	}
 	md := string(mdBytes)
 	for _, want := range []string{
-		"| Arm | Client | Strategy | Tasks | Failed | Reward Rate | Wall Clock (s) | Throughput (tasks/min) | Warm Hit Rate | Peak Active | Standing Pool | TTFI p50/p95/p99 | Wake p50/p95/p99 |",
+		"| Arm | Client | Strategy | Tasks | Failed | Reward Rate | Wall Clock (s) | Throughput (tasks/min) | Warm Hit Rate | Peak Active | Standing Pool | TTFC (cmd complete) p50/p95/p99 | Wake (cmd complete) p50/p95/p99 |",
 		"| `go-none` | `go` | `none` | 12 | 0 | 1.000 | ",
 		"| `go-naive` | `go` | `naive` | 12 | 0 | 1.000 | ",
 		"| `go-sliding` | `go` | `sliding` | 12 | 0 | 1.000 | ",

@@ -271,23 +271,23 @@ Copy [`./REPORT_TEMPLATE.md`](./REPORT_TEMPLATE.md) to `$ARTIFACT_DIR/BENCHMARK_
    `preflight` or `bench prewarm`, images × nodes, golden/cache footing, plus the strategies tested
    in `swebench-loader` / `run_fleet_bench.py` via the `sandboxenv-rl` SDK, concurrency, rollouts,
    and reward rate), followed by a concise **`Key numbers`** bullet with single summed `p50 / p90`
-   values (`Max concurrency observed` via `steps[].active_sandboxes`, **`TTFI start`** `p50 / p90`
-   from sandbox request -> container restored & 1st cmd starting inside the guest, and
+   values (`Max concurrency observed` via `steps[].active_sandboxes`, **`TTFI` (`cmd started`)**
+   `p50 / p90` from sandbox request -> container restored & 1st cmd started inside the guest, and
    **`Time to restore`** `p50 / p90` via `restores.{first,wakes}.phases[total]`), leaving the
    component drill-down (`handle_claim`, `prewarm`, demand-wake routing, `atelet` sub-phases, and
-   `TTFC` with `baseline` execution) to Sections `3.1`–`3.4`; also record headline time attribution
-   across `Go`/`Python`/`ate` infra/LLM think/guest workload, workload parameters, and exact
-   `prewarm` and `run-r2e-swebench.sh` commands.
+   `TTFC` [`cmd complete`, including `baseline` execution]) to Sections `3.1`–`3.4`; also record
+   headline time attribution across `Go`/`Python`/`ate` infra/LLM think/guest workload, workload
+   parameters, and exact `prewarm` and `run-r2e-swebench.sh` commands.
 3. **Populate results and findings (`## 3` and `## 4`)**: Fill the multi-arm table (`3.1`) from
    `comparison.json` / `comparison.md`, per-arm `report.json`, and `{r2e,swe}-summary.json` (with
-   explicit `ms` vs `s` units and per-shard `r2e`/`swe` `TTFC`/`Wake`), decompose where time is
-   spent by execution layer (`3.2`: host `Go`/`Python` SDK vs `ate-env`/`ate` infra vs simulated LLM
-   think timer vs in-sandbox guest `bash`/`git` and container `Python` `pytest`/grader), fill all
-   raw sandbox lifecycle and command latencies across `p50`, `p90`, `p95`, `p99`, and `max` (`3.3`:
-   `sdk_slot_wait`, `actor_create`, `sandbox_create`, `prewarm`, `handle_claim`
-   [`wire_claim_to_ready_ms`], `ttfi` [cmd start: sandbox requested -> container restored & 1st cmd
-   running], `first_cmd_exec` [`ready_to_first_cmd_ms`], `ttfc` [cmd finished via
-   `stats[event="ttfi"]`], `suspend`, `wake`, `step/*`, `task/*`, `delete`, `step_barrier`), fill
-   step barrier and shard split (`3.4`, plus node cache and `atelet` restore phases when
-   `SAMPLE_CACHE=1` or `HARVEST_RESTORES=1` ran), and summarize failures, findings, and caveats
-   (`## 4`).
+   explicit `ms` vs `s` units and per-shard `r2e`/`swe` `TTFC` [`cmd complete`]), decompose where
+   time is spent by execution layer (`3.2`: host `Go`/`Python` SDK vs `ate-env`/`ate` infra vs
+   simulated LLM think timer vs in-sandbox guest `bash`/`git` and container `Python`
+   `pytest`/grader), fill all raw sandbox lifecycle and command latencies across `p50`, `p90`,
+   `p95`, `p99`, and `max` (`3.3`: `sdk_slot_wait`, `actor_create`, `sandbox_create`, `prewarm`,
+   `handle_claim` [`wire_claim_to_ready_ms`], `ttfi` [`cmd started`: sandbox requested -> container
+   restored & 1st cmd started], `first_cmd_exec` [`ready_to_first_cmd_ms`], `ttfc` [`cmd complete`
+   via `stats[event="ttfi"]`], `suspend`, `wake` [`cmd complete` via `stats[event="wake"]`],
+   `step/*`, `task/*`, `delete`, `step_barrier`), fill step barrier and shard split (`3.4`, plus
+   node cache and `atelet` restore phases when `SAMPLE_CACHE=1` or `HARVEST_RESTORES=1` ran), and
+   summarize failures, findings, and caveats (`## 4`).

@@ -3837,13 +3837,14 @@ func WriteComparison(w io.Writer, reps []*Report, names []string) {
 // WriteComparisonMarkdown writes the arm table of a strategy or client sweep,
 // one row per run: its client and strategy labels, tasks, failures, reward
 // rate, wall clock, throughput, warm-pool hit rate, peak active sandboxes,
-// standing pool and the ttfi and wake percentiles; then WriteComparison's
-// text table in a code block. run-r2e-swebench.sh writes it to comparison.md.
+// standing pool and the TTFC (event="ttfi") and wake (cmd complete) percentiles;
+// then WriteComparison's text table in a code block. run-r2e-swebench.sh writes
+// it to comparison.md.
 func WriteComparisonMarkdown(w io.Writer, reps []*Report, names []string) {
 	labels := columnLabels(reps, names)
 	fmt.Fprintln(w, "# Multi-Arm Strategy & Client Chain Comparison")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "| Arm | Client | Strategy | Tasks | Failed | Reward Rate | Wall Clock (s) | Throughput (tasks/min) | Warm Hit Rate | Peak Active | Standing Pool | TTFI p50/p95/p99 | Wake p50/p95/p99 |")
+	fmt.Fprintln(w, "| Arm | Client | Strategy | Tasks | Failed | Reward Rate | Wall Clock (s) | Throughput (tasks/min) | Warm Hit Rate | Peak Active | Standing Pool | TTFC (cmd complete) p50/p95/p99 | Wake (cmd complete) p50/p95/p99 |")
 	fmt.Fprintln(w, "| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- | :--- |")
 	for i, r := range reps {
 		client := r.Labels["client"]

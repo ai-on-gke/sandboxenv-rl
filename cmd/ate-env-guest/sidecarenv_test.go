@@ -67,7 +67,7 @@ func TestSidecarEnvReachesOnlySidecars(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(os.Args[0], "-listen=127.0.0.1:0", "-log-dir="+dir, "-workspace="+dir, "-sidecar=/bin/sh "+script)
+	cmd := exec.Command(os.Args[0], "-listen=127.0.0.1:0", "-log-dir="+dir, "-workspace="+dir, "-sidecar=/bin/sh "+script, "-"+sidecarenv.RequiredFlag)
 	cmd.Env = append(os.Environ(),
 		runMainEnv+"=1",
 		"PLAIN_VAR=visible",
@@ -113,13 +113,24 @@ func TestSidecarEnvReachesOnlySidecars(t *testing.T) {
 	defer conn.Close()
 	client := ateenvv1alpha.NewProcessServiceClient(conn)
 
-	for _, reqEnv := range []map[string]string{nil, {"REQ_VAR": "1"}} {
-		out := runInGuest(t, client, reqEnv, "echo SELF; env; echo CHILD; /bin/sh -c env")
+	type runCase struct {
+		name string
+		env  map[string]string
+		tty  *ateenvv1alpha.TTY
+	}
+	cases := []runCase{{"no request env", nil, nil}, {"request env", map[string]string{"REQ_VAR": "1"}, nil}}
+	// The PTY path builds the command's environment the same way; the guest
+	// allocates a PTY on Linux only.
+	if _, err := os.Stat("/dev/ptmx"); err == nil && runtime.GOOS == "linux" {
+		cases = append(cases, runCase{"tty", nil, &ateenvv1alpha.TTY{Rows: 24, Cols: 80}})
+	}
+	for _, rc := range cases {
+		out := runInGuest(t, client, rc.env, rc.tty, "echo SELF; env; echo CHILD; /bin/sh -c env")
 		if strings.Contains(out, secret) || strings.Contains(out, "OH_SESSION_API_KEYS_0") || strings.Contains(out, sidecarenv.Prefix) {
-			t.Errorf("request env %v: an exec'd command or its child sees the sidecar-only variable:\n%s", reqEnv, out)
+			t.Errorf("%s: an exec'd command or its child sees the sidecar-only variable:\n%s", rc.name, out)
 		}
 		if strings.Count(out, "PLAIN_VAR=visible") != 2 {
-			t.Errorf("request env %v: want PLAIN_VAR in the command's and its child's environment:\n%s", reqEnv, out)
+			t.Errorf("%s: want PLAIN_VAR in the command's and its child's environment:\n%s", rc.name, out)
 		}
 	}
 
@@ -170,11 +181,11 @@ func TestSidecarEnvReachesOnlySidecars(t *testing.T) {
 
 // runInGuest runs script with /bin/sh through the guest's process service and
 // returns its stdout.
-func runInGuest(t *testing.T, client ateenvv1alpha.ProcessServiceClient, env map[string]string, script string) string {
+func runInGuest(t *testing.T, client ateenvv1alpha.ProcessServiceClient, env map[string]string, tty *ateenvv1alpha.TTY, script string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	p, err := client.StartProcess(ctx, &ateenvv1alpha.StartProcessRequest{Command: []string{"/bin/sh", "-c", script}, Env: env})
+	p, err := client.StartProcess(ctx, &ateenvv1alpha.StartProcessRequest{Command: []string{"/bin/sh", "-c", script}, Env: env, Tty: tty})
 	if err != nil {
 		t.Fatalf("StartProcess: %v", err)
 	}
@@ -200,4 +211,45 @@ func runInGuest(t *testing.T, client ateenvv1alpha.ProcessServiceClient, env map
 		}
 	}
 	return out.String()
+}
+
+// With -sidecar-env-required, which `ate-env manifest template --sidecar-env`
+// renders, the guest exits before it listens or starts a sidecar when the
+// container has no sidecar-only variable. A guest older than the flag exits
+// at flag parse ("flag provided but not defined"), thus a template with
+// --sidecar-env never runs its sidecars without their values.
+func TestSidecarEnvRequiredWithoutVariablesExits(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("no /bin/sh on this host")
+	}
+	dir := t.TempDir()
+	started := filepath.Join(dir, "started")
+	script := filepath.Join(dir, "sidecar.sh")
+	if err := os.WriteFile(script, []byte("touch "+started+"\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-listen=127.0.0.1:0", "-log-dir="+dir, "-workspace="+dir, "-sidecar=/bin/sh "+script, "-"+sidecarenv.RequiredFlag)
+	cmd.Env = []string{runMainEnv + "=1", "PATH=" + os.Getenv("PATH"), "PLAIN_VAR=visible"}
+	done := make(chan struct{})
+	var out []byte
+	var err error
+	go func() { out, err = cmd.CombinedOutput(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("the guest did not exit")
+	}
+	if err == nil {
+		t.Fatalf("the guest exited 0, want an error:\n%s", out)
+	}
+	if !strings.Contains(string(out), "-"+sidecarenv.RequiredFlag+" is set") {
+		t.Errorf("the guest's output does not name the flag:\n%s", out)
+	}
+	if strings.Contains(string(out), "listening on") {
+		t.Errorf("the guest listened before it exited:\n%s", out)
+	}
+	if _, err := os.Stat(started); err == nil {
+		t.Error("the sidecar started")
+	}
 }

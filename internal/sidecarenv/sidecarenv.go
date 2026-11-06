@@ -29,6 +29,15 @@ import (
 // Prefix marks a container environment variable as sidecar-only.
 const Prefix = "ATE_SIDECAR_ENV_"
 
+// RequiredFlag is the guest flag that a template with sidecar-only
+// variables carries. A guest that does not know Prefix does not know this
+// flag either, thus it exits at flag parse and the actor crashes at start.
+// Without the flag, such a guest would start the sidecars without the
+// variables, and a sidecar that treats a missing key as "no
+// authentication" (the OpenHands agent-server does) would serve everyone.
+// A guest that knows the flag exits when Take finds nothing.
+const RequiredFlag = "sidecar-env-required"
+
 // Take removes each Prefix variable from the process environment and returns
 // them as NAME=VALUE with the prefix stripped, in environment order. A
 // variable that is the prefix alone is removed and not returned.

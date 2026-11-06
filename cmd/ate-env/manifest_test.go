@@ -1179,6 +1179,12 @@ func TestBuildTemplateSidecarEnv(t *testing.T) {
 	cfg.sidecarEnv = []string{"OH_SESSION_API_KEYS_0=s3cret", "EMPTY="}
 	want := func(t *testing.T, what string, tmpl *ateapipb.ActorTemplate) {
 		t.Helper()
+		// The guest flag that makes an older guest exit, instead of starting
+		// the sidecars without the values, must survive the re-rooting of
+		// the guest command in a derived template.
+		if n := slices.Index(tmpl.GetContainers()[0].GetCommand(), "-"+sidecarenv.RequiredFlag); n < 1 {
+			t.Errorf("%s: command = %q, want -%s after the guest binary", what, tmpl.GetContainers()[0].GetCommand(), sidecarenv.RequiredFlag)
+		}
 		got, order := envMap(tmpl.GetContainers()[0])
 		if w := "PORT,LOG_JSON," + sidecarenv.Prefix + "OH_SESSION_API_KEYS_0," + sidecarenv.Prefix + "EMPTY"; strings.Join(order, ",") != w {
 			t.Errorf("%s: env order = %v, want %s", what, order, w)
@@ -1213,6 +1219,20 @@ func TestBuildTemplateSidecarEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	want(t, "derived from a --rootfs-image base", derived)
+
+	// Without --sidecar-env, the template does not carry the flag, thus an
+	// older guest still runs it.
+	cfg.sidecarEnv = nil
+	for _, rootfs := range []string{"", "docker.io/library/debian@sha256:" + testHex64} {
+		cfg.rootfsImage = rootfs
+		plain, err := buildTemplate(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if slices.Contains(plain.GetContainers()[0].GetCommand(), "-"+sidecarenv.RequiredFlag) {
+			t.Errorf("rootfs %q without --sidecar-env: command = %q, want no -%s", rootfs, plain.GetContainers()[0].GetCommand(), sidecarenv.RequiredFlag)
+		}
+	}
 }
 
 func TestTemplateConfigRejectsBadSidecarEnv(t *testing.T) {

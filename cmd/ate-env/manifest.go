@@ -954,6 +954,11 @@ func buildTemplate(cfg templateConfig) (*ateapipb.ActorTemplate, error) {
 	for _, u := range cfg.sidecarReadyz {
 		command = append(command, "-sidecar-readyz", u)
 	}
+	// An older guest does not know the sidecar-only prefix and would start
+	// the sidecars without those values. This flag makes it exit instead.
+	if len(cfg.sidecarEnv) > 0 {
+		command = append(command, "-"+sidecarenv.RequiredFlag)
+	}
 	c.Command = command
 	if cfg.rootfsImage == "" {
 		return tmpl, nil

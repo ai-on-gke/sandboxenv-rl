@@ -265,7 +265,7 @@ Copy [`./REPORT_TEMPLATE.md`](./REPORT_TEMPLATE.md) to `$ARTIFACT_DIR/BENCHMARK_
      -run-id "${RUN_ID:-r2eswe}" \
      -dest "${ARTIFACT_DIR}/arms/<client>-<strategy>"
    ```
-2. **Populate the headline summary, concurrency, workload parameters, and command
+2. **Populate the headline summary + diagrams and workload parameters
    (`## Headline Outcome & Time Attribution Summary` and `## 2`)**: Lead the headline summary with a
    first **`What ran`** bullet (prewarmer loader such as `swebench-loader plan-placement` +
    `preflight` or `bench prewarm`, images × nodes, golden/cache footing, plus the strategies tested
@@ -277,21 +277,23 @@ Copy [`./REPORT_TEMPLATE.md`](./REPORT_TEMPLATE.md) to `$ARTIFACT_DIR/BENCHMARK_
    (`cmd complete`)** `p50 / p90` including `baseline` execution; and **`Time to restore`**
    `p50 / p90` via `restores.{first,wakes}.phases[total]`), leaving the component drill-down
    (`handle_claim`, `prewarm`, demand-wake routing, `atelet` sub-phases, and per-window barrier
-   idle) to Sections `3.1`–`3.4`; also record headline time attribution across `Go`/`Python`/`ate`
-   infra/LLM think/guest workload, workload parameters, and exact `prewarm` and
-   `run-r2e-swebench.sh` commands.
-3. **Populate results and findings (`## 3` and `## 4`)**: Fill the strategy multi-arm table and
-   grouped `xychart-beta` time histograms (`3.1`, with Y-axis `Time (ms)` / `Time (s)` and X-axis
-   `Test Strategy / Category` across startup lifecycle, `TTFC`, and shard/arm wall clock) from
-   `comparison.json` / `comparison.md`, per-arm `report.json`, and `{r2e,swe}-summary.json` (with
-   explicit `ms` vs `s` units, arm + `r2e`/`swe` shard `Wall (s)`, and per-shard `r2e`/`swe` `TTFC`
-   [`cmd complete`]), decompose where time is spent by execution layer (`3.2`: first-command `TTFC`,
-   single-rollout `task`, and arm/sweep `Wall (s)` across slot-busy work vs straggler/window-barrier
-   idle), fill all raw sandbox lifecycle and command latencies across `p50`, `p90`, `p95`, `p99`,
-   and `max` (`3.3`: `sdk_slot_wait`, `actor_create`, `sandbox_create`, `prewarm`, `handle_claim`
+   idle) to Sections `3.1`–`3.4`; include the end-to-end execution-layer `flowchart LR` diagram and
+   grouped `xychart-beta` multi-arm time histograms (`Y-axis = Time`,
+   `X-axis = Test Strategy / Category` across startup lifecycle, `TTFC`, and shard/arm wall clock)
+   directly inside `## Headline Outcome & Time Attribution Summary`, and populate the concurrency
+   and workload parameters table in `## 2`.
+3. **Populate results, findings, and exact commands executed (`## 3`, `## 4`, and `## 5`)**: Fill
+   the strategy multi-arm table (`3.1`) from `comparison.json` / `comparison.md`, per-arm
+   `report.json`, and `{r2e,swe}-summary.json` (with explicit `ms` vs `s` units, arm + `r2e`/`swe`
+   shard `Wall (s)`, and per-shard `r2e`/`swe` `TTFC` [`cmd complete`]), decompose where time is
+   spent by execution layer (`3.2`: first-command `TTFC`, single-rollout `task`, and arm/sweep
+   `Wall (s)` across slot-busy work vs straggler/window-barrier idle), fill all raw sandbox
+   lifecycle and command latencies across `p50`, `p90`, `p95`, `p99`, and `max` (`3.3`:
+   `sdk_slot_wait`, `actor_create`, `sandbox_create`, `prewarm`, `handle_claim`
    [`wire_claim_to_ready_ms`], `ttfi` [`cmd started`: sandbox requested -> container restored & 1st
    cmd started], `first_cmd_exec` [`ready_to_first_cmd_ms`], `ttfc` [`cmd complete` via
    `stats[event="ttfi"]`], `suspend`, `wake` [`cmd complete` via `stats[event="wake"]`], `step/*`,
    `task/*`, `delete`, `step_barrier`, `run` wall clock), fill step barrier, shard wall clock, and
    shard split (`3.4`, plus node cache and `atelet` restore phases when `SAMPLE_CACHE=1` or
-   `HARVEST_RESTORES=1` ran), and summarize failures, findings, and caveats (`## 4`).
+   `HARVEST_RESTORES=1` ran), summarize failures, findings, and caveats (`## 4`), and record the
+   exact prewarm, benchmark, and measurement commands that actually ran at the bottom (`## 5`).

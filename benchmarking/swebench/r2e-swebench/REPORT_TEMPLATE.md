@@ -50,82 +50,13 @@ version tables from `system_description.json` (`bench measure -k8s`) and the pre
 > - **Strategy and client takeaway**:
 >   `<1-2 sentences comparing tested strategies (wall-clock vs standing-pool reduction and window-drain barriers) and Go / Go-direct / Python chains, plus dominant_bottleneck>`.
 
-## 1. Cluster, node, and version specification
-
-### 1.1 Cluster spec
-
-| Field                     | Value                                                                                               |
-| :------------------------ | :-------------------------------------------------------------------------------------------------- |
-| **Platform and K8s**      | `<GKE / K8s version>`, node image / kernel `<os_kernel>`, `<storage_driver_and_fs>`                 |
-| **Zones and networking**  | `<zone_topology>`, `<private/public nodes, Cloud NAT egress, VPC>`                                  |
-| **Registry and bucket**   | Image registry in `<region>`, snapshots bucket in `<bucket_region>`                                 |
-| **Telemetry**             | `-enable-tracing=<bool>`, OTel collector `<on/off>`, `SAMPLE_CACHE=<0/1>`, `HARVEST_RESTORES=<0/1>` |
-| **CPU family uniformity** | `<single CPU family (<platform>) \| mixed families (note in Caveats)>`                              |
-
-### 1.2 Node pool spec
-
-| Node pool       | Machine type and CPU family      | vCPU / RAM     |   Nodes | Boot disk type and size | Role                                        | Labels and taints                     |
-| :-------------- | :------------------------------- | :------------- | ------: | :---------------------- | :------------------------------------------ | :------------------------------------ |
-| `<worker-pool>` | `<e.g. n2-standard-32, Cascade>` | `<vcpu / gib>` | `<cnt>` | `<e.g. 500 GB pd-ssd>`  | Sandbox nodes (`atelet` + `ateworker` pods) | `<labels / runtime NoSchedule taint>` |
-| `<ctrl-pool>`   | `<e.g. e2-standard-16>`          | `<vcpu / gib>` | `<cnt>` | `<e.g. 200 GB pd-ssd>`  | `ate` control plane + `ate-env-api`         | `<control-plane taint>`               |
-| `<db-pool>`     | `<e.g. n2-standard-16>`          | `<vcpu / gib>` | `<cnt>` | `<disk + PVC>`          | Bundled Postgres                            | `<postgres taint>`                    |
-| `<driver-pool>` | `<e.g. e2-standard-32>`          | `<vcpu / gib>` | `<cnt>` | `<disk>`                | Benchmark loader `Job` (when `in-cluster`)  | `<labels / taints>`                   |
-
-### 1.3 `ate` (Substrate) and `ate-env` versions and settings
-
-| Component                | Version / image digest     | Replicas / count                  | Key settings                                                                               |
-| :----------------------- | :------------------------- | :-------------------------------- | :----------------------------------------------------------------------------------------- |
-| `ate-api-server`         | `<substrate_version>`      | `<replicas>`                      | `ATE_API_POSTGRES_POOL_MAX_CONNS=<N>`                                                      |
-| `atenet-router`          | `<substrate_version>`      | `<replicas>`                      | `<default or overrides>`                                                                   |
-| `atelet` (`DaemonSet`)   | `<substrate_version>`      | `<sandbox_nodes>`                 | `--image-cache-gc-period=<d> --image-cache-high-percent=<h> --image-cache-low-percent=<l>` |
-| `WorkerPool`             | `<ateworker image@sha256>` | `<worker_pod_count>` (`<k>`/node) | `<pool_name>`, `worker_actor_capacity=<N>`, `max_concurrent_sandboxes_cap=<M>`             |
-| `SandboxConfig`          | `<runtime_class>`          | `<config_name>`                   | `<gvisor or microvm>`                                                                      |
-| Base `ActorTemplate`     | `<guest_image@sha256>`     | `1` (`<base_template>`)           | `<cpu>` vCPU / `<memory_gib>` GiB / `<disk_gib>` GiB, golden snapshots `<on/off>`          |
-| Derived `ActorTemplate`s | `<base_template>-<12hex>`  | `<derived_count>`                 | `<N/N goldenTags ready before t0>`                                                         |
-| `ate-env-api`            | `<api_image@sha256>`       | `<replicas>`                      | Service `<api_service>`, `-wake-budget=<d>`, `-wake-running-budget=<d>`                    |
-| `ate-env` SDK / loader   | `<sandboxenv-rl git_sha>`  | `<connections>` gRPC channels     | Go `clients/go`, Python `ate_env_rl`, `--execution <in-cluster \| local>`                  |
-
-## 2. Concurrency, workload parameters, and command
-
-| Parameter                   | Value                                                         | Source / flag                                                                          |
-| :-------------------------- | :------------------------------------------------------------ | :------------------------------------------------------------------------------------- |
-| **Configured concurrency**  | `<max_concurrent>` total (`r2e=<w1>`, `swe=<w2>`, `<k>`/node) | `--concurrency`, `--r2e-width`, `--swe-width`                                          |
-| **Observed pool footprint** | `peak_active=<n>`, `standing_pool=<n>`, `peak_parked=<n>`     | `report.json` (`peak_active_sandboxes`, `standing_pool_size`, `peak_parked_sandboxes`) |
-| **Distinct images**         | `<total>` (`<r2e>` R2E-Gym + `<swe>` SWE-bench, `<exclude>`)  | `--images`, `distinct_images`, `labels.exclude_file`                                   |
-| **Rollouts per image**      | `<rollouts>` (`steps=<steps>`, `mode=<mode>`, `park=<park>`)  | `--rollouts-per-image`, `--steps`, `--mode`, `--park`                                  |
-| **Total tasks**             | `<tasks>` (`r2e=<r2e_tasks>`, `swe=<swe_tasks>`)              | `report.json` (`tasks`, `jobs`)                                                        |
-| **Strategies and window**   | `<none \| naive \| sliding \| pipelined \| all>` (`win=<w>`)  | `--strategy`, `--window-size`                                                          |
-| **Client chains**           | `<go \| go-direct \| python \| all>`                          | `--client`                                                                             |
-| **Workload trajectory**     | `<graded (r2e-gold + swebench-gold) \| io>`                   | `--workload`, `labels.trajectory`                                                      |
-
-```bash
-<exact prewarm and run-r2e-swebench.sh commands>
+```mermaid
+flowchart LR
+  Host["1. Host Driver (Go / Python SDK): loader + SDK + LLM Think Timer"] --> API["2. ate-env-api (Go): Lifecycle & Process/FS gRPC Proxy"]
+  API --> ATE["3. ate Control & Router (Go + Envoy): ateapi + atenet-router mTLS Wake"]
+  ATE --> Node["4. Worker Node (ate Infra): atelet Image Cache + Snapshot Restore + ate-env-guest"]
+  Node --> Guest["5. In-Sandbox Guest Workload (bash + git + Guest Python): baseline commit + pytest/grader"]
 ```
-
-## 3. Results
-
-### 3.1 Strategy multi-arm comparison
-
-Populate from `$ARTIFACT_DIR/comparison.json` / `comparison.md`, per-arm `report.json`, and
-`{r2e,swe}-summary.json`. `Wall (s)` is in **seconds (`s`)**; every latency column is `p50/p95/p99`
-(or `p50` where noted) in **milliseconds (`ms`)**:
-
-- **`Wall` (`s`: arm [`r2e` / `swe`])**: Concurrent arm wall clock (`report.json` `run_ms / 1000` =
-  `max(r2e, swe)`), followed by per-shard `r2e` and `swe` wall clock from `{r2e,swe}-summary.json`.
-- **`Handle claim` (`ms`)**: Sandbox requested -> `SUSPENDED` actor handle returned
-  (`wire_claim_to_ready_*` on `none`; `0` at rollout start on warm-pool hits after upfront
-  `Create` + `Suspend` prewarm; container has not booted yet).
-- **`TTFI` — `cmd started` (`p50/p90/p95 ms`)**: Sandbox requested -> container restored and 1st
-  command started inside the guest (join `events/*.jsonl` `ttfi`/`wake` start `ts - dur_ms` to
-  `atelet_restores.jsonl` `time`, or sum `handle_claim` + demand-wake routing + `atelet` `total`
-  restore).
-- **`TTFC` — `cmd complete` (`ms`)**: Sandbox requested -> 1st command complete
-  (`stats[event="ttfi"]` on `none` or `stats[event="wake"]` on warm-pool strategies, including
-  `step=baseline` execution inside the sandbox).
-
-| Arm     | Client     | Strategy     |       Active / Pool | Tasks (fail) |   Reward | Wall (`s`: arm [`r2e`/`swe`]) | Tasks/min | Warm hit | Prewarm `Create` (`ms`) | Prewarm `Suspend` (`ms`) | `Handle` claim (`ms`) | `TTFI` — `cmd started` (`p50/p90/p95 ms`) | `TTFC` — `cmd complete` (`ms`) | `TTFC` — `cmd complete` (`p50 ms`: `r2e` / `swe`) |     `Delete` (`ms`) |
-| :------ | :--------- | :----------- | ------------------: | -----------: | -------: | ----------------------------: | --------: | -------: | ----------------------: | -----------------------: | --------------------: | ----------------------------------------: | -----------------------------: | ------------------------------------------------: | ------------------: |
-| `<arm>` | `<client>` | `<strategy>` | `<active> / <pool>` |  `<n> (<f>)` | `<rate>` |     `<sec> (<r2e_s>/<swe_s>)` |   `<tpm>` | `<pct>%` |     `<p50>/<p95>/<p99>` |      `<p50>/<p95>/<p99>` |   `<p50>/<p95>/<p99>` |                       `<p50>/<p90>/<p95>` |            `<p50>/<p95>/<p99>` |                             `<r2e_p50>/<swe_p50>` | `<p50>/<p95>/<p99>` |
 
 Populate the grouped bar histograms below with one `bar [...]` series per arm in table row order
 (for example left-to-right: `none`, `naive`, `sliding`, `pipelined`) and adjust each `y-axis` max to
@@ -163,6 +94,80 @@ xychart-beta
   bar [0, 0]
   bar [0, 0]
 ```
+
+## 1. Cluster, node, and version specification
+
+### 1.1 Cluster spec
+
+| Field                     | Value                                                                                               |
+| :------------------------ | :-------------------------------------------------------------------------------------------------- |
+| **Platform and K8s**      | `<GKE / K8s version>`, node image / kernel `<os_kernel>`, `<storage_driver_and_fs>`                 |
+| **Zones and networking**  | `<zone_topology>`, `<private/public nodes, Cloud NAT egress, VPC>`                                  |
+| **Registry and bucket**   | Image registry in `<region>`, snapshots bucket in `<bucket_region>`                                 |
+| **Telemetry**             | `-enable-tracing=<bool>`, OTel collector `<on/off>`, `SAMPLE_CACHE=<0/1>`, `HARVEST_RESTORES=<0/1>` |
+| **CPU family uniformity** | `<single CPU family (<platform>) \| mixed families (note in Caveats)>`                              |
+
+### 1.2 Node pool spec
+
+| Node pool       | Machine type and CPU family      | vCPU / RAM     |   Nodes | Boot disk type and size | Role                                        | Labels and taints                     |
+| :-------------- | :------------------------------- | :------------- | ------: | :---------------------- | :------------------------------------------ | :------------------------------------ |
+| `<worker-pool>` | `<e.g. n2-standard-32, Cascade>` | `<vcpu / gib>` | `<cnt>` | `<e.g. 500 GB pd-ssd>`  | Sandbox nodes (`atelet` + `ateworker` pods) | `<labels / runtime NoSchedule taint>` |
+| `<ctrl-pool>`   | `<e.g. e2-standard-16>`          | `<vcpu / gib>` | `<cnt>` | `<e.g. 200 GB pd-ssd>`  | `ate` control plane + `ate-env-api`         | `<control-plane taint>`               |
+| `<db-pool>`     | `<e.g. n2-standard-16>`          | `<vcpu / gib>` | `<cnt>` | `<disk + PVC>`          | Bundled Postgres                            | `<postgres taint>`                    |
+| `<driver-pool>` | `<e.g. e2-standard-32>`          | `<vcpu / gib>` | `<cnt>` | `<disk>`                | Benchmark loader `Job` (when `in-cluster`)  | `<labels / taints>`                   |
+
+### 1.3 `ate` (Substrate) and `ate-env` versions and settings
+
+| Component                | Version / image digest     | Replicas / count                  | Key settings                                                                               |
+| :----------------------- | :------------------------- | :-------------------------------- | :----------------------------------------------------------------------------------------- |
+| `ate-api-server`         | `<substrate_version>`      | `<replicas>`                      | `ATE_API_POSTGRES_POOL_MAX_CONNS=<N>`                                                      |
+| `atenet-router`          | `<substrate_version>`      | `<replicas>`                      | `<default or overrides>`                                                                   |
+| `atelet` (`DaemonSet`)   | `<substrate_version>`      | `<sandbox_nodes>`                 | `--image-cache-gc-period=<d> --image-cache-high-percent=<h> --image-cache-low-percent=<l>` |
+| `WorkerPool`             | `<ateworker image@sha256>` | `<worker_pod_count>` (`<k>`/node) | `<pool_name>`, `worker_actor_capacity=<N>`, `max_concurrent_sandboxes_cap=<M>`             |
+| `SandboxConfig`          | `<runtime_class>`          | `<config_name>`                   | `<gvisor or microvm>`                                                                      |
+| Base `ActorTemplate`     | `<guest_image@sha256>`     | `1` (`<base_template>`)           | `<cpu>` vCPU / `<memory_gib>` GiB / `<disk_gib>` GiB, golden snapshots `<on/off>`          |
+| Derived `ActorTemplate`s | `<base_template>-<12hex>`  | `<derived_count>`                 | `<N/N goldenTags ready before t0>`                                                         |
+| `ate-env-api`            | `<api_image@sha256>`       | `<replicas>`                      | Service `<api_service>`, `-wake-budget=<d>`, `-wake-running-budget=<d>`                    |
+| `ate-env` SDK / loader   | `<sandboxenv-rl git_sha>`  | `<connections>` gRPC channels     | Go `clients/go`, Python `ate_env_rl`, `--execution <in-cluster \| local>`                  |
+
+## 2. Concurrency and workload parameters
+
+| Parameter                   | Value                                                         | Source / flag                                                                          |
+| :-------------------------- | :------------------------------------------------------------ | :------------------------------------------------------------------------------------- |
+| **Configured concurrency**  | `<max_concurrent>` total (`r2e=<w1>`, `swe=<w2>`, `<k>`/node) | `--concurrency`, `--r2e-width`, `--swe-width`                                          |
+| **Observed pool footprint** | `peak_active=<n>`, `standing_pool=<n>`, `peak_parked=<n>`     | `report.json` (`peak_active_sandboxes`, `standing_pool_size`, `peak_parked_sandboxes`) |
+| **Distinct images**         | `<total>` (`<r2e>` R2E-Gym + `<swe>` SWE-bench, `<exclude>`)  | `--images`, `distinct_images`, `labels.exclude_file`                                   |
+| **Rollouts per image**      | `<rollouts>` (`steps=<steps>`, `mode=<mode>`, `park=<park>`)  | `--rollouts-per-image`, `--steps`, `--mode`, `--park`                                  |
+| **Total tasks**             | `<tasks>` (`r2e=<r2e_tasks>`, `swe=<swe_tasks>`)              | `report.json` (`tasks`, `jobs`)                                                        |
+| **Strategies and window**   | `<none \| naive \| sliding \| pipelined \| all>` (`win=<w>`)  | `--strategy`, `--window-size`                                                          |
+| **Client chains**           | `<go \| go-direct \| python \| all>`                          | `--client`                                                                             |
+| **Workload trajectory**     | `<graded (r2e-gold + swebench-gold) \| io>`                   | `--workload`, `labels.trajectory`                                                      |
+
+## 3. Results
+
+### 3.1 Strategy multi-arm comparison
+
+Populate from `$ARTIFACT_DIR/comparison.json` / `comparison.md`, per-arm `report.json`, and
+`{r2e,swe}-summary.json` (matching the grouped bar histograms in
+`## Headline Outcome & Time Attribution Summary`). `Wall (s)` is in **seconds (`s`)**; every latency
+column is `p50/p95/p99` (or `p50` where noted) in **milliseconds (`ms`)**:
+
+- **`Wall` (`s`: arm [`r2e` / `swe`])**: Concurrent arm wall clock (`report.json` `run_ms / 1000` =
+  `max(r2e, swe)`), followed by per-shard `r2e` and `swe` wall clock from `{r2e,swe}-summary.json`.
+- **`Handle claim` (`ms`)**: Sandbox requested -> `SUSPENDED` actor handle returned
+  (`wire_claim_to_ready_*` on `none`; `0` at rollout start on warm-pool hits after upfront
+  `Create` + `Suspend` prewarm; container has not booted yet).
+- **`TTFI` — `cmd started` (`p50/p90/p95 ms`)**: Sandbox requested -> container restored and 1st
+  command started inside the guest (join `events/*.jsonl` `ttfi`/`wake` start `ts - dur_ms` to
+  `atelet_restores.jsonl` `time`, or sum `handle_claim` + demand-wake routing + `atelet` `total`
+  restore).
+- **`TTFC` — `cmd complete` (`ms`)**: Sandbox requested -> 1st command complete
+  (`stats[event="ttfi"]` on `none` or `stats[event="wake"]` on warm-pool strategies, including
+  `step=baseline` execution inside the sandbox).
+
+| Arm     | Client     | Strategy     |       Active / Pool | Tasks (fail) |   Reward | Wall (`s`: arm [`r2e`/`swe`]) | Tasks/min | Warm hit | Prewarm `Create` (`ms`) | Prewarm `Suspend` (`ms`) | `Handle` claim (`ms`) | `TTFI` — `cmd started` (`p50/p90/p95 ms`) | `TTFC` — `cmd complete` (`ms`) | `TTFC` — `cmd complete` (`p50 ms`: `r2e` / `swe`) |     `Delete` (`ms`) |
+| :------ | :--------- | :----------- | ------------------: | -----------: | -------: | ----------------------------: | --------: | -------: | ----------------------: | -----------------------: | --------------------: | ----------------------------------------: | -----------------------------: | ------------------------------------------------: | ------------------: |
+| `<arm>` | `<client>` | `<strategy>` | `<active> / <pool>` |  `<n> (<f>)` | `<rate>` |     `<sec> (<r2e_s>/<swe_s>)` |   `<tpm>` | `<pct>%` |     `<p50>/<p95>/<p99>` |      `<p50>/<p95>/<p99>` |   `<p50>/<p95>/<p99>` |                       `<p50>/<p90>/<p95>` |            `<p50>/<p95>/<p99>` |                             `<r2e_p50>/<swe_p50>` | `<p50>/<p95>/<p99>` |
 
 ### 3.2 Where time is spent: layer attribution (`Go` vs `Python` vs `ate` infra vs guest workload)
 
@@ -258,3 +263,19 @@ operation does not occur in the selected strategy (for example `ttfc` on `100%` 
   `<2-3 bullets on strategy wall-clock vs standing-pool trade-off and Go vs Go-direct vs Python overhead>`.
 - **Caveats**:
   `<cluster or execution caveats affecting comparisons, such as local port-forward RTT, mixed node CPU families, or uncollected OTel spans for actor_create>`.
+
+## 5. Exact commands executed
+
+Record the verbatim prewarm, benchmark execution, telemetry harvest, and cleanup commands that
+produced this bundle:
+
+```bash
+# 1. Upfront placement plan + golden & node-cache prewarm (if run)
+<exact swebench-loader plan-placement + preflight or bench prewarm commands>
+
+# 2. Mixed R2E-Gym + SWE-bench benchmark execution
+<exact run-r2e-swebench.sh or swebench-loader / run_fleet_bench.py command>
+
+# 3. Cluster snapshot / report / teardown commands (if run)
+<exact bench measure -k8s, sample-node-cache.sh, or cleanup commands>
+```

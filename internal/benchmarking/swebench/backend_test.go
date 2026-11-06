@@ -25,6 +25,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -846,5 +847,48 @@ func TestNewBackendDriver(t *testing.T) {
 	}
 	if _, _, err := NewBackendDriver(BackendDriverOptions{Backend: "substrate", Access: "bogus"}); err == nil {
 		t.Fatal("expected error for unknown access")
+	}
+}
+
+func TestEnvBackendCreateFollowsThePlacementPlan(t *testing.T) {
+	api := &fakeAPI{domainNodes: map[string][]string{"d0": {"n0"}, "d1": {"n1"}}}
+	b := newFakeBackend(t, api)
+	WithPlacement(twoDomainPlan())(b)
+	ctx := context.Background()
+	// b is in d0 and d1: creates alternate; a is in d0 only; an image the plan
+	// does not place gets no selector.
+	for i, want := range []map[string]string{{"ate-env/domain": "d0"}, {"ate-env/domain": "d1"}, {"ate-env/domain": "d0"}} {
+		id := fmt.Sprintf("b-%d", i)
+		if _, err := b.Create(ctx, id, pfImgB); err != nil {
+			t.Fatal(err)
+		}
+		if got := api.selectors[id]; !reflect.DeepEqual(got, want) {
+			t.Errorf("create %d of b sent selector %v, want %v", i, got, want)
+		}
+	}
+	if _, err := b.Create(ctx, "a-0", pfImgA); err != nil {
+		t.Fatal(err)
+	}
+	if got := api.selectors["a-0"]; !reflect.DeepEqual(got, map[string]string{"ate-env/domain": "d0"}) {
+		t.Errorf("a sent selector %v", got)
+	}
+	other := "registry.example/swebench/z@sha256:" + strings.Repeat("c", 64)
+	if _, err := b.Create(ctx, "z-0", other); err != nil {
+		t.Fatal(err)
+	}
+	if got := api.selectors["z-0"]; len(got) != 0 {
+		t.Errorf("an unplaced image sent selector %v, want none", got)
+	}
+}
+
+func TestNewBackendDriverRefusesPlacementOffTheEnvAPI(t *testing.T) {
+	plan := twoDomainPlan()
+	for _, opts := range []BackendDriverOptions{
+		{Backend: "agent-sandbox", Access: "sdk", Endpoint: "http://127.0.0.1:1", Placement: plan},
+		{Backend: "substrate", Access: "direct", Endpoint: "127.0.0.1:1", Placement: plan},
+	} {
+		if _, _, err := NewBackendDriver(opts); err == nil || !strings.Contains(err.Error(), "placement plan needs the ate-env API backend") {
+			t.Errorf("%s/%s with a plan: err = %v", opts.Backend, opts.Access, err)
+		}
 	}
 }

@@ -407,9 +407,10 @@ func TestReportArms(t *testing.T) {
 }
 
 func TestOwnLabels(t *testing.T) {
-	l := ownLabels("https://host/bucket/swebench.jsonl?X-Goog-Signature=secret", 4, "base", "lists/offline.txt", []string{"x", "y"}, []string{"a", "b"}, map[string]string{"READ_FILES": "10"})
+	l := ownLabels("https://host/bucket/swebench.jsonl?X-Goog-Signature=secret", 4, "base", "lists/offline.txt", "plans/image-placement.json", []string{"x", "y"}, []string{"a", "b"}, map[string]string{"READ_FILES": "10"})
 	want := map[string]string{"dataset": "swebench.jsonl", "connections": "4", "base_template": "base",
-		"exclude_file": "offline.txt@" + idsDigest([]string{"x", "y"}), "instances": "2@" + idsDigest([]string{"a", "b"}), "set.READ_FILES": "10"}
+		"exclude_file": "offline.txt@" + idsDigest([]string{"x", "y"}), "instances": "2@" + idsDigest([]string{"a", "b"}), "set.READ_FILES": "10",
+		"placement": "image-placement.json"}
 	if !reflect.DeepEqual(l, want) {
 		t.Fatalf("labels = %v, want %v", l, want)
 	}
@@ -422,7 +423,7 @@ func TestOwnLabels(t *testing.T) {
 			t.Errorf("label %s is not in LoaderLabelKeys, so report -arm would not compare it", k)
 		}
 	}
-	l = ownLabels("data/swebench.jsonl", 1, "t", "", nil, nil, nil)
+	l = ownLabels("data/swebench.jsonl", 1, "t", "", "", nil, nil, nil)
 	if _, ok := l["exclude_file"]; ok || l["dataset"] != "swebench.jsonl" || len(l) != 3 {
 		t.Fatalf("labels without an exclude file or instances = %v", l)
 	}
@@ -891,5 +892,72 @@ func TestReportParkModeFromLabel(t *testing.T) {
 	}
 	if len(reps) != 1 || reps[0].ParkMode != "suspend-async" || reps[0].LifecyclePolicy == nil || reps[0].LifecyclePolicy.ParkMode != "suspend-async" {
 		t.Fatalf("-arm -json: %+v", reps)
+	}
+}
+
+// -placement is read and checked before -dry-run returns and whatever backend
+// runs: the plan must know every selected image, and only the ate-env API
+// driver places environments.
+func TestRunCmdPlacementFlag(t *testing.T) {
+	const digest = "sha256:" + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	dir := t.TempDir()
+	manifest := filepath.Join(dir, "cmd.jsonl")
+	if err := os.WriteFile(manifest, []byte(
+		`{"kind":"command","instance_id":"a","image":"reg/a@`+digest+`","command":"true"}`+"\n"+
+			`{"kind":"command","instance_id":"b","image":"reg/b@`+digest+`","command":"true"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	plan := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	domains := `"domains":[{"name":"d0","selector":{"ate-env/domain":"d0"},"nodes":1,"node_cache_bytes":0,"assigned_bytes":0,"image_count":1}]`
+	partial := plan("partial.json", `{"schema_version":"v1","unpack_factor":1,"replication":1,`+domains+`,"images":[{"image":"reg/a@`+digest+`","domains":["d0"],"bytes_compressed":1,"bytes_unpacked":1}]}`)
+	full := plan("full.json", `{"schema_version":"v1","unpack_factor":1,"replication":1,`+domains+`,"images":[{"image":"reg/a@`+digest+`","domains":["d0"],"bytes_compressed":1,"bytes_unpacked":1}],"unplaced":[{"image":"reg/b@`+digest+`","reason":"over budget"}]}`)
+
+	err := runCmd([]string{"-dataset", manifest, "-dry-run", "-placement", partial})
+	if err == nil || !strings.Contains(err.Error(), "neither places nor lists as unplaced 1 of the 2") {
+		t.Errorf("-dry-run with a plan missing an image: err = %v, want the missing image named", err)
+	}
+	if err := runCmd([]string{"-dataset", manifest, "-dry-run", "-placement", full}); err != nil {
+		t.Errorf("-dry-run with a complete plan: %v", err)
+	}
+	err = runCmd([]string{"-dataset", manifest, "-dry-run", "-placement", full, "-backend", "agent-sandbox", "-access", "sdk"})
+	if err == nil || !strings.Contains(err.Error(), "cannot place") {
+		t.Errorf("-placement on agent-sandbox: err = %v, want a refusal", err)
+	}
+	err = runCmd([]string{"-dataset", manifest, "-dry-run", "-placement", full, "-access", "sdk"})
+	if err == nil || !strings.Contains(err.Error(), "cannot place") {
+		t.Errorf("-placement on substrate/sdk: err = %v, want a refusal", err)
+	}
+	err = runCmd([]string{"-dataset", manifest, "-dry-run", "-placement", filepath.Join(dir, "none.json")})
+	if err == nil {
+		t.Error("a missing plan file was accepted")
+	}
+
+	// With the test backend the run goes through and the run event carries
+	// the plan's name.
+	testBackendOverride = e2eFakeBackend{}
+	t.Cleanup(func() { testBackendOverride = nil })
+	events := filepath.Join(dir, "events.jsonl")
+	if err := runCmd([]string{"-dataset", manifest, "-placement", full, "-run-id", "pl", "-out", events, "-width", "2"}); err != nil {
+		t.Fatalf("run with -placement: %v", err)
+	}
+	raw, err := os.ReadFile(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"placement":"full.json"`) {
+		t.Errorf("run event lacks the placement label:\n%s", raw)
+	}
+}
+
+func TestReportCmdPreflightCoverageTakesOneEventsFile(t *testing.T) {
+	err := reportCmd([]string{"-arm", "a=nofile.jsonl", "-preflight-coverage", "cov.json"}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "-preflight-coverage") {
+		t.Errorf("-arm with -preflight-coverage: err = %v, want a refusal naming the flag", err)
 	}
 }

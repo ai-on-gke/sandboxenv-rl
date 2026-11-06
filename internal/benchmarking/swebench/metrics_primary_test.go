@@ -107,7 +107,7 @@ func TestMetricsPrimaryWithTraceFallback(t *testing.T) {
 		"2.0":  10,
 		"+Inf": 10,
 	})...)
-	prom = append(prom, makePromBuckets("ate_env_client_acquire_seconds", map[string]string{"status": "ok", "source": "cold_create"}, map[string]float64{
+	prom = append(prom, makePromBuckets("ate_env_client_wire_claim_seconds", map[string]string{"status": "ok", "source": "cold_create"}, map[string]float64{
 		"1.0":  5,
 		"2.0":  10,
 		"+Inf": 10,

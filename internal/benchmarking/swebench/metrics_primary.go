@@ -300,7 +300,10 @@ func (rep *Report) ApplyMetricsPrimaryWithTraceFallback(meas *schema.Measurement
 			ttfi.Event = EventTTFI
 			rep.upsertStatPrimary(ttfi)
 		}
-		if createSt, ok := PromHistogramStat(meas, "ate_env_client_acquire_seconds", map[string]string{"source": "cold_create"}); ok {
+		// create: the cold-create claim RPC. ate_env_client_acquire_seconds has
+		// no source label (CLIENT_FAMILIES), so the per-source view lives in
+		// the wire_claim sub-phase.
+		if createSt, ok := PromHistogramStat(meas, "ate_env_client_wire_claim_seconds", map[string]string{"source": "cold_create"}); ok {
 			createSt.Event = EventCreate
 			rep.upsertStatPrimary(createSt)
 		} else if apiCreateSt, ok := PromHistogramStat(meas, "ate_env_api_create_to_ready_seconds", nil); ok {

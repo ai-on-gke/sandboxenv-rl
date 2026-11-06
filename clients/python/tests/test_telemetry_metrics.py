@@ -221,4 +221,9 @@ def test_timed_out_exec_records_error_status_regardless_of_check(monkeypatch):
     handle.exec("sleep 999", check=False, phase="grade")
     sub = metrics.get_recorded_summary()["subphases"]
     assert sub["grade:mock"]["error"] == 1 and sub["grade:mock"]["ok"] == 0
+    # The in-memory Prometheus rendering keeps the error count too.
+    monkeypatch.setattr(metrics, "_ENABLED", False)
+    text = metrics.render_prometheus()
+    assert 'ate_env_client_grade_seconds_count{source="mock",status="error"} 1' in text
+    assert 'ate_env_client_grade_seconds_count{source="mock",status="ok"} 0' in text
 

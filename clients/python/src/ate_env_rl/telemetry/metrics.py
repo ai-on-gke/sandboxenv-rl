@@ -419,11 +419,12 @@ def render_prometheus() -> str:
             phase, (f"ate_env_client_{phase}_seconds", f"Subphase {phase} latency")
         )[0]
         lines.append(f"# TYPE {fam} histogram")
+        for st in ("ok", "error"):
+            cnt = stats.get(st, 0)
+            if cnt > 0 or st == "ok":
+                lines.append(f'{fam}_count{{source="{src}",status="{st}"}} {cnt}')
         lines.append(
-            f'{fam}_count{{source="{src}",status="ok"}} {stats["ok"]}'
-        )
-        lines.append(
-            f'{fam}_sum{{source="{src}",status="ok"}} {stats["sum_s"]:.6f}'
+            f'{fam}_sum{{source="{src}"}} {stats["sum_s"]:.6f}'
         )
     return "\n".join(lines) + ("\n" if lines else "")
 

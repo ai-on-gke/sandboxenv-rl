@@ -318,14 +318,22 @@ has the details. Versions below 1.36 are not supported.
 You must put the API's SPIFFE ID on the router's ingress allow-list. The ID is
 `spiffe://cluster.local/ns/<namespace>/sa/ate-env-api`, thus
 `spiffe://cluster.local/ns/ate-env/sa/ate-env-api` in the default namespace, and
-`ate-env manifest` prints the exact ID. If you also use `kubectl ate proxy actor`,
-add `spiffe://cluster.local/ns/ate-system/sa/atenet-client`, the ID that command
-presents. The value is one comma-separated list that becomes the router's whole
-`--ingress-allowed-spiffe-ids`, thus keep the IDs already on it. Rerun the deploy
-for a running install:
+`ate-env manifest` prints the exact ID. The value is one comma-separated list that
+becomes the router's whole `--ingress-allowed-spiffe-ids`, thus keep the IDs already
+on it. Rerun the deploy for a running install:
 
 ```bash
 # In the Substrate checkout.
+ATE_INGRESS_ALLOWED_SPIFFE_IDS=spiffe://cluster.local/ns/ate-env/sa/ate-env-api,<existing IDs> \
+  go run ./cmd/ate-setup deploy ate-system
+```
+
+Optional: `kubectl ate proxy actor` presents
+`spiffe://cluster.local/ns/ate-system/sa/atenet-client`, thus it works only when that
+ID is on the list too. Add it only if you need that command, because it lets each
+user who can create PodCertificateRequests in `ate-system` reach each actor:
+
+```bash
 ATE_INGRESS_ALLOWED_SPIFFE_IDS=spiffe://cluster.local/ns/ate-env/sa/ate-env-api,spiffe://cluster.local/ns/ate-system/sa/atenet-client,<existing IDs> \
   go run ./cmd/ate-setup deploy ate-system
 ```
@@ -333,15 +341,20 @@ ATE_INGRESS_ALLOWED_SPIFFE_IDS=spiffe://cluster.local/ns/ate-env/sa/ate-env-api,
 Editing the `atenet-router` Deployment's `--ingress-allowed-spiffe-ids`
 argument does the same by hand. ate-setup does not check the list: since
 Substrate [`c093a40c`](https://github.com/agent-substrate/substrate/commit/c093a40c)
-an install without it succeeds. The router then starts but serves no TLS
-listener at all, thus no client reaches any actor. The two mistakes fail
-differently:
+an install without it succeeds. With the default Envoy dataplane, the router
+then starts but serves no TLS listener at all, thus no client reaches any
+actor, and it logs `No --ingress-allowed-spiffe-ids, so the router serves no
+traffic` at startup. (The Agentgateway dataplane takes its listeners from
+static configuration; this section describes the Envoy dataplane.) The two
+mistakes fail differently:
 
-- **Empty list.** The connection to the router is refused. Creates succeed,
-  then each guest call retries as if the environment were still waking and
-  fails with `Unavailable: environment ... did not answer within the ...
-  budget ...` and a `connection refused` cause. The port proxy answers 502
-  (`is unreachable`).
+- **Empty list.** The connection to the router is refused. Creates succeed.
+  Each guest call then retries as if the environment were still waking: for
+  the running budget (`--wake-running-budget`, 20 s by default) when the
+  environment is RUNNING, or for the wake budget (`--wake-budget`, 5 min by
+  default) while it wakes. It then fails with `Unavailable: environment ...
+  did not answer within the ... budget ...` and a `connection refused` cause.
+  The port proxy does not retry: it answers 502 (`is unreachable`) at once.
 - **List without the API's ID**, or a router that does not trust the
   podidentity signer. The router rejects the API's certificate. Guest calls
   fail at once with `FailedPrecondition` naming the ID and what to check, and

@@ -7,6 +7,17 @@ user needs to know across them.
 ## Unreleased
 
 ### Added
+- `ate-env manifest template --sidecar-env NAME=VALUE`: a variable that only
+  the `--sidecar` processes get. The container carries it as
+  `ATE_SIDECAR_ENV_NAME`; the guest takes it out of its own environment before
+  it starts anything and gives `NAME` to the sidecars only, thus the commands
+  that ate-env-api starts do not inherit it (`internal/sidecarenv`). Needs a
+  guest image with this change: the template also carries the guest flag
+  `-sidecar-env-required`, thus an older guest exits at start instead of
+  running the sidecars without the values. The OpenHands base template passes
+  `OH_SESSION_API_KEYS_0` this way; a base registered with the key in `--env`,
+  and each template derived from it, must be deleted and registered again
+  (`RECREATE=1` in `examples/openhands/demo.sh`).
 
 - swebench-loader: `run -delete-rate` caps the environment deletes per second
   through ate-env-api (default 200; 0 removes the cap), and a delete the

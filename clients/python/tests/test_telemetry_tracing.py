@@ -1041,3 +1041,26 @@ async def test_client_builds_no_attributes_with_tracing_off(monkeypatch):
         await client.close()
     finally:
         await server.stop(None)
+
+
+async def test_image_status_spans_carry_the_template_and_follow_the_rpc(spans):
+    server, port = await _start_fake_server()
+    client = Client(f"127.0.0.1:{port}", tracer_config=TracerConfig(enable_tracing=True))
+    image = "docker.io/library/python@sha256:" + "0123456789abcdef" * 4
+    try:
+        await client.image_status(image)
+        await client.image_status(image, ensure=True, template_name="layered", template_atespace="t-space")
+    finally:
+        await client.close()
+        await server.stop(None)
+    names = _by_name(spans.get_finished_spans())
+    (get,) = names["ate_env_client.get_image_status"]
+    (ensure,) = names["ate_env_client.ensure_image_template"]
+    assert get.attributes["rpc.method"].endswith("EnvironmentService/GetImageStatus")
+    assert ensure.attributes["rpc.method"].endswith("EnvironmentService/EnsureImageTemplate")
+    assert "ate.template.name" not in get.attributes  # unset values are not recorded
+    assert ensure.attributes["ate.template.name"] == "layered"
+    assert ensure.attributes["ate.template.atespace"] == "t-space"
+    assert "ate_env.rootfs_image" in ensure.attributes
+    for span in (get, ensure):
+        assert span.status.status_code.name != "ERROR"

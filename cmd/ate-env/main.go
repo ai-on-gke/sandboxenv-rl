@@ -333,6 +333,81 @@ func newGetCommand() *cobra.Command {
 	return cmd
 }
 
+func newImageStatusCommand() *cobra.Command {
+	var (
+		endpoint         string
+		atespace         string
+		auth             authFlags
+		template         string
+		templateAtespace string
+		ensure           bool
+		asJSON           bool
+	)
+	cmd := &cobra.Command{
+		Use:   "image-status <rootfs-image>",
+		Short: "Show the template derived for a rootfs image and whether its golden snapshot is ready",
+		Long: "Show the template derived for a digest-pinned rootfs image and the state of its golden snapshot:\n" +
+			"none (no template yet), pending (baking; environments boot from the image), ready, or failed.\n" +
+			"With --ensure the template is created when missing, which starts the bake; no environment is created.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			token, err := auth.resolve(cmd)
+			if err != nil {
+				return err
+			}
+			client, err := env.NewClient(env.ClientOptions{
+				Endpoint:  endpoint,
+				AuthToken: token,
+			})
+			if err != nil {
+				return err
+			}
+			defer client.Close()
+			var tmpl *ateenvv1alpha.Template
+			if template != "" || templateAtespace != "" {
+				tmpl = &ateenvv1alpha.Template{Name: template, Atespace: templateAtespace}
+			}
+			var st *ateenvv1alpha.ImageStatus
+			if ensure {
+				st, err = client.EnsureImageTemplate(cmd.Context(), &ateenvv1alpha.EnsureImageTemplateRequest{RootfsImage: args[0], Template: tmpl, Atespace: atespace})
+			} else {
+				st, err = client.ImageStatus(cmd.Context(), &ateenvv1alpha.GetImageStatusRequest{RootfsImage: args[0], Template: tmpl, Atespace: atespace})
+			}
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			if asJSON {
+				b, err := protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true}.Marshal(st)
+				if err != nil {
+					return err
+				}
+				_, err = fmt.Fprintf(out, "%s\n", b)
+				return err
+			}
+			fmt.Fprintf(out, "image: %s\ntemplate: %s/%s (%s)\ngolden: %s\n",
+				st.GetRootfsImage(), st.GetTemplate().GetAtespace(), st.GetTemplate().GetName(),
+				map[bool]string{true: "exists", false: "missing"}[st.GetTemplateExists()],
+				strings.ToLower(strings.TrimPrefix(st.GetGolden().String(), "GOLDEN_SNAPSHOT_STATE_")))
+			if st.GetGoldenTag() != "" {
+				fmt.Fprintf(out, "golden tag: %s\n", st.GetGoldenTag())
+			}
+			if st.GetGoldenError() != "" {
+				fmt.Fprintf(out, "golden error: %s\n", st.GetGoldenError())
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&endpoint, "api", envOr("SUBSTRATE_ENV_API", "127.0.0.1:7777"), "address of the ate-env-api service (e.g. localhost:7777)")
+	cmd.Flags().StringVar(&atespace, "atespace", "", "Substrate atespace of the templates (defaults to --template-atespace, else "+apiservice.DefaultAtespace+")")
+	auth.register(cmd, false)
+	cmd.Flags().StringVar(&template, "template", "", "base ActorTemplate name (defaults to server default)")
+	cmd.Flags().StringVar(&templateAtespace, "template-atespace", "", "Substrate atespace of the base ActorTemplate (defaults to --atespace)")
+	cmd.Flags().BoolVar(&ensure, "ensure", false, "create the derived template when missing, which starts its golden snapshot bake")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print the status as JSON")
+	return cmd
+}
+
 // checkNotSubcommand rejects an environment id that equals an ate-env
 // subcommand name (create, delete, help, ...): `ate-env <id> read|write|shell`
 // cannot reach such an environment, because the subcommand takes the name.
@@ -487,6 +562,7 @@ Common environment commands:
 	root.AddCommand(newManifestCommand())
 	root.AddCommand(newCreateCommand())
 	root.AddCommand(newGetCommand())
+	root.AddCommand(newImageStatusCommand())
 	root.AddCommand(newSuspendCommand())
 	root.AddCommand(newDeleteCommand())
 	root.AddCommand(newServerInfoCommand())

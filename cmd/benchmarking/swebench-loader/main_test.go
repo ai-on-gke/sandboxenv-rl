@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -691,5 +693,129 @@ func TestPlanPlacementCmd(t *testing.T) {
 	}
 	if runMain([]string{"plan-placement", "-dataset", manifest, "-domains", domains, "-out", filepath.Join(dir, "p2.json")}, &stderr, &stderr) != 0 {
 		t.Errorf("runMain plan-placement failed:\n%s", stderr.String())
+	}
+}
+
+// fakeWarmer is an in-memory swebench.ImageWarmer: goldens are ready at
+// once, probes land round-robin on the two nodes of their domain.
+type fakeWarmer struct {
+	mu      sync.Mutex
+	counter map[string]int
+	nodes   map[string]string
+	deleted []string
+}
+
+func (f *fakeWarmer) EnsureImageTemplate(context.Context, string) (swebench.ImageState, error) {
+	return swebench.ImageState{Template: "default-template-x", Exists: true, Golden: swebench.GoldenReady, Tag: "golden-x"}, nil
+}
+
+func (f *fakeWarmer) ImageStatus(ctx context.Context, image string) (swebench.ImageState, error) {
+	return f.EnsureImageTemplate(ctx, image)
+}
+
+func (f *fakeWarmer) CreateWith(_ context.Context, id, _ string, opts swebench.CreateOptions) (swebench.Sandbox, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	domain := opts.WorkerSelector["ate-env/domain"]
+	f.nodes[id] = fmt.Sprintf("node-%s-%d", domain, f.counter[domain]%2)
+	f.counter[domain]++
+	return &fakeWarmerSandbox{w: f, id: id}, nil
+}
+
+func (f *fakeWarmer) Node(_ context.Context, id string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nodes[id], nil
+}
+
+type fakeWarmerSandbox struct {
+	w  *fakeWarmer
+	id string
+}
+
+func (s *fakeWarmerSandbox) Run(context.Context, string, time.Duration) (swebench.Result, error) {
+	return swebench.Result{}, nil
+}
+func (s *fakeWarmerSandbox) WriteFile(context.Context, string, []byte, fs.FileMode) error { return nil }
+func (s *fakeWarmerSandbox) Suspend(context.Context) error                                { return nil }
+func (s *fakeWarmerSandbox) Delete(context.Context) error {
+	s.w.mu.Lock()
+	defer s.w.mu.Unlock()
+	s.w.deleted = append(s.w.deleted, s.id)
+	return nil
+}
+
+func TestPreflightCmd(t *testing.T) {
+	dir := t.TempDir()
+	imgA := "registry.example/swebench/a@sha256:" + strings.Repeat("a", 64)
+	plan := filepath.Join(dir, "image-placement.json")
+	if err := os.WriteFile(plan, []byte(`{"schema_version":"v1","unpack_factor":1,"replication":1,
+		"domains":[{"name":"d0","selector":{"ate-env/domain":"d0"},"nodes":2,"node_cache_bytes":0,"assigned_bytes":1,"image_count":1}],
+		"images":[{"image":"`+imgA+`","domains":["d0"],"bytes_compressed":1,"bytes_unpacked":1}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	warmer := &fakeWarmer{counter: map[string]int{}, nodes: map[string]string{}}
+	testPreflightBackend = warmer
+	t.Cleanup(func() { testPreflightBackend = nil })
+	events := filepath.Join(dir, "run")
+	var stderr bytes.Buffer
+	if err := preflightCmd([]string{"-plan", plan, "-events-dir", events, "-run-id", "pf-t", "-probes-per-node", "1", "-golden-poll", "1ms"}, &stderr); err != nil {
+		t.Fatalf("preflight: %v\n%s", err, stderr.String())
+	}
+	report, err := os.ReadFile(filepath.Join(events, "preflight-coverage.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cov schema.PreflightCoverage
+	if err := json.Unmarshal(report, &cov); err != nil {
+		t.Fatal(err)
+	}
+	if err := cov.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if !cov.Complete || cov.RunID != "pf-t" || len(cov.Domains) != 1 || len(cov.Domains[0].NodesSeen) != 2 {
+		t.Errorf("coverage = %+v", cov)
+	}
+	if len(warmer.deleted) != 2 {
+		t.Errorf("deleted = %v, want the two probes", warmer.deleted)
+	}
+	if _, err := os.Stat(filepath.Join(events, "preflight-events.jsonl")); err != nil {
+		t.Errorf("events file: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "pre-flight complete: goldens 1/1 ready") {
+		t.Errorf("summary:\n%s", stderr.String())
+	}
+	if err := preflightCmd([]string{"-events-dir", events}, &stderr); err == nil {
+		t.Error("missing -plan accepted")
+	}
+	if err := preflightCmd([]string{"-plan", plan, "-events-dir", events, "stray"}, &stderr); err == nil || !strings.Contains(err.Error(), "positional") {
+		t.Errorf("a positional argument: err = %v, want a refusal", err)
+	}
+	if err := preflightCmd([]string{"-plan", plan, "-events-dir", events, "-out", filepath.Join(dir, "x.jsonl")}, &stderr); err == nil || !strings.Contains(err.Error(), "exclude") {
+		t.Errorf("-events-dir with -out: err = %v, want a refusal", err)
+	}
+	if err := preflightCmd([]string{"-plan", plan}, &stderr); err == nil {
+		t.Error("missing -events-dir and -out accepted")
+	}
+	outEvents := filepath.Join(dir, "nested", "pf.jsonl")
+	if runMain([]string{"preflight", "-plan", plan, "-run-id", "pf-out", "-out", outEvents, "-coverage-out", filepath.Join(dir, "cov.json"), "-probes-per-node", "1"}, &stderr, &stderr) != 0 {
+		t.Fatalf("runMain preflight failed:\n%s", stderr.String())
+	}
+	rawEvents, err := os.ReadFile(outEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(rawEvents)), "\n") {
+		if err := schema.ValidateAgainstJSONSchema("event.schema.json", []byte(line)); err != nil {
+			t.Errorf("preflight event %s: %v", line, err)
+		}
+	}
+	var badCovStderr bytes.Buffer
+	badCovPath := filepath.Join(outEvents, "unwritable-cov.json")
+	if err := preflightCmd([]string{"-plan", plan, "-out", filepath.Join(dir, "pf2.jsonl"), "-coverage-out", badCovPath, "-probes-per-node", "1", "-golden-poll", "1ms"}, &badCovStderr); err == nil {
+		t.Error("unwritable -coverage-out accepted")
+	}
+	if strings.Contains(badCovStderr.String(), "wrote "+badCovPath) {
+		t.Errorf("stderr falsely reported wrote %s:\n%s", badCovPath, badCovStderr.String())
 	}
 }

@@ -109,7 +109,8 @@ ruff check --config clients/python/pyproject.toml examples/Qwen3-1.7B-verl
 Targets: `make build` (Go), `make build-cli` (`bin/ate-env`), `make images` (`ko`),
 `make format-docs` (Markdown), `make clean` (`bin/`). Regenerate protos via `buf generate` (Go) and
 `make python-protos` (Python); never hand-edit generated files. Use `internal/internaltest`
-(`fakecontrol`, `fakerouter`, `testcerts`) for test doubles instead of custom mocks.
+(`fakecontrol`, `fakerouter`, `synctestrapid`, `testcerts`) for test doubles and `rapid`/`synctest`
+bridges.
 
 ## Pull requests and commits
 

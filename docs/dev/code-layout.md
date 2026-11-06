@@ -17,7 +17,7 @@ internal/
   ate/                   # Substrate client adapter: dials ateapi control plane and atenet router
   benchmarking/          # Benchmark packages: job, measure, overlay, schema, sut, swebench, trace
   hostcheck/             # HTTP middleware: DNS-rebinding defense on Host headers
-  internaltest/          # Test doubles: fakecontrol, fakerouter, testcerts
+  internaltest/          # Test doubles and bridges: fakecontrol, fakerouter, synctestrapid, testcerts
   inventory/             # Fleet inventory snapshot: v1 JSON Schema, strict decoder, Substrate state vocabulary
   mcp/                   # Streamable HTTP MCP server: maps shell and file tools to guest gRPC
   portproxy/             # HTTP/CONNECT reverse proxy: tunnels ports inside actors via atenet
@@ -103,9 +103,9 @@ Go benchmark packages in `internal/benchmarking/` (`job`, `measure`, `overlay`, 
 
 ### Test doubles and fixtures
 
-Never write custom mock servers or fakes for Substrate. Reuse the existing test doubles under
-`internal/internaltest`: `fakecontrol` (in-memory `ateapi` control plane), `fakerouter` (`atenet`
-HTTP and `CONNECT` router), and `testcerts` (dynamic SPIFFE client certificates).
+Never write custom Substrate mocks. Reuse `internal/internaltest`: `fakecontrol` (in-memory `ateapi`
+control plane), `fakerouter` (`atenet` router), `synctestrapid` (`rapid` in `testing/synctest`
+bubbles), and `testcerts` (SPIFFE client certificates).
 
 ### Agent workflows in `.agents/skills/`
 

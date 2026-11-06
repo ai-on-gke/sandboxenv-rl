@@ -261,12 +261,17 @@ func TestWarmImageCommandFailsOnShortCoverageAndBadTimeout(t *testing.T) {
 	if last := strings.Split(strings.TrimSpace(out), "\n"); !strings.Contains(last[len(last)-1], `"undeleted_probes":["leftover-1-1"]`) || !strings.Contains(last[len(last)-1], `"waited":"2.500s"`) {
 		t.Errorf("leftover --json coverage line = %q, want undeleted_probes and waited", last[len(last)-1])
 	}
-	before := len(stub.warms)
-	_, err = runCLI(t, "warm-image", "example.com/task@sha256:abc", "--api", addr, "--nodes", "2", "--probe-timeout", "-1s")
-	if err == nil || !strings.Contains(err.Error(), "--probe-timeout must be positive") {
-		t.Errorf("negative timeout: err = %v, want a refusal", err)
-	}
-	if len(stub.warms) != before {
-		t.Error("negative timeout reached the server")
+	// A zero or negative timeout is refused before the request is sent; zero
+	// would otherwise leave the request's probe_timeout empty and look like
+	// the server's default.
+	for _, timeout := range []string{"-1s", "0s", "0"} {
+		before := len(stub.warms)
+		_, err = runCLI(t, "warm-image", "example.com/task@sha256:abc", "--api", addr, "--nodes", "2", "--probe-timeout", timeout)
+		if err == nil || !strings.Contains(err.Error(), "--probe-timeout must be positive") {
+			t.Errorf("--probe-timeout %s: err = %v, want a refusal", timeout, err)
+		}
+		if len(stub.warms) != before {
+			t.Errorf("--probe-timeout %s reached the server", timeout)
+		}
 	}
 }

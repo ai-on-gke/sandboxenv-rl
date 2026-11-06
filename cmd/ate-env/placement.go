@@ -143,7 +143,9 @@ func newWarmImageCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if probeTimeout < 0 {
+			// Zero fails like a negative value: unset, the flag leaves the
+			// request's probe_timeout empty and the server's default applies.
+			if cmd.Flags().Changed("probe-timeout") && probeTimeout <= 0 {
 				return fmt.Errorf("--probe-timeout must be positive, got %s", probeTimeout)
 			}
 			token, err := auth.resolve(cmd)

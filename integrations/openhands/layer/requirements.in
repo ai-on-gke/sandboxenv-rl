@@ -30,4 +30,6 @@ fastmcp-slim>=3.4.10
 oauthlib>=4.0.1
 pillow>=13.0.0
 pyasn1>=0.6.5
-pypdf>=6.21.4
+# pypdf: 6.21.4 fixes the alerts; the cap keeps the 7.0.0 major release
+# (2026-11-06) out until it passes the 7-day Dependabot wait.
+pypdf>=6.21.4,<7

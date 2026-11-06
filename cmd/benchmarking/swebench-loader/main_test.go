@@ -405,8 +405,8 @@ func TestReportArms(t *testing.T) {
 }
 
 func TestOwnLabels(t *testing.T) {
-	l := ownLabels("https://host/bucket/swebench.jsonl?X-Goog-Signature=secret", 4, "base", "lists/offline.txt", []string{"x", "y"}, []string{"a", "b"}, map[string]string{"READ_FILES": "10"})
-	want := map[string]string{"dataset": "swebench.jsonl", "connections": "4", "base_template": "base",
+	l := ownLabels("https://host/bucket/swebench.jsonl?X-Goog-Signature=secret", 4, 200, "base", "lists/offline.txt", []string{"x", "y"}, []string{"a", "b"}, map[string]string{"READ_FILES": "10"})
+	want := map[string]string{"dataset": "swebench.jsonl", "connections": "4", "delete_rate": "200", "base_template": "base",
 		"exclude_file": "offline.txt@" + idsDigest([]string{"x", "y"}), "instances": "2@" + idsDigest([]string{"a", "b"}), "set.READ_FILES": "10"}
 	if !reflect.DeepEqual(l, want) {
 		t.Fatalf("labels = %v, want %v", l, want)
@@ -420,9 +420,16 @@ func TestOwnLabels(t *testing.T) {
 			t.Errorf("label %s is not in LoaderLabelKeys, so report -arm would not compare it", k)
 		}
 	}
-	l = ownLabels("data/swebench.jsonl", 1, "t", "", nil, nil, nil)
-	if _, ok := l["exclude_file"]; ok || l["dataset"] != "swebench.jsonl" || len(l) != 3 {
+	l = ownLabels("data/swebench.jsonl", 1, 0, "t", "", nil, nil, nil)
+	if _, ok := l["exclude_file"]; ok || l["dataset"] != "swebench.jsonl" || len(l) != 4 {
 		t.Fatalf("labels without an exclude file or instances = %v", l)
+	}
+	// The cap is recorded as given, 0 for none, so a capped and an uncapped
+	// run do not pool as one workload; a negative value is no cap too.
+	for in, want := range map[float64]string{0: "0", 12.5: "12.5", -1: "0"} {
+		if got := ownLabels("d.jsonl", 1, in, "t", "", nil, nil, nil)["delete_rate"]; got != want {
+			t.Errorf("delete_rate for %v = %q, want %q", in, got, want)
+		}
 	}
 }
 

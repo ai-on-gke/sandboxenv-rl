@@ -11,7 +11,8 @@ user needs to know across them.
 - swebench-loader: `run -delete-rate` caps the environment deletes per second
   through ate-env-api (default 200; 0 removes the cap), and a delete the
   bucket rate-limits (429, `ResourceExhausted`) is retried with backoff for
-  up to two minutes instead of failing.
+  up to two minutes instead of failing. The run records the cap as the
+  `delete_rate` label, so `report -arm` keeps runs with different caps apart.
 - `examples/Qwen3.5-397B-A17B-verl`: the agentic GRPO recipe from 2 to 16 GPU
   nodes with profiles for Qwen3.5-35B-A3B and Qwen3.5-397B-A17B, steps of
   thousands of trajectories, and guarded verl patches for 64K responses.

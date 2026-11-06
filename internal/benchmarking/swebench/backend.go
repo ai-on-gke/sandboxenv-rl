@@ -195,10 +195,14 @@ func (l deleteLimits) do(ctx context.Context, del func(context.Context) error) e
 }
 
 // isRetryableDelete reports whether a failed delete is worth another try:
-// ResourceExhausted, which is how ateapi reports the bucket rate-limiting its
-// snapshot deletes, the codes isTransient retries, and a message that carries
-// the bucket's own rate-limit error under another code. The message carries
-// the environment id too, so a bare "429" is not matched: a run id such as
+// the codes isTransient retries, ResourceExhausted, and a message that
+// carries the bucket's own rate-limit error under another code. Where each
+// comes from: Substrate's DeleteActor returns the delete workflow's joined
+// errors uncoded, the snapshot release among them, and ate-env-api's
+// toGRPCError maps an uncoded or Unknown error to Internal, which
+// isTransient covers; a coded error ate-env-api passes through unchanged,
+// which is where a ResourceExhausted arrives. The message carries the
+// environment id too, so a bare "429" is not matched: a run id such as
 // swe-1794290000 contains one.
 func isRetryableDelete(err error) bool {
 	st, ok := status.FromError(err)

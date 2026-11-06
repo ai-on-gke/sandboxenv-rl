@@ -533,28 +533,52 @@ func TestStepsParkEachBoundsAwakeEnvironments(t *testing.T) {
 	}
 }
 
-// With Keep the last step parks like the others, so the fleet stays behind
-// suspended rather than deleted.
+// With Keep the last step leaves the fleet in place on both park modes, as
+// the barrier path does: a suspend park parks it like the other steps, a
+// delete park leaves it awake.
 func TestStepsParkEachKeepParksTheLastStep(t *testing.T) {
-	f := newFake()
-	var out bytes.Buffer
-	cfg := baseConfig(t, f, &out)
-	cfg.Mode = ModeSteps
-	cfg.Rollouts = 2
-	cfg.Steps = 2
-	cfg.Park = ParkSuspend
-	cfg.ParkEach = true
-	cfg.Keep = true
-	if _, err := Run(context.Background(), cfg); err != nil {
-		t.Fatal(err)
-	}
-	if len(f.created) != 6 || len(f.deleted) != 0 {
-		t.Fatalf("created %d deleted %v, want 6 created and none deleted", len(f.created), f.deleted)
-	}
-	for id, n := range f.suspended {
-		if n != 2 {
-			t.Fatalf("env %s suspended %d times, want 2 (every step parks under -keep)", id, n)
-		}
+	for _, park := range []Park{ParkSuspend, ParkDelete} {
+		t.Run(string(park), func(t *testing.T) {
+			f := newFake()
+			var out bytes.Buffer
+			cfg := baseConfig(t, f, &out)
+			cfg.Mode = ModeSteps
+			cfg.Rollouts = 2 // 6 environments
+			cfg.Steps = 2
+			cfg.Park = park
+			cfg.ParkEach = true
+			cfg.Keep = true
+			if _, err := Run(context.Background(), cfg); err != nil {
+				t.Fatal(err)
+			}
+			switch park {
+			case ParkSuspend:
+				if len(f.created) != 6 || len(f.deleted) != 0 {
+					t.Fatalf("created %d deleted %v, want 6 created and none deleted", len(f.created), f.deleted)
+				}
+				for id, n := range f.suspended {
+					if n != 2 {
+						t.Fatalf("env %s suspended %d times, want 2 (every step parks under -keep)", id, n)
+					}
+				}
+			case ParkDelete:
+				// Step 1 retires its 6; step 2 creates 6 more and leaves them
+				// awake, as the barrier path's -park delete -keep does.
+				left := 0
+				for id, n := range f.created {
+					if n != 1 || f.deleted[id] > 1 {
+						t.Fatalf("env %s created %d deleted %d", id, n, f.deleted[id])
+					}
+					if f.deleted[id] == 0 {
+						left++
+					}
+				}
+				if len(f.created) != 12 || left != 6 || len(f.suspended) != 0 || f.awake.Load() != 6 {
+					t.Fatalf("created %d left %d suspended %d awake %d, want 12 created, 6 left awake, none suspended",
+						len(f.created), left, len(f.suspended), f.awake.Load())
+				}
+			}
+		})
 	}
 }
 

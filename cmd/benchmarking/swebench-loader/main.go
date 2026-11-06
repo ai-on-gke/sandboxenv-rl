@@ -216,11 +216,14 @@ func datasetLabel(dataset string) string {
 // rest come from Config.labels); every key is in swebench.LoaderLabelKeys or
 // is a var's effective value under set.KEY. The exclude file and the
 // instance list are named by their file name or count plus a digest of their
-// ids, so two lists of one length differ.
-func ownLabels(dataset string, connections int, baseTemplate, excludeFile string, exclude, instances []string, vars map[string]string) map[string]string {
+// ids, so two lists of one length differ. The delete rate is recorded as
+// given, 0 for no cap, so report -arm keeps runs with different caps apart:
+// the cap's queue is in their delete and park times.
+func ownLabels(dataset string, connections int, deleteRate float64, baseTemplate, excludeFile string, exclude, instances []string, vars map[string]string) map[string]string {
 	l := map[string]string{
 		"dataset":       datasetLabel(dataset),
 		"connections":   strconv.Itoa(connections),
+		"delete_rate":   strconv.FormatFloat(max(deleteRate, 0), 'g', -1, 64),
 		"base_template": baseTemplate,
 	}
 	for k, v := range vars {
@@ -508,7 +511,7 @@ func runCmd(args []string) (retErr error) {
 		stepTimeout   = fs.Duration("step-timeout", 10*time.Minute, "Default deadline for a run step without its own timeout.")
 		wakeBudget    = fs.Duration("wake-budget", 3*time.Minute, "How long a task's first command is retried while the environment is still waking or its image is still being baked.")
 		wakeBackoff   = fs.Duration("wake-backoff", swebench.DefaultWakeBackoff, "Initial pause between wake retries; doubles up to five times this.")
-		deleteRate    = fs.Float64("delete-rate", swebench.DefaultDeleteRate, "Most environment deletes per second across the run, through ate-env-api; the bucket rate-limits snapshot deletes, and a delete it refuses is retried with backoff for up to two minutes. 0 removes the cap.")
+		deleteRate    = fs.Float64("delete-rate", swebench.DefaultDeleteRate, "Most environment deletes per second per loader process, through ate-env-api; the bucket rate-limits snapshot deletes, and a delete it refuses is retried with backoff for up to two minutes. 0 removes the cap. Recorded as the delete_rate label.")
 		runID         = fs.String("run-id", "", "Run id, prefix of every environment name: lowercase letters, digits and '-', at most 20 characters; default swe-<unix time>.")
 		out           = fs.String("out", "", "JSONL events file; default <run-id>.jsonl in the working directory.")
 		eventsDir     = fs.String("events-dir", "", "Optional base directory for per-worker event shards (events/<worker>.jsonl).")
@@ -785,7 +788,7 @@ func runCmd(args []string) (retErr error) {
 		WakeBackoff:   *wakeBackoff,
 		Keep:          *keep,
 		Labels:        labels,
-		Invocation:    ownLabels(*dataset, *connections, *baseTemplate, *excludeFile, exclude, ids, effective),
+		Invocation:    ownLabels(*dataset, *connections, *deleteRate, *baseTemplate, *excludeFile, exclude, ids, effective),
 	})
 	endTS := time.Now().UTC()
 	_ = rec.Flush()

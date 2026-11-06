@@ -166,7 +166,7 @@ func (c *Config) trajectoryNames() string {
 var LoaderLabelKeys = []string{
 	"mode", "width", "images", "trajectory", "tasks_per_image", "rollouts", "steps", "park",
 	"create_timeout", "step_timeout", "wake_budget", "wake_backoff",
-	"dataset", "connections", "base_template", "exclude_file", "instances", "seed", "images_per_step",
+	"dataset", "connections", "delete_rate", "base_template", "exclude_file", "instances", "seed", "images_per_step",
 	"park_each",
 }
 
@@ -959,10 +959,12 @@ func (r *runner) runSteps(ctx context.Context, envs []*environment) {
 // its replay ends, Width at a time. The barrier covers the parking, so no
 // park event is recorded; the suspend and delete events carry the cost.
 // The last step deletes each environment right after its replay instead of
-// parking it (unless Keep): a suspend there would upload one more snapshot
-// per environment for the run's cleanup to delete moments later, in one
-// burst the bucket rate-limits; deleting here spreads the deletes over the
-// step, and the cleanup finds nothing left. An environment whose step failed
+// parking it: a suspend there would upload one more snapshot per
+// environment for the run's cleanup to delete moments later, in one burst
+// the bucket rate-limits; deleting here spreads the deletes over the step,
+// and the cleanup finds nothing left. Keep leaves the last step's fleet in
+// place on both park modes, as the barrier path does: suspended under a
+// suspend park, awake under a delete park. An environment whose step failed
 // leaves the run and is deleted at once, so it does not hold a slot until
 // the cleanup.
 func (r *runner) stepParkEach(ctx context.Context, envs []*environment, step int) {
@@ -989,8 +991,11 @@ func (r *runner) stepParkEach(ctx context.Context, envs []*environment, step int
 			r.remove(ctx, e, step)
 			return
 		}
+		last := step == r.cfg.Steps
 		switch {
-		case r.cfg.Park == ParkDelete, step == r.cfg.Steps && !r.cfg.Keep:
+		case last && r.cfg.Keep && r.cfg.Park == ParkDelete:
+			// Keep leaves the fleet awake, as the barrier path does.
+		case r.cfg.Park == ParkDelete, last && !r.cfg.Keep:
 			r.remove(ctx, e, step)
 		case r.cfg.Park == ParkSuspend:
 			r.suspend(ctx, e, step)

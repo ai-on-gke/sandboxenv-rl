@@ -104,7 +104,7 @@ API server included, which is what a trainer sees):
 | `wake` | first command after a suspend park, including the wake it triggers |
 | `step` (by name) | each trajectory step, with exit code; the reward step carries the reward and an output tail |
 | `task` | one replay end to end, ok and reward |
-| `suspend`, `delete` | the calls |
+| `suspend`, `delete` | the calls. Through ate-env-api a `delete` also includes its wait in the `-delete-rate` queue and any retry backoff, and so does the `park_s` of a `-park delete` run: the standard run's startup arm retires 890 environments per step, and at 200 per second with a burst of 200 the queue alone adds at least 3.4 s per step |
 | `step_barrier` | steps mode: first task start to last task end in a training step |
 | `park` | steps mode: parking the whole fleet; absent with `-park-each`, where the barrier includes the parking |
 | `run` | the whole run |
@@ -118,11 +118,11 @@ tasks, failures, barrier, park and wake p50/p95. `-json` then writes the
 summaries as an array. Files go before the flags.
 
 Every run event carries labels: the loader's own (mode, width, images,
-trajectory, dataset, the shape flags, connections, base template, exclude
-file, instances and the timeouts) plus any `run -label KEY=VALUE`, which is
-where the Substrate commit, the cluster and the arm go. A `-label` with a key
-the loader records itself is refused, so the same-workload check below cannot
-be overridden. The report prints
+trajectory, dataset, the shape flags, connections, delete rate, base
+template, exclude file, instances and the timeouts) plus any
+`run -label KEY=VALUE`, which is where the Substrate commit, the cluster and
+the arm go. A `-label` with a key the loader records itself is refused, so
+the same-workload check below cannot be overridden. The report prints
 them under its header, and the comparison shows one row per label key, so a
 column's provenance is in the table. `report -arm pull=p1.jsonl,p2.jsonl
 -arm stream=s1.jsonl,s2.jsonl` gives one column per arm, in flag order. Two
@@ -187,12 +187,12 @@ flag.
 ## How many actors, and on which clusters
 
 Every environment the loader creates is one Substrate actor. Three flags
-set how many:
+set how many, and one paces their deletes:
 
 | Flag | Controls |
 |---|---|
 | `-width` | actors in flight at once; also the cap on parallel creates |
-| `-delete-rate` | most environment deletes per second through ate-env-api, 200 by default; 0 removes the cap. The bucket rate-limits snapshot deletes, and a delete it refuses (429, `ResourceExhausted`) is retried with backoff for up to two minutes |
+| `-delete-rate` | most environment deletes per second through ate-env-api, per loader process (several loaders at once add their caps up), 200 by default; 0 removes the cap. The bucket rate-limits snapshot deletes, and a delete it refuses (429, `ResourceExhausted`) is retried with backoff for up to two minutes. The queue wait and the backoff count in the `delete` event and in the `park_s` of a `-park delete` run; the run records the cap as the `delete_rate` label |
 | `-tasks-per-image` | eval: actors created per image, each a full create, replay, delete |
 | `-rollouts` | steps: actors per image kept alive across the training steps |
 
@@ -472,7 +472,7 @@ The bundle built with `bench measure -k8s` records the cluster, node pools,
 Kubernetes and Substrate versions and the loader commit; pass the arm as a
 `run -label` and record by hand what neither records: boot disk type and size,
 CPU family, workers per node, bucket region. The loader records its own flags
-itself: mode, width, images, trajectory,
-dataset, tasks per image or rollouts, steps and park, connections, base
-template, exclude file, instances, and the create, step, wake-budget and
-wake-backoff timeouts. The report alone is not reproducible without them.
+itself: mode, width, images, trajectory, dataset, tasks per image or
+rollouts, steps and park, connections, delete rate, base template, exclude
+file, instances, and the create, step, wake-budget and wake-backoff timeouts.
+The report alone is not reproducible without them.

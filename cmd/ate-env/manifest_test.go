@@ -88,9 +88,9 @@ func TestTemplateConfigResolveImages(t *testing.T) {
 	}
 }
 
-// Substrate rejects a template that sets snapshotConfig.storageLocation
-// unless ate-api-server runs with the PerTemplateSnapshotLocation preview
-// gate (substrate#3357), thus the template sets it only when
+// Without ate-api-server's PerTemplateSnapshotLocation preview gate,
+// Substrate ignores snapshotConfig.storageLocation at the pin and rejects it
+// from substrate#3357, thus the template sets it only when
 // --snapshots-bucket names one.
 func TestManifestTemplateStorageLocationOptIn(t *testing.T) {
 	render := func(t *testing.T, extra ...string) string {

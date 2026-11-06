@@ -118,8 +118,10 @@ preview gate, to the bucket that `ate-env manifest template --snapshots-bucket` 
 
 What ate-env controls: `ate-env manifest template` writes the bucket URL into the template's
 `snapshotConfig.storageLocation` only when `--snapshots-bucket` is set, and templates that
-`ate-env-api` derives keep the base's value, or its absence. `ate-env-api` does not read or write
-the bucket itself.
+`ate-env-api` derives keep the base's value, or its absence. `ate-env-api` does not opt in to
+Substrate preview features, thus Substrate rejects a derived template that carries
+`storageLocation` when the `PerTemplateSnapshotLocation` gate is on (and, from Substrate
+`d86746d8`, also when it is off), and image environments cannot be created from such a base. `ate-env-api` does not read or write the bucket itself.
 
 What ate-env does not control: Substrate writes and reads the snapshots. The operator owns the
 access control, the encryption and the retention of the bucket. What stays in the bucket after an

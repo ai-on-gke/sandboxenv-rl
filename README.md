@@ -287,6 +287,14 @@ When you upgrade an existing cluster across these changes:
   is, thus registering the base again does not change it. To give a `--sidecar-readyz` template
   the 120 s default, delete the base and its derived templates (`<base>-<12 hex digits>`), then
   register the base again; `ate-env-api` derives each image template again from the new base.
+- A base registered by an earlier ate-env build carries `snapshotConfig.storageLocation`, because
+  `--snapshots-bucket` was required, and each template `ate-env-api` derives from it copies the
+  field. On a cluster that runs Substrate at or after
+  [`d86746d8`](https://github.com/agent-substrate/substrate/commit/d86746d8) without the
+  `PerTemplateSnapshotLocation` preview gate, Substrate rejects each new derived template with
+  `InvalidArgument` (`storage_location: Forbidden`). Delete the base and its derived templates
+  (`<base>-<12 hex digits>`) with `kubectl-ate delete actor-template`, then register the base again
+  without `--snapshots-bucket`.
 
 ### 1. Deploy the Kubernetes Resources
 
@@ -431,12 +439,20 @@ ate-env manifest template \
 ```
 
 The template sets no `snapshotConfig.storageLocation`, thus its snapshots, and those of the
-templates `ate-env-api` derives from it, go under the install's `--snapshot-location`.
+templates `ate-env-api` derives from it, go under the install's `--snapshot-location`. An install
+with the `PerTemplateSnapshotLocation` preview gate can run without `--snapshot-location`; there
+Substrate rejects a template without a location with `FailedPrecondition`.
+
 `--snapshots-bucket <object-storage-url>` sets a location for this template instead. Substrate
 honors it only with the `PerTemplateSnapshotLocation` preview gate (ate-setup
 `--preview=PerTemplateSnapshotLocation`), and the create then needs `kubectl-ate --preview`.
-Without the gate, Substrate at the pinned commit ignores the field, and Substrate from
-[`d86746d8`](https://github.com/agent-substrate/substrate/commit/d86746d8) rejects the template.
+Without the gate, Substrate before
+[`d86746d8`](https://github.com/agent-substrate/substrate/commit/d86746d8) ignores the field, and
+Substrate from `d86746d8` rejects the template. Even with the gate, `ate-env-api` cannot derive
+image templates from such a base: it does not opt in to preview features, thus Substrate rejects
+the derived template's `storageLocation` with `Forbidden`, and each create with a `rootfs_image`
+on that base fails. Use `--snapshots-bucket` only for a base that you do not create image
+environments from.
 
 Each actor gets 2 CPUs and 4 GiB unless you pass `--cpu` and `--memory` (Kubernetes quantities such as
 `500m` or `8Gi`; CPU at most `999.999`, as Substrate requires). Substrate requires both limits and books them against worker capacity; templates

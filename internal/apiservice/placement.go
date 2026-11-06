@@ -554,7 +554,7 @@ func warmSelector(template, request map[string]string) (map[string]string, error
 func (s *Server) domainNodes(ctx context.Context, selector map[string]string) (int, error) {
 	workers, err := s.client.ListWorkers(ctx)
 	if err != nil {
-		if status.Code(errors.Unwrap(err)) == codes.PermissionDenied || status.Code(err) == codes.PermissionDenied {
+		if grpcCode(err) == codes.PermissionDenied {
 			return 0, status.Errorf(codes.PermissionDenied, "nodes is 0 and ate-env-api may not list workers: pass nodes, or grant it the global viewer role (ate-env manifest access-policy --global): %v", err)
 		}
 		return 0, toGRPCError(err)
@@ -773,7 +773,9 @@ func (s *Server) deleteWarmProbe(ctx context.Context, atespace, id string) error
 	wait := warmRetryInitial
 	for attempt := 1; ; attempt++ {
 		err := s.client.Delete(dctx, atespace, id)
-		if err == nil || grpcCode(err) == codes.NotFound {
+		// A missing probe is ate.ErrNotFound: the ate client folds the
+		// NotFound status into it, so no status code is left to read.
+		if err == nil || errors.Is(err, ate.ErrNotFound) {
 			return nil
 		}
 		retry := false

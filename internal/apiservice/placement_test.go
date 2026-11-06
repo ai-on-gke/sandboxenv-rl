@@ -518,6 +518,14 @@ func TestWarmImageRetriesTransientCreateAndResumeFailures(t *testing.T) {
 	if n := control.Creates(); n < 6 {
 		t.Errorf("%d creates, want several attempts per probe", n)
 	}
+	// A create cut off may have landed, so each probe is deleted once; the
+	// NotFound that answers is the probe gone, not one left for a sweep.
+	if n := control.Deletes(); n != 2 {
+		t.Errorf("%d deletes, want one per probe whose create may have landed", n)
+	}
+	if len(cov.GetUndeletedProbes()) != 0 {
+		t.Errorf("undeleted = %v, want none: a NotFound delete is done", cov.GetUndeletedProbes())
+	}
 }
 
 // A failure that waiting cannot fix is final: the probe fails at once, with
@@ -543,6 +551,10 @@ func TestWarmImageDoesNotRetryFinalCreateFailures(t *testing.T) {
 		}
 		if cov.GetFailed() != 1 || !strings.Contains(cov.GetError(), "create: ") || !strings.Contains(cov.GetError(), inject.msg) || strings.Contains(cov.GetError(), "attempts") {
 			t.Errorf("%s: coverage = %v, want one create failed at once", name, cov)
+		}
+		// The refused probe never existed: nothing of it is left for a sweep.
+		if len(cov.GetUndeletedProbes()) != 0 {
+			t.Errorf("%s: undeleted = %v, want none: the refused probe never existed", name, cov.GetUndeletedProbes())
 		}
 		if n := control.Creates(); n != 2 {
 			t.Errorf("%s: %d creates, want 2: no retry", name, n)

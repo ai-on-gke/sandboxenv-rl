@@ -43,3 +43,13 @@ func TestTake(t *testing.T) {
 		t.Errorf("second Take = %q, want nothing", got)
 	}
 }
+
+func TestNames(t *testing.T) {
+	got := Names([]string{"KEY=a=b", "EMPTY="})
+	if want := []string{"KEY", "EMPTY"}; !slices.Equal(got, want) {
+		t.Errorf("Names = %q, want %q", got, want)
+	}
+	if got := Names(nil); len(got) != 0 {
+		t.Errorf("Names(nil) = %q, want nothing", got)
+	}
+}

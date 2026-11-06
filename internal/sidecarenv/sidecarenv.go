@@ -60,3 +60,14 @@ func Take() []string {
 	}
 	return out
 }
+
+// Names returns the NAME of each NAME=VALUE that Take returned, for a log
+// line that must not show the values.
+func Names(env []string) []string {
+	names := make([]string, 0, len(env))
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		names = append(names, name)
+	}
+	return names
+}

@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -91,9 +92,14 @@ func TestSidecarEnvReachesOnlySidecars(t *testing.T) {
 		}
 	})
 	addrCh := make(chan string, 1)
+	var logMu sync.Mutex
+	var guestLog strings.Builder
 	go func() {
 		sc := bufio.NewScanner(stderr)
 		for sc.Scan() {
+			logMu.Lock()
+			guestLog.WriteString(sc.Text() + "\n")
+			logMu.Unlock()
 			if m := listeningOn.FindStringSubmatch(sc.Text()); m != nil {
 				addrCh <- m[1]
 			}
@@ -162,6 +168,18 @@ func TestSidecarEnvReachesOnlySidecars(t *testing.T) {
 	}
 	if strings.Contains(string(sidecar), sidecarenv.Prefix) {
 		t.Errorf("the sidecar's environment has the prefixed variable:\n%s", sidecar)
+	}
+
+	// The guest logs the names it took, before the listening line, and never
+	// a value.
+	logMu.Lock()
+	logged := guestLog.String()
+	logMu.Unlock()
+	if !strings.Contains(logged, "for the sidecars only: [OH_SESSION_API_KEYS_0]") {
+		t.Errorf("the guest log does not name the sidecar-only variable it took:\n%s", logged)
+	}
+	if strings.Contains(logged, secret) {
+		t.Errorf("the guest log shows the sidecar-only value:\n%s", logged)
 	}
 
 	// What remains, as docs/security/threat-model.md says: the environment

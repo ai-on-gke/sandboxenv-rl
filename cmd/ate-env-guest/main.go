@@ -151,6 +151,9 @@ func main() {
 		}()
 	}
 
+	// Names only, never values: this line shows that the guest has
+	// --sidecar-env support and which variables it took.
+	log.Printf("sidecar-only variables taken from the environment, for the sidecars only: %v", sidecarenv.Names(sidecarEnv))
 	log.Printf("ate-env-guest listening on %s (gRPC services=%s, workspace=%s, logdir=%s)",
 		lis.Addr(), guest.FormatEnabledServices(cfg), cfg.Workspace, cfg.LogDir)
 	if err := srv.Serve(lis); err != nil && !errors.Is(err, http.ErrServerClosed) {

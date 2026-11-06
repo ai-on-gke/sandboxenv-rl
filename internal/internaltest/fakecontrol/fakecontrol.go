@@ -238,6 +238,102 @@ func (s *Server) Serve() (addr string, stop func(), err error) {
 	return lis.Addr().String(), grpcServer.Stop, nil
 }
 
+// Client returns an in-process ControlClient backed directly by s without
+// network sockets or background goroutines, suitable for testing/synctest
+// bubbles via ate.NewControlClient(s.Client()).
+func (s *Server) Client() ateapipb.ControlClient {
+	return inProcessControlClient{s: s}
+}
+
+type inProcessControlClient struct {
+	ateapipb.ControlClient
+	s *Server
+}
+
+func ctxErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return status.FromContextError(err).Err()
+	}
+	return nil
+}
+
+func (c inProcessControlClient) GetActor(ctx context.Context, in *ateapipb.GetActorRequest, _ ...grpc.CallOption) (*ateapipb.Actor, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	return c.s.GetActor(ctx, in)
+}
+
+func (c inProcessControlClient) CreateActor(ctx context.Context, in *ateapipb.CreateActorRequest, _ ...grpc.CallOption) (*ateapipb.Actor, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	return c.s.CreateActor(ctx, in)
+}
+
+func (c inProcessControlClient) ResumeActor(ctx context.Context, in *ateapipb.ResumeActorRequest, _ ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	return c.s.ResumeActor(ctx, in)
+}
+
+func (c inProcessControlClient) SuspendActor(ctx context.Context, in *ateapipb.SuspendActorRequest, _ ...grpc.CallOption) (*ateapipb.SuspendActorResponse, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	return c.s.SuspendActor(ctx, in)
+}
+
+func (c inProcessControlClient) DeleteActor(ctx context.Context, in *ateapipb.DeleteActorRequest, _ ...grpc.CallOption) (*ateapipb.Actor, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	return c.s.DeleteActor(ctx, in)
+}
+
+func (c inProcessControlClient) ListActors(ctx context.Context, in *ateapipb.ListActorsRequest, _ ...grpc.CallOption) (*ateapipb.ListActorsResponse, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	return c.s.ListActors(ctx, in)
+}
+
+func (c inProcessControlClient) CreateAtespace(ctx context.Context, in *ateapipb.CreateAtespaceRequest, _ ...grpc.CallOption) (*ateapipb.Atespace, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	return c.s.CreateAtespace(ctx, in)
+}
+
+func (c inProcessControlClient) GetAtespace(ctx context.Context, in *ateapipb.GetAtespaceRequest, _ ...grpc.CallOption) (*ateapipb.Atespace, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	return c.s.GetAtespace(ctx, in)
+}
+
+func (c inProcessControlClient) GetActorTemplate(ctx context.Context, in *ateapipb.GetActorTemplateRequest, _ ...grpc.CallOption) (*ateapipb.ActorTemplate, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	return c.s.GetActorTemplate(ctx, in)
+}
+
+func (c inProcessControlClient) CreateActorTemplate(ctx context.Context, in *ateapipb.CreateActorTemplateRequest, _ ...grpc.CallOption) (*ateapipb.ActorTemplate, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	return c.s.CreateActorTemplate(ctx, in)
+}
+
+func (c inProcessControlClient) DeleteActorTemplate(ctx context.Context, in *ateapipb.DeleteActorTemplateRequest, _ ...grpc.CallOption) (*ateapipb.ActorTemplate, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+	return c.s.DeleteActorTemplate(ctx, in)
+}
+
 func selfSignedCert() (tls.Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

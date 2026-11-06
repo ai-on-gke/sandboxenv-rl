@@ -123,6 +123,12 @@ func DeriveImageTemplate(base *ateapipb.ActorTemplate, name, image string) (*ate
 		if _, err := ImageDigest(guestImage); err != nil {
 			return nil, fmt.Errorf("base template %q guest image: %w", base.GetMetadata().GetName(), err)
 		}
+		// Substrate requires unique volume names and mounts that do not
+		// nest, so a base that already uses the guest's volume name or mount
+		// path would derive a template Substrate rejects. Say why here.
+		if err := checkGuestSlotFree(tmpl, c); err != nil {
+			return nil, fmt.Errorf("base template %q: %w", base.GetMetadata().GetName(), err)
+		}
 		tmpl.Volumes = append(tmpl.Volumes, &ateapipb.Volume{
 			Name:  GuestVolumeName,
 			Image: &ateapipb.ImageVolumeSource{Reference: guestImage},
@@ -139,6 +145,23 @@ func DeriveImageTemplate(base *ateapipb.ActorTemplate, name, image string) (*ate
 	}
 	c.Image = image
 	return tmpl, nil
+}
+
+// checkGuestSlotFree reports an error when tmpl already has a volume named
+// GuestVolumeName (that is not the guest image volume) or c mounts a volume
+// at or under GuestMountPath, where the guest volume goes.
+func checkGuestSlotFree(tmpl *ateapipb.ActorTemplate, c *ateapipb.Container) error {
+	for _, v := range tmpl.GetVolumes() {
+		if v.GetName() == GuestVolumeName {
+			return fmt.Errorf("volume %q is not an image volume, but the guest image volume needs that name; rename it", GuestVolumeName)
+		}
+	}
+	for _, m := range c.GetVolumeMounts() {
+		if p := m.GetMountPath(); p == GuestMountPath || strings.HasPrefix(p, GuestMountPath+"/") {
+			return fmt.Errorf("volume %q is mounted at %s, which overlaps the guest mount at %s; mount it elsewhere", m.GetName(), p, GuestMountPath)
+		}
+	}
+	return nil
 }
 
 // guestVolume returns the template's guest image volume, or nil when the

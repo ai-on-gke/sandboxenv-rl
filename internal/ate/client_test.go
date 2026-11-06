@@ -20,6 +20,7 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/agent-substrate/env/internal/ate"
@@ -294,4 +295,92 @@ func TestDialGuestOverTLS(t *testing.T) {
 	if err := conn2.Invoke(ctx, "/ateenv.test.Nothing/Ping", &emptypb.Empty{}, &emptypb.Empty{}); err == nil || status.Code(err) == codes.Unimplemented {
 		t.Fatalf("plaintext to a TLS router: %v, want a transport error", err)
 	}
+}
+
+func TestNewControlClientInSynctest(t *testing.T) {
+	synctest.Test(t, func(bt *testing.T) {
+		ctrl := fakecontrol.New()
+		raw := ctrl.Client()
+		client := ate.NewControlClient(raw)
+
+		ctx := context.Background()
+		if err := client.EnsureAtespace(ctx, "bubble-space"); err != nil {
+			bt.Fatalf("EnsureAtespace: %v", err)
+		}
+		if _, err := raw.GetAtespace(ctx, &ateapipb.GetAtespaceRequest{
+			Atespace: &ateapipb.ObjectRef{Name: "bubble-space"},
+		}); err != nil {
+			bt.Fatalf("GetAtespace: %v", err)
+		}
+		if _, err := raw.CreateActorTemplate(ctx, &ateapipb.CreateActorTemplateRequest{
+			ActorTemplate: &ateapipb.ActorTemplate{
+				Metadata: &ateapipb.ResourceMetadata{Atespace: "bubble-space", Name: "tpl"},
+			},
+		}); err != nil {
+			bt.Fatalf("CreateActorTemplate: %v", err)
+		}
+		if _, err := raw.GetActorTemplate(ctx, &ateapipb.GetActorTemplateRequest{
+			ActorTemplate: &ateapipb.ObjectRef{Atespace: "bubble-space", Name: "tpl"},
+		}); err != nil {
+			bt.Fatalf("GetActorTemplate: %v", err)
+		}
+		if err := client.Create(ctx, ate.CreateOptions{Atespace: "bubble-space", ID: "a1", Template: "tpl"}); err != nil {
+			bt.Fatalf("Create: %v", err)
+		}
+		if _, err := client.Get(ctx, "bubble-space", "a1"); err != nil {
+			bt.Fatalf("Get: %v", err)
+		}
+		if err := client.Suspend(ctx, "bubble-space", "a1"); err != nil {
+			bt.Fatalf("Suspend: %v", err)
+		}
+		if _, err := raw.ResumeActor(ctx, &ateapipb.ResumeActorRequest{
+			Actor: &ateapipb.ObjectRef{Atespace: "bubble-space", Name: "a1"},
+		}); err != nil {
+			bt.Fatalf("ResumeActor: %v", err)
+		}
+		if _, err := raw.ListActors(ctx, &ateapipb.ListActorsRequest{Atespace: "bubble-space"}); err != nil {
+			bt.Fatalf("ListActors: %v", err)
+		}
+		if err := client.Delete(ctx, "bubble-space", "a1"); err != nil {
+			bt.Fatalf("Delete: %v", err)
+		}
+		if _, err := raw.DeleteActorTemplate(ctx, &ateapipb.DeleteActorTemplateRequest{
+			ActorTemplate: &ateapipb.ObjectRef{Atespace: "bubble-space", Name: "tpl"},
+		}); err != nil {
+			bt.Fatalf("DeleteActorTemplate: %v", err)
+		}
+
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		for name, call := range map[string]func() error{
+			"GetActor":       func() error { _, err := raw.GetActor(cancelled, &ateapipb.GetActorRequest{}); return err },
+			"CreateActor":    func() error { _, err := raw.CreateActor(cancelled, &ateapipb.CreateActorRequest{}); return err },
+			"ResumeActor":    func() error { _, err := raw.ResumeActor(cancelled, &ateapipb.ResumeActorRequest{}); return err },
+			"SuspendActor":   func() error { _, err := raw.SuspendActor(cancelled, &ateapipb.SuspendActorRequest{}); return err },
+			"DeleteActor":    func() error { _, err := raw.DeleteActor(cancelled, &ateapipb.DeleteActorRequest{}); return err },
+			"ListActors":     func() error { _, err := raw.ListActors(cancelled, &ateapipb.ListActorsRequest{}); return err },
+			"CreateAtespace": func() error { _, err := raw.CreateAtespace(cancelled, &ateapipb.CreateAtespaceRequest{}); return err },
+			"GetAtespace":    func() error { _, err := raw.GetAtespace(cancelled, &ateapipb.GetAtespaceRequest{}); return err },
+			"GetActorTemplate": func() error {
+				_, err := raw.GetActorTemplate(cancelled, &ateapipb.GetActorTemplateRequest{})
+				return err
+			},
+			"CreateActorTemplate": func() error {
+				_, err := raw.CreateActorTemplate(cancelled, &ateapipb.CreateActorTemplateRequest{})
+				return err
+			},
+			"DeleteActorTemplate": func() error {
+				_, err := raw.DeleteActorTemplate(cancelled, &ateapipb.DeleteActorTemplateRequest{})
+				return err
+			},
+		} {
+			if err := call(); status.Code(err) != codes.Canceled {
+				bt.Fatalf("%s on cancelled ctx: code=%v (%v), want Canceled", name, status.Code(err), err)
+			}
+		}
+
+		if err := client.Close(); err != nil {
+			bt.Fatalf("Close: %v", err)
+		}
+	})
 }

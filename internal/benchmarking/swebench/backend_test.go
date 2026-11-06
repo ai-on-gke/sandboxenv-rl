@@ -55,11 +55,13 @@ type fakeAPI struct {
 
 	mu sync.Mutex
 	// pollsUntilExit is how many GetProcess calls a process stays running;
-	// unavailablePolls is how many GetProcess calls answer Unavailable first.
-	pollsUntilExit   int
-	unavailablePolls int
-	exitCode         int32
-	stdout, stderr   string
+	// unavailableStarts and unavailablePolls are how many StartProcess or
+	// GetProcess calls answer Unavailable first.
+	pollsUntilExit    int
+	unavailableStarts int
+	unavailablePolls  int
+	exitCode          int32
+	stdout, stderr    string
 
 	nextID    int
 	polls     map[string]int
@@ -74,6 +76,34 @@ type fakeAPI struct {
 	// features, when set, is what GetServerInfo reports; nil leaves it
 	// Unimplemented, as an ate-env-api that predates the RPC answers.
 	features []string
+
+	// Placement, for the pre-flight: the nodes of each domain (the value of
+	// the ate-env/domain selector label), handed out round-robin per create,
+	// or always the first with sameNode; the node and selector per
+	// environment; the derived templates and their golden state, which
+	// turns READY after goldenReadyAfter status calls unless goldenFail
+	// names the image.
+	domainNodes      map[string][]string
+	domainCounter    map[string]int
+	sameNode         bool
+	nodes            map[string]string
+	selectors        map[string]map[string]string
+	templates        map[string]bool
+	statusCalls      map[string]int
+	goldenReadyAfter int
+	goldenFail       map[string]string
+	goldenDisabled   bool
+	// createFailAfter makes every CreateEnvironment after that many fail
+	// with ResourceExhausted, as a full pool does.
+	createFailAfter int
+	// goldenPendingForever names images whose golden never gets ready.
+	goldenPendingForever map[string]bool
+	ensured              []string
+	// images is the rootfs image per environment.
+	images map[string]string
+	// inflight and maxInflight count the environments alive per domain.
+	inflight, maxInflight map[string]int
+	onCreate              func(id string)
 }
 
 func (f *fakeAPI) GetServerInfo(context.Context, *ateenvv1alpha.GetServerInfoRequest) (*ateenvv1alpha.GetServerInfoResponse, error) {
@@ -86,8 +116,92 @@ func (f *fakeAPI) GetServerInfo(context.Context, *ateenvv1alpha.GetServerInfoReq
 func (f *fakeAPI) CreateEnvironment(_ context.Context, req *ateenvv1alpha.CreateEnvironmentRequest) (*ateenvv1alpha.CreateEnvironmentResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.createFailAfter > 0 && len(f.created) >= f.createFailAfter {
+		return nil, status.Error(codes.ResourceExhausted, "no worker has room for the actor")
+	}
 	f.created = append(f.created, req.GetId())
-	return &ateenvv1alpha.CreateEnvironmentResponse{Environment: &ateenvv1alpha.Environment{Id: req.GetId(), Atespace: req.GetAtespace()}}, nil
+	f.selectors[req.GetId()] = req.GetWorkerSelector()
+	f.images[req.GetId()] = req.GetRootfsImage()
+	domain := req.GetWorkerSelector()["ate-env/domain"]
+	node := "node-any"
+	if list := f.domainNodes[domain]; len(list) > 0 {
+		idx := 0
+		if !f.sameNode {
+			key := domain + "\x00" + req.GetRootfsImage()
+			idx = f.domainCounter[key] % len(list)
+			f.domainCounter[key]++
+		}
+		node = list[idx]
+	}
+	f.nodes[req.GetId()] = node
+	f.inflight[domain]++
+	f.maxInflight[domain] = max(f.maxInflight[domain], f.inflight[domain])
+	cb := f.onCreate
+	if cb != nil {
+		cb(req.GetId())
+	}
+	return &ateenvv1alpha.CreateEnvironmentResponse{Environment: &ateenvv1alpha.Environment{Id: req.GetId(), Atespace: req.GetAtespace(), WorkerSelector: req.GetWorkerSelector()}}, nil
+}
+
+func (f *fakeAPI) GetEnvironment(_ context.Context, req *ateenvv1alpha.GetEnvironmentRequest) (*ateenvv1alpha.GetEnvironmentResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	node, ok := f.nodes[req.GetId()]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "environment %q not found", req.GetId())
+	}
+	return &ateenvv1alpha.GetEnvironmentResponse{Environment: &ateenvv1alpha.Environment{
+		Id: req.GetId(), Atespace: req.GetAtespace(), Node: node, WorkerSelector: f.selectors[req.GetId()],
+		Status: ateenvv1alpha.EnvironmentStatus_ENVIRONMENT_STATUS_RUNNING,
+	}}, nil
+}
+
+func (f *fakeAPI) imageStatusLocked(image string) *ateenvv1alpha.ImageStatus {
+	digest := image[strings.LastIndex(image, ":")+1:]
+	st := &ateenvv1alpha.ImageStatus{
+		RootfsImage: image,
+		Template:    &ateenvv1alpha.Template{Name: "default-template-" + digest[:12], Atespace: "ate-env"},
+		Golden:      ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_NONE,
+	}
+	if !f.templates[image] {
+		return st
+	}
+	st.TemplateExists = true
+	f.statusCalls[image]++
+	switch {
+	case f.goldenDisabled:
+	case f.goldenPendingForever[image]:
+		st.Golden = ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_PENDING
+	case f.goldenFail[image] != "":
+		st.Golden = ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_FAILED
+		st.GoldenError = f.goldenFail[image]
+	case f.statusCalls[image] > f.goldenReadyAfter:
+		st.Golden = ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_READY
+		st.GoldenTag = "golden-" + digest[:12]
+	default:
+		st.Golden = ateenvv1alpha.GoldenSnapshotState_GOLDEN_SNAPSHOT_STATE_PENDING
+	}
+	return st
+}
+
+func (f *fakeAPI) GetImageStatus(_ context.Context, req *ateenvv1alpha.GetImageStatusRequest) (*ateenvv1alpha.ImageStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !strings.Contains(req.GetRootfsImage(), "@sha256:") {
+		return nil, status.Error(codes.InvalidArgument, "image is not pinned by digest")
+	}
+	return f.imageStatusLocked(req.GetRootfsImage()), nil
+}
+
+func (f *fakeAPI) EnsureImageTemplate(_ context.Context, req *ateenvv1alpha.EnsureImageTemplateRequest) (*ateenvv1alpha.ImageStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !strings.Contains(req.GetRootfsImage(), "@sha256:") {
+		return nil, status.Error(codes.InvalidArgument, "image is not pinned by digest")
+	}
+	f.ensured = append(f.ensured, req.GetRootfsImage())
+	f.templates[req.GetRootfsImage()] = true
+	return f.imageStatusLocked(req.GetRootfsImage()), nil
 }
 
 func (f *fakeAPI) SuspendEnvironment(_ context.Context, req *ateenvv1alpha.SuspendEnvironmentRequest) (*ateenvv1alpha.SuspendEnvironmentResponse, error) {
@@ -102,12 +216,17 @@ func (f *fakeAPI) DeleteEnvironment(_ context.Context, req *ateenvv1alpha.Delete
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleted = append(f.deleted, req.GetId())
+	f.inflight[f.selectors[req.GetId()]["ate-env/domain"]]--
 	return &ateenvv1alpha.DeleteEnvironmentResponse{}, nil
 }
 
 func (f *fakeAPI) StartProcess(_ context.Context, req *ateenvv1alpha.StartProcessRequest) (*ateenvv1alpha.Process, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.unavailableStarts > 0 {
+		f.unavailableStarts--
+		return nil, status.Error(codes.Unavailable, "router: wake timed out")
+	}
 	f.nextID++
 	id := fmt.Sprintf("p%d", f.nextID)
 	f.commands = append(f.commands, strings.Join(req.GetCommand(), " "))
@@ -166,6 +285,17 @@ func newFakeBackend(t *testing.T, api *fakeAPI) *EnvBackend {
 	t.Helper()
 	api.polls = map[string]int{}
 	api.exited = map[string]bool{}
+	api.domainCounter = map[string]int{}
+	api.nodes = map[string]string{}
+	api.selectors = map[string]map[string]string{}
+	api.inflight = map[string]int{}
+	api.maxInflight = map[string]int{}
+	api.images = map[string]string{}
+	api.templates = map[string]bool{}
+	api.statusCalls = map[string]int{}
+	if api.goldenFail == nil {
+		api.goldenFail = map[string]string{}
+	}
 	lis := bufconn.Listen(1 << 20)
 	srv := grpc.NewServer()
 	ateenvv1alpha.RegisterEnvironmentServiceServer(srv, api)

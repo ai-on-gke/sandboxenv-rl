@@ -291,8 +291,10 @@ When you upgrade an existing cluster across these changes:
   `--snapshots-bucket` was required, and each template `ate-env-api` derives from it copies the
   field. On a cluster that runs Substrate at or after
   [`d86746d8`](https://github.com/agent-substrate/substrate/commit/d86746d8) without the
-  `PerTemplateSnapshotLocation` preview gate, Substrate rejects each new derived template with
-  `InvalidArgument` (`storage_location: Forbidden`). Delete the base and its derived templates
+  `PerTemplateSnapshotLocation` preview gate, or on any cluster with the gate on, Substrate rejects
+  each new derived template with `InvalidArgument` (`storage_location: Forbidden`). With the gate on,
+  this is because `ate-env-api` does not opt in to preview features (see
+  [step 2](#2-register-the-actortemplate-in-substrate)). Delete the base and its derived templates
   (`<base>-<12 hex digits>`) with `kubectl-ate delete actor-template`, then register the base again
   without `--snapshots-bucket`.
 

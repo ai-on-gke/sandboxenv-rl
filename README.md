@@ -536,8 +536,8 @@ $ ate-env suspend dev1
 $ ate-env delete dev1
 ```
 
-Subcommand names (`create`, `get`, `delete`, `suspend`, `manifest`, `server-info`, `help`,
-`completion`) are reserved: `ate-env create` rejects them as environment IDs, because `ate-env <id> ...` cannot reach
+Subcommand names (`create`, `get`, `image-status`, `delete`, `suspend`, `manifest`, `server-info`,
+`help`, `completion`) are reserved: `ate-env create` rejects them as environment IDs, because `ate-env <id> ...` cannot reach
 such an environment.
 
 `ate-env` provides help text:
@@ -556,13 +556,14 @@ Usage:
 
 Available Commands:
   completion  Generate the autocompletion script for the specified shell
-  create      Create and start an environment
-  delete      Delete an environment
-  get         Show an environment: template, status, node and worker selector
-  help        Help about any command
-  manifest    Generate Kubernetes manifests to deploy the system
-  server-info Show the ate-env-api server's version and features
-  suspend     Suspend an environment
+  create       Create and start an environment
+  delete       Delete an environment
+  get          Show an environment: template, status, node and worker selector
+  help         Help about any command
+  image-status Show the template derived for a rootfs image and whether its golden snapshot is ready
+  manifest     Generate Kubernetes manifests to deploy the system
+  server-info  Show the ate-env-api server's version and features
+  suspend      Suspend an environment
 
 Flags:
   -h, --help      help for ate-env
@@ -652,7 +653,9 @@ Manages the lifecycle of isolated execution environments (defined in [`proto/ate
 | RPC | Description |
 | --- | ----------- |
 | `CreateEnvironment` | Creates and starts a new environment actor from an ActorTemplate, or from a digest-pinned `rootfs_image` on top of one: the template becomes the base, the image the container, and the guest is mounted in as a read-only image volume |
-| `GetEnvironment` | Retrieves environment details and status |
+| `GetEnvironment` | Retrieves environment details and status, the node it is on and its worker selector |
+| `GetImageStatus` | Reports the ActorTemplate derived for a digest-pinned `rootfs_image` (whether it exists) and the state of its golden snapshot: `NONE` (no template), `PENDING` (baking; environments boot from the image), `READY` (with the golden tag), `FAILED` (with the reason). Reads only. `ate-env image-status <image>` |
+| `EnsureImageTemplate` | Creates the derived ActorTemplate when it is missing, which starts the golden bake, and reports it like `GetImageStatus`; no environment is created, and a template whose bake failed is recreated the way a create would. `ate-env image-status <image> --ensure`. Advertised as feature `image_status` |
 | `SuspendEnvironment` | Suspends and checkpoints the environment: to snapshot storage by default, or to its node first with `mode: SUSPEND_MODE_LOCAL` (the upload follows in the background) |
 | `DeleteEnvironment` | Deletes the environment permanently |
 | `GetServerInfo` | Reports the server implementation (`sandboxenv-rl`), its version, the version of the `go.ate.dev/substrate` module it was built against, and its optional features (`rootfs_image`, `pty`, `suspend_mode`, and `port_proxy` when enabled); answered by `ate-env-api` itself. The Substrate version is a build fact, not the version of the control plane the server talks to; Substrate has no RPC that reports that. `ate-env server-info --json` prints the four fields as one JSON object |

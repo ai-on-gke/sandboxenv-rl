@@ -7,6 +7,14 @@ user needs to know across them.
 ## Unreleased
 
 ### Added
+- ate-env-api: `GetImageStatus` and `EnsureImageTemplate`, the ActorTemplate
+  derived for a `rootfs_image` and the state of its golden snapshot (`NONE`,
+  `PENDING`, `READY` with the tag, `FAILED` with the reason); ensure creates
+  the template, which starts the bake, with no environment. Feature
+  `image_status`; `ate-env image-status <image> [--ensure]` (`image-status` joins
+  the reserved environment ids); the Python
+  client's `image_status()` and `ImageStatus`; the Go client's `ImageStatus`
+  and `EnsureImageTemplate`.
 - `examples/Qwen3.5-397B-A17B-verl`: the agentic GRPO recipe from 2 to 16 GPU
   nodes with profiles for Qwen3.5-35B-A3B and Qwen3.5-397B-A17B, steps of
   thousands of trajectories, and guarded verl patches for 64K responses.

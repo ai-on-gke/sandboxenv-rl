@@ -40,7 +40,11 @@ type wakeAttempt struct {
 	noCapacity   bool // ... with the router's "no worker has room" text
 	ctxEnded     bool // caller ctx ended before or during the parked probe
 	readCtxEnded bool // caller ctx ended before readStatus completed
-	state        ateapipb.ActorState
+	readCut      bool // readStatus ran out of the time awaitWake gave it
+	// readErr is the control plane's error for the state read (OK: none).
+	// With an error, or readCut, state stays UNSPECIFIED: unknown.
+	readErr codes.Code
+	state   ateapipb.ActorState
 }
 
 var wakeStates = []ateapipb.ActorState{
@@ -51,26 +55,36 @@ var wakeStates = []ateapipb.ActorState{
 	ateapipb.ActorState_ACTOR_STATE_DELETING,
 }
 
-const maxProbeLatency = 3 * time.Second
+const (
+	maxProbeLatency = 3 * time.Second
+	maxReadLatency  = 3 * time.Second
+)
 
 // TestAwaitWakeProperties drives awaitWake (ensureAwake's loop) with generated
-// router answers, probe latencies, control-plane states, budgets and caller
-// cancellations/deadlines on synctest's fake clock, checking WF-1 to WF-7
+// router answers, probe latencies, control-plane states, state-read latencies
+// and errors, budgets and caller cancellations/deadlines on synctest's fake
+// clock, checking WF-1 to WF-7
 // (docs/plans/ate-env-api/acceptance-criteria.md) after every run:
 //
 //   - WF-1: a probe the guest answers ends the wait at once, with no error.
 //   - WF-2: an unreachable guest whose actor is CRASHED ends the wait at once
 //     with FailedPrecondition, naming the crash reason when there is one;
-//     DELETING ends it with NotFound.
+//     DELETING ends it with NotFound, and a state read that answers a
+//     non-transient error (NotFound, Internal) ends it with that error.
 //   - WF-3: ResourceExhausted only with a positive no-capacity grace, after a
-//     run of no-room answers (actor not RUNNING) that lasted the grace,
-//     measured from the first probe's start to the last probe's answer.
+//     run of no-room answers (actor not reported RUNNING, CRASHED or
+//     DELETING) that lasted the grace, measured from the first probe's start
+//     to the last probe's answer; a control-plane ResourceExhausted on the
+//     state read is not one.
 //   - WF-4: once such a run has lasted the grace at a probe's answer, that
-//     probe is the last one: the wait never runs on past the grace.
+//     probe is the last one: the wait never runs on past the grace, however
+//     slow the state read.
 //   - WF-5: a timeout (Unavailable) only after the wake budget, or after the
 //     running budget counted from the first attempt of the current RUNNING
-//     run.
-//   - WF-6: the wait never runs past the wake budget by more than one probe.
+//     run; a transient state-read error leaves the state unknown and never
+//     ends the wait early.
+//   - WF-6: the wait never runs past the wake budget by more than one probe,
+//     however slow the state read.
 //   - WF-7: caller cancellation or deadline expiry during a parked probe or
 //     backoff ends the wait at once with Canceled or DeadlineExceeded and
 //     never marks create_to_ready or wake_wait as ready.
@@ -89,12 +103,31 @@ func TestAwaitWakeProperties(t *testing.T) {
 // wakeStep is what one probe meets: its latency, the router's answer
 // (0: the guest answers; 1-4: no room; 5-9: another Unavailable), and the
 // state the control plane reports after an unreachable probe (an index into
-// wakeStateWeights).
+// wakeStateWeights), after readLatency, or the error it answers instead (an
+// index into wakeReadErrs).
 type wakeStep struct {
-	latency time.Duration
-	answer  int
-	state   int
+	latency     time.Duration
+	answer      int
+	state       int
+	readLatency time.Duration
+	readErr     int
 }
+
+// Mostly a state; sometimes a transient error, which leaves the state
+// unknown; rarely NotFound (a deleted environment) or Internal, which end
+// the wait with that error.
+var wakeReadErrs = func() []codes.Code {
+	out := []codes.Code{
+		codes.Unavailable, codes.Unavailable,
+		codes.DeadlineExceeded, codes.DeadlineExceeded,
+		codes.ResourceExhausted, codes.ResourceExhausted,
+		codes.NotFound, codes.Internal,
+	}
+	for len(out) < 40 {
+		out = append(out, codes.OK)
+	}
+	return out
+}()
 
 // Mostly not-yet-running states, so runs reach the budgets.
 var wakeStateWeights = []int{0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 4}
@@ -123,13 +156,19 @@ func checkAwaitWake(_ *testing.T, rt *rapid.T) {
 	}
 	crashReason := rapid.SampledFrom([]string{"", "OOMKilled"}).Draw(rt, "crash_reason")
 	steps := rapid.SliceOfN(rapid.Custom(func(t *rapid.T) wakeStep {
-		return wakeStep{
+		step := wakeStep{
 			latency: time.Duration(rapid.Int64Range(0, maxProbeLatency.Milliseconds()).Draw(t, "latency_ms")) * time.Millisecond,
 			answer:  rapid.IntRange(0, 9).Draw(t, "answer"),
 			state:   rapid.IntRange(0, len(wakeStateWeights)-1).Draw(t, "state"),
+			readErr: rapid.IntRange(0, len(wakeReadErrs)-1).Draw(t, "read_err"),
 		}
+		if rapid.Bool().Draw(t, "slow_read") {
+			step.readLatency = time.Duration(rapid.Int64Range(1, maxReadLatency.Milliseconds()).Draw(t, "read_latency_ms")) * time.Millisecond
+		}
+		return step
 	}), 0, maxWakeSteps).Draw(rt, "steps")
 
+	callerCtx := context.Background()
 	var attempts []wakeAttempt
 	probe := func(ctx context.Context) error {
 		step := wakeStep{}
@@ -170,16 +209,37 @@ func checkAwaitWake(_ *testing.T, rt *rapid.T) {
 		return perr
 	}
 	readStatus := func(ctx context.Context) (*ateapipb.ActorStatus, error) {
-		if ctx.Err() != nil {
-			attempts[len(attempts)-1].readCtxEnded = true
+		a := &attempts[len(attempts)-1]
+		step := wakeStep{readErr: len(wakeReadErrs) - 1} // a state, at once
+		if n := len(attempts) - 1; n < len(steps) {
+			step = steps[n]
+		}
+		// The read ends when ctx does, as a gRPC call does: the caller's
+		// ctx, or the deadline awaitWake gave the read.
+		ended := func() (*ateapipb.ActorStatus, error) {
+			if callerCtx.Err() != nil {
+				a.readCtxEnded = true
+			} else {
+				a.readCut = true
+			}
 			return nil, status.FromContextError(ctx.Err()).Err()
 		}
-		idx := 0
-		if n := len(attempts) - 1; n < len(steps) {
-			idx = steps[n].state
+		if ctx.Err() != nil {
+			return ended()
 		}
-		st := wakeStates[wakeStateWeights[idx]]
-		attempts[len(attempts)-1].state = st
+		if step.readLatency > 0 {
+			select {
+			case <-ctx.Done():
+				return ended()
+			case <-time.After(step.readLatency):
+			}
+		}
+		if c := wakeReadErrs[step.readErr]; c != codes.OK {
+			a.readErr = c
+			return nil, status.Error(c, "ate-api: "+c.String())
+		}
+		st := wakeStates[wakeStateWeights[step.state]]
+		a.state = st
 		out := &ateapipb.ActorStatus{State: st}
 		if st == ateapipb.ActorState_ACTOR_STATE_CRASHED && crashReason != "" {
 			out.Crash = &ateapipb.ActorCrash{Message: crashReason}
@@ -209,6 +269,7 @@ func checkAwaitWake(_ *testing.T, rt *rapid.T) {
 		cleanup = cancel
 		wantCtxCode = codes.DeadlineExceeded
 	}
+	callerCtx = ctx
 
 	err := s.awaitWake(ctx, "ns", "env", probe, readStatus)
 	now := time.Now()
@@ -240,6 +301,11 @@ func checkAwaitWake(_ *testing.T, rt *rapid.T) {
 	case last.ctxEnded || last.readCtxEnded:
 		if code != wantCtxCode {
 			rt.Fatalf("WF-7: caller context ended during probe/read, got %v, want %v", err, wantCtxCode)
+		}
+	case readEndsWait(last.readErr):
+		// The caller's ctx may end at the instant the read answers.
+		if code != last.readErr && (ctxErr == nil || code != wantCtxCode) {
+			rt.Fatalf("WF-2: a state read that answered %v gave %v, want that code", last.readErr, err)
 		}
 	case last.state == ateapipb.ActorState_ACTOR_STATE_CRASHED:
 		if code != codes.FailedPrecondition {
@@ -274,7 +340,7 @@ func checkAwaitWake(_ *testing.T, rt *rapid.T) {
 		}
 	}
 	for i, a := range attempts[:len(attempts)-1] {
-		if a.answered || a.ctxEnded || a.readCtxEnded ||
+		if a.answered || a.ctxEnded || a.readCtxEnded || readEndsWait(a.readErr) ||
 			a.state == ateapipb.ActorState_ACTOR_STATE_CRASHED ||
 			a.state == ateapipb.ActorState_ACTOR_STATE_DELETING {
 			rt.Fatalf("WF-1/WF-2/WF-7: attempt %d of %d (answered=%t ctxEnded=%t state=%s) should have ended the wait",
@@ -285,7 +351,10 @@ func checkAwaitWake(_ *testing.T, rt *rapid.T) {
 	// WF-3, WF-4: the no-capacity grace.
 	var runStart time.Time
 	for i, a := range attempts {
+		// An unknown state (a transient read error, or a read cut short)
+		// keeps the run: the router's no-room answer is what it counts.
 		inRun := a.unavailable && !a.readCtxEnded && a.noCapacity &&
+			!readEndsWait(a.readErr) &&
 			a.state != ateapipb.ActorState_ACTOR_STATE_RUNNING &&
 			a.state != ateapipb.ActorState_ACTOR_STATE_CRASHED &&
 			a.state != ateapipb.ActorState_ACTOR_STATE_DELETING
@@ -337,6 +406,13 @@ func checkAwaitWake(_ *testing.T, rt *rapid.T) {
 	if elapsed > s.WakeBudget+maxProbeLatency {
 		rt.Fatalf("WF-6: waited %s, past the wake budget %s plus one probe (%s)", elapsed, s.WakeBudget, maxProbeLatency)
 	}
+}
+
+// readEndsWait reports whether a state read that failed with c ends the
+// wait with that error, as ensureAwake's doc comment says of every read error
+// but Unavailable, DeadlineExceeded and ResourceExhausted.
+func readEndsWait(c codes.Code) bool {
+	return c == codes.NotFound || c == codes.Internal
 }
 
 func histogramSampleCount(rt *rapid.T, m *telemetry.Metrics, family, labelKey, labelVal string) uint64 {

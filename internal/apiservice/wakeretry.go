@@ -112,6 +112,16 @@ func setStartFailure(ctx context.Context, reason string) {
 // one per two seconds, so a full four-minute wait costs about 120
 // control-plane reads.
 //
+// The state read gets only what is left of WakeBudget and, during a run of
+// no-room answers, of WakeNoCapacityGrace, so a slow control plane cannot
+// hold the wait past either. A read that runs out of that time, or that the
+// control plane answers with a transient error (Unavailable,
+// DeadlineExceeded, or ResourceExhausted such as a quota), leaves the state
+// unknown: the attempt counts as one outside RUNNING, CRASHED and DELETING,
+// and the wait backs off and probes again within the budget. Any other read
+// error, NotFound for a deleted environment included, ends the wait with
+// that error.
+//
 // Two failures end the wait early, because waiting cannot fix them, and mark
 // the call's trailers with StartFailureKey: an actor the control plane moved
 // to CRASHED (FailedPrecondition, with the control plane's crash reason), and,
@@ -169,6 +179,7 @@ func (s *Server) awaitWake(ctx context.Context, atespace, id string,
 	// the router parks a probe for its parking budget before it answers
 	// no-room, so that wait counts toward the grace.
 	var noCapacitySince time.Time
+	lastStateText := "" // the last state the control plane reported, for errors
 	backoff := wakeRetryInitialBackoff
 	for attempt := 1; ; attempt++ {
 		probeStart := time.Now()
@@ -193,11 +204,46 @@ func (s *Server) awaitWake(ctx context.Context, atespace, id string,
 				identityNote(s.RouterIdentity), err, routertls.RejectionAdvice)
 		}
 		waited = true
-		st, serr := readStatus(ctx)
+		// The read gets what is left of the wake budget and, when this
+		// answer starts or continues a run of no-room answers that has not
+		// yet lasted the grace, what is left of the grace, so a slow control
+		// plane cannot hold the wait past either.
+		readBy := start.Add(budget)
+		if grace := s.WakeNoCapacityGrace; grace > 0 && routerNoCapacity(err) {
+			runStart := noCapacitySince
+			if runStart.IsZero() {
+				runStart = probeStart
+			}
+			if graceEnd := runStart.Add(grace); graceEnd.After(probeDone) && graceEnd.Before(readBy) {
+				readBy = graceEnd
+			}
+		}
+		readCtx, cancelRead := context.WithDeadline(ctx, readBy)
+		st, serr := readStatus(readCtx)
+		cancelRead()
 		if serr != nil {
-			return serr
+			if ctx.Err() != nil {
+				return status.FromContextError(ctx.Err()).Err()
+			}
+			// A read cut short by readBy fails with DeadlineExceeded.
+			if !transientControlPlaneError(serr) {
+				return serr
+			}
+			// The state is unknown: go on as for a state outside RUNNING,
+			// CRASHED and DELETING, so only the wake budget and the router's
+			// no-room answers bound this attempt.
+			st = nil
 		}
 		state := st.GetState()
+		stateText := shortState(state)
+		switch {
+		case st != nil:
+			lastStateText = stateText
+		case lastStateText != "":
+			stateText = "last seen " + lastStateText
+		default:
+			stateText = "UNKNOWN"
+		}
 		if state == ateapipb.ActorState_ACTOR_STATE_CRASHED {
 			s.finishCreate(atespace, id, telemetry.ReadyStatusCrashed)
 			setStartFailure(ctx, StartFailureCrashed)
@@ -240,10 +286,10 @@ func (s *Server) awaitWake(ctx context.Context, atespace, id string,
 		if remaining <= 0 {
 			outcome = telemetry.WakeOutcomeTimeout
 			return status.Errorf(codes.Unavailable, "environment %s/%s did not answer within the %s of %s while %s (%d attempts): %v",
-				atespace, id, which, allowed, shortState(state), attempt, err)
+				atespace, id, which, allowed, stateText, attempt, err)
 		}
 		if attempt == 1 {
-			log.Printf("waiting for environment %s/%s to wake (state %s, %s %s)", atespace, id, shortState(state), which, allowed)
+			log.Printf("waiting for environment %s/%s to wake (state %s, %s %s)", atespace, id, stateText, which, allowed)
 		}
 		select {
 		case <-ctx.Done():
@@ -252,6 +298,17 @@ func (s *Server) awaitWake(ctx context.Context, atespace, id string,
 		}
 		backoff = min(backoff*2, wakeRetryMaxBackoff)
 	}
+}
+
+// transientControlPlaneError reports whether a control-plane read failed in a
+// way that a later read can fix: the control plane was unreachable, slow, or
+// rate-limited the read.
+func transientControlPlaneError(err error) bool {
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted:
+		return true
+	}
+	return false
 }
 
 func identityNote(id string) string {

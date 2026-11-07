@@ -819,7 +819,9 @@ def test_enable_tracing_emits_v1_trace_events(tmp_path: pathlib.Path, monkeypatc
     assert all(ev["image"].startswith("us-docker.pkg.dev/p/r2e/") for ev in exec_traces)
 
     events = [json.loads(ln) for ln in out_jsonl.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    reap_ev = next(e for e in events if e["event"] == "reap")
+    reap_evs = [e for e in events if e["event"] == "reap"]
+    assert len(reap_evs) == 1, reap_evs
+    reap_ev = reap_evs[0]
     assert reap_ev["ok"] is True
     assert reap_ev["metrics"]["orphan_count"] == 0.0
 

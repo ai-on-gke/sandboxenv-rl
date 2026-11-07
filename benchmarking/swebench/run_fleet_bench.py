@@ -584,6 +584,7 @@ class _InstrumentedDriver:
         self._mock_warm_pool: dict[tuple[str, str | None], list[str]] = collections.defaultdict(list)
         self._synth_to_raw_id: dict[str, str] = {}
         self._warm_seq = 0
+        self._reap_recorded: set[str] = set()
         self._local = threading.local()
 
     @property
@@ -957,6 +958,14 @@ class _InstrumentedDriver:
             self._emit_warm_delete(wid, img_label, dur_ms / max(1, len(to_delete)))
         with self._meta_lock:
             remaining_count = len(self._live_warm_envs) + len(self.sandbox_meta)
+            # The fleet reaps twice per `with` block: the strategy tears down at
+            # the end of run() and __exit__ tears down again. One reap event per
+            # run id, like bench reap's events/reap.jsonl; a repeat that deletes
+            # nothing and finds nothing is not an event.
+            repeat = run_id in self._reap_recorded
+            self._reap_recorded.add(run_id)
+        if repeat and reaped == 0 and not to_delete and remaining_count == 0:
+            return reaped
         self._rec.record({
             "event": "reap",
             "env": run_id,

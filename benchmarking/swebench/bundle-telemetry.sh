@@ -47,13 +47,38 @@ bench_ensure_bin() {
   fi
 }
 
+# bench_reset_bundle_telemetry removes what an earlier run left in <arm_dir>
+# that this run writes again or that bench report derives, so a reused artifact
+# directory cannot carry an old run's telemetry into this run's bundle. It
+# removes only those files, by name: anything else in the directory (an
+# operator's own traces/, a hand-placed preflight-coverage.json) stays.
 bench_reset_bundle_telemetry() {
   local arm_dir="${1:-}"
   if [[ -z "${arm_dir}" ]]; then
     return 0
   fi
-  rm -rf "${arm_dir}/measurements_snapshots" "${arm_dir}/traces"
-  rm -f "${arm_dir}/events/reap.jsonl" "${arm_dir}/cache_before.prom" "${arm_dir}/cache_after.prom"
+  local f
+  for f in \
+    "${arm_dir}/events/reap.jsonl" \
+    "${arm_dir}/cache_before.prom" \
+    "${arm_dir}/cache_after.prom" \
+    "${arm_dir}/atelet_restores.jsonl" \
+    "${arm_dir}/restore_timings.jsonl" \
+    "${arm_dir}/traces/swe.jsonl" \
+    "${arm_dir}/traces/r2e.jsonl" \
+    "${arm_dir}/measurements.json" \
+    "${arm_dir}/system_description.json" \
+    "${arm_dir}/report.json" \
+    "${arm_dir}/report.md" \
+    "${arm_dir}/run_window.json" \
+    "${arm_dir}"/*-summary.json \
+    "${arm_dir}"/measurements_snapshots/meas_*.json \
+    "${arm_dir}"/measurements_snapshots/.meas_*.json.tmp; do
+    if [[ -f "${f}" ]]; then
+      rm -f "${f}"
+      echo "reset: removed ${f} left by an earlier run" >&2
+    fi
+  done
 }
 
 bench_exec() {

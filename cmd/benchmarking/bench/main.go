@@ -858,21 +858,36 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 		return err
 	}
 	parsedEvents, parsedEventsErr := swebench.ReadEvents(bytes.NewReader(rawCombined))
-	for _, rtName := range []string{"restore_timings.jsonl", "atelet_restores.jsonl"} {
-		if rtFile, err := os.Open(filepath.Join(destDir, rtName)); err == nil {
-			timings, parseErr := swebench.ParseRestoreTimings(rtFile)
-			_ = rtFile.Close()
-			if parseErr == nil && len(timings) > 0 {
-				if rtName == "atelet_restores.jsonl" && !fileExistsNonEmpty(filepath.Join(destDir, "restore_timings.jsonl")) {
-					_ = materializeRestoreTimingsJSONL(filepath.Join(destDir, "restore_timings.jsonl"), timings)
-				}
-				if parsedEventsErr == nil {
-					if rb := swebench.JoinRestores(parsedEvents, timings); rb.First.Restores+rb.Wakes.Restores > 0 {
-						rep.Restores = rb
-						break
-					}
-				}
+	// atelet_restores.jsonl, the raw harvest, comes first: it keeps the failed
+	// records and every phase, which the derived restore_timings.jsonl drops,
+	// and a reused artifact directory can hold a restore_timings.jsonl from an
+	// earlier run. Each time the raw file wins the join, restore_timings.jsonl
+	// is rewritten from it, so bench validate reads this run's samples and a
+	// second render gives the same restores block. restore_timings.jsonl is the
+	// fallback for a bundle without the raw file.
+	restoreTimingsPath := filepath.Join(destDir, "restore_timings.jsonl")
+	for _, rtName := range []string{"atelet_restores.jsonl", "restore_timings.jsonl"} {
+		rtFile, err := os.Open(filepath.Join(destDir, rtName))
+		if err != nil {
+			continue
+		}
+		timings, parseErr := swebench.ParseRestoreTimings(rtFile)
+		_ = rtFile.Close()
+		if parseErr != nil || len(timings) == 0 {
+			continue
+		}
+		joined := false
+		if parsedEventsErr == nil {
+			if rb := swebench.JoinRestores(parsedEvents, timings); rb.First.Restores+rb.Wakes.Restores > 0 {
+				rep.Restores = rb
+				joined = true
 			}
+		}
+		if rtName == "atelet_restores.jsonl" && (joined || !fileExistsNonEmpty(restoreTimingsPath)) {
+			_ = materializeRestoreTimingsJSONL(restoreTimingsPath, timings)
+		}
+		if joined {
+			break
 		}
 	}
 	rep.Scopes = activeScopes

@@ -857,13 +857,17 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 	if err != nil {
 		return err
 	}
+	parsedEvents, parsedEventsErr := swebench.ReadEvents(bytes.NewReader(rawCombined))
 	for _, rtName := range []string{"restore_timings.jsonl", "atelet_restores.jsonl"} {
 		if rtFile, err := os.Open(filepath.Join(destDir, rtName)); err == nil {
 			timings, parseErr := swebench.ParseRestoreTimings(rtFile)
 			_ = rtFile.Close()
 			if parseErr == nil && len(timings) > 0 {
-				if evs, evErr := swebench.ReadEvents(bytes.NewReader(rawCombined)); evErr == nil {
-					if rb := swebench.JoinRestores(evs, timings); rb.First.Restores+rb.Wakes.Restores > 0 {
+				if rtName == "atelet_restores.jsonl" && !fileExistsNonEmpty(filepath.Join(destDir, "restore_timings.jsonl")) {
+					_ = materializeRestoreTimingsJSONL(filepath.Join(destDir, "restore_timings.jsonl"), timings)
+				}
+				if parsedEventsErr == nil {
+					if rb := swebench.JoinRestores(parsedEvents, timings); rb.First.Restores+rb.Wakes.Restores > 0 {
 						rep.Restores = rb
 						break
 					}
@@ -961,6 +965,12 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 			endT = *outRep.Measurements.EndTS
 		}
 	}
+	if parsedEventsErr == nil && (startT.IsZero() || endT.Sub(startT) <= 2*time.Second) {
+		if evS, evE, ok := inferEventBounds(parsedEvents); ok {
+			startT = evS
+			endT = evE
+		}
+	}
 	if err := ensureRunWindowFile(destDir, runID, clusterName, startT, endT, rep.TraceMetadata()); err != nil {
 		return fmt.Errorf("run_window.json: %w", err)
 	}
@@ -974,6 +984,94 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 		return err
 	}
 	return os.WriteFile(targetJSON, append(b, '\n'), 0o644)
+}
+
+func inferEventBounds(events []swebench.Event) (time.Time, time.Time, bool) {
+	scan := func(filterTimed bool) (time.Time, time.Time, bool) {
+		var minS, maxE time.Time
+		found := false
+		for _, ev := range events {
+			if ev.Time.IsZero() {
+				continue
+			}
+			if filterTimed && (ev.Event == swebench.EventPrewarm || ev.Event == swebench.EventRun || ev.Event == swebench.EventReap) {
+				continue
+			}
+			evStart := ev.Time
+			if ev.DurMS > 0 {
+				evStart = ev.Time.Add(-time.Duration(ev.DurMS * float64(time.Millisecond)))
+			}
+			if !found || evStart.Before(minS) {
+				minS = evStart
+			}
+			if !found || ev.Time.After(maxE) {
+				maxE = ev.Time
+			}
+			found = true
+		}
+		return minS, maxE, found && maxE.After(minS)
+	}
+	if s, e, ok := scan(true); ok {
+		return s, e, true
+	}
+	return scan(false)
+}
+
+func materializeRestoreTimingsJSONL(outPath string, timings map[string][]swebench.RestoreTiming) error {
+	var samples []schema.RestoreSample
+	for _, list := range timings {
+		for _, rt := range list {
+			if rt.Actor == "" || rt.Err != "" {
+				continue
+			}
+			totalSec, hasTotal := rt.Phases["total"]
+			if !hasTotal || totalSec < 0 {
+				continue
+			}
+			var tsPtr *time.Time
+			if !rt.Time.IsZero() {
+				t := rt.Time.UTC()
+				tsPtr = &t
+			}
+			samples = append(samples, schema.RestoreSample{
+				SchemaVersion:   schema.SchemaVersion,
+				Env:             rt.Actor,
+				Kind:            rt.Fidelity,
+				TS:              tsPtr,
+				TotalMS:         totalSec * 1000.0,
+				ManifestFetchMS: rt.Phases["manifest_fetch"] * 1000.0,
+				DownloadMS:      rt.Phases["download"] * 1000.0,
+				OCIUnpackMS:     rt.Phases["oci_unpack"] * 1000.0,
+				WorkerRestoreMS: rt.Phases["worker_restore"] * 1000.0,
+				PersistMS:       rt.Phases["persist"] * 1000.0,
+			})
+		}
+	}
+	if len(samples) == 0 {
+		return nil
+	}
+	sort.Slice(samples, func(i, j int) bool {
+		ti, tj := time.Time{}, time.Time{}
+		if samples[i].TS != nil {
+			ti = *samples[i].TS
+		}
+		if samples[j].TS != nil {
+			tj = *samples[j].TS
+		}
+		if !ti.Equal(tj) {
+			return ti.Before(tj)
+		}
+		return samples[i].Env < samples[j].Env
+	})
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	for _, s := range samples {
+		if err := enc.Encode(s); err != nil {
+			return err
+		}
+	}
+	return os.WriteFile(outPath, buf.Bytes(), 0o644)
 }
 
 var (

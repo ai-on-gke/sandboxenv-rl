@@ -565,6 +565,13 @@ document stated. Reproduced: `add_phase("acquire", 2.0); add_phase("acquire", -5
 `count=2, total_s=-3.0, max_s=2.0`. Latent, because every caller uses `time.monotonic()`. Amendment:
 `add_phase` and `task_done` clamp negative values to 0 (AC-7). `main` has the clamp.
 
+**P-8, rounding in `to_dict()`.** The property held for `phases` but not for the values a report
+prints: `to_dict()` rounded `total_s` and `max_s` to 0.01 separately. Reproduced on `main` at
+`beedf88` (#273): 3 phases of 0.004 s gave `{"count": 3, "total_s": 0.01, "max_s": 0.0}`, so
+`total_s <= count * max_s` failed. The example tests all used durations of 0.5 s or more, which
+round exactly. Amendment: `max_s` rounds up to 0.01 and `total_s` is kept in
+`[max_s, count * max_s]` (AC-7).
+
 **P-1, the bound.** The property first said `MAX_FAMILIES + 1`. A Hypothesis run found 65 distinct
 repos plus one unparseable input give 66 values (64 families, `other`, `unknown`). The spec was
 wrong.

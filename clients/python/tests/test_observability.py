@@ -188,6 +188,22 @@ def test_report_clamps_negative_phase_duration():
     assert rep.phases["plan"] == [1, 0.0, 0.0]
 
 
+def test_report_phase_bounds_hold_in_to_dict_for_short_phases():
+    """AC-7: the rounded phase stats keep 0 <= max_s <= total_s <= count * max_s.
+
+    Rounded separately, 3 phases of 0.004 s gave total_s 0.01 and max_s 0.0.
+    """
+    rep = RunReport("naive")
+    for _ in range(3):
+        rep.add_phase("acquire", 0.004)
+    rep.add_phase("plan", 0.004)
+    phases = rep.to_dict()["phases"]
+    for p in phases.values():
+        assert 0 <= p["max_s"] <= p["total_s"] <= p["count"] * p["max_s"], p
+    assert phases["acquire"] == {"count": 3, "total_s": 0.01, "max_s": 0.01}
+    assert phases["plan"] == {"count": 1, "total_s": 0.01, "max_s": 0.01}
+
+
 def test_report_task_done_clamps_negative_duration():
     obs = Observer(ObservabilityConfig(enable_metrics=False))
     with obs.run("naive") as rep:

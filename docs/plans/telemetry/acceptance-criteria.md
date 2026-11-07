@@ -263,7 +263,8 @@ Conventions:
 - Expected: the pytest run passes (40 plain tests and the stateful `test_warm_pool_accounting`).
   15.2: `test_cold_acquire_cancelled_in_create_leaves_the_actor_for_any_reap` (cancelled by
   `timeout_s`, and by the caller),
-  `test_cold_acquire_cancelled_in_create_after_its_runs_reap_deletes_the_actor`. 15.4:
+  `test_cold_acquire_cancelled_in_create_after_its_runs_reap_deletes_the_actor` and the machine's
+  `start_acquire`, `finish_acquire` and `cancel_acquire` rules. 15.4:
   `test_unwarm_cancels_a_warm_pool_in_flight`,
   `test_shrinking_resize_cancels_a_warm_pool_in_flight`,
   `test_warm_pool_after_unwarm_ignores_the_cancelled_call` and the machine's `unwarm` rule. 15.5:

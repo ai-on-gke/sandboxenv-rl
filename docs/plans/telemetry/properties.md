@@ -404,15 +404,27 @@ from the run is alive on Substrate or tracked by the driver.
   whose `create()` succeeded and `suspend()` raised was neither pooled, returned nor owned. It is
   now owned under `WARM_POOL_RUN_ID` and deleted at once
   (`test_warm_actor_whose_suspend_fails_is_deleted_or_left_for_any_reap`; `WarmSuspendFailedSafe`,
-  with `WarmSuspendFailedBeforeSafe` failing). The stateful machine cancels nothing and never fails
-  a suspend, so it reaches neither case.
+  with `WarmSuspendFailedBeforeSafe` failing). The stateful machine cancels only acquires and never
+  fails a suspend, so it reaches neither case.
 - AC-15.2, fixed by #276: a cold `acquire` cancelled while its `create()` was in flight (for example
   by its own `timeout_s`) dropped the actor id, so an actor whose create had landed was neither
   returned nor owned, and no reap found it (#273). It is now owned under `WARM_POOL_RUN_ID`, as a
   cancelled `warm_pool` call's actors are, and deleted at once in a background task if a reap ran
   since the acquire read `_teardowns`. Tests:
   `test_cold_acquire_cancelled_in_create_leaves_the_actor_for_any_reap`,
-  `test_cold_acquire_cancelled_in_create_after_its_runs_reap_deletes_the_actor`.
+  `test_cold_acquire_cancelled_in_create_after_its_runs_reap_deletes_the_actor`. The stateful
+  machine starts acquires that pause at their own gate (in `get()` for a warm claim, in `create()`
+  before or after the create lands) and finishes or cancels them at any later step, and at the end
+  of every example it cancels the acquires still in flight, lets paused calls resume and tears down,
+  then checks `nothing_survives_teardown`. On the code before #276 it fails, for example, with:
+
+  ```text
+  state.start_acquire(lands_first=True)      # create() landed, reply pending
+  state.start_teardown()
+  state.cancel_acquire(data=data(...))
+  state.finish_teardown()                    # -> sb-... alive after teardown
+  ```
+
 - AC-15.9, fixed by #238: a cancelled cleanup delete, and a `release` whose delete fails or is
   cancelled while a reap runs, re-tag the actor too. See "Run-id gaps" in the findings.
 - Fixed by #221. Before it, the stateful test shrank it to two minimal counter-examples (recorded
@@ -667,6 +679,16 @@ else under its run id, so the run's own reap retries it. The check and the updat
 hold, so a reap on another thread cannot start in between. `DeleteCancelledFixedSafe`,
 `WarmCommitDrainedSafe` and `ReturnPoppedSafe` verify these; the scratch reproductions are now
 tests.
+
+**Cancelled cold acquire (AC-15.2), fixed by #276.** The acceptance-criteria audit (#273) found that
+a cold `acquire` cancelled while its `create()` is in flight, for example by its own `timeout_s`,
+dropped the actor id although the create may have landed, so the actor stayed alive and untracked.
+The stateful machine missed it because it started acquires only through rules that ran them to
+completion or put actors in the owned actors directly, and cancelled nothing; the Dafny model has no
+cancelled-acquire action. With acquires paused at their own gates and cancelled at any step, the
+machine finds it on the code before #276 in 10 of 10 seeds at the default 500 examples (6 of 10
+without the end-of-example teardown). It also cancels warm claims in `get()`: the popped actor stays
+owned under its run id and the run's reap deletes it, so that path holds.
 
 **How the concurrency model works.** Each piece of code between two `await`s is one atomic action on
 shared state (`Acquire`, `RecycleStart`, `RecycleFinish`, `WarmPlan`, `WarmCommit`, `Reap`). The

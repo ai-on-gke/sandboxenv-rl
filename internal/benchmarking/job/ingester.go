@@ -42,6 +42,11 @@ type IngestResult struct {
 	StepEvents    []swebench.Event
 	TraceEvents   []swebench.Event
 	CustomMetrics map[string]schema.MetricSummary
+	// TraceTruncatedLines counts torn trailing trace lines that were dropped
+	// (a shard copied while its writer was mid-record); TraceTruncatedFiles
+	// names them as "<relative path>:<line>".
+	TraceTruncatedLines int
+	TraceTruncatedFiles []string
 }
 
 // TelemetryIngester extracts canonical events and custom metrics from logs or traces in DestDir.
@@ -146,32 +151,46 @@ func (userSandboxTraceIngester) Ingest(ctx IngestContext, out *IngestResult) err
 	if jobName == "" {
 		jobName = "verl-qwen3-1p7b-fully-async"
 	}
+	ingest := func(p string) error {
+		evs, st, perr := ParseTraceJSONLFileWithStats(p, jobName)
+		if perr != nil {
+			return perr
+		}
+		if st.TruncatedTail > 0 {
+			rel, rerr := filepath.Rel(ctx.DestDir, p)
+			if rerr != nil {
+				rel = p
+			}
+			out.TraceTruncatedLines += st.TruncatedTail
+			out.TraceTruncatedFiles = append(out.TraceTruncatedFiles, fmt.Sprintf("%s:%d", rel, st.TruncatedLine))
+		}
+		out.TraceEvents = append(out.TraceEvents, evs...)
+		return nil
+	}
+	// A merged trace at the artifact root wins over per-job shards, so a
+	// bundle that holds both is not counted twice.
 	for _, traceName := range []string{"verl-live-trace.jsonl", "trace.jsonl"} {
 		p := filepath.Join(ctx.DestDir, traceName)
 		if _, err := os.Stat(p); err == nil {
-			evs, perr := ParseTraceJSONLFile(p, jobName)
-			if perr != nil {
-				return perr
-			}
-			out.TraceEvents = append(out.TraceEvents, evs...)
-			return nil
+			return ingest(p)
 		}
 	}
+	// Shards: traces/*.jsonl, RealJobDriver's traces/<job>/*.jsonl,
+	// trace_collection's traces/<job>/<pod>/*.jsonl, and results/traces/*.jsonl.
+	var shards []string
 	for _, pattern := range []string{
 		filepath.Join(ctx.DestDir, "traces", "*.jsonl"),
+		filepath.Join(ctx.DestDir, "traces", "*", "*.jsonl"),
+		filepath.Join(ctx.DestDir, "traces", "*", "*", "*.jsonl"),
 		filepath.Join(ctx.DestDir, "results", "traces", "*.jsonl"),
 	} {
 		tMatches, _ := filepath.Glob(pattern)
-		if len(tMatches) > 0 {
-			sort.Strings(tMatches)
-			for _, tp := range tMatches {
-				evs, perr := ParseTraceJSONLFile(tp, jobName)
-				if perr != nil {
-					return perr
-				}
-				out.TraceEvents = append(out.TraceEvents, evs...)
-			}
-			return nil
+		shards = append(shards, tMatches...)
+	}
+	sort.Strings(shards)
+	for _, tp := range shards {
+		if err := ingest(tp); err != nil {
+			return err
 		}
 	}
 	return nil

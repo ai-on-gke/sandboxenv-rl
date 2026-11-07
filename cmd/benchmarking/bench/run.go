@@ -49,6 +49,10 @@ func runScenarioCmd(args []string, stdout, stderr io.Writer) error {
 	instancesPath := fs.String("instances", "", "Alias for -dataset: optional dataset JSONL path.")
 	runID := fs.String("run-id", "bench-run", "Run identifier.")
 	cluster := fs.String("cluster", "local-cluster", "Cluster name recorded in system_description.json.")
+	snapshotInterval := fs.Duration("snapshot-interval", 0, "Sample cluster telemetry (-k8s, -prom-url) every interval into <dest>/"+measure.SnapshotsDirName+" while jobs run; bench report rolls the samples up.")
+	k8sCollect := fs.Bool("k8s", false, "With -snapshot-interval: collect Kubernetes/Substrate telemetry in each sample.")
+	promURL := fs.String("prom-url", "", "With -snapshot-interval: Prometheus HTTP base URL to scrape in each sample.")
+	atespace := fs.String("atespace", "ate-env", "With -snapshot-interval -k8s: Substrate atespace.")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -58,6 +62,9 @@ func runScenarioCmd(args []string, stdout, stderr io.Writer) error {
 	}
 	if *scenarioPath == "" || targetDir == "" {
 		return fmt.Errorf("-scenario and -dest (or -out-dir) are required")
+	}
+	if *snapshotInterval > 0 && !*k8sCollect && *promURL == "" {
+		return fmt.Errorf("-snapshot-interval needs -k8s and/or -prom-url to have something to sample")
 	}
 
 	raw, err := os.ReadFile(*scenarioPath)
@@ -90,12 +97,49 @@ func runScenarioCmd(args []string, stdout, stderr io.Writer) error {
 
 	overlays := parseOverlayFlag(*overlayFlag)
 	ctx := context.Background()
+
+	// Sample cluster telemetry for the whole job window so the rolled-up
+	// measurements reflect active sandboxes, not the idle cluster left after
+	// the jobs released them.
+	var startSampler samplerFactory
+	if *snapshotInterval > 0 {
+		startSampler = func(dir string) func() {
+			req := measure.CollectRequest{
+				RunID:     *runID,
+				DestDir:   dir,
+				Scopes:    []schema.TelemetryScope{schema.ScopeSubstrate, schema.ScopeK8s},
+				EnableK8s: *k8sCollect,
+				K8s:       measure.K8sCollectOptions{Cluster: *cluster, Atespace: *atespace},
+			}
+			if *promURL != "" {
+				req.Scraper = &measure.PrometheusScraper{BaseURL: *promURL}
+				req.Queries = measure.MustDefaultPromQueries()
+			}
+			sctx, cancel := context.WithCancel(ctx)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				sr, err := measure.RunSnapshotSampler(sctx, req, measure.SamplerOptions{
+					Dir:      filepath.Join(dir, measure.SnapshotsDirName),
+					Interval: *snapshotInterval,
+					OnError:  func(err error) { fmt.Fprintf(stderr, "run: telemetry sample failed: %v\n", err) },
+				})
+				if err != nil {
+					fmt.Fprintf(stderr, "run: telemetry sampler: %v\n", err)
+				} else {
+					fmt.Fprintf(stderr, "run: wrote %d telemetry snapshot(s) (%d failed)\n", sr.Written, sr.Failed)
+				}
+			}()
+			return func() { cancel(); <-done }
+		}
+	}
+
 	if len(overlays) <= 1 {
 		ovName := ""
 		if len(overlays) == 1 {
 			ovName = overlays[0]
 		}
-		if _, err := executeScenarioRun(ctx, &scen, sched, ovName, *runID, *cluster, targetDir); err != nil {
+		if _, err := executeScenarioRun(ctx, &scen, sched, ovName, *runID, *cluster, targetDir, startSampler, stderr); err != nil {
 			return err
 		}
 		fmt.Fprintf(stdout, "completed benchmark run in %s\n", targetDir)
@@ -108,11 +152,11 @@ func runScenarioCmd(args []string, stdout, stderr io.Writer) error {
 	nameA, nameB := overlays[0], overlays[1]
 	dirA := filepath.Join(targetDir, nameA)
 	dirB := filepath.Join(targetDir, nameB)
-	repA, err := executeScenarioRun(ctx, &scen, sched, nameA, *runID+"-a", *cluster, dirA)
+	repA, err := executeScenarioRun(ctx, &scen, sched, nameA, *runID+"-a", *cluster, dirA, startSampler, stderr)
 	if err != nil {
 		return fmt.Errorf("run overlay %s: %w", nameA, err)
 	}
-	repB, err := executeScenarioRun(ctx, &scen, sched, nameB, *runID+"-b", *cluster, dirB)
+	repB, err := executeScenarioRun(ctx, &scen, sched, nameB, *runID+"-b", *cluster, dirB, startSampler, stderr)
 	if err != nil {
 		return fmt.Errorf("run overlay %s: %w", nameB, err)
 	}
@@ -151,6 +195,11 @@ func parseOverlayFlag(raw string) []string {
 	return out
 }
 
+// samplerFactory starts a background telemetry sampler writing into
+// <dir>/measurements_snapshots and returns a function that stops it and
+// waits for it to finish. A nil factory disables sampling.
+type samplerFactory func(dir string) (stop func())
+
 func executeScenarioRun(
 	ctx context.Context,
 	scen *schema.Scenario,
@@ -159,6 +208,8 @@ func executeScenarioRun(
 	runID string,
 	cluster string,
 	outDir string,
+	startSampler samplerFactory,
+	stderr io.Writer,
 ) (*swebench.Report, error) {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return nil, err
@@ -241,18 +292,32 @@ func executeScenarioRun(
 		return nil, err
 	}
 
-	// 2. Write measurements.json.
+	// 2. Write measurements.json, keeping what an earlier step merged into it
+	// (bench spinup -dest records the WorkerPool spin-up there before bench
+	// run starts; overwriting the file would lose those timings).
 	meas, err := measure.CollectMeasurements(ctx, measure.CollectOptions{
 		RunID: runID,
 	})
 	if err != nil {
 		return nil, err
 	}
-	if err := measure.WriteMeasurements(filepath.Join(outDir, "measurements.json"), meas); err != nil {
+	measPath := filepath.Join(outDir, "measurements.json")
+	if raw, rerr := os.ReadFile(measPath); rerr == nil {
+		if existing, derr := schema.DecodeJSONStrict[schema.Measurements](bytes.NewReader(raw)); derr == nil {
+			if existing.RunID == "" {
+				existing.RunID = runID
+			}
+			if len(existing.ServerSummary) > 0 || len(existing.PromMetrics) > 0 || len(existing.CustomMetrics) > 0 {
+				meas = &existing
+			}
+		}
+	}
+	if err := measure.WriteMeasurements(measPath, meas); err != nil {
 		return nil, err
 	}
 
-	// 3. Run ScenarioRunner across all jobs (writing schedule.json and events.jsonl).
+	// 3. Run ScenarioRunner across all jobs (writing schedule.json and events.jsonl),
+	// sampling cluster telemetry for exactly the job window.
 	sr := &job.ScenarioRunner{
 		RunID:    runID,
 		Scenario: &runScen,
@@ -262,9 +327,24 @@ func executeScenarioRun(
 			return &localScenarioEnvClient{source: defaultSource}
 		},
 		SleepFunc: func(_ context.Context, _ time.Duration) error { return nil },
+		Warnf:     func(format string, args ...any) { fmt.Fprintf(stderr, "run: "+format+"\n", args...) },
 	}
-	if err := sr.Run(ctx); err != nil {
-		return nil, err
+	stopSampler := func() {}
+	if startSampler != nil {
+		stopSampler = startSampler(outDir)
+	}
+	runErr := sr.Run(ctx)
+	stopSampler()
+	if runErr != nil {
+		return nil, runErr
+	}
+	// Fold the in-window samples into measurements.json so the report sees
+	// active-window sandbox counts and packing instead of the idle post-run cluster.
+	if rollUpSnapshotsIntoMeasurements(outDir, meas) {
+		meas.PromMetrics = buildPromSeriesFromSnapshotsOrSummary(outDir, meas)
+		if err := measure.WriteMeasurements(filepath.Join(outDir, "measurements.json"), meas); err != nil {
+			return nil, err
+		}
 	}
 
 	// 4. If footing == "warm", record a prewarm event so Validity Rule 1 passes.
@@ -291,6 +371,7 @@ func executeScenarioRun(
 		return nil, err
 	}
 	enrichSystemDescriptionFromArtifactDir(outDir, &sysDesc, rep, meas)
+	applyDeclaredLoad(&sysDesc, declaredLoadParams(&runScen))
 	if sysDesc.MaxConcurrentSandboxesCap <= 0 {
 		if sysDesc.MaxActivePods > 0 {
 			sysDesc.MaxConcurrentSandboxesCap = sysDesc.MaxActivePods

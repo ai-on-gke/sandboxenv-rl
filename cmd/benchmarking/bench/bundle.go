@@ -104,7 +104,11 @@ type BundleValidationResult struct {
 	// metadata). Tracing adds per-call latency, so it is always surfaced.
 	TraceCaptured bool `json:"trace_captured"`
 	// TraceFiles lists the trace JSONL files found in the bundle, relative to it.
-	TraceFiles     []string               `json:"trace_files,omitempty"`
+	TraceFiles []string `json:"trace_files,omitempty"`
+	// TraceTruncated lists trace shards whose torn last line was dropped, as
+	// "<relative path>:<line>". A shard copied while its writer was
+	// mid-record is expected; it is reported, not a failure.
+	TraceTruncated []string               `json:"trace_truncated,omitempty"`
 	CheckedFiles   []string               `json:"checked_files,omitempty"`
 	Reasons        []string               `json:"reasons,omitempty"`
 	ReportValidity *schema.ReportValidity `json:"report_validity,omitempty"`
@@ -322,10 +326,13 @@ func ValidateArtifactBundle(destDir string, opts swebench.ValidateOptions, folde
 			for _, tf := range traceFiles {
 				rel, _ := filepath.Rel(destDir, tf)
 				markChecked(rel)
-				evs, err := job.ParseTraceJSONLFile(tf, "")
+				evs, st, err := job.ParseTraceJSONLFileWithStats(tf, "")
 				if err != nil {
 					addFailure("invalid trace file %s: %v", rel, err)
 					continue
+				}
+				if st.TruncatedTail > 0 {
+					res.TraceTruncated = append(res.TraceTruncated, fmt.Sprintf("%s:%d", rel, st.TruncatedLine))
 				}
 				totalTraces += len(evs)
 			}

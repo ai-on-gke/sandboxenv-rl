@@ -53,16 +53,18 @@ Always execute all five phases so no telemetry section (`restores`, `cache`, `re
    - **Mode 2 (`prewarmed` / warm pool)**: set `-idle-park-timeout` / warm pool flags as required, and run `bench prewarm` if prewarming templates at job start.
 2. Create `$ARTIFACT_DIR`, time the cold `0 -> N` spin-up of Substrate's `WorkerPool` (`workerpool.ate.dev/default-template-workerpool`), and capture the pre-run node image-cache counters:
    ```bash
-   mkdir -p "$ARTIFACT_DIR/measurements_snapshots"
+   mkdir -p "$ARTIFACT_DIR"
+   go build -o bin/bench ./cmd/benchmarking/bench   # the Phase 3 sampler is stopped with a signal, which `go run` does not forward
    # If workerpool is already scaled up and you want a clean cold 0->N spin-up timing, run `bench spindown` first.
-   go run ./cmd/benchmarking/bench spinup \
+   bin/bench spinup \
      -namespace ate-env \
      -workerpool default-template-workerpool \
      -replicas <N> \
+     -timeout 40m -stall-timeout 5m \
      -dest "$ARTIFACT_DIR"
-   go run ./cmd/benchmarking/bench measure -sample-node-cache "$ARTIFACT_DIR/cache_before.prom"
+   bin/bench measure -sample-node-cache "$ARTIFACT_DIR/cache_before.prom"
    ```
-   `bench spinup` records `workerpool_spinup_wall_ms`, per-`ateworker`-pod startup sub-phases (`worker_pod_schedule_ms`, `worker_pod_init_ms`, `worker_pod_container_start_ms`, `worker_pod_total_ready_ms`), and `worker_pod_count` into `$ARTIFACT_DIR/measurements.json` and `$ARTIFACT_DIR/events/substrate_lifecycle.jsonl`.
+   `bench spinup` records `workerpool_spinup_wall_ms`, per-`ateworker`-pod startup sub-phases (`worker_pod_schedule_ms`, `worker_pod_init_ms`, `worker_pod_container_start_ms`, `worker_pod_total_ready_ms`), and `worker_pod_count` into `$ARTIFACT_DIR/measurements.json` and `$ARTIFACT_DIR/events/substrate_lifecycle.jsonl`. `-timeout` caps the whole wait; `-stall-timeout` fails only when no new pod has gone Ready for that long, so a slow cold autoscale finishes while a stuck pool fails fast (the Ready pods' metrics are still recorded, with `ok=false`).
 
 ### Phase 2: Launch the RL Job
 ```bash
@@ -75,20 +77,24 @@ Always execute all five phases so no telemetry section (`restores`, `cache`, `re
 kubectl -n ate-env port-forward deploy/ate-env-api 18443:8443 &
 PF_PID=$!
 
-# Run periodically (e.g. every 5-10 minutes) while the RL job is in flight:
-go run ./cmd/benchmarking/bench measure \
+# Sample for the whole job window; one file per sample lands in
+# $ARTIFACT_DIR/measurements_snapshots/. Stop it in Phase 4 with SIGINT: the
+# sampler then writes system_description.json from its last sample and rolls
+# the snapshots up into measurements.json (keeping what spinup merged in).
+bin/bench measure \
   -k8s \
   -ate-endpoint 127.0.0.1:18443 \
   -atespace ate-env \
   -run-id "<run-id>" \
-  -dest "$ARTIFACT_DIR"
-cp "$ARTIFACT_DIR/measurements.json" \
-   "$ARTIFACT_DIR/measurements_snapshots/meas_$(date -u +%Y%m%dT%H%M%SZ).json"
+  -dest "$ARTIFACT_DIR" \
+  -interval 30s &
+SAMPLER_PID=$!
 ```
 
 ### Phase 4: Harvest Logs/Traces, Reap Orphans, & Capture Post-Run Counters
 Once the head pod logs `=== DONE rc=0 ===`:
 ```bash
+kill -INT "$SAMPLER_PID"; wait "$SAMPLER_PID"   # non-zero only if every sample failed
 HEAD_POD=$(kubectl -n default get pods -l app=<k8s-job-name>,role=head -o jsonpath='{.items[0].metadata.name}')
 kubectl -n default cp "$HEAD_POD:/workspace/results/train.log" "$ARTIFACT_DIR/verl-head.log"
 kubectl -n default cp "$HEAD_POD:/workspace/results/traces" "$ARTIFACT_DIR/traces"

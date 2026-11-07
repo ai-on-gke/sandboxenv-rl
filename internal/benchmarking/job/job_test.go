@@ -66,8 +66,14 @@ type fakeCmdExecutor struct {
 
 func (f *fakeCmdExecutor) Run(_ context.Context, name string, _ map[string]string, args ...string) ([]byte, error) {
 	f.calls = append(f.calls, name+" "+strings.Join(args, " "))
+	if strings.Contains(strings.Join(args, " "), "get job") {
+		return []byte(completeJobJSON), nil
+	}
 	return []byte(f.out), nil
 }
+
+// completeJobJSON is what `kubectl get job -o json` returns for a finished Job.
+const completeJobJSON = `{"status":{"conditions":[{"type":"Complete","status":"True"}]}}`
 
 func TestScenarioRunnerMultiJobClosedAndOpenLoop(t *testing.T) {
 	dir := t.TempDir()

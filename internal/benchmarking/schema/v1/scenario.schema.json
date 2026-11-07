@@ -115,7 +115,29 @@
         "step_pause_ms": { "type": "number", "minimum": 0 },
         "prefetch": { "type": "boolean" },
         "seed": { "type": "integer" },
-        "schedule_mode": { "type": "string", "enum": ["fixed", "sampled", "explicit"] }
+        "schedule_mode": { "type": "string", "enum": ["fixed", "sampled", "explicit"] },
+        "trainer_manifest": { "type": "string" },
+        "trainer_command": { "type": "array", "items": { "type": "string" } },
+        "trace_mode": { "type": "string", "enum": ["measure", "trace"] },
+        "env_vars": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "head_job": { "type": "string", "minLength": 1 },
+        "pod_selector": { "type": "string", "minLength": 1 },
+        "timeout": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h)([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))*$" },
+        "trace_collection": { "$ref": "#/$defs/TraceCollection" }
+      }
+    },
+    "TraceCollection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["remote_dir"],
+      "properties": {
+        "pod_selector": { "type": "string", "minLength": 1 },
+        "container": { "type": "string" },
+        "trainer_container": { "type": "string" },
+        "remote_dir": { "type": "string", "pattern": "^/" }
       }
     },
     "WindowPolicy": {

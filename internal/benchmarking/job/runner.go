@@ -46,7 +46,9 @@ type ScenarioRunner struct {
 	OutDir     string
 	ClientFunc func(job schema.JobSpec) swebench.EnvClient
 	CmdRunner  CommandExecutor
-	SleepFunc  func(ctx context.Context, d time.Duration) error
+	// Warnf receives real jobs' non-fatal notes; nil discards them.
+	Warnf     func(format string, args ...any)
+	SleepFunc func(ctx context.Context, d time.Duration) error
 }
 
 // GenerateSchedule builds a deterministic `schema.Schedule` for all jobs in a
@@ -142,6 +144,21 @@ func (sr *ScenarioRunner) Run(ctx context.Context) error {
 }
 
 func (sr *ScenarioRunner) buildDriver(idx int, spec schema.JobSpec, sj schema.ScheduledJob, runID string) (JobDriver, error) {
+	// A scenario may declare a job by kind (the schema's vocabulary) rather
+	// than mode: `kind: real` runs as a real job, `kind: simulated` as a
+	// closed loop unless open-loop was asked for.
+	if spec.Mode == "" {
+		switch spec.Kind {
+		case "real":
+			spec.Mode = schema.JobModeReal
+		case "simulated":
+			if spec.LoaderMode == "open-loop" {
+				spec.Mode = schema.JobModeOpenLoop
+			} else {
+				spec.Mode = schema.JobModeClosedLoop
+			}
+		}
+	}
 	switch spec.Mode {
 	case schema.JobModeClosedLoop, schema.JobModeOpenLoop:
 		var client swebench.EnvClient
@@ -181,6 +198,7 @@ func (sr *ScenarioRunner) buildDriver(idx int, spec schema.JobSpec, sj schema.Sc
 			Spec:       spec,
 			OutDir:     sr.OutDir,
 			Executor:   sr.CmdRunner,
+			Warnf:      sr.Warnf,
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported job mode %q", spec.Mode)

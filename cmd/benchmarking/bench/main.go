@@ -21,17 +21,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"math"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/agent-substrate/env/internal/benchmarking/job"
@@ -278,6 +281,10 @@ func prewarmCmd(args []string, stdout, stderr io.Writer) error {
 
 var lifecycleKubeRunner measure.KubeCommandRunner
 
+// measureKubeRunner runs kubectl for bench measure's -k8s collection; nil
+// uses kubectl itself. Tests inject a fake.
+var measureKubeRunner measure.KubeCommandRunner
+
 func spinupCmd(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("spinup", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -285,7 +292,8 @@ func spinupCmd(args []string, stdout, stderr io.Writer) error {
 	namespace := fs.String("namespace", "", "Alias for -atespace: Kubernetes namespace containing the WorkerPool.")
 	workerPool := fs.String("workerpool", "default-template-workerpool", "Substrate WorkerPool name.")
 	replicas := fs.Int("replicas", 2, "Target WorkerPool replica count (> 0).")
-	timeout := fs.Duration("timeout", 5*time.Minute, "Maximum time to wait for all WorkerPool pods to become Ready.")
+	timeout := fs.Duration("timeout", 5*time.Minute, "Overall cap on waiting for all WorkerPool pods to become Ready. A 0->N cold autoscale that provisions nodes needs more; prefer -stall-timeout to tell slow from stuck.")
+	stallTimeout := fs.Duration("stall-timeout", 0, "Fail once the Ready count has not increased for this long (0 = off). Lets a progressing cold spin-up run up to -timeout while a stuck pool fails fast.")
 	runID := fs.String("run-id", "rlb", "Run ID.")
 	destDir := fs.String("dest", "", "Artifact directory ($ARTIFACT_DIR); merges spin-up metrics into measurements.json and writes events/substrate_lifecycle.jsonl.")
 	if err := fs.Parse(args); err != nil {
@@ -297,14 +305,26 @@ func spinupCmd(args []string, stdout, stderr io.Writer) error {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout+10*time.Second)
 	defer cancel()
 
-	metrics, err := measure.SpinUpWorkerPool(ctx, lifecycleKubeRunner, *atespace, *workerPool, *replicas, *timeout)
+	metrics, err := measure.SpinUpWorkerPoolWithOptions(ctx, lifecycleKubeRunner, measure.SpinUpOptions{
+		Namespace: *atespace, WorkerPool: *workerPool, Replicas: *replicas,
+		Timeout: *timeout, StallTimeout: *stallTimeout,
+	})
 	if err != nil {
+		var te *measure.SpinUpTimeoutError
+		if errors.As(err, &te) && metrics != nil && *destDir != "" {
+			// Keep what did come up: the per-pod phases of the Ready pods are
+			// the evidence for diagnosing a slow or stalled spin-up.
+			wallMS := metrics["workerpool_spinup_wall_ms"].P50
+			if rerr := recordLifecycleMetrics(*destDir, *runID, "workerpool_spinup", wallMS, te.Got, metrics, false); rerr != nil {
+				fmt.Fprintf(stderr, "spinup: recording partial metrics: %v\n", rerr)
+			}
+		}
 		return err
 	}
 	wallMS := metrics["workerpool_spinup_wall_ms"].P50
 	readyPods := int(metrics["worker_pod_count"].P50)
 	if *destDir != "" {
-		if err := recordLifecycleMetrics(*destDir, *runID, "workerpool_spinup", wallMS, readyPods, metrics); err != nil {
+		if err := recordLifecycleMetrics(*destDir, *runID, "workerpool_spinup", wallMS, readyPods, metrics, true); err != nil {
 			return err
 		}
 	}
@@ -337,7 +357,7 @@ func spindownCmd(args []string, stdout, stderr io.Writer) error {
 	wallMS := metrics["workerpool_spindown_wall_ms"].P50
 	drained := int(metrics["workerpool_drained_pods"].P50)
 	if *destDir != "" {
-		if err := recordLifecycleMetrics(*destDir, *runID, "workerpool_spindown", wallMS, drained, metrics); err != nil {
+		if err := recordLifecycleMetrics(*destDir, *runID, "workerpool_spindown", wallMS, drained, metrics, true); err != nil {
 			return err
 		}
 	}
@@ -345,7 +365,7 @@ func spindownCmd(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func recordLifecycleMetrics(destDir, runID, phaseName string, wallMS float64, count int, metrics map[string]schema.MetricSummary) error {
+func recordLifecycleMetrics(destDir, runID, phaseName string, wallMS float64, count int, metrics map[string]schema.MetricSummary, ok bool) error {
 	eventsPath := filepath.Join(destDir, "events", "substrate_lifecycle.jsonl")
 	if err := os.MkdirAll(filepath.Dir(eventsPath), 0o755); err != nil {
 		return err
@@ -359,16 +379,20 @@ func recordLifecycleMetrics(destDir, runID, phaseName string, wallMS float64, co
 	for k, ms := range metrics {
 		evMetrics[k] = ms.P50
 	}
-	rec.Record(swebench.Event{
+	ev := swebench.Event{
 		Time:    time.Now().UTC(),
 		RunID:   runID,
 		Event:   swebench.EventPhase,
 		Name:    phaseName,
 		Count:   count,
 		DurMS:   wallMS,
-		OK:      true,
+		OK:      ok,
 		Metrics: evMetrics,
-	})
+	}
+	if !ok {
+		ev.Err = "timeout: pool did not reach its target Ready count"
+	}
+	rec.Record(ev)
 	_ = f.Close()
 
 	measPath := filepath.Join(destDir, "measurements.json")
@@ -510,6 +534,16 @@ func parseCLIPlugins(promFlags, logFlags, metricFlags, cmdFlags []string) ([]sch
 }
 
 func loadTelemetrySpecFromScenario(scenarioPath string) (*schema.TelemetrySpec, error) {
+	scen, err := loadScenario(scenarioPath)
+	if err != nil || scen == nil {
+		return nil, err
+	}
+	return scen.Telemetry, nil
+}
+
+// loadScenario decodes the Scenario YAML at scenarioPath; an empty path
+// yields nil, nil.
+func loadScenario(scenarioPath string) (*schema.Scenario, error) {
 	if strings.TrimSpace(scenarioPath) == "" {
 		return nil, nil
 	}
@@ -521,7 +555,7 @@ func loadTelemetrySpecFromScenario(scenarioPath string) (*schema.TelemetrySpec, 
 	if err != nil {
 		return nil, err
 	}
-	return scen.Telemetry, nil
+	return &scen, nil
 }
 
 func measureCmd(args []string, stderr io.Writer) error {
@@ -546,6 +580,9 @@ func measureCmd(args []string, stderr io.Writer) error {
 	scopesFlag := fs.String("scopes", "", "Comma-separated telemetry scopes to collect (rl,user-sandbox,substrate,k8s or all; default all).")
 	collectorsFlag := fs.String("collectors", "", "Optional comma-separated collector names to run.")
 	scenarioPath := fs.String("scenario", "", "Optional Scenario YAML path to load telemetry.scopes and telemetry.plugins.")
+	sampleInterval := fs.Duration("interval", 0, "Sample every interval into -snapshots-dir instead of a single pass; run the built binary in the background during the job window and stop it with SIGINT/SIGTERM (go run does not forward signals) or -duration. On stop it writes system_description.json and a rolled-up measurements.json under -dest.")
+	sampleDuration := fs.Duration("duration", 0, "With -interval: stop sampling after this long (0 = until signalled).")
+	snapshotsDir := fs.String("snapshots-dir", "", "With -interval: directory for per-sample measurements (defaults to <dest>/"+measure.SnapshotsDirName+").")
 	var queries querySliceFlag
 	var pluginProms, pluginLogs, pluginMetrics, pluginCmds stringSliceFlag
 	fs.Var(&queries, "query", "Prometheus query in name=expr format (repeatable, required).")
@@ -644,7 +681,7 @@ func measureCmd(args []string, stderr io.Writer) error {
 			queries = measure.MustDefaultPromQueries()
 		}
 	}
-	res, err := measure.RunCollectors(context.Background(), measure.CollectRequest{
+	req := measure.CollectRequest{
 		RunID:             *runID,
 		DestDir:           *destDir,
 		Scopes:            activeScopes,
@@ -661,9 +698,45 @@ func measureCmd(args []string, stderr io.Writer) error {
 			Atespace:     *atespace,
 			BaseTemplate: *baseTemplate,
 			ATEEndpoint:  *ateEndpoint,
+			Kube:         measureKubeRunner,
 		},
 		Plugins: plugins,
-	})
+	}
+	if *sampleInterval > 0 {
+		dir := *snapshotsDir
+		if dir == "" {
+			if *destDir == "" {
+				return fmt.Errorf("-interval requires -dest or -snapshots-dir")
+			}
+			dir = filepath.Join(*destDir, measure.SnapshotsDirName)
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		sr, err := measure.RunSnapshotSampler(ctx, req, measure.SamplerOptions{
+			Dir:      dir,
+			Interval: *sampleInterval,
+			Duration: *sampleDuration,
+			OnError:  func(err error) { fmt.Fprintf(stderr, "measure: sample failed: %v\n", err) },
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stderr, "measure: wrote %d snapshot(s) to %s (%d failed)\n", sr.Written, dir, sr.Failed)
+		// The sampler stands in for the single pass, so it leaves the same
+		// files: system_description.json from the last sample, and a
+		// measurements.json that rolls the samples up (bench report does the
+		// same roll-up, but bench validate wants the file to exist).
+		if *sysOut != "" && sr.Last != nil && sr.Last.SystemDescription != nil {
+			if err := sut.WriteSystemDescription(*sysOut, *sr.Last.SystemDescription); err != nil {
+				return err
+			}
+		}
+		if *destDir != "" && filepath.Dir(dir) == filepath.Clean(*destDir) {
+			return writeRolledUpMeasurements(*destDir, *outPath, *runID, sr.Last)
+		}
+		return nil
+	}
+	res, err := measure.RunCollectors(context.Background(), req)
 	if err != nil {
 		return err
 	}
@@ -780,9 +853,13 @@ func reportCmd(args []string, stdout, stderr io.Writer) error {
 	if path == "" && fs.NArg() > 0 {
 		path = fs.Arg(0)
 	}
-	telSpec, err := loadTelemetrySpecFromScenario(*scenarioPath)
+	scen, err := loadScenario(*scenarioPath)
 	if err != nil {
 		return err
+	}
+	var telSpec *schema.TelemetrySpec
+	if scen != nil {
+		telSpec = scen.Telemetry
 	}
 	var scopeInputs []string
 	if *scopesFlag != "" {
@@ -807,7 +884,7 @@ func reportCmd(args []string, stdout, stderr io.Writer) error {
 	plugins = append(plugins, cliPlugins...)
 
 	if *destDir != "" {
-		return reportFromArtifactDir(*destDir, *jsonOut, activeScopes, plugins, stdout)
+		return reportFromArtifactDir(*destDir, *jsonOut, activeScopes, plugins, declaredLoadParams(scen), stdout, stderr)
 	}
 	if path == "" {
 		return fmt.Errorf("report needs a JSONL file or -dest DIR")
@@ -823,7 +900,7 @@ func reportCmd(args []string, stdout, stderr io.Writer) error {
 	return swebench.WriteReportFiles(rep, *jsonOut, "", *unresolvedOut, *unresolvedNote, "", "", "")
 }
 
-func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.TelemetryScope, plugins []schema.TelemetryPluginSpec, stdout io.Writer) error {
+func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.TelemetryScope, plugins []schema.TelemetryPluginSpec, declaredLoad *schema.LoadParams, stdout, stderr io.Writer) error {
 	ingRes, err := job.IngestArtifactDir(job.IngestContext{
 		DestDir: destDir,
 		Scopes:  activeScopes,
@@ -873,16 +950,32 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 			rep.CustomMetrics[k] = v
 		}
 	}
+	if ingRes != nil && ingRes.TraceTruncatedLines > 0 {
+		rep.TraceTruncatedLines = ingRes.TraceTruncatedLines
+		fmt.Fprintf(stderr, "report: dropped %d truncated trailing trace line(s) (shard copied mid-write): %s\n",
+			ingRes.TraceTruncatedLines, strings.Join(ingRes.TraceTruncatedFiles, ", "))
+	}
 	rep.WriteText(stdout)
 
 	outRep := benchArtifactReport{Report: rep}
 	measPath := filepath.Join(destDir, "measurements.json")
+	if _, err := os.Stat(measPath); os.IsNotExist(err) {
+		// A sampler-only bundle (bench measure -interval, or bench run's
+		// -snapshot-interval) has snapshots and no measurements.json yet;
+		// build it from them so the report and bench validate see one.
+		if snapFiles, _ := filepath.Glob(filepath.Join(destDir, measure.SnapshotsDirName, "*.json")); len(snapFiles) > 0 {
+			if err := writeRolledUpMeasurements(destDir, measPath, rep.RunID, nil); err != nil {
+				return err
+			}
+		}
+	}
 	if rawMeas, err := os.ReadFile(measPath); err == nil {
 		meas, derr := schema.DecodeJSONStrict[schema.Measurements](bytes.NewReader(rawMeas))
 		if derr != nil {
 			return fmt.Errorf("invalid measurements.json: %w", derr)
 		}
-		if rollUpSnapshotsIntoMeasurements(destDir, &meas) || len(meas.PromMetrics) == 0 {
+		snapFiles, _ := filepath.Glob(filepath.Join(destDir, measure.SnapshotsDirName, "*.json"))
+		if rollUpSnapshotsIntoMeasurements(destDir, &meas) || len(snapFiles) > 0 || len(meas.PromMetrics) == 0 {
 			meas.PromMetrics = buildPromSeriesFromSnapshotsOrSummary(destDir, &meas)
 		}
 		_ = measure.WriteMeasurements(measPath, &meas)
@@ -923,6 +1016,7 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 	}
 	if sysDescPtr != nil {
 		enrichSystemDescriptionFromArtifactDir(destDir, sysDescPtr, rep, outRep.Measurements)
+		applyDeclaredLoad(sysDescPtr, declaredLoad)
 	}
 	rep.AttachClusterTelemetry(sysDescPtr, outRep.Measurements)
 	swebench.NormalizeLegacyReport(rep)
@@ -976,13 +1070,121 @@ var (
 	trainFilesRe    = regexp.MustCompile(`data\.train_files=([^\s]+)`)
 	filterLenRe     = regexp.MustCompile(`filter dataset len:\s*(\d+)`)
 	datasetLenRe    = regexp.MustCompile(`dataset len:\s*(\d+)`)
-	trainBatchSzRe  = regexp.MustCompile(`(?:data\.train_batch_size=|'train_batch_size'\s*:\s*)([1-9]\d*)`)
-	ppoMiniBatchRe  = regexp.MustCompile(`(?:actor_rollout_ref\.actor\.ppo_mini_batch_size=|'ppo_mini_batch_size'\s*:\s*)(\d+)`)
-	rolloutNRe      = regexp.MustCompile(`(?:actor_rollout_ref\.rollout\.n=|'rollout_n'\s*:\s*)(\d+)`)
 	totalTrainStpRe = regexp.MustCompile(`(?:trainer\.total_training_steps|total_train_steps|'total_training_steps')\s*[:=]?\s*([1-9]\d*)`)
-	maxSessionsRe   = regexp.MustCompile(`(?:max_concurrent_sessions=|'max_concurrent_sessions'\s*:\s*)(\d+)`)
 	warmupBatchesRe = regexp.MustCompile(`(?:num_warmup_batches=|'num_warmup_batches'\s*:\s*)(\d+)`)
+
+	// Load parameters come in two shapes in a trainer log: the CLI override
+	// (`data.train_batch_size=64`, echoed by launchers, wrappers and banners)
+	// and the trainer's resolved config dump (`'train_batch_size': 64`),
+	// printed after Hydra/argparse merged every override. The resolved form
+	// is what the trainer actually ran with, so it wins; within a form the
+	// last occurrence wins, so a stale banner or echoed profile default at the
+	// top of the log never outranks the effective value.
+	trainBatchResolvedRe = regexp.MustCompile(`'train_batch_size'\s*:\s*([1-9]\d*)`)
+	trainBatchCLIRe      = regexp.MustCompile(`data\.train_batch_size=([1-9]\d*)`)
+	ppoMiniResolvedRe    = regexp.MustCompile(`'ppo_mini_batch_size'\s*:\s*(\d+)`)
+	ppoMiniCLIRe         = regexp.MustCompile(`actor_rollout_ref\.actor\.ppo_mini_batch_size=(\d+)`)
+	rolloutNResolvedRe   = regexp.MustCompile(`'rollout_n'\s*:\s*(\d+)`)
+	rolloutNCLIRe        = regexp.MustCompile(`actor_rollout_ref\.rollout\.n=(\d+)`)
+	maxSessionsRsvRe     = regexp.MustCompile(`'max_concurrent_sessions'\s*:\s*(\d+)`)
+	maxSessionsCLIRe     = regexp.MustCompile(`max_concurrent_sessions=(\d+)`)
 )
+
+// trainerLoadParam returns the effective value of one load parameter in a
+// trainer log: the last resolved-config match, else the last CLI-form match,
+// else 0.
+func trainerLoadParam(text string, resolved, cli *regexp.Regexp) int {
+	for _, re := range []*regexp.Regexp{resolved, cli} {
+		all := re.FindAllStringSubmatch(text, -1)
+		if len(all) == 0 {
+			continue
+		}
+		if v, err := strconv.Atoi(all[len(all)-1][1]); err == nil && v > 0 {
+			return v
+		}
+	}
+	return 0
+}
+
+// declaredLoadParams returns the load parameters a scenario declares for its
+// first real job (tasks_per_step, group_size, steps, max_concurrent,
+// instances, images), or nil when the scenario has no real job or declares
+// none of them. Declared values are authoritative over anything sniffed from
+// trainer logs: the scenario is what the run was asked to do.
+func declaredLoadParams(scen *schema.Scenario) *schema.LoadParams {
+	if scen == nil {
+		return nil
+	}
+	for _, j := range scen.Jobs {
+		if j.Kind != "real" && j.Mode != schema.JobModeReal {
+			continue
+		}
+		tasksPerStep := j.TasksPerStep
+		if tasksPerStep <= 0 {
+			tasksPerStep = j.BatchSize
+		}
+		groupSize := j.GroupSize
+		if groupSize <= 0 {
+			groupSize = j.RolloutsPerTask
+		}
+		maxConc := j.MaxConcurrent
+		if maxConc <= 0 {
+			maxConc = j.Concurrency
+		}
+		lp := &schema.LoadParams{
+			Tasks:          j.Instances,
+			GroupSize:      groupSize,
+			Steps:          j.Steps,
+			TasksPerStep:   tasksPerStep,
+			MaxConcurrent:  maxConc,
+			DistinctImages: j.Images,
+		}
+		if lp.Tasks == 0 && lp.GroupSize == 0 && lp.Steps == 0 && lp.TasksPerStep == 0 && lp.MaxConcurrent == 0 && lp.DistinctImages == 0 {
+			return nil
+		}
+		return lp
+	}
+	return nil
+}
+
+// applyDeclaredLoad overlays the non-zero fields of declared onto sys.Load,
+// creating it when absent, and recomputes TrajectoriesPerStep.
+func applyDeclaredLoad(sys *schema.SystemDescription, declared *schema.LoadParams) {
+	if sys == nil || declared == nil {
+		return
+	}
+	if sys.Load == nil {
+		sys.Load = &schema.LoadParams{Repeat: 1}
+	}
+	lp := sys.Load
+	if declared.Tasks > 0 {
+		lp.Tasks = declared.Tasks
+	}
+	if declared.GroupSize > 0 {
+		lp.GroupSize = declared.GroupSize
+	}
+	if declared.Steps > 0 {
+		lp.Steps = declared.Steps
+	}
+	if declared.TasksPerStep > 0 {
+		lp.TasksPerStep = declared.TasksPerStep
+	}
+	if declared.MaxConcurrent > 0 {
+		lp.MaxConcurrent = declared.MaxConcurrent
+	}
+	if declared.DistinctImages > 0 {
+		lp.DistinctImages = declared.DistinctImages
+	}
+	if lp.GroupSize <= 0 {
+		lp.GroupSize = 1
+	}
+	if lp.Repeat <= 0 {
+		lp.Repeat = 1
+	}
+	if lp.TasksPerStep > 0 {
+		lp.TrajectoriesPerStep = lp.GroupSize * lp.TasksPerStep
+	}
+}
 
 func enrichSystemDescriptionFromArtifactDir(destDir string, sys *schema.SystemDescription, rep *swebench.Report, meas *schema.Measurements) {
 	if sys == nil {
@@ -1107,19 +1309,19 @@ func enrichSystemDescriptionFromArtifactDir(destDir string, sys *schema.SystemDe
 				datasetTasks, _ = strconv.Atoi(m[1])
 			}
 		}
-		if m := trainBatchSzRe.FindStringSubmatch(text); len(m) == 2 {
-			tasksPerStep, _ = strconv.Atoi(m[1])
-		} else if m := ppoMiniBatchRe.FindStringSubmatch(text); len(m) == 2 {
-			tasksPerStep, _ = strconv.Atoi(m[1])
+		if v := trainerLoadParam(text, trainBatchResolvedRe, trainBatchCLIRe); v > 0 {
+			tasksPerStep = v
+		} else if v := trainerLoadParam(text, ppoMiniResolvedRe, ppoMiniCLIRe); v > 0 {
+			tasksPerStep = v
 		}
-		if m := rolloutNRe.FindStringSubmatch(text); len(m) == 2 {
-			groupSize, _ = strconv.Atoi(m[1])
+		if v := trainerLoadParam(text, rolloutNResolvedRe, rolloutNCLIRe); v > 0 {
+			groupSize = v
 		}
 		if m := totalTrainStpRe.FindStringSubmatch(text); len(m) == 2 {
 			stepsCount, _ = strconv.Atoi(m[1])
 		}
-		if m := maxSessionsRe.FindStringSubmatch(text); len(m) == 2 {
-			maxConc, _ = strconv.Atoi(m[1])
+		if v := trainerLoadParam(text, maxSessionsRsvRe, maxSessionsCLIRe); v > 0 {
+			maxConc = v
 		}
 		if stepsCount <= 0 && rep != nil && len(rep.Steps) > 0 {
 			stepsCount = len(rep.Steps)
@@ -1211,6 +1413,41 @@ func enrichSystemDescriptionFromArtifactDir(destDir string, sys *schema.SystemDe
 
 func nearestRankPct(sorted []float64, p float64) float64 {
 	return swebench.NearestRankPct(sorted, p)
+}
+
+// writeRolledUpMeasurements writes outPath as the roll-up of
+// destDir/measurements_snapshots: an existing measurements.json (for example
+// the one bench spinup -dest merged its lifecycle metrics into) is the base,
+// else last's measurements, else an empty document for runID. The snapshot
+// scalars are summarised into ServerSummary and every scraped series is kept
+// in time order, so the metrics-first report reads the run window.
+func writeRolledUpMeasurements(destDir, outPath, runID string, last *measure.CollectResult) error {
+	meas := schema.Measurements{SchemaVersion: schema.SchemaVersion, RunID: runID, CollectedAt: time.Now().UTC()}
+	if raw, err := os.ReadFile(outPath); err == nil {
+		if existing, derr := schema.DecodeJSONStrict[schema.Measurements](bytes.NewReader(raw)); derr == nil {
+			meas = existing
+		}
+	} else if last != nil && last.Measurements != nil {
+		meas = *last.Measurements
+	}
+	if meas.RunID == "" {
+		meas.RunID = runID
+	}
+	rollUpSnapshotsIntoMeasurements(destDir, &meas)
+	if meas.RunID == "" {
+		// Neither an existing file nor the caller named the run: take it
+		// from the samples, which the sampler stamped with -run-id.
+		if snaps, _ := filepath.Glob(filepath.Join(destDir, measure.SnapshotsDirName, "*.json")); len(snaps) > 0 {
+			if raw, err := os.ReadFile(snaps[0]); err == nil {
+				var first schema.Measurements
+				if json.Unmarshal(raw, &first) == nil {
+					meas.RunID = first.RunID
+				}
+			}
+		}
+	}
+	meas.PromMetrics = buildPromSeriesFromSnapshotsOrSummary(destDir, &meas)
+	return measure.WriteMeasurements(outPath, &meas)
 }
 
 func roundStatVal(v float64) float64 {
@@ -1351,37 +1588,111 @@ func rollUpSnapshotsIntoMeasurements(destDir string, meas *schema.Measurements) 
 	return true
 }
 
+// promSeriesKey identifies a series by name and label set, so histogram
+// buckets (`le`), statuses and sources of one family stay distinct.
+func promSeriesKey(name string, labels map[string]string) string {
+	if len(labels) == 0 {
+		return name
+	}
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString(name)
+	for _, k := range keys {
+		b.WriteByte('|')
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(labels[k])
+	}
+	return b.String()
+}
+
+// isCumulativePromSeries reports whether name is a monotonic counter family
+// (histogram _bucket/_count/_sum or a _total counter) whose window value is a
+// delta rather than a level.
+func isCumulativePromSeries(name string) bool {
+	for _, suffix := range []string{"_bucket", "_count", "_sum", "_total"} {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildPromSeriesFromSnapshotsOrSummary folds the periodic
+// measurements_snapshots into one series set: every Prometheus series the
+// samples scraped (histogram buckets, counts and sums of the SDK and
+// ate-env-api families included) with its values in time order, plus one
+// series per ServerSummary scalar. The metrics-first report reads the
+// histogram families from here, so a workload whose pod is gone by the time
+// a post-run `bench measure` runs (its series stale in Prometheus) is still
+// reported from what the in-window samples saw.
 func buildPromSeriesFromSnapshotsOrSummary(destDir string, meas *schema.Measurements) []schema.PrometheusSeries {
 	if meas == nil {
 		return nil
 	}
 	seriesByMetric := make(map[string]*schema.PrometheusSeries)
 	var metricOrder []string
+	add := func(key string, mk func() *schema.PrometheusSeries) *schema.PrometheusSeries {
+		ps, exists := seriesByMetric[key]
+		if !exists {
+			ps = mk()
+			seriesByMetric[key] = ps
+			metricOrder = append(metricOrder, key)
+		}
+		return ps
+	}
 
 	snapFiles, _ := filepath.Glob(filepath.Join(destDir, "measurements_snapshots", "*.json"))
 	sort.Strings(snapFiles)
-	for _, sf := range snapFiles {
+	for idx, sf := range snapFiles {
 		raw, err := os.ReadFile(sf)
 		if err != nil {
 			continue
 		}
 		var snap schema.Measurements
-		if err := json.Unmarshal(raw, &snap); err != nil || len(snap.ServerSummary) == 0 {
+		if err := json.Unmarshal(raw, &snap); err != nil {
 			continue
 		}
+		for _, s := range snap.PromMetrics {
+			s := s
+			ps := add(promSeriesKey(s.Name, s.Labels), func() *schema.PrometheusSeries {
+				cp := s
+				cp.Values = nil
+				cp.Value = nil
+				// A cumulative series that first shows up partway through the
+				// window belongs to a process that started inside it (the
+				// workload pod came up after sampling began), so its window
+				// delta runs from zero, not from the first value scraped.
+				if idx > 0 && isCumulativePromSeries(s.Name) {
+					cp.Values = []float64{0}
+				}
+				return &cp
+			})
+			if s.Value != nil {
+				v := *s.Value
+				ps.Value = &v
+				ps.Values = append(ps.Values, v)
+			} else if len(s.Values) > 0 {
+				v := s.Values[len(s.Values)-1]
+				ps.Value = &v
+				ps.Values = append(ps.Values, s.Values...)
+			}
+			if s.Status != "" {
+				ps.Status = s.Status
+			}
+		}
 		for k, ms := range snap.ServerSummary {
-			ps, exists := seriesByMetric[k]
-			if !exists {
-				val := ms.P50
-				ps = &schema.PrometheusSeries{
+			ps := add(promSeriesKey(k, map[string]string{"unit": ms.Unit}), func() *schema.PrometheusSeries {
+				return &schema.PrometheusSeries{
 					Name:   k,
 					Labels: map[string]string{"unit": ms.Unit},
 					Status: "ok",
-					Value:  &val,
 				}
-				seriesByMetric[k] = ps
-				metricOrder = append(metricOrder, k)
-			}
+			})
 			val := ms.P50
 			ps.Value = &val
 			ps.Values = append(ps.Values, val)
@@ -1389,28 +1700,26 @@ func buildPromSeriesFromSnapshotsOrSummary(destDir string, meas *schema.Measurem
 	}
 
 	for k, ms := range meas.ServerSummary {
-		ps, exists := seriesByMetric[k]
-		if !exists {
-			val := ms.P50
-			ps = &schema.PrometheusSeries{
+		val := ms.P50
+		add(promSeriesKey(k, map[string]string{"unit": ms.Unit}), func() *schema.PrometheusSeries {
+			return &schema.PrometheusSeries{
 				Name:   k,
 				Labels: map[string]string{"unit": ms.Unit},
 				Status: "ok",
 				Value:  &val,
 				Values: []float64{val},
 			}
-			seriesByMetric[k] = ps
-			metricOrder = append(metricOrder, k)
-		}
+		})
 	}
 	for _, existing := range meas.PromMetrics {
 		cp := existing
-		ps, exists := seriesByMetric[cp.Name]
+		key := promSeriesKey(cp.Name, cp.Labels)
+		ps, exists := seriesByMetric[key]
 		if !exists {
-			seriesByMetric[cp.Name] = &cp
-			metricOrder = append(metricOrder, cp.Name)
+			seriesByMetric[key] = &cp
+			metricOrder = append(metricOrder, key)
 		} else if len(cp.Values) > len(ps.Values) {
-			seriesByMetric[cp.Name] = &cp
+			seriesByMetric[key] = &cp
 		}
 	}
 	sort.Strings(metricOrder)

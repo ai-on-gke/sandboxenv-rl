@@ -18,6 +18,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -41,10 +42,15 @@ func IsVeRLManifest(manifestPath string) bool {
 		strings.HasSuffix(clean, "job-fully-async.yaml")
 }
 
-// runVeRLManifest deploys the PR #112 Qwen3-1.7B VeRL fully-async RL workload
-// (either via `deploy.sh up` or by creating the `verl-qwen3-1p7b-scripts`
-// ConfigMap and applying `job-fully-async.yaml`), waits for
-// `job/verl-qwen3-1p7b-fully-async` to complete, and collects its trainer logs.
+// runVeRLManifest deploys a VeRL fully-async RL workload (either via
+// `deploy.sh up` or by creating the scripts ConfigMap and applying the job
+// manifest), waits for the job's head Job to complete, and collects its
+// trainer logs.
+//
+// The head Job defaults to the PR #112 example name
+// (`verl-qwen3-1p7b-fully-async`) only when the scenario leaves `head_job`
+// unset; multi-job scenarios must set `head_job` per job, or every driver
+// would wait on the same Job and return as soon as the first one finishes.
 func (r *RealJobDriver) runVeRLManifest(
 	ctx context.Context,
 	execRunner CommandExecutor,
@@ -52,6 +58,10 @@ func (r *RealJobDriver) runVeRLManifest(
 	manifest string,
 	env map[string]string,
 ) ([]byte, error) {
+	headJob := strings.TrimSpace(r.Spec.HeadJob)
+	if headJob == "" {
+		headJob = VeRLHeadJobName
+	}
 	if strings.HasSuffix(manifest, "deploy.sh") {
 		if _, err := execRunner.Run(ctx, "bash", env, manifest, "up"); err != nil {
 			return nil, fmt.Errorf("verl deploy.sh up: %w", err)
@@ -99,14 +109,23 @@ func (r *RealJobDriver) runVeRLManifest(
 		}
 	}
 
-	if _, err := execRunner.Run(ctx, "kubectl", env, "-n", ns, "wait", "--for=condition=complete", "job/"+VeRLHeadJobName, "--timeout=3600s"); err != nil {
-		return nil, fmt.Errorf("wait for %s: %w", VeRLHeadJobName, err)
+	if r.Spec.PodSelector == "" && r.trainerContainer() == "" {
+		// The example's pods carry no job-name label bench can predict, so
+		// without a pod_selector wait on the Job and read its logs by name.
+		if err := waitForJobTerminal(ctx, execRunner, env, ns, headJob, r.waitTimeout()); err != nil {
+			if !errors.Is(err, ErrJobFailed) {
+				return nil, fmt.Errorf("wait for %s: %w", headJob, err)
+			}
+			logs, _ := execRunner.Run(ctx, "kubectl", env, "-n", ns, "logs", "job/"+headJob, "--tail=-1")
+			return logs, err
+		}
+		logs, err := execRunner.Run(ctx, "kubectl", env, "-n", ns, "logs", "job/"+headJob, "--tail=-1")
+		if err != nil {
+			return nil, fmt.Errorf("collect logs from %s: %w", headJob, err)
+		}
+		return logs, nil
 	}
-	logs, err := execRunner.Run(ctx, "kubectl", env, "-n", ns, "logs", "job/"+VeRLHeadJobName, "--tail=-1")
-	if err != nil {
-		return nil, fmt.Errorf("collect logs from %s: %w", VeRLHeadJobName, err)
-	}
-	return logs, nil
+	return r.awaitJobAndLogs(ctx, execRunner, env, ns, headJob)
 }
 
 // archiveClientsPython packs pyproject.toml, README.md, and src/ from

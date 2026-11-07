@@ -66,8 +66,14 @@ type fakeCmdExecutor struct {
 
 func (f *fakeCmdExecutor) Run(_ context.Context, name string, _ map[string]string, args ...string) ([]byte, error) {
 	f.calls = append(f.calls, name+" "+strings.Join(args, " "))
+	if strings.Contains(strings.Join(args, " "), "get job") {
+		return []byte(completeJobJSON), nil
+	}
 	return []byte(f.out), nil
 }
+
+// completeJobJSON is what `kubectl get job -o json` returns for a finished Job.
+const completeJobJSON = `{"status":{"conditions":[{"type":"Complete","status":"True"}]}}`
 
 func TestScenarioRunnerMultiJobClosedAndOpenLoop(t *testing.T) {
 	dir := t.TempDir()
@@ -284,5 +290,52 @@ func TestRealJobDriverVeRLBundlesClientsPython(t *testing.T) {
 	}
 	if len(execFake.calls) == 0 || !strings.Contains(execFake.calls[0], "--from-file=ate-env-rl.tgz=") {
 		t.Fatalf("expected ConfigMap command to bundle ate-env-rl.tgz, got calls: %v", execFake.calls)
+	}
+}
+
+func TestScenarioRunnerMapsKindToDriver(t *testing.T) {
+	// A scenario written in the schema's vocabulary (`kind`) and one written
+	// with `mode` must build the same drivers; `kind: real` without `mode`
+	// used to fail with "unsupported job mode".
+	sr := &ScenarioRunner{
+		Scenario:   &schema.Scenario{SUT: schema.SUTSpec{Namespace: "bench-ns", ServerAddr: "http://ate:8080"}},
+		ClientFunc: func(schema.JobSpec) swebench.EnvClient { return &fakeEnvClient{} },
+	}
+	for _, tc := range []struct {
+		name string
+		spec schema.JobSpec
+		want string
+	}{
+		{"kind real", schema.JobSpec{Name: "r", Kind: "real", RealMode: "measure", TrainerManifest: "m.yaml"}, "*job.RealJobDriver"},
+		{"kind simulated closed", schema.JobSpec{Name: "s", Kind: "simulated", Dataset: "d", Trajectory: "t"}, "*job.SimulatedJobDriver"},
+		{"kind simulated open-loop", schema.JobSpec{Name: "o", Kind: "simulated", LoaderMode: "open-loop", Dataset: "d", Trajectory: "t"}, "*job.SimulatedJobDriver"},
+		{"mode real", schema.JobSpec{Name: "m", Mode: schema.JobModeReal, TrainerManifest: "m.yaml"}, "*job.RealJobDriver"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			drv, err := sr.buildDriver(0, tc.spec, schema.ScheduledJob{}, "run")
+			if err != nil {
+				t.Fatalf("buildDriver: %v", err)
+			}
+			if got := fmt.Sprintf("%T", drv); got != tc.want {
+				t.Fatalf("driver = %s, want %s", got, tc.want)
+			}
+			switch d := drv.(type) {
+			case *RealJobDriver:
+				if d.Spec.Mode != schema.JobModeReal || d.Namespace != "bench-ns" || d.ServerAddr != "http://ate:8080" {
+					t.Fatalf("real driver = mode %q ns %q addr %q", d.Spec.Mode, d.Namespace, d.ServerAddr)
+				}
+			case *SimulatedJobDriver:
+				want := schema.JobModeClosedLoop
+				if tc.spec.LoaderMode == "open-loop" {
+					want = schema.JobModeOpenLoop
+				}
+				if d.Spec.Mode != want {
+					t.Fatalf("simulated driver mode = %q, want %q", d.Spec.Mode, want)
+				}
+			}
+		})
+	}
+	if _, err := sr.buildDriver(0, schema.JobSpec{Name: "x", Kind: "other"}, schema.ScheduledJob{}, "run"); err == nil || !strings.Contains(err.Error(), "unsupported job mode") {
+		t.Fatalf("an unknown kind must still be refused, got %v", err)
 	}
 }

@@ -105,6 +105,20 @@ func RegisterCollector(c Collector) {
 	collectorRegistry[name] = c
 }
 
+// unregisterCollector removes a collector registered by a test, so one
+// test's collector does not run in another's scope-wide pass.
+func unregisterCollector(name string) {
+	collectorsMu.Lock()
+	defer collectorsMu.Unlock()
+	delete(collectorRegistry, name)
+	for i, n := range collectorOrder {
+		if n == name {
+			collectorOrder = append(collectorOrder[:i], collectorOrder[i+1:]...)
+			break
+		}
+	}
+}
+
 // RegisteredCollectors returns all registered collectors in registration order.
 func RegisteredCollectors() []Collector {
 	collectorsMu.RLock()

@@ -1372,15 +1372,59 @@ func isWorkerPoolPod(pod k8sPod, workerPool string) bool {
 	return false
 }
 
-// SpinUpWorkerPool patches the specified Substrate WorkerPool in namespace to
-// replicas, polls until all replicas reach Ready=True (and ate-env-api is rolled out
-// if present), and returns wall-clock spin-up and per-worker-pod startup sub-phase
-// metrics (`workerpool_spinup_wall_ms`, `worker_pod_schedule_ms`, `worker_pod_init_ms`,
-// `worker_pod_container_start_ms`, `worker_pod_total_ready_ms`, `worker_pod_count`).
-func SpinUpWorkerPool(ctx context.Context, kube KubeCommandRunner, namespace, workerPool string, replicas int, timeout time.Duration) (map[string]schema.MetricSummary, error) {
+// SpinUpOptions configures SpinUpWorkerPoolWithOptions.
+type SpinUpOptions struct {
+	Namespace  string
+	WorkerPool string
+	Replicas   int
+	// Timeout caps the whole wait; 0 means 5 minutes.
+	Timeout time.Duration
+	// StallTimeout, when > 0, fails the wait once the Ready count has not
+	// increased for this long, so a pool that stops making progress (an
+	// unschedulable pod, exhausted quota) is reported in minutes while a slow
+	// but progressing cold autoscale (tens of nodes provisioning one by one)
+	// is allowed to finish within Timeout.
+	StallTimeout time.Duration
+	// Poll is the status poll interval; 0 means 500 ms.
+	Poll time.Duration
+}
+
+// SpinUpTimeoutError is returned when a WorkerPool did not reach its target
+// Ready count. The metrics for the pods that did come up are returned
+// alongside it, so a slow or stalled spin-up still leaves evidence.
+type SpinUpTimeoutError struct {
+	WorkerPool string
+	Namespace  string
+	Want, Got  int
+	Waited     time.Duration
+	// Stalled is true when the stall timeout fired (no new Ready pod for
+	// StallTimeout), false when the overall Timeout did.
+	Stalled bool
+	Stall   time.Duration
+}
+
+func (e *SpinUpTimeoutError) Error() string {
+	if e.Stalled {
+		return fmt.Sprintf("workerpool/%s in %s stalled: no new Ready pod for %s (%d/%d Ready after %s)",
+			e.WorkerPool, e.Namespace, e.Stall.Round(time.Second), e.Got, e.Want, e.Waited.Round(time.Second))
+	}
+	return fmt.Sprintf("timed out after %s waiting for workerpool/%s in %s to reach %d Ready pods (got %d)",
+		e.Waited.Round(time.Second), e.WorkerPool, e.Namespace, e.Want, e.Got)
+}
+
+// SpinUpWorkerPoolWithOptions patches the Substrate WorkerPool to Replicas,
+// polls until all replicas reach Ready=True (and ate-env-api is rolled out if
+// present), and returns wall-clock spin-up and per-worker-pod startup
+// sub-phase metrics (`workerpool_spinup_wall_ms`, `worker_pod_schedule_ms`,
+// `worker_pod_init_ms`, `worker_pod_container_start_ms`,
+// `worker_pod_total_ready_ms`, `worker_pod_count`). On timeout or stall it
+// returns the metrics computed from the pods that are Ready together with a
+// *SpinUpTimeoutError.
+func SpinUpWorkerPoolWithOptions(ctx context.Context, kube KubeCommandRunner, opts SpinUpOptions) (map[string]schema.MetricSummary, error) {
 	if kube == nil {
 		kube = defaultKubeRunner{}
 	}
+	namespace, workerPool, replicas, timeout := opts.Namespace, opts.WorkerPool, opts.Replicas, opts.Timeout
 	if namespace == "" {
 		namespace = "ate-env"
 	}
@@ -1393,6 +1437,10 @@ func SpinUpWorkerPool(ctx context.Context, kube KubeCommandRunner, namespace, wo
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
+	poll := opts.Poll
+	if poll <= 0 {
+		poll = 500 * time.Millisecond
+	}
 	start := time.Now()
 	patchJSON := fmt.Sprintf(`{"spec":{"replicas":%d}}`, replicas)
 	if out, err := kube.Run(ctx, "-n", namespace, "patch", "workerpool", workerPool, "--type=merge", "-p", patchJSON); err != nil {
@@ -1402,12 +1450,18 @@ func SpinUpWorkerPool(ctx context.Context, kube KubeCommandRunner, namespace, wo
 	_, _ = kube.Run(ctx, "-n", namespace, "rollout", "status", "deploy/ate-env-api", "--timeout=60s")
 
 	deadline := start.Add(timeout)
+	// Progress is measured from here, after the rollout wait: that wait can
+	// take 60 s, and a short -stall-timeout must not fire before the first
+	// pod listing.
+	lastProgress := time.Now()
 	var readyWorkers []k8sPod
+	var waitErr *SpinUpTimeoutError
 	for {
 		podsRaw, err := kube.Run(ctx, "-n", namespace, "get", "pods", "-o", "json")
 		if err == nil {
 			var pl k8sPodList
 			if json.Unmarshal(podsRaw, &pl) == nil {
+				prev := len(readyWorkers)
 				readyWorkers = readyWorkers[:0]
 				for _, pod := range pl.Items {
 					if !isWorkerPoolPod(pod, workerPool) || pod.Metadata.DeletionTimestamp != "" {
@@ -1420,19 +1474,29 @@ func SpinUpWorkerPool(ctx context.Context, kube KubeCommandRunner, namespace, wo
 						}
 					}
 				}
+				if len(readyWorkers) > prev {
+					lastProgress = time.Now()
+				}
 				if len(readyWorkers) >= replicas {
 					break
 				}
 			}
 		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("timed out after %s waiting for workerpool/%s in %s to reach %d Ready pods (got %d)",
-				timeout, workerPool, namespace, replicas, len(readyWorkers))
+		now := time.Now()
+		if opts.StallTimeout > 0 && now.Sub(lastProgress) >= opts.StallTimeout {
+			waitErr = &SpinUpTimeoutError{WorkerPool: workerPool, Namespace: namespace, Want: replicas, Got: len(readyWorkers),
+				Waited: now.Sub(start), Stalled: true, Stall: opts.StallTimeout}
+			break
+		}
+		if now.After(deadline) {
+			waitErr = &SpinUpTimeoutError{WorkerPool: workerPool, Namespace: namespace, Want: replicas, Got: len(readyWorkers),
+				Waited: now.Sub(start)}
+			break
 		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(poll):
 		}
 	}
 
@@ -1493,6 +1557,10 @@ func SpinUpWorkerPool(ctx context.Context, kube KubeCommandRunner, namespace, wo
 	}
 	if len(readyDurs) > 0 {
 		out["worker_pod_total_ready_ms"] = summarizeSlice(readyDurs, "ms")
+	}
+	if waitErr != nil {
+		out["worker_pod_missing"] = singleScalarSummary(float64(replicas-len(readyWorkers)), "pods")
+		return out, waitErr
 	}
 	return out, nil
 }

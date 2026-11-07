@@ -17,6 +17,8 @@ package schema
 import (
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 )
 
 // JobMode enumerates the supported job runner modes in a Scenario.
@@ -189,6 +191,71 @@ type JobSpec struct {
 	TrainerCommand  []string          `json:"trainer_command,omitempty"`
 	TraceMode       string            `json:"trace_mode,omitempty"`
 	EnvVars         map[string]string `json:"env_vars,omitempty"`
+	// HeadJob is the Kubernetes Job (or RayJob/JobSet head) that marks this
+	// job's completion; `bench run` waits on `job/<head_job>`. Defaults to Name.
+	HeadJob string `json:"head_job,omitempty"`
+	// PodSelector is the label selector used to find this job's pods for
+	// trainer logs and trace collection. Defaults to `job-name=<head_job>`.
+	PodSelector string `json:"pod_selector,omitempty"`
+	// Timeout bounds how long bench waits for the job to finish, as a Go
+	// duration string ("3h", "90m"). Empty means one hour; a large model's
+	// run needs more.
+	Timeout string `json:"timeout,omitempty"`
+	// TraceCollection pulls `*.jsonl` trace files out of every pod matched by
+	// its selector after the job finishes (Ray workers included), so a
+	// real_mode "trace" job does not depend on a shared volume.
+	TraceCollection *TraceCollection `json:"trace_collection,omitempty"`
+}
+
+// TraceCollection configures post-run trace file harvesting from job pods.
+type TraceCollection struct {
+	// PodSelector overrides JobSpec.PodSelector for trace harvesting (for
+	// example to include Ray worker pods that do not carry the head job
+	// label). With TrainerContainer set it is also the selector the trainer
+	// wait and the trainer logs use, so the pods waited on are the pods
+	// harvested.
+	PodSelector string `json:"pod_selector,omitempty"`
+	// Container is the container to exec into; empty uses the pod default.
+	Container string `json:"container,omitempty"`
+	// TrainerContainer, when set, changes how the job's end is detected: bench
+	// waits for this container to terminate in every matching pod that runs
+	// it instead of for the Job to complete, harvests from Container while a
+	// keepalive sidecar still holds the pod open, and then deletes the head
+	// Job on every exit (timeout and cancellation included). A pod that has
+	// completed cannot be exec'd into, so a Job whose only container is the
+	// trainer cannot be harvested after the fact. Manifests whose pods carry
+	// no `job-name` label (the verl example) need a selector with it.
+	TrainerContainer string `json:"trainer_container,omitempty"`
+	// RemoteDir is the absolute in-pod directory holding `*.jsonl` traces.
+	RemoteDir string `json:"remote_dir"`
+}
+
+// Validate checks TraceCollection invariants.
+func (t TraceCollection) Validate() error {
+	dir := strings.TrimSpace(t.RemoteDir)
+	if dir == "" {
+		return errors.New("trace_collection.remote_dir is required")
+	}
+	if !strings.HasPrefix(dir, "/") {
+		return fmt.Errorf("trace_collection.remote_dir must be an absolute in-pod path, got %q", t.RemoteDir)
+	}
+	return nil
+}
+
+// EffectiveHeadJob returns HeadJob when set, else Name.
+func (j JobSpec) EffectiveHeadJob() string {
+	if h := strings.TrimSpace(j.HeadJob); h != "" {
+		return h
+	}
+	return j.Name
+}
+
+// EffectivePodSelector returns PodSelector when set, else `job-name=<head_job>`.
+func (j JobSpec) EffectivePodSelector() string {
+	if s := strings.TrimSpace(j.PodSelector); s != "" {
+		return s
+	}
+	return "job-name=" + j.EffectiveHeadJob()
 }
 
 // Validate checks JobSpec invariants.
@@ -255,7 +322,31 @@ func (j JobSpec) Validate() error {
 	if j.StartOffsetMS < 0 || j.StepPauseMS < 0 {
 		return fmt.Errorf("job %q: start_offset_ms and step_pause_ms must be >= 0", j.Name)
 	}
+	if j.TraceCollection != nil {
+		if err := j.TraceCollection.Validate(); err != nil {
+			return fmt.Errorf("job %q: %w", j.Name, err)
+		}
+	}
+	if _, err := j.WaitTimeout(); err != nil {
+		return fmt.Errorf("job %q: %w", j.Name, err)
+	}
 	return nil
+}
+
+// WaitTimeout is Timeout parsed, or one hour when empty.
+func (j JobSpec) WaitTimeout() (time.Duration, error) {
+	s := strings.TrimSpace(j.Timeout)
+	if s == "" {
+		return time.Hour, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("timeout %q is not a duration (want e.g. \"3h\" or \"90m\")", j.Timeout)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("timeout must be > 0, got %q", j.Timeout)
+	}
+	return d, nil
 }
 
 // WindowPolicy configures steady-state step boundaries and run duration caps inside Scenario.

@@ -42,6 +42,30 @@ user needs to know across them.
   the reserved environment ids); the Python
   client's `image_status()` and `ImageStatus`; the Go client's `ImageStatus`
   and `EnsureImageTemplate`.
+- `bench run` scenario fields for real jobs: `head_job` (the Job each driver
+  waits on, so a multi-job scenario ends when its last job does), `pod_selector`,
+  `timeout`, and `trace_collection` (`pod_selector`, `container`,
+  `trainer_container`, `remote_dir`), which pulls `traces/<job>/<pod>/*.jsonl`
+  out of every matching pod through a keepalive sidecar. With
+  `trainer_container`, the wait, the trainer logs and the harvest read the
+  same pods (`trace_collection.pod_selector`, else `pod_selector`); a pod
+  that is `Failed` without a trainer exit fails the job; and the head Job is
+  deleted on every exit, a timeout or an interrupt included. A job declared
+  by `kind: real` or `kind: simulated` without `mode` runs as that kind.
+- `bench measure -interval` (with `-duration`, `-snapshots-dir`) and
+  `bench run -snapshot-interval -k8s -prom-url -atespace`: sample cluster
+  telemetry through the job window into `measurements_snapshots/`; the
+  sampler writes `system_description.json` and a rolled-up `measurements.json`
+  when it stops. When no sample succeeded, `bench measure` fails and
+  `bench run` exits non-zero after writing the run's artifacts. A
+  `-snapshots-dir` outside `<dest>/measurements_snapshots` is refused, and an
+  existing `measurements.json` that does not decode is an error rather than
+  a file to overwrite.
+- `bench spinup -stall-timeout`: fail when no new worker pod has gone Ready
+  for that long; on any timeout the Ready pods' metrics are still recorded.
+- `bench report`: a torn last line in a trace shard is dropped and counted
+  (`trace_truncated_lines`); load parameters come from the scenario's first
+  real job, then the trainer's resolved config, then its command line.
 - `examples/Qwen3.5-397B-A17B-verl`: the agentic GRPO recipe from 2 to 16 GPU
   nodes with profiles for Qwen3.5-35B-A3B and Qwen3.5-397B-A17B, steps of
   thousands of trajectories, and guarded verl patches for 64K responses.

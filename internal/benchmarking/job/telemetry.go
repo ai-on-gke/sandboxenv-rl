@@ -17,6 +17,7 @@ package job
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"regexp"
 	"sort"
@@ -329,13 +330,39 @@ func isGradeTraceRecord(te rawTraceRecord) bool {
 	return false
 }
 
+// TraceParseStats reports what ParseTraceJSONLFileWithStats dropped.
+type TraceParseStats struct {
+	// Records is the number of trace records decoded.
+	Records int
+	// TruncatedTail is 1 when the file's last non-empty line was not valid
+	// JSON and was dropped, else 0. A trace file is appended one record per
+	// write, so a reader that catches a writer mid-record sees exactly one
+	// torn line, at the end; anything malformed before the tail is real
+	// corruption and still fails the parse.
+	TruncatedTail int
+	// TruncatedLine is the 1-based line number of the dropped tail, or 0.
+	TruncatedLine int
+}
+
 // ParseTraceJSONLFile reads a JSONL file of `schema.TraceEvent` lines (such as
 // those emitted by `ate_env_tool.py` or `uni_agent_substrate` when `ATE_ENV_TRACE_DIR`
 // is set) and converts them into canonical `swebench.Event` lifecycle, phase, TTFI, and task events.
+// A torn last line (a file copied while its writer was mid-record) is dropped
+// silently here; callers that report it use ParseTraceJSONLFileWithStats.
 func ParseTraceJSONLFile(path, defaultJob string) ([]swebench.Event, error) {
+	evs, _, err := ParseTraceJSONLFileWithStats(path, defaultJob)
+	return evs, err
+}
+
+// ParseTraceJSONLFileWithStats is ParseTraceJSONLFile with parse statistics.
+// Only the final non-empty line may be malformed; it is dropped and counted in
+// TraceParseStats.TruncatedTail. A malformed line anywhere else returns an
+// error naming the line.
+func ParseTraceJSONLFileWithStats(path, defaultJob string) ([]swebench.Event, TraceParseStats, error) {
+	var stats TraceParseStats
 	rawBytes, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, stats, err
 	}
 
 	type pendingClaim struct {
@@ -347,14 +374,26 @@ func ParseTraceJSONLFile(path, defaultJob string) ([]swebench.Event, error) {
 
 	scanner := bufio.NewScanner(strings.NewReader(string(rawBytes)))
 	scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
+	lineNum := 0
+	var (
+		badLine int
+		badErr  error
+	)
 	for scanner.Scan() {
+		lineNum++
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
+		if badErr != nil {
+			// A malformed line followed by more content is corruption, not a
+			// torn tail.
+			return nil, stats, fmt.Errorf("%s: line %d: %w", path, badLine, badErr)
+		}
 		var te rawTraceRecord
 		if err := json.Unmarshal([]byte(line), &te); err != nil {
-			return nil, err
+			badLine, badErr = lineNum, err
+			continue
 		}
 		rawOp := strings.ToLower(strings.TrimSpace(te.Op))
 		if rawOp == "episode" || rawOp == "rollout" {
@@ -363,8 +402,13 @@ func ParseTraceJSONLFile(path, defaultJob string) ([]swebench.Event, error) {
 		records = append(records, te)
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return nil, stats, err
 	}
+	if badErr != nil {
+		stats.TruncatedTail = 1
+		stats.TruncatedLine = badLine
+	}
+	stats.Records = len(records)
 
 	var out []swebench.Event
 	pendingFirstCmd := make(map[string]pendingClaim) // env -> claim timing
@@ -662,7 +706,7 @@ func ParseTraceJSONLFile(path, defaultJob string) ([]swebench.Event, error) {
 			}
 		}
 	}
-	return out, nil
+	return out, stats, nil
 }
 
 func normalizeTraceOp(op string) string {

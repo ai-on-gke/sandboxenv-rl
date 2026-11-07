@@ -431,13 +431,17 @@ func (rep *Report) RecordTraceCapture(captured bool, files int) {
 
 // TraceCapturedLabel is the human-readable trace capture fact.
 func (rep *Report) TraceCapturedLabel() string {
+	truncated := ""
+	if rep.TraceTruncatedLines > 0 {
+		truncated = fmt.Sprintf("; %d truncated trailing line(s) dropped", rep.TraceTruncatedLines)
+	}
 	switch {
 	case !rep.TraceCaptured:
 		return "no"
 	case rep.TraceFileCount > 0:
-		return fmt.Sprintf("yes (%d trace files; latencies include trace overhead)", rep.TraceFileCount)
+		return fmt.Sprintf("yes (%d trace files; latencies include trace overhead%s)", rep.TraceFileCount, truncated)
 	default:
-		return "yes (latencies include trace overhead)"
+		return fmt.Sprintf("yes (latencies include trace overhead%s)", truncated)
 	}
 }
 
@@ -458,12 +462,14 @@ func (rep *Report) TraceMetadata() map[string]string {
 }
 
 // Trace JSONL locations: the SDK's trace.jsonl / verl-live-trace.jsonl,
-// RealJobDriver's traces/<job>/, and traces gathered from Ray workers.
+// RealJobDriver's traces/<job>/, per-pod traces/<job>/<pod>/ written by
+// trace_collection, and traces gathered from Ray workers.
 var traceFilePatterns = []string{
 	"trace.jsonl",
 	"verl-live-trace.jsonl",
 	filepath.Join("traces", "*.jsonl"),
 	filepath.Join("traces", "*", "*.jsonl"),
+	filepath.Join("traces", "*", "*", "*.jsonl"),
 	filepath.Join("results", "traces", "*.jsonl"),
 }
 

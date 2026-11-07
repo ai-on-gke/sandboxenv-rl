@@ -382,6 +382,9 @@ type Report struct {
 	// include trace overhead. Always emitted so "no trace" is explicit.
 	TraceCaptured  bool `json:"trace_captured"`
 	TraceFileCount int  `json:"trace_file_count,omitempty"`
+	// TraceTruncatedLines counts torn trailing lines dropped from trace
+	// shards that were copied while their writer was mid-record.
+	TraceTruncatedLines int `json:"trace_truncated_lines,omitempty"`
 
 	// Auxiliary counters populated from event streams for validity rules and setup identification.
 	PrewarmCount        int  `json:"prewarm_count,omitempty"`

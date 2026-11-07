@@ -47,7 +47,9 @@ clients do not follow redirects.
   request-target. A path that starts with `//` would read as an authority if written as is, so in it
   only those bytes are escaped and the segments stay. Found by an audit of the criterion: the
   property test sent its paths through `http.Client`, which escapes these bytes itself, and
-  generated none of them.
+  generated none of them. It now writes each request line on a raw TCP connection, generates these
+  bytes mixed with `%2F`, a leading `//` and a query, and also sends the routing prefix with one
+  separator escaped, which must reach no daemon. On the old code it fails at once, shrunk to `/{`.
 
 It is not a timing bug, so `testing/synctest` alone would not have found it: synctest makes
 scheduling deterministic but generates no inputs and checks nothing.

@@ -122,6 +122,11 @@ user needs to know across them.
 
 ### Fixed
 
+- Python client: `RunReport.to_dict()` keeps every phase's
+  `0 <= max_s <= total_s <= count * max_s`. It rounded `total_s` and `max_s`
+  to 0.01 separately, so 3 phases of 0.004 s reported `total_s` 0.01 and
+  `max_s` 0.0. `max_s` now rounds up to the next 0.01 and `total_s` stays
+  between `max_s` and `count * max_s` (#273).
 - swebench-loader `-park-each`: the last step deletes each environment right
   after its replay instead of suspending it (unless `-keep`). A 37,000
   environment run suspended them all, one more snapshot upload each. The

@@ -41,6 +41,7 @@ import contextlib
 import datetime
 import json
 import logging
+import math
 import pathlib
 import re
 import threading
@@ -309,14 +310,27 @@ class RunReport:
         names = list(self.ORDER) + [p for p in self.phases if p not in self.ORDER]
         return [(p, self.phases[p]) for p in names if p in self.phases]
 
+    @staticmethod
+    def _phase_dict(c: list[float]) -> dict[str, Any]:
+        """One ``phases`` entry, in seconds to 0.01, keeping ``0 <= max_s <= total_s <= count * max_s``.
+
+        Rounding ``total_s`` and ``max_s`` to the nearest 0.01 separately breaks
+        the bound for short phases (3 of 0.004 s give 0.01 and 0.0). So
+        ``max_s`` rounds up to the next 0.01, ignoring float noise below 1e-11 s,
+        and ``total_s`` rounds to the nearest 0.01, then is moved into
+        ``[max_s, count * max_s]``. The move is less than 0.01 s up, or one
+        float step down where ``count * max_s`` is just under a multiple of 0.01.
+        """
+        count = int(c[0])
+        max_s = math.ceil(round(c[2] * 100, 9)) / 100
+        total_s = min(max(round(c[1], 2), max_s), count * max_s)
+        return {"count": count, "total_s": total_s, "max_s": max_s}
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "strategy": self.strategy,
             "total_s": round(self.total_s, 2),
-            "phases": {
-                p: {"count": int(c[0]), "total_s": round(c[1], 2), "max_s": round(c[2], 2)}
-                for p, c in self._ordered()
-            },
+            "phases": {p: self._phase_dict(c) for p, c in self._ordered()},
             "claims": self.claims,
             "tasks_ok": self.tasks_ok,
             "tasks_err": self.tasks_err,

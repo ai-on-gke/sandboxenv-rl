@@ -104,6 +104,9 @@ if [[ -n "${AUTH_TOKEN_SECRET}" ]]; then
                   name: ${AUTH_TOKEN_SECRET}
                   key: token")
 fi
+if [[ "${ENABLE_TRACING}" == "1" && -z "${OTEL_EXPORTER_OTLP_ENDPOINT}" ]]; then
+  echo "warning: ENABLE_TRACING=1 with no OTEL_EXPORTER_OTLP_ENDPOINT: the loader exports its spans to the OTel default localhost:4317 in its pod; without a collector there each export fails" >&2
+fi
 if [[ "${ENABLE_TRACING}" == "1" && -n "${OTEL_EXPORTER_OTLP_ENDPOINT}" ]]; then
   OTLP_EP_JSON="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${OTEL_EXPORTER_OTLP_ENDPOINT}")"
   LOADER_ENV_LINES+=("            - name: OTEL_EXPORTER_OTLP_ENDPOINT
@@ -145,19 +148,23 @@ fi
 GCS_BENCHMARK_FOLDER="${GCS_BENCHMARK_FOLDER:-}"
 GCS_BENCHMARK_NICKNAME="${GCS_BENCHMARK_NICKNAME:-}"
 GCS_DRY_RUN="${GCS_DRY_RUN:-0}"
-if [[ -n "${COLLECT_TELEMETRY:-}" ]]; then
-  COLLECT_TELEMETRY="${COLLECT_TELEMETRY}"
-elif [[ -n "${GCS_BENCHMARK_BUCKET}" ]]; then
-  COLLECT_TELEMETRY="1"
-else
-  COLLECT_TELEMETRY="0"
+if [[ -z "${COLLECT_TELEMETRY:-}" ]]; then
+  if [[ -n "${GCS_BENCHMARK_BUCKET}" ]]; then
+    COLLECT_TELEMETRY="1"
+  else
+    COLLECT_TELEMETRY="0"
+  fi
 fi
-if [[ -n "${VALIDATE_BUNDLE:-}" ]]; then
-  VALIDATE_BUNDLE="${VALIDATE_BUNDLE}"
-elif [[ "${COLLECT_TELEMETRY}" == "1" || -n "${GCS_BENCHMARK_BUCKET}" ]]; then
-  VALIDATE_BUNDLE="1"
-else
-  VALIDATE_BUNDLE="0"
+if [[ "${COLLECT_TELEMETRY}" != "0" && "${COLLECT_TELEMETRY}" != "1" ]]; then
+  echo "COLLECT_TELEMETRY must be 0 or 1 (got '${COLLECT_TELEMETRY}')" >&2
+  exit 2
+fi
+if [[ -z "${VALIDATE_BUNDLE:-}" ]]; then
+  if [[ "${COLLECT_TELEMETRY}" == "1" || -n "${GCS_BENCHMARK_BUCKET}" ]]; then
+    VALIDATE_BUNDLE="1"
+  else
+    VALIDATE_BUNDLE="0"
+  fi
 fi
 BUNDLE_MODE=0
 if [[ "${COLLECT_TELEMETRY}" == "1" || -n "${ARTIFACT_DIR:-}" || -n "${GCS_BENCHMARK_BUCKET}" || "${VALIDATE_BUNDLE}" == "1" ]]; then
@@ -318,6 +325,7 @@ merge_harvest() {
   echo "restore records in ${RESTORE_LOG}: $(wc -l < "${RESTORE_LOG}" | tr -d ' ')"
 }
 
+# shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
 cleanup_with_telemetry() {
   bench_cleanup_telemetry
   cleanup

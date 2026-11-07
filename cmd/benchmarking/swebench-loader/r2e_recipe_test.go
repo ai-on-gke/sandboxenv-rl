@@ -696,7 +696,13 @@ func TestAllStrategiesRenderPlanAndDirectDriverValidation(t *testing.T) {
 	}
 
 	// 4. Verify run-r2e-swebench.sh dry-run telemetry, tracing, and GCS folder validation.
+	// The script derives and checks the GCS folder with python3 whenever a bucket,
+	// a folder or bundle validation is in effect, so both dry-runs need it.
 	scriptPath := filepath.Join("..", "..", "..", "benchmarking", "swebench", "run-r2e-swebench.sh")
+	_, pyErr := exec.LookPath("python3")
+	if pyErr != nil {
+		t.Logf("python3 not found (%v); skipping the --gcs-bucket dry-runs", pyErr)
+	}
 	artDir := filepath.Join(dir, "dry-gcs")
 	cmd := exec.Command("bash", scriptPath, "dry-run",
 		"--r2e-dataset", r2eManifest,
@@ -715,21 +721,23 @@ func TestAllStrategiesRenderPlanAndDirectDriverValidation(t *testing.T) {
 		"--artifact-dir", artDir,
 	)
 	cmd.Env = append(os.Environ(), "SWE_EXCLUDE_FILE=")
-	outBytes, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("run-r2e-swebench.sh dry-run failed: %v\n%s", err, string(outBytes))
-	}
-	outText := string(outBytes)
-	for _, want := range []string{
-		"_simulated-w20_r2e2-swe2_smoke-go-naive/",
-		"_simulated-w20_r2e2-swe2_smoke-go-sliding/",
-	} {
-		if !strings.Contains(outText, "gs://unit-test-bucket/") || !strings.Contains(outText, want) {
-			t.Fatalf("dry-run output missing %q:\n%s", want, outText)
+	if pyErr == nil {
+		outBytes, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("run-r2e-swebench.sh dry-run failed: %v\n%s", err, string(outBytes))
+		}
+		outText := string(outBytes)
+		for _, want := range []string{
+			"_simulated-w20_r2e2-swe2_smoke-go-naive/",
+			"_simulated-w20_r2e2-swe2_smoke-go-sliding/",
+		} {
+			if !strings.Contains(outText, "gs://unit-test-bucket/") || !strings.Contains(outText, want) {
+				t.Fatalf("dry-run output missing %q:\n%s", want, outText)
+			}
 		}
 	}
 
-	if _, pyErr := exec.LookPath("python3"); pyErr == nil {
+	if pyErr == nil {
 		pyArtDir := filepath.Join(dir, "dry-py-traced")
 		pyCmd := exec.Command("bash", scriptPath, "dry-run",
 			"--r2e-dataset", r2eManifest,

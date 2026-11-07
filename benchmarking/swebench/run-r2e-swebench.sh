@@ -963,12 +963,16 @@ GCS_DRY_RUN="${CLI_GCS_DRY_RUN:-${GCS_DRY_RUN:-0}}"
 
 if [[ -n "${CLI_COLLECT_TELEMETRY}" ]]; then
   COLLECT_TELEMETRY="${CLI_COLLECT_TELEMETRY}"
-elif [[ -n "${COLLECT_TELEMETRY:-}" ]]; then
-  COLLECT_TELEMETRY="${COLLECT_TELEMETRY}"
-elif [[ -n "${GCS_BENCHMARK_BUCKET}" ]]; then
-  COLLECT_TELEMETRY="1"
-else
-  COLLECT_TELEMETRY="0"
+elif [[ -z "${COLLECT_TELEMETRY:-}" ]]; then
+  if [[ -n "${GCS_BENCHMARK_BUCKET}" ]]; then
+    COLLECT_TELEMETRY="1"
+  else
+    COLLECT_TELEMETRY="0"
+  fi
+fi
+if [[ "${COLLECT_TELEMETRY}" != "0" && "${COLLECT_TELEMETRY}" != "1" ]]; then
+  echo "COLLECT_TELEMETRY must be 0 or 1 (got '${COLLECT_TELEMETRY}')" >&2
+  exit 2
 fi
 
 if [[ "${COLLECT_TELEMETRY}" == "1" ]]; then
@@ -1001,14 +1005,27 @@ if [[ -n "${FOOTING}" && "${FOOTING}" != "warm" && "${FOOTING}" != "cold" ]]; th
 fi
 ENABLE_TRACING="${CLI_ENABLE_TRACING:-${ENABLE_TRACING:-0}}"
 OTEL_EXPORTER_OTLP_ENDPOINT="${CLI_OTLP_ENDPOINT:-${OTEL_EXPORTER_OTLP_ENDPOINT:-}}"
+if [[ "${ENABLE_TRACING}" == "1" && -z "${OTEL_EXPORTER_OTLP_ENDPOINT}" ]]; then
+  for c_tr in "${CLIENTS[@]}"; do
+    if [[ "${c_tr}" != "python" ]]; then
+      echo "warning: --trace with no --otlp-endpoint: the ${c_tr} arms export their spans to the OTel default localhost:4317; without a collector there each export fails" >&2
+    fi
+  done
+fi
 if [[ -n "${CLI_VALIDATE_BUNDLE}" ]]; then
   VALIDATE_BUNDLE="${CLI_VALIDATE_BUNDLE}"
-elif [[ -n "${VALIDATE_BUNDLE:-}" ]]; then
-  VALIDATE_BUNDLE="${VALIDATE_BUNDLE}"
-elif [[ "${COLLECT_TELEMETRY}" == "1" || -n "${GCS_BENCHMARK_BUCKET}" ]]; then
-  VALIDATE_BUNDLE="1"
-else
-  VALIDATE_BUNDLE="0"
+elif [[ -z "${VALIDATE_BUNDLE:-}" ]]; then
+  if [[ "${COLLECT_TELEMETRY}" == "1" || -n "${GCS_BENCHMARK_BUCKET}" ]]; then
+    VALIDATE_BUNDLE="1"
+  else
+    VALIDATE_BUNDLE="0"
+  fi
+fi
+# bench_bundle_has_trace and bench_check_gcs_folder_syntax run python3 whenever
+# a GCS folder is derived or checked: with a bucket or folder, and after each
+# arm that is validated.
+if [[ -n "${GCS_BENCHMARK_BUCKET}" || -n "${GCS_BENCHMARK_FOLDER}" || "${VALIDATE_BUNDLE}" == "1" ]]; then
+  command -v python3 >/dev/null || { echo "python3 is required with --gcs-bucket, --gcs-folder and --validate-bundle (GCS folder checks)" >&2; exit 2; }
 fi
 
 if [[ -z "${EXECUTION:-}" ]]; then
@@ -1581,6 +1598,7 @@ cleanup_cluster() {
   bench_stop_measure_loop ""
 }
 
+# shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
 cleanup_all() {
   cleanup_cluster
   bench_cleanup_telemetry

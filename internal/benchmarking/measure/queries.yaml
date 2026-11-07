@@ -42,26 +42,189 @@ queries:
   - name: ate_env_client_acquire_seconds
     expr: ate_env_client_acquire_seconds_sum
     required: false
+  - name: ate_env_client_acquire_seconds_bucket
+    expr: ate_env_client_acquire_seconds_bucket
+    required: false
+  - name: ate_env_client_acquire_seconds_count
+    expr: ate_env_client_acquire_seconds_count
+    required: false
   - name: ate_env_client_exec_seconds
     expr: ate_env_client_exec_seconds_sum
+    required: false
+  - name: ate_env_client_exec_seconds_bucket
+    expr: ate_env_client_exec_seconds_bucket
+    required: false
+  - name: ate_env_client_exec_seconds_count
+    expr: ate_env_client_exec_seconds_count
     required: false
   - name: ate_env_client_suspend_seconds
     expr: ate_env_client_suspend_seconds_sum
     required: false
+  - name: ate_env_client_suspend_seconds_bucket
+    expr: ate_env_client_suspend_seconds_bucket
+    required: false
+  - name: ate_env_client_suspend_seconds_count
+    expr: ate_env_client_suspend_seconds_count
+    required: false
   - name: ate_env_client_warm_claim_seconds
     expr: ate_env_client_warm_claim_seconds_sum
+    required: false
+  - name: ate_env_client_warm_claim_seconds_bucket
+    expr: ate_env_client_warm_claim_seconds_bucket
+    required: false
+  - name: ate_env_client_warm_claim_seconds_count
+    expr: ate_env_client_warm_claim_seconds_count
     required: false
   - name: ate_env_client_release_seconds
     expr: ate_env_client_release_seconds_sum
     required: false
+  - name: ate_env_client_release_seconds_bucket
+    expr: ate_env_client_release_seconds_bucket
+    required: false
+  - name: ate_env_client_release_seconds_count
+    expr: ate_env_client_release_seconds_count
+    required: false
   - name: ate_env_client_slot_wait_seconds
     expr: ate_env_client_slot_wait_seconds_sum
+    required: false
+  - name: ate_env_client_slot_wait_seconds_bucket
+    expr: ate_env_client_slot_wait_seconds_bucket
+    required: false
+  - name: ate_env_client_slot_wait_seconds_count
+    expr: ate_env_client_slot_wait_seconds_count
     required: false
   - name: ate_env_client_wire_claim_seconds
     expr: ate_env_client_wire_claim_seconds_sum
     required: false
+  - name: ate_env_client_wire_claim_seconds_bucket
+    expr: ate_env_client_wire_claim_seconds_bucket
+    required: false
+  - name: ate_env_client_wire_claim_seconds_count
+    expr: ate_env_client_wire_claim_seconds_count
+    required: false
   - name: ate_env_client_ready_to_first_command_seconds
     expr: ate_env_client_ready_to_first_command_seconds_sum
+    required: false
+  - name: ate_env_client_ready_to_first_command_seconds_bucket
+    expr: ate_env_client_ready_to_first_command_seconds_bucket
+    required: false
+  - name: ate_env_client_ready_to_first_command_seconds_count
+    expr: ate_env_client_ready_to_first_command_seconds_count
+    required: false
+  - name: ate_env_client_ttfi_seconds
+    expr: ate_env_client_ttfi_seconds_sum
+    required: false
+  - name: ate_env_client_ttfi_seconds_bucket
+    expr: ate_env_client_ttfi_seconds_bucket
+    required: false
+  - name: ate_env_client_ttfi_seconds_count
+    expr: ate_env_client_ttfi_seconds_count
+    required: false
+  - name: ate_env_client_grade_seconds
+    expr: ate_env_client_grade_seconds_sum
+    required: false
+  - name: ate_env_client_grade_seconds_bucket
+    expr: ate_env_client_grade_seconds_bucket
+    required: false
+  - name: ate_env_client_grade_seconds_count
+    expr: ate_env_client_grade_seconds_count
+    required: false
+  - name: ate_env_client_read_file_seconds
+    expr: ate_env_client_read_file_seconds_sum
+    required: false
+  - name: ate_env_client_read_file_seconds_bucket
+    expr: ate_env_client_read_file_seconds_bucket
+    required: false
+  - name: ate_env_client_read_file_seconds_count
+    expr: ate_env_client_read_file_seconds_count
+    required: false
+  - name: ate_env_client_write_file_seconds
+    expr: ate_env_client_write_file_seconds_sum
+    required: false
+  - name: ate_env_client_write_file_seconds_bucket
+    expr: ate_env_client_write_file_seconds_bucket
+    required: false
+  - name: ate_env_client_write_file_seconds_count
+    expr: ate_env_client_write_file_seconds_count
+    required: false
+  # Exact extremes of the client families (gauges)
+  - name: ate_env_client_acquire_max_seconds
+    expr: ate_env_client_acquire_max_seconds
+    required: false
+  - name: ate_env_client_acquire_min_seconds
+    expr: ate_env_client_acquire_min_seconds
+    required: false
+  - name: ate_env_client_exec_max_seconds
+    expr: ate_env_client_exec_max_seconds
+    required: false
+  - name: ate_env_client_exec_min_seconds
+    expr: ate_env_client_exec_min_seconds
+    required: false
+  - name: ate_env_client_suspend_max_seconds
+    expr: ate_env_client_suspend_max_seconds
+    required: false
+  - name: ate_env_client_suspend_min_seconds
+    expr: ate_env_client_suspend_min_seconds
+    required: false
+  - name: ate_env_client_warm_claim_max_seconds
+    expr: ate_env_client_warm_claim_max_seconds
+    required: false
+  - name: ate_env_client_warm_claim_min_seconds
+    expr: ate_env_client_warm_claim_min_seconds
+    required: false
+  - name: ate_env_client_release_max_seconds
+    expr: ate_env_client_release_max_seconds
+    required: false
+  - name: ate_env_client_release_min_seconds
+    expr: ate_env_client_release_min_seconds
+    required: false
+  - name: ate_env_client_slot_wait_max_seconds
+    expr: ate_env_client_slot_wait_max_seconds
+    required: false
+  - name: ate_env_client_slot_wait_min_seconds
+    expr: ate_env_client_slot_wait_min_seconds
+    required: false
+  - name: ate_env_client_wire_claim_max_seconds
+    expr: ate_env_client_wire_claim_max_seconds
+    required: false
+  - name: ate_env_client_wire_claim_min_seconds
+    expr: ate_env_client_wire_claim_min_seconds
+    required: false
+  - name: ate_env_client_ready_to_first_command_max_seconds
+    expr: ate_env_client_ready_to_first_command_max_seconds
+    required: false
+  - name: ate_env_client_ready_to_first_command_min_seconds
+    expr: ate_env_client_ready_to_first_command_min_seconds
+    required: false
+  - name: ate_env_client_ttfi_max_seconds
+    expr: ate_env_client_ttfi_max_seconds
+    required: false
+  - name: ate_env_client_ttfi_min_seconds
+    expr: ate_env_client_ttfi_min_seconds
+    required: false
+  - name: ate_env_client_grade_max_seconds
+    expr: ate_env_client_grade_max_seconds
+    required: false
+  - name: ate_env_client_grade_min_seconds
+    expr: ate_env_client_grade_min_seconds
+    required: false
+  - name: ate_env_client_read_file_max_seconds
+    expr: ate_env_client_read_file_max_seconds
+    required: false
+  - name: ate_env_client_read_file_min_seconds
+    expr: ate_env_client_read_file_min_seconds
+    required: false
+  - name: ate_env_client_write_file_max_seconds
+    expr: ate_env_client_write_file_max_seconds
+    required: false
+  - name: ate_env_client_write_file_min_seconds
+    expr: ate_env_client_write_file_min_seconds
+    required: false
+  - name: ate_env_fleet_task_latency_seconds_bucket
+    expr: ate_env_fleet_task_latency_seconds_bucket
+    required: false
+  - name: ate_env_fleet_task_latency_seconds_count
+    expr: ate_env_fleet_task_latency_seconds_count
     required: false
   # ate-env-api server series (#114)
   - name: ate_env_api_requests_total
@@ -73,8 +236,20 @@ queries:
   - name: ate_env_api_create_to_ready_seconds
     expr: ate_env_api_create_to_ready_seconds_sum
     required: false
+  - name: ate_env_api_create_to_ready_seconds_bucket
+    expr: ate_env_api_create_to_ready_seconds_bucket
+    required: false
+  - name: ate_env_api_create_to_ready_seconds_count
+    expr: ate_env_api_create_to_ready_seconds_count
+    required: false
   - name: ate_env_api_wake_wait_seconds
     expr: ate_env_api_wake_wait_seconds_sum
+    required: false
+  - name: ate_env_api_wake_wait_seconds_bucket
+    expr: ate_env_api_wake_wait_seconds_bucket
+    required: false
+  - name: ate_env_api_wake_wait_seconds_count
+    expr: ate_env_api_wake_wait_seconds_count
     required: false
   - name: ate_env_api_environments
     expr: max by (atespace, state) (ate_env_api_environments)

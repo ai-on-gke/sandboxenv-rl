@@ -17,6 +17,7 @@ package job
 import (
 	"bufio"
 	"encoding/json"
+	"math"
 	"os"
 	"regexp"
 	"sort"
@@ -341,6 +342,7 @@ func ParseTraceJSONLFile(path, defaultJob string) ([]swebench.Event, error) {
 	type pendingClaim struct {
 		claimMS    float64
 		slotWaitMS float64
+		readyAt    time.Time // end of the claim (create or wake) record
 	}
 	var records []rawTraceRecord
 	hasEpisodeOp := false
@@ -430,7 +432,7 @@ func ParseTraceJSONLFile(path, defaultJob string) ([]swebench.Event, error) {
 				Tags:     te.Tags,
 			})
 			if te.OK && te.Env != "" {
-				pendingFirstCmd[te.Env] = pendingClaim{claimMS: te.DurMS, slotWaitMS: slotWaitMS}
+				pendingFirstCmd[te.Env] = pendingClaim{claimMS: te.DurMS, slotWaitMS: slotWaitMS, readyAt: ts}
 			}
 		case "wake", "acquire":
 			sw := slotWaitMS
@@ -458,7 +460,7 @@ func ParseTraceJSONLFile(path, defaultJob string) ([]swebench.Event, error) {
 			})
 			if te.OK && te.Env != "" {
 				if _, exists := pendingFirstCmd[te.Env]; !exists {
-					pendingFirstCmd[te.Env] = pendingClaim{claimMS: te.DurMS, slotWaitMS: slotWaitMS}
+					pendingFirstCmd[te.Env] = pendingClaim{claimMS: te.DurMS, slotWaitMS: slotWaitMS, readyAt: ts}
 				}
 			}
 		case "prewarm":
@@ -605,8 +607,22 @@ func ParseTraceJSONLFile(path, defaultJob string) ([]swebench.Event, error) {
 			}
 			if pc, isFirst := pendingFirstCmd[te.Env]; isFirst && (rawOp == "exec" || rawOp == "shell" || !hasEpisodeOp) {
 				delete(pendingFirstCmd, te.Env)
+				// ttfi ends when the first command is issued, not when it
+				// returns. A trace record's ts is its span end, so the
+				// command started at ts - dur_ms; the gap from the claim's
+				// end to that start is the ready-to-first-command time. The
+				// command's own round trip (the boot or wake wait ate-env-api
+				// performs inside it, plus the run) is not part of it. The
+				// event is stamped at that start too, so its window
+				// [Time - DurMS, Time] is [ask, issue]: JoinRestores pairs
+				// restore records by that window.
+				firstStart := ts.Add(-time.Duration(te.DurMS * float64(time.Millisecond)))
+				readyToFirstMS := 0.0
+				if !pc.readyAt.IsZero() {
+					readyToFirstMS = math.Max(0, float64(firstStart.Sub(pc.readyAt))/float64(time.Millisecond))
+				}
 				out = append(out, swebench.Event{
-					Time:     ts,
+					Time:     firstStart,
 					RunID:    runID,
 					Job:      jobName,
 					Worker:   te.Worker,
@@ -616,14 +632,29 @@ func ParseTraceJSONLFile(path, defaultJob string) ([]swebench.Event, error) {
 					Instance: te.Instance,
 					Image:    te.Image,
 					Step:     te.Step,
-					DurMS:    pc.slotWaitMS + pc.claimMS + te.DurMS,
+					DurMS:    pc.slotWaitMS + pc.claimMS + readyToFirstMS,
 					OK:       rpcOK,
 					Err:      te.Err,
 					Metrics: map[string]float64{
 						"sdk_slot_wait_ms":       pc.slotWaitMS,
 						"wire_claim_to_ready_ms": pc.claimMS,
-						"ready_to_first_cmd_ms":  te.DurMS,
+						"ready_to_first_cmd_ms":  readyToFirstMS,
 					},
+				})
+				out = append(out, swebench.Event{
+					Time:     ts,
+					RunID:    runID,
+					Job:      jobName,
+					Worker:   te.Worker,
+					Event:    swebench.EventTTFIC,
+					Source:   source,
+					Env:      te.Env,
+					Instance: te.Instance,
+					Image:    te.Image,
+					Step:     te.Step,
+					DurMS:    pc.slotWaitMS + pc.claimMS + readyToFirstMS + te.DurMS,
+					OK:       rpcOK,
+					Err:      te.Err,
 				})
 			}
 			isTaskEvent := !hasEpisodeOp || rawOp == "episode" || rawOp == "rollout"

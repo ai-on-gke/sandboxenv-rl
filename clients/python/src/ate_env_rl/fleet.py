@@ -19,6 +19,7 @@ import contextvars
 import dataclasses
 import logging
 import threading
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -34,6 +35,7 @@ from .runtime.base import RuntimeGuestHook
 from .sizing import plan_replicas
 from .strategies import STRATEGIES
 from .telemetry.trace_recorder import (
+    current_slot_wait_s,
     is_trace_mode,
     record_trace_event,
     register_env_meta,
@@ -503,6 +505,9 @@ class SandboxFleet:
             return self._acquire_task(task_obj, timeout_s)
 
     def _acquire_task(self, task_obj: Task, timeout_s: float | None) -> SandboxHandle:
+        # ttfi starts when the caller asked for a sandbox: before the strategy's
+        # slot wait, which ran already and left its length in the context.
+        acquire_started_at = time.monotonic() - (current_slot_wait_s.get() or 0.0)
         if task_obj.template:
             template_id = task_obj.template
             rootfs_image = None
@@ -559,6 +564,7 @@ class SandboxFleet:
             default_timeout_s=self.config.step_timeout_s,
             tracer=self._tracer,
             claim_source=claim_source,
+            _acquire_started_at=acquire_started_at,
         )
 
     def _build_runtime(

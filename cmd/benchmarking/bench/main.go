@@ -873,7 +873,6 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 			rep.CustomMetrics[k] = v
 		}
 	}
-	rep.WriteText(stdout)
 
 	outRep := benchArtifactReport{Report: rep}
 	measPath := filepath.Join(destDir, "measurements.json")
@@ -882,7 +881,8 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 		if derr != nil {
 			return fmt.Errorf("invalid measurements.json: %w", derr)
 		}
-		if rollUpSnapshotsIntoMeasurements(destDir, &meas) || len(meas.PromMetrics) == 0 {
+		snapFiles, _ := filepath.Glob(filepath.Join(destDir, "measurements_snapshots", "*.json"))
+		if rollUpSnapshotsIntoMeasurements(destDir, &meas) || len(snapFiles) > 0 || len(meas.PromMetrics) == 0 {
 			meas.PromMetrics = buildPromSeriesFromSnapshotsOrSummary(destDir, &meas)
 		}
 		_ = measure.WriteMeasurements(measPath, &meas)
@@ -927,6 +927,7 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 	rep.AttachClusterTelemetry(sysDescPtr, outRep.Measurements)
 	swebench.NormalizeLegacyReport(rep)
 	rep.RecordTraceCapture(false, len(swebench.FindTraceFiles(destDir)))
+	rep.WriteText(stdout)
 	if sysDescPtr != nil {
 		_ = sut.WriteSystemDescription(sysPath, *sysDescPtr)
 	}
@@ -1351,37 +1352,114 @@ func rollUpSnapshotsIntoMeasurements(destDir string, meas *schema.Measurements) 
 	return true
 }
 
+// promSeriesKey identifies a series by name and label set, so histogram
+// buckets (`le`), statuses and sources of one family stay distinct.
+func promSeriesKey(name string, labels map[string]string) string {
+	if len(labels) == 0 {
+		return name
+	}
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString(name)
+	for _, k := range keys {
+		b.WriteByte('|')
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(labels[k])
+	}
+	return b.String()
+}
+
+// isCumulativePromSeries reports whether name is a monotonic counter family
+// (histogram _bucket/_count/_sum or a _total counter) whose window value is a
+// delta rather than a level.
+func isCumulativePromSeries(name string) bool {
+	for _, suffix := range []string{"_bucket", "_count", "_sum", "_total"} {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildPromSeriesFromSnapshotsOrSummary folds the periodic
+// measurements_snapshots into one series set: every Prometheus series the
+// samples scraped (histogram buckets, counts and sums of the SDK and
+// ate-env-api families included) with its values in time order, plus one
+// series per ServerSummary scalar. The metrics-first report reads the
+// histogram families from here, so a workload whose pod is gone by the time
+// a post-run `bench measure` runs (its series stale in Prometheus) is still
+// reported from what the in-window samples saw.
 func buildPromSeriesFromSnapshotsOrSummary(destDir string, meas *schema.Measurements) []schema.PrometheusSeries {
 	if meas == nil {
 		return nil
 	}
 	seriesByMetric := make(map[string]*schema.PrometheusSeries)
 	var metricOrder []string
+	add := func(key string, mk func() *schema.PrometheusSeries) *schema.PrometheusSeries {
+		ps, exists := seriesByMetric[key]
+		if !exists {
+			ps = mk()
+			seriesByMetric[key] = ps
+			metricOrder = append(metricOrder, key)
+		}
+		return ps
+	}
 
 	snapFiles, _ := filepath.Glob(filepath.Join(destDir, "measurements_snapshots", "*.json"))
 	sort.Strings(snapFiles)
-	for _, sf := range snapFiles {
+	for idx, sf := range snapFiles {
 		raw, err := os.ReadFile(sf)
 		if err != nil {
 			continue
 		}
 		var snap schema.Measurements
-		if err := json.Unmarshal(raw, &snap); err != nil || len(snap.ServerSummary) == 0 {
+		if err := json.Unmarshal(raw, &snap); err != nil {
 			continue
 		}
+		for _, s := range snap.PromMetrics {
+			s := s
+			ps := add(promSeriesKey(s.Name, s.Labels), func() *schema.PrometheusSeries {
+				cp := s
+				cp.Values = nil
+				cp.Value = nil
+				// A cumulative series absent from the first sample belongs to
+				// a process that started inside the window (the workload pod
+				// came up after sampling began), so its window delta runs from
+				// zero, not from the first value scraped. This assumes the
+				// first sample saw every family that existed then; a family a
+				// failed scrape missed is read as new, which overstates its
+				// delta by its value at window start.
+				if idx > 0 && isCumulativePromSeries(s.Name) {
+					cp.Values = []float64{0}
+				}
+				return &cp
+			})
+			if s.Value != nil {
+				v := *s.Value
+				ps.Value = &v
+				ps.Values = append(ps.Values, v)
+			} else if len(s.Values) > 0 {
+				v := s.Values[len(s.Values)-1]
+				ps.Value = &v
+				ps.Values = append(ps.Values, s.Values...)
+			}
+			if s.Status != "" {
+				ps.Status = s.Status
+			}
+		}
 		for k, ms := range snap.ServerSummary {
-			ps, exists := seriesByMetric[k]
-			if !exists {
-				val := ms.P50
-				ps = &schema.PrometheusSeries{
+			ps := add(promSeriesKey(k, map[string]string{"unit": ms.Unit}), func() *schema.PrometheusSeries {
+				return &schema.PrometheusSeries{
 					Name:   k,
 					Labels: map[string]string{"unit": ms.Unit},
 					Status: "ok",
-					Value:  &val,
 				}
-				seriesByMetric[k] = ps
-				metricOrder = append(metricOrder, k)
-			}
+			})
 			val := ms.P50
 			ps.Value = &val
 			ps.Values = append(ps.Values, val)
@@ -1389,28 +1467,26 @@ func buildPromSeriesFromSnapshotsOrSummary(destDir string, meas *schema.Measurem
 	}
 
 	for k, ms := range meas.ServerSummary {
-		ps, exists := seriesByMetric[k]
-		if !exists {
-			val := ms.P50
-			ps = &schema.PrometheusSeries{
+		val := ms.P50
+		add(promSeriesKey(k, map[string]string{"unit": ms.Unit}), func() *schema.PrometheusSeries {
+			return &schema.PrometheusSeries{
 				Name:   k,
 				Labels: map[string]string{"unit": ms.Unit},
 				Status: "ok",
 				Value:  &val,
 				Values: []float64{val},
 			}
-			seriesByMetric[k] = ps
-			metricOrder = append(metricOrder, k)
-		}
+		})
 	}
 	for _, existing := range meas.PromMetrics {
 		cp := existing
-		ps, exists := seriesByMetric[cp.Name]
+		key := promSeriesKey(cp.Name, cp.Labels)
+		ps, exists := seriesByMetric[key]
 		if !exists {
-			seriesByMetric[cp.Name] = &cp
-			metricOrder = append(metricOrder, cp.Name)
+			seriesByMetric[key] = &cp
+			metricOrder = append(metricOrder, key)
 		} else if len(cp.Values) > len(ps.Values) {
-			seriesByMetric[cp.Name] = &cp
+			seriesByMetric[key] = &cp
 		}
 	}
 	sort.Strings(metricOrder)

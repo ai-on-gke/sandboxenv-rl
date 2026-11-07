@@ -202,9 +202,10 @@ describes.
 
 ## 3. Read the report
 
-- `ttfi` is create start to first command answered; `retried` on that row counts first commands
-  that waited on a bake or a wake.
-- The `restore first` block (needs `RESTORE_LOG`) splits each first command: `download` is the
+- `ttfi` is the ask for a sandbox to the first command being issued; `ttfic` runs on to that
+  command's answer, so it holds the boot or restore wait. `retried` on the `ttfic` row counts first
+  commands that waited on a bake or a wake.
+- The `restore first` block (needs `RESTORE_LOG`) splits each first command (paired by its `ttfic` window): `download` is the
   golden from the bucket, `oci_unpack` is the image onto the node, `worker_restore` is gVisor,
   `outside` is everything atelet does not do (create, placement, router, guest readiness). No
   restore records at all means the actors booted; see check 3.

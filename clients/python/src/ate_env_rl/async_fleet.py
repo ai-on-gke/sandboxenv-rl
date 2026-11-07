@@ -280,6 +280,9 @@ class AsyncSandboxFleet:
             return await self._acquire_task(task_obj, timeout_s)
 
     async def _acquire_task(self, task_obj: Task, timeout_s: float | None) -> SandboxHandle:
+        # ttfi starts when the caller asked for a sandbox: before the slot
+        # wait, which ran already and left its length in the context.
+        acquire_started_at = time.monotonic() - (current_slot_wait_s.get() or 0.0)
         if task_obj.template:
             template_id = task_obj.template
             rootfs_image = None
@@ -356,6 +359,7 @@ class AsyncSandboxFleet:
             default_timeout_s=self.config.step_timeout_s,
             tracer=self._fleet._tracer,
             claim_source=claim_source,
+            _acquire_started_at=acquire_started_at,
         )
 
     async def acquire_batch(

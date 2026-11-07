@@ -451,10 +451,10 @@ func TestJoinRestores(t *testing.T) {
 		return v
 	}
 	events := []Event{
-		{Time: at("10:00:10"), RunID: "r", Event: EventTTFI, Env: "r-a-0", DurMS: 10100, OK: true},
+		{Time: at("10:00:10"), RunID: "r", Event: EventTTFIC, Env: "r-a-0", DurMS: 10100, OK: true},
 		{Time: at("10:05:02"), RunID: "r", Event: EventWake, Env: "r-a-0", Step: 2, DurMS: 1500, OK: true},
-		{Time: at("10:00:45"), RunID: "r", Event: EventTTFI, Env: "r-b-0", DurMS: 46000, OK: true, Attempts: 2},
-		{Time: at("10:00:20"), RunID: "r", Event: EventTTFI, Env: "r-c-0", DurMS: 5000, OK: true},
+		{Time: at("10:00:45"), RunID: "r", Event: EventTTFIC, Env: "r-b-0", DurMS: 46000, OK: true, Attempts: 2},
+		{Time: at("10:00:20"), RunID: "r", Event: EventTTFIC, Env: "r-c-0", DurMS: 5000, OK: true},
 		{Time: at("10:10:02"), RunID: "r", Event: EventWake, Env: "r-c-0", Step: 2, DurMS: 2000, OK: true},
 		{Time: at("10:20:03"), RunID: "r", Event: EventWake, Env: "r-c-0", Step: 3, DurMS: 3000, OK: false, Err: "timeout"},
 		{Time: at("10:30:02"), RunID: "r", Event: EventWake, Env: "r-c-0", Step: 4, DurMS: 2000, OK: true},
@@ -584,10 +584,10 @@ func TestPool(t *testing.T) {
 
 func TestSlowest(t *testing.T) {
 	events := []Event{
-		{Event: EventTTFI, Env: "e1", Instance: "i1", DurMS: 10, OK: true},
-		{Event: EventTTFI, Env: "e2", Instance: "i2", DurMS: 30, OK: true, Attempts: 2},
-		{Event: EventTTFI, Env: "e3", Instance: "i3", DurMS: 20, OK: true},
-		{Event: EventTTFI, Env: "e4", Instance: "i4", DurMS: 99, OK: false},
+		{Event: EventTTFIC, Env: "e1", Instance: "i1", DurMS: 10, OK: true},
+		{Event: EventTTFIC, Env: "e2", Instance: "i2", DurMS: 30, OK: true, Attempts: 2},
+		{Event: EventTTFIC, Env: "e3", Instance: "i3", DurMS: 20, OK: true},
+		{Event: EventTTFIC, Env: "e4", Instance: "i4", DurMS: 99, OK: false},
 		{Event: EventWake, Env: "e1", Step: 2, DurMS: 5, OK: true},
 		{Event: EventWake, Env: "e2", Step: 2, DurMS: 7, OK: true},
 	}
@@ -599,7 +599,7 @@ func TestSlowest(t *testing.T) {
 	rep.Slowest = got
 	var text bytes.Buffer
 	rep.WriteText(&text)
-	if flat := strings.Join(strings.Fields(text.String()), " "); !strings.Contains(flat, "slowest first commands and wakes: event env instance step ms attempts ttfi e2 i2 0 30 2") {
+	if flat := strings.Join(strings.Fields(text.String()), " "); !strings.Contains(flat, "slowest first commands and wakes: event env instance step ms attempts ttfic e2 i2 0 30 2") {
 		t.Fatalf("slowest table:\n%s", text.String())
 	}
 }

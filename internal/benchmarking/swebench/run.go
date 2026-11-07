@@ -1500,17 +1500,38 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 		res, attempts, err := r.doStep(ctx, e, s, first)
 		dur := time.Since(stepStart)
 		if first {
-			fe := r.event(firstEvent, e, step, time.Since(firstStart), err)
+			// ttfi: from the ask for a sandbox (the slot wait, then the
+			// claim) until the first command is issued; the command's own
+			// round trip, which holds the readiness wait the server performs
+			// before running it, is the step's own duration. A wake keeps
+			// its whole first round trip: the wake is the call.
+			firstDur := time.Since(firstStart)
+			if firstEvent == EventTTFI {
+				firstDur = stepStart.Sub(firstStart)
+			}
+			fe := r.event(firstEvent, e, step, firstDur, err)
 			fe.Attempts = attempts
 			fe.SlotWaitMS = e.slotWaitMS
 			if firstEvent == EventTTFI {
+				// Stamped when the first command was issued, so the event's
+				// window [Time - DurMS, Time] is [ask, issue], the span ttfi
+				// measures.
+				fe.Time = stepStart.UTC()
 				wireMS := math.Max(0, ms(stepStart.Sub(firstStart)))
-				firstCmdMS := ms(dur)
+				fe.DurMS = round1(e.slotWaitMS + wireMS)
 				fe.Metrics = map[string]float64{
 					"sdk_slot_wait_ms":       round1(e.slotWaitMS),
 					"wire_claim_to_ready_ms": round1(wireMS),
-					"ready_to_first_cmd_ms":  round1(firstCmdMS),
+					"ready_to_first_cmd_ms":  0,
 				}
+				// ttfic runs on to the first command's return: it holds the
+				// boot or restore wait the server performs inside that
+				// command, which is what the restore records pair against.
+				fc := r.event(EventTTFIC, e, step, time.Since(firstStart), err)
+				fc.DurMS = round1(e.slotWaitMS + fc.DurMS)
+				fc.Attempts = attempts
+				fc.SlotWaitMS = e.slotWaitMS
+				r.rec.Record(fc)
 			}
 			r.rec.Record(fe)
 			first = false

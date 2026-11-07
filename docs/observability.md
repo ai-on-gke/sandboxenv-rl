@@ -90,9 +90,10 @@ A Go client's spans take the place of the `ate_env_client.*` ones, named
 `suspend_environment`, `delete_environment`, `exec`, `read_file`,
 `write_file`), as children of whatever span the caller's context carries.
 
-The swebench loader writes each event when its operation finishes, so with
-`-enable-tracing` every event becomes one span recorded after the fact, timed
-from the event's `ts` minus `dur_ms` to `ts`, all under one run span:
+The swebench loader writes each event when its operation finishes (the
+`ttfi` event when the first command is issued), so with `-enable-tracing`
+every event becomes one span recorded after the fact, timed from the event's
+`ts` minus `dur_ms` to `ts`, all under one run span:
 
 ```
 swebench-loader.run          attributes run, mode
@@ -131,7 +132,8 @@ spans carry its own `run`, `env` and `instance`.
   `ate_env_client_ttfi_seconds` (time to first instruction: the ask for a
   sandbox to the first command being issued) and the per-operation
   `ate_env_client_{grade,read_file,write_file}_seconds`, all with `status` and
-  `source` labels):
+  `source` labels, each histogram paired with exact
+  `ate_env_client_<op>_{max,min}_seconds` gauges):
   the [Python client README](../clients/python/README.md#observability).
 
 Collectors register on the first metrics-enabled `Observer`, never at import,

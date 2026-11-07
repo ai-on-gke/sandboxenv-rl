@@ -563,6 +563,11 @@ wake wait the server performs inside that first call is not included, see
 A command counts as grading when `exec(..., phase="grade")` says so; without
 `phase`, commands naming `run_tests.sh` or `/eval.sh`
 (`SandboxHandle.DEFAULT_GRADE_COMMAND_MARKERS`) do, and `phase=""` opts out.
+Every `ate_env_client_*_seconds` histogram has buckets from 10 ms to 600 s
+and a pair of gauges, `ate_env_client_<op>_max_seconds` and
+`ate_env_client_<op>_min_seconds` with the same labels, that hold the exact
+largest and smallest observation of the process, since a histogram can only
+place them inside a bucket.
 Collectors register on the first metrics-enabled `Observer`, never at
 import. Labels are limited to `phase`, `backend` (`substrate` or `mock`),
 `family` (the task's repo family, see `ate_env_rl.observability.repo_family`),
@@ -684,14 +689,15 @@ Like otelgrpc, the client reads `OTEL_SEMCONV_STABILITY_OPT_IN` once at import:
 `rpc.method` (`CreateEnvironment`), and `rpc/dup` gives both sets, with the full
 `rpc.method`. Set it to the same value for the client and for `ate-env-api`.
 
-**Time to first command (TTFC).** `acquire` ends when the create call
+**Time to first instruction.** `acquire` ends when the create call
 returns. The wake and readiness wait happen inside the first command, so the
-first `exec` span of each sandbox holds wake time plus command time. Compute
-TTFC per sandbox as the start of `ate_env_client.acquire` to the end of the
-`ate_env_client.exec` span with `ate_env.first_command=true` and the same
-`ate.actor.name`. This equals the swebench loader's `ttfi` (create start to
-first command returning), so a real trainer and the loader report the same
-client-side number.
+first `exec` span of each sandbox holds wake time plus command time. Two
+numbers follow from the spans: `ttfi`, the start of `ate_env_client.acquire`
+to the start of the `ate_env_client.exec` span with
+`ate_env.first_command=true` and the same `ate.actor.name` (what
+`ate_env_client_ttfi_seconds` records), and `ttfic`, the same start to that
+span's end, which holds the wait. These equal the swebench loader's `ttfi` and
+`ttfic`, so a real trainer and the loader report the same client-side numbers.
 
 **Where spans go.** The client never installs the process-global
 OpenTelemetry `TracerProvider`. Its tracers choose a provider each time a span

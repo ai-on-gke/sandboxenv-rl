@@ -122,6 +122,12 @@ func TestMetricsPrimaryWithTraceFallback(t *testing.T) {
 		"0.1":  10,
 		"+Inf": 10,
 	}, 0.6)...)
+	// Exact extremes: the client exports them as gauges next to each histogram.
+	prom = append(prom,
+		schema.PrometheusSeries{Name: "ate_env_client_ttfi_max_seconds", Labels: map[string]string{"status": "ok", "source": "warm_pool"}, Values: []float64{0.9, 1.8}, Value: floatPtr(1.8)},
+		schema.PrometheusSeries{Name: "ate_env_client_ttfi_min_seconds", Labels: map[string]string{"status": "ok", "source": "warm_pool"}, Values: []float64{0.4, 0.3}, Value: floatPtr(0.3)},
+		schema.PrometheusSeries{Name: "ate_env_client_slot_wait_min_seconds", Labels: map[string]string{"status": "ok", "source": "warm_pool"}, Value: floatPtr(0.012)},
+	)
 	prom = append(prom,
 		schema.PrometheusSeries{
 			Name:   "ate_env_fleet_tasks_total",
@@ -153,8 +159,8 @@ func TestMetricsPrimaryWithTraceFallback(t *testing.T) {
 	if ttfi.P50MS != 875.0 {
 		t.Errorf("TTFI P50MS = %v, want 875.0", ttfi.P50MS)
 	}
-	if ttfi.MaxMS != 0 {
-		t.Errorf("TTFI MaxMS = %v, want 0 for a histogram-derived stat", ttfi.MaxMS)
+	if ttfi.MaxMS != 1800.0 {
+		t.Errorf("TTFI MaxMS = %v, want 1800 from the _max_seconds gauge", ttfi.MaxMS)
 	}
 	if rep.Headline == nil || rep.Headline.TTFIP50MS != 875.0 || rep.Headline.CreateP50MS != 1000.0 {
 		t.Fatalf("unexpected Headline: %+v", rep.Headline)
@@ -162,9 +168,15 @@ func TestMetricsPrimaryWithTraceFallback(t *testing.T) {
 	if gradeSt, ok := rep.StatFor(EventPhase, "grade"); !ok || gradeSt.Count != 10 {
 		t.Fatalf("grade phase stat = %+v (ok=%v), want Count=10", gradeSt, ok)
 	}
+	if gradeSt, _ := rep.StatFor(EventPhase, "grade"); gradeSt.MaxMS != 0 {
+		t.Errorf("grade MaxMS = %v, want 0 when no _max_seconds gauge was scraped", gradeSt.MaxMS)
+	}
 	sw := rep.CustomMetrics["sdk_slot_wait_ms"]
 	if sw.Count != 10 || sw.Sum != 600 || sw.P99 == 0 {
 		t.Fatalf("sdk_slot_wait_ms = %+v, want Count=10 Sum=600 (from _sum) and a P99", sw)
+	}
+	if sw.Min != 12 {
+		t.Errorf("sdk_slot_wait_ms Min = %v, want 12 from the _min_seconds gauge", sw.Min)
 	}
 	if rep.Headline.SDKSlotWaitP50MS != sw.P50 {
 		t.Fatalf("headline slot wait %v != custom metric %v", rep.Headline.SDKSlotWaitP50MS, sw.P50)

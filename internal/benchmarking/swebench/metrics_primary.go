@@ -101,8 +101,10 @@ func windowed(ps schema.PrometheusSeries) bool {
 // histogram series (`<baseName>_bucket`, `<baseName>_count`, `<baseName>_sum`) or
 // pre-aggregated MetricSummary entries in Measurements. Histogram series count
 // only when windowed (two samples); the quantiles are bucket estimates in the
-// manner of histogram_quantile, so MaxMS is left 0: a histogram holds no
-// observed maximum, only an upper bucket bound.
+// manner of histogram_quantile. MaxMS (and the summary's Min) come from the
+// client's `<family>_max_seconds` / `<family>_min_seconds` gauges when
+// scraped, and stay 0 otherwise: a histogram holds no observation, only
+// bucket bounds.
 func PromHistogramStat(meas *schema.Measurements, baseName string, labelFilter map[string]string) (Stat, bool) {
 	st, _, ok := promHistogram(meas, baseName, labelFilter)
 	return st, ok
@@ -111,7 +113,19 @@ func PromHistogramStat(meas *schema.Measurements, baseName string, labelFilter m
 // promHistogramDetail carries what Stat has no field for.
 type promHistogramDetail struct {
 	SumMS float64
+	MinMS float64
 	P99MS float64
+}
+
+// promSeriesLast is the newest value of a series.
+func promSeriesLast(ps schema.PrometheusSeries) (float64, bool) {
+	if n := len(ps.Values); n > 0 && !math.IsNaN(ps.Values[n-1]) {
+		return ps.Values[n-1], true
+	}
+	if ps.Value != nil && !math.IsNaN(*ps.Value) {
+		return *ps.Value, true
+	}
+	return 0, false
 }
 
 func promHistogram(meas *schema.Measurements, baseName string, labelFilter map[string]string) (Stat, promHistogramDetail, bool) {
@@ -122,11 +136,14 @@ func promHistogram(meas *schema.Measurements, baseName string, labelFilter map[s
 	bucketName := baseName + "_bucket"
 	countName := baseName + "_count"
 	sumName := baseName + "_sum"
+	family := strings.TrimSuffix(baseName, "_seconds")
+	maxName := family + "_max_seconds"
+	minName := family + "_min_seconds"
 	buckets := make(map[float64]float64)
 	var infCount, infErrCount float64
 	var explicitCount, explicitErrCount float64
-	var sumSeconds float64
-	var sawBucket, sawSum bool
+	var sumSeconds, maxSeconds, minSeconds float64
+	var sawBucket, sawSum, sawMax, sawMin bool
 
 	isErr := func(labels map[string]string) bool {
 		return labels != nil && (labels["status"] == "error" || labels["outcome"] == "error")
@@ -165,6 +182,16 @@ func promHistogram(meas *schema.Measurements, baseName string, labelFilter map[s
 			// queries.yaml scrapes <family>_sum under the family's base name.
 			sawSum = true
 			sumSeconds += promSeriesWindowDelta(ps)
+		case ps.Name == maxName && labelsMatch(ps.Labels, labelFilter):
+			// Gauges, not counters: the last value is the process-lifetime
+			// extreme, exact where the buckets can only bound it.
+			if v, ok := promSeriesLast(ps); ok && (!sawMax || v > maxSeconds) {
+				maxSeconds, sawMax = v, true
+			}
+		case ps.Name == minName && labelsMatch(ps.Labels, labelFilter):
+			if v, ok := promSeriesLast(ps); ok && v > 0 && (!sawMin || v < minSeconds) {
+				minSeconds, sawMin = v, true
+			}
 		}
 	}
 
@@ -183,13 +210,20 @@ func promHistogram(meas *schema.Measurements, baseName string, labelFilter map[s
 		if sawSum {
 			detail.SumMS = round2(sumSeconds * 1000.0)
 		}
-		return Stat{
+		if sawMin {
+			detail.MinMS = round2(minSeconds * 1000.0)
+		}
+		st := Stat{
 			Count:  int(math.Round(totalCount)),
 			Failed: int(math.Round(errCount)),
 			P50MS:  round2(p50),
 			P90MS:  round2(p90),
 			P95MS:  round2(p95),
-		}, detail, true
+		}
+		if sawMax {
+			st.MaxMS = round2(maxSeconds * 1000.0)
+		}
+		return st, detail, true
 	}
 
 	// Check pre-aggregated MetricSummary maps (CustomMetrics / ServerSummary).
@@ -203,7 +237,7 @@ func promHistogram(meas *schema.Measurements, baseName string, labelFilter map[s
 			if p95 == 0 {
 				p95 = summary.P90
 			}
-			detail.SumMS, detail.P99MS = summary.Sum, summary.P99
+			detail.SumMS, detail.MinMS, detail.P99MS = summary.Sum, summary.Min, summary.P99
 			return Stat{
 				Count: summary.Count,
 				P50MS: round2(summary.P50),
@@ -217,7 +251,7 @@ func promHistogram(meas *schema.Measurements, baseName string, labelFilter map[s
 			if p95 == 0 {
 				p95 = summary.P90
 			}
-			detail.SumMS, detail.P99MS = summary.Sum*1000.0, summary.P99*1000.0
+			detail.SumMS, detail.MinMS, detail.P99MS = summary.Sum*1000.0, summary.Min*1000.0, summary.P99*1000.0
 			return Stat{
 				Count: summary.Count,
 				P50MS: round2(summary.P50 * 1000.0),
@@ -261,6 +295,7 @@ func statToMetricSummaryMS(st Stat, d promHistogramDetail) schema.MetricSummary 
 	return schema.MetricSummary{
 		Count: st.Count,
 		Sum:   d.SumMS,
+		Min:   d.MinMS,
 		P50:   st.P50MS,
 		P90:   st.P90MS,
 		P95:   st.P95MS,
@@ -309,10 +344,11 @@ func (rep *Report) ApplyMetricsPrimaryWithTraceFallback(meas *schema.Measurement
 		} else if apiCreateSt, ok := PromHistogramStat(meas, "ate_env_api_create_to_ready_seconds", nil); ok {
 			apiCreateSt.Event = EventCreate
 			rep.upsertStatPrimary(apiCreateSt)
-		} else if acqSt, ok := PromHistogramStat(meas, "ate_env_client_acquire_seconds", nil); ok {
-			acqSt.Event = EventCreate
-			rep.upsertStatPrimary(acqSt)
 		}
+		// No third branch on ate_env_client_acquire_seconds: it has no source
+		// label and times warm claims and cold creates alike, so a window with
+		// no cold create would report warm claims as creates. The trace
+		// create stat, if any, stays.
 
 		if wakeSt, ok := PromHistogramStat(meas, "ate_env_client_warm_claim_seconds", nil); ok {
 			wakeSt.Event = EventWake

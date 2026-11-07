@@ -1415,10 +1415,13 @@ func buildPromSeriesFromSnapshotsOrSummary(destDir string, meas *schema.Measurem
 				cp := s
 				cp.Values = nil
 				cp.Value = nil
-				// A cumulative series that first shows up partway through the
-				// window belongs to a process that started inside it (the
-				// workload pod came up after sampling began), so its window
-				// delta runs from zero, not from the first value scraped.
+				// A cumulative series absent from the first sample belongs to
+				// a process that started inside the window (the workload pod
+				// came up after sampling began), so its window delta runs from
+				// zero, not from the first value scraped. This assumes the
+				// first sample saw every family that existed then; a family a
+				// failed scrape missed is read as new, which overstates its
+				// delta by its value at window start.
 				if idx > 0 && isCumulativePromSeries(s.Name) {
 					cp.Values = []float64{0}
 				}

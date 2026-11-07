@@ -410,7 +410,7 @@ type SlowEvent struct {
 // successful wake events, longest first.
 func Slowest(events []Event, n int) []SlowEvent {
 	var out []SlowEvent
-	for _, kind := range []string{EventTTFI, EventWake} {
+	for _, kind := range []string{EventTTFIC, EventWake} {
 		var picked []SlowEvent
 		for _, e := range events {
 			if e.Event == kind && e.OK {
@@ -2863,7 +2863,7 @@ func (rep *Report) WriteText(w io.Writer) {
 		fmt.Fprintln(w)
 	}
 	if b := rep.Restores; b != nil {
-		fmt.Fprint(w, "\nrestore phases from atelet's log, paired with ttfi (first) and wake events by time; outside = the event's span minus atelet's total")
+		fmt.Fprint(w, "\nrestore phases from atelet's log, paired with ttfic (first) and wake events by time; outside = the event's span minus atelet's total")
 		for _, x := range []struct {
 			n    int
 			what string
@@ -4160,7 +4160,7 @@ const pairSlack = 2 * time.Second
 
 // JoinRestores pairs each restore record with the ttfi or wake event of its
 // environment whose window, the event's end minus its duration up to its
-// end, contains the record's time. A record paired with a ttfi event is a
+// end, contains the record's time. A record paired with a ttfic event is a
 // first start; one paired with a wake is a wake. Records outside the run's
 // span, for unknown actors, or inside no window are counted, not paired.
 func JoinRestores(events []Event, timings map[string][]RestoreTiming) *RestoreBreakdown {
@@ -4168,7 +4168,7 @@ func JoinRestores(events []Event, timings map[string][]RestoreTiming) *RestoreBr
 	windows := map[string][]Event{}
 	var spanStart, spanEnd time.Time
 	for _, e := range events {
-		if e.Event != EventTTFI && e.Event != EventWake {
+		if e.Event != EventTTFIC && e.Event != EventWake {
 			continue
 		}
 		windows[e.Env] = append(windows[e.Env], e)
@@ -4207,7 +4207,7 @@ func JoinRestores(events []Event, timings map[string][]RestoreTiming) *RestoreBr
 				continue
 			}
 			g, recsOut, outside := &b.Wakes, &wakeRecs, &wakeOutside
-			if ev.Event == EventTTFI {
+			if ev.Event == EventTTFIC {
 				g, recsOut, outside = &b.First, &firstRecs, &firstOutside
 			}
 			if rt.Err != "" {

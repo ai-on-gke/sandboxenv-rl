@@ -41,7 +41,7 @@ from .trace_recorder import get_bench_context, is_measure_mode
 logger = logging.getLogger("ate_env_rl.telemetry.metrics")
 
 # One bucket set, in seconds, for every ate_env histogram.
-SEC_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600)
+SEC_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600)
 
 _MISSING_EXTRA_MSG = (
     "prometheus_client not installed; metrics disabled. "
@@ -220,6 +220,8 @@ _ALLOWED_SOURCES = frozenset({"warm_pool", "cold_create", "mock", "direct"})
 _ENABLED = False
 _HISTOGRAMS: dict[str, Any] = {}
 _SUBPHASE_HISTOGRAMS: dict[str, Any] = {}
+# (family name) -> (max gauge, min gauge); see _observe_extremes.
+_EXTREMES: dict[str, tuple[Any, Any]] = {}
 
 _SUMMARY_LOCK = threading.Lock()
 _RECORDED_OPS: dict[str, dict[str, Any]] = {}
@@ -278,6 +280,36 @@ def _subphase_histogram(phase: str) -> Any:
     return hist
 
 
+def _observe_extremes(name: str, doc: str, labelnames: list[str], labels: dict[str, str], seconds: float) -> None:
+    """Keep the largest and smallest observation of a family in two gauges.
+
+    A histogram holds counts per bucket, never an observation, so the report
+    can only place the maximum inside the last non-empty bucket. The gauges
+    ``<family>_max_seconds`` and ``<family>_min_seconds`` carry the exact
+    values, per label set, over the process lifetime, as the histogram
+    counters do.
+    """
+    pair = _EXTREMES.get(name)
+    if pair is None:
+        with _LOCK:
+            pair = _EXTREMES.get(name)
+            if pair is None:
+                prom = _load_prom()
+                pair = (
+                    _metric(prom.Gauge, name.removesuffix("_seconds") + "_max_seconds", doc + " (largest observation)", labelnames),
+                    _metric(prom.Gauge, name.removesuffix("_seconds") + "_min_seconds", doc + " (smallest observation)", labelnames),
+                )
+                _EXTREMES[name] = pair
+    mx, mn = pair[0].labels(**labels), pair[1].labels(**labels)
+    # Gauge has no atomic max/min; the race loses at most one update, which
+    # for an extreme is tolerable and the lock cost is not.
+    if seconds > mx._value.get():
+        mx.set(seconds)
+    cur = mn._value.get()
+    if cur == 0.0 or seconds < cur:
+        mn.set(seconds)
+
+
 def _record_inmem_op(op: str, seconds: float, status: str) -> None:
     dur_s = max(0.0, float(seconds))
     with _SUMMARY_LOCK:
@@ -290,12 +322,14 @@ def _record_inmem_op(op: str, seconds: float, status: str) -> None:
                 "cancelled": 0,
                 "sum_s": 0.0,
                 "max_s": 0.0,
+                "min_s": None,
             }
             _RECORDED_OPS[op] = entry
         entry["count"] += 1
         entry[status if status in ("ok", "error", "cancelled") else "error"] += 1
         entry["sum_s"] += dur_s
         entry["max_s"] = max(entry["max_s"], dur_s)
+        entry["min_s"] = dur_s if entry["min_s"] is None else min(entry["min_s"], dur_s)
 
 
 def _record_inmem_subphase(
@@ -315,6 +349,7 @@ def _record_inmem_subphase(
                 "error": 0,
                 "sum_s": 0.0,
                 "max_s": 0.0,
+                "min_s": None,
             }
             _RECORDED_SUBPHASES[key] = entry
         entry["count"] += 1
@@ -324,6 +359,7 @@ def _record_inmem_subphase(
             entry["error"] += 1
         entry["sum_s"] += dur_s
         entry["max_s"] = max(entry["max_s"], dur_s)
+        entry["min_s"] = dur_s if entry["min_s"] is None else min(entry["min_s"], dur_s)
 
 
 def observe(op: str, seconds: float, status: str = "ok") -> None:
@@ -336,6 +372,8 @@ def observe(op: str, seconds: float, status: str = "ok") -> None:
     _record_inmem_op(op, seconds, status)
     if _ENABLED and op in CLIENT_FAMILIES:
         _histogram(op).labels(status=status).observe(seconds)
+        name, doc = CLIENT_FAMILIES[op]
+        _observe_extremes(name, doc, ["status"], {"status": status}, seconds)
 
 
 def observe_subphase(
@@ -357,6 +395,10 @@ def observe_subphase(
         _subphase_histogram(phase).labels(
             status=status, source=bounded_source
         ).observe(seconds)
+        name, doc = SUBPHASE_FAMILIES[phase]
+        _observe_extremes(
+            name, doc, ["status", "source"], {"status": status, "source": bounded_source}, seconds
+        )
 
 
 @contextlib.contextmanager
@@ -404,7 +446,12 @@ def render_prometheus() -> str:
             return text
     lines: list[str] = []
     snap = get_recorded_summary()
+    base = lambda fam: fam.removesuffix("_seconds")  # noqa: E731
     for op, stats in sorted(snap["ops"].items()):
+        if op in SUBPHASE_FAMILIES:
+            # The handle records these under the sub-phase family (status,
+            # source); one TYPE block per metric name, so they render below.
+            continue
         fam = CLIENT_FAMILIES.get(op, (f"ate_env_client_{op}_seconds", f"Client {op} latency"))[0]
         lines.append(f"# TYPE {fam} histogram")
         for st in ("ok", "error", "cancelled"):
@@ -412,20 +459,27 @@ def render_prometheus() -> str:
             if cnt > 0 or st == "ok":
                 lines.append(f'{fam}_count{{status="{st}"}} {cnt}')
         lines.append(f'{fam}_sum {stats["sum_s"]:.6f}')
+        lines.append(f'{base(fam)}_max_seconds {stats["max_s"]:.6f}')
+        if stats.get("min_s") is not None:
+            lines.append(f'{base(fam)}_min_seconds {stats["min_s"]:.6f}')
+    seen_type: set[str] = set()
     for (_key, stats) in sorted(snap["subphases"].items()):
         phase = stats["phase"]
         src = stats["source"]
         fam = SUBPHASE_FAMILIES.get(
             phase, (f"ate_env_client_{phase}_seconds", f"Subphase {phase} latency")
         )[0]
-        lines.append(f"# TYPE {fam} histogram")
+        if fam not in seen_type:
+            seen_type.add(fam)
+            lines.append(f"# TYPE {fam} histogram")
         for st in ("ok", "error"):
             cnt = stats.get(st, 0)
             if cnt > 0 or st == "ok":
                 lines.append(f'{fam}_count{{source="{src}",status="{st}"}} {cnt}')
-        lines.append(
-            f'{fam}_sum{{source="{src}"}} {stats["sum_s"]:.6f}'
-        )
+        lines.append(f'{fam}_sum{{source="{src}"}} {stats["sum_s"]:.6f}')
+        lines.append(f'{base(fam)}_max_seconds{{source="{src}"}} {stats["max_s"]:.6f}')
+        if stats.get("min_s") is not None:
+            lines.append(f'{base(fam)}_min_seconds{{source="{src}"}} {stats["min_s"]:.6f}')
     return "\n".join(lines) + ("\n" if lines else "")
 
 

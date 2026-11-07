@@ -220,6 +220,7 @@ class SandboxHandle:
         """
         first = self._note_first_command()
         to_s = self.default_timeout_s if timeout_s is None else timeout_s
+        exec_phase = self._exec_phase(command, phase)
         token = in_handle_span.set(True)
         cmd_t0 = time.monotonic()
         status = "ok"
@@ -233,7 +234,7 @@ class SandboxHandle:
                     instance=self.task.id if self.task else None,
                     image=self.task.image if self.task else None,
                     run_id=self.run_id,
-                    phase=self._exec_phase(command, phase),
+                    phase=exec_phase,
                 )
                 res = self.runtime.exec(command, cwd=cwd, env=env, timeout_s=to_s)
                 status = self._exec_status(res, check)
@@ -243,7 +244,7 @@ class SandboxHandle:
             raise
         finally:
             in_handle_span.reset(token)
-            self._record_exec_phases(self._exec_phase(command, phase), cmd_t0, status)
+            self._record_exec_phases(exec_phase, cmd_t0, status)
         self._raise_for_result(command, res, to_s, check)
         return res
 
@@ -259,6 +260,7 @@ class SandboxHandle:
         """Asynchronously execute command inside the sandbox; see ``exec``."""
         first = self._note_first_command()
         to_s = self.default_timeout_s if timeout_s is None else timeout_s
+        exec_phase = self._exec_phase(command, phase)
         token = in_handle_span.set(True)
         cmd_t0 = time.monotonic()
         status = "ok"
@@ -272,7 +274,7 @@ class SandboxHandle:
                     instance=self.task.id if self.task else None,
                     image=self.task.image if self.task else None,
                     run_id=self.run_id,
-                    phase=self._exec_phase(command, phase),
+                    phase=exec_phase,
                 )
                 res = await self.runtime.exec_async(command, cwd=cwd, env=env, timeout_s=to_s)
                 status = self._exec_status(res, check)
@@ -282,7 +284,7 @@ class SandboxHandle:
             raise
         finally:
             in_handle_span.reset(token)
-            self._record_exec_phases(self._exec_phase(command, phase), cmd_t0, status)
+            self._record_exec_phases(exec_phase, cmd_t0, status)
         self._raise_for_result(command, res, to_s, check)
         return res
 

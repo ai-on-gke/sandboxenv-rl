@@ -1386,6 +1386,10 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 			fe.Attempts = attempts
 			fe.SlotWaitMS = e.slotWaitMS
 			if firstEvent == EventTTFI {
+				// Stamped when the first command was issued, so the event's
+				// window [Time - DurMS, Time] is [ask, issue], the span ttfi
+				// measures.
+				fe.Time = stepStart.UTC()
 				wireMS := math.Max(0, ms(stepStart.Sub(firstStart)))
 				fe.DurMS = round1(e.slotWaitMS + wireMS)
 				fe.Metrics = map[string]float64{
@@ -1393,6 +1397,14 @@ func (r *runner) replay(ctx context.Context, e *environment, step int) {
 					"wire_claim_to_ready_ms": round1(wireMS),
 					"ready_to_first_cmd_ms":  0,
 				}
+				// ttfic runs on to the first command's return: it holds the
+				// boot or restore wait the server performs inside that
+				// command, which is what the restore records pair against.
+				fc := r.event(EventTTFIC, e, step, time.Since(firstStart), err)
+				fc.DurMS = round1(e.slotWaitMS + fc.DurMS)
+				fc.Attempts = attempts
+				fc.SlotWaitMS = e.slotWaitMS
+				r.rec.Record(fc)
 			}
 			r.rec.Record(fe)
 			first = false

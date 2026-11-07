@@ -193,6 +193,10 @@ func TestRealJobDriverVeRLAndTraceIngestion(t *testing.T) {
 	if rep.Headline == nil || rep.Headline.TTFIP50MS != 725.0 || rep.Headline.WireClaimToReadyP50MS != 145.0 || rep.Headline.ReadyToFirstCmdP50MS != 580.0 {
 		t.Fatalf("unexpected Headline TTFI breakdown: %+v", rep.Headline)
 	}
+	// ttfic runs on to the first command's return: ttfi + the 420 ms round trip.
+	if st, ok := rep.StatFor(swebench.EventTTFIC, ""); !ok || st.Count != 1 || st.P50MS != 1145.0 {
+		t.Fatalf("ttfic stat = %+v (ok=%v), want Count=1 P50MS=1145", st, ok)
+	}
 	if rep.RLBreakdown == nil || rep.RLBreakdown.ParamSyncP50MS != 2340.0 || rep.RLBreakdown.RewardP50MS <= 0 {
 		t.Fatalf("unexpected RLBreakdown: %+v", rep.RLBreakdown)
 	}

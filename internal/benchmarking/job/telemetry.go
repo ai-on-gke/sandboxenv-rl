@@ -612,14 +612,17 @@ func ParseTraceJSONLFile(path, defaultJob string) ([]swebench.Event, error) {
 				// command started at ts - dur_ms; the gap from the claim's
 				// end to that start is the ready-to-first-command time. The
 				// command's own round trip (the boot or wake wait ate-env-api
-				// performs inside it, plus the run) is not part of it.
+				// performs inside it, plus the run) is not part of it. The
+				// event is stamped at that start too, so its window
+				// [Time - DurMS, Time] is [ask, issue]: JoinRestores pairs
+				// restore records by that window.
+				firstStart := ts.Add(-time.Duration(te.DurMS * float64(time.Millisecond)))
 				readyToFirstMS := 0.0
 				if !pc.readyAt.IsZero() {
-					firstStart := ts.Add(-time.Duration(te.DurMS * float64(time.Millisecond)))
 					readyToFirstMS = math.Max(0, float64(firstStart.Sub(pc.readyAt))/float64(time.Millisecond))
 				}
 				out = append(out, swebench.Event{
-					Time:     ts,
+					Time:     firstStart,
 					RunID:    runID,
 					Job:      jobName,
 					Worker:   te.Worker,
@@ -637,6 +640,21 @@ func ParseTraceJSONLFile(path, defaultJob string) ([]swebench.Event, error) {
 						"wire_claim_to_ready_ms": pc.claimMS,
 						"ready_to_first_cmd_ms":  readyToFirstMS,
 					},
+				})
+				out = append(out, swebench.Event{
+					Time:     ts,
+					RunID:    runID,
+					Job:      jobName,
+					Worker:   te.Worker,
+					Event:    swebench.EventTTFIC,
+					Source:   source,
+					Env:      te.Env,
+					Instance: te.Instance,
+					Image:    te.Image,
+					Step:     te.Step,
+					DurMS:    pc.slotWaitMS + pc.claimMS + readyToFirstMS + te.DurMS,
+					OK:       rpcOK,
+					Err:      te.Err,
 				})
 			}
 			isTaskEvent := !hasEpisodeOp || rawOp == "episode" || rawOp == "rollout"

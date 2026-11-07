@@ -18,7 +18,7 @@ are wall time as a trainer sees it, API server and network included.
 
 | Question | Run shape | The numbers it produces |
 |---|---|---|
-| Cold restore: how long until a sandbox whose image is on no node can run a command | `-mode eval`, one task per image or many, on nodes that have not seen the images | `ttfi` (create start to the first command's answer), `create`, the restore phases from atelet (download, unpack, restore), pulls per start from the node cache samples |
+| Cold restore: how long until a sandbox whose image is on no node can run a command | `-mode eval`, one task per image or many, on nodes that have not seen the images | `ttfic` (the ask to the first command's answer), `create`, the restore phases from atelet (download, unpack, restore), pulls per start from the node cache samples |
 | Warm restore: the same when the image is already on the node | `-mode eval` with several tasks per image on a fixed pool, or a second pass | `ttfi` with unpack near zero; the gap between it and atelet's restore is the control plane |
 | Park and wake: what it costs to suspend a fleet and resume it for the next step | `-mode steps -park suspend`, with `-park-each` for a fleet larger than the running slots | `suspend`, `wake` p50/p95, `step_barrier` (first task start to last task end in a step), and with `-restore-log` the restore phases of each wake; a `download` phase in a wake's record is the only trace of a move to another node |
 | Image delivery: pull against streaming or another loader | `-mode eval` with the `workload-*` trajectories | `ttfi` per start and the read step's time, under the same command per mechanism |
@@ -100,7 +100,8 @@ API server included, which is what a trainer sees):
 | Event | Meaning |
 |---|---|
 | `create` | CreateEnvironment call |
-| `ttfi` | create start to the first command's return (time to first instruction) |
+| `ttfi` | the ask for a sandbox to the first command being issued (time to first instruction) |
+| `ttfic` | the ask to the first command's return (time to first instruction complete): the boot or restore wait lives here |
 | `wake` | first command after a suspend park, including the wake it triggers |
 | `step` (by name) | each trajectory step, with exit code; the reward step carries the reward and an output tail |
 | `task` | one replay end to end, ok and reward |
@@ -425,9 +426,9 @@ RESTORE_LOG=restores.jsonl benchmarking/swebench/run-in-cluster.sh pull-baseline
 atelet logs one record per actor restore with the seconds each phase took:
 manifest fetch, snapshot download, image unpack, the worker's restore, and
 the total. The actor's name is the environment's name, so the report pairs
-each record with the `ttfi` or `wake` event of that environment whose window
+each record with the `ttfic` or `wake` event of that environment whose window
 (the event's end minus its duration, up to its end) contains the record's
-time: a record inside a `ttfi` window is a first start, one inside a `wake`
+time: a record inside a `ttfic` window is a first start, one inside a `wake`
 window is a wake. The table gives p50/p95/max per phase plus an `outside`
 row, the event's span minus atelet's total, which is ateapi, the scheduler,
 the router and the command itself. The report does not call a restore cold

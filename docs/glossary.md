@@ -77,6 +77,9 @@ for control-plane terms.
 - **Park**: The between-step action in multi-step RL rollouts (`suspend`, `delete`, or `none`).
 - **TTFE**: Time To First Execution, measuring total initialization and run latency
   (`ready_s + first_cmd_s`) in `integrations/nemo-gym/benchmarks/driver_sim.py`.
-- **TTFI**: Time To First Interaction, emitted as `EventTTFI` by `internal/benchmarking/swebench`,
-  measuring wall time from starting `CreateEnvironment` until the first command completes inside the
-  guest daemon.
+- **TTFI**: Time To First Instruction, emitted as `EventTTFI` by `internal/benchmarking/swebench`
+  and recorded by the Python client as `ate_env_client_ttfi_seconds`: wall time from the ask for a
+  sandbox (before any slot wait) until the first command is issued. The boot or wake wait the server
+  performs inside that first command is not part of it.
+- **TTFIC**: Time To First Instruction Complete, emitted as `EventTTFIC`: the ask until the first
+  command returns, so it holds the boot or wake wait; atelet restore records pair against it.

@@ -32,7 +32,7 @@ FAMILIES = {
     "warm_claim": "ate_env_client_warm_claim_seconds",
     "release": "ate_env_client_release_seconds",
 }
-BUCKETS = (0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600)
+BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600)
 
 
 def test_client_families_match_the_contract():
@@ -76,7 +76,11 @@ def test_histograms_register_on_first_use_only():
         assert names() == set(), names()
         metrics.observe("exec", 0.2)
         assert {n.removesuffix("_bucket").removesuffix("_count").removesuffix("_sum")
-                .removesuffix("_created") for n in names()} == {"ate_env_client_exec_seconds"}
+                .removesuffix("_created") for n in names()} == {
+            "ate_env_client_exec_seconds",
+            "ate_env_client_exec_max_seconds",
+            "ate_env_client_exec_min_seconds",
+        }
         with metrics.timed("acquire"):
             pass
         try:
@@ -91,6 +95,12 @@ def test_histograms_register_on_first_use_only():
         hist = prometheus_client.REGISTRY._names_to_collectors["ate_env_client_exec_seconds"]
         assert tuple(hist._labelnames) == ("status",)
         assert tuple(hist._upper_bounds[:-1]) == metrics.SEC_BUCKETS
+        # Exact extremes ride alongside the histogram as two gauges per family.
+        metrics.observe("exec", 0.05)
+        assert get("ate_env_client_exec_max_seconds", {"status": "ok"}) == 0.2
+        assert get("ate_env_client_exec_min_seconds", {"status": "ok"}) == 0.05
+        metrics.observe_subphase("ttfi", 1.5, source="warm_pool")
+        assert get("ate_env_client_ttfi_max_seconds", {"status": "ok", "source": "warm_pool"}) == 1.5
         print("ok")
         """
     )
@@ -226,4 +236,29 @@ def test_timed_out_exec_records_error_status_regardless_of_check(monkeypatch):
     text = metrics.render_prometheus()
     assert 'ate_env_client_grade_seconds_count{source="mock",status="error"} 1' in text
     assert 'ate_env_client_grade_seconds_count{source="mock",status="ok"} 0' in text
+
+
+def test_recorded_summary_and_render_keep_exact_extremes(monkeypatch):
+    """Both the in-memory summary and its Prometheus rendering carry the exact
+    min and max alongside the histogram counters."""
+    metrics.reset_recorded_metrics()
+    monkeypatch.setattr(metrics, "is_measure_mode", lambda: True)
+    metrics.observe("release", 0.3)
+    metrics.observe("release", 0.02)
+    metrics.observe_subphase("ttfi", 2.0, source="warm_pool")
+    metrics.observe_subphase("ttfi", 0.5, source="warm_pool")
+
+    snap = metrics.get_recorded_summary()
+    assert snap["ops"]["release"]["max_s"] == 0.3
+    assert snap["ops"]["release"]["min_s"] == 0.02
+    assert snap["subphases"]["ttfi:warm_pool"]["min_s"] == 0.5
+
+    # Force the in-memory rendering even when prometheus_client is installed.
+    monkeypatch.setattr(metrics, "_ENABLED", False)
+    text = metrics.render_prometheus()
+    assert "ate_env_client_release_max_seconds 0.300000" in text
+    assert "ate_env_client_release_min_seconds 0.020000" in text
+    assert 'ate_env_client_ttfi_max_seconds{source="warm_pool"} 2.000000' in text
+    assert 'ate_env_client_ttfi_min_seconds{source="warm_pool"} 0.500000' in text
+    assert text.count("# TYPE ate_env_client_ttfi_seconds histogram") == 1
 

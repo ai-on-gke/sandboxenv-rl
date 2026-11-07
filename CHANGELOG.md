@@ -22,10 +22,18 @@ user needs to know across them.
   `ate_env_client_{grade,read_file,write_file}_seconds` histograms, so the
   sandbox latency breakdown exists without a trace; `exec(..., phase="grade")`
   marks a grading command explicitly.
-- `bench report` reads the Prometheus histograms (`bench measure` scrapes
-  them) before trace-derived stats; traces are the fallback. The `ttfi`
-  event from traces and the loader now ends when the first command is
-  issued, matching the histogram.
+- `bench report` reads the Prometheus histograms before trace-derived stats;
+  traces are the fallback. The histograms count only when sampled through the
+  run window (two or more samples per series: `bench measure -interval` or
+  `bench run -snapshot-interval`); a single post-run scrape holds one sample
+  and is skipped. The client also records `<family>_max_seconds` and
+  `<family>_min_seconds` gauges, which give the report an exact max and min
+  where buckets only bound them, and the histogram buckets gain `0.01` and
+  `0.025` s for sub-50 ms operations.
+- The `ttfi` event from traces and the loader now ends when the first command
+  is issued, matching the histogram; the former span (through the first
+  command's return, which holds the boot or wake wait) is the new `ttfic`
+  event, and atelet restore records pair against it.
 - Python client: `FleetConfig.node_selector` is sent as every environment's
   `worker_selector`, and `FleetConfig.placement` adds labels per task image;
   `SubstrateBackendDriver(worker_selector=, placement=)` and

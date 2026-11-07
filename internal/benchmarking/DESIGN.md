@@ -497,7 +497,16 @@ while breaking the system.
    path. Per-call JSONL logging is restricted to `trace` mode.
 5. **Exact raw-event aggregation**: `Report` (`W4`) must compute percentiles
    (`p50`, `p90`, `p95`, `max`) over the merged raw event durations, never by
-   averaging percentiles across steps, shards or jobs.
+   averaging percentiles across steps, shards or jobs. When the bundle holds
+   in-window Prometheus histograms of a client family (two or more samples of
+   its `_bucket` series), the report takes that family's stat from the
+   histogram first: traces add latency of their own and are often not
+   captured, while the histogram sees every call. Its percentiles are bucket
+   estimates and its max comes from the client's `_max_seconds` gauge; the
+   raw-event stat is the fallback when no windowed histogram exists. A single
+   post-run `bench measure` holds one sample per series and does not qualify
+   (range queries that would let it are tracked in #271; exact client-side
+   quantiles in #272).
 6. **Non-blocking prefetch and client self-benchmarking**: Next-step pool
    prefetch and previous-step retirement (`W3`) must run asynchronously off the
    step barrier's critical path. The load generator and event recorder must

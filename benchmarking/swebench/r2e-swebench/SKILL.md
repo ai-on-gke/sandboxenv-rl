@@ -244,7 +244,9 @@ top-level comparison artifacts land at `$ARTIFACT_DIR/`:
 - `system_description.json`, `measurements.json`, `measurements_snapshots/meas_*.json`, and
   `run_window.json` (or `arms/<arm>/...`): periodic in-flight and post-arm `bench measure -k8s`
   telemetry rolled up and folded into `report.json` by `bench report -dest`, plus `events/reap.jsonl`
-  when `--ate-endpoint` is set and `preflight-coverage.json` when `--preflight-coverage` is passed.
+  when `--ate-endpoint` is set on a `go` or `go-direct` arm (a `python` arm writes its own `reap`
+  event into `events/{swe,r2e}.jsonl` instead) and `preflight-coverage.json` when
+  `--preflight-coverage` is passed.
 - `cache_before.prom`, `cache_after.prom`, `atelet_restores.jsonl`, and `traces/*.jsonl`: node cache
   counters and raw `atelet` restore records (`go` and `go-direct` arms) joined into both the
   `*-summary.json` files and `report.json` (`restores`), plus `v1` `TraceEvent` JSONL streams when

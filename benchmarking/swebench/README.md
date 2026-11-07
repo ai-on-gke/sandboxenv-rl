@@ -585,7 +585,7 @@ benchmarking/swebench/run-r2e-swebench.sh run \
   --execution in-cluster \
   --collect-telemetry \
   --measure-interval 60 \
-  --gcs-bucket "${GCS_BENCHMARK_BUCKET}" \
+  ${GCS_BENCHMARK_BUCKET:+--gcs-bucket "${GCS_BENCHMARK_BUCKET}"} \
   --artifact-dir "${ARTIFACT_DIR}"
 ```
 
@@ -637,7 +637,7 @@ forward to `--client python`).
 | `--prom-url URL` | `PROM_URL` | unset | Optional Prometheus HTTP base URL for `bench measure`. |
 | `--preflight-coverage PATH` | `PREFLIGHT_COVERAGE` | unset | Optional `preflight-coverage.json` copied into each arm bundle for warm-footing validation (Validity Rule 1). |
 | `--footing warm\|cold` | `FOOTING` | unset | Optional footing check passed to `bench validate` / `bench upload`. |
-| `--trace, --enable-tracing` | `ENABLE_TRACING` | `0` | Enable OTel/SDK tracing (`-enable-tracing` on Go `swebench-loader`; `traces/{r2e,swe}.jsonl` `v1` `TraceEvent` capture on `--client python`, automatically appending `_traced` to derived GCS folders). |
+| `--trace, --enable-tracing` | `ENABLE_TRACING` | `0` | Enable OTel/SDK tracing (`-enable-tracing` on Go `swebench-loader`; `traces/{r2e,swe}.jsonl` `v1` `TraceEvent` capture on `--client python`). Only a `python` arm with a trace file gets `_traced` appended to its derived GCS folder; a Go arm exports OTLP spans and its folder stays untraced. |
 | `--otlp-endpoint ADDR` | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Optional OTLP gRPC collector `host:port` forwarded to traced loader processes / `Job`s. |
 | `--validate-bundle` | `VALIDATE_BUNDLE` | `1` when `COLLECT_TELEMETRY=1` or `--gcs-bucket` set | Run `bench validate -dest` on each completed arm bundle. |
 | `--gcs-bucket BUCKET` | `GCS_BENCHMARK_BUCKET` | unset (never hardcoded) | Validate and upload each arm bundle via `bench upload` to `gs://<BUCKET>/<folder>/`. |

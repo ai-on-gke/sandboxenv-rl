@@ -162,11 +162,21 @@ jobs:
   pod cannot be exec'd into, so give the Job a keepalive sidecar (for example
   `busybox sleep`) that mounts the same `emptyDir` as the trainer, name it in
   `container`, and name the trainer in `trainer_container`. `bench run` then
-  waits for the trainer container to terminate, lists pods by selector (Ray
-  workers included), streams `tar -ch` out of the sidecar (`-h` dereferences
-  symlinks so only regular files land), writes `traces/<job>/<pod>/*.jsonl`,
-  and deletes the head Job. A pod without `remote_dir` is skipped; a `tar`
-  that fails (a file changed under it) fails the harvest naming the pod.
+  waits for the trainer container to terminate in every pod of the trace
+  selector (`trace_collection.pod_selector`, else `pod_selector`, else
+  `job-name=<head_job>`; pods under it that do not run the trainer, Ray
+  workers for instance, neither block the wait nor are read for logs), reads
+  the trainer's logs pod by pod, streams `tar -ch` out of the sidecar (`-h`
+  dereferences symlinks so only regular files land), writes
+  `traces/<job>/<pod>/*.jsonl`, and deletes the head Job. A pod that is
+  `Failed` without a trainer exit code (evicted, OOM-killed) fails the job
+  like a non-zero exit. A pod without `remote_dir` is skipped; a `tar` that
+  fails (a file changed under it) fails the harvest naming the pod. The
+  head Job is deleted on every way out, a timed-out wait or an interrupted
+  run included, because the sidecar would otherwise hold it open for ever;
+  if that delete itself fails, `bench run` says so and the Job is yours to
+  delete. The verl example's pods carry no `job-name` label, so
+  `trainer_container` on it needs a `pod_selector`.
   Each job already gets its own `ATE_ENV_TRACE_DIR=<dest>/traces/<job>`;
   wrappers that write their own event files should likewise key the path on
   `$ATE_BENCH_RUN_ID` and `$ATE_BENCH_JOB_NAME`, never a fixed path on a
@@ -177,12 +187,18 @@ jobs:
 - **Lifecycle timings come from `bench spinup` / `bench spindown -dest`**,
   which append `events/substrate_lifecycle.jsonl` and merge
   `workerpool_spinup_wall_ms` / `workerpool_spindown_wall_ms` into
-  `measurements.json`; `bench run` keeps that file's contents. Wrappers that
-  manage the WorkerPool themselves should call these instead of injecting
-  numbers afterwards; a phase that did not run is omitted, never written as `0`.
+  `measurements.json`; `bench run` keeps that file's contents (and refuses
+  to run over one it cannot decode). Wrappers that manage the WorkerPool
+  themselves should call these instead of injecting numbers afterwards; a
+  phase that did not run is omitted, never written as `0`.
 - **`-snapshot-interval 30s -k8s [-prom-url …]`** makes `bench run` sample
   telemetry itself for exactly the job window and roll it into
-  `measurements.json` before the report is built.
+  `measurements.json` before the report is built. When not one sample
+  succeeded, `bench run` exits non-zero after writing the run's artifacts: the
+  events and report are there to inspect, but a run without its telemetry is
+  not a result. `bench measure -interval` with `-dest` writes its samples to
+  `<dest>/measurements_snapshots`; a `-snapshots-dir` anywhere else is refused,
+  since nothing would read it.
 
 ### 3. Archiving Results & Further Guides
 

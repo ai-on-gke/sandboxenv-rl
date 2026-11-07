@@ -46,6 +46,12 @@ type clusterFakeExecutor struct {
 	trainerExit         int
 	trainerRunningPolls int
 	podJSONPolls        int
+	// podFailedNoExit makes every pod report phase Failed with the trainer
+	// container still `running` (evicted before its status landed).
+	podFailedNoExit bool
+	// trainerless names pods in the JSON listing that do not run the
+	// trainer container at all (Ray workers under a shared selector).
+	trainerless map[string]bool
 	// tarFails names pods whose tar exits 1 (a live writer changed a file).
 	tarFails map[string]bool
 }
@@ -71,11 +77,19 @@ func (f *clusterFakeExecutor) podJSON() []byte {
 	f.podJSONPolls++
 	var items []string
 	for _, p := range f.pods {
+		if f.trainerless[p] {
+			items = append(items, fmt.Sprintf(`{"metadata":{"name":%q},"status":{"phase":"Running","containerStatuses":[{"name":"ray-worker","state":{"running":{}}}]}}`, p))
+			continue
+		}
+		phase := "Running"
 		state := `{"running":{}}`
-		if f.podJSONPolls > f.trainerRunningPolls {
+		switch {
+		case f.podFailedNoExit:
+			phase = "Failed"
+		case f.podJSONPolls > f.trainerRunningPolls:
 			state = fmt.Sprintf(`{"terminated":{"exitCode":%d,"reason":"Completed"}}`, f.trainerExit)
 		}
-		items = append(items, fmt.Sprintf(`{"metadata":{"name":%q},"status":{"phase":"Running","containerStatuses":[{"name":"workload","state":%s},{"name":"keepalive","state":{"running":{}}}]}}`, p, state))
+		items = append(items, fmt.Sprintf(`{"metadata":{"name":%q},"status":{"phase":%q,"containerStatuses":[{"name":"workload","state":%s},{"name":"keepalive","state":{"running":{}}}]}}`, p, phase, state))
 	}
 	return []byte(`{"items":[` + strings.Join(items, ",") + `]}`)
 }
@@ -259,8 +273,8 @@ func TestRealJobDriverSidecarModeWaitsForTrainerContainerAndDeletesJob(t *testin
 	if fake.podJSONPolls < 4 {
 		t.Fatalf("expected the wait loop to poll until the trainer exited, polls=%d", fake.podJSONPolls)
 	}
-	if !strings.Contains(joined, "logs -l app=j --tail=-1 -c workload") {
-		t.Fatalf("logs must come from the trainer container:\n%s", joined)
+	if !strings.Contains(joined, "logs trainer-0 -c workload --tail=-1") {
+		t.Fatalf("logs must come from the trainer container, pod by pod:\n%s", joined)
 	}
 	if !strings.Contains(joined, "exec trainer-0 -c keepalive -- sh -c") {
 		t.Fatalf("traces must be harvested from the keepalive container:\n%s", joined)
@@ -304,6 +318,123 @@ func TestRealJobDriverSidecarModeReportsTrainerExitCodeAfterHarvest(t *testing.T
 	}
 	if !strings.Contains(strings.Join(fake.calls, "\n"), "delete job j --ignore-not-found") {
 		t.Fatal("the head Job must be deleted after a failed trainer too")
+	}
+}
+
+func sidecarDriver(t *testing.T, fake *clusterFakeExecutor, spec schema.JobSpec) (*RealJobDriver, *swebench.Recorder) {
+	t.Helper()
+	dir := t.TempDir()
+	rec, err := swebench.NewFileRecorder(filepath.Join(dir, "events.jsonl"), "run-sc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rec.Close() })
+	spec.Mode, spec.TrainerManifest, spec.TraceMode = schema.JobModeReal, "m.yaml", "trace"
+	return &RealJobDriver{RunID: "run-sc", Namespace: "ns", OutDir: dir, Executor: fake, Spec: spec}, rec
+}
+
+func TestRealJobDriverSidecarModeFailsOnFailedPodWithoutContainerExit(t *testing.T) {
+	// A pod evicted or OOM-killed before the trainer's exit status landed is
+	// phase Failed with the container still "running": a failure, not exit 0.
+	fake := &clusterFakeExecutor{logs: "step:1 - timing_s/step:1.0\n", pods: []string{"trainer-0"}, podFailedNoExit: true}
+	drv, rec := sidecarDriver(t, fake, schema.JobSpec{
+		Name: "j", HeadJob: "j-head", PodSelector: "app=j",
+		TraceCollection: &schema.TraceCollection{Container: "keepalive", TrainerContainer: "workload", RemoteDir: "/tmp/ate-traces"},
+	})
+	start := time.Now()
+	err := drv.Run(context.Background(), rec)
+	if !errors.Is(err, ErrJobFailed) || !strings.Contains(err.Error(), "pod trainer-0 is Failed") {
+		t.Fatalf("err = %v, want ErrJobFailed naming the Failed pod", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatal("a Failed pod must not be waited on until the timeout")
+	}
+	if !strings.Contains(strings.Join(fake.calls, "\n"), "delete job j-head --ignore-not-found") {
+		t.Fatal("the head Job must be deleted after a Failed pod too")
+	}
+}
+
+func TestRealJobDriverSidecarModeDeletesHeadJobWhenTheWaitDoesNotEnd(t *testing.T) {
+	// Without the delete, a wait that times out or is cancelled leaves the
+	// keepalive sidecar holding the Job open for ever.
+	t.Run("timeout", func(t *testing.T) {
+		fake := &clusterFakeExecutor{pods: []string{"trainer-0"}, trainerRunningPolls: 1 << 30}
+		drv, rec := sidecarDriver(t, fake, schema.JobSpec{
+			Name: "j", HeadJob: "j-head", PodSelector: "app=j", Timeout: "20ms",
+			TraceCollection: &schema.TraceCollection{Container: "keepalive", TrainerContainer: "workload", RemoteDir: "/tmp/ate-traces"},
+		})
+		err := drv.Run(context.Background(), rec)
+		if err == nil || !strings.Contains(err.Error(), "timed out") {
+			t.Fatalf("err = %v, want a timeout", err)
+		}
+		if !strings.Contains(strings.Join(fake.calls, "\n"), "delete job j-head --ignore-not-found") {
+			t.Fatalf("the head Job must be deleted after a timed-out wait:\n%s", strings.Join(fake.calls, "\n"))
+		}
+	})
+	t.Run("cancelled context", func(t *testing.T) {
+		fake := &clusterFakeExecutor{pods: []string{"trainer-0"}, trainerRunningPolls: 1 << 30}
+		drv, rec := sidecarDriver(t, fake, schema.JobSpec{
+			Name: "j", HeadJob: "j-head", PodSelector: "app=j",
+			TraceCollection: &schema.TraceCollection{Container: "keepalive", TrainerContainer: "workload", RemoteDir: "/tmp/ate-traces"},
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { time.Sleep(10 * time.Millisecond); cancel() }()
+		if err := drv.Run(ctx, rec); !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+		if !strings.Contains(strings.Join(fake.calls, "\n"), "delete job j-head --ignore-not-found") {
+			t.Fatalf("the head Job must be deleted after a cancelled wait:\n%s", strings.Join(fake.calls, "\n"))
+		}
+	})
+}
+
+func TestRealJobDriverSidecarModeWaitsOnTheTraceSelector(t *testing.T) {
+	// The wait, the logs and the harvest read the same pods:
+	// trace_collection.pod_selector first. Pods under it that do not run the
+	// trainer container (Ray workers) neither block the wait nor get a logs call.
+	fake := &clusterFakeExecutor{
+		logs:        "step:1 - timing_s/step:1.0\n",
+		pods:        []string{"ray-head-0", "ray-worker-a"},
+		podTraces:   map[string]map[string]string{"ray-worker-a": {"trace.jsonl": traceLineA}},
+		trainerless: map[string]bool{"ray-worker-a": true},
+	}
+	drv, rec := sidecarDriver(t, fake, schema.JobSpec{
+		Name: "j", HeadJob: "j-head",
+		TraceCollection: &schema.TraceCollection{
+			PodSelector: "ray.io/cluster=j", Container: "keepalive", TrainerContainer: "workload", RemoteDir: "/tmp/ate-traces",
+		},
+	})
+	if err := drv.Run(context.Background(), rec); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	joined := strings.Join(fake.calls, "\n")
+	if !strings.Contains(joined, "get pods -l ray.io/cluster=j -o json") {
+		t.Fatalf("the wait must use trace_collection.pod_selector:\n%s", joined)
+	}
+	if strings.Contains(joined, "job-name=j-head") {
+		t.Fatalf("the default job-name selector must not be used when trace_collection names one:\n%s", joined)
+	}
+	if !strings.Contains(joined, "logs ray-head-0 -c workload") || strings.Contains(joined, "logs ray-worker-a") {
+		t.Fatalf("logs must be read from the trainer pods only:\n%s", joined)
+	}
+	if _, err := os.Stat(filepath.Join(drv.OutDir, "traces", "j", "ray-worker-a", "trace.jsonl")); err != nil {
+		t.Fatalf("harvested trace missing: %v", err)
+	}
+}
+
+func TestVeRLSidecarModeRefusesTheDefaultSelector(t *testing.T) {
+	fake := &clusterFakeExecutor{logs: "step:1 - timing_s/step:1.0\n", pods: []string{"p"}}
+	drv, rec := sidecarDriver(t, fake, schema.JobSpec{
+		Name:            "j",
+		TraceCollection: &schema.TraceCollection{Container: "keepalive", TrainerContainer: "workload", RemoteDir: "/tmp/ate-traces"},
+	})
+	drv.Spec.TrainerManifest = "examples/Qwen3-1.7B-verl/job-fully-async.yaml"
+	err := drv.Run(context.Background(), rec)
+	if err == nil || !strings.Contains(err.Error(), "needs pod_selector") {
+		t.Fatalf("err = %v, want a refusal naming pod_selector", err)
+	}
+	if strings.Contains(strings.Join(fake.calls, "\n"), "apply") {
+		t.Fatal("nothing must be applied before the refusal")
 	}
 }
 

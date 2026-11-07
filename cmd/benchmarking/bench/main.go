@@ -704,11 +704,15 @@ func measureCmd(args []string, stderr io.Writer) error {
 	}
 	if *sampleInterval > 0 {
 		dir := *snapshotsDir
-		if dir == "" {
-			if *destDir == "" {
-				return fmt.Errorf("-interval requires -dest or -snapshots-dir")
-			}
+		switch {
+		case dir == "" && *destDir == "":
+			return fmt.Errorf("-interval requires -dest or -snapshots-dir")
+		case dir == "":
 			dir = filepath.Join(*destDir, measure.SnapshotsDirName)
+		case *destDir != "" && filepath.Clean(dir) != filepath.Join(*destDir, measure.SnapshotsDirName):
+			// The roll-up and bench report read <dest>/measurements_snapshots;
+			// samples anywhere else would be written and then never found.
+			return fmt.Errorf("-snapshots-dir %s is not %s: with -dest, leave -snapshots-dir unset or point it there", dir, filepath.Join(*destDir, measure.SnapshotsDirName))
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
@@ -731,7 +735,7 @@ func measureCmd(args []string, stderr io.Writer) error {
 				return err
 			}
 		}
-		if *destDir != "" && filepath.Dir(dir) == filepath.Clean(*destDir) {
+		if *destDir != "" {
 			return writeRolledUpMeasurements(*destDir, *outPath, *runID, sr.Last)
 		}
 		return nil
@@ -1424,9 +1428,13 @@ func nearestRankPct(sorted []float64, p float64) float64 {
 func writeRolledUpMeasurements(destDir, outPath, runID string, last *measure.CollectResult) error {
 	meas := schema.Measurements{SchemaVersion: schema.SchemaVersion, RunID: runID, CollectedAt: time.Now().UTC()}
 	if raw, err := os.ReadFile(outPath); err == nil {
-		if existing, derr := schema.DecodeJSONStrict[schema.Measurements](bytes.NewReader(raw)); derr == nil {
-			meas = existing
+		// A file that is there but does not decode is not a blank slate:
+		// overwriting it would silently drop what bench spinup recorded.
+		existing, derr := schema.DecodeJSONStrict[schema.Measurements](bytes.NewReader(raw))
+		if derr != nil {
+			return fmt.Errorf("existing %s does not decode as measurements (move it aside to start over): %w", outPath, derr)
 		}
+		meas = existing
 	} else if last != nil && last.Measurements != nil {
 		meas = *last.Measurements
 	}

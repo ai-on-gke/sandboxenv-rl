@@ -52,10 +52,7 @@ func (r *RealJobDriver) collectPodTraces(
 	if ns == "" {
 		ns = "ate-bench"
 	}
-	selector := strings.TrimSpace(tc.PodSelector)
-	if selector == "" {
-		selector = r.Spec.EffectivePodSelector()
-	}
+	selector := r.traceSelector()
 	remoteDir := path.Clean(strings.TrimSpace(tc.RemoteDir))
 
 	pods, err := listPods(ctx, execRunner, env, ns, selector)

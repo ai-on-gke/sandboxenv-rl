@@ -144,6 +144,17 @@ func (r *RealJobDriver) Run(ctx context.Context, rec *swebench.Recorder) error {
 			return fmt.Errorf("execute trainer_command for %s: %w (output: %s)", r.Spec.Name, err, string(logOutput))
 		}
 	case r.Spec.TrainerManifest != "":
+		if r.trainerContainer() != "" {
+			// Sidecar mode: the keepalive container holds the pod, and so
+			// the Job, open for ever. Delete it on every way out of this run
+			// (harvested, wait timed out, context cancelled, logs failed),
+			// after the harvest below, which the deferred order gives.
+			ns := r.Namespace
+			if ns == "" {
+				ns = "ate-bench"
+			}
+			defer r.deleteHeadJob(ctx, execRunner, env, ns)
+		}
 		logOutput, err = r.runManifestJob(ctx, execRunner, env)
 		if err != nil {
 			if !errors.Is(err, ErrJobFailed) {
@@ -170,13 +181,6 @@ func (r *RealJobDriver) Run(ctx context.Context, rec *swebench.Recorder) error {
 			traceDir = filepath.Join(r.OutDir, "traces", r.Spec.Name)
 		}
 		_, cerr := r.collectPodTraces(ctx, execRunner, env, traceDir)
-		if r.trainerContainer() != "" {
-			ns := r.Namespace
-			if ns == "" {
-				ns = "ate-bench"
-			}
-			r.deleteHeadJob(ctx, execRunner, env, ns)
-		}
 		if cerr != nil {
 			if jobErr != nil {
 				return fmt.Errorf("%w (and collecting traces: %v)", jobErr, cerr)
@@ -224,44 +228,66 @@ func (r *RealJobDriver) runManifestJob(ctx context.Context, execRunner CommandEx
 // awaitJobAndLogs waits for the job to finish and returns its trainer logs.
 //
 // Without trace_collection.trainer_container it waits for the head Job to
-// reach Complete or Failed (Failed fails fast). With it, the manifest is
-// expected to hold the pod open after the trainer exits (a keepalive
-// sidecar sharing the trace volume), so it waits for that container to
-// terminate in every matching pod instead: the pod is then still exec-able
-// for trace harvesting, which a Succeeded pod is not. A non-zero trainer
-// exit is reported through the returned error wrapping ErrJobFailed, after
-// the logs were read, so the caller can still harvest traces before failing.
+// reach Complete or Failed (Failed fails fast) and reads the logs of the
+// job's pod_selector. With it, the manifest is expected to hold the pod open
+// after the trainer exits (a keepalive sidecar sharing the trace volume), so
+// it waits for that container to terminate in every pod of the trace
+// selector (trace_collection.pod_selector, else pod_selector, else
+// `job-name=<head_job>`, the same pods the harvest reads) and reads the
+// trainer container's logs pod by pod: the pod is then still exec-able for
+// trace harvesting, which a Succeeded pod is not. A non-zero trainer exit,
+// or a Failed pod without one, is reported through the returned error
+// wrapping ErrJobFailed, after the logs were read, so the caller can still
+// harvest traces before failing.
 func (r *RealJobDriver) awaitJobAndLogs(ctx context.Context, execRunner CommandExecutor, env map[string]string, ns, headJob string) ([]byte, error) {
-	podSelector := r.Spec.EffectivePodSelector()
 	trainer := r.trainerContainer()
-	var waitErr error
 	if trainer == "" {
-		waitErr = waitForJobTerminal(ctx, execRunner, env, ns, headJob, r.waitTimeout())
+		podSelector := r.Spec.EffectivePodSelector()
+		waitErr := waitForJobTerminal(ctx, execRunner, env, ns, headJob, r.waitTimeout())
 		if waitErr != nil && !errors.Is(waitErr, ErrJobFailed) {
 			return nil, waitErr
 		}
-	} else {
-		exits, err := waitForContainerExit(ctx, execRunner, env, ns, podSelector, trainer, r.waitTimeout())
+		logs, err := execRunner.Run(ctx, "kubectl", env, "-n", ns, "logs", "-l", podSelector, "--tail=-1")
 		if err != nil {
-			return nil, err
-		}
-		for _, e := range exits {
-			if e.ExitCode != 0 {
-				waitErr = fmt.Errorf("%w: container %s of pod %s exited %d (%s)", ErrJobFailed, trainer, e.Pod, e.ExitCode, e.Reason)
-				break
+			if waitErr != nil {
+				return nil, fmt.Errorf("%w (and kubectl logs %s: %v)", waitErr, podSelector, err)
 			}
+			return nil, fmt.Errorf("kubectl logs %s: %w", podSelector, err)
 		}
+		return logs, waitErr
 	}
-	logArgs := []string{"-n", ns, "logs", "-l", podSelector, "--tail=-1"}
-	if trainer != "" {
-		logArgs = append(logArgs, "-c", trainer)
-	}
-	logs, err := execRunner.Run(ctx, "kubectl", env, logArgs...)
+
+	selector := r.traceSelector()
+	exits, err := waitForContainerExit(ctx, execRunner, env, ns, selector, trainer, r.waitTimeout())
 	if err != nil {
-		if waitErr != nil {
-			return nil, fmt.Errorf("%w (and kubectl logs %s: %v)", waitErr, podSelector, err)
+		return nil, err
+	}
+	var waitErr error
+	for _, e := range exits {
+		if e.PodFailed {
+			waitErr = fmt.Errorf("%w: pod %s is Failed and container %s recorded no exit", ErrJobFailed, e.Pod, trainer)
+			break
 		}
-		return nil, fmt.Errorf("kubectl logs %s: %w", podSelector, err)
+		if e.ExitCode != 0 {
+			waitErr = fmt.Errorf("%w: container %s of pod %s exited %d (%s)", ErrJobFailed, trainer, e.Pod, e.ExitCode, e.Reason)
+			break
+		}
+	}
+	// Per pod rather than `logs -l`: the trace selector may cover pods
+	// without the trainer container, which `-l ... -c` refuses as a whole.
+	var logs []byte
+	for _, e := range exits {
+		out, lerr := execRunner.Run(ctx, "kubectl", env, "-n", ns, "logs", e.Pod, "-c", trainer, "--tail=-1")
+		if lerr != nil {
+			if waitErr != nil {
+				return nil, fmt.Errorf("%w (and kubectl logs %s -c %s: %v)", waitErr, e.Pod, trainer, lerr)
+			}
+			return nil, fmt.Errorf("kubectl logs %s -c %s: %w", e.Pod, trainer, lerr)
+		}
+		logs = append(logs, out...)
+		if len(out) > 0 && out[len(out)-1] != '\n' {
+			logs = append(logs, '\n')
+		}
 	}
 	return logs, waitErr
 }
@@ -283,10 +309,31 @@ func (r *RealJobDriver) trainerContainer() string {
 	return strings.TrimSpace(r.Spec.TraceCollection.TrainerContainer)
 }
 
+// traceSelector is the label selector of the pods traces are harvested
+// from, and in sidecar mode waited on: trace_collection.pod_selector, else
+// the job's pod_selector, else `job-name=<head_job>`.
+func (r *RealJobDriver) traceSelector() string {
+	if r.Spec.TraceCollection != nil {
+		if s := strings.TrimSpace(r.Spec.TraceCollection.PodSelector); s != "" {
+			return s
+		}
+	}
+	return r.Spec.EffectivePodSelector()
+}
+
 // deleteHeadJob removes the head Job once a keepalive sidecar has served its
-// purpose; without it the Job never completes on its own.
+// purpose; without it the Job never completes on its own. It runs on every
+// exit of a sidecar-mode run, a cancelled context included, so the delete
+// gets its own short deadline. A failure is logged, not returned: the run's
+// own outcome is already decided by then.
 func (r *RealJobDriver) deleteHeadJob(ctx context.Context, execRunner CommandExecutor, env map[string]string, ns string) {
-	_, _ = execRunner.Run(ctx, "kubectl", env, "-n", ns, "delete", "job", r.Spec.EffectiveHeadJob(), "--ignore-not-found", "--wait=false")
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	name := r.Spec.EffectiveHeadJob()
+	if out, err := execRunner.Run(dctx, "kubectl", env, "-n", ns, "delete", "job", name, "--ignore-not-found", "--wait=false"); err != nil && r.Warnf != nil {
+		r.Warnf("job %s: delete head job/%s in %s failed (the keepalive sidecar holds it open; delete it by hand): %v %s",
+			r.Spec.Name, name, ns, err, strings.TrimSpace(string(out)))
+	}
 }
 
 // IngestTraceDir reads all `*.jsonl` trace files under `traceDir` (including

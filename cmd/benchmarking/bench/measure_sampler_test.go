@@ -146,8 +146,8 @@ func TestReportCreatesMeasurementsFromSnapshotsWhenAbsent(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "events", "run.jsonl"), []byte(`{"run_id":"snap-only","event":"task","env":"e1","dur_ms":10,"ok":true}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	snapshotWith(t, dir, mustTime("2026-11-05T16:00:10Z"), map[string]float64{"0.5": 0, "+Inf": 0})
-	snapshotWith(t, dir, mustTime("2026-11-05T16:00:40Z"), map[string]float64{"0.5": 3, "+Inf": 4})
+	snapshotWith(t, dir, mustTime("2026-11-05T16:00:10Z"), map[string]float64{"0.5": 0, "1": 0, "5": 0, "+Inf": 0})
+	snapshotWith(t, dir, mustTime("2026-11-05T16:00:40Z"), map[string]float64{"0.5": 3, "1": 4, "5": 4, "+Inf": 4})
 	var out, errBuf bytes.Buffer
 	if code := execute([]string{"report", "-dest", dir}, &out, &errBuf); code != 0 {
 		t.Fatalf("bench report failed (code=%d): %s", code, errBuf.String())
@@ -162,5 +162,143 @@ func TestReportCreatesMeasurementsFromSnapshotsWhenAbsent(t *testing.T) {
 	}
 	if meas.RunID != "snap-only" || meas.ServerSummary["active_sandboxes"].Count != 2 {
 		t.Fatalf("unexpected rolled-up measurements: run=%q active=%+v", meas.RunID, meas.ServerSummary["active_sandboxes"])
+	}
+	// Every bucket series survives the fold as its own series, keyed by
+	// label set, with one value per sample in time order: that is what the
+	// metrics-first report's windowed delta reads.
+	byLE := map[string][]float64{}
+	for _, ps := range meas.PromMetrics {
+		if ps.Name == "ate_env_client_ttfi_seconds_bucket" {
+			byLE[ps.Labels["le"]] = ps.Values
+		}
+	}
+	want := map[string][]float64{"0.5": {0, 3}, "1": {0, 4}, "5": {0, 4}, "+Inf": {0, 4}}
+	if len(byLE) != len(want) {
+		t.Fatalf("folded bucket series = %v, want the 4 le buckets", byLE)
+	}
+	for le, vals := range want {
+		if got := byLE[le]; len(got) != 2 || got[0] != vals[0] || got[1] != vals[1] {
+			t.Fatalf("bucket le=%s values = %v, want %v", le, got, vals)
+		}
+	}
+}
+
+func TestMeasureIntervalRejectsSnapshotsDirOutsideDest(t *testing.T) {
+	dir := t.TempDir()
+	var out, errBuf bytes.Buffer
+	code := execute([]string{"measure", "-dest", dir, "-run-id", "x", "-interval", "20ms", "-duration", "40ms",
+		"-snapshots-dir", filepath.Join(t.TempDir(), "elsewhere"), "-scopes", "substrate"}, &out, &errBuf)
+	if code == 0 || !strings.Contains(errBuf.String(), "-snapshots-dir") {
+		t.Fatalf("want a refusal naming -snapshots-dir (code=%d): %s", code, errBuf.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "measurements.json")); err == nil {
+		t.Fatal("nothing must be written when the flags disagree")
+	}
+}
+
+func TestRolledUpMeasurementsRefuseToOverwriteAnUndecodableFile(t *testing.T) {
+	dir := t.TempDir()
+	snapshotWith(t, dir, mustTime("2026-11-05T16:00:10Z"), map[string]float64{"+Inf": 0})
+	outPath := filepath.Join(dir, "measurements.json")
+	if err := os.WriteFile(outPath, []byte(`{"schema_version":"v1","run_id":"r","not_a_field":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := writeRolledUpMeasurements(dir, outPath, "r", nil)
+	if err == nil || !strings.Contains(err.Error(), "does not decode") {
+		t.Fatalf("err = %v, want a decode error, not a silent restart from empty", err)
+	}
+	raw, _ := os.ReadFile(outPath)
+	if !strings.Contains(string(raw), "not_a_field") {
+		t.Fatal("the undecodable file must be left as it was")
+	}
+}
+
+const sampledRunScenario = `schema_version: v1
+name: sampled-smoke
+footing: warm
+seed: 1
+sut:
+  backend: substrate
+  access: ate-env-api
+  endpoint: localhost:7777
+jobs:
+  - name: job-closed
+    kind: simulated
+    mode: closed-loop
+    steps: 1
+    batch_size: 1
+    concurrency: 1
+    park_policy: snapshot
+    instances: 1
+`
+
+// A run whose telemetry never arrived is not a result: bench run exits
+// non-zero when the sampler wrote no snapshot, but only after every artifact
+// of the run is on disk, so the events and report can still be inspected.
+func TestBenchRunFailsWhenTheSamplerWroteNoSnapshotButKeepsArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	scenPath := filepath.Join(dir, "scen.yaml")
+	if err := os.WriteFile(scenPath, []byte(sampledRunScenario), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runDir := filepath.Join(dir, "out")
+	var out, errBuf bytes.Buffer
+	// Nothing listens on port 1: every scrape fails, so no snapshot is written.
+	code := execute([]string{"run", "-scenario", scenPath, "-dest", runDir, "-run-id", "ns",
+		"-snapshot-interval", "10ms", "-prom-url", "http://127.0.0.1:1"}, &out, &errBuf)
+	if code == 0 || !strings.Contains(errBuf.String(), "no snapshot was written") {
+		t.Fatalf("want a non-zero exit naming the missing snapshots (code=%d): %s", code, errBuf.String())
+	}
+	for _, rel := range []string{"events.jsonl", "report.json", "report.md", "measurements.json", "system_description.json"} {
+		if _, err := os.Stat(filepath.Join(runDir, rel)); err != nil {
+			t.Fatalf("artifact %s must still be written: %v", rel, err)
+		}
+	}
+}
+
+// bench spinup -dest records the WorkerPool spin-up into measurements.json
+// before bench run starts; the run must fold its own numbers in, not start over.
+func TestBenchRunKeepsMeasurementsRecordedBeforeTheRun(t *testing.T) {
+	dir := t.TempDir()
+	scenPath := filepath.Join(dir, "scen.yaml")
+	if err := os.WriteFile(scenPath, []byte(sampledRunScenario), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runDir := filepath.Join(dir, "out")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pre := schema.Measurements{
+		SchemaVersion: schema.SchemaVersion, RunID: "keep", CollectedAt: mustTime("2026-11-05T15:59:00Z"),
+		ServerSummary: map[string]schema.MetricSummary{
+			"workerpool_spinup_wall_ms": {Count: 1, Sum: 4200, Min: 4200, Max: 4200, P50: 4200, P90: 4200, P95: 4200, P99: 4200, Unit: "ms"},
+		},
+	}
+	raw, _ := json.MarshalIndent(pre, "", "  ")
+	if err := os.WriteFile(filepath.Join(runDir, "measurements.json"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errBuf bytes.Buffer
+	if code := execute([]string{"run", "-scenario", scenPath, "-dest", runDir, "-run-id", "keep"}, &out, &errBuf); code != 0 {
+		t.Fatalf("bench run failed (code=%d): %s", code, errBuf.String())
+	}
+	after, err := os.ReadFile(filepath.Join(runDir, "measurements.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	meas, err := schema.DecodeJSONStrict[schema.Measurements](bytes.NewReader(after))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := meas.ServerSummary["workerpool_spinup_wall_ms"]; got.P50 != 4200 {
+		t.Fatalf("workerpool_spinup_wall_ms = %+v, want the pre-run value kept", got)
+	}
+	// And a file that is there but does not decode is an error, not a blank slate.
+	if err := os.WriteFile(filepath.Join(runDir, "measurements.json"), []byte(`{"schema_version":"v1","bogus":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	errBuf.Reset()
+	if code := execute([]string{"run", "-scenario", scenPath, "-dest", runDir, "-run-id", "keep"}, &out, &errBuf); code == 0 || !strings.Contains(errBuf.String(), "does not decode") {
+		t.Fatalf("want a decode error (code=%d): %s", code, errBuf.String())
 	}
 }

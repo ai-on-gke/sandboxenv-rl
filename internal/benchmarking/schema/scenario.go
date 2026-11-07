@@ -210,16 +210,21 @@ type JobSpec struct {
 // TraceCollection configures post-run trace file harvesting from job pods.
 type TraceCollection struct {
 	// PodSelector overrides JobSpec.PodSelector for trace harvesting (for
-	// example to include Ray worker pods that do not carry the head job label).
+	// example to include Ray worker pods that do not carry the head job
+	// label). With TrainerContainer set it is also the selector the trainer
+	// wait and the trainer logs use, so the pods waited on are the pods
+	// harvested.
 	PodSelector string `json:"pod_selector,omitempty"`
 	// Container is the container to exec into; empty uses the pod default.
 	Container string `json:"container,omitempty"`
 	// TrainerContainer, when set, changes how the job's end is detected: bench
-	// waits for this container to terminate in every matching pod instead of
-	// for the Job to complete, harvests from Container while a keepalive
-	// sidecar still holds the pod open, and then deletes the head Job. A pod
-	// that has completed cannot be exec'd into, so a Job whose only container
-	// is the trainer cannot be harvested after the fact.
+	// waits for this container to terminate in every matching pod that runs
+	// it instead of for the Job to complete, harvests from Container while a
+	// keepalive sidecar still holds the pod open, and then deletes the head
+	// Job on every exit (timeout and cancellation included). A pod that has
+	// completed cannot be exec'd into, so a Job whose only container is the
+	// trainer cannot be harvested after the fact. Manifests whose pods carry
+	// no `job-name` label (the verl example) need a selector with it.
 	TrainerContainer string `json:"trainer_container,omitempty"`
 	// RemoteDir is the absolute in-pod directory holding `*.jsonl` traces.
 	RemoteDir string `json:"remote_dir"`

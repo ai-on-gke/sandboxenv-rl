@@ -17,6 +17,7 @@ package schema
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"sigs.k8s.io/yaml"
 )
@@ -36,6 +37,39 @@ func TestJobSpecHeadJobAndPodSelectorDefaults(t *testing.T) {
 	}
 	if got := j.EffectivePodSelector(); got != "ray.io/cluster=trainer-2" {
 		t.Fatalf("EffectivePodSelector = %q, want override", got)
+	}
+}
+
+func TestJobSpecWaitTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		timeout string
+		want    time.Duration
+		wantErr string
+	}{
+		{"", time.Hour, ""},
+		{"3h", 3 * time.Hour, ""},
+		{" 90m ", 90 * time.Minute, ""},
+		{"x", 0, "not a duration"},
+		{"0", 0, "must be > 0"},
+		{"-5m", 0, "must be > 0"},
+	} {
+		j := JobSpec{Name: "j", Kind: "real", RealMode: "measure", TrainerManifest: "m.yaml", Timeout: tc.timeout}
+		d, err := j.WaitTimeout()
+		if tc.wantErr == "" {
+			if err != nil || d != tc.want {
+				t.Fatalf("WaitTimeout(%q) = %v, %v; want %v", tc.timeout, d, err, tc.want)
+			}
+			if verr := j.Validate(); verr != nil {
+				t.Fatalf("Validate with timeout %q: %v", tc.timeout, verr)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			t.Fatalf("WaitTimeout(%q) err = %v, want %q", tc.timeout, err, tc.wantErr)
+		}
+		if verr := j.Validate(); verr == nil || !strings.Contains(verr.Error(), tc.wantErr) {
+			t.Fatalf("Validate with timeout %q = %v, want the same rejection", tc.timeout, verr)
+		}
 	}
 }
 

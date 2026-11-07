@@ -103,7 +103,7 @@ func runScenarioCmd(args []string, stdout, stderr io.Writer) error {
 	// the jobs released them.
 	var startSampler samplerFactory
 	if *snapshotInterval > 0 {
-		startSampler = func(dir string) func() {
+		startSampler = func(dir string) func() error {
 			req := measure.CollectRequest{
 				RunID:     *runID,
 				DestDir:   dir,
@@ -117,6 +117,7 @@ func runScenarioCmd(args []string, stdout, stderr io.Writer) error {
 			}
 			sctx, cancel := context.WithCancel(ctx)
 			done := make(chan struct{})
+			var samplerErr error
 			go func() {
 				defer close(done)
 				sr, err := measure.RunSnapshotSampler(sctx, req, measure.SamplerOptions{
@@ -125,12 +126,12 @@ func runScenarioCmd(args []string, stdout, stderr io.Writer) error {
 					OnError:  func(err error) { fmt.Fprintf(stderr, "run: telemetry sample failed: %v\n", err) },
 				})
 				if err != nil {
-					fmt.Fprintf(stderr, "run: telemetry sampler: %v\n", err)
-				} else {
-					fmt.Fprintf(stderr, "run: wrote %d telemetry snapshot(s) (%d failed)\n", sr.Written, sr.Failed)
+					samplerErr = err
+					return
 				}
+				fmt.Fprintf(stderr, "run: wrote %d telemetry snapshot(s) (%d failed)\n", sr.Written, sr.Failed)
 			}()
-			return func() { cancel(); <-done }
+			return func() error { cancel(); <-done; return samplerErr }
 		}
 	}
 
@@ -196,9 +197,10 @@ func parseOverlayFlag(raw string) []string {
 }
 
 // samplerFactory starts a background telemetry sampler writing into
-// <dir>/measurements_snapshots and returns a function that stops it and
-// waits for it to finish. A nil factory disables sampling.
-type samplerFactory func(dir string) (stop func())
+// <dir>/measurements_snapshots and returns a function that stops it, waits
+// for it to finish and reports its outcome (measure.ErrNoSnapshots when no
+// sample succeeded). A nil factory disables sampling.
+type samplerFactory func(dir string) (stop func() error)
 
 func executeScenarioRun(
 	ctx context.Context,
@@ -303,13 +305,15 @@ func executeScenarioRun(
 	}
 	measPath := filepath.Join(outDir, "measurements.json")
 	if raw, rerr := os.ReadFile(measPath); rerr == nil {
-		if existing, derr := schema.DecodeJSONStrict[schema.Measurements](bytes.NewReader(raw)); derr == nil {
-			if existing.RunID == "" {
-				existing.RunID = runID
-			}
-			if len(existing.ServerSummary) > 0 || len(existing.PromMetrics) > 0 || len(existing.CustomMetrics) > 0 {
-				meas = &existing
-			}
+		existing, derr := schema.DecodeJSONStrict[schema.Measurements](bytes.NewReader(raw))
+		if derr != nil {
+			return nil, fmt.Errorf("existing %s does not decode as measurements (move it aside to start over): %w", measPath, derr)
+		}
+		if existing.RunID == "" {
+			existing.RunID = runID
+		}
+		if len(existing.ServerSummary) > 0 || len(existing.PromMetrics) > 0 || len(existing.CustomMetrics) > 0 {
+			meas = &existing
 		}
 	}
 	if err := measure.WriteMeasurements(measPath, meas); err != nil {
@@ -329,12 +333,15 @@ func executeScenarioRun(
 		SleepFunc: func(_ context.Context, _ time.Duration) error { return nil },
 		Warnf:     func(format string, args ...any) { fmt.Fprintf(stderr, "run: "+format+"\n", args...) },
 	}
-	stopSampler := func() {}
+	stopSampler := func() error { return nil }
 	if startSampler != nil {
 		stopSampler = startSampler(outDir)
 	}
 	runErr := sr.Run(ctx)
-	stopSampler()
+	// The sampler's outcome is reported after every artifact below is on
+	// disk: a run whose telemetry never arrived is not a result, but its
+	// events, report and partial measurements are still worth keeping.
+	samplerErr := stopSampler()
 	if runErr != nil {
 		return nil, runErr
 	}
@@ -422,6 +429,9 @@ func executeScenarioRun(
 	}
 	if err := os.WriteFile(filepath.Join(outDir, "report.json"), append(repBytes, '\n'), 0o644); err != nil {
 		return nil, err
+	}
+	if samplerErr != nil {
+		return rep, fmt.Errorf("telemetry sampler: %w; the run's artifacts are in %s", samplerErr, outDir)
 	}
 	return rep, nil
 }

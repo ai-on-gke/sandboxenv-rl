@@ -123,14 +123,24 @@ type containerExit struct {
 	Pod      string
 	ExitCode int
 	Reason   string
+	// PodFailed is set when the pod as a whole is Failed without the
+	// container having recorded a terminated state (evicted, node lost,
+	// OOM-killed before the status landed): no exit code, but not a success.
+	PodFailed bool
 }
 
+// Failed reports whether this outcome is a trainer failure.
+func (e containerExit) Failed() bool { return e.PodFailed || e.ExitCode != 0 }
+
 // waitForContainerExit polls the pods matching selector until, in every
-// one of them, the named container has terminated (and at least one pod
-// matched). The pod itself may still be running: that is the point, a
-// keepalive sidecar holds it open so traces can be harvested after the
-// trainer exits. Pods already Succeeded or Failed as a whole count as
-// terminated too.
+// one of them that runs the named container, it has terminated (and at
+// least one such pod matched). The pod itself may still be running: that is
+// the point, a keepalive sidecar holds it open so traces can be harvested
+// after the trainer exits. A pod already Succeeded or Failed as a whole
+// counts as terminated too; Failed without a container exit is reported as
+// PodFailed. Pods whose container statuses name no such container (Ray
+// workers under a selector shared with the trace harvest) are skipped; a
+// pod with no statuses yet (Pending) still blocks.
 func waitForContainerExit(ctx context.Context, exec CommandExecutor, env map[string]string, ns, selector, container string, timeout time.Duration) ([]containerExit, error) {
 	if timeout <= 0 {
 		timeout = jobWaitTimeout
@@ -145,22 +155,36 @@ func waitForContainerExit(ctx context.Context, exec CommandExecutor, env map[str
 				var exits []containerExit
 				allDone := true
 				for _, p := range pl.Items {
-					done := p.Status.Phase == "Succeeded" || p.Status.Phase == "Failed"
 					ce := containerExit{Pod: p.Metadata.Name}
+					terminated, hasContainer := false, false
 					for _, cs := range p.Status.ContainerStatuses {
-						if cs.Name == container && cs.State.Terminated != nil {
-							done = true
+						if cs.Name != container {
+							continue
+						}
+						hasContainer = true
+						if cs.State.Terminated != nil {
+							terminated = true
 							ce.ExitCode = cs.State.Terminated.ExitCode
 							ce.Reason = cs.State.Terminated.Reason
 						}
 					}
-					if !done {
+					if !hasContainer && len(p.Status.ContainerStatuses) > 0 {
+						continue // a pod of the selector that does not run the trainer
+					}
+					switch {
+					case terminated:
+					case p.Status.Phase == "Failed":
+						ce.PodFailed, ce.Reason = true, "PodFailed"
+					case p.Status.Phase == "Succeeded":
+					default:
 						allDone = false
+					}
+					if !allDone {
 						break
 					}
 					exits = append(exits, ce)
 				}
-				if allDone {
+				if allDone && len(exits) > 0 {
 					return exits, nil
 				}
 			} else if jerr != nil {

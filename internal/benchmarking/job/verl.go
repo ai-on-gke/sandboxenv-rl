@@ -62,6 +62,12 @@ func (r *RealJobDriver) runVeRLManifest(
 	if headJob == "" {
 		headJob = VeRLHeadJobName
 	}
+	if r.trainerContainer() != "" && r.traceSelector() == "job-name="+r.Spec.EffectiveHeadJob() {
+		// The example's pods carry no job-name label, so the default
+		// selector would match nothing and the container wait would run to
+		// its timeout. Refuse before anything is applied.
+		return nil, fmt.Errorf("job %s: trace_collection.trainer_container on a verl manifest needs pod_selector or trace_collection.pod_selector (its pods carry no job-name label)", r.Spec.Name)
+	}
 	if strings.HasSuffix(manifest, "deploy.sh") {
 		if _, err := execRunner.Run(ctx, "bash", env, manifest, "up"); err != nil {
 			return nil, fmt.Errorf("verl deploy.sh up: %w", err)

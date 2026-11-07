@@ -358,7 +358,12 @@ class SubstrateBackendDriver(BackendDriver):
         timeout_s: float = 180.0,
         rootfs_image: str | None = None,
     ) -> RawSandboxInstance:
-        """Acquire a live sandbox instance within timeout_s."""
+        """Acquire a live sandbox instance within timeout_s.
+
+        An acquire that times out or is cancelled while its create() is in
+        flight leaves the environment, if the create landed, to the driver:
+        the next reap of any run deletes it (AC-15.2).
+        """
         to_s = timeout_s or self.acquire_timeout_s
         slot_wait_s = current_slot_wait_s.get() or 0.0
         drv_token = in_driver_span.set(True)
@@ -516,34 +521,42 @@ class SubstrateBackendDriver(BackendDriver):
                 )
                 wire_start = time.monotonic()
                 last_err: Exception | None = None
-                for attempt in range(4):
-                    try:
-                        await self._client_for(actor_id).create(
-                            actor_id,
-                            template_name=template_id,
-                            atespace=self.atespace,
-                            rootfs_image=rootfs_image,
-                            worker_selector=self.worker_selector_for(rootfs_image),
-                        )
-                        last_err = None
-                        break
-                    except (NotFoundError, FailedPreconditionError) as e:
-                        metrics.observe_subphase(
-                            "wire_claim",
-                            time.monotonic() - wire_start,
-                            status="error",
-                            source="cold_create",
-                        )
-                        raise SandboxStartError(
-                            f"ActorTemplate '{template_id}' invalid or does not exist on Substrate server: {e}"
-                        ) from e
-                    except Exception as e:
-                        last_err = e
-                        if "already exists" in str(e).lower():
+                try:
+                    for attempt in range(4):
+                        try:
+                            await self._client_for(actor_id).create(
+                                actor_id,
+                                template_name=template_id,
+                                atespace=self.atespace,
+                                rootfs_image=rootfs_image,
+                                worker_selector=self.worker_selector_for(rootfs_image),
+                            )
                             last_err = None
                             break
-                        if attempt < 3:
-                            await asyncio.sleep(0.05 * (attempt + 1))
+                        except (NotFoundError, FailedPreconditionError) as e:
+                            metrics.observe_subphase(
+                                "wire_claim",
+                                time.monotonic() - wire_start,
+                                status="error",
+                                source="cold_create",
+                            )
+                            raise SandboxStartError(
+                                f"ActorTemplate '{template_id}' invalid or does not exist on Substrate server: {e}"
+                            ) from e
+                        except Exception as e:
+                            last_err = e
+                            if "already exists" in str(e).lower():
+                                last_err = None
+                                break
+                            if attempt < 3:
+                                await asyncio.sleep(0.05 * (attempt + 1))
+                except BaseException as e:
+                    if not isinstance(e, Exception):
+                        # Cancelled (for example by acquire's timeout_s) with a
+                        # create() sent: the server may have made the actor,
+                        # and no caller will hold it (AC-15.2).
+                        self._own_abandoned_create(actor_id, template_id, rootfs_image, teardowns)
+                    raise
                 if last_err is not None:
                     metrics.observe_subphase(
                         "wire_claim",
@@ -787,6 +800,32 @@ class SubstrateBackendDriver(BackendDriver):
                 raise res
             if isinstance(res, Exception):
                 logger.warning("Error provisioning warm actor: %s", res)
+
+    def _own_abandoned_create(
+        self, actor_id: str, template_id: str, rootfs_image: str | None, teardowns: int
+    ) -> None:
+        """Own an actor whose cold create() was cancelled in flight.
+
+        As a cancelled warm_pool does (AC-15.8): own it under
+        WARM_POOL_RUN_ID, so any run's reap deletes it (one whose create never
+        landed is NotFound there, which counts as gone). If a reap ran since
+        the caller read ``teardowns``, that reap may have taken its snapshot
+        first: delete it now too, in a background task so the cancel is not
+        delayed. A delete that fails or never runs leaves it for any later
+        reap.
+        """
+        with self._lock:
+            reaped_since = not self._may_pool(teardowns)
+            self._owned_actors.setdefault(
+                actor_id,
+                self._make_instance(
+                    actor_id, template_id, run_id=WARM_POOL_RUN_ID, rootfs_image=rootfs_image
+                ),
+            )
+        if reaped_since:
+            task = asyncio.create_task(self._delete_unpooled(actor_id, "after a cancelled acquire"))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
     def _may_pool(self, teardowns: int) -> bool:
         """Whether an actor may enter the pool: no reap ran since the caller

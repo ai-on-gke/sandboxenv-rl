@@ -163,3 +163,8 @@ user needs to know across them.
   owned, and the next `reap` of any run deletes it. An environment that an `acquire`
   creates while its own run's teardown runs is also deleted by the next `reap`
   of any run, unless the caller releases it first.
+- Python client: an `acquire` cancelled while its environment's create is in
+  flight, for example by its own `timeout_s`, no longer leaks the environment
+  if the create reached Substrate. The driver keeps it, and the next `reap` of
+  any run deletes it; if a teardown ran during the create, the driver deletes
+  it right away.

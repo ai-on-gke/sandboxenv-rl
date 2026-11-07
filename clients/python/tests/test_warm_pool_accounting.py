@@ -18,14 +18,16 @@ For any sequence of acquire, recycle, warm_pool and teardown operations,
 interleaved at their awaits: the warm-replica gauge equals the warm pool,
 teardown leaves no environment alive, and warm_pool never provisions more than
 it was asked for. The fake client pauses ``suspend()`` per actor, ``create()``
-per warm_pool call, ``delete()`` during a teardown and, when told to, fails
-``get()``, ``create()`` or ``delete()``, so the test chooses where the
-coroutines interleave.
+per warm_pool call, an acquire's ``get()`` and ``create()`` on its own gate,
+``delete()`` during a teardown and, when told to, fails ``get()``, ``create()``
+or ``delete()``, so the test chooses where the coroutines interleave.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import dataclasses
 import itertools
 
 import pytest
@@ -49,6 +51,22 @@ from ate_env_rl.telemetry import metrics
 R = 3  # replicas asked for by every warm_pool call
 
 
+@dataclasses.dataclass
+class AcquireGate:
+    """Pauses one acquire's ``get()`` and ``create()`` calls until ``event`` is set."""
+
+    event: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+    # The create() reaches the server before it waits: the actor is live,
+    # and only the reply is pending.
+    lands_first: bool = False
+
+
+# Set in the task that runs an acquire; the tasks it starts inherit it.
+acquire_gate: contextvars.ContextVar[AcquireGate | None] = contextvars.ContextVar(
+    "acquire_gate", default=None
+)
+
+
 class GatedClient:
     """A Substrate client whose calls wait on, or fail by, test-held settings."""
 
@@ -67,6 +85,11 @@ class GatedClient:
 
     async def create(self, actor_id: str, **kw: object) -> None:
         n, self.creates = self.creates, self.creates + 1
+        gate = acquire_gate.get()
+        if gate is not None:
+            if gate.lands_first and n not in self.create_errors:
+                self.live.add(actor_id)
+            await gate.event.wait()
         if self.create_gate is not None:
             await self.create_gate.wait()
         if n in self.create_errors:
@@ -91,6 +114,9 @@ class GatedClient:
         self.live.discard(actor_id)
 
     async def get(self, actor_id: str, **kw: object) -> None:
+        gate = acquire_gate.get()
+        if gate is not None:
+            await gate.event.wait()
         if self.get_gate is not None:
             await self.get_gate.wait()
         if self.get_error is not None:
@@ -701,6 +727,54 @@ async def test_cold_acquire_keeps_its_run_id_without_an_overlapping_reap_of_its_
     assert driver._owned_actors[instance.instance_id].run_id == "run-1"
     await driver.reap_async("run-1")
     assert client.live == set()
+
+
+# AC-15.2: a cold acquire cancelled while its create() is in flight, by its own
+# timeout_s or by its caller, leaves the actor, if the create landed, for any
+# run's reap.
+@pytest.mark.parametrize("cancel", ["timeout", "caller"])
+async def test_cold_acquire_cancelled_in_create_leaves_the_actor_for_any_reap(
+    cancel: str,
+) -> None:
+    client = GatedClient()
+    driver, _ = _driver(client)
+    acquire_gate.set(AcquireGate(lands_first=True))  # the reply never arrives
+
+    if cancel == "timeout":
+        with pytest.raises(SandboxStartError):
+            await driver.acquire_async("tmpl", "run-1", timeout_s=0.05)
+    else:
+        acquire = asyncio.create_task(driver.acquire_async("tmpl", "run-1"))
+        await _spin()  # paused in create()
+        acquire.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await acquire
+    assert client.creates == 1 and len(client.live) == 1
+    assert {i.run_id for i in driver._owned_actors.values()} == {WARM_POOL_RUN_ID}
+
+    await driver.reap_async("run-2")  # any later reap
+    assert client.live == set()
+    assert driver._owned_actors == {}
+
+
+async def test_cold_acquire_cancelled_in_create_after_its_runs_reap_deletes_the_actor() -> None:
+    # The run's reap ran during the create and could not see the actor, and a
+    # fleet reaps its run once: the cancel deletes it.
+    client = GatedClient()
+    driver, _ = _driver(client)
+    acquire_gate.set(AcquireGate(lands_first=True))
+
+    acquire = asyncio.create_task(driver.acquire_async("tmpl", "run-1"))
+    await _spin()  # paused in create(), the actor live
+    await driver.reap_async("run-1")
+    assert len(client.live) == 1
+    acquire.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await acquire
+    await asyncio.gather(*list(driver._background_tasks))
+
+    assert client.live == set()
+    assert driver._owned_actors == {}
 
 
 async def test_direct_reap_moves_the_gauge_with_the_pool() -> None:

@@ -101,14 +101,15 @@ the wait: `-wake-budget` (`DefaultWakeBudget`, 5 minutes), `-wake-running-budget
   grace had run out. The read had no deadline of its own, so its latency could push the wait past
   `WakeBudget` and the probe that ends a no-capacity run past the grace. An audit (#273) found all
   three; `TestAwaitWakeProperties` missed them because its `readStatus` fake always answered at once
-  with a state.
+  with a state. It now draws a latency for each read and, sometimes, a control-plane `Unavailable`,
+  `DeadlineExceeded`, `ResourceExhausted`, `NotFound` or `Internal` instead of the state.
 
 ### How the wake tests check them
 
 - `TestAwaitWakeProperties` (`internal/apiservice/wakeretry_property_test.go`) runs 2,000 generated
   timelines inside `synctestrapid.Check`, drawing budgets, optional `WakeNoCapacityGrace`, probe
-  latencies, router answers, actor states, and caller cancellation or deadline instants on
-  `testing/synctest`'s fake clock.
+  latencies, router answers, actor states, state-read latencies and control-plane errors, and caller
+  cancellation or deadline instants on `testing/synctest`'s fake clock.
 - `TestEnsureAwakeSynctestStateMachine` (`internal/apiservice/wakeretry_synctest_test.go`) drives
   concurrent `ensureAwake` callers through `ate.NewControlClient(ctrl.Client())` and an in-bubble
   gRPC connection inside `synctestrapid.Repeat`, checking `WF-5` budget bounds, `WF-7` caller

@@ -705,6 +705,10 @@ func reapCmd(args []string, stdout, stderr io.Writer) error {
 			if f, ferr := os.Create(filepath.Join(eventsDir, "reap.jsonl")); ferr == nil {
 				rec := swebench.NewRecorder(f)
 				now := time.Now().UTC()
+				evRunID := strings.TrimRight(*prefix, "-")
+				if evRunID == "" {
+					evRunID = *prefix
+				}
 				var delIDs []string
 				for id := range res.DeleteDurations {
 					delIDs = append(delIDs, id)
@@ -714,7 +718,7 @@ func reapCmd(args []string, stdout, stderr io.Writer) error {
 					d := res.DeleteDurations[id]
 					rec.Record(swebench.Event{
 						Time:  now,
-						RunID: *prefix,
+						RunID: evRunID,
 						Env:   id,
 						Event: swebench.EventDelete,
 						DurMS: float64(d.Microseconds()) / 1000.0,
@@ -723,9 +727,9 @@ func reapCmd(args []string, stdout, stderr io.Writer) error {
 				}
 				ev := swebench.Event{
 					Time:  now,
-					RunID: *prefix,
+					RunID: evRunID,
 					Task:  0,
-					Env:   *prefix,
+					Env:   evRunID,
 					Event: swebench.EventReap,
 					DurMS: float64(res.Duration.Microseconds()) / 1000.0,
 					OK:    reapErr == nil && res.Remaining == 0,
@@ -853,13 +857,16 @@ func reportFromArtifactDir(destDir, jsonOut string, activeScopes []schema.Teleme
 	if err != nil {
 		return err
 	}
-	if rtFile, err := os.Open(filepath.Join(destDir, "restore_timings.jsonl")); err == nil {
-		timings, parseErr := swebench.ParseRestoreTimings(rtFile)
-		_ = rtFile.Close()
-		if parseErr == nil && len(timings) > 0 {
-			if evs, evErr := swebench.ReadEvents(bytes.NewReader(rawCombined)); evErr == nil {
-				if rb := swebench.JoinRestores(evs, timings); rb.First.Restores+rb.Wakes.Restores > 0 {
-					rep.Restores = rb
+	for _, rtName := range []string{"restore_timings.jsonl", "atelet_restores.jsonl"} {
+		if rtFile, err := os.Open(filepath.Join(destDir, rtName)); err == nil {
+			timings, parseErr := swebench.ParseRestoreTimings(rtFile)
+			_ = rtFile.Close()
+			if parseErr == nil && len(timings) > 0 {
+				if evs, evErr := swebench.ReadEvents(bytes.NewReader(rawCombined)); evErr == nil {
+					if rb := swebench.JoinRestores(evs, timings); rb.First.Restores+rb.Wakes.Restores > 0 {
+						rep.Restores = rb
+						break
+					}
 				}
 			}
 		}

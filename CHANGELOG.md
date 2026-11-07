@@ -142,6 +142,11 @@ user needs to know across them.
   non-image volume named `guest`, or a mount at or under `/ate`, fails with
   `InvalidArgument` naming the clash, instead of creating a template that
   Substrate rejects for a duplicate volume or nested mounts.
+- ate-env-api: a guest call that waits for its environment to wake keeps
+  waiting through a transient control-plane error on the state read
+  (`Unavailable`, `DeadlineExceeded`, or `ResourceExhausted` such as a quota)
+  instead of failing at once with it, and a slow state read no longer holds
+  the wait past `-wake-budget` or `-wake-no-capacity-grace`.
 - ate-env-api: a guest call whose caller context cancels or expires while its
   wake probe is parked at the router returns `Canceled` or `DeadlineExceeded`
   instead of treating the unwoken environment as awake and recording

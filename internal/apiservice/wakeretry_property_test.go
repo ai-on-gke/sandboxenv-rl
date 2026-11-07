@@ -40,6 +40,7 @@ type wakeAttempt struct {
 	noCapacity   bool // ... with the router's "no worker has room" text
 	ctxEnded     bool // caller ctx ended before or during the parked probe
 	readCtxEnded bool // caller ctx ended before readStatus completed
+	readCut      bool // readStatus ran out of the time awaitWake gave it
 	state        ateapipb.ActorState
 }
 
@@ -130,6 +131,7 @@ func checkAwaitWake(_ *testing.T, rt *rapid.T) {
 		}
 	}), 0, maxWakeSteps).Draw(rt, "steps")
 
+	callerCtx := context.Background()
 	var attempts []wakeAttempt
 	probe := func(ctx context.Context) error {
 		step := wakeStep{}
@@ -171,7 +173,13 @@ func checkAwaitWake(_ *testing.T, rt *rapid.T) {
 	}
 	readStatus := func(ctx context.Context) (*ateapipb.ActorStatus, error) {
 		if ctx.Err() != nil {
-			attempts[len(attempts)-1].readCtxEnded = true
+			// The caller's ctx ended, or the deadline awaitWake gave the
+			// read passed (the state is then unknown).
+			if callerCtx.Err() != nil {
+				attempts[len(attempts)-1].readCtxEnded = true
+			} else {
+				attempts[len(attempts)-1].readCut = true
+			}
 			return nil, status.FromContextError(ctx.Err()).Err()
 		}
 		idx := 0
@@ -209,6 +217,7 @@ func checkAwaitWake(_ *testing.T, rt *rapid.T) {
 		cleanup = cancel
 		wantCtxCode = codes.DeadlineExceeded
 	}
+	callerCtx = ctx
 
 	err := s.awaitWake(ctx, "ns", "env", probe, readStatus)
 	now := time.Now()

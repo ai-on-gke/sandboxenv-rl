@@ -250,3 +250,49 @@ func TestDeriveImageTemplateRefusesClashWithGuestSlot(t *testing.T) {
 		})
 	}
 }
+
+// A base that already mounts the guest (the second base shape) carries its
+// mounts over unchanged, so it must already have the guest alone at
+// GuestMountPath. Derive refuses one that does not, with the reason, as it
+// does a guest-as-image base. (AE-4 in
+// docs/plans/ate-env-api/acceptance-criteria.md.)
+func TestDeriveImageTemplateRefusesInjectedBaseWithGuestNotAlone(t *testing.T) {
+	data := func(path string) func(*ateapipb.ActorTemplate) {
+		return func(base *ateapipb.ActorTemplate) {
+			base.Volumes = append(base.Volumes, &ateapipb.Volume{Name: "data", DurableDir: &ateapipb.DurableDirVolumeSource{}})
+			c := base.Containers[0]
+			c.VolumeMounts = append(c.VolumeMounts, &ateapipb.VolumeMount{Name: "data", MountPath: path})
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*ateapipb.ActorTemplate)
+		want   string
+	}{
+		{"mount at the guest path", data(GuestMountPath), "overlaps the guest mount"},
+		{"mount under the guest path", data(GuestMountPath + "/cache"), "overlaps the guest mount"},
+		{"guest mounted elsewhere", func(base *ateapipb.ActorTemplate) {
+			base.Containers[0].VolumeMounts[0].MountPath = "/opt/guest"
+		}, "the guest must be mounted at"},
+		{"guest also mounted elsewhere", func(base *ateapipb.ActorTemplate) {
+			c := base.Containers[0]
+			c.VolumeMounts = append(c.VolumeMounts, &ateapipb.VolumeMount{Name: GuestVolumeName, MountPath: "/opt/guest"})
+		}, "the guest must be mounted at"},
+		{"guest not mounted", func(base *ateapipb.ActorTemplate) {
+			base.Containers[0].VolumeMounts = nil
+		}, "mounted 0 times"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A valid injected base: the guest image volume mounted at /ate.
+			base, err := DeriveImageTemplate(modeABase(), "py-base", "example.com/base@sha256:"+strings.Repeat("b", 64))
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(base)
+			got, err := DeriveImageTemplate(base, "py-base-0123456789ab", testRootfsImage)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("DeriveImageTemplate: err = %v, want one containing %q; mounts = %v", err, tc.want, got.GetContainers()[0].GetVolumeMounts())
+			}
+		})
+	}
+}

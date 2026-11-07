@@ -191,8 +191,10 @@ func TestRerootKeepsDotDotUnderMount(t *testing.T) {
 // changes only the container image (and the name); thus
 // Derive(Derive(base, n1, i1), n2, i2) == Derive(base, n2, i2). The base is
 // never changed, and a derived template is one Substrate can run with the
-// guest found (checkDerivedTemplate); a base that already claims the guest's
-// volume name or mount path may be refused instead.
+// guest found (checkDerivedTemplate). A base that already claims the guest's
+// volume name or mount path, or that mounts the guest anywhere but alone at
+// GuestMountPath, is refused instead (claimsGuestSlot); every other base
+// derives.
 func TestPropDeriveComposes(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		base := genBaseTemplate().Draw(t, "base")
@@ -203,13 +205,14 @@ func TestPropDeriveComposes(t *testing.T) {
 		if !proto.Equal(base, before) {
 			t.Fatal("base mutated")
 		}
+		// Checked both ways: a base whose guest slot is taken must be
+		// refused (accepting it carries a broken mount layout over), and an
+		// ordinary base must derive.
+		if claims := claimsGuestSlot(base); (err != nil) != claims {
+			t.Fatalf("DeriveImageTemplate: err = %v, want refused = %v; volumes = %v, mounts = %v",
+				err, claims, base.GetVolumes(), base.GetContainers()[0].GetVolumeMounts())
+		}
 		if err != nil {
-			// Refusing is allowed only for a base whose volumes or mounts
-			// already claim the guest's name or mount path; an ordinary
-			// base must derive.
-			if !claimsGuestSlot(base) {
-				t.Fatalf("ordinary base refused: %v", err)
-			}
 			return
 		}
 		checkDerivedTemplate(t, once, i2)
@@ -227,38 +230,65 @@ func TestPropDeriveComposes(t *testing.T) {
 	})
 }
 
-// genBaseTemplate draws a valid guest-as-image base template (the shape
-// `ate-env manifest template` writes): modeABase with one to three
-// containers, zero to three extra volumes with distinct names, of image or
-// durable-dir kind, mounted into the first container at distinct paths, and
-// maybe no command. Names and mount paths include the guest's own
+// genBaseTemplate draws a base template of either documented shape. Half
+// are guest-as-image bases (the shape `ate-env manifest template` writes):
+// modeABase. Half already mount the guest (a template derived before, or
+// written by hand that way): modeABase running a rootfs image, with a guest
+// image volume mounted at GuestMountPath, mostly, or elsewhere, twice, or not
+// at all, and the command already under the mount. Either kind gets one to
+// three containers, zero to three extra volumes with distinct names, of image
+// or durable-dir kind, mounted into the first container at distinct paths,
+// and maybe no command. Names and mount paths include the guest's own
 // (GuestVolumeName, GuestMountPath and under it): those are the inputs where
-// adding the guest volume can clash, since Substrate requires unique volume
-// names and mounts that do not nest.
+// the guest can end up not alone at GuestMountPath, since Substrate requires
+// unique volume names and mounts that do not nest. A sibling such as
+// "/ate-cache" shares the prefix but does not nest, so it must not be
+// refused.
 func genBaseTemplate() *rapid.Generator[*ateapipb.ActorTemplate] {
 	return rapid.Custom(func(t *rapid.T) *ateapipb.ActorTemplate {
 		base := modeABase()
+		paths := map[string]bool{}
+		c := base.Containers[0]
+		if rapid.Bool().Draw(t, "injected") {
+			c.Image = "example.com/rootfs@sha256:" + genDigest().Draw(t, "rd")
+			c.Command = []string{GuestMountPath + defaultGuestBinary, "-workspace", "/workspace"}
+			base.Volumes = append(base.Volumes, &ateapipb.Volume{Name: GuestVolumeName, Image: &ateapipb.ImageVolumeSource{Reference: testGuestImage}})
+			var guestPaths []string
+			switch rapid.SampledFrom([]string{"alone", "alone", "elsewhere", "twice", "none"}).Draw(t, "guestmount") {
+			case "alone":
+				guestPaths = []string{GuestMountPath}
+			case "elsewhere":
+				guestPaths = []string{"/opt/" + GuestVolumeName}
+			case "twice":
+				guestPaths = []string{GuestMountPath, "/opt/" + GuestVolumeName}
+			}
+			for _, p := range guestPaths {
+				paths[p] = true
+				c.VolumeMounts = append(c.VolumeMounts, &ateapipb.VolumeMount{Name: GuestVolumeName, MountPath: p})
+			}
+		}
 		for i := range rapid.IntRange(0, 2).Draw(t, "sidecars") {
 			base.Containers = append(base.Containers, &ateapipb.Container{
 				Name: "side" + string(rune('a'+i)), Image: "example.com/side@sha256:" + genDigest().Draw(t, "sd"),
 			})
 		}
 		names := rapid.SliceOfNDistinct(rapid.SampledFrom([]string{"execd", "py", "tools", "cache", GuestVolumeName}), 0, 3, rapid.ID[string]).Draw(t, "volumes")
-		paths := map[string]bool{}
-		c := base.Containers[0]
 		for _, name := range names {
 			v := &ateapipb.Volume{Name: name}
-			// An image volume named GuestVolumeName is the other base shape
-			// (guest already mounted), which Derive(Derive(...)) covers.
+			// An extra volume named GuestVolumeName is not an image: an
+			// image one is the guest itself, drawn above.
 			if name != GuestVolumeName && rapid.Bool().Draw(t, "image") {
 				v.Image = &ateapipb.ImageVolumeSource{Reference: "example.com/l@sha256:" + genDigest().Draw(t, "ld")}
 			} else {
 				v.DurableDir = &ateapipb.DurableDirVolumeSource{}
 			}
 			base.Volumes = append(base.Volumes, v)
-			p := rapid.SampledFrom([]string{"/opt/" + name, GuestMountPath, GuestMountPath + "/sub"}).Draw(t, "mount")
+			p := rapid.SampledFrom([]string{"/opt/" + name, GuestMountPath, GuestMountPath + "/sub", GuestMountPath + "-" + name}).Draw(t, "mount")
 			if paths[p] {
 				p = "/opt/" + name
+			}
+			if paths[p] {
+				p = "/srv/" + name // "/opt/guest" taken by the guest mount
 			}
 			paths[p] = true
 			c.VolumeMounts = append(c.VolumeMounts, &ateapipb.VolumeMount{Name: name, MountPath: p})
@@ -270,20 +300,39 @@ func genBaseTemplate() *rapid.Generator[*ateapipb.ActorTemplate] {
 	})
 }
 
-// claimsGuestSlot reports whether base already has a volume named
-// GuestVolumeName or a first-container mount at or under GuestMountPath.
+// claimsGuestSlot reports whether base must be refused because the derived
+// template could not have the guest alone at GuestMountPath. A base whose
+// only volume named GuestVolumeName is an image volume already carries the
+// guest: it is refused unless its first container mounts that volume exactly
+// once, at GuestMountPath, and nothing else at or under it. Any other base
+// gets the guest volume added: it is refused when it already has a volume
+// named GuestVolumeName or a first-container mount at or under
+// GuestMountPath.
 func claimsGuestSlot(base *ateapipb.ActorTemplate) bool {
+	var guestVols, guestImageVols int
 	for _, v := range base.GetVolumes() {
 		if v.GetName() == GuestVolumeName {
-			return true
+			guestVols++
+			if v.GetImage() != nil {
+				guestImageVols++
+			}
 		}
 	}
+	var guestAtMount, others int
 	for _, m := range base.GetContainers()[0].GetVolumeMounts() {
-		if m.GetMountPath() == GuestMountPath || strings.HasPrefix(m.GetMountPath(), GuestMountPath+"/") {
-			return true
+		p := m.GetMountPath()
+		atMount := p == GuestMountPath || strings.HasPrefix(p, GuestMountPath+"/")
+		switch {
+		case m.GetName() == GuestVolumeName && p == GuestMountPath:
+			guestAtMount++
+		case m.GetName() == GuestVolumeName || atMount:
+			others++
 		}
 	}
-	return false
+	if guestImageVols > 0 {
+		return guestVols != 1 || guestAtMount != 1 || others != 0
+	}
+	return guestVols > 0 || guestAtMount > 0 || others > 0
 }
 
 // checkDerivedTemplate asserts that a derived template is one Substrate can
@@ -319,11 +368,18 @@ func checkDerivedTemplate(t *rapid.T, tmpl *ateapipb.ActorTemplate, image string
 	if g := vols[GuestVolumeName]; g == nil || g.GetImage() == nil {
 		t.Fatalf("no guest image volume %q in %v", GuestVolumeName, tmpl.GetVolumes())
 	}
+	guestMounts := 0
 	for _, m := range c.GetVolumeMounts() {
+		if m.GetName() == GuestVolumeName {
+			guestMounts++
+		}
 		atMount := m.GetMountPath() == GuestMountPath || strings.HasPrefix(m.GetMountPath(), GuestMountPath+"/")
 		if (m.GetName() == GuestVolumeName) != (m.GetMountPath() == GuestMountPath) || (atMount && m.GetName() != GuestVolumeName) {
 			t.Fatalf("guest not alone at %s: %v", GuestMountPath, c.GetVolumeMounts())
 		}
+	}
+	if guestMounts != 1 {
+		t.Fatalf("guest volume mounted %d times, want once at %s: %v", guestMounts, GuestMountPath, c.GetVolumeMounts())
 	}
 }
 

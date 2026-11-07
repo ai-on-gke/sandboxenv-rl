@@ -91,6 +91,10 @@ func ImageTemplateName(base, image string) (string, error) {
 // that image becomes the guest volume and the command is re-rooted under the
 // mount; or one that already mounts the guest as an image volume (named
 // GuestVolumeName), in which case only the container image changes.
+// Either way the result must be a template Substrate accepts, with the guest
+// volume alone at GuestMountPath, so a base that already claims the guest's
+// volume name or mount path, or that mounts the guest anywhere else, is
+// refused with the reason.
 // Everything else carries over: worker selector, snapshots, sandbox config,
 // resources, env, readiness, and any other volumes, such as extra runtime
 // layers, together with the command-line flags that start them.
@@ -142,6 +146,11 @@ func DeriveImageTemplate(base *ateapipb.ActorTemplate, name, image string) (*ate
 			return nil, fmt.Errorf("base template %q: %w", base.GetMetadata().GetName(), err)
 		}
 		c.Command = command
+	} else if err := checkGuestMounted(tmpl, c); err != nil {
+		// The base already mounts the guest. It carries over as is, so it
+		// must already be what Substrate accepts, with the guest alone at
+		// GuestMountPath. Say why here, as for the other base shape.
+		return nil, fmt.Errorf("base template %q: %w", base.GetMetadata().GetName(), err)
 	}
 	c.Image = image
 	return tmpl, nil
@@ -160,6 +169,38 @@ func checkGuestSlotFree(tmpl *ateapipb.ActorTemplate, c *ateapipb.Container) err
 		if p := m.GetMountPath(); p == GuestMountPath || strings.HasPrefix(p, GuestMountPath+"/") {
 			return fmt.Errorf("volume %q is mounted at %s, which overlaps the guest mount at %s; mount it elsewhere", m.GetName(), p, GuestMountPath)
 		}
+	}
+	return nil
+}
+
+// checkGuestMounted reports an error unless a base that already has the guest
+// image volume has exactly one volume named GuestVolumeName, mounted by c
+// exactly once and at GuestMountPath, with nothing else mounted at or under
+// GuestMountPath.
+func checkGuestMounted(tmpl *ateapipb.ActorTemplate, c *ateapipb.Container) error {
+	named := 0
+	for _, v := range tmpl.GetVolumes() {
+		if v.GetName() == GuestVolumeName {
+			named++
+		}
+	}
+	if named > 1 {
+		return fmt.Errorf("%d volumes are named %q, but volume names must be unique; rename the extra ones", named, GuestVolumeName)
+	}
+	mounted := 0
+	for _, m := range c.GetVolumeMounts() {
+		p := m.GetMountPath()
+		switch {
+		case m.GetName() == GuestVolumeName && p == GuestMountPath:
+			mounted++
+		case m.GetName() == GuestVolumeName:
+			return fmt.Errorf("guest volume %q is mounted at %s, but the guest must be mounted at %s; mount it there only", GuestVolumeName, p, GuestMountPath)
+		case p == GuestMountPath || strings.HasPrefix(p, GuestMountPath+"/"):
+			return fmt.Errorf("volume %q is mounted at %s, which overlaps the guest mount at %s; mount it elsewhere", m.GetName(), p, GuestMountPath)
+		}
+	}
+	if mounted != 1 {
+		return fmt.Errorf("guest volume %q is mounted %d times in container %q, want once at %s", GuestVolumeName, mounted, c.GetName(), GuestMountPath)
 	}
 	return nil
 }

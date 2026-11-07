@@ -794,3 +794,35 @@ func TestServerInfoAdvertisesPlacementFeatures(t *testing.T) {
 		}
 	}
 }
+
+// A create cut off may have landed, and a later attempt refused for good
+// does not undo that: the probe is deleted all the same, and nothing is
+// left for a sweep. Found by TestPropWarmImageLeavesNoProbe (1 node, 1
+// probe, create plan: stored but reply lost, then refused).
+func TestWarmImageDeletesAProbeWhoseLostCreateLanded(t *testing.T) {
+	apiservice.SetWarmTimings(t, 10*time.Millisecond, 50*time.Millisecond, time.Second)
+	client, control := newTestEnv(t)
+	seedDomains(t, control)
+	control.PlanCreates("pf-l-1-0",
+		fakecontrol.CreateOutcome{Code: codes.Unavailable, Msg: "graceful_stop", Stored: true},
+		fakecontrol.CreateOutcome{Code: codes.ResourceExhausted, Msg: "atespace quota reached"},
+	)
+	probes, cov, err := warm(t, client, &ateenvv1alpha.WarmImageRequest{
+		RootfsImage: testRootfsImage, WorkerSelector: map[string]string{"ate-env/domain": "d0"}, Nodes: 1, ProbesPerNode: 1, MaxRounds: 1, RunId: "pf-l",
+	})
+	if err != nil {
+		t.Fatalf("WarmImage: %v", err)
+	}
+	if len(probes) != 1 || cov.GetFailed() != 1 || !strings.Contains(cov.GetError(), "create: ") || !strings.Contains(cov.GetError(), "atespace quota reached") {
+		t.Errorf("probes = %v, coverage = %v, want one probe refused for good", probes, cov)
+	}
+	if n := control.Deletes(); n != 1 {
+		t.Errorf("%d deletes, want 1: the lost create may have landed", n)
+	}
+	if n := control.ActorCount(); n != 0 {
+		t.Errorf("%d actors left, want 0: the landed probe is deleted", n)
+	}
+	if len(cov.GetUndeletedProbes()) != 0 {
+		t.Errorf("undeleted = %v, want none", cov.GetUndeletedProbes())
+	}
+}

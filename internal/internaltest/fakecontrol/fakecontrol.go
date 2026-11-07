@@ -99,6 +99,12 @@ type Server struct {
 	// CreateActor, ResumeActor and DeleteActor fail, as a control plane
 	// under load does; see FailCreates, FailResumes and FailDeletes.
 	failCreates, failResumes, failDeletes injectedFailure
+	// createPlans scripts the next CreateActor calls of an actor by name,
+	// one outcome per call; see PlanCreates.
+	createPlans map[string][]CreateOutcome
+	// crashResumes makes the next ResumeActor calls crash their actor, as a
+	// restore that fails does; see CrashResumes.
+	crashResumes injectedFailure
 	// KeepCrashed makes DeleteActor refuse a CRASHED actor with
 	// FailedPrecondition, as Substrate does today (its DeleteVolumes
 	// prerequisite is not met); off, an actor in any state is deleted.
@@ -131,6 +137,48 @@ func (s *Server) FailCreates(n int, code codes.Code, msg string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failCreates = injectedFailure{n: n, code: code, msg: msg}
+}
+
+// CreateOutcome is what one planned CreateActor call does: it fails with
+// Code and Msg, after storing the actor when Stored is set, as a create that
+// landed while its reply was lost does.
+type CreateOutcome struct {
+	Code   codes.Code
+	Msg    string
+	Stored bool
+}
+
+// PlanCreates scripts the next CreateActor calls for the actor named name,
+// one outcome per call in order; once the plan is spent, a call proceeds as
+// usual (and finds the actor there when an outcome stored it). A planned
+// call is counted like any other. Plans go before FailCreates.
+func (s *Server) PlanCreates(name string, outcomes ...CreateOutcome) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.createPlans == nil {
+		s.createPlans = map[string][]CreateOutcome{}
+	}
+	s.createPlans[name] = append(s.createPlans[name], outcomes...)
+}
+
+// CrashResumes makes the next n ResumeActor calls fail Internal with msg and
+// leave their actor CRASHED with msg as the crash reason, as a restore that
+// fails does.
+func (s *Server) CrashResumes(n int, msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.crashResumes = injectedFailure{n: n, code: codes.Internal, msg: msg}
+}
+
+// ActorNames returns the names of the actors that exist, in no order.
+func (s *Server) ActorNames() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.actors))
+	for _, a := range s.actors {
+		out = append(out, a.GetMetadata().GetName())
+	}
+	return out
 }
 
 // FailResumes makes the next n ResumeActor calls fail with code and msg,
@@ -668,16 +716,31 @@ func (s *Server) CreateActor(ctx context.Context, req *ateapipb.CreateActorReque
 	if name == "" {
 		return nil, status.Error(codes.InvalidArgument, "metadata.name is required")
 	}
+	k := key(actor.GetMetadata().GetAtespace(), name)
+	if plan := s.createPlans[name]; len(plan) > 0 {
+		out := plan[0]
+		s.createPlans[name] = plan[1:]
+		if out.Stored && s.actors[k] == nil {
+			s.store(k, actor)
+		}
+		return nil, status.Error(out.Code, out.Msg)
+	}
 	if err := s.failCreates.take(); err != nil {
 		return nil, err
 	}
-	k := key(actor.GetMetadata().GetAtespace(), name)
 	if _, ok := s.actors[k]; ok {
 		return nil, status.Errorf(codes.AlreadyExists, "actor %q already exists", name)
 	}
 	if ref := actor.GetActorTemplate(); s.RequireTemplate && s.templates[key(ref.GetAtespace(), ref.GetName())] == nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "actor template not found; ObjectRef: %s/%s", ref.GetAtespace(), ref.GetName())
 	}
+	return clone(s.store(k, actor)), nil
+}
+
+// store keeps actor under k as an accepted create does: RUNNING and placed,
+// or SUSPENDED and unplaced when BornSuspended; the slow-start reads, the
+// high-water mark and the created log follow. Called with the lock held.
+func (s *Server) store(k string, actor *ateapipb.Actor) *ateapipb.Actor {
 	a := clone(actor)
 	a.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING}
 	if s.BornSuspended {
@@ -695,7 +758,7 @@ func (s *Server) CreateActor(ctx context.Context, req *ateapipb.CreateActorReque
 	s.actors[k] = a
 	s.maxActors = max(s.maxActors, len(s.actors))
 	s.created = append(s.created, clone(a))
-	return clone(a), nil
+	return a
 }
 
 func (s *Server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error) {
@@ -707,6 +770,14 @@ func (s *Server) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorReque
 	}
 	s.resumes++
 	if err := s.failResumes.take(); err != nil {
+		return nil, err
+	}
+	if err := s.crashResumes.take(); err != nil {
+		if a.Status == nil {
+			a.Status = &ateapipb.ActorStatus{}
+		}
+		a.Status.State = ateapipb.ActorState_ACTOR_STATE_CRASHED
+		a.Status.Crash = &ateapipb.ActorCrash{Message: status.Convert(err).Message()}
 		return nil, err
 	}
 	if s.BornSuspended {

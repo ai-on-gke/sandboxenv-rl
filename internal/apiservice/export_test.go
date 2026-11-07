@@ -35,3 +35,18 @@ func SetTemplateRecreateTimeout(t *testing.T, d time.Duration) {
 	templateRecreateTimeout = d
 	t.Cleanup(func() { templateRecreateTimeout = old })
 }
+
+// WarmProbesInFlight reports the probe slots WarmImage calls hold on this
+// server, over every selector, for tests that wait for a cancelled call's
+// cleanup to end.
+func (s *Server) WarmProbesInFlight() int {
+	s.warmSlots.mu.Lock()
+	defer s.warmSlots.mu.Unlock()
+	total := 0
+	for _, w := range s.warmSlots.m {
+		w.mu.Lock()
+		total += w.inflight
+		w.mu.Unlock()
+	}
+	return total
+}

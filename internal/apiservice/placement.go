@@ -629,7 +629,10 @@ func (s *Server) warmProbe(ctx context.Context, atespace, template string, selec
 		cut = cut || createMayHaveLanded(err)
 		return err
 	})
-	r.created = err == nil || createMayHaveLanded(err)
+	// Created, or may be: the last attempt made it, or an attempt was cut
+	// off (cut) and may have made it even when a later attempt was refused
+	// for good. Either way the call deletes it.
+	r.created = err == nil || cut || createMayHaveLanded(err)
 	if err != nil {
 		r.err = fmt.Errorf("create: %w", err)
 		return r

@@ -28,6 +28,8 @@ import textwrap
 import urllib.request
 
 import pytest
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
 
 from ate_env_rl import AsyncSandboxFleet, FleetConfig, SandboxFleet, Task, observability
 from ate_env_rl.config import ObservabilityConfig, ValidationError
@@ -202,6 +204,45 @@ def test_report_phase_bounds_hold_in_to_dict_for_short_phases():
         assert 0 <= p["max_s"] <= p["total_s"] <= p["count"] * p["max_s"], p
     assert phases["acquire"] == {"count": 3, "total_s": 0.01, "max_s": 0.01}
     assert phases["plan"] == {"count": 1, "total_s": 0.01, "max_s": 0.01}
+
+
+# Durations around the 0.01 s rounding step (where rounding total_s and max_s
+# apart breaks the bound), negative ones (clamped) and the wide range of P-8.
+# Runs of one duration on the 0.01 s grid reach total_s == count * max_s,
+# where the float product can land just under the rounded total (3 * 0.29).
+_durations = st.one_of(
+    st.floats(0, 0.03),
+    st.sampled_from([0.004, 0.005, 0.0049999, 0.0050001]),
+    st.integers(0, 100).map(lambda k: k / 100),
+    st.floats(-1e3, 1e4, allow_nan=False),
+)
+_phase_runs = st.tuples(
+    st.sampled_from(["acquire", "process", "release", "reap", "teardown", "custom"]),
+    _durations,
+    st.integers(1, 5),
+)
+
+
+@settings(max_examples=300, deadline=None)
+@given(st.lists(_phase_runs, max_size=20))
+@example([("acquire", 0.004, 3)])  # #273: total_s 0.01, max_s 0.0
+@example([("acquire", 0.29, 3)])  # 3 * 0.29 == 0.8699999999999999 < round(total_s) 0.87
+def test_phase_stats_consistent(runs):
+    """P-8: every phase keeps 0 <= max_s <= total_s <= count * max_s, raw and in to_dict()."""
+    ops = [(name, dur) for name, dur, n in runs for _ in range(n)]
+    rep = RunReport("naive")
+    for name, dur in ops:
+        rep.add_phase(name, dur)
+    phases = rep.to_dict()["phases"]
+    assert set(phases) == {name for name, _ in ops}
+    for name, (count, total, mx) in rep.phases.items():
+        assert count == sum(1 for n, _ in ops if n == name)
+        assert 0 <= mx <= total <= count * mx * (1 + 1e-12)
+        p = phases[name]
+        assert p["count"] == count
+        assert 0 <= p["max_s"] <= p["total_s"] <= p["count"] * p["max_s"], p
+        # Rounding moves each value by less than 0.01 s.
+        assert abs(p["max_s"] - mx) < 0.01 and abs(p["total_s"] - total) < 0.01 + 1e-9, (p, total, mx)
 
 
 def test_report_task_done_clamps_negative_duration():

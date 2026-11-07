@@ -194,12 +194,17 @@ execs started concurrently from several threads, exactly one `ate_env_client.exe
 ### P-8: Phase statistics stay consistent
 
 _For any_ sequence of `add_phase(name, d)` calls, with any names and any finite durations including
-negative ones, every phase keeps `0 <= max_s <= total_s <= count * max_s`.
+negative ones, every phase keeps `0 <= max_s <= total_s <= count * max_s`, in `phases` and in the
+rounded `to_dict()` values.
 
 **Validates: AC-7.3**
 
-- Generators: `st.lists(st.tuples(phase_name(), st.floats(-1e3, 1e4, allow_nan=False)))`.
-- Proposed test: Hypothesis `test_phase_stats_consistent`.
+- Generators: `st.lists(st.tuples(phase_name(), duration, st.integers(1, 5)))`, each duration
+  repeated that many times; `duration` mixes `st.floats(0, 0.03)`, values next to the 0.01 s
+  rounding step, multiples of 0.01 up to 1 s and `st.floats(-1e3, 1e4, allow_nan=False)`.
+- Test: Hypothesis `test_phase_stats_consistent` (#279). A generator of only `st.floats(-1e3, 1e4)`
+  seldom reaches the rounding step; repeats of a multiple of 0.01 reach `total_s == count * max_s`,
+  where the float product can land under the rounded total (3 \* 0.29).
 - Example coverage on `main`: `test_report_clamps_negative_phase_duration`.
 
 ### P-16: The report matches its operations

@@ -65,7 +65,7 @@ func TestGcloudUploadArgsFlattensBundleRoot(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".tmp-ignore"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	dest := "gs://swebench_benchmarks/2026-11-07_simulated_r2e-swebench-2000_w500-go-none/"
+	dest := "gs://unit-test-bucket/2026-11-07_simulated_r2e-swebench-2000_w500-go-none/"
 	got, err := gcloudUploadArgs(dir, dest)
 	if err != nil {
 		t.Fatalf("gcloudUploadArgs: %v", err)

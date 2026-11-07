@@ -1481,6 +1481,9 @@ func normalizeDatasetRevision(raw string) string {
 	return d
 }
 
+// datasetShortName is the dataset's base name without its .jsonl extension,
+// the segment of the merged tag of a multi-shard run
+// (r2e-dataset+swe-dataset).
 func datasetShortName(raw string) string {
 	d := strings.TrimSpace(raw)
 	if d == "" {
@@ -1489,7 +1492,7 @@ func datasetShortName(raw string) string {
 	if qIdx := strings.IndexByte(d, '?'); qIdx >= 0 {
 		d = d[:qIdx]
 	}
-	return filepath.Base(d)
+	return strings.TrimSuffix(filepath.Base(d), ".jsonl")
 }
 
 // mergeMultiJobRunTags combines per-job EventRun tags when multiple concurrent

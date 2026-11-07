@@ -203,8 +203,8 @@ func TestReportValidateAndUploadWithAteletRestoresAndSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode enriched system_description.json: %v", err)
 	}
-	if sysAfter.DatasetRevision != "r2e-dataset.jsonl+swe-dataset.jsonl" {
-		t.Fatalf("DatasetRevision = %q, want r2e-dataset.jsonl+swe-dataset.jsonl", sysAfter.DatasetRevision)
+	if sysAfter.DatasetRevision != "r2e-dataset+swe-dataset" {
+		t.Fatalf("DatasetRevision = %q, want r2e-dataset+swe-dataset", sysAfter.DatasetRevision)
 	}
 	if sysAfter.Load == nil || sysAfter.Load.MaxConcurrent != 8 || sysAfter.Load.TrajectoriesPerStep != 2 || sysAfter.Load.DistinctImages != 2 {
 		t.Fatalf("unexpected merged sysAfter.Load: %+v", sysAfter.Load)

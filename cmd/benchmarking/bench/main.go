@@ -675,6 +675,15 @@ func measureCmd(args []string, stderr io.Writer) error {
 	return measure.WriteMeasurements(*outPath, res.Measurements)
 }
 
+// dialReaper opens the server-queried reaper reapCmd uses; tests replace it.
+var dialReaper = func(endpoint string) (sut.LiveResourceListerDeleter, func() error, error) {
+	reaper, closeFn, err := sut.DialATEClusterReaper(endpoint)
+	if err != nil {
+		return nil, nil, err
+	}
+	return reaper, closeFn, nil
+}
+
 func reapCmd(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("reap", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -691,7 +700,7 @@ func reapCmd(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "reap: no -ate-endpoint specified, 0 remaining\n")
 		return nil
 	}
-	reaper, closeFn, err := sut.DialATEClusterReaper(*ateEndpoint)
+	reaper, closeFn, err := dialReaper(*ateEndpoint)
 	if err != nil {
 		return err
 	}

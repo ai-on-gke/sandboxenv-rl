@@ -39,9 +39,9 @@ user needs to know across them.
 - `bench report -dest` joins the raw `atelet_restores.jsonl` into `restores`
   and writes `restore_timings.jsonl` from it, so `bench validate` and the
   upload carry the samples. When shards share one bundle (`r2e` and `swe`),
-  the run tags merge, `load_*` totals and the dataset tag `r2e+swe`, instead
-  of keeping the last shard's, and a dataset tag loses its `/var/run/ko/`
-  prefix. `bench reap -prefix run-` writes `run` as the run id of
+  the run tags merge, `load_*` totals and the dataset tag
+  `r2e-dataset+swe-dataset`, instead of keeping the last shard's, and a
+  dataset tag loses its `/var/run/ko/` prefix. `bench reap -prefix run-` writes `run` as the run id of
   `events/reap.jsonl`, and `bench upload` copies the bundle's files into
   `gs://<bucket>/<folder>/` itself, not into a `<folder>/<dir>/` subdirectory.
 - swebench-loader: `run -delete-rate` caps the environment deletes per second

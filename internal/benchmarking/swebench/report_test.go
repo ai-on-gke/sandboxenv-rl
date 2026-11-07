@@ -839,8 +839,8 @@ func TestMultiJobRunTagsMergeAndClusterTelemetry(t *testing.T) {
 	}
 
 	rep := Build(events)
-	if got := rep.RunTags["dataset"]; got != "r2e-dataset.jsonl+swe-dataset.jsonl" {
-		t.Fatalf("merged dataset tag = %q, want r2e-dataset.jsonl+swe-dataset.jsonl", got)
+	if got := rep.RunTags["dataset"]; got != "r2e-dataset+swe-dataset" {
+		t.Fatalf("merged dataset tag = %q, want r2e-dataset+swe-dataset", got)
 	}
 	if got := rep.RunTags["load_max_concurrent"]; got != "200" {
 		t.Fatalf("load_max_concurrent = %q, want 200", got)
@@ -854,8 +854,8 @@ func TestMultiJobRunTagsMergeAndClusterTelemetry(t *testing.T) {
 
 	sys := &schema.SystemDescription{SchemaVersion: schema.SchemaVersion}
 	rep.AttachClusterTelemetry(sys, nil)
-	if sys.DatasetRevision != "r2e-dataset.jsonl+swe-dataset.jsonl" {
-		t.Fatalf("sys.DatasetRevision = %q, want r2e-dataset.jsonl+swe-dataset.jsonl", sys.DatasetRevision)
+	if sys.DatasetRevision != "r2e-dataset+swe-dataset" {
+		t.Fatalf("sys.DatasetRevision = %q, want r2e-dataset+swe-dataset", sys.DatasetRevision)
 	}
 	if sys.Load == nil || sys.Load.Tasks != 3 || sys.Load.GroupSize != 2 || sys.Load.TrajectoriesPerStep != 6 || sys.Load.MaxConcurrent != 200 || sys.Load.DistinctImages != 3 {
 		t.Fatalf("unexpected sys.Load: %+v", sys.Load)
